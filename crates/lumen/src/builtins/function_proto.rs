@@ -243,7 +243,7 @@ pub(super) fn install_generator_function_ctors(it: &mut Interp) {
         // The constructor's `.prototype` object; its [[Prototype]] is %Function.prototype%.
         let kind_proto = Object::new(Some(fp.clone()));
         set_to_string_tag(it, &kind_proto, tag);
-        let key: &'static str = Box::leak(format!("%{tag}.prototype%").into_boxed_str());
+        let key = super::static_name(&format!("%{tag}.prototype%"));
         Rc::make_mut(&mut it.extra_protos).insert(key, kind_proto.clone());
         let kind_ctor = it.make_native(tag, 1, make_fn);
         kind_ctor.borrow_mut().proto = Some(function_ctor.clone()); // [[Prototype]] is %Function%

@@ -9085,11 +9085,13 @@ pub(crate) fn to_int32(n: f64) -> i32 {
     }
 }
 
-/// Parse a string to a Number per the (simplified) StringToNumber grammar: trimmed, empty → 0,
-/// supports decimals, `Infinity`, and `0x`/`0o`/`0b` radix prefixes.
+/// StringToNumber (ECMA-262 #sec-stringtonumber): the StringNumericLiteral grammar with its
+/// StrWhiteSpace trimmed (empty is 0), `Infinity`, decimal literals and the `0x`/`0o`/`0b`
+/// NonDecimalIntegerLiterals; anything else is NaN.
 fn parse_number(s: &str) -> f64 {
-    // StrWhiteSpace includes U+FEFF (which Rust's char::is_whitespace omits).
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    // StrWhiteSpaceChar is WhiteSpace or LineTerminator: U+FEFF but not U+0085 (NEL), unlike
+    // Rust's char::is_whitespace.
+    let t = s.trim_matches(crate::regex::js_whitespace);
     if t.is_empty() {
         return 0.0;
     }
@@ -9354,7 +9356,7 @@ pub(crate) fn private_display(key: &str) -> &str {
 /// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable.
 fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
     use crate::bigint::JsBigInt;
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    let t = s.trim_matches(crate::regex::js_whitespace);
     if t.is_empty() {
         return Some(JsBigInt::zero());
     }

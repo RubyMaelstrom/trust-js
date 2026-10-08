@@ -36,13 +36,13 @@ fn range_endpoints(
     this: &Value,
     x: &Value,
     y: &Value,
-) -> Result<(Gc, f64, f64), Value> {
+) -> Result<(Gc, IntlMv, IntlMv), Value> {
     let o = instance(i, this)?;
     if matches!(x, Value::Undefined) || matches!(y, Value::Undefined) {
         return Err(i.make_error("TypeError", "formatRange requires two arguments"));
     }
-    let a = to_intl_number(i, x)?;
-    let b = to_intl_number(i, y)?;
+    let a = to_intl_mv(i, x)?;
+    let b = to_intl_mv(i, y)?;
     if a.is_nan() || b.is_nan() {
         return Err(i.make_error("RangeError", "formatRange arguments must not be NaN"));
     }
@@ -51,8 +51,8 @@ fn range_endpoints(
 
 fn format_range(i: &mut Interp, this: &Value, x: &Value, y: &Value) -> Result<Value, Value> {
     let (o, a, b) = range_endpoints(i, this, x, y)?;
-    let sa = assemble_number_exact(i, &o, a, exact_of(x)).text;
-    let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
+    let sa = assemble_number_exact(i, &o, &a).text;
+    let sb = assemble_number_exact(i, &o, &b).text;
     let nu = get_str(&o, "#\u{0}nf_nu");
     // Endpoints that FORMAT identically collapse to a single approximate value.
     if sa == sb {
@@ -129,8 +129,8 @@ fn format_range_to_parts(
             out.push(Value::Obj(ob));
         }
     };
-    let sa = assemble_number_exact(i, &o, a, exact_of(x)).text;
-    let sb = assemble_number_exact(i, &o, b, exact_of(y)).text;
+    let sa = assemble_number_exact(i, &o, &a).text;
+    let sb = assemble_number_exact(i, &o, &b).text;
     if sa == sb {
         let approx = i.new_object();
         set_data(&approx, "type", Value::lstr("approximatelySign"));
@@ -717,26 +717,8 @@ fn get_num(o: &Gc, k: &str) -> Option<u32> {
     }
 }
 
-/// Produce (sign_is_negative, digit-string) for |x| per digit options.
-fn format_magnitude(x: f64, o: &Gc) -> String {
-    let min_int = get_num(o, "#\u{0}nf_minint").unwrap_or(1);
-    let min_frac = get_num(o, "#\u{0}nf_minfrac").unwrap_or(0);
-    let max_frac = get_num(o, "#\u{0}nf_maxfrac").unwrap_or(0);
-    let min_sig = get_num(o, "#\u{0}nf_minsig");
-    let max_sig = get_num(o, "#\u{0}nf_maxsig");
-
-    let increment = get_num(o, "#\u{0}nf_roundingincrement").unwrap_or(1);
-    let mode = get_str(o, "#\u{0}nf_roundingmode");
-    let mode = if mode.is_empty() { "halfExpand" } else { &mode };
-    let rtype = get_str(o, "#\u{0}nf_roundingtype");
-    format_magnitude_options(
-        x, min_int, min_frac, max_frac, min_sig, max_sig, increment, mode, &rtype,
-    )
-}
-
-/// `FormatNumericToString`'s decimal rounding and minimum-integer padding, shared with
-/// `Intl.PluralRules`. Keeping this path common prevents plural selection from drifting from the
-/// number that the same digit options format.
+/// `FormatNumericToString`'s decimal rounding and minimum-integer padding for a Number, shared
+/// with `Intl.PluralRules`: the Number's exact value is its Number::toString digits.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn format_magnitude_options(
     x: f64,
@@ -749,48 +731,17 @@ pub(super) fn format_magnitude_options(
     mode: &str,
     rtype: &str,
 ) -> String {
-    let mut s = match rtype {
-        "significant" => {
-            round_significant_dec(x, max_sig.unwrap_or(21), min_sig.unwrap_or(1), mode)
-        }
-        "morePrecision" | "lessPrecision" => round_priority(
-            x,
-            min_sig.unwrap_or(1),
-            max_sig.unwrap_or(21),
-            min_frac,
-            max_frac,
-            increment,
-            mode,
-            rtype == "morePrecision",
-        ),
-        "fraction" => round_fraction_dec(x, min_frac, max_frac, increment, mode),
-        // Fallback for formatters created without a stored rounding type.
-        _ if max_sig.is_some() => {
-            round_significant_dec(x, max_sig.unwrap(), min_sig.unwrap_or(1), mode)
-        }
-        _ => round_fraction_dec(x, min_frac, max_frac, increment, mode),
-    };
-    // Pad integer digits to min_int.
-    {
-        let (int_part, frac_part) = match s.split_once('.') {
-            Some((a, b)) => (a.to_string(), Some(b.to_string())),
-            None => (s.clone(), None),
-        };
-        let int_digits = int_part.trim_start_matches('0');
-        let int_len = int_digits.len().max(1);
-        let padded_int = if (int_len as u32) < min_int {
-            format!("{:0>width$}", int_digits.max(""), width = min_int as usize)
-        } else if int_digits.is_empty() {
-            "0".to_string()
-        } else {
-            int_digits.to_string()
-        };
-        s = match frac_part {
-            Some(f) => format!("{padded_int}.{f}"),
-            None => padded_int,
-        };
-    }
-    s
+    exact_magnitude_options(
+        &ExactDec::from_f64(x),
+        min_int,
+        min_frac,
+        max_frac,
+        min_sig,
+        max_sig,
+        increment,
+        mode,
+        rtype,
+    )
 }
 
 /// The shortest round-trip decimal digits of `|x|` as (integer_digits, fraction_digits). Rounding is
@@ -806,6 +757,11 @@ fn decimal_digits(x: f64) -> (String, String) {
 /// Round the decimal `int_str.frac_str` to `keep` fraction digits (may be negative, rounding integer
 /// places), snapping to a multiple of `inc` at that scale, per the ECMA-402 `mode`. Returns the exact
 /// decimal string (unsigned, `keep` fraction digits when `keep > 0`, no min-frac padding).
+///
+/// ToRawPrecision/ToRawFixed choose between the two candidates around the value with
+/// ApplyUnsignedRoundingMode (#sec-applyunsignedroundingmode). The arithmetic is exact on the
+/// digit strings: every permitted rounding increment divides 10^4, so the coefficient's residue
+/// modulo the increment (and the parity of its quotient) comes from its last five digits.
 fn round_decimal(
     int_str: &str,
     frac_str: &str,
@@ -814,54 +770,110 @@ fn round_decimal(
     mode: &str,
     negative: bool,
 ) -> String {
-    let mut digits: Vec<u8> = int_str
+    let inc = inc.max(1);
+    let digits: Vec<u8> = int_str
         .bytes()
         .chain(frac_str.bytes())
         .map(|b| b - b'0')
         .collect();
-    let point = int_str.len() as i32;
-    let cut = point + keep; // number of leading digits retained as the coefficient
-    if cut <= 0 {
-        // Everything is discarded; the only possible non-zero result is a single rounded-up unit.
-        let any = digits.iter().any(|&d| d != 0);
-        let up = round_up_decision(
-            mode,
-            negative,
-            /*rem*/ 0.0,
-            /*frac*/ if any { 0.5001 } else { 0.0 },
-            inc,
-            0,
-        );
-        let val = if up { inc as u128 } else { 0 };
-        return place_decimal(&val.to_string(), keep);
-    }
-    let cut = cut as usize;
-    if digits.len() < cut {
-        digits.resize(cut, 0);
-    }
-    let retained: String = digits[..cut].iter().map(|d| (d + b'0') as char).collect();
-    let discarded = &digits[cut..];
-    // The discarded tail as a fraction of one retained unit (short string → exact enough to compare).
-    let frac = if discarded.is_empty() {
-        0.0
+    let cut = int_str.len() as i64 + i64::from(keep);
+    // The retained coefficient (in units of 10^-keep) and the discarded tail, as digits.
+    let (mut coefficient, discarded): (Vec<u8>, &[u8]) = if cut <= 0 {
+        (vec![0], &digits[..])
     } else {
-        let s: String = discarded.iter().map(|d| (d + b'0') as char).collect();
-        format!("0.{s}").parse::<f64>().unwrap_or(0.0)
+        let cut = cut as usize;
+        let mut retained = digits[..cut.min(digits.len())].to_vec();
+        retained.resize(cut, 0);
+        (retained, &digits[cut.min(digits.len())..])
     };
-    let Ok(c) = retained.parse::<u128>() else {
-        // Coefficient too large for exact arithmetic; emit unrounded (huge integers seldom round).
-        return place_decimal(&retained, keep);
+    // When everything is discarded below the first retained place, leading zeros of the tail
+    // that lie between the retained place and the digits make the tail smaller still.
+    let tail_scale_zeros = if cut < 0 { (-cut) as usize } else { 0 };
+    let low_digits = |coefficient: &[u8], count: usize| -> u32 {
+        coefficient[coefficient.len().saturating_sub(count)..]
+            .iter()
+            .fold(0u32, |acc, &digit| acc * 10 + u32::from(digit))
     };
-    let rem = (c % inc.max(1) as u128) as f64;
-    let quotient = c / inc.max(1) as u128;
-    let up = round_up_decision(mode, negative, rem, frac, inc, quotient);
-    let base = c - (c % inc.max(1) as u128);
-    let result = if up { base + inc as u128 } else { base };
-    place_decimal(&result.to_string(), keep)
+    let remainder = low_digits(&coefficient, 4) % inc;
+    let quotient_odd = (low_digits(&coefficient, 5) % (2 * inc)) / inc == 1;
+    let tail_nonzero = discarded.iter().any(|&digit| digit != 0);
+    // Compare the discarded position (remainder + tail, in units) with half an increment:
+    // 2·remainder + 2·tail against inc, with 0 ≤ tail < 1.
+    let twice = 2 * remainder;
+    let versus_half = if twice > inc {
+        std::cmp::Ordering::Greater
+    } else if twice + 2 <= inc {
+        std::cmp::Ordering::Less
+    } else if twice == inc {
+        if tail_nonzero {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    } else {
+        // inc = 2·remainder + 1: compare the tail with one half.
+        if tail_scale_zeros > 0 || discarded.is_empty() {
+            std::cmp::Ordering::Less
+        } else {
+            match discarded[0].cmp(&5) {
+                std::cmp::Ordering::Equal if discarded[1..].iter().any(|&d| d != 0) => {
+                    std::cmp::Ordering::Greater
+                }
+                other => other,
+            }
+        }
+    };
+    let inexact = remainder != 0 || tail_nonzero;
+    let up = round_up_decision(mode, negative, inexact, versus_half, quotient_odd);
+    // coefficient - remainder (+ inc when rounding up), in decimal digits.
+    sub_small(&mut coefficient, remainder);
+    if up {
+        add_small(&mut coefficient, inc);
+    }
+    let text: String = coefficient.iter().map(|d| (d + b'0') as char).collect();
+    let trimmed = text.trim_start_matches('0');
+    place_decimal(if trimmed.is_empty() { "0" } else { trimmed }, keep)
+}
+
+/// `digits -= value` for a decimal digit vector no smaller than `value`.
+fn sub_small(digits: &mut [u8], mut value: u32) {
+    for digit in digits.iter_mut().rev() {
+        if value == 0 {
+            break;
+        }
+        let take = (value % 10) as u8;
+        value /= 10;
+        if *digit >= take {
+            *digit -= take;
+        } else {
+            *digit += 10 - take;
+            value += 1;
+        }
+    }
+}
+
+/// `digits += value`, growing the vector on a final carry.
+fn add_small(digits: &mut Vec<u8>, mut value: u32) {
+    for digit in digits.iter_mut().rev() {
+        if value == 0 {
+            return;
+        }
+        let sum = u32::from(*digit) + value % 10;
+        value /= 10;
+        *digit = (sum % 10) as u8;
+        value += sum / 10;
+    }
+    while value > 0 {
+        digits.insert(0, (value % 10) as u8);
+        value /= 10;
+    }
 }
 
 /// Reconstruct a decimal string from an integer coefficient at scale `10^-keep`.
 fn place_decimal(coeff: &str, keep: i32) -> String {
+    if keep <= 0 && coeff == "0" {
+        return "0".to_string();
+    }
     if keep <= 0 {
         return format!("{coeff}{}", "0".repeat((-keep) as usize));
     }
@@ -875,142 +887,33 @@ fn place_decimal(coeff: &str, keep: i32) -> String {
     format!("{}.{}", &padded[..split], &padded[split..])
 }
 
-/// Whether to round the coefficient up by one increment, given the discarded position `rem + frac`
-/// (in increment units, `rem` an integer remainder and `frac` in [0,1)) under ECMA-402 `mode`.
+/// Whether to round the coefficient up by one increment: ApplyUnsignedRoundingMode for the
+/// ECMA-402 `mode` (GetUnsignedRoundingMode maps it by sign), given whether the value was
+/// inexact, how its discarded position compares with half an increment, and whether the
+/// rounded-down quotient is odd (for halfEven).
 fn round_up_decision(
     mode: &str,
     negative: bool,
-    rem: f64,
-    frac: f64,
-    inc: u32,
-    quotient: u128,
+    inexact: bool,
+    versus_half: std::cmp::Ordering,
+    quotient_odd: bool,
 ) -> bool {
-    let position = rem + frac;
-    let half = inc as f64 / 2.0;
-    let some = position > 0.0;
+    use std::cmp::Ordering::{Equal, Greater};
+    if !inexact {
+        return false;
+    }
     match mode {
         "trunc" => false,
-        "expand" => some,
-        "ceil" => some && !negative,
-        "floor" => some && negative,
-        "halfTrunc" => position > half,
-        "halfExpand" => position >= half,
-        "halfCeil" => position > half || (position == half && !negative),
-        "halfFloor" => position > half || (position == half && negative),
-        "halfEven" => {
-            // Tie → round toward the multiple whose quotient is even (parity of the retained value).
-            position > half || (position == half && quotient % 2 == 1)
-        }
-        _ => position >= half, // halfExpand default
+        "expand" => true,
+        "ceil" => !negative,
+        "floor" => negative,
+        "halfTrunc" => versus_half == Greater,
+        "halfCeil" => versus_half == Greater || (versus_half == Equal && !negative),
+        "halfFloor" => versus_half == Greater || (versus_half == Equal && negative),
+        "halfEven" => versus_half == Greater || (versus_half == Equal && quotient_odd),
+        // halfExpand, the default.
+        _ => versus_half != std::cmp::Ordering::Less,
     }
-}
-
-/// Round `x` to at most `max_frac` fraction digits, snapping to `increment`, per `mode`; pad to
-/// `min_frac`.
-fn round_fraction_dec(x: f64, min_frac: u32, max_frac: u32, increment: u32, mode: &str) -> String {
-    let (int_str, frac_str) = decimal_digits(x);
-    let negative = x.is_sign_negative();
-    let mut s = round_decimal(
-        &int_str,
-        &frac_str,
-        max_frac as i32,
-        increment.max(1),
-        mode,
-        negative,
-    );
-    // Trim trailing zeros beyond min_frac (only meaningful without an increment > 1).
-    if increment <= 1 && max_frac > min_frac && s.contains('.') {
-        while s.ends_with('0') {
-            let frac_len = s.split('.').nth(1).map(|f| f.len()).unwrap_or(0);
-            if frac_len as u32 <= min_frac {
-                break;
-            }
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    s
-}
-
-/// The base-10 exponent of the most-significant digit of `x` (0 for the ones place). Zero maps to 0,
-/// matching ToRawPrecision's handling.
-fn msd_exponent(x: f64) -> i32 {
-    if x == 0.0 {
-        return 0;
-    }
-    let (int_str, frac_str) = decimal_digits(x);
-    let int_trim = int_str.trim_start_matches('0');
-    if !int_trim.is_empty() {
-        int_trim.len() as i32 - 1
-    } else {
-        -(1 + frac_str.bytes().take_while(|&b| b == b'0').count() as i32)
-    }
-}
-
-/// PartitionNumberPattern's morePrecision/lessPrecision disambiguation: round `x` both ways and pick
-/// the significant-digit or fraction-digit result. The rounding magnitude uses the *maximum*
-/// settings (ToRawPrecision: `e - maxSig + 1`; ToRawFixed: `-maxFrac`).
-#[allow(clippy::too_many_arguments)]
-fn round_priority(
-    x: f64,
-    min_sig: u32,
-    max_sig: u32,
-    min_frac: u32,
-    max_frac: u32,
-    increment: u32,
-    mode: &str,
-    more: bool,
-) -> String {
-    let s_result = round_significant_dec(x, max_sig, min_sig, mode);
-    let f_result = round_fraction_dec(x, min_frac, max_frac, increment.max(1), mode);
-    let s_mag = msd_exponent(x) - max_sig as i32 + 1;
-    let f_mag = -(max_frac as i32);
-    let fixed_is_more_precise = f_mag < s_mag;
-    if (more && fixed_is_more_precise) || (!more && !fixed_is_more_precise) {
-        f_result
-    } else {
-        s_result
-    }
-}
-
-/// Round `x` to `max_sig` significant digits (per `mode`), keeping at least `min_sig`.
-fn round_significant_dec(x: f64, max_sig: u32, min_sig: u32, mode: &str) -> String {
-    if x == 0.0 {
-        if min_sig > 1 {
-            return format!("0.{}", "0".repeat((min_sig - 1) as usize));
-        }
-        return "0".to_string();
-    }
-    let (int_str, frac_str) = decimal_digits(x);
-    let negative = x.is_sign_negative();
-    // Position of the most-significant digit (0 = ones place, positive = 10^k, negative = 10^-k).
-    let int_trim = int_str.trim_start_matches('0');
-    let msd: i32 = if !int_trim.is_empty() {
-        int_trim.len() as i32 - 1
-    } else {
-        // Leading zeros in the fraction push the first significant digit right.
-        -(1 + frac_str.bytes().take_while(|&b| b == b'0').count() as i32)
-    };
-    let keep = max_sig as i32 - 1 - msd; // fraction digits to retain
-    let mut s = round_decimal(&int_str, &frac_str, keep, 1, mode, negative);
-    // Trim trailing fractional zeros down to min_sig significant digits.
-    if s.contains('.') {
-        let significant = |t: &str| {
-            t.chars()
-                .filter(|c| c.is_ascii_digit())
-                .skip_while(|c| *c == '0')
-                .count()
-        };
-        while s.ends_with('0') && significant(&s) as u32 > min_sig {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    s
 }
 
 fn group_integer(
@@ -1082,13 +985,220 @@ impl ExactDec {
     }
 }
 
-/// The exact value a format argument carries, when it has one.
-pub(crate) fn exact_of(x: &Value) -> Option<ExactDec> {
-    match x {
-        Value::BigInt(b) => ExactDec::parse(&b.to_string_radix(10)),
-        Value::Str(s) => ExactDec::parse(s),
-        _ => None,
+impl ExactDec {
+    /// The decimal `0.digits × 10^point`, canonicalized: no leading integer zeros, no trailing
+    /// fraction zeros.
+    fn from_digits(digits: &str, point: i64, negative: bool) -> ExactDec {
+        let len = digits.len() as i64;
+        let (int, frac) = if point <= 0 {
+            (
+                String::new(),
+                format!("{}{digits}", "0".repeat((-point) as usize)),
+            )
+        } else if point >= len {
+            (
+                format!("{digits}{}", "0".repeat((point - len) as usize)),
+                String::new(),
+            )
+        } else {
+            let (int, frac) = digits.split_at(point as usize);
+            (int.to_string(), frac.to_string())
+        };
+        let int = int.trim_start_matches('0');
+        ExactDec {
+            int: if int.is_empty() { "0" } else { int }.to_string(),
+            frac: frac.trim_end_matches('0').to_string(),
+            negative,
+        }
     }
+
+    /// The exact value of a finite Number via Number::toString(x, 10), as ToIntlMathematicalValue
+    /// prescribes (so 0.1 is exactly one tenth, not its binary expansion).
+    pub(crate) fn from_f64(x: f64) -> ExactDec {
+        let (int, frac) = decimal_digits(x);
+        ExactDec::from_digits(
+            &format!("{int}{frac}"),
+            int.len() as i64,
+            x.is_sign_negative(),
+        )
+    }
+}
+
+/// An ECMA-402 Intl mathematical value: a mathematical value (a [`ExactDec`]; a negative zero
+/// is a zero with `negative` set), positive or negative infinity, or not-a-number.
+#[derive(Clone)]
+pub(crate) enum IntlMv {
+    Finite(ExactDec),
+    PositiveInfinity,
+    NegativeInfinity,
+    NotANumber,
+}
+
+impl IntlMv {
+    pub(crate) fn is_nan(&self) -> bool {
+        matches!(self, IntlMv::NotANumber)
+    }
+
+    /// The Number nearest the value: used only for NaN, infinity and sign tests.
+    fn approximate(&self) -> f64 {
+        match self {
+            IntlMv::Finite(decimal) => exact_f64(decimal),
+            IntlMv::PositiveInfinity => f64::INFINITY,
+            IntlMv::NegativeInfinity => f64::NEG_INFINITY,
+            IntlMv::NotANumber => f64::NAN,
+        }
+    }
+
+    fn exact(&self) -> Option<ExactDec> {
+        match self {
+            IntlMv::Finite(decimal) => Some(decimal.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// ECMA-402 #sec-tointlmathematicalvalue (snapshot b1c961988b9a).
+pub(crate) fn to_intl_mv(i: &mut Interp, value: &Value) -> Result<IntlMv, Value> {
+    let primitive = ab(i.to_primitive(value, crate::eval::Hint::Number))?;
+    match primitive {
+        // A BigInt is its exact value, without RoundMVResult.
+        Value::BigInt(b) => {
+            let text = b.to_string_radix(10);
+            let digits = text.trim_start_matches('-');
+            Ok(IntlMv::Finite(ExactDec::from_digits(
+                digits,
+                digits.len() as i64,
+                b.is_negative(),
+            )))
+        }
+        Value::Str(s) => Ok(string_intl_mv(&s)),
+        other => {
+            let x = ab(i.to_number(&other))?;
+            if x == 0.0 && x.is_sign_negative() {
+                return Ok(IntlMv::Finite(ExactDec::from_digits("0", 1, true)));
+            }
+            Ok(string_intl_mv(&i.num_to_str(x)))
+        }
+    }
+}
+
+/// ParseText(str, StringNumericLiteral) and its StringIntlMV, with ToIntlMathematicalValue's
+/// RoundMVResult steps: a value whose magnitude rounds to an infinite Number is an infinity and
+/// one that rounds to zero is a (signed) zero; any other value keeps every digit.
+fn string_intl_mv(text: &str) -> IntlMv {
+    let t = text.trim_matches(crate::regex::js_whitespace);
+    if t.is_empty() {
+        return IntlMv::Finite(ExactDec::from_digits("0", 1, false));
+    }
+    match t {
+        "Infinity" | "+Infinity" => return IntlMv::PositiveInfinity,
+        "-Infinity" => return IntlMv::NegativeInfinity,
+        _ => {}
+    }
+    // NonDecimalIntegerLiteral: unsigned, exact.
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0o", 8),
+        ("0O", 8),
+        ("0b", 2),
+        ("0B", 2),
+    ] {
+        if let Some(digits) = t.strip_prefix(prefix) {
+            return match crate::bigint::JsBigInt::parse_radix(digits, radix) {
+                Some(value) if !digits.is_empty() && !digits.contains(['+', '-']) => {
+                    let decimal = value.to_string_radix(10);
+                    let decimal = ExactDec::from_digits(&decimal, decimal.len() as i64, false);
+                    if exact_f64(&decimal).is_infinite() {
+                        IntlMv::PositiveInfinity
+                    } else {
+                        IntlMv::Finite(decimal)
+                    }
+                }
+                _ => IntlMv::NotANumber,
+            };
+        }
+    }
+    // StrDecimalLiteral: [+-] (Digits [. Digits?] | . Digits) [(e|E) [+-] Digits].
+    let bytes = t.as_bytes();
+    let mut at = 0;
+    let negative = bytes[0] == b'-';
+    if matches!(bytes[0], b'+' | b'-') {
+        at = 1;
+    }
+    let int_start = at;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        at += 1;
+    }
+    let int_digits = &t[int_start..at];
+    let mut frac_digits = "";
+    if at < bytes.len() && bytes[at] == b'.' {
+        at += 1;
+        let frac_start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        frac_digits = &t[frac_start..at];
+    }
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return IntlMv::NotANumber;
+    }
+    let mut exponent: i64 = 0;
+    if at < bytes.len() && matches!(bytes[at], b'e' | b'E') {
+        at += 1;
+        let exponent_negative = at < bytes.len() && bytes[at] == b'-';
+        if at < bytes.len() && matches!(bytes[at], b'+' | b'-') {
+            at += 1;
+        }
+        let exponent_start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            // Saturate: any exponent this large already rounds to an infinity or zero below.
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i64::from(bytes[at] - b'0'))
+                .min(1 << 40);
+            at += 1;
+        }
+        if at == exponent_start {
+            return IntlMv::NotANumber;
+        }
+        if exponent_negative {
+            exponent = -exponent;
+        }
+    }
+    if at != bytes.len() {
+        return IntlMv::NotANumber;
+    }
+    let digits = format!("{int_digits}{frac_digits}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return IntlMv::Finite(ExactDec::from_digits("0", 1, negative));
+    }
+    // The decimal point position relative to the first significant digit.
+    let leading_zeros = (digits.len() - significant.len()) as i64;
+    let point = int_digits.len() as i64 - leading_zeros + exponent;
+    let significant = significant.trim_end_matches('0');
+    // RoundMVResult(abs(intlMV)): Rust's parse rounds a decimal string correctly (half-even).
+    let rounded: f64 = if point > 400 {
+        f64::INFINITY
+    } else if point < -400 {
+        0.0
+    } else {
+        format!("0.{significant}e{point}")
+            .parse()
+            .unwrap_or(f64::NAN)
+    };
+    if rounded.is_infinite() {
+        return if negative {
+            IntlMv::NegativeInfinity
+        } else {
+            IntlMv::PositiveInfinity
+        };
+    }
+    if rounded == 0.0 {
+        return IntlMv::Finite(ExactDec::from_digits("0", 1, negative));
+    }
+    IntlMv::Finite(ExactDec::from_digits(significant, point, negative))
 }
 
 fn exact_msd(ed: &ExactDec) -> i32 {
@@ -1145,7 +1255,7 @@ fn shift_exact(ed: &ExactDec, places: i32) -> ExactDec {
 }
 
 /// Format an exact magnitude after any percent/notation scaling has moved its radix point.
-fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
+fn exact_magnitude(ed: &ExactDec, o: &Gc) -> String {
     exact_magnitude_options(
         ed,
         get_num(o, "#\u{0}nf_minint").unwrap_or(1),
@@ -1156,12 +1266,12 @@ fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
         get_num(o, "#\u{0}nf_roundingincrement").unwrap_or(1),
         &get_str(o, "#\u{0}nf_roundingmode"),
         &get_str(o, "#\u{0}nf_roundingtype"),
-        "standard",
     )
 }
 
-/// Exact-decimal counterpart of [`format_magnitude_options`]. It covers the standard rounding
-/// shapes without converting BigInt or decimal-string inputs through `f64`.
+/// ECMA-402 #sec-formatnumerictostring over an exact decimal: ToRawPrecision / ToRawFixed (or
+/// both, for morePrecision/lessPrecision) and minimum-integer padding. Returns the unsigned
+/// rounded magnitude; `ed.negative` selects the rounding mode's unsigned direction.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn exact_magnitude_options(
     ed: &ExactDec,
@@ -1173,11 +1283,7 @@ pub(super) fn exact_magnitude_options(
     increment: u32,
     mode: &str,
     rtype: &str,
-    notation: &str,
-) -> Option<String> {
-    if notation != "standard" {
-        return None;
-    }
+) -> String {
     if matches!(rtype, "morePrecision" | "lessPrecision") {
         let significant = exact_magnitude_options(
             ed,
@@ -1189,23 +1295,20 @@ pub(super) fn exact_magnitude_options(
             1,
             mode,
             "significant",
-            "standard",
-        )?;
+        );
         let fraction = exact_magnitude_options(
-            ed, min_int, min_frac, max_frac, None, None, increment, mode, "fraction", "standard",
-        )?;
+            ed, min_int, min_frac, max_frac, None, None, increment, mode, "fraction",
+        );
         let significant_magnitude = exact_msd(ed) - max_sig.unwrap_or(21) as i32 + 1;
         let fraction_magnitude = -(max_frac as i32);
         let fixed_is_more_precise = fraction_magnitude < significant_magnitude;
-        return Some(
-            if (rtype == "morePrecision" && fixed_is_more_precise)
-                || (rtype == "lessPrecision" && !fixed_is_more_precise)
-            {
-                fraction
-            } else {
-                significant
-            },
-        );
+        return if (rtype == "morePrecision" && fixed_is_more_precise)
+            || (rtype == "lessPrecision" && !fixed_is_more_precise)
+        {
+            fraction
+        } else {
+            significant
+        };
     }
 
     let significant = rtype == "significant" || min_sig.is_some() || max_sig.is_some();
@@ -1286,11 +1389,11 @@ pub(super) fn exact_magnitude_options(
     if integer.len() < min_int as usize {
         integer.insert_str(0, &"0".repeat(min_int as usize - integer.len()));
     }
-    Some(if fraction.is_empty() {
+    if fraction.is_empty() {
         integer
     } else {
         format!("{integer}.{fraction}")
-    })
+    }
 }
 
 struct FormattedNumber {
@@ -1300,19 +1403,15 @@ struct FormattedNumber {
     unit_pattern: Option<String>,
 }
 
-/// `exact` carries a BigInt or decimal-string input whose digits must not round through f64.
-fn assemble_number_exact(
-    i: &mut Interp,
-    o: &Gc,
-    x: f64,
-    exact: Option<ExactDec>,
-) -> FormattedNumber {
+/// ECMA-402 #sec-partitionnumberpattern over an Intl mathematical value. Every finite value is
+/// formatted from its exact decimal digits; only NaN and the infinities take the symbol paths.
+fn assemble_number_exact(i: &mut Interp, o: &Gc, mv: &IntlMv) -> FormattedNumber {
     let style = get_str(o, "#\u{0}nf_style");
     let cldr_locale = cldr_number_locale(o);
     let number_system = get_str(o, "#\u{0}nf_nu");
     let symbols = crate::cldr_numbers::symbols(cldr_locale, &number_system);
-    let mut value = x;
-    let mut exact = exact;
+    let mut value = mv.approximate();
+    let mut exact = mv.exact();
     if style == "percent" {
         value *= 100.0;
         exact = exact.as_ref().map(|decimal| shift_exact(decimal, 2));
@@ -1325,37 +1424,22 @@ fn assemble_number_exact(
     // scientific / engineering notation: mantissa in [1,10) or [1,1000), plus an exponent.
     let notation = get_str(o, "#\u{0}nf_notation");
     let mut exponent: Option<i32> = None;
-    if (notation == "scientific" || notation == "engineering")
-        && exact.as_ref().is_some_and(|decimal| !exact_zero(decimal))
-    {
-        let mut e = exact_msd(exact.as_ref().unwrap());
-        if notation == "engineering" {
-            e -= e.rem_euclid(3);
-        }
-        exact = exact.as_ref().map(|decimal| shift_exact(decimal, -e));
-        value = exact.as_ref().map(exact_f64).unwrap_or(value);
-        exponent = Some(e);
-    } else if (notation == "scientific" || notation == "engineering")
-        && value != 0.0
-        && value.is_finite()
-    {
-        let mut e = value.abs().log10().floor() as i32;
-        if notation == "engineering" {
-            e -= e.rem_euclid(3);
-        }
-        value /= 10f64.powi(e);
-        // Guard against log10 rounding pushing the mantissa to 10.
-        if value.abs()
-            >= if notation == "engineering" {
-                1000.0
+    if notation == "scientific" || notation == "engineering" {
+        if let Some(decimal) = exact.as_ref() {
+            // ComputeExponent: zero (including negative zero) has exponent 0, and the scientific
+            // sub-pattern still applies ("0E0").
+            let mut e = if exact_zero(decimal) {
+                0
             } else {
-                10.0
+                exact_msd(decimal)
+            };
+            if notation == "engineering" {
+                e -= e.rem_euclid(3);
             }
-        {
-            value /= 10.0;
-            e += 1;
+            exact = Some(shift_exact(decimal, -e));
+            value = exact.as_ref().map(exact_f64).unwrap_or(value);
+            exponent = Some(e);
         }
-        exponent = Some(e);
     }
     // ComputeExponentForMagnitude selects the CLDR compact pattern for the input magnitude; the
     // pattern's zero count determines the scaling exponent.
@@ -1399,27 +1483,12 @@ fn assemble_number_exact(
     } else if value.is_infinite() && exact.is_none() {
         (symbols.infinity.to_string(), None)
     } else {
-        // Compact notation rounds with the default "morePrecision" of 2 significant / 0 fraction
-        // digits: keep max(0, 2 - integerDigits) fraction digits (unless digit options were given).
-        let has_sig = o.borrow().props.contains("#\u{0}nf_minsig");
-        let mag = if let Some(magnitude) = exact.as_ref().and_then(|ed| exact_magnitude(ed, o)) {
-            magnitude
-        } else if compact.is_some() && !has_sig {
-            // roundingPriority "morePrecision" over (max 0 fraction) and (max 2 significant): pick
-            // whichever shows more fraction digits (ties keep the integer/fraction result).
-            let s_frac = round_fraction_dec(value.abs(), 0, 0, 1, "halfExpand");
-            let s_sig = round_significant_dec(value.abs(), 2, 1, "halfExpand");
-            let fd = |s: &str| s.split('.').nth(1).map(|f| f.len()).unwrap_or(0);
-            if fd(&s_sig) > fd(&s_frac) {
-                s_sig
-            } else {
-                s_frac
-            }
-        } else {
-            // Pass the signed value so the sign-sensitive rounding modes (ceil/floor and their
-            // half-variants) see the true sign; the returned magnitude is unsigned.
-            format_magnitude(value, o)
-        };
+        // FormatNumericToString on the exact (scaled) value; compact notation's default
+        // "morePrecision" of 2 significant / 0 fraction digits is in the stored digit options.
+        let decimal = exact
+            .as_ref()
+            .expect("a finite Intl mathematical value is exact");
+        let mag = exact_magnitude(decimal, o);
         match mag.split_once('.') {
             Some((a, b)) => (a.to_string(), Some(b.to_string())),
             None => (mag.clone(), None),
@@ -1428,14 +1497,10 @@ fn assemble_number_exact(
     // ComputeExponent repeats after rounding when a compact result crosses into the next
     // magnitude (for example 999,500 → 1M rather than 1000K).
     if let Some((magnitude, seed)) = compact {
-        let rounded = match &frac_part {
-            Some(fraction) => format!("{int_part}.{fraction}"),
-            None => int_part.clone(),
-        };
+        // Did rounding reach 10^(magnitude - exponent + 1)? Compare integer digit counts exactly.
         let threshold_power = magnitude as i32 - seed.exponent + 1;
-        let crossed = rounded
-            .parse::<f64>()
-            .is_ok_and(|number| number >= 10f64.powi(threshold_power));
+        let integer_digits = int_part.trim_start_matches('0').len() as i32;
+        let crossed = threshold_power >= 0 && integer_digits > threshold_power;
         if crossed {
             let next_magnitude = magnitude.saturating_add(1);
             if let Some(next) = crate::cldr_numbers::compact(
@@ -1453,24 +1518,12 @@ fn assemble_number_exact(
                     .as_ref()
                     .map(exact_f64)
                     .unwrap_or_else(|| compact_input / 10f64.powi(next.exponent));
-                let remade = if let Some(magnitude) = exact
-                    .as_ref()
-                    .and_then(|decimal| exact_magnitude(decimal, o))
-                {
-                    magnitude
-                } else if o.borrow().props.contains("#\u{0}nf_minsig") {
-                    format_magnitude(value, o)
-                } else {
-                    let fraction = round_fraction_dec(value.abs(), 0, 0, 1, "halfExpand");
-                    let significant = round_significant_dec(value.abs(), 2, 1, "halfExpand");
-                    let digits =
-                        |number: &str| number.split('.').nth(1).map(str::len).unwrap_or_default();
-                    if digits(&significant) > digits(&fraction) {
-                        significant
-                    } else {
-                        fraction
-                    }
-                };
+                let remade = exact_magnitude(
+                    exact
+                        .as_ref()
+                        .expect("a finite Intl mathematical value is exact"),
+                    o,
+                );
                 match remade.split_once('.') {
                     Some((integer, fraction)) => {
                         int_part = integer.to_string();
@@ -1532,9 +1585,12 @@ fn assemble_number_exact(
         };
         let compact_exponent = seed.exponent.max(0) as u32;
         let category = crate::cldr_plurals::select_cardinal(o_lang(o), &rounded, compact_exponent);
-        let exact_one = rounded
-            .parse::<f64>()
-            .is_ok_and(|rounded_value| rounded_value == 1.0);
+        let exact_one = int_part.trim_start_matches('0') == "1"
+            && frac_part
+                .as_deref()
+                .unwrap_or("")
+                .bytes()
+                .all(|digit| digit == b'0');
         let selected = crate::cldr_numbers::compact(
             cldr_locale,
             &number_system,
@@ -1676,13 +1732,10 @@ fn assemble_number_exact(
             let category =
                 quantity_plural_category(o_lang(o), &rounded, quantity_exponent, compact_exponent);
             unit_pattern = unit_pattern_for_category(o, category);
+            // Every sanctioned unit has CLDR patterns, so the bare number is never reached.
             num = match unit_pattern.as_deref() {
                 Some(p) => p.replace("{0}", &signed),
-                None => {
-                    let unit = get_str(o, "#\u{0}nf_unit");
-                    let disp = get_str(o, "#\u{0}nf_unitdisplay");
-                    unit_wrap(&signed, &unit, &disp, category != "one")
-                }
+                None => signed,
             };
         }
         _ => {
@@ -1768,49 +1821,6 @@ fn render_number_affix(
         .replace("{plusSign}", symbols.plus)
 }
 
-fn unit_short_name(u: &str) -> Option<&'static str> {
-    Some(match u {
-        "kilometer-per-hour" => "km/h",
-        "meter" => "m",
-        "kilometer" => "km",
-        "centimeter" => "cm",
-        "percent" => "%",
-        "liter" => "L",
-        "kilobyte" => "kB",
-        "megabyte" => "MB",
-        "celsius" => "°C",
-        "fahrenheit" => "°F",
-        _ => return None,
-    })
-}
-
-fn unit_wrap(num: &str, unit: &str, display: &str, plural: bool) -> String {
-    if display == "long" {
-        return format!("{num} {}", unit_long_en(unit, plural));
-    }
-    let name = unit_short_name(unit).unwrap_or(unit);
-    // The narrow style attaches the unit with no space ("987km/h"); short keeps a space.
-    if display == "narrow" {
-        format!("{num}{name}")
-    } else {
-        format!("{num} {name}")
-    }
-}
-
-/// The English long display name of a sanctioned unit (regular +s plural; "X-per-Y" pluralizes the
-/// numerator and keeps a singular denominator).
-fn unit_long_en(unit: &str, plural: bool) -> String {
-    if let Some((a, b)) = unit.split_once("-per-") {
-        return format!("{} per {}", unit_long_en(a, plural), unit_long_en(b, false));
-    }
-    let name = unit.replace('-', " ");
-    if plural {
-        format!("{name}s")
-    } else {
-        name
-    }
-}
-
 /// Replace the ASCII digits of a formatted number with the glyphs of numbering system `nu` (a no-op
 /// for `latn` or an unknown system).
 pub(crate) fn xlate_digits(s: &str, nu: &str) -> String {
@@ -1834,8 +1844,8 @@ pub(crate) fn xlate_digits(s: &str, nu: &str) -> String {
 
 fn format_number(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
-    let n = to_intl_number(i, x)?;
-    let s = assemble_number_exact(i, &o, n, exact_of(x)).text;
+    let n = to_intl_mv(i, x)?;
+    let s = assemble_number_exact(i, &o, &n).text;
     Ok(Value::lstr(xlate_digits(&s, &get_str(&o, "#\u{0}nf_nu"))))
 }
 
@@ -1852,21 +1862,13 @@ fn suffix_type_of(o: &Gc) -> String {
     }
 }
 
-pub(super) fn to_intl_number(i: &mut Interp, x: &Value) -> Result<f64, Value> {
-    // ToIntlMathematicalValue — we approximate with ToNumber (BigInt handled as its value).
-    match x {
-        Value::BigInt(b) => Ok(b.to_f64()),
-        _ => ab(i.to_number(x)),
-    }
-}
-
 fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Value> {
     let o = instance(i, this)?;
-    let n = to_intl_number(i, x)?;
+    let n = to_intl_mv(i, x)?;
     let FormattedNumber {
         text: whole,
         unit_pattern,
-    } = assemble_number_exact(i, &o, n, exact_of(x));
+    } = assemble_number_exact(i, &o, &n);
     let nu = get_str(&o, "#\u{0}nf_nu");
     let symbols = cldr_number_symbols(&o);
     // Unit style: rebuild from the CLDR pattern so a unit prefix/suffix (e.g. ko "시속 {0}킬로미터")
@@ -1931,10 +1933,84 @@ fn unit_pattern_for_category(o: &Gc, category: &str) -> Option<String> {
     let locale = cldr_number_locale(o);
     let cldr_loc = if locale == "zh" { "zh-Hans" } else { locale };
     let lang = o_lang(o);
-    crate::cldr_units::unit_pattern(cldr_loc, &unit, style, category)
-        .or_else(|| crate::cldr_units::unit_pattern(cldr_loc, &unit, style, "other"))
-        .or_else(|| crate::cldr_units::unit_pattern(lang, &unit, style, "other"))
-        .map(|s| s.to_string())
+    // UTS #35 Part 2: a missing narrow pattern inherits short, a missing short inherits long;
+    // a plural category without a pattern uses `other`. Every advertised locale has CLDR unit
+    // data; English is the default locale's data for any other.
+    let styles: &[&str] = match style {
+        "narrow" => &["narrow", "short", "long"],
+        "short" => &["short", "long"],
+        _ => &["long"],
+    };
+    [cldr_loc, lang, "en"].into_iter().find_map(|loc| {
+        styles
+            .iter()
+            .find_map(|style| {
+                crate::cldr_units::unit_pattern(loc, &unit, style, category)
+                    .or_else(|| crate::cldr_units::unit_pattern(loc, &unit, style, "other"))
+            })
+            .map(str::to_string)
+            .or_else(|| compound_unit_pattern(loc, &unit, style, category))
+    })
+}
+
+/// UTS #35 Part 2 Compound Units, `pattern(unitId, …)`, for an ECMA-402 "X-per-Y" unit without a
+/// precomposed CLDR pattern: the numerator's pattern for the plural category (the per structure
+/// keeps the compound's category for its first value) with its placeholder extracted, then the
+/// denominator's precomposed `perUnitPattern` when it has one, else the `per` compound pattern
+/// with the denominator's singular (`one`) unit name; finally the placeholder is reattached.
+fn compound_unit_pattern(loc: &str, unit: &str, style: &str, category: &str) -> Option<String> {
+    let (numerator, denominator) = unit.split_once("-per-")?;
+    // Lateral inheritance: a missing narrow pattern uses short, a missing short uses long.
+    let styles: &[&str] = match style {
+        "narrow" => &["narrow", "short", "long"],
+        "short" => &["short", "long"],
+        _ => &["long"],
+    };
+    let simple = |name: &str, count: &str| {
+        styles.iter().find_map(|style| {
+            crate::cldr_units::unit_pattern(loc, name, style, count)
+                .or_else(|| crate::cldr_units::unit_pattern(loc, name, style, "other"))
+        })
+    };
+    let per = |name: &str| {
+        styles
+            .iter()
+            .find_map(|style| crate::cldr_units::per_pattern(loc, name, style))
+    };
+    let (core, placeholder, at_start) = extract_placeholder(simple(numerator, category)?)?;
+    let combined = match per(denominator) {
+        Some(per_unit) => per_unit.replacen("{0}", &core, 1),
+        None => {
+            let (denominator_core, _, _) = extract_placeholder(simple(denominator, "one")?)?;
+            per("per")?
+                .replacen("{0}", &core, 1)
+                .replacen("{1}", &denominator_core, 1)
+        }
+    };
+    Some(if at_start {
+        format!("{placeholder}{combined}")
+    } else {
+        format!("{combined}{placeholder}")
+    })
+}
+
+/// UTS #35 Extract(corePattern, coreUnit, placeholder, placeholderPosition): split a unit pattern
+/// into its unit text and its `{0}` placeholder with the adjoining whitespace. A placeholder in
+/// the middle of the pattern cannot be composed.
+fn extract_placeholder(pattern: &str) -> Option<(String, String, bool)> {
+    let at = pattern.find("{0}")?;
+    let (before, after) = (&pattern[..at], &pattern[at + 3..]);
+    if before.trim().is_empty() {
+        let unit = after.trim_start();
+        let placeholder = format!("{before}{{0}}{}", &after[..after.len() - unit.len()]);
+        Some((unit.to_string(), placeholder, true))
+    } else if after.trim().is_empty() {
+        let unit = before.trim_end();
+        let placeholder = format!("{}{{0}}{after}", &before[unit.len()..]);
+        Some((unit.to_string(), placeholder, false))
+    } else {
+        None
+    }
 }
 
 /// Tokenize a unit pattern's pre/post affix into (unit, literal) parts: the unit name is the

@@ -93,9 +93,12 @@ fn time_zone_string(t: f64) -> String {
     let sign = if offset >= 0 { '+' } else { '-' };
     let minutes = offset.abs() / 60_000;
     let (hours, minutes) = (minutes / 60, minutes % 60);
-    let name = crate::tz::long_name(system_time_zone(), (t / 1000.0).floor() as i64)
-        .map(str::to_string)
+    // The zone's English CLDR name, else (or without Intl's locale data) its offset.
+    #[cfg(feature = "intl")]
+    let name = crate::intl::time_zone_long_name(system_time_zone(), (t / 1000.0).floor() as i64)
         .unwrap_or_else(|| format!("GMT{sign}{hours:02}:{minutes:02}"));
+    #[cfg(not(feature = "intl"))]
+    let name = format!("GMT{sign}{hours:02}:{minutes:02}");
     format!("GMT{sign}{hours:02}{minutes:02} ({name})")
 }
 
@@ -340,9 +343,11 @@ fn date_set_multi(
     Ok(Value::Num(ms))
 }
 
-/// Minimal ISO-8601 parser: `YYYY[-MM[-DD]][THH:mm[:ss[.sss]]][Z]`. Returns NaN on anything else.
-/// Best-effort parse of the RFC-2822-ish / `toString`/`toUTCString`/`toDateString` formats (e.g.
-/// "Thu, 01 Jan 1970 00:00:00 GMT", "Wed Jul 28 1993 14:39:07 GMT-0600 (…)").
+/// The implementation-specific date formats ECMA-262 #sec-date.parse permits when a string is not
+/// in the Date Time String Format: the `toString`/`toUTCString`/`toDateString` renderings and the
+/// RFC 5322 section 3.3 date-time with its numeric and section 4.3 obsolete zones (e.g.
+/// "Thu, 01 Jan 1970 00:00:00 GMT", "Wed Jul 28 1993 14:39:07 GMT-0600 (…)", "… 10:00 PST"),
+/// plus the slash dates other engines read. NaN for anything else.
 fn parse_rfc(s: &str) -> f64 {
     const MONTHS: [&str; 12] = [
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -359,6 +364,23 @@ fn parse_rfc(s: &str) -> f64 {
             continue;
         }
         let low = tok.to_lowercase();
+        // RFC 5322 section 4.3 obs-zone: "UT"/"GMT" and the North American zone names.
+        let obs_zone = match low.as_str() {
+            "ut" | "gmt" => Some(0),
+            "edt" => Some(-4 * 60),
+            "est" | "cdt" => Some(-5 * 60),
+            "cst" | "mdt" => Some(-6 * 60),
+            "mst" | "pdt" => Some(-7 * 60),
+            "pst" => Some(-8 * 60),
+            _ => None,
+        };
+        if let Some(minutes) = obs_zone {
+            if got_time {
+                offset = minutes;
+                zoned = true;
+                continue;
+            }
+        }
         // Slash dates, as in other engines: year first (`2027/01/31`) or the
         // US month/day/year order (`1/31/2027`).
         // A first number above 31 can only be the year (`50/1/31`).

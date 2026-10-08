@@ -335,9 +335,10 @@ fn install_style_components(obj: &Gc, pattern: &str) {
 fn install_resolved_components(obj: &Gc, pattern: &str) {
     if obj.borrow().props.contains("#\u{0}dtf_month") {
         if let Some(width) = dtf_pattern_width(pattern, "ML") {
+            // The requested width stays in `dtf_month`: the format pattern is matched from it.
             set_builtin(
                 obj,
-                "#\u{0}dtf_month",
+                "#\u{0}dtfr_month",
                 Value::lstr(match width {
                     2 => "2-digit",
                     3 => "short",
@@ -566,10 +567,12 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
             ca_addition = None;
         }
     }
+    // Without a calendar option or -u-ca- extension, the locale's preferred calendar applies
+    // (ResolveLocale's [[LocaleData]] default: th → buddhist, ar-SA → islamic-umalqura).
     let eff_cal = calendar
         .clone()
         .or(ca_ext)
-        .unwrap_or_else(|| "gregory".to_string());
+        .unwrap_or_else(|| super::locale::default_calendar(&resolved_locale));
     // ResolveLocale for the `hc` key: reflect a valid -u-hc- unless the hourCycle/hour12 options
     // override it with a different value.
     let hc_valid = hc_ext
@@ -635,7 +638,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(ds) = &date_style {
         install_style_components(
             &obj,
-            crate::cldr_datetime_patterns::date_style(cldr_locale, ds),
+            crate::cldr_datetime_patterns::date_style(cldr_locale, &dtf_calendar(&obj), ds).0,
         );
     }
     if let Some(ts) = &time_style {
@@ -698,9 +701,9 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
                 requested.push((kind, String::new()));
             }
         }
-        if let Some(pattern) = resolved_dtf_pattern(&obj, &requested) {
-            install_resolved_components(&obj, &pattern);
-        }
+        let _ = requested;
+        let (pattern, _) = formatter_pattern(&obj, 0);
+        install_resolved_components(&obj, &pattern);
     }
     // Legacy "ChainDateTimeFormat": called without `new` on an object inheriting from
     // %DateTimeFormat.prototype%, the fresh instance is stored ON that object under the realm's
@@ -912,8 +915,6 @@ fn do_format_ms(o: &Gc, ms: f64, kind: u8) -> String {
     crate::intl::numberformat::xlate_digits(&s, &dtf_nu(o))
 }
 
-/// Build localized typed `(type, value)` parts for the given epoch milliseconds. `kind` gates which
-/// components a Temporal receiver may show (see [`dtf_ms_kind`]).
 fn dtf_slot(o: &Gc, slot: &str) -> Option<String> {
     match o.borrow().props.get(slot).map(|property| property.value()) {
         Some(Value::Str(value)) => Some(value.to_string()),
@@ -921,241 +922,250 @@ fn dtf_slot(o: &Gc, slot: &str) -> Option<String> {
     }
 }
 
-fn skeleton_width(value: &str, numeric: char, named: char) -> String {
-    match value {
-        "2-digit" => numeric.to_string().repeat(2),
-        "short" => named.to_string().repeat(3),
-        "long" => named.to_string().repeat(4),
-        "narrow" => named.to_string().repeat(5),
-        _ => numeric.to_string(),
+/// The formatter's calendar as a locale-data key (an unset calendar is Gregorian). The ISO 8601
+/// calendar has CLDR patterns of its own, with the Gregorian names and eras.
+fn dtf_calendar(o: &Gc) -> String {
+    match dtf_slot(o, "#\u{0}dtf_ca").as_deref() {
+        None | Some("" | "gregory") => "gregory".to_string(),
+        Some(calendar) => calendar.to_string(),
     }
 }
 
-fn skeleton_signature(skeleton: &str) -> String {
-    let mut output = String::new();
-    for character in skeleton.chars() {
-        let field = match character {
-            'L' => 'M',
-            'e' | 'c' => 'E',
-            'K' => 'h',
-            'k' => 'H',
-            other => other,
+/// The pattern letter of the formatter's resolved hour cycle.
+fn hour_letter(o: &Gc) -> char {
+    match dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref() {
+        Some("h11") => 'K',
+        Some("h12") => 'h',
+        Some("h24") => 'k',
+        _ => 'H',
+    }
+}
+
+/// Whether a Temporal receiver of `kind` can show a component (the Temporal additions to
+/// ECMA-402's DateTimeFormat: each Plain type formats only its own fields, and only the absolute
+/// kinds have a time zone).
+fn kind_allows(kind: u8, field: &str) -> bool {
+    if field == "tzname" && matches!(kind, 1..=5) {
+        return false;
+    }
+    match kind {
+        1 => !matches!(
+            field,
+            "hour" | "minute" | "second" | "dayperiod" | "fracsec"
+        ),
+        2 => matches!(
+            field,
+            "hour" | "minute" | "second" | "dayperiod" | "fracsec"
+        ),
+        4 => matches!(field, "year" | "month" | "era"),
+        5 => matches!(field, "month" | "day"),
+        _ => true,
+    }
+}
+
+/// The skeleton field name of a UTS #35 pattern letter.
+fn letter_field(letter: char) -> Option<&'static str> {
+    Some(match letter {
+        'G' => "era",
+        'y' | 'Y' | 'u' | 'U' | 'r' => "year",
+        'M' | 'L' => "month",
+        'd' => "day",
+        'E' | 'c' | 'e' => "weekday",
+        'a' | 'b' | 'B' => "dayperiod",
+        'h' | 'H' | 'K' | 'k' => "hour",
+        'm' => "minute",
+        's' => "second",
+        'S' => "fracsec",
+        'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => "tzname",
+        _ => return None,
+    })
+}
+
+/// The UTS #35 skeleton of the formatter's requested components for a receiver of `kind`. A
+/// formatter with defaulted components shows the receiver's natural fields.
+fn requested_skeleton(o: &Gc, kind: u8) -> String {
+    let slot = |field: &str| dtf_slot(o, &format!("#\u{0}dtf_{field}"));
+    let width = |value: &str, letter: char, text: bool| -> String {
+        let count = match value {
+            "2-digit" => 2,
+            "narrow" => 5,
+            "short" if text => 3,
+            "long" => 4,
+            _ => 1,
         };
-        if !output.contains(field) {
-            output.push(field);
+        std::iter::repeat_n(letter, count).collect()
+    };
+    let hour = hour_letter(o);
+    let mut skeleton = String::new();
+    let defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
+    if defaulted {
+        if let Some(era) = slot("era").filter(|_| kind_allows(kind, "era")) {
+            skeleton.push_str(&width(&era, 'G', true));
         }
-    }
-    output
-}
-
-fn skeleton_distance(left: &str, right: &str) -> usize {
-    let widths = |skeleton: &str| {
-        let mut result = [0_u8; 128];
-        let mut chars = skeleton.chars().peekable();
-        while let Some(character) = chars.next() {
-            if !character.is_ascii() {
+        match kind {
+            4 => skeleton.push_str("yM"),
+            5 => skeleton.push_str("Md"),
+            2 => {}
+            _ => skeleton.push_str("yMd"),
+        }
+        if matches!(kind, 2 | 3 | 6) {
+            skeleton.push(hour);
+            skeleton.push_str("mmss");
+        }
+    } else {
+        for (field, letter, text) in [
+            ("era", 'G', true),
+            ("year", 'y', false),
+            ("month", 'M', true),
+            ("weekday", 'E', true),
+            ("day", 'd', false),
+            ("dayperiod", 'B', true),
+            ("hour", hour, false),
+            ("minute", 'm', false),
+            ("second", 's', false),
+        ] {
+            if !kind_allows(kind, field) {
                 continue;
             }
-            let mut width = 1_u8;
-            while chars.peek() == Some(&character) {
-                chars.next();
-                width = width.saturating_add(1);
+            if let Some(value) = slot(field) {
+                skeleton.push_str(&width(&value, letter, text));
             }
-            result[character as usize] = width;
         }
-        result
-    };
-    let left = widths(left);
-    let right = widths(right);
-    left.iter()
-        .zip(right.iter())
-        .map(|(a, b)| a.abs_diff(*b) as usize)
-        .sum()
-}
-
-fn closest_available_pattern(locale: &str, skeleton: &str) -> Option<&'static str> {
-    if let Some(pattern) = crate::cldr_datetime_patterns::available_exact(locale, skeleton) {
-        return Some(pattern);
-    }
-    let signature = skeleton_signature(skeleton);
-    crate::cldr_datetime_patterns::available(locale)
-        .iter()
-        .filter(|row| skeleton_signature(row.0) == signature)
-        .min_by_key(|row| skeleton_distance(row.0, skeleton))
-        .map(|row| row.1)
-}
-
-/// Apply the formatter's resolved hour cycle to a CLDR time-style pattern. UTS #35 pattern
-/// matching replaces the hour field type and removes the day-period field for a 24-hour request.
-fn time_style_pattern(o: &Gc, locale: &str, style: &str) -> String {
-    let pattern = crate::cldr_datetime_patterns::time_style(locale, style);
-    if !matches!(
-        dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
-        Some("h23" | "h24")
-    ) {
-        return pattern.to_string();
-    }
-
-    let mut output = String::new();
-    let mut chars = pattern.chars().peekable();
-    let mut quoted = false;
-    while let Some(character) = chars.next() {
-        if character == '\'' {
-            output.push(character);
-            if chars.peek() == Some(&'\'') {
-                output.push(chars.next().unwrap());
-            } else {
-                quoted = !quoted;
+        if kind_allows(kind, "fracsec") {
+            if let Some(Value::Num(digits)) =
+                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
+            {
+                skeleton.extend(std::iter::repeat_n('S', digits as usize));
             }
-            continue;
-        }
-        if !quoted && matches!(character, 'a' | 'b' | 'B') {
-            while chars.peek() == Some(&character) {
-                chars.next();
-            }
-            while output.chars().last().is_some_and(char::is_whitespace) {
-                output.pop();
-            }
-            if output.is_empty() {
-                while chars.peek().is_some_and(|next| next.is_whitespace()) {
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        if !quoted && matches!(character, 'h' | 'H' | 'K' | 'k') {
-            output.push('H');
-        } else {
-            output.push(character);
         }
     }
-    output
+    if kind_allows(kind, "tzname") {
+        if let Some(name) = slot("tzname") {
+            skeleton.push_str(match name.as_str() {
+                "long" => "zzzz",
+                "shortOffset" => "O",
+                "longOffset" => "OOOO",
+                "shortGeneric" => "v",
+                "longGeneric" => "vvvv",
+                _ => "z",
+            });
+        }
+    }
+    skeleton
 }
 
-/// Select a CLDR style or availableFormats pattern for the formatter's resolved fields. UTS #35
-/// handles mixed date/time requests by matching each half and joining them with dateTimeFormats.
-fn resolved_dtf_pattern(o: &Gc, parts: &[(&'static str, String)]) -> Option<String> {
+/// The pattern and UTS #35 `numbers` override that format a receiver of `kind`: the
+/// dateStyle/timeStyle patterns (DateTimeStyleFormat), restricted to the receiver's fields, or
+/// the best match for the requested components (BestFitFormatMatcher). Cached per kind.
+fn formatter_pattern(o: &Gc, kind: u8) -> (String, String) {
+    let pattern_slot = format!("#\u{0}dtf_pattern{kind}");
+    let numbers_slot = format!("#\u{0}dtf_numbers{kind}");
+    if let (Some(pattern), Some(numbers)) = (dtf_slot(o, &pattern_slot), dtf_slot(o, &numbers_slot))
+    {
+        return (pattern, numbers);
+    }
+    let (pattern, numbers) = select_pattern(o, kind);
+    set_builtin(o, &pattern_slot, Value::lstr(pattern.clone()));
+    set_builtin(o, &numbers_slot, Value::lstr(numbers.clone()));
+    (pattern, numbers)
+}
+
+fn select_pattern(o: &Gc, kind: u8) -> (String, String) {
     let locale = dtf_cldr_locale(o);
+    let calendar = dtf_calendar(o);
+    let decimal = crate::cldr_numbers::symbols(locale, &dtf_nu(o)).decimal;
+    let hour = hour_letter(o);
+    let best = |skeleton: &str| -> String {
+        let pattern = super::dtf_pattern::best_pattern(locale, &calendar, skeleton, true, decimal);
+        if matches!(hour, 'K' | 'k') {
+            super::dtf_pattern::with_hour_letter(&pattern, hour)
+        } else {
+            pattern
+        }
+    };
     let date_style = dtf_slot(o, "#\u{0}dtf_datestyle");
     let time_style = dtf_slot(o, "#\u{0}dtf_timestyle");
-    if date_style.is_some() || time_style.is_some() {
-        let has_date = parts.iter().any(|part| {
-            matches!(
-                part.0,
-                "weekday" | "era" | "year" | "relatedYear" | "yearName" | "month" | "day"
-            )
-        });
-        let has_time = parts.iter().any(|part| {
-            matches!(
-                part.0,
-                "dayPeriod" | "hour" | "minute" | "second" | "fractionalSecond" | "timeZoneName"
-            )
-        });
-        let date = date_style
-            .as_deref()
-            .filter(|_| has_date)
-            .map(|style| crate::cldr_datetime_patterns::date_style(locale, style).to_string());
-        let time = time_style
-            .as_deref()
-            .filter(|_| has_time)
-            .map(|style| time_style_pattern(o, locale, style));
-        return match (date, time) {
-            (Some(date), Some(time)) => {
-                let connector = crate::cldr_datetime_patterns::connector(
-                    locale,
-                    date_style.as_deref().unwrap(),
+    if date_style.is_none() && time_style.is_none() {
+        return (best(&requested_skeleton(o, kind)), String::new());
+    }
+    // DateTimeStyleFormat: the locale's date pattern for the calendar, the time pattern in the
+    // formatter's hour cycle (the 12- or 24-hour variant of the style), and the connector.
+    let date = date_style.as_deref().map(|style| {
+        let (pattern, numbers) =
+            crate::cldr_datetime_patterns::date_style(locale, &calendar, style);
+        (pattern.to_string(), numbers.to_string())
+    });
+    let time = time_style.as_deref().map(|style| {
+        let pattern = crate::cldr_datetime_patterns::time_style(locale, style);
+        let twelve = |letter: char| matches!(letter, 'h' | 'K');
+        let pattern_hour = super::dtf_pattern::tokenize(pattern)
+            .into_iter()
+            .find_map(|token| match token {
+                super::dtf_pattern::Token::Field(letter @ ('h' | 'H' | 'K' | 'k'), _) => {
+                    Some(letter)
+                }
+                _ => None,
+            });
+        match pattern_hour {
+            Some(letter) if twelve(letter) != twelve(hour) => {
+                // The other clock: rebuild the style's skeleton with the cycle's hour letter.
+                let skeleton = super::dtf_pattern::with_hour_letter(
+                    &super::dtf_pattern::pattern_skeleton(pattern),
+                    if twelve(hour) { 'h' } else { 'H' },
                 );
-                Some(connector.replace("{1}", &date).replace("{0}", &time))
+                best(&skeleton)
             }
-            (Some(date), None) => Some(date),
-            (None, Some(time)) => Some(time),
-            _ => None,
-        };
-    }
-
-    let has = |kind: &str| parts.iter().any(|part| part.0 == kind);
-    // The bespoke related-year/year-name cluster for Chinese/Dangi cannot be represented by one
-    // ordinary `y` token; retain its calendar-specific assembly.
-    if has("relatedYear") || has("yearName") {
-        return None;
-    }
-    let mut date = String::new();
-    if has("era") {
-        date.push_str(&skeleton_width(
-            &dtf_slot(o, "#\u{0}dtf_era").unwrap_or_else(|| "short".to_string()),
-            'G',
-            'G',
-        ));
-    }
-    if has("year") {
-        date.push_str(&skeleton_width(
-            &dtf_slot(o, "#\u{0}dtf_year").unwrap_or_else(|| "numeric".to_string()),
-            'y',
-            'y',
-        ));
-    }
-    if has("month") {
-        date.push_str(&skeleton_width(
-            &dtf_slot(o, "#\u{0}dtf_month").unwrap_or_else(|| "numeric".to_string()),
-            'M',
-            'M',
-        ));
-    }
-    if has("weekday") {
-        date.push_str(&skeleton_width(
-            &dtf_slot(o, "#\u{0}dtf_weekday").unwrap_or_else(|| "short".to_string()),
-            'E',
-            'E',
-        ));
-    }
-    if has("day") {
-        date.push_str(&skeleton_width(
-            &dtf_slot(o, "#\u{0}dtf_day").unwrap_or_else(|| "numeric".to_string()),
-            'd',
-            'd',
-        ));
-    }
-
-    let mut time = String::new();
-    if dtf_slot(o, "#\u{0}dtf_dayperiod").is_some() {
-        time.push('B');
-    }
-    if has("hour") {
-        let hour = if matches!(
-            dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
-            Some("h11" | "h12")
-        ) {
-            'h'
-        } else {
-            'H'
-        };
-        time.push(hour);
-    }
-    if has("minute") {
-        time.push('m');
-    }
-    if has("second") {
-        time.push('s');
-    }
-    if has("timeZoneName") {
-        time.push('v');
-    }
-
-    let find = |skeleton: &str| closest_available_pattern(locale, skeleton).map(str::to_string);
-    match (date.is_empty(), time.is_empty()) {
-        (false, false) => {
-            let date_pattern = find(&date)?;
-            let time_pattern = find(&time)?;
-            Some(
-                crate::cldr_datetime_patterns::connector(locale, "medium")
-                    .replace("{1}", &date_pattern)
-                    .replace("{0}", &time_pattern),
+            Some(_) => super::dtf_pattern::with_hour_letter(pattern, hour),
+            None => pattern.to_string(),
+        }
+    });
+    let allowed = |pattern: &str| {
+        super::dtf_pattern::tokenize(pattern)
+            .into_iter()
+            .all(|token| match token {
+                super::dtf_pattern::Token::Field(letter, _) => {
+                    letter_field(letter).is_none_or(|field| kind_allows(kind, field))
+                }
+                super::dtf_pattern::Token::Literal(_) => true,
+            })
+    };
+    let has_date_fields = !matches!(kind, 2);
+    let has_time_fields = !matches!(kind, 1 | 4 | 5);
+    let date = date.filter(|_| has_date_fields);
+    let time = time.filter(|_| has_time_fields);
+    let (pattern, numbers) = match (date, time) {
+        (Some((date, numbers)), Some(time)) => {
+            let connector = crate::cldr_datetime_patterns::connector(
+                locale,
+                &calendar,
+                date_style.as_deref().unwrap(),
+            );
+            (
+                connector.replace("{1}", &date).replace("{0}", &time),
+                numbers,
             )
         }
-        (false, true) => find(&date),
-        (true, false) => find(&time),
-        (true, true) => None,
+        (Some(date), None) => date,
+        (None, Some(time)) => (time, String::new()),
+        // The receiver shares no fields with the styles: its own natural fields.
+        (None, None) => (best(&requested_skeleton(o, kind)), String::new()),
+    };
+    if allowed(&pattern) {
+        return (pattern, numbers);
     }
+    // A Temporal receiver shows only its own fields of the style pattern.
+    let skeleton: String = super::dtf_pattern::tokenize(&pattern)
+        .into_iter()
+        .filter_map(|token| match token {
+            super::dtf_pattern::Token::Field(letter, len)
+                if letter_field(letter).is_some_and(|field| kind_allows(kind, field)) =>
+            {
+                Some(std::iter::repeat_n(letter, len).collect::<String>())
+            }
+            _ => None,
+        })
+        .collect();
+    (best(&skeleton), String::new())
 }
 
 fn push_dtf_literal(parts: &mut Vec<(&'static str, String)>, value: &str) {
@@ -1173,352 +1183,717 @@ fn push_dtf_literal(parts: &mut Vec<(&'static str, String)>, value: &str) {
     }
 }
 
-/// Apply a UTS #35 date pattern to already-computed field values, preserving ECMA-402 part types.
-fn apply_dtf_pattern(
+/// ECMA-402 ToLocalTime: a receiver's fields in the formatter's calendar and time zone.
+struct LocalFields {
+    calendar: String,
+    /// The calendar's (proleptic) year: the related Gregorian year for Chinese and Dangi.
+    year: i64,
+    era: Option<&'static str>,
+    era_year: Option<i64>,
+    /// The ISO year (UTS #35 `r`).
+    related_year: i64,
+    /// The 1-based month number naming the month (Hebrew uses CLDR's month index).
+    month: u32,
+    /// The month as a number: the ordinal month in the year for Hebrew (as ICU and Temporal
+    /// number it, so a common year's Adar is 6), otherwise `month`.
+    month_number: u32,
+    leap_month: bool,
+    /// Hebrew Adar II: month 7 of a leap year, which CLDR names separately.
+    leap_year_month: bool,
+    day: u32,
+    /// 0 = Sunday.
+    weekday: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    millisecond: u32,
+    /// The instant, for time zone names.
+    epoch_sec: i64,
+}
+
+fn local_fields(o: &Gc, ms: f64, kind: u8) -> LocalFields {
+    let epoch_sec = (ms / 1000.0).floor() as i64;
+    // An absolute instant (number/Date kind 0, Temporal.Instant kind 6) is shifted into the
+    // formatter's time zone; Temporal wall-clock values (kinds 1-5) already carry their local time.
+    let local_ms = if kind == 0 || kind == 6 {
+        match dtf_slot(o, "#\u{0}dtf_tz") {
+            Some(tz) => {
+                let off_ms = crate::tz::offset_at(&tz, epoch_sec)
+                    .map(|s| s as f64 * 1000.0)
+                    .unwrap_or_else(|| tz_offset_ms(&tz));
+                ms + off_ms
+            }
+            None => ms,
+        }
+    } else {
+        ms
+    };
+    let (iso_year, iso_month, iso_day, hour, minute, second, weekday) = ymd(local_ms);
+    let millisecond = local_ms.rem_euclid(1000.0) as u32;
+    let iso_date = crate::temporal::IsoDate {
+        year: iso_year,
+        month: iso_month as u8,
+        day: iso_day as u8,
+    };
+    let calendar = dtf_calendar(o);
+    let mut fields = LocalFields {
+        calendar: calendar.clone(),
+        year: iso_year,
+        era: None,
+        era_year: None,
+        related_year: iso_year,
+        month: iso_month,
+        month_number: iso_month,
+        leap_month: false,
+        leap_year_month: false,
+        day: iso_day,
+        weekday,
+        hour,
+        minute,
+        second,
+        millisecond,
+        epoch_sec,
+    };
+    if calendar == "gregory" || calendar == "iso8601" {
+        let (era, era_year) = crate::temporal::cal_era("gregory", iso_date);
+        fields.era = era;
+        fields.era_year = era_year;
+        return fields;
+    }
+    let calendar_fields = crate::temporal::cal_fields(&calendar, iso_date);
+    fields.year = crate::temporal::cal_year_num(&calendar, iso_date);
+    fields.month = calendar_fields.1 as u32;
+    fields.month_number = fields.month;
+    fields.day = calendar_fields.2 as u32;
+    let (era, era_year) = crate::temporal::cal_era(&calendar, iso_date);
+    fields.era = era;
+    fields.era_year = era_year;
+    match calendar.as_str() {
+        "chinese" | "dangi" => {
+            // The month number (a leap month repeats its predecessor's number).
+            let (number, leap) = crate::temporal::lunisolar_month_num(&calendar, iso_date);
+            fields.month = number as u32;
+            fields.month_number = number as u32;
+            fields.leap_month = leap;
+            fields.related_year = fields.year;
+        }
+        "hebrew" => {
+            let month = crate::temporal::hebrew_cldr_month(iso_date) as u32;
+            fields.leap_year_month = month == 7 && calendar_fields.7;
+            fields.month = month;
+        }
+        _ => {}
+    }
+    fields
+}
+
+/// The CLDR era key of a calendar's era code, and the calendar whose era names apply.
+fn era_key(calendar: &str, code: &str) -> (&'static str, &'static str) {
+    match (calendar, code) {
+        ("japanese", "reiwa") => ("japanese", "236"),
+        ("japanese", "heisei") => ("japanese", "235"),
+        ("japanese", "showa") => ("japanese", "234"),
+        ("japanese", "taisho") => ("japanese", "233"),
+        ("japanese", "meiji") => ("japanese", "232"),
+        // Before Meiji, Temporal's Japanese calendar uses the Gregorian eras.
+        ("japanese", code) => ("gregory", era_cldr_index("gregory", code)),
+        // CLDR's ISO 8601 calendar aliases the Gregorian eras.
+        ("iso8601", code) => ("gregory", era_cldr_index("gregory", code)),
+        _ => (static_calendar(calendar), era_cldr_index(calendar, code)),
+    }
+}
+
+fn static_calendar(calendar: &str) -> &'static str {
+    match calendar {
+        "buddhist" => "buddhist",
+        "chinese" => "chinese",
+        "coptic" => "coptic",
+        "dangi" => "dangi",
+        "ethioaa" => "ethioaa",
+        "ethiopic" => "ethiopic",
+        "hebrew" => "hebrew",
+        "indian" => "indian",
+        "islamic-civil" => "islamic-civil",
+        "islamic-tbla" => "islamic-tbla",
+        "islamic-umalqura" => "islamic-umalqura",
+        "japanese" => "japanese",
+        "persian" => "persian",
+        "roc" => "roc",
+        _ => "gregory",
+    }
+}
+
+/// The digits of a numeric numbering system a CLDR pattern's `numbers` override names (CLDR
+/// numberingSystems.xml `type="numeric"`): its fields keep their padded width, in those digits.
+fn numbering_digits(system: &str) -> Option<[char; 10]> {
+    match system {
+        "hanidec" => Some(['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九']),
+        _ => None,
+    }
+}
+
+/// Spell `value` in an algorithmic numbering system a CLDR pattern's `numbers` override names
+/// (CLDR numberingSystems.xml `type="algorithmic"` and the RBNF rules it cites). An algorithmic
+/// system spells the whole value, so a two-letter field is neither padded nor truncated.
+fn numbering(system: &str, value: i64) -> Option<String> {
+    const HAN: [char; 10] = ['〇', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    match system {
+        // zh/SpelloutRules/spellout-numbering-days: 初一…初十, 十一…二十, 廿一…廿九, 三十.
+        "hanidays" => {
+            let spell = |n: i64| -> String {
+                match n {
+                    0..=9 => HAN[n as usize].to_string(),
+                    10 => "十".to_string(),
+                    11..=19 => format!("十{}", HAN[(n - 10) as usize]),
+                    20 => "二十".to_string(),
+                    _ => format!(
+                        "{}十{}",
+                        HAN[(n / 10) as usize],
+                        if n % 10 == 0 {
+                            String::new()
+                        } else {
+                            HAN[(n % 10) as usize].to_string()
+                        }
+                    ),
+                }
+            };
+            Some(match value {
+                1..=10 => format!("初{}", spell(value)),
+                11..=20 => spell(value),
+                21..=29 => format!("廿{}", HAN[(value - 20) as usize]),
+                30 => "三十".to_string(),
+                _ => value.to_string(),
+            })
+        }
+        // ja/SpelloutRules/spellout-numbering-year-latn: year 1 is 元.
+        "jpanyear" => Some(if value == 1 {
+            "元".to_string()
+        } else {
+            value.to_string()
+        }),
+        _ => None,
+    }
+}
+
+/// The numbering-system override a pattern's `numbers` string applies to a field letter:
+/// `hanidec` for every numeric field, or `d=hanidays;y=jpanyear`-style per-letter overrides.
+/// The `numbers` attribute belongs to a date style pattern (UTS #35 Part 4, dateFormats), so a
+/// whole-pattern override reaches only the date fields when that pattern is combined with a time
+/// pattern: `ja-u-ca-chinese`'s hanidec day numbers do not apply to the hour.
+fn numbering_override(numbers: &str, letter: char) -> Option<&str> {
+    /// The date field letters (UTS #35 Part 4 Date Field Symbol Table: era through week day,
+    /// excluding the names that never take numerals).
+    const DATE_FIELDS: &str = "yYuUrQqMLwWdDFgEec";
+    if numbers.is_empty() {
+        return None;
+    }
+    if !numbers.contains('=') {
+        return DATE_FIELDS.contains(letter).then_some(numbers);
+    }
+    numbers.split(';').find_map(|entry| {
+        let (fields, system) = entry.split_once('=')?;
+        fields.contains(letter).then_some(system)
+    })
+}
+
+/// The flexible day period (UTS #35 Part 4 Day Period Rules) of a time for `B`. As in ICU, noon
+/// applies at exactly 12:00 (counting the minutes and seconds the pattern shows) and midnight is
+/// not used.
+fn flexible_day_period(language: &str, hour: u32, exact_hour: bool) -> Option<&'static str> {
+    let rules = crate::cldr_datetime_patterns::day_period_rules(language);
+    if hour == 12 && exact_hour && rules.iter().any(|rule| rule.0 == "noon") {
+        return Some("noon");
+    }
+    let hour = hour as u8;
+    rules.iter().find_map(|&(period, from, before)| {
+        let applies = if from < before {
+            (from..before).contains(&hour)
+        } else if from > before {
+            hour >= from || hour < before
+        } else {
+            false
+        };
+        applies.then_some(period)
+    })
+}
+
+/// FormatDateTimePattern (ECMA-402 #sec-formatdatetimepattern) for a UTS #35 pattern: each
+/// field's value in the width its pattern letter gives, with the pattern's literals.
+fn render_pattern(
     o: &Gc,
     pattern: &str,
-    values: &[(&'static str, String)],
+    numbers: &str,
+    fields: &LocalFields,
 ) -> Vec<(&'static str, String)> {
-    let field_type = |symbol: char| match symbol {
-        'G' => Some("era"),
-        'y' | 'Y' | 'u' | 'U' | 'r' => Some("year"),
-        'M' | 'L' => Some("month"),
-        'd' => Some("day"),
-        'E' | 'e' | 'c' => Some("weekday"),
-        'a' | 'b' | 'B' => Some("dayPeriod"),
-        'h' | 'H' | 'K' | 'k' => Some("hour"),
-        'm' => Some("minute"),
-        's' => Some("second"),
-        'S' => Some("fractionalSecond"),
-        'z' | 'Z' | 'O' | 'v' | 'V' => Some("timeZoneName"),
-        _ => None,
+    use super::dtf_pattern::Token;
+    let locale = dtf_cldr_locale(o);
+    let language = locale.split('-').next().unwrap_or("en");
+    let calendar = fields.calendar.as_str();
+    let names_calendar = static_calendar(calendar);
+    // CLDR gives every ja Japanese-calendar date format that writes 年 the `y=jpanyear` override,
+    // so an era's first year reads 元年; a flexible pattern writing 年 has no `numbers` attribute
+    // of its own and takes the same year numbering (as ICU's SimpleDateFormat::applyPattern does).
+    let numbers = if numbers.is_empty()
+        && language == "ja"
+        && calendar == "japanese"
+        && pattern.contains('年')
+    {
+        "y=jpanyear"
+    } else {
+        numbers
     };
-    let find = |kind: &str| {
-        values
+    let tokens = super::dtf_pattern::tokenize(pattern);
+    let shows = |letters: &str| {
+        tokens
             .iter()
-            .find(|value| value.0 == kind)
-            .map(|value| &value.1)
+            .any(|token| matches!(token, Token::Field(letter, _) if letters.contains(*letter)))
     };
-    let field_value = |kind: &str, symbol: char, width: usize, value: &str| -> String {
-        // A selected interval pattern can refine a numeric field's width relative to the base
-        // format (CLDR Japanese yMd ranges use MM/dd even though the ordinary yMd pattern uses
-        // M/d). Apply those pattern widths before numbering-system digit substitution.
-        let numeric = value.parse::<i64>().ok();
-        match (kind, symbol, width, numeric) {
-            ("year", _, 2, Some(number)) => format!("{:02}", number.rem_euclid(100)),
-            (
-                "month" | "day" | "hour" | "minute" | "second",
-                'M' | 'L' | 'd' | 'h' | 'H' | 'K' | 'k' | 'm' | 's',
-                2,
-                Some(number),
-            ) => format!("{number:02}"),
-            ("fractionalSecond", 'S', width, _) => {
-                let mut result: String = value.chars().take(width).collect();
-                result.extend(std::iter::repeat_n('0', width.saturating_sub(result.len())));
-                result
-            }
-            _ => value.to_string(),
+    let shows_minute = shows("m");
+    let shows_second = shows("s");
+    let name_width = |len: usize| match len {
+        4 => "long",
+        5 => "narrow",
+        _ => "short",
+    };
+    let pad = |value: i64, len: usize| -> String {
+        let text = value.unsigned_abs().to_string();
+        let padded = if text.len() < len {
+            format!("{}{text}", "0".repeat(len - text.len()))
+        } else {
+            text
+        };
+        if value < 0 {
+            format!("-{padded}")
+        } else {
+            padded
         }
     };
-    let mut output = Vec::new();
-    let mut chars = pattern.chars().peekable();
-    let mut quoted = false;
-    let mut fraction_emitted = false;
-    while let Some(character) = chars.next() {
-        if character == '\'' {
-            if chars.peek() == Some(&'\'') {
-                chars.next();
-                push_dtf_literal(&mut output, "'");
+    // A numeric field in `len` digits; UTS #35 `yy` is the year truncated to its last two.
+    let numeric = |letter: char, value: i64, len: usize| -> String {
+        let two_digit_year = letter == 'y' && len == 2;
+        let digits = |value: i64| {
+            if two_digit_year {
+                pad(value.rem_euclid(100), 2)
             } else {
-                quoted = !quoted;
+                pad(value, len)
             }
-            continue;
+        };
+        match numbering_override(numbers, letter) {
+            Some(system) => {
+                if let Some(table) = numbering_digits(system) {
+                    digits(value)
+                        .chars()
+                        .map(|c| c.to_digit(10).map_or(c, |d| table[d as usize]))
+                        .collect()
+                } else {
+                    numbering(system, value).unwrap_or_else(|| digits(value))
+                }
+            }
+            None => digits(value),
         }
-        if !quoted && character.is_ascii_alphabetic() {
-            let mut width = 1;
-            while chars.peek() == Some(&character) {
-                chars.next();
-                width += 1;
+    };
+    let mut parts = Vec::new();
+    for token in &tokens {
+        let (letter, len) = match token {
+            Token::Literal(text) => {
+                push_dtf_literal(&mut parts, text);
+                continue;
             }
-            if let Some(kind) = field_type(character) {
-                if let Some(value) = find(kind) {
-                    output.push((kind, field_value(kind, character, width, value)));
-                    if kind == "fractionalSecond" {
-                        fraction_emitted = true;
+            Token::Field(letter, len) => (*letter, *len),
+        };
+        let part: Option<(&'static str, String)> = match letter {
+            'G' => fields.era.map(|code| {
+                let (era_calendar, key) = era_key(calendar, code);
+                let name = crate::cldr_dates::era_name(locale, era_calendar, name_width(len), key)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| code.to_uppercase());
+                ("era", name)
+            }),
+            'y' => {
+                let value = if matches!(calendar, "chinese" | "dangi") {
+                    (fields.related_year - 4).rem_euclid(60) + 1
+                } else if let Some(era_year) = fields.era_year {
+                    era_year
+                } else if fields.year <= 0 {
+                    1 - fields.year
+                } else {
+                    fields.year
+                };
+                Some(("year", numeric('y', value, len)))
+            }
+            'Y' | 'u' => Some(("year", numeric(letter, fields.year, len))),
+            'r' => Some(("relatedYear", numeric('r', fields.related_year, len))),
+            'U' => {
+                let cyclic = ((fields.related_year - 4).rem_euclid(60) + 1) as u8;
+                let name = crate::cldr_datetime_patterns::cyclic_year(
+                    locale,
+                    names_calendar,
+                    name_width(len),
+                    cyclic,
+                )
+                .map(str::to_string)
+                .unwrap_or_else(|| cyclic.to_string());
+                Some(("yearName", name))
+            }
+            'M' | 'L' => {
+                let standalone = letter == 'L';
+                let text = if len >= 3 {
+                    let width = name_width(len);
+                    let name = |month: u32| {
+                        if standalone {
+                            crate::cldr_dates::standalone_month_name(
+                                locale,
+                                names_calendar,
+                                width,
+                                month as u8,
+                            )
+                        } else {
+                            crate::cldr_dates::month_name(
+                                locale,
+                                names_calendar,
+                                width,
+                                month as u8,
+                            )
+                        }
+                    };
+                    let named = if fields.leap_year_month {
+                        name(100 + fields.month).or_else(|| name(fields.month))
+                    } else {
+                        name(fields.month)
+                    };
+                    named.map(|text| {
+                        if fields.leap_month {
+                            let key = format!(
+                                "{}-{width}",
+                                if standalone { "stand-alone" } else { "format" }
+                            );
+                            crate::cldr_datetime_patterns::leap_month_pattern(
+                                locale,
+                                names_calendar,
+                                &key,
+                            )
+                            .map_or_else(|| text.to_string(), |leap| leap.replace("{0}", text))
+                        } else {
+                            text.to_string()
+                        }
+                    })
+                } else {
+                    None
+                };
+                let text = text.unwrap_or_else(|| {
+                    let number = numeric(letter, fields.month_number as i64, len.min(2));
+                    if fields.leap_month {
+                        crate::cldr_datetime_patterns::leap_month_pattern(
+                            locale,
+                            names_calendar,
+                            "numeric",
+                        )
+                        .map_or_else(
+                            || format!("{number}bis"),
+                            |leap| leap.replace("{0}", &number),
+                        )
+                    } else {
+                        number
                     }
-                    if kind == "second" && !pattern.contains('S') {
-                        if let Some(fraction) = find("fractionalSecond") {
-                            let symbols =
-                                crate::cldr_numbers::symbols(dtf_cldr_locale(o), &dtf_nu(o));
-                            push_dtf_literal(&mut output, symbols.decimal);
-                            output.push(("fractionalSecond", fraction.clone()));
-                            fraction_emitted = true;
+                });
+                Some(("month", text))
+            }
+            'd' => Some(("day", numeric('d', fields.day as i64, len))),
+            'E' | 'c' | 'e' => {
+                const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+                let key = DAYS[fields.weekday as usize];
+                if len <= 2 && letter != 'E' {
+                    // A numeric local day of the week, counted from the region's first day.
+                    let region = locale_region(o);
+                    let (first_day, _) = crate::cldr_locale_info::week_info(&region);
+                    let iso = if fields.weekday == 0 {
+                        7
+                    } else {
+                        fields.weekday
+                    };
+                    let local = (iso as i64 - first_day as i64).rem_euclid(7) + 1;
+                    Some(("weekday", numeric(letter, local, len)))
+                } else {
+                    let width = if len == 6 {
+                        "short"
+                    } else {
+                        name_width(len.max(3))
+                    };
+                    let name = (letter == 'c')
+                        .then(|| {
+                            crate::cldr_datetime_patterns::standalone_weekday_override(
+                                locale, width, key,
+                            )
+                        })
+                        .flatten()
+                        .or_else(|| crate::cldr_datetime_patterns::weekday(locale, width, key))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            if width == "long" {
+                                WD_LONG[fields.weekday as usize].to_string()
+                            } else {
+                                WD_SHORT[fields.weekday as usize].to_string()
+                            }
+                        });
+                    Some(("weekday", name))
+                }
+            }
+            'a' | 'b' | 'B' => {
+                let width = name_width(len);
+                let am_pm = if fields.hour < 12 { "am" } else { "pm" };
+                let period = if letter == 'B' {
+                    let exact = (!shows_minute || fields.minute == 0)
+                        && (!shows_second || fields.second == 0);
+                    flexible_day_period(language, fields.hour, exact).unwrap_or(am_pm)
+                } else if letter == 'b' && fields.hour == 12 && fields.minute == 0 {
+                    "noon"
+                } else {
+                    am_pm
+                };
+                let name = crate::cldr_datetime_patterns::day_period(locale, width, period)
+                    .or_else(|| crate::cldr_datetime_patterns::day_period(locale, width, am_pm))
+                    .unwrap_or(if fields.hour < 12 { "AM" } else { "PM" });
+                Some(("dayPeriod", name.to_string()))
+            }
+            'h' | 'H' | 'K' | 'k' => {
+                let hour = fields.hour;
+                let value = match letter {
+                    'h' => {
+                        if hour.is_multiple_of(12) {
+                            12
+                        } else {
+                            hour % 12
                         }
                     }
+                    'K' => hour % 12,
+                    'k' => {
+                        if hour == 0 {
+                            24
+                        } else {
+                            hour
+                        }
+                    }
+                    _ => hour,
+                };
+                Some(("hour", numeric(letter, value as i64, len)))
+            }
+            'm' => Some(("minute", numeric('m', fields.minute as i64, len))),
+            's' => Some(("second", numeric('s', fields.second as i64, len))),
+            'S' => {
+                let mut digits = format!("{:03}", fields.millisecond);
+                while digits.len() < len {
+                    digits.push('0');
                 }
+                digits.truncate(len);
+                Some(("fractionalSecond", digits))
             }
-        } else {
-            let mut literal = character.to_string();
-            while let Some(next) = chars.peek().copied() {
-                if next == '\'' || (!quoted && next.is_ascii_alphabetic()) {
-                    break;
-                }
-                literal.push(next);
-                chars.next();
+            'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => {
+                let style = match (letter, len) {
+                    ('z', 1..=3) => "short",
+                    ('z', _) => "long",
+                    ('O', 1) => "shortOffset",
+                    ('O', _) | ('Z', 4) => "longOffset",
+                    ('v', 1) | ('V', 1) => "shortGeneric",
+                    ('v', _) | ('V', _) => "longGeneric",
+                    _ => "longOffset",
+                };
+                let tz = dtf_slot(o, "#\u{0}dtf_tz")
+                    .unwrap_or_else(|| crate::builtins::system_time_zone().to_string());
+                let name = super::tz_names::display_name(
+                    locale,
+                    &locale_region(o),
+                    &tz,
+                    style,
+                    fields.epoch_sec,
+                );
+                Some(("timeZoneName", name))
             }
-            push_dtf_literal(&mut output, &literal);
-        }
-    }
-    if !fraction_emitted && find("fractionalSecond").is_some() && find("second").is_none() {
-        output.push((
-            "fractionalSecond",
-            find("fractionalSecond").unwrap().clone(),
-        ));
-    }
-    output
-}
-
-fn interval_skeleton(pattern: &str) -> String {
-    let mut widths: std::collections::BTreeMap<char, usize> = Default::default();
-    let mut chars = pattern.chars().peekable();
-    let mut quoted = false;
-    while let Some(character) = chars.next() {
-        if character == '\'' {
-            if chars.peek() == Some(&'\'') {
-                chars.next();
-            } else {
-                quoted = !quoted;
-            }
-            continue;
-        }
-        if quoted || !character.is_ascii_alphabetic() {
-            continue;
-        }
-        let mut count = 1;
-        while chars.peek() == Some(&character) {
-            chars.next();
-            count += 1;
-        }
-        let field = match character {
-            'G' => 'G',
-            'y' | 'Y' | 'u' | 'U' | 'r' => 'y',
-            'M' | 'L' => 'M',
-            'd' => 'd',
-            'E' | 'e' | 'c' => 'E',
-            'B' | 'b' => 'B',
-            'h' | 'K' => 'h',
-            'H' | 'k' => 'H',
-            'm' => 'm',
-            's' | 'S' => 's',
-            'z' | 'Z' | 'O' | 'v' | 'V' => 'v',
-            _ => continue,
+            _ => None,
         };
-        let width = match field {
-            // CLDR interval data normally supplies one numeric and one named-month skeleton; the
-            // closest-match algorithm then adjusts the selected pattern back to the requested
-            // width. Field values are already width-adjusted here.
-            'M' if count >= 3 => 3,
-            'M' => 1,
-            'E' | 'G' | 'y' | 'd' | 'B' | 'h' | 'H' | 'm' | 's' | 'v' => 1,
-            _ => count,
-        };
-        widths.entry(field).or_insert(width);
-    }
-    let mut result = String::new();
-    for field in ['G', 'y', 'M', 'E', 'd', 'B', 'h', 'H', 'm', 's', 'v'] {
-        if let Some(width) = widths.get(&field) {
-            result.push_str(&field.to_string().repeat(*width));
+        if let Some(part) = part {
+            parts.push(part);
         }
     }
-    result
+    parts
 }
 
-fn greatest_range_difference(
-    o: &Gc,
-    skeleton: &str,
-    start: &[(&'static str, String)],
-    end: &[(&'static str, String)],
-) -> Option<&'static str> {
-    let changed = |kind: &str| {
-        let a = start.iter().find(|part| part.0 == kind).map(|part| &part.1);
-        let b = end.iter().find(|part| part.0 == kind).map(|part| &part.1);
-        a != b
-    };
-    if changed("era") {
-        Some("G")
-    } else if changed("year") || changed("relatedYear") || changed("yearName") {
-        Some("y")
-    } else if changed("month") {
-        Some("M")
-    } else if changed("day") || changed("weekday") {
-        Some("d")
-    } else if changed("dayPeriod") {
-        Some(if skeleton.contains('B') { "B" } else { "a" })
-    } else if changed("hour") {
-        Some(
-            if matches!(
-                dtf_slot(o, "#\u{0}dtf_hourcycle").as_deref(),
-                Some("h11" | "h12")
-            ) {
-                "h"
-            } else {
-                "H"
-            },
-        )
-    } else if changed("minute") {
-        Some("m")
-    } else if changed("second") || changed("fractionalSecond") {
-        Some("s")
-    } else {
-        None
+/// The region subtag of the formatter's locale, else its likely region.
+/// The formatter locale's region: its region subtag, else the likely region of its language
+/// and script (UTS #35 Part 1 Likely Subtags), else the world (`001`). It selects the week data
+/// and the preferred zones of metazones.
+fn locale_region(o: &Gc) -> String {
+    let locale = dtf_slot(o, "#\u{0}dtf_locale").unwrap_or_default();
+    match super::tags::parse(&locale) {
+        Some(tag) if !tag.region.is_empty() => tag.region,
+        Some(tag) => super::locale::add_likely(&tag.language, &tag.script, "")
+            .map(|(_, _, region)| region)
+            .filter(|region| !region.is_empty())
+            .unwrap_or_else(|| "001".to_string()),
+        None => "001".to_string(),
     }
 }
 
-fn split_interval_pattern(pattern: &str) -> Option<(&str, &str)> {
-    let mut seen = Vec::new();
-    let mut chars = pattern.char_indices().peekable();
-    let mut quoted = false;
-    while let Some((index, character)) = chars.next() {
-        if character == '\'' {
-            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
-                chars.next();
-            } else {
-                quoted = !quoted;
-            }
-            continue;
-        }
-        if quoted || !character.is_ascii_alphabetic() {
-            continue;
-        }
-        while chars.peek().is_some_and(|(_, next)| *next == character) {
-            chars.next();
-        }
-        let field = match character {
-            'M' | 'L' => 'M',
-            'E' | 'e' | 'c' => 'E',
-            'h' | 'H' | 'K' | 'k' => 'h',
-            other => other,
-        };
-        if seen.contains(&field) {
-            return Some((&pattern[..index], &pattern[index..]));
-        }
-        seen.push(field);
-    }
-    None
-}
-
-fn fallback_range_parts(
-    o: &Gc,
-    start: Vec<(&'static str, String)>,
-    end: Vec<(&'static str, String)>,
-) -> Vec<(&'static str, String, &'static str)> {
-    let fallback = crate::cldr_datetime_patterns::range_fallback(dtf_cldr_locale(o));
-    let mut output = Vec::new();
-    let is_time = |kind: &str| {
-        matches!(
-            kind,
-            "dayPeriod" | "hour" | "minute" | "second" | "fractionalSecond" | "timeZoneName"
-        )
-    };
-    let start_time = start.iter().position(|part| is_time(part.0));
-    let end_time = end.iter().position(|part| is_time(part.0));
-    let share_date = match (start_time, end_time) {
-        (Some(a), Some(b)) => {
-            start[..a] == end[..b]
-                && start[..a].iter().any(|part| {
-                    matches!(
-                        part.0,
-                        "weekday" | "era" | "year" | "relatedYear" | "yearName" | "month" | "day"
-                    )
-                })
-        }
-        _ => false,
-    };
-    let (start, end) = if share_date {
-        let prefix = start_time.unwrap();
-        output.extend(
-            start[..prefix]
-                .iter()
-                .map(|(kind, value)| (*kind, value.clone(), "shared")),
-        );
-        (&start[prefix..], &end[end_time.unwrap()..])
-    } else {
-        (&start[..], &end[..])
-    };
-    let mut rest = fallback;
-    while let Some(index) = rest.find(['{']) {
-        if index > 0 {
-            output.push(("literal", rest[..index].to_string(), "shared"));
-        }
-        let marker = &rest[index..];
-        if let Some(tail) = marker.strip_prefix("{0}") {
-            output.extend(
-                start
-                    .iter()
-                    .map(|(kind, value)| (*kind, value.clone(), "startRange")),
-            );
-            rest = tail;
-        } else if let Some(tail) = marker.strip_prefix("{1}") {
-            output.extend(
-                end.iter()
-                    .map(|(kind, value)| (*kind, value.clone(), "endRange")),
-            );
-            rest = tail;
-        } else {
-            output.push(("literal", "{".to_string(), "shared"));
-            rest = &marker[1..];
-        }
-    }
-    if !rest.is_empty() {
-        output.push(("literal", rest.to_string(), "shared"));
-    }
-    output
-}
-
+/// ECMA-402 PartitionDateTimeRangePattern: the parts of a range with their sources. The range
+/// patterns come from CLDR intervalFormats ([`super::dtf_interval`]); the greatest field in which
+/// the two local times differ (era through fractional seconds, as the format shows them) selects
+/// one. Equal fields format a single date whose parts are all shared.
 fn build_range_parts(
     o: &Gc,
     start_ms: f64,
     end_ms: f64,
     kind: u8,
 ) -> Vec<(&'static str, String, &'static str)> {
-    let start = build_parts(o, start_ms, kind);
-    let end = build_parts(o, end_ms, kind);
-    if start == end {
-        return start
+    use super::dtf_interval::{self, Field, RangePattern};
+    let (pattern, numbers) = formatter_pattern(o, kind);
+    let start = local_fields(o, start_ms, kind);
+    let end = local_fields(o, end_ms, kind);
+    let single = |fields: &LocalFields| {
+        render_pattern(o, &pattern, &numbers, fields)
             .into_iter()
             .map(|(kind, value)| (kind, value, "shared"))
-            .collect();
+            .collect::<Vec<_>>()
+    };
+    // [[FractionalSecondDigits]] compares milliseconds at the displayed precision.
+    let fraction_digits = super::dtf_pattern::tokenize(&pattern)
+        .into_iter()
+        .find_map(|token| match token {
+            super::dtf_pattern::Token::Field('S', len) => Some(len.min(3) as u32),
+            _ => None,
+        });
+    let key = |fields: &LocalFields| -> [i64; 9] {
+        let fraction = match fraction_digits {
+            Some(digits) => i64::from(fields.millisecond / 10u32.pow(3 - digits)),
+            None => i64::from(fields.millisecond),
+        };
+        [
+            0,
+            fields.year,
+            i64::from(fields.month_number) * 2 + i64::from(fields.leap_month),
+            i64::from(fields.day),
+            i64::from(fields.hour >= 12),
+            i64::from(fields.hour),
+            i64::from(fields.minute),
+            i64::from(fields.second),
+            fraction,
+        ]
+    };
+    let mut start_key = key(&start);
+    let end_key = key(&end);
+    if start.era != end.era {
+        start_key[0] = 1;
     }
-    let Some(base_pattern) = resolved_dtf_pattern(o, &start) else {
-        return fallback_range_parts(o, start, end);
+    let Some(field) = dtf_interval::greatest_difference(&start_key, &end_key) else {
+        return single(&start);
     };
-    let skeleton = interval_skeleton(&base_pattern);
-    let Some(difference) = greatest_range_difference(o, &skeleton, &start, &end) else {
-        return fallback_range_parts(o, start, end);
+    let locale = dtf_cldr_locale(o);
+    let calendar = dtf_calendar(o);
+    let decimal = crate::cldr_numbers::symbols(locale, &dtf_nu(o)).decimal;
+    let patterns = dtf_interval::range_patterns(locale, &calendar, &pattern, decimal);
+    let numbers_for = |candidate: &str| {
+        if candidate == pattern {
+            numbers.as_str()
+        } else {
+            ""
+        }
     };
-    let Some(pattern) =
-        crate::cldr_datetime_patterns::interval(dtf_cldr_locale(o), &skeleton, difference)
-    else {
-        return fallback_range_parts(o, start, end);
+    let same_day = matches!(
+        field,
+        Field::AmPm | Field::Hour | Field::Minute | Field::Second | Field::Millisecond
+    );
+    // UTS #35 intervalFormatFallback: both dates in a full pattern, the later first when the
+    // fallback is "{1} – {0}". A difference within one day of a date-time pattern shows the
+    // date once beside the time range, combined by the dateTimeFormat.
+    let fallback = |full: &str| -> Vec<(&'static str, String, &'static str)> {
+        let range = |time_pattern: &str| {
+            let mut parts = Vec::new();
+            let mut rest = patterns.fallback.as_str();
+            while let Some(open) = rest.find('{') {
+                push_shared_literal(&mut parts, &rest[..open]);
+                let (fields, source) = if rest[open..].starts_with("{0}") {
+                    (&start, "startRange")
+                } else {
+                    (&end, "endRange")
+                };
+                parts.extend(
+                    render_pattern(o, time_pattern, numbers_for(time_pattern), fields)
+                        .into_iter()
+                        .map(|(kind, value)| (kind, value, source)),
+                );
+                rest = &rest[open + 3..];
+            }
+            push_shared_literal(&mut parts, rest);
+            parts
+        };
+        match patterns.date_and_time().filter(|_| same_day) {
+            Some((date_pattern, time_pattern)) => {
+                let mut parts = Vec::new();
+                let mut rest = patterns.date_time.as_str();
+                while let Some(open) = rest.find('{') {
+                    push_shared_literal(&mut parts, &rest[..open]);
+                    if rest[open..].starts_with("{0}") {
+                        parts.extend(range(time_pattern));
+                    } else {
+                        parts.extend(
+                            render_pattern(o, date_pattern, numbers_for(date_pattern), &start)
+                                .into_iter()
+                                .map(|(kind, value)| (kind, value, "shared")),
+                        );
+                    }
+                    rest = &rest[open + 3..];
+                }
+                push_shared_literal(&mut parts, rest);
+                parts
+            }
+            None => range(full),
+        }
     };
-    let Some((first_pattern, second_pattern)) = split_interval_pattern(pattern) else {
-        return fallback_range_parts(o, start, end);
-    };
-    let first = apply_dtf_pattern(o, first_pattern, &start);
-    let second = apply_dtf_pattern(o, second_pattern, &end);
+    match patterns.get(field) {
+        None if dtf_interval::field_unit_ignored(&patterns.full, field) => single(&start),
+        None => fallback(&patterns.full),
+        Some(RangePattern::Fallback(full)) => fallback(full),
+        Some(RangePattern::Split {
+            first,
+            second,
+            later_first,
+        }) => {
+            let (first_fields, first_source, second_fields, second_source) = if *later_first {
+                (&end, "endRange", &start, "startRange")
+            } else {
+                (&start, "startRange", &end, "endRange")
+            };
+            let first_parts = render_pattern(o, first, "", first_fields);
+            let second_parts = render_pattern(o, second, "", second_fields);
+            split_range_parts(first_parts, first_source, second_parts, second_source)
+        }
+    }
+}
+
+/// Append a fallback or dateTimeFormat literal as a shared part.
+fn push_shared_literal(parts: &mut Vec<(&'static str, String, &'static str)>, text: &str) {
+    if !text.is_empty() {
+        parts.push(("literal", text.to_string(), "shared"));
+    }
+}
+
+/// The parts of an interval pattern's two halves. The literal at the split is the shared range
+/// separator; a field shown once (with equal values) belongs to both dates, as do the literals
+/// beside such fields.
+fn split_range_parts(
+    first: Vec<(&'static str, String)>,
+    first_source: &'static str,
+    second: Vec<(&'static str, String)>,
+    second_source: &'static str,
+) -> Vec<(&'static str, String, &'static str)> {
     let boundary = first.len();
     let mut combined: Vec<_> = first
         .into_iter()
-        .map(|(kind, value)| (kind, value, "startRange"))
+        .map(|(kind, value)| (kind, value, first_source))
         .chain(
             second
                 .into_iter()
-                .map(|(kind, value)| (kind, value, "endRange")),
+                .map(|(kind, value)| (kind, value, second_source)),
         )
         .collect();
-
-    // UTS #35 splits an interval at the first repeated field. The literal immediately adjoining
-    // that split is the shared range separator, including non-dash separators such as Japanese ～.
     if boundary > 0 && combined[boundary - 1].0 == "literal" {
         combined[boundary - 1].2 = "shared";
     } else if combined
@@ -1527,19 +1902,9 @@ fn build_range_parts(
     {
         combined[boundary].2 = "shared";
     }
-
     for index in 0..combined.len() {
-        if combined[index].0 == "literal" {
-            if combined[index].1.contains(['–', '—', '-']) {
-                combined[index].2 = "shared";
-            }
-            continue;
-        }
         let kind = combined[index].0;
-        let occurrences = combined.iter().filter(|part| part.0 == kind).count();
-        let start_value = start.iter().find(|part| part.0 == kind).map(|part| &part.1);
-        let end_value = end.iter().find(|part| part.0 == kind).map(|part| &part.1);
-        if occurrences == 1 && start_value == end_value {
+        if kind != "literal" && combined.iter().filter(|part| part.0 == kind).count() == 1 {
             combined[index].2 = "shared";
         }
     }
@@ -1563,505 +1928,17 @@ fn build_range_parts(
     combined
 }
 
+/// FormatDateTime's parts (ECMA-402 #sec-partitiondatetimepattern) for epoch milliseconds and a
+/// receiver kind (see [`dtf_ms_kind`]).
 fn build_parts(o: &Gc, ms: f64, kind: u8) -> Vec<(&'static str, String)> {
-    let instant_sec = (ms / 1000.0).floor() as i64;
-    // An absolute instant (number/Date kind 0, Temporal.Instant kind 6) is shifted into the
-    // formatter's time zone; Temporal wall-clock values (kinds 1-5) already carry their local time.
-    let ms = if kind == 0 || kind == 6 {
-        match o.borrow().props.get("#\u{0}dtf_tz").map(|p| p.value()) {
-            Some(Value::Str(tz)) => {
-                let epoch_sec = (ms / 1000.0).floor() as i64;
-                let off_ms = crate::tz::offset_at(&tz, epoch_sec)
-                    .map(|s| s as f64 * 1000.0)
-                    .unwrap_or_else(|| tz_offset_ms(&tz));
-                ms + off_ms
-            }
-            _ => ms,
-        }
-    } else {
-        ms
-    };
-    let (mut y, mut mo, mut d, h, mi, s, wd) = ymd(ms);
-    let iso_date = crate::temporal::IsoDate {
-        year: y,
-        month: mo as u8,
-        day: d as u8,
-    };
-    // A non-Gregorian calendar renders its own numeric year/month/day via the calendar tables.
-    let dcal = match o.borrow().props.get("#\u{0}dtf_ca").map(|p| p.value()) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => "iso8601".to_string(),
-    };
-    let greg_cal = matches!(dcal.as_str(), "" | "gregory" | "iso8601");
-    let mut leap_month = false;
-    if !greg_cal {
-        let f = crate::temporal::cal_fields(&dcal, iso_date);
-        // The year uses cal_year_num (era-year, e.g. ethioaa amete-alem = +5500); month/day come
-        // from cal_fields.
-        y = crate::temporal::cal_year_num(&dcal, iso_date);
-        mo = f.1 as u32;
-        d = f.2 as u32;
-        // Lunisolar months display their month NUMBER (leap months flagged), not the ordinal;
-        // Hebrew months use the fixed CLDR index (Adar I is 6 in leap years only).
-        if dcal == "chinese" || dcal == "dangi" {
-            let (num, leap) = crate::temporal::lunisolar_month_num(&dcal, iso_date);
-            mo = num as u32;
-            leap_month = leap;
-        } else if dcal == "hebrew" {
-            mo = crate::temporal::hebrew_cldr_month(iso_date) as u32;
-        } else if dcal == "japanese" {
-            // The Japanese calendar's year is the era year (Reiwa 32), matching Temporal.
-            if let (_, Some(ey)) = crate::temporal::cal_era("japanese", iso_date) {
-                y = ey;
-            }
-        }
-    }
-    // A Temporal receiver restricts the displayable fields: YearMonth drops day/weekday/time,
-    // MonthDay drops year/weekday/time, Date/YearMonth/MonthDay drop time, Time drops date.
-    let allow = |slot: &str| -> bool {
-        // A Temporal receiver without a time zone (any kind except 0/number and 6/Zoned) never
-        // shows a time-zone name.
-        if slot == "tzname" && matches!(kind, 1..=5) {
-            return false;
-        }
-        match kind {
-            1 => !matches!(slot, "hour" | "minute" | "second" | "dayperiod" | "fracsec"), // Date
-            2 => matches!(slot, "hour" | "minute" | "second" | "dayperiod" | "fracsec"),  // Time
-            4 => matches!(slot, "year" | "month" | "era"), // YearMonth
-            5 => matches!(slot, "month" | "day"),          // MonthDay
-            _ => true,
-        }
-    };
-    // Read a component slot (gated by `allow`), falling back to the dateStyle/timeStyle expansion.
-    let defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
-    let get = |k: &str| {
-        let field = k.trim_start_matches("#\u{0}dtf_");
-        if !allow(field) {
-            return None;
-        }
-        // A fully-defaulted formatter adapts to the receiver: a PlainTime shows no date fields.
-        if defaulted && kind == 2 && matches!(field, "year" | "month" | "day" | "era") {
-            return None;
-        }
-        let read = |key: &str| match o.borrow().props.get(key).map(|p| p.value()) {
-            Some(Value::Str(s)) => Some(s.to_string()),
-            _ => None,
-        };
-        read(k).or_else(|| read(&k.replacen("#\u{0}dtf_", "#\u{0}dtfx_", 1)))
-    };
-    let mut parts: Vec<(&'static str, String)> = Vec::new();
-    let lit = |parts: &mut Vec<(&'static str, String)>, s: &str| {
-        parts.push(("literal", s.to_string()));
-    };
-    let cldr_loc = dtf_cldr_locale(o);
-
-    if let Some(w) = get("#\u{0}dtf_weekday") {
-        const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-        let name = crate::cldr_datetime_patterns::weekday(cldr_loc, &w, DAYS[wd as usize])
-            .unwrap_or_else(|| {
-                if w == "long" {
-                    WD_LONG[wd as usize]
-                } else {
-                    WD_SHORT[wd as usize]
-                }
-            });
-        parts.push(("weekday", name.to_string()));
-        lit(&mut parts, ", ");
-    }
-
-    let cal_key = if greg_cal { "gregory" } else { dcal.as_str() };
-    // Named months come from CLDR (localized, per-calendar); missing → numeric.
-    let mut month_is_named = false;
-    // ICU marks a chinese/dangi leap month with a "bis" suffix in numeric contexts.
-    let bis = if leap_month { "bis" } else { "" };
-    let month_str = get("#\u{0}dtf_month").map(|m| {
-        // Hebrew months always render by name regardless of the requested width (CLDR-15510).
-        if dcal == "hebrew" {
-            if let Some(n) = crate::cldr_dates::month_name(cldr_loc, "hebrew", "long", mo as u8) {
-                month_is_named = true;
-                return n.to_string();
-            }
-        }
-        match m.as_str() {
-            w @ ("long" | "short" | "narrow") => {
-                if let Some(n) = crate::cldr_dates::month_name(cldr_loc, cal_key, w, mo as u8) {
-                    month_is_named = true;
-                    n.to_string()
-                } else {
-                    format!("{mo}{bis}")
-                }
-            }
-            "2-digit" => format!("{mo:02}{bis}"),
-            _ => format!("{mo}{bis}"),
-        }
-    });
-    let day_str = get("#\u{0}dtf_day").map(|dd| {
-        if dd == "2-digit" {
-            format!("{d:02}")
-        } else {
-            format!("{d}")
-        }
-    });
-    // When an era is shown for the Gregorian calendar, the year is the positive era year.
-    let disp_year = if greg_cal && get("#\u{0}dtf_era").is_some() && y <= 0 {
-        1 - y
-    } else {
-        y
-    };
-    let year_str = get("#\u{0}dtf_year").map(|yy| {
-        if yy == "2-digit" {
-            format!("{:02}", (disp_year % 100 + 100) % 100)
-        } else {
-            format!("{disp_year}")
-        }
-    });
-    // chinese/dangi years render as related Gregorian year + sexagenary cycle name.
-    let year_cluster: Option<Vec<(&'static str, String)>> =
-        if (dcal == "chinese" || dcal == "dangi") && year_str.is_some() {
-            const STEMS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
-            const BRANCHES: [&str; 12] = [
-                "子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥",
-            ];
-            let name = format!(
-                "{}{}",
-                STEMS[(y - 4).rem_euclid(10) as usize],
-                BRANCHES[(y - 4).rem_euclid(12) as usize]
-            );
-            Some(if cldr_loc.starts_with("zh") {
-                vec![
-                    ("relatedYear", y.to_string()),
-                    ("yearName", name),
-                    ("literal", "年".to_string()),
-                ]
-            } else {
-                vec![
-                    ("relatedYear", y.to_string()),
-                    ("literal", "(".to_string()),
-                    ("yearName", name),
-                    ("literal", ")".to_string()),
-                ]
-            })
-        } else {
-            None
-        };
-    let named_month = month_is_named;
-    let have_date = month_str.is_some() || day_str.is_some() || year_str.is_some();
-
-    if named_month {
-        if let Some(m) = &month_str {
-            parts.push(("month", m.clone()));
-        }
-        if let Some(dd) = &day_str {
-            lit(&mut parts, " ");
-            parts.push(("day", dd.clone()));
-        }
-        if let Some(yy) = &year_str {
-            lit(&mut parts, ", ");
-            match &year_cluster {
-                Some(c) => parts.extend(c.iter().cloned()),
-                None => parts.push(("year", yy.clone())),
-            }
-        }
-    } else if have_date {
-        // Numeric date: field order and separator follow the locale's CLDR short pattern
-        // (en: M/D/Y, de: D.M.Y, ja: Y/M/D, ...). Default is M/D/Y with "/".
-        let lang = {
-            let loc = match o.borrow().props.get("#\u{0}dtf_locale").map(|p| p.value()) {
-                Some(Value::Str(s)) => s.to_string(),
-                _ => "en".to_string(),
-            };
-            loc.split('-').next().unwrap_or("en").to_string()
-        };
-        // (order, separator, trailing separator after the year — de/fi style "1.2.1970" has none)
-        let (order, sep): (&[u8], &str) = match lang.as_str() {
-            "de" | "ru" | "fi" | "cs" | "sk" | "uk" | "bg" | "sr" | "lv" | "et" | "ro" | "no"
-            | "nb" | "da" | "is" | "mk" | "sq" | "hr" => (b"dmy", "."),
-            "fr" | "es" | "it" | "pt" | "el" | "id" | "ms" | "vi" | "he" | "ar" | "th" | "ca"
-            | "gl" | "uz" => (b"dmy", "/"),
-            "nl" | "sw" => (b"dmy", "-"),
-            "pl" | "sl" => (b"dmy", "."),
-            "hu" | "lt" | "sv" => (b"ymd", "."),
-            "ja" | "zh" | "ko" | "eu" => (b"ymd", "/"),
-            _ => (b"mdy", "/"),
-        };
-        // Hungarian/Swedish/Lithuanian actually use "y. m. d." / "y-m-d"; keep it simple with
-        // the dominant separator per language above.
-        let (order, sep): (&[u8], &str) = match lang.as_str() {
-            "hu" => (b"ymd", ". "),
-            "lt" | "sv" => (b"ymd", "-"),
-            _ => (order, sep),
-        };
-        let mut first = true;
-        for f in order {
-            match f {
-                b'm' => {
-                    if let Some(m) = &month_str {
-                        if !first {
-                            lit(&mut parts, sep);
-                        }
-                        parts.push(("month", m.clone()));
-                        first = false;
-                    }
-                }
-                b'd' => {
-                    if let Some(dd) = &day_str {
-                        if !first {
-                            lit(&mut parts, sep);
-                        }
-                        parts.push(("day", dd.clone()));
-                        first = false;
-                    }
-                }
-                _ => {
-                    if let Some(yy) = &year_str {
-                        if !first {
-                            lit(&mut parts, sep);
-                        }
-                        match &year_cluster {
-                            Some(c) => parts.extend(c.iter().cloned()),
-                            None => parts.push(("year", yy.clone())),
-                        }
-                        first = false;
-                    }
-                }
-            }
-        }
-    }
-    // The era follows the date (CLDR name for the calendar/locale; the code is the fallback).
-    if let (true, Some(width)) = (have_date, get("#\u{0}dtf_era")) {
-        let (code, _) =
-            crate::temporal::cal_era(if greg_cal { "gregory" } else { &dcal }, iso_date);
-        if let Some(code) = code {
-            // Japanese named eras resolve by code; its ce/bce fallback uses the Gregorian names.
-            let jp_name = if dcal == "japanese" {
-                match code {
-                    "reiwa" => Some("Reiwa"),
-                    "heisei" => Some("Heisei"),
-                    "showa" => Some("Shōwa"),
-                    "taisho" => Some("Taishō"),
-                    "meiji" => Some("Meiji"),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let idx = era_cldr_index(if greg_cal { "gregory" } else { &dcal }, code);
-            let ekey = if cal_key == "japanese" {
-                "gregory"
-            } else {
-                cal_key
-            };
-            let name = jp_name
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    crate::cldr_dates::era_name(cldr_loc, ekey, &width, idx).map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| code.to_uppercase());
-            lit(&mut parts, " ");
-            parts.push(("era", name));
-        }
-    }
-
-    // A PlainTime (kind 2), or a fully-defaulted formatter over a PlainDateTime (kind 3), shows the
-    // natural h:m:s even without explicit time components (the PlainDateTime format defaults to all).
-    let dtf_defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
-    let has_frac = o.borrow().props.contains("#\u{0}dtf_fracsec");
-    let day_period = get("#\u{0}dtf_dayperiod");
-    let time_defaulted = (kind == 2 || ((kind == 3 || kind == 6) && dtf_defaulted))
-        && get("#\u{0}dtf_hour").is_none()
-        && get("#\u{0}dtf_minute").is_none()
-        && get("#\u{0}dtf_second").is_none()
-        && day_period.is_none()
-        && !has_frac;
-    let have_time = time_defaulted
-        || day_period.is_some()
-        || has_frac
-        || get("#\u{0}dtf_hour").is_some()
-        || get("#\u{0}dtf_minute").is_some()
-        || get("#\u{0}dtf_second").is_some();
-    if have_time {
-        if have_date {
-            lit(&mut parts, ", ");
-        }
-        let has_hour = time_defaulted || get("#\u{0}dtf_hour").is_some();
-        // An explicit dayPeriod field replaces the AM/PM marker with a flexible period word; a plain
-        // AM/PM marker only appears alongside a 12-hour clock. When the hour cycle wasn't resolved
-        // (a default formatter over a PlainTime), use the locale default (en is 12-hour, others 24).
-        let cycle = match o
-            .borrow()
-            .props
-            .get("#\u{0}dtf_hourcycle")
-            .map(|p| p.value())
-        {
-            Some(Value::Str(s)) => Some(s.to_string()),
-            _ => None,
-        };
-        let use12 = day_period.is_some()
-            || match cycle.as_deref() {
-                Some("h11") | Some("h12") => true,
-                Some(_) => false,
-                None => match o.borrow().props.get("#\u{0}dtf_hour12").map(|p| p.value()) {
-                    Some(Value::Bool(b)) => b,
-                    _ => cldr_loc == "en",
-                },
-            };
-        // Map the 0..23 hour into the display range of the resolved cycle: h11 [0,11], h12 [1,12],
-        // h23 [0,23], h24 [1,24].
-        let disp_h = match cycle.as_deref() {
-            Some("h11") => h % 12,
-            Some("h12") => {
-                if h % 12 == 0 {
-                    12
-                } else {
-                    h % 12
-                }
-            }
-            Some("h24") => {
-                if h == 0 {
-                    24
-                } else {
-                    h
-                }
-            }
-            Some("h23") => h,
-            Some(_) => h,
-            None if use12 => {
-                if h % 12 == 0 {
-                    12
-                } else {
-                    h % 12
-                }
-            }
-            None => h,
-        };
-        let ampm = if use12 {
-            match &day_period {
-                Some(width) => {
-                    let period = day_period_key(h);
-                    Some(
-                        crate::cldr_datetime_patterns::day_period(cldr_loc, width, period)
-                            .unwrap_or_else(|| day_period_word(h, width))
-                            .to_string(),
-                    )
-                }
-                None if has_hour => {
-                    let period = if h < 12 { "am" } else { "pm" };
-                    Some(
-                        crate::cldr_datetime_patterns::day_period(cldr_loc, "short", period)
-                            .unwrap_or(if h < 12 { "AM" } else { "PM" })
-                            .to_string(),
-                    )
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let has_clock = time_defaulted
-            || get("#\u{0}dtf_hour").is_some()
-            || get("#\u{0}dtf_minute").is_some()
-            || get("#\u{0}dtf_second").is_some();
-        let mut first = true;
-        if time_defaulted || get("#\u{0}dtf_hour").is_some() {
-            // A 24-hour cycle (h23/h24) renders 2-digit even for a numeric hour (CLDR "HH"); a
-            // 12-hour cycle uses 1-digit unless "2-digit" was explicitly requested.
-            let pad = get("#\u{0}dtf_hour").as_deref() == Some("2-digit") || !use12;
-            parts.push((
-                "hour",
-                if pad {
-                    format!("{disp_h:02}")
-                } else {
-                    format!("{disp_h}")
-                },
-            ));
-            first = false;
-        }
-        if time_defaulted || get("#\u{0}dtf_minute").is_some() {
-            if !first {
-                lit(&mut parts, ":");
-            }
-            parts.push(("minute", format!("{mi:02}")));
-            first = false;
-        }
-        let frac_alone = has_frac && !(time_defaulted || get("#\u{0}dtf_second").is_some());
-        if frac_alone {
-            if let Some(Value::Num(fd)) =
-                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
-            {
-                let ms_frac = (ms.rem_euclid(1000.0)) as u32;
-                let digits = format!("{ms_frac:03}");
-                parts.push(("fractionalSecond", digits[..fd as usize].to_string()));
-            }
-        }
-        if time_defaulted || get("#\u{0}dtf_second").is_some() {
-            if !first {
-                lit(&mut parts, ":");
-            }
-            parts.push(("second", format!("{s:02}")));
-            // fractionalSecondDigits appends the leading digits of the millisecond fraction.
-            if let Some(Value::Num(fd)) =
-                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
-            {
-                let ms_frac = (ms.rem_euclid(1000.0)) as u32;
-                let digits = format!("{ms_frac:03}");
-                // The fractional separator is the numbering system's decimal symbol (arab: U+066B).
-                let sep = if matches!(dtf_nu(o).as_str(), "arab" | "arabext") {
-                    "\u{066b}"
-                } else {
-                    "."
-                };
-                lit(&mut parts, sep);
-                parts.push(("fractionalSecond", digits[..fd as usize].to_string()));
-            }
-        }
-        if let Some(ap) = ampm {
-            // Separate the day-period marker from the clock only when clock digits were emitted.
-            if has_clock {
-                lit(&mut parts, " ");
-            }
-            parts.push(("dayPeriod", ap));
-        }
-    }
-
-    // Time-zone name (UTC only; the display form depends on the requested style).
-    if let Some(style) = get("#\u{0}dtf_tzname") {
-        let tz = match o.borrow().props.get("#\u{0}dtf_tz").map(|p| p.value()) {
-            Some(Value::Str(s)) => s.to_string(),
-            _ => crate::builtins::system_time_zone().to_string(),
-        };
-        let name = tz_display_name(&tz, &style, instant_sec);
-        // CLDR joins a zone name to a time with a space and to a date alone
-        // with ", " ("10/3/2026, Central European Summer Time").
-        let after_date = parts
-            .iter()
-            .rev()
-            .find(|(kind, _)| *kind != "literal")
-            .is_some_and(|(kind, _)| matches!(*kind, "year" | "month" | "day" | "weekday" | "era"));
-        if after_date {
-            lit(&mut parts, ", ");
-        } else if !parts.is_empty() {
-            lit(&mut parts, " ");
-        }
-        parts.push(("timeZoneName", name));
-    }
-
-    if parts.is_empty() {
-        // Default numeric date.
-        parts.push(("month", format!("{mo}")));
-        lit(&mut parts, "/");
-        parts.push(("day", format!("{d}")));
-        lit(&mut parts, "/");
-        parts.push(("year", format!("{y}")));
-    }
-    match resolved_dtf_pattern(o, &parts) {
-        Some(pattern) => apply_dtf_pattern(o, &pattern, &parts),
-        None => parts,
-    }
+    let (pattern, numbers) = formatter_pattern(o, kind);
+    render_pattern(o, &pattern, &numbers, &local_fields(o, ms, kind))
 }
 
 /// Validate and canonicalize a `timeZone` option. Offset forms (`±HH`, `±HH:MM`, `±HHMM`) are
-/// checked strictly (ASCII sign, hour 00-23, minute 00-59) and normalized to `±HH:MM`; the UTC
-/// aliases collapse to "UTC"; any other IANA-looking name is accepted as-is (we lack a full DB).
+/// checked strictly (ASCII sign, hour 00-23, minute 00-59) and normalized to `±HH:MM`; a name is
+/// looked up case-insensitively in the IANA registry (ECMA-402 GetAvailableNamedTimeZoneIdentifier)
+/// and keeps its registry spelling, or is rejected.
 fn canonicalize_time_zone(tz: &str) -> Option<String> {
     let first = tz.bytes().next()?;
     if first == b'+' || first == b'-' {
@@ -2119,102 +1996,6 @@ fn canon_utc_offset(s: &str) -> Option<String> {
     Some(format!("{sign_c}{h:02}:{m:02}"))
 }
 
-/// The English flexible day-period word for an hour under a `dayPeriod` width (`long`/`short` share
-/// forms; only `narrow` noon differs).
-fn day_period_key(h: u32) -> &'static str {
-    if h == 12 {
-        "noon"
-    } else if h < 12 {
-        "morning1"
-    } else if h < 18 {
-        "afternoon1"
-    } else if h < 21 {
-        "evening1"
-    } else {
-        "night1"
-    }
-}
-
-fn day_period_word(h: u32, width: &str) -> &'static str {
-    if h == 12 {
-        if width == "narrow" {
-            "n"
-        } else {
-            "noon"
-        }
-    } else if h < 12 {
-        "in the morning"
-    } else if h < 18 {
-        "in the afternoon"
-    } else if h < 21 {
-        "in the evening"
-    } else {
-        "at night"
-    }
-}
-
-/// The time-zone display name for `tz` at `epoch_sec` under a `timeZoneName` style.
-fn tz_display_name(tz: &str, style: &str, epoch_sec: i64) -> String {
-    if tz == "UTC" {
-        return match style {
-            "long" | "longGeneric" => "Coordinated Universal Time",
-            "longOffset" => "GMT",
-            _ => "UTC", // short, shortOffset, shortGeneric
-        }
-        .to_string();
-    }
-    // An offset zone renders as a GMT offset (a zero offset is plain "GMT"; minutes only when
-    // nonzero).
-    if tz.starts_with('+') || tz.starts_with('-') {
-        let (sign, rest) = (&tz[..1], &tz[1..]);
-        let mut it = rest.split(':');
-        let h: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        let m: i64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        return if h == 0 && m == 0 {
-            "GMT".to_string()
-        } else if m == 0 {
-            format!("GMT{sign}{h}")
-        } else {
-            format!("GMT{sign}{h}:{m:02}")
-        };
-    }
-    // Named zones: the short styles render the GMT offset at the instant; the long styles use
-    // the CLDR metazone name (standard or daylight at the instant) where known, else the
-    // canonical identifier.
-    let canon = crate::tz::canonicalize(tz).unwrap_or(tz).to_string();
-    let off = crate::tz::offset_at(&canon, epoch_sec).unwrap_or(0) as i64;
-    let sign = if off < 0 { "-" } else { "+" };
-    let (h, m) = (off.abs() / 3600, (off.abs() % 3600) / 60);
-    if let Some(name) = crate::tz::long_name(&canon, epoch_sec) {
-        match style {
-            "long" => return name.to_string(),
-            "longGeneric" => {
-                return ["Standard Time", "Summer Time", "Daylight Time"]
-                    .iter()
-                    .find_map(|suffix| name.strip_suffix(suffix))
-                    .map_or_else(|| name.to_string(), |stem| format!("{stem}Time"));
-            }
-            _ => {}
-        }
-    }
-    match style {
-        "longOffset" if off == 0 => "GMT".to_string(),
-        "longOffset" => format!("GMT{sign}{h:02}:{m:02}"),
-        "short" | "shortOffset" | "shortGeneric" => {
-            if off == 0 {
-                "GMT".to_string()
-            } else if m == 0 {
-                format!("GMT{sign}{h}")
-            } else {
-                format!("GMT{sign}{h}:{m:02}")
-            }
-        }
-        // A zone without a CLDR name: its GMT offset, as in other engines.
-        _ if off == 0 => "GMT".to_string(),
-        _ => format!("GMT{sign}{h:02}:{m:02}"),
-    }
-}
-
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let o = crate::intl::brand_slot_legacy(i, &this, "#\u{0}dtf", "Intl.DateTimeFormat")?;
     let res = i.new_object();
@@ -2243,7 +2024,11 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     put(i, &res, "weekday", "#\u{0}dtf_weekday");
     put(i, &res, "era", "#\u{0}dtf_era");
     put(i, &res, "year", "#\u{0}dtf_year");
-    put(i, &res, "month", "#\u{0}dtf_month");
+    if o.borrow().props.contains("#\u{0}dtfr_month") {
+        put(i, &res, "month", "#\u{0}dtfr_month");
+    } else {
+        put(i, &res, "month", "#\u{0}dtf_month");
+    }
     put(i, &res, "day", "#\u{0}dtf_day");
     put(i, &res, "dayPeriod", "#\u{0}dtf_dayperiod");
     put(i, &res, "hour", "#\u{0}dtf_hour");

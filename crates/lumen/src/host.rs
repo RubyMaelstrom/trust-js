@@ -487,9 +487,14 @@ pub struct ResourceTable {
 }
 
 impl ResourceTable {
+    /// Store `resource` under a fresh id. Ids are never reused, so once ids 0..u32::MAX have been
+    /// handed out the id space is exhausted and this panics rather than recycle an id a script
+    /// may still hold.
     pub fn add<T: Any>(&mut self, resource: T) -> ResourceId {
         let rid = self.next;
-        self.next += 1;
+        self.next = rid
+            .checked_add(1)
+            .expect("ResourceTable id space exhausted; ids are never reused");
         self.map.insert(rid, Rc::new(resource));
         rid
     }
@@ -910,5 +915,22 @@ mod tests {
         state.take::<External>();
         state.resources.close(rid);
         assert!(state.retained_memory().external_allocations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod resource_id_tests {
+    use super::ResourceTable;
+
+    #[test]
+    #[should_panic(expected = "ids are never reused")]
+    fn exhausted_resource_ids_are_not_recycled() {
+        let mut table = ResourceTable {
+            next: u32::MAX - 1,
+            ..ResourceTable::default()
+        };
+        assert_eq!(table.add(()), u32::MAX - 1);
+        // Ids 0..=u32::MAX - 1 are all spent: the next addition refuses to wrap.
+        table.add(());
     }
 }

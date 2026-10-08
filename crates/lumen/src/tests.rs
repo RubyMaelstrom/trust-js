@@ -3339,6 +3339,89 @@ fn dates_follow_the_system_time_zone() {
 }
 
 #[test]
+fn dates_follow_the_zone_rule_after_the_last_tabulated_transition() {
+    // RFC 9636 section 3.3: the TZif footer TZ string governs local time after the last
+    // transition, so daylight saving time continues after 2037. Expected values are V8's
+    // (Node, ICU 78) with TZ set to each zone; the Temporal transitions are CPython zoneinfo's.
+    struct Zone;
+    impl Drop for Zone {
+        fn drop(&mut self) {
+            crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(None));
+        }
+    }
+    let _reset = Zone;
+    crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(Some("Europe/Berlin")));
+    assert_eq!(
+        run("new Date(2040, 6, 1, 12).toString()"),
+        "Sun Jul 01 2040 12:00:00 GMT+0200 (Central European Summer Time)"
+    );
+    assert_eq!(run("new Date(2040, 6, 1, 12).getTimezoneOffset()"), "-120");
+    assert_eq!(run("new Date(2040, 0, 1, 12).getTimezoneOffset()"), "-60");
+    crate::builtins::TEST_TIME_ZONE.with(|zone| zone.set(Some("America/New_York")));
+    assert_eq!(
+        run("new Date(Date.UTC(2050, 6, 1)).toString()"),
+        "Thu Jun 30 2050 20:00:00 GMT-0400 (Eastern Daylight Time)"
+    );
+    // A skipped and a repeated local time after the table, as in #sec-utc-t.
+    assert_eq!(
+        run("new Date(2050, 2, 13, 2, 30).toISOString()"),
+        "2050-03-13T07:30:00.000Z"
+    );
+    assert_eq!(
+        run("new Date(2050, 10, 6, 1, 30).toISOString()"),
+        "2050-11-06T05:30:00.000Z"
+    );
+    assert_eq!(
+        run(
+            "['2045-01-15', '2045-07-15'].map(d => new Intl.DateTimeFormat('en-US', \
+             {timeZone: 'Australia/Sydney', hour: 'numeric', timeZoneName: 'longOffset'}) \
+             .format(new Date(d))).join('|')"
+        ),
+        "11 AM GMT+11:00|10 AM GMT+10:00"
+    );
+    assert_eq!(
+        run(
+            "Temporal.ZonedDateTime.from('2037-12-01T12:00[Europe/Berlin]') \
+             .getTimeZoneTransition('next').toString()"
+        ),
+        "2038-03-28T03:00:00+02:00[Europe/Berlin]"
+    );
+    assert_eq!(
+        run(
+            "Temporal.ZonedDateTime.from('2040-01-01T00:00[Europe/Berlin]') \
+             .getTimeZoneTransition('previous').toString()"
+        ),
+        "2039-10-30T02:00:00+01:00[Europe/Berlin]"
+    );
+    assert_eq!(
+        run(
+            "Temporal.ZonedDateTime.from('2045-06-01T00:00[America/Santiago]') \
+             .getTimeZoneTransition('next').toString()"
+        ),
+        "2045-09-03T01:00:00-03:00[America/Santiago]"
+    );
+    assert_eq!(
+        run("Temporal.ZonedDateTime.from('2050-07-01T12:00[America/New_York]').offset"),
+        "-04:00"
+    );
+    // The rule never stops, but a transition after nsMaxInstant is null.
+    assert_eq!(
+        run(
+            "new Temporal.ZonedDateTime(8640000000000000000000n, 'Europe/Berlin') \
+             .getTimeZoneTransition('next')"
+        ),
+        "null"
+    );
+    assert_eq!(
+        run(
+            "new Temporal.ZonedDateTime(8639968464000000000000n, 'Europe/Berlin') \
+             .getTimeZoneTransition('next') === null"
+        ),
+        "false"
+    );
+}
+
+#[test]
 fn dates() {
     assert_eq!(run("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
     // Two-digit years in the implementation-specific formats, as V8 and
@@ -24793,6 +24876,76 @@ fn locale_info_uses_cldr_region_preference() {
 
 #[cfg(feature = "intl")]
 #[test]
+fn locale_info_text_direction_numbering_systems_and_time_zones() {
+    // ECMA-402 TextDirectionOfLocale: the explicit script, else the Add Likely Subtags script,
+    // looked up in UTS #35 Script Metadata; an undetermined direction is undefined.
+    let direction = |tag: &str| run(&format!("new Intl.Locale('{tag}').getTextInfo().direction"));
+    assert_eq!(direction("ar"), "rtl");
+    assert_eq!(direction("he"), "rtl");
+    assert_eq!(direction("fa-IR"), "rtl");
+    assert_eq!(direction("ur"), "rtl");
+    assert_eq!(direction("dv"), "rtl");
+    assert_eq!(direction("en"), "ltr");
+    assert_eq!(direction("ja"), "ltr");
+    assert_eq!(direction("az-Arab"), "rtl");
+    assert_eq!(direction("ar-Latn"), "ltr");
+    assert_eq!(direction("und-Zyyy"), "undefined");
+    assert_eq!(direction("en-Brai"), "undefined");
+    assert_eq!(
+        run("Object.keys(new Intl.Locale('ar').getTextInfo()).join(',')"),
+        "direction"
+    );
+
+    // NumberingSystemsOfLocale: the nu keyword, else the matched NumberFormat locale's default,
+    // agreeing with Intl.NumberFormat's own resolution.
+    assert_eq!(
+        run("new Intl.Locale('ar').getNumberingSystems().join(',')"),
+        "arab"
+    );
+    assert_eq!(
+        run("new Intl.Locale('ar-MA').getNumberingSystems().join(',')"),
+        "latn"
+    );
+    assert_eq!(
+        run("new Intl.Locale('ar-u-nu-latn').getNumberingSystems().join(',')"),
+        "latn"
+    );
+    assert_eq!(
+        run("new Intl.Locale('ar').getNumberingSystems()[0] === \
+             new Intl.NumberFormat('ar').resolvedOptions().numberingSystem"),
+        "true"
+    );
+    assert_eq!(
+        run("new Intl.Locale('en').getNumberingSystems().join(',')"),
+        "latn"
+    );
+
+    // TimeZonesOfLocale: undefined without a region; otherwise the region's zone.tab zones,
+    // primary identifiers in code unit order.
+    assert_eq!(
+        run("String(new Intl.Locale('en').getTimeZones())"),
+        "undefined"
+    );
+    assert_eq!(
+        run("new Intl.Locale('de-DE').getTimeZones().join(',')"),
+        "Europe/Berlin,Europe/Busingen"
+    );
+    assert_eq!(
+        run("new Intl.Locale('en-GB').getTimeZones().join(',')"),
+        "Europe/London"
+    );
+    assert_eq!(
+        run("var z = new Intl.Locale('en-US').getTimeZones(); \
+             [z.length, z[0], z.includes('America/New_York'), z.includes('Pacific/Honolulu'), \
+              z.every((zone, k) => k === 0 || z[k - 1] < zone), \
+              z.every(zone => Intl.supportedValuesOf('timeZone').includes(zone))].join()"),
+        "29,America/Adak,true,true,true,true"
+    );
+    assert_eq!(run("new Intl.Locale('es-419').getTimeZones().length"), "0");
+}
+
+#[cfg(feature = "intl")]
+#[test]
 fn locale_info_collations_and_default_locale() {
     assert_eq!(
         run("new Intl.Locale('und').getCollations().join(',')"),
@@ -25006,7 +25159,7 @@ fn datetimeformat_cldr_styles_skeletons_connectors_and_ranges() {
               }).formatToParts(t + 789).filter(p =>
                 p.type === 'fractionalSecond' || p.value === '٫'
               ).map(p => p.value).join('')].join('|')"),
-        "15 juin 2020 à 13:45|2020年6月15日月曜日|15 जून 2020|2020/6/15|numeric|٫٧٨٩"
+        "15 juin 2020 à 13:45|2020年6月15日月曜日|15 जून 2020|2020年6月15日|numeric|٫٧٨٩"
     );
 
     // UTS #35 interval formats collapse shared fields, may refine numeric widths, and split at the
@@ -28439,4 +28592,770 @@ fn embedded_scripts_report_their_origin_in_stack_frames() {
             .to_string(),
         frames(&["Error: v", "at https://example.com/v.js:1:1"])
     );
+}
+
+#[test]
+fn number_to_string_radix_is_the_shortest_round_trip() {
+    // ECMA-262 #sec-numeric-types-number-tostring (snapshot e28783d5fc9d): for a radix other
+    // than 10, the fewest digits s with 𝔽(s × radix^(n - k)) equal to x, written positionally.
+    // Each expectation was checked with exact rational arithmetic to round to x under
+    // round-half-even and to have no shorter such representation. (V8 prints
+    // 1e21.toString(36) as "5v1j4f4ds7c000", which does not round to 1e21.)
+    let cases = [
+        ("1e21.toString(36)", "5v1j4f4ds7a000"),
+        (
+            "0.1.toString(2)",
+            "0.0001100110011001100110011001100110011001100110011001101",
+        ),
+        (
+            "(1/3).toString(2)",
+            "0.010101010101010101010101010101010101010101010101010101",
+        ),
+        ("Math.PI.toString(7)", "3.066365143203613411"),
+        ("123.456.toString(36)", "3f.gez4w97ry"),
+        (
+            "(2**60).toString(3)",
+            "21200101122222021102111220121120000000",
+        ),
+        (
+            "(2**53 + 2).toString(3)",
+            "1121202011211211122211100012101121",
+        ),
+        ("(-255.5).toString(16)", "-ff.8"),
+        ("0.5.toString(3)", "0.1111111111111111111111111111111112"),
+        ("1e-7.toString(16)", "0.000001ad7f29abcaf48"),
+        ("4.35.toString(8)", "4.26314631463146314"),
+        ("(-0).toString(2)", "0"),
+        ("NaN.toString(36)", "NaN"),
+        ("(-Infinity).toString(2)", "-Infinity"),
+        ("(2**53 - 1).toString(36)", "2gosa7pa2gv"),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(run(source), expected, "{source}");
+    }
+    // Subnormal and extreme magnitudes keep every needed digit.
+    assert_eq!(
+        run("(2**-1074).toString(2) === '0.' + '0'.repeat(1073) + '1'"),
+        "true"
+    );
+    assert_eq!(
+        run("Number.MAX_VALUE.toString(2) === '1'.repeat(53) + '0'.repeat(971)"),
+        "true"
+    );
+    assert_eq!(
+        run("Number.MIN_VALUE.toString(36) === '0.' + '0'.repeat(207) + '3'"),
+        "true"
+    );
+    // The common identifier idiom stays short.
+    assert_eq!(
+        run("[0.123456789, 0.987654321].map(x => x.toString(36)).join()"),
+        "0.4fzzzxjylrz,0.zk00000yttk"
+    );
+}
+
+#[test]
+fn string_numeric_whitespace_is_the_ecmascript_set() {
+    // ECMA-262 #sec-stringtonumber and #sec-stringtobigint: StrWhiteSpaceChar is WhiteSpace or
+    // LineTerminator — every Zs code point, U+FEFF, TAB/VT/FF and LF/CR/LS/PS, but not U+0085
+    // (NEL), which Unicode's White_Space property includes.
+    assert_eq!(run("Number('\\u0085')"), "NaN");
+    assert_eq!(run("Number('\\u00855')"), "NaN");
+    assert_eq!(run("Number('\\u2028 5 \\u3000')"), "5");
+    assert_eq!(run("Number('\\uFEFF\\u000B5\\u00A0')"), "5");
+    assert_eq!(run("Number('\\u180E')"), "NaN");
+    assert_eq!(throws("BigInt('\\u00851')"), "SyntaxError");
+    assert_eq!(run("BigInt('\\u2029 7 \\u1680')"), "7");
+    assert_eq!(run("'\\u0085'.trim().length"), "1");
+    assert_eq!(run("parseFloat('\\u0085 1')"), "NaN");
+    // #sec-white-space: U+0085 in source text is not WhiteSpace.
+    assert!(Engine::new().eval("1\u{85}+ 1", false).is_err());
+    assert_eq!(run("1\u{3000}+\u{FEFF}1"), "2");
+    // #sec-encodeforregexpescape: only punctuators, WhiteSpace and LineTerminator (and
+    // surrogates) are escaped; other control characters are returned as themselves.
+    assert_eq!(
+        run("RegExp.escape('\\x01\\x85\\x7f\\u2028 ,') === '\\x01\\x85\\x7f\\\\u2028\\\\x20\\\\x2c'"),
+        "true"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn segmenter_segments_and_segment_iterators_follow_ecma_402() {
+    // ECMA-402 #sec-segments-objects, #sec-segment-iterator-objects and
+    // #sec-createsegmentdataobject (snapshot b1c961988b9a).
+    let prelude = "var g = new Intl.Segmenter('en'); var w = new Intl.Segmenter('en', \
+                   {granularity: 'word'}); var s = g.segment('a\\uD800b\\u{1F600}e\\u0301');";
+    let check = |source: &str, expected: &str| {
+        assert_eq!(run(&format!("{prelude} {source}")), expected, "{source}");
+    };
+    // %IntlSegmentsPrototype% is one shared ordinary object holding the methods.
+    check(
+        "var p = Object.getPrototypeOf(s); [p === Object.getPrototypeOf(w.segment('x')), \
+         Object.getPrototypeOf(p) === Object.prototype, Object.getOwnPropertyNames(s).length, \
+         Reflect.ownKeys(p).length, p.containing.length, p[Symbol.iterator].name].join()",
+        "true,true,0,2,1,[Symbol.iterator]",
+    );
+    // %IntlSegmentIteratorPrototype% inherits from %Iterator.prototype%.
+    check(
+        "var it = s[Symbol.iterator](); var ip = Object.getPrototypeOf(it); \
+         [Object.prototype.toString.call(it), Object.getPrototypeOf(ip) === Iterator.prototype, \
+          Object.getOwnPropertyNames(ip).join(), ip.next.length, \
+          JSON.stringify(Object.getOwnPropertyDescriptor(ip, Symbol.toStringTag))].join('|')",
+        "[object Segmenter String Iterator]|true|next|0|\
+         {\"value\":\"Segmenter String Iterator\",\"writable\":false,\"enumerable\":false,\"configurable\":true}",
+    );
+    // Lone surrogates, astral characters and combining marks; data objects are fresh each time.
+    check(
+        "[...s].map(d => d.segment.length + '@' + d.index).join()",
+        "1@0,1@1,1@2,2@3,2@5",
+    );
+    check(
+        "var it = s[Symbol.iterator](); var r = []; for (var k = 0; k < 6; k++) { var n = it.next(); \
+         r.push(n.done ? 'done' : n.value.index); } r.join()",
+        "0,1,2,3,5,done",
+    );
+    check(
+        "var c = s.containing(4); [c === s.containing(4), c.index, c.segment === '\\u{1F600}', \
+         c.input === s.containing(0).input, 'isWordLike' in c, Object.keys(c).join()].join()",
+        "false,3,true,true,false,segment,index,input",
+    );
+    check(
+        "var c = s.containing(0); c.segment = 'changed'; s.containing(0).segment",
+        "a",
+    );
+    // ToIntegerOrInfinity(index) and the range check.
+    check(
+        "[s.containing(-0.9).index, s.containing(NaN).index, s.containing(6.9).index, \
+         s.containing(-1), s.containing(7), s.containing(Infinity), s.containing(-Infinity)].join()",
+        "0,0,5,,,,",
+    );
+    check(
+        "var u = w.segment('Hello, world!'); \
+         [...u].map(d => d.segment + ':' + d.isWordLike).join('|') + '|' + \
+         u.containing(8).segment + ':' + u.containing(8).isWordLike",
+        "Hello:true|,:false| :false|world:true|!:false|world:true",
+    );
+    // RequireInternalSlot runs before the index conversion, and the two kinds are distinct.
+    check(
+        "var it = s[Symbol.iterator](); var e = []; \
+         for (var [f, t] of [[s.containing, it], [s.containing, {}], [it.next, s], [it.next, {}], \
+                             [s[Symbol.iterator], it]]) \
+           { try { f.call(t, {valueOf() { throw 'converted'; }}); e.push('none'); } \
+             catch (x) { e.push(x instanceof TypeError ? 'TypeError' : x); } } e.join()",
+        "TypeError,TypeError,TypeError,TypeError,TypeError",
+    );
+    // Iterators over one Segments object advance independently and mix with containing.
+    check(
+        "var a = s[Symbol.iterator](), b = s[Symbol.iterator](); a.next(); a.next(); \
+         [a.next().value.index, b.next().value.index, s.containing(5).index, a.next().value.index].join()",
+        "2,0,5,3",
+    );
+    check(
+        "s[Symbol.iterator]().map(d => d.index).filter(x => x > 1).toArray().join()",
+        "2,3,5",
+    );
+    check(
+        "[...g.segment('')].length + ':' + g.segment('').containing(0)",
+        "0:undefined",
+    );
+    // Segmenting is linear: a long input is not re-scanned per segment.
+    check(
+        "var big = 'ab\\u0301'.repeat(100000); var n = 0; for (var d of g.segment(big)) n++; \
+         n + ':' + g.segment(big).containing(299999).index",
+        "200000:299998",
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn number_format_uses_exact_intl_mathematical_values() {
+    // ECMA-402 #sec-tointlmathematicalvalue and #sec-runtime-semantics-stringintlmv (snapshot
+    // b1c961988b9a): ToPrimitive(number), then a String keeps its exact decimal value (a Number
+    // is its Number::toString digits), with only overflow/underflow mapped by RoundMVResult.
+    // FormatNumericToString then rounds that exact value. Expected strings are V8's (Node 24)
+    // except where noted.
+    let cases: &[(&str, &str, &str)] = &[
+        ("{}", "'0x1fffffffffffff8f'", "2,305,843,009,213,693,839"),
+        (
+            "{maximumFractionDigits: 0}",
+            "'1.49999999999999999999999'",
+            "1",
+        ),
+        (
+            "{maximumFractionDigits: 0}",
+            "'123456789012345678901234567890123456789012.5'",
+            "123,456,789,012,345,678,901,234,567,890,123,456,789,013",
+        ),
+        (
+            "{maximumFractionDigits: 20}",
+            "{valueOf() { return '1.0000000000000000001'; }}",
+            "1.0000000000000000001",
+        ),
+        ("{}", "'-0'", "-0"),
+        ("{}", "'1e400'", "∞"),
+        ("{}", "'-1e-400'", "-0"),
+        ("{}", "' 12_3 '", "NaN"),
+        ("{}", "'\\u00A01e+1\\u2028'", "10"),
+        ("{}", "'.5'", "0.5"),
+        ("{}", "'5.'", "5"),
+        ("{notation: 'scientific'}", "0", "0E0"),
+        ("{notation: 'scientific'}", "-0", "-0E0"),
+        (
+            "{notation: 'engineering'}",
+            "12345678901234567890123n",
+            "12.346E21",
+        ),
+        (
+            "{notation: 'compact'}",
+            "'999999999999999999999.5'",
+            "1,000,000,000T",
+        ),
+        (
+            "{minimumFractionDigits: 2, maximumFractionDigits: 2, roundingIncrement: 5}",
+            "'1234567890123456789012345678901234567890.025'",
+            "1,234,567,890,123,456,789,012,345,678,901,234,567,890.05",
+        ),
+        (
+            "{maximumFractionDigits: 0, roundingMode: 'halfEven'}",
+            "'2.50000000000000000001'",
+            "3",
+        ),
+        (
+            "{maximumFractionDigits: 0, roundingMode: 'halfEven'}",
+            "'2.5'",
+            "2",
+        ),
+        (
+            "{maximumFractionDigits: 0, roundingMode: 'floor'}",
+            "'-0.00000000000000000000001'",
+            "-1",
+        ),
+        (
+            "{maximumSignificantDigits: 2, roundingMode: 'halfTrunc'}",
+            "'125.00000000000000000001'",
+            "130",
+        ),
+        (
+            "{style: 'percent', maximumFractionDigits: 30}",
+            "'0.123456789012345678901234567'",
+            "12.3456789012345678901234567%",
+        ),
+        (
+            "{minimumFractionDigits: 20}",
+            "0.1",
+            "0.10000000000000000000",
+        ),
+        (
+            "{}",
+            "2n ** 200n",
+            "1,606,938,044,258,990,275,541,962,092,341,162,602,522,202,993,782,792,835,301,376",
+        ),
+    ];
+    for (options, value, expected) in cases {
+        assert_eq!(
+            run(&format!(
+                "new Intl.NumberFormat('en', {options}).format({value})"
+            )),
+            *expected,
+            "{options} {value}"
+        );
+    }
+    // Distinct exact endpoints are not "approximately" equal (V8 compares their Numbers).
+    assert_eq!(
+        run("new Intl.NumberFormat('en', {maximumFractionDigits: 20}) \
+             .formatRange('1.00000000000000000001', '1.00000000000000000002')"),
+        "1.00000000000000000001–1.00000000000000000002"
+    );
+    // PluralRules.select applies ToIntlMathematicalValue too: v = 24 here, so "other".
+    assert_eq!(
+        run("new Intl.PluralRules('en', {maximumFractionDigits: 30}) \
+             .select('1.000000000000000000000001')"),
+        "other"
+    );
+    assert_eq!(run("new Intl.PluralRules('en').select('1')"), "one");
+    // ToPrimitive(value, number) runs once; the primitive String is then parsed exactly.
+    assert_eq!(
+        run(
+            "var calls = 0; var nf = new Intl.NumberFormat('en', {maximumFractionDigits: 25}); \
+             nf.format({[Symbol.toPrimitive](hint) { calls++; return hint + '' === 'number' ? \
+             '0.1000000000000000000000001' : 'x'; }}) + ':' + calls"
+        ),
+        "0.1000000000000000000000001:1"
+    );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn date_time_format_follows_cldr_patterns_calendars_and_zone_names() {
+    // ECMA-402 #sec-formatdatetimepattern over CLDR 48 locale data: availableFormats matched by
+    // UTS #35 Part 4 Matching Skeletons (stand-alone months, appendItems), each calendar's own
+    // patterns and names (Japanese 元年 via y=jpanyear, Chinese leap months and cyclic years,
+    // the Hebrew ordinal month and Adar II, a date pattern's numbers override kept to its date
+    // fields), CLDR day periods, the locale's default calendar (th: buddhist), and time zone
+    // names by UTS #35 Part 4 Using Time Zone Names. Expected strings are V8's (ICU 78).
+    let cases = [
+        (
+            "en",
+            r#"{"month":"long","timeZone":"UTC"}"#,
+            1720105509000_i64,
+            "July",
+        ),
+        (
+            "en",
+            r#"{"year":"numeric","month":"long","day":"numeric","timeZone":"UTC"}"#,
+            1720105509000,
+            "July 4, 2024",
+        ),
+        (
+            "ja",
+            r#"{"year":"numeric","month":"long","timeZone":"UTC"}"#,
+            1720105509000,
+            "2024年7月",
+        ),
+        (
+            "ru",
+            r#"{"month":"long","timeZone":"UTC"}"#,
+            1720105509000,
+            "июль",
+        ),
+        (
+            "ru",
+            r#"{"month":"long","day":"numeric","timeZone":"UTC"}"#,
+            1720105509000,
+            "4 июля",
+        ),
+        ("th", r#"{"timeZone":"UTC"}"#, 1720105509000, "4/7/2567"),
+        (
+            "en-u-ca-buddhist",
+            r#"{"dateStyle":"full","timeZone":"UTC"}"#,
+            1720105509000,
+            "Thursday, July 4, 2567 BE",
+        ),
+        (
+            "ja-u-ca-japanese",
+            r#"{"year":"numeric","timeZone":"UTC"}"#,
+            1556712000000,
+            "令和元年",
+        ),
+        (
+            "ja-u-ca-japanese",
+            r#"{"year":"2-digit","timeZone":"UTC"}"#,
+            1720105509000,
+            "令和6年",
+        ),
+        (
+            "ja-u-ca-japanese",
+            r#"{"dateStyle":"long","timeZone":"UTC"}"#,
+            1556712000000,
+            "令和元年5月1日",
+        ),
+        (
+            "en-u-ca-chinese",
+            r#"{"dateStyle":"long","timeZone":"UTC"}"#,
+            1679446800000,
+            "Second Monthbis 1, 2023(gui-mao)",
+        ),
+        (
+            "zh-u-ca-chinese",
+            r#"{"dateStyle":"long","timeZone":"UTC"}"#,
+            1679446800000,
+            "2023癸卯年闰二月初一",
+        ),
+        (
+            "ko-u-ca-dangi",
+            r#"{"year":"numeric","month":"long","day":"numeric","timeZone":"UTC"}"#,
+            1679446800000,
+            "2023년(계묘년) 윤2월 1일",
+        ),
+        (
+            "ja-u-ca-chinese",
+            r#"{"dateStyle":"full","timeStyle":"short","timeZone":"UTC"}"#,
+            1720105509000,
+            "甲辰年五月二九日木曜日 15:05",
+        ),
+        (
+            "en-u-ca-hebrew",
+            r#"{"month":"numeric","timeZone":"UTC"}"#,
+            1679446800000,
+            "6",
+        ),
+        (
+            "en-u-ca-hebrew",
+            r#"{"dateStyle":"medium","timeZone":"UTC"}"#,
+            1679446800000,
+            "29 Adar 5783",
+        ),
+        (
+            "en-u-ca-hebrew",
+            r#"{"dateStyle":"medium","timeZone":"UTC"}"#,
+            1711069200000,
+            "12 Adar II 5784",
+        ),
+        (
+            "en-u-ca-islamic-umalqura",
+            r#"{"dateStyle":"long","timeZone":"UTC"}"#,
+            1720105509000,
+            "Dhuʻl-Hijjah 28, 1445 AH",
+        ),
+        (
+            "en-u-ca-persian",
+            r#"{"dateStyle":"long","timeZone":"UTC"}"#,
+            1720105509000,
+            "Tir 14, 1403 AP",
+        ),
+        (
+            "en",
+            r#"{"hour":"numeric","dayPeriod":"long","timeZone":"UTC"}"#,
+            1720105509000,
+            "3 in the afternoon",
+        ),
+        (
+            "zh",
+            r#"{"hour":"numeric","minute":"numeric","timeZone":"UTC"}"#,
+            1720105509000,
+            "15:05",
+        ),
+        (
+            "zh-u-ca-buddhist",
+            r#"{"hour":"numeric","minute":"numeric","timeZoneName":"shortOffset","timeZone":"UTC"}"#,
+            1720105509000,
+            "15:05 GMT+0",
+        ),
+        (
+            "de",
+            r#"{"timeZone":"Europe/Berlin","timeZoneName":"long","hour":"numeric"}"#,
+            1720105509000,
+            "17 Uhr Mitteleuropäische Sommerzeit",
+        ),
+        (
+            "fr",
+            r#"{"timeZone":"America/New_York","timeZoneName":"longGeneric","hour":"numeric"}"#,
+            1720105509000,
+            "11 h heure de l’Est nord-américain",
+        ),
+        (
+            "ja",
+            r#"{"timeZone":"Asia/Tokyo","timeZoneName":"short","hour":"numeric"}"#,
+            1720105509000,
+            "0時 JST",
+        ),
+        (
+            "en",
+            r#"{"timeZone":"America/Phoenix","timeZoneName":"shortGeneric","hour":"numeric"}"#,
+            1720105509000,
+            "8 AM MST",
+        ),
+        (
+            "en",
+            r#"{"weekday":"short","timeZone":"UTC"}"#,
+            1720105509000,
+            "Thu",
+        ),
+        (
+            "de",
+            r#"{"year":"numeric","month":"2-digit","day":"2-digit","timeZone":"UTC"}"#,
+            1720105509000,
+            "04.07.2024",
+        ),
+        // The ISO 8601 calendar's own CLDR patterns, with the locale's Gregorian names.
+        (
+            "en-u-ca-iso8601",
+            r#"{"dateStyle":"full","timeZone":"UTC"}"#,
+            1720105509000,
+            "2024 July 4, Thursday",
+        ),
+        (
+            "de-u-ca-iso8601",
+            r#"{"timeZone":"UTC"}"#,
+            1720105509000,
+            "2024-07-04",
+        ),
+        (
+            "ja-u-ca-iso8601",
+            r#"{"dateStyle":"medium","timeZone":"UTC"}"#,
+            1720105509000,
+            "2024 7月 4",
+        ),
+    ];
+    for (locale, options, epoch_ms, expected) in cases {
+        assert_eq!(
+            run(&format!(
+                "new Intl.DateTimeFormat('{locale}', {options}).format({epoch_ms})"
+            )),
+            expected,
+            "{locale} {options}"
+        );
+    }
+    assert_eq!(
+        run("new Intl.DateTimeFormat('th').resolvedOptions().calendar"),
+        "buddhist"
+    );
+    // UTS #35 interval formats: widths follow the request, a missing year difference uses the
+    // year-extended skeleton, a time range shares its date, and a time alone gains the date when
+    // the days differ (expected strings are V8's, with Lumen's ordinary space before a day period).
+    for (options, start, end, expected) in [
+        (
+            "{month: 'long', day: 'numeric'}",
+            "Date.UTC(2019, 0, 3)",
+            "Date.UTC(2019, 1, 5)",
+            "January 3\u{2009}\u{2013}\u{2009}February 5",
+        ),
+        (
+            "{month: 'short', day: 'numeric'}",
+            "Date.UTC(2019, 0, 3)",
+            "Date.UTC(2020, 0, 3)",
+            "Jan 3, 2019\u{2009}\u{2013}\u{2009}Jan 3, 2020",
+        ),
+        (
+            "{dateStyle: 'medium', timeStyle: 'short'}",
+            "Date.UTC(2019, 0, 3, 10)",
+            "Date.UTC(2019, 0, 3, 11)",
+            "Jan 3, 2019, 10:00\u{2009}\u{2013}\u{2009}11:00 AM",
+        ),
+        (
+            "{hour: 'numeric', minute: 'numeric'}",
+            "Date.UTC(2019, 0, 3, 10)",
+            "Date.UTC(2019, 0, 4, 11, 30)",
+            "1/3/2019, 10:00 AM\u{2009}\u{2013}\u{2009}1/4/2019, 11:30 AM",
+        ),
+        (
+            "{year: '2-digit', month: '2-digit', day: '2-digit'}",
+            "Date.UTC(2019, 0, 3)",
+            "Date.UTC(2019, 0, 5)",
+            "1/3/19\u{2009}\u{2013}\u{2009}1/5/19",
+        ),
+    ] {
+        assert_eq!(
+            run(&format!(
+                "new Intl.DateTimeFormat('en', {{...{options}, timeZone: 'UTC'}}).formatRange({start}, {end})"
+            )),
+            expected,
+            "{options}"
+        );
+    }
+    // The two-digit year of a Gregorian-era pattern is the year modulo 100.
+    assert_eq!(
+        run("new Intl.DateTimeFormat('en', {year: '2-digit', timeZone: 'UTC'}).format(Date.UTC(2024, 0, 1))"),
+        "24"
+    );
+    // A Gregorian date before 1582 stays proleptic (ECMA-402 ToLocalTime uses ECMA-262's
+    // YearFromTime, MonthFromTime and DateFromTime for "gregory").
+    assert_eq!(
+        run("new Intl.DateTimeFormat('en', {dateStyle: 'long', timeZone: 'UTC'}).format(Date.UTC(1000, 0, 1))"),
+        "January 1, 1000"
+    );
+}
+
+#[test]
+fn date_parse_reads_rfc_5322_obsolete_zones() {
+    // RFC 5322 section 4.3 obs-zone in Date.parse's implementation-specific fallback; the
+    // expected values are V8's (Node 24).
+    for (text, expected) in [
+        ("Tue, 01 Jan 2030 10:00:00 PST", "1893520800000"),
+        ("Tue, 01 Jan 2030 10:00:00 PDT", "1893517200000"),
+        ("7 March 2021 10:00 EST", "1615129200000"),
+        ("7 March 2021 10:00 EDT", "1615125600000"),
+        ("7 March 2021 10:00 CST", "1615132800000"),
+        ("7 March 2021 10:00 MDT", "1615132800000"),
+        ("Sun, 07 Mar 2021 10:00:00 UT", "1615111200000"),
+        ("Sun, 07 Mar 2021 10:00:00 GMT", "1615111200000"),
+    ] {
+        assert_eq!(run(&format!("Date.parse('{text}')")), expected, "{text}");
+    }
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn number_format_composes_per_units_from_cldr_patterns() {
+    // ECMA-402 IsWellFormedUnitIdentifier admits "X-per-Y" for any two sanctioned single units;
+    // UTS #35 Part 2 Compound Units formats them: a precomposed pattern when CLDR has one, else
+    // the numerator (for the plural category) with the denominator's perUnitPattern, else the
+    // `per` compound pattern with the denominator's singular name. Expected strings are V8's.
+    let cases = [
+        ("en", "5", "megabyte-per-second", "short", "5 MB/s"),
+        ("en", "5", "meter-per-second", "long", "5 meters per second"),
+        (
+            "de",
+            "1",
+            "kilometer-per-hour",
+            "long",
+            "1 Kilometer pro Stunde",
+        ),
+        ("en", "5", "kilobyte-per-millisecond", "narrow", "5kB/ms"),
+        ("fr", "5", "gallon-per-hour", "long", "5 gallons par heure"),
+        (
+            "en",
+            "1234.5",
+            "liter-per-kilometer",
+            "short",
+            "1,234.5 L/km",
+        ),
+        ("en", "1", "byte-per-week", "long", "1 byte per week"),
+        ("en", "5", "byte-per-week", "long", "5 bytes per week"),
+        ("en", "5", "liter-per-acre", "short", "5 L/ac"),
+        ("en", "5", "liter-per-acre", "long", "5 liters per acre"),
+        ("ja", "5", "gigabyte-per-day", "long", "5 ギガバイト/日"),
+        (
+            "ru",
+            "2",
+            "kilometer-per-second",
+            "long",
+            "2 километра в секунду",
+        ),
+        (
+            "ru",
+            "5",
+            "kilometer-per-second",
+            "long",
+            "5 километров в секунду",
+        ),
+        ("en", "30", "mile-per-hour", "short", "30 mph"),
+        ("en", "30", "mile-per-gallon", "long", "30 miles per gallon"),
+        ("pl", "2", "gram-per-liter", "long", "2 gramy na litr"),
+    ];
+    for (locale, number, unit, display, expected) in cases {
+        assert_eq!(
+            run(&format!(
+                "new Intl.NumberFormat('{locale}', {{style: 'unit', unit: '{unit}', \
+                 unitDisplay: '{display}'}}).format({number})"
+            )),
+            expected,
+            "{locale} {unit} {display}"
+        );
+    }
+    assert_eq!(
+        run(
+            "JSON.stringify(new Intl.NumberFormat('en', {style: 'unit', \
+             unit: 'megabyte-per-second'}).formatToParts(5))"
+        ),
+        r#"[{"type":"integer","value":"5"},{"type":"literal","value":" "},{"type":"unit","value":"MB/s"}]"#
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn embedding_helpers_follow_their_documented_semantics() {
+    let mut engine = Engine::new();
+    let same = |a: &Value, b: &Value| match (a, b) {
+        (Value::Obj(a), Value::Obj(b)) => std::rc::Rc::ptr_eq(a, b),
+        _ => false,
+    };
+    let value = |engine: &mut Engine, source: &str| {
+        engine
+            .eval_value_interruptible(source)
+            .expect("parses")
+            .unwrap_or_else(|_| panic!("{source} threw"))
+    };
+    // make_uint8array allocates with the intrinsic %Uint8Array.prototype% and runs no author code,
+    // however the global binding is replaced (AllocateTypedArray, ECMA-262 #sec-allocatetypedarray).
+    run_in(
+        &mut engine,
+        "var proto = Uint8Array.prototype; var calls = 0; \
+         globalThis.Uint8Array = function () { calls++; throw new Error('author code ran'); }",
+    );
+    let bytes = engine
+        .ctx()
+        .make_uint8array(&[1, 2, 3])
+        .unwrap_or_else(|_| panic!("allocation threw"));
+    let global = engine.global_this();
+    assert!(engine.ctx().member_set(&global, "made", bytes).is_ok());
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "[Object.getPrototypeOf(made) === proto, made.length, made.join(), calls].join()"
+        ),
+        "true,3,1,2,3,0"
+    );
+    // TypedArrayCreateSameType and fromBase64 also use the intrinsics, not global bindings.
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "var I8 = Int8Array; globalThis.Int8Array = null; \
+             var reversed = new I8([1, 2, 3]).toReversed(); \
+             [reversed instanceof I8, reversed.join(), \
+              Object.getPrototypeOf(proto.constructor.fromBase64('AQI=')) === proto, calls].join()"
+        ),
+        "true,3,2,1,true,0"
+    );
+    // typed_array_set_bytes writes only within the view.
+    run_in(
+        &mut engine,
+        "var whole = new proto.constructor(16); var view = new proto.constructor(whole.buffer, 4, 4)",
+    );
+    let view = value(&mut engine, "view");
+    assert!(!engine.ctx().typed_array_set_bytes(&view, &[9; 6]));
+    assert!(engine.ctx().typed_array_set_bytes(&view, &[7, 7]));
+    assert_eq!(run_in(&mut engine, "whole.join('')"), "0000770000000000");
+    // prototype_of: the ToObject view without traps; get_prototype_of: Object.getPrototypeOf.
+    let number_proto = value(&mut engine, "Number.prototype");
+    let five = Value::Num(5.0);
+    assert!(same(&engine.ctx().prototype_of(&five), &number_proto));
+    let trapped = value(
+        &mut engine,
+        "new Proxy({}, {getPrototypeOf() { return Array.prototype; }})",
+    );
+    let array_proto = value(&mut engine, "Array.prototype");
+    let object_proto = value(&mut engine, "Object.prototype");
+    assert!(same(&engine.ctx().prototype_of(&trapped), &object_proto));
+    let resolved = engine
+        .ctx()
+        .get_prototype_of(&trapped)
+        .unwrap_or_else(|_| panic!("trap threw"));
+    assert!(same(&resolved, &array_proto));
+    assert!(engine.ctx().get_prototype_of(&Value::Null).is_err());
+    // Ctx::type_of applies Annex B.3.6.
+    let dda = engine.ctx().make_html_dda();
+    assert_eq!(dda.type_of(), "function");
+    assert_eq!(engine.ctx().type_of(&dda), "undefined");
+    // eval_in_realm is ScriptEvaluation: global lexical declarations persist in that Realm, and a
+    // parse failure is that Realm's SyntaxError.
+    let realm = engine.ctx().create_realm();
+    assert!(engine
+        .ctx()
+        .eval_in_realm(&realm, "let shared = 41;")
+        .is_ok());
+    let completion = engine.ctx().eval_in_realm(&realm, "shared + 1");
+    assert!(matches!(completion, Ok(Value::Num(n)) if n == 42.0));
+    // A sloppy Script's assignment to an undeclared name creates that Realm's global property.
+    assert!(engine.ctx().eval_in_realm(&realm, "assigned = 7;").is_ok());
+    let completion = engine.ctx().eval_in_realm(&realm, "globalThis.assigned");
+    assert!(matches!(completion, Ok(Value::Num(n)) if n == 7.0));
+    let other_syntax = engine
+        .ctx()
+        .member_get(&realm, "SyntaxError")
+        .unwrap_or_else(|_| panic!("SyntaxError lookup threw"));
+    match engine.ctx().eval_in_realm(&realm, "let let = 1") {
+        Err(crate::interpreter::Abrupt::Throw(error)) => {
+            let constructor = engine
+                .ctx()
+                .member_get(&error, "constructor")
+                .unwrap_or_else(|_| panic!("constructor lookup threw"));
+            assert!(same(&constructor, &other_syntax));
+        }
+        _ => panic!("expected the other Realm's SyntaxError"),
+    }
+    // A sparse length beyond the copied prefix allocates nothing large.
+    let sparse = value(
+        &mut engine,
+        "var sparse = [1, 2]; sparse.length = 4e9; sparse",
+    );
+    assert!(engine
+        .ctx()
+        .copy_numeric_array(&sparse, usize::MAX)
+        .is_none());
+    // An interruption stays distinguishable from a JavaScript throw.
+    let function = value(&mut engine, "(function () { return 1; })");
+    engine.interrupt_handle().cancel();
+    assert_eq!(
+        engine.ctx().pending_interrupt(),
+        Some(crate::InterruptReason::Cancelled)
+    );
+    assert!(matches!(
+        engine
+            .ctx()
+            .invoke_interruptible(function, Value::Undefined, &[]),
+        Err(crate::embed::EvalError::Interrupted(
+            crate::InterruptReason::Cancelled
+        ))
+    ));
 }

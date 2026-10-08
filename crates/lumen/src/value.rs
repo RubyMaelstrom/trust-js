@@ -1501,6 +1501,9 @@ impl Value {
     pub fn is_callable(&self) -> bool {
         matches!(self, Value::Obj(o) if !matches!(o.borrow().call, Callable::None))
     }
+    /// The `typeof` result determined by the value alone. The Annex B.3.6 [[IsHTMLDDA]] object
+    /// (`document.all`) is branded in its Agent, so this reports "function" for it; use
+    /// `Ctx::type_of` for the operator's exact result.
     pub fn type_of(&self) -> &'static str {
         match self {
             Value::Undefined | Value::Empty => "undefined",
@@ -1708,9 +1711,9 @@ pub struct StringIteratorState {
     pub(crate) index: usize,
 }
 
-/// Exotic internal data for built-in object kinds (arrays, primitive wrappers). The wrapper
-/// variants are read by the `this_*` coercion helpers but not yet constructed (`new String()` etc.
-/// still return primitives — boxing is the next built-ins milestone).
+/// Exotic internal data for built-in object kinds: arrays, primitive wrappers (the
+/// [[BooleanData]]/[[NumberData]]/[[StringData]]/[[SymbolData]]/[[BigIntData]] of wrapper
+/// objects), errors, arguments objects, and array/string iterators.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub enum Exotic {

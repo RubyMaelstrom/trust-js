@@ -1,7 +1,7 @@
-//! A from-scratch subset of the `Temporal` proposal (ISO-8601 calendar only). Covers the
-//! non-timezone types — PlainDate/PlainTime/PlainDateTime/PlainYearMonth/PlainMonthDay/Duration/
-//! Instant — with constructors, field getters, `from`/`compare`/`equals`/`toString`, `with`, and
-//! basic `add`/`subtract`. ZonedDateTime and TimeZone/Calendar objects are out of scope.
+//! A from-scratch `Temporal` (the TC39 Temporal specification): Instant, ZonedDateTime,
+//! PlainDateTime, PlainDate, PlainTime, PlainYearMonth, PlainMonthDay, Duration and Now, over the
+//! ISO 8601 calendar and the CLDR calendars in [`KNOWN_CALENDARS`] (ECMA-402 calendar support),
+//! with named time zones from the IANA database ([`crate::tz`]) and UTC offset time zones.
 
 use crate::interpreter::Interp;
 use crate::value::{Gc, NativeFn, Object, Property, Value};
@@ -360,10 +360,8 @@ fn build_time(
 /// Build a time honoring `overflow`: `reject` range-checks (as [`build_time`]); `constrain` clamps
 /// each field into its valid range.
 #[allow(clippy::too_many_arguments)]
-/// The recognised BCP-47 calendar identifiers. Date arithmetic uses the proleptic ISO/Gregorian
-/// calendar for all of them (exact for iso8601/gregory; the others are accepted so construction and
-/// `calendarId` round-trip, even though their field output is not yet calendar-specific).
-// The calendars Temporal itself accepts. Note "islamic", "islamic-rgsa", and "islamicc" are NOT
+// The calendars Temporal itself accepts; each has its own field arithmetic below (the arithmetic
+// calendars, the Hebrew and Chinese/Dangi lunisolar calendars, and table-based Umm al-Qura). Note "islamic", "islamic-rgsa", and "islamicc" are NOT
 // here: "islamicc" is only an alias (→ islamic-civil), and "islamic"/"islamic-rgsa" are recognized
 // solely by Intl.DateTimeFormat, so Temporal rejects them.
 const KNOWN_CALENDARS: &[&str] = &[
@@ -491,7 +489,8 @@ fn is_13month(cal: &str) -> bool {
 }
 
 // Tabular Islamic ("civil"/Kuwaiti) calendar. epoch_days of AH 1-01-01: civil = Julian 622-07-16,
-// astronomical (tbla) = 622-07-15. Observational variants are approximated by the civil algorithm.
+// astronomical (tbla) = 622-07-15. Temporal rejects the observational "islamic"/"islamic-rgsa";
+// Intl.DateTimeFormat resolves those identifiers to islamic-civil.
 const ISLAMIC_EPOCH: i64 = -492148;
 fn is_islamic(cal: &str) -> bool {
     cal.starts_with("islamic")
@@ -10398,6 +10397,12 @@ fn install_zoned(it: &mut Interp, ns: &Gc) {
         // Skip table entries that do not change the actual UTC offset (rule-only changes).
         loop {
             match crate::tz::next_transition(&tz, sec, forward) {
+                // GetNamedTimeZoneNextTransition/PreviousTransition return null when the first
+                // transition lies outside the representable instants; a zone's rule can keep
+                // producing transitions indefinitely.
+                Some(ts) if (ts as i128 * 1_000_000_000).abs() > NS_MAX_INSTANT => {
+                    return Ok(Value::Null)
+                }
                 Some(ts) => {
                     let ns = ts as i128 * 1_000_000_000;
                     let off = zone_offset(&tz, ns);

@@ -377,8 +377,9 @@ impl Lexer<'_> {
             if is_line_terminator(c) {
                 self.nl_pending = true;
                 self.bump();
-            } else if c.is_whitespace() || c == '\u{FEFF}' {
-                // ZWNBSP (U+FEFF) is JS whitespace anywhere in the source, not just as a BOM.
+            } else if crate::regex::js_whitespace(c) {
+                // WhiteSpace (ECMA-262 #sec-white-space): ZWNBSP (U+FEFF) anywhere in the source,
+                // not just as a BOM, and every Zs code point, but not U+0085 (NEL).
                 self.bump();
             } else if c == '/' && self.peek2() == Some('/') {
                 self.skip_line_comment();
@@ -812,7 +813,7 @@ impl Lexer<'_> {
                 Some(c) => {
                     src.push(c);
                     newline |= is_line_terminator(c);
-                    if !c.is_whitespace() {
+                    if !crate::regex::js_whitespace(c) {
                         last_sig = Some(c);
                         newline = false;
                     }

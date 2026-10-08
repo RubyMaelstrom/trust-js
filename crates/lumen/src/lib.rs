@@ -159,7 +159,11 @@ mod typedarray_search_tests;
 mod tz;
 mod weak_metadata;
 #[rustfmt::skip]
+// The daylight-time flags serve Intl's time zone names.
+#[cfg_attr(not(feature = "intl"), allow(dead_code))]
 mod tzdata;
+#[rustfmt::skip]
+mod tzrules;
 #[rustfmt::skip]
 mod umalqura;
 #[rustfmt::skip]
@@ -175,6 +179,9 @@ mod cldr_collation;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_datetime_patterns;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_tz_names;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_units;
@@ -1380,7 +1387,8 @@ impl Engine {
         !self.interp.microtasks.is_empty() || !self.interp.pending_finalization_cleanup.is_empty()
     }
 
-    /// Run a single queued job; `false` when the queue was empty.
+    /// Run a single queued job; `false` when the queue was empty or a host interruption stopped
+    /// the job (use [`Self::run_one_job_interruptible`] to tell the two apart).
     pub fn run_one_job(&mut self) -> bool {
         self.run_one_job_interruptible().unwrap_or(false)
     }

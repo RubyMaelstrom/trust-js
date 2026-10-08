@@ -774,15 +774,50 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
     Ok(result)
 }
 
-/// Construct a fresh TypedArray of the same element kind via its intrinsic constructor (ignoring
-/// `@@species`), as `TypedArrayCreateSameType` does for toSorted/toReversed/with.
+/// ECMA-262 #sec-typedarraycreatesametype for toSorted/toReversed/with: construct through the
+/// Table 71 *intrinsic* constructor of the exemplar's type (never a global binding or
+/// `@@species`). Constructing the intrinsic with a length runs no author code and allocates
+/// with its non-writable `prototype`, so allocating directly is observably identical.
 fn ta_create_same(i: &mut Interp, kind: TaKind, len: usize) -> Result<(Value, TaInfo), Value> {
-    let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), kind.name()))?;
-    let r = ab(i.construct(ctor, &[Value::Num(len as f64)]))?;
-    let info = map_ptr(&r)
-        .and_then(|p| i.typed_arrays.get(&p).copied())
-        .ok_or_else(|| i.make_error("TypeError", "TypedArray constructor did not return a view"))?;
-    Ok((r, info))
+    if len > MAX_BUFFER_BYTES / kind.elsize() {
+        return Err(i.make_error(
+            "RangeError",
+            "TypedArray backing buffer exceeds allocation limit",
+        ));
+    }
+    Ok(typed_array_from_bytes(
+        i,
+        kind,
+        vec![0; len * kind.elsize()],
+    ))
+}
+
+/// AllocateTypedArray (ECMA-262 #sec-allocatetypedarray) with the current Realm's intrinsic
+/// %<kind>.prototype% over a fresh fixed-length ArrayBuffer holding `bytes` (a whole number of
+/// elements). It runs no author code, so a replaced global constructor cannot observe or
+/// substitute the result.
+pub(crate) fn typed_array_from_bytes(
+    i: &mut Interp,
+    kind: TaKind,
+    bytes: Vec<u8>,
+) -> (Value, TaInfo) {
+    let len = bytes.len() / kind.elsize();
+    let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
+    let obj = Object::new(i.extra_protos.get(kind.name()).cloned());
+    let p = Rc::as_ptr(&obj) as usize;
+    i.gc_pin(&obj);
+    obj.borrow().ic_plain.set(false);
+    let info = TaInfo {
+        buffer: buf_ptr,
+        offset: 0,
+        len,
+        kind,
+        track: false,
+    };
+    i.typed_arrays.insert(p, info);
+    i.ta_buffer.insert(p, buf_val);
+    i.register_native_typed_array(&obj, info);
+    (Value::Obj(obj), info)
 }
 
 /// CompareTypedArrayElements default (no comparefn): a total order over numbers where NaN sorts last
@@ -2397,17 +2432,10 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
     let buf = storage.borrow();
     Ok(buf[info.offset..info.offset + info.len].to_vec())
 }
+/// The new Uint8Array of `Uint8Array.fromBase64`/`fromHex`: AllocateTypedArray("Uint8Array",
+/// %Uint8Array%, %Uint8Array.prototype%, length) and its bytes (proposal-arraybuffer-base64).
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
-    let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Uint8Array"))?;
-    let ta = ab(i.construct(ctor, &[Value::Num(bytes.len() as f64)]))?;
-    if let Some(ptr) = map_ptr(&ta) {
-        if let Some(info) = i.typed_arrays.get(&ptr).copied() {
-            if let Some(buf) = i.array_buffers.get(&info.buffer) {
-                buf.borrow_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
-            }
-        }
-    }
-    Ok(ta)
+    Ok(typed_array_from_bytes(i, TaKind::U8, bytes).0)
 }
 fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
     if let Value::Obj(_) = opts {

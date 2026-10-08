@@ -236,6 +236,45 @@ pub fn week_info(region: &str) -> (u8, Vec<u8>) {
     (first_day, weekend)
 }
 
+/// The scripts whose default general ordering of characters within a line is right-to-left
+/// (`RTL: YES`) in UTS #35 Part 1 Script Metadata, CLDR common/properties/scriptMetadata.txt
+/// at commit 1c6bc010ee9a36ec11c108b7f5e015d08b86e389. Sorted.
+const RTL_SCRIPTS: &[&str] = &[
+    "Adlm", "Arab", "Armi", "Avst", "Chrs", "Cprt", "Elym", "Gara", "Hatr", "Hebr", "Hung", "Khar",
+    "Lydi", "Mand", "Mani", "Mend", "Merc", "Mero", "Narb", "Nbat", "Nkoo", "Orkh", "Ougr", "Palm",
+    "Phli", "Phlp", "Phnx", "Prti", "Rohg", "Samr", "Sarb", "Sidt", "Sogd", "Sogo", "Syrc", "Thaa",
+    "Yezi",
+];
+
+/// The scripts the same file marks left-to-right (`RTL: NO`). Scripts it marks `UNKNOWN`
+/// (Brai, Zinh, Zyyy, Zzzz) and scripts it does not list have no known direction. Sorted.
+const LTR_SCRIPTS: &[&str] = &[
+    "Aghb", "Ahom", "Armn", "Bali", "Bamu", "Bass", "Batk", "Beng", "Berf", "Bhks", "Bopo", "Brah",
+    "Bugi", "Buhd", "Cakm", "Cans", "Cari", "Cham", "Cher", "Copt", "Cpmn", "Cyrl", "Deva", "Diak",
+    "Dogr", "Dsrt", "Dupl", "Egyp", "Elba", "Ethi", "Geor", "Glag", "Gong", "Gonm", "Goth", "Gran",
+    "Grek", "Gujr", "Gukh", "Guru", "Hanb", "Hang", "Hani", "Hano", "Hans", "Hant", "Hira", "Hluw",
+    "Hmng", "Hmnp", "Ital", "Jamo", "Java", "Jpan", "Jurc", "Kali", "Kana", "Kawi", "Khmr", "Khoj",
+    "Kits", "Knda", "Kore", "Krai", "Kthi", "Lana", "Laoo", "Latn", "Lepc", "Limb", "Lina", "Linb",
+    "Lisu", "Lyci", "Mahj", "Maka", "Marc", "Medf", "Mlym", "Modi", "Mong", "Mroo", "Mtei", "Mult",
+    "Mymr", "Nagm", "Nand", "Newa", "Nshu", "Ogam", "Olck", "Onao", "Orya", "Osge", "Osma", "Pauc",
+    "Pcun", "Perm", "Phag", "Plrd", "Rjng", "Runr", "Saur", "Seal", "Sgnw", "Shaw", "Shrd", "Sidd",
+    "Sind", "Sinh", "Sora", "Soyo", "Sund", "Sunu", "Sylo", "Tagb", "Takr", "Tale", "Talu", "Taml",
+    "Tang", "Tavt", "Tayo", "Telu", "Tfng", "Tglg", "Thai", "Tibt", "Tirh", "Tnsa", "Todr", "Tols",
+    "Toto", "Tutg", "Ugar", "Vaii", "Vith", "Wara", "Wcho", "Xpeo", "Xsux", "Yiii", "Zanb",
+];
+
+/// The default line direction of a (title-case) ISO 15924 script: `"rtl"`, `"ltr"`, or `None`
+/// when Script Metadata does not determine it.
+pub fn script_direction(script: &str) -> Option<&'static str> {
+    if RTL_SCRIPTS.binary_search(&script).is_ok() {
+        Some("rtl")
+    } else if LTR_SCRIPTS.binary_search(&script).is_ok() {
+        Some("ltr")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +287,19 @@ mod tests {
         assert_eq!(week_info("AF"), (6, vec![4, 5]));
         assert_eq!(week_info("IN"), (7, vec![7]));
         assert_eq!(week_info("001"), (1, vec![6, 7]));
+    }
+
+    #[test]
+    fn script_metadata_directions_are_sorted_and_disjoint() {
+        assert!(RTL_SCRIPTS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(LTR_SCRIPTS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(RTL_SCRIPTS
+            .iter()
+            .all(|script| !LTR_SCRIPTS.contains(script)));
+        assert_eq!(script_direction("Arab"), Some("rtl"));
+        assert_eq!(script_direction("Hebr"), Some("rtl"));
+        assert_eq!(script_direction("Latn"), Some("ltr"));
+        assert_eq!(script_direction("Zyyy"), None);
+        assert_eq!(script_direction("Qaaa"), None);
     }
 }

@@ -1,7 +1,7 @@
-//! A from-scratch subset of ECMA-402 (`Intl`). No external ICU/CLDR dependency: the locale data
-//! (aliases, number symbols, date patterns, …) is embedded as small Rust tables, grown as the
-//! intl402 test262 score climbs. The structural machinery — BCP-47 tag parsing/canonicalization,
-//! option coercion, locale negotiation — is complete; the per-locale data is a deliberate subset.
+//! A from-scratch ECMA-402 (`Intl`) without an ICU dependency. The locale data (aliases, number
+//! symbols, date patterns, time zone names, …) is CLDR's, embedded as generated tables for the
+//! advertised locales. The structural machinery — BCP-47 tag parsing/canonicalization, option
+//! coercion, locale negotiation — covers every locale.
 
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, Gc, Object, Property, Value};
@@ -11,6 +11,8 @@ mod collator;
 mod data;
 mod datetimeformat;
 mod displaynames;
+mod dtf_interval;
+mod dtf_pattern;
 mod durationformat;
 mod listformat;
 mod locale;
@@ -20,8 +22,16 @@ mod relativetimeformat;
 mod segmenter;
 mod service;
 mod tags;
+mod tz_names;
 
 pub use tags::{canonicalize_language_tag, is_structurally_valid_tag};
+
+/// The English (CLDR `en`) specific non-location long name of a time zone at an instant, such
+/// as "Central European Summer Time", when CLDR has one: the implementation-defined name
+/// `Date.prototype.toString` appends (ECMA-262 #sec-timezoneestring).
+pub(crate) fn time_zone_long_name(zone: &str, epoch_sec: i64) -> Option<String> {
+    tz_names::english_long_name(zone, epoch_sec)
+}
 
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Undefined)
@@ -88,7 +98,7 @@ pub fn install(it: &mut Interp) {
     ] {
         let ctor = intl.borrow().props.get(svc).map(|p| p.value());
         if let Some(Value::Obj(c)) = ctor {
-            let key: &'static str = Box::leak(format!("%Intl.{svc}%").into_boxed_str());
+            let key = crate::builtins::static_name(&format!("%Intl.{svc}%"));
             Rc::make_mut(&mut it.extra_protos).insert(key, c);
         }
     }
@@ -276,7 +286,7 @@ pub(crate) fn make_service(
         );
     }
     Rc::make_mut(&mut it.extra_protos).insert(
-        Box::leak(format!("Intl.{name}").into_boxed_str()),
+        crate::builtins::static_name(&format!("Intl.{name}")),
         proto.clone(),
     );
     set_builtin(ns, name, Value::Obj(ctor.clone()));

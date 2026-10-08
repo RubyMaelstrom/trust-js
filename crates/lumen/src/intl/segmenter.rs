@@ -8,7 +8,8 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_builtin, set_data, Gc, Object, Property, Value};
+use std::rc::Rc;
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "Segmenter", 0, construct);
@@ -17,6 +18,31 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         segment(i, &this, &arg(a, 0))
     });
     it.def_method(&proto, "resolvedOptions", 0, resolved_options);
+    install_segments_prototypes(it);
+}
+
+/// ECMA-402 #sec-%intlsegmentsprototype%-object and #sec-%intlsegmentiteratorprototype%-object.
+fn install_segments_prototypes(it: &mut Interp) {
+    let segments_proto = Object::new(Some(it.object_proto.clone()));
+    it.def_method(&segments_proto, "containing", 1, segments_containing);
+    if let Some(symbol) = it.iterator_sym.clone() {
+        let iterator = it.make_native("[Symbol.iterator]", 0, segments_iterator);
+        segments_proto.borrow_mut().props.insert(
+            Interp::sym_key(&symbol),
+            Property::builtin(Value::Obj(iterator)),
+        );
+    }
+    let iterator_proto = Object::new(it.extra_protos.get("%IteratorPrototype%").cloned());
+    it.def_method(&iterator_proto, "next", 0, segment_iterator_next);
+    if let Some(key) = crate::builtins::to_string_tag_key(it) {
+        iterator_proto.borrow_mut().props.insert(
+            key,
+            Property::data(Value::lstr("Segmenter String Iterator"), false, false, true),
+        );
+    }
+    let protos = Rc::make_mut(&mut it.extra_protos);
+    protos.insert("%IntlSegmentsPrototype%", segments_proto);
+    protos.insert("%IntlSegmentIteratorPrototype%", iterator_proto);
 }
 
 fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
@@ -536,9 +562,61 @@ fn boundaries(s: &[u16], granularity: &str) -> Vec<(usize, bool)> {
     }
 }
 
+/// ECMA-402 #sec-intl.segmenter.prototype.segment.
 fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "#\u{0}sg")?;
-    let granularity = match o
+    let segmenter = brand_slot(i, this, "#\u{0}sg")?;
+    let string = ab(i.to_string(input))?;
+    // CreateSegmentsObject: [[SegmentsSegmenter]] and [[SegmentsString]].
+    let segments = Object::new(i.extra_protos.get("%IntlSegmentsPrototype%").cloned());
+    set_builtin(&segments, SEGMENTER_SLOT, Value::Obj(segmenter));
+    set_builtin(&segments, STRING_SLOT, Value::Str(string));
+    Ok(Value::Obj(segments))
+}
+
+/// Segments instances' [[SegmentsSegmenter]] and [[SegmentsString]].
+const SEGMENTER_SLOT: &str = "#\u{0}segments_segmenter";
+const STRING_SLOT: &str = "#\u{0}segments_string";
+/// Segment Iterators' [[IteratingSegmenter]] and [[IteratedString]].
+const ITERATING_SEGMENTER_SLOT: &str = "#\u{0}segment_iterator_segmenter";
+const ITERATED_STRING_SLOT: &str = "#\u{0}segment_iterator_string";
+/// The string's boundaries under the segmenter, computed on first use and shared by the
+/// Segments object's iterators: a hidden ArrayBuffer of [`RECORD`]-byte records (u32 UTF-16
+/// start, u32 byte start in the engine string, u8 word-like), one per segment, then a sentinel
+/// record holding the string's lengths.
+const BOUNDARIES_SLOT: &str = "#\u{0}segments_boundaries";
+const NEXT_INDEX_SLOT: &str = "#\u{0}segments_next_index";
+const RECORD: usize = 9;
+
+/// A Segments instance's or Segment Iterator's internal slots, after RequireInternalSlot.
+struct SegmentsSlots {
+    holder: Gc,
+    segmenter: Gc,
+    string: crate::lstr::LStr,
+}
+
+fn segments_slots(i: &mut Interp, this: &Value) -> Result<SegmentsSlots, Value> {
+    slots_of(this, SEGMENTER_SLOT, STRING_SLOT)
+        .ok_or_else(|| i.make_error("TypeError", "receiver is not a Segments object"))
+}
+
+fn slots_of(this: &Value, segmenter_slot: &str, string_slot: &str) -> Option<SegmentsSlots> {
+    this.as_obj().and_then(|holder| {
+        let object = holder.borrow();
+        let segmenter = object.props.get(segmenter_slot)?.value();
+        let string = object.props.get(string_slot)?.value();
+        match (segmenter, string) {
+            (Value::Obj(segmenter), Value::Str(string)) => Some(SegmentsSlots {
+                holder: holder.clone(),
+                segmenter,
+                string,
+            }),
+            _ => None,
+        }
+    })
+}
+
+fn granularity_of(segmenter: &Gc) -> String {
+    match segmenter
         .borrow()
         .props
         .get("#\u{0}sg_granularity")
@@ -546,88 +624,180 @@ fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> 
     {
         Some(Value::Str(s)) => s.to_string(),
         _ => "grapheme".to_string(),
-    };
-    let s = ab(i.to_string(input))?.to_string();
-    // jstr units: lone surrogates must round-trip (each is its own single-unit segment).
-    let units: Vec<u16> = crate::jstr::units(&s);
-    let bnds = boundaries(&units, &granularity);
-
-    // Build an array-like "Segments" object that is iterable and has a `containing` method. We
-    // pre-materialise the segment records.
-    let segments = i.new_object();
-    let mut records: Vec<Value> = Vec::new();
-    for (k, &(start, wordlike)) in bnds.iter().enumerate() {
-        let end = bnds.get(k + 1).map(|&(e, _)| e).unwrap_or(units.len());
-        let seg: String = crate::jstr::from_units(&units[start..end]);
-        let rec = i.new_object();
-        set_data(&rec, "segment", Value::lstr(seg));
-        set_data(&rec, "index", Value::Num(start as f64));
-        set_data(&rec, "input", Value::lstr(s.clone()));
-        if granularity == "word" {
-            set_data(&rec, "isWordLike", Value::Bool(wordlike));
-        }
-        records.push(Value::Obj(rec));
     }
-    // Make `segments` iterable by giving it a @@iterator returning an array iterator over records.
-    let arr = i.make_array(records);
-    set_builtin(&segments, "#\u{0}seg_records", arr.clone());
-    if let Some(sym) = i.iterator_sym.clone() {
-        let f = i.make_native("[Symbol.iterator]", 0, |i, this, _| {
-            let recs = ab(i.get_member(&this, "#\u{0}seg_records"))?;
-            let itf = ab(i.get_member(&recs, "values"))?;
-            ab(i.call(itf, recs, &[]))
-        });
-        segments.borrow_mut().props.insert(
-            crate::interpreter::Interp::sym_key(&sym),
-            crate::value::Property::builtin(Value::Obj(f)),
-        );
-    }
-    it_containing(i, &segments);
-    Ok(Value::Obj(segments))
 }
 
-fn it_containing(i: &mut Interp, segments: &Gc) {
-    let f = i.make_native("containing", 1, |i, this, a| {
-        let number = ab(i.to_number(&arg(a, 0)))?;
-        let idx = if number.is_nan() { 0.0 } else { number.trunc() };
-        if idx < 0.0 || idx == f64::INFINITY {
-            return Ok(Value::Undefined);
+/// The boundary records of the slots' string, computing and caching them on first use.
+fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter::ArrayBufferBytes {
+    let cached = slots
+        .holder
+        .borrow()
+        .props
+        .get(BOUNDARIES_SLOT)
+        .map(|p| p.value());
+    if let Some(Value::Obj(buffer)) = cached {
+        if let Some(bytes) = i.array_buffers.get(&(Rc::as_ptr(&buffer) as usize)) {
+            return bytes.clone();
         }
-        let recs = ab(i.get_member(&this, "#\u{0}seg_records"))?;
-        let len = ab(i.get_member(&recs, "length"))?;
-        let len = ab(i.to_number(&len))? as usize;
-        // Segment starts are strictly increasing. Find the first start greater than `idx`, then
-        // inspect its predecessor: O(log segments) instead of the old full-record scan.
-        let mut low = 0usize;
-        let mut high = len;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let record = ab(i.get_member(&recs, &middle.to_string()))?;
-            let start = ab(i.get_member(&record, "index"))?;
-            let start = ab(i.to_number(&start))?;
-            if start <= idx {
-                low = middle + 1;
-            } else {
-                high = middle;
+    }
+    let text: &str = &slots.string;
+    // jstr units: lone surrogates must round-trip (each is its own single-unit segment).
+    let units = crate::jstr::units(text);
+    let starts = boundaries(&units, &granularity_of(&slots.segmenter));
+    let mut bytes = Vec::with_capacity((starts.len() + 1) * RECORD);
+    let mut push = |unit: usize, byte: usize, word_like: bool| {
+        bytes.extend_from_slice(&(unit as u32).to_le_bytes());
+        bytes.extend_from_slice(&(byte as u32).to_le_bytes());
+        bytes.push(u8::from(word_like));
+    };
+    // Boundaries fall between code points, so each is a character boundary of the engine string.
+    let mut next = starts.iter().peekable();
+    let (mut unit, mut byte) = (0usize, 0usize);
+    for character in text.chars() {
+        while let Some(&&(start, word_like)) = next.peek() {
+            if start != unit {
+                break;
             }
+            push(unit, byte, word_like);
+            next.next();
         }
-        if low == 0 {
-            return Ok(Value::Undefined);
-        }
-        let record = ab(i.get_member(&recs, &(low - 1).to_string()))?;
-        let segment = ab(i.get_member(&record, "segment"))?;
-        let start = ab(i.get_member(&record, "index"))?;
-        let start = ab(i.to_number(&start))?;
-        let length = match &segment {
-            Value::Str(value) => crate::jstr::unit_len(value) as f64,
-            _ => 0.0,
+        unit += if crate::jstr::smuggled(character).is_some() {
+            1
+        } else {
+            character.len_utf16()
         };
-        if idx < start + length {
-            return Ok(record);
+        byte += character.len_utf8();
+    }
+    push(unit, byte, false);
+    let storage = Rc::new(std::cell::RefCell::new(bytes));
+    let (buffer, _) = crate::builtins::array_buffer_with_storage(i, storage.clone());
+    set_builtin(&slots.holder, BOUNDARIES_SLOT, buffer);
+    storage
+}
+
+/// Record `index`: (UTF-16 start, byte start, word-like).
+fn record_at(bytes: &[u8], index: usize) -> (usize, usize, bool) {
+    let at = index * RECORD;
+    let word = |from: usize| u32::from_le_bytes(bytes[from..from + 4].try_into().unwrap());
+    (word(at) as usize, word(at + 4) as usize, bytes[at + 8] != 0)
+}
+
+/// The number of segments (records before the sentinel) and the string's UTF-16 length.
+fn segment_count_and_length(bytes: &[u8]) -> (usize, usize) {
+    let count = bytes.len() / RECORD - 1;
+    (count, record_at(bytes, count).0)
+}
+
+/// The segment containing code unit `n` (< length): the last boundary at or before `n`
+/// (FindBoundary ~before~); the next record, possibly the sentinel, is its end (~after~).
+fn segment_at(bytes: &[u8], n: usize) -> usize {
+    let (count, _) = segment_count_and_length(bytes);
+    let (mut low, mut high) = (0, count);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if record_at(bytes, middle).0 <= n {
+            low = middle + 1;
+        } else {
+            high = middle;
         }
-        Ok(Value::Undefined)
-    });
-    set_builtin(segments, "containing", Value::Obj(f));
+    }
+    low - 1
+}
+
+/// ECMA-402 #sec-createsegmentdataobject for segment `index`.
+fn segment_data(i: &mut Interp, slots: &SegmentsSlots, bytes: &[u8], index: usize) -> Value {
+    let (start, start_byte, word_like) = record_at(bytes, index);
+    let (_, end_byte, _) = record_at(bytes, index + 1);
+    let result = i.new_object();
+    set_data(
+        &result,
+        "segment",
+        Value::Str(slots.string.slice_bytes(start_byte, end_byte)),
+    );
+    set_data(&result, "index", Value::Num(start as f64));
+    set_data(&result, "input", Value::Str(slots.string.clone()));
+    if granularity_of(&slots.segmenter) == "word" {
+        set_data(&result, "isWordLike", Value::Bool(word_like));
+    }
+    Value::Obj(result)
+}
+
+/// ECMA-402 #sec-%intlsegmentsprototype%.containing.
+fn segments_containing(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    let slots = segments_slots(i, &this)?;
+    // ToIntegerOrInfinity(index).
+    let number = ab(i.to_number(&arg(a, 0)))?;
+    let n = if number.is_nan() { 0.0 } else { number.trunc() };
+    let storage = boundary_records(i, &slots);
+    let bytes = storage.borrow();
+    let (_, length) = segment_count_and_length(&bytes);
+    if n < 0.0 || n >= length as f64 {
+        return Ok(Value::Undefined);
+    }
+    let index = segment_at(&bytes, n as usize);
+    Ok(segment_data(i, &slots, &bytes, index))
+}
+
+/// ECMA-402 #sec-%intlsegmentsprototype%-%symbol.iterator%: CreateSegmentIterator.
+fn segments_iterator(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
+    let slots = segments_slots(i, &this)?;
+    let iterator = Object::new(
+        i.extra_protos
+            .get("%IntlSegmentIteratorPrototype%")
+            .cloned(),
+    );
+    // [[IteratingSegmenter]], [[IteratedString]] and [[IteratedStringNextSegmentCodeUnitIndex]];
+    // the iterator shares its Segments object's boundary cache.
+    set_builtin(
+        &iterator,
+        ITERATING_SEGMENTER_SLOT,
+        Value::Obj(slots.segmenter.clone()),
+    );
+    set_builtin(
+        &iterator,
+        ITERATED_STRING_SLOT,
+        Value::Str(slots.string.clone()),
+    );
+    set_builtin(&iterator, NEXT_INDEX_SLOT, Value::Num(0.0));
+    boundary_records(i, &slots);
+    let buffer = slots
+        .holder
+        .borrow()
+        .props
+        .get(BOUNDARIES_SLOT)
+        .map(|p| p.value());
+    if let Some(buffer) = buffer {
+        set_builtin(&iterator, BOUNDARIES_SLOT, buffer);
+    }
+    Ok(Value::Obj(iterator))
+}
+
+/// ECMA-402 #sec-%intlsegmentiteratorprototype%.next.
+fn segment_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
+    let slots = slots_of(&this, ITERATING_SEGMENTER_SLOT, ITERATED_STRING_SLOT)
+        .ok_or_else(|| i.make_error("TypeError", "receiver is not a Segment Iterator"))?;
+    let start = match slots
+        .holder
+        .borrow()
+        .props
+        .get(NEXT_INDEX_SLOT)
+        .map(|p| p.value())
+    {
+        Some(Value::Num(start)) => start as usize,
+        _ => 0,
+    };
+    let storage = boundary_records(i, &slots);
+    let bytes = storage.borrow();
+    let (_, length) = segment_count_and_length(&bytes);
+    if start >= length {
+        return Ok(i.iter_result_obj(Value::Undefined, true));
+    }
+    let index = segment_at(&bytes, start);
+    let (end, _, _) = record_at(&bytes, index + 1);
+    set_builtin(&slots.holder, NEXT_INDEX_SLOT, Value::Num(end as f64));
+    let data = segment_data(i, &slots, &bytes, index);
+    drop(bytes);
+    Ok(i.iter_result_obj(data, false))
 }
 
 fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {

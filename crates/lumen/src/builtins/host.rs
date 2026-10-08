@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// The test262 `$262` host object. Only the portions lumen can support are provided (`global`,
-/// `gc`, `evalScript`, best-effort `detachArrayBuffer`); `agent`/`createRealm` are omitted.
+/// The test262 `$262` host object (test262 INTERPRETING.md): `global`, `gc`, `createRealm`,
+/// `evalScript`, `detachArrayBuffer`, `IsHTMLDDA`, `agent` and `AbstractModuleSource`.
 pub(super) fn install_host(it: &mut Interp) {
     let host = make_262(it, None);
     set_builtin(&it.global, "$262", host);
@@ -40,7 +40,14 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
         };
         let rg = ab(i.get_member(&this, "#\u{0}realm_global"))?;
         if let Value::Obj(_) = &rg {
-            return ab(i.eval_in_realm(&rg, &code));
+            return match i.eval_script_in_realm(&rg, &code) {
+                Ok(value) => Ok(value),
+                Err(Abrupt::Throw(value)) => Err(value),
+                Err(Abrupt::Interrupt(reason)) => {
+                    Err(i.make_error("QuotaExceededError", reason.message()))
+                }
+                Err(_) => Ok(Value::Undefined),
+            };
         }
         let (body, source) = crate::parser::parse_script_from(
             &code,

@@ -152,14 +152,10 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 
         set_builtin(
             &obj,
-            Box::leak(format!("#\u{0}df_u_{plural}").into_boxed_str()),
+            &format!("#\u{0}df_u_{plural}"),
             Value::lstr(style.clone()),
         );
-        set_builtin(
-            &obj,
-            Box::leak(format!("#\u{0}df_d_{plural}").into_boxed_str()),
-            Value::lstr(display),
-        );
+        set_builtin(&obj, &format!("#\u{0}df_d_{plural}"), Value::lstr(display));
         // prevStyle is updated only for hours..microseconds (nanoseconds and the calendar units do
         // not propagate).
         if matches!(
@@ -684,7 +680,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         set_data(&res, plural, get(&format!("#\u{0}df_u_{plural}")));
         set_data(
             &res,
-            Box::leak(format!("{plural}Display").into_boxed_str()),
+            &format!("{plural}Display"),
             get(&format!("#\u{0}df_d_{plural}")),
         );
     }

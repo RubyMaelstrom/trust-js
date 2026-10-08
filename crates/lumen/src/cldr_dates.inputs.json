@@ -5,7 +5,7 @@
   "distinct_input_count": 384,
   "era_record_count": 18504,
   "generator": "scripts/gen-cldr-dates.py",
-  "generator_sha256": "1d89f8f76e538ec0dc1387a4105a10c3d35d4554f359f9d6e26cb6297f79f52c",
+  "generator_sha256": "a91022b324e2a6c92327dcdd3e689031db1a229e0f9c4c608aa8a2a062b47b70",
   "input_url_base": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json",
   "inputs": [
     {
@@ -1545,16 +1545,16 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-dates-full/main/zh/ca-gregorian.json"
     }
   ],
-  "month_record_count": 14112,
+  "month_record_count": 14724,
   "original_generated_snapshot": {
     "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
     "path": "crates/lumen/src/cldr_dates.rs",
     "sha256": "7a0198abceba5fe084e7747fffcbb9525e6158b0bf2ec00a87e6e019c218e53b"
   },
-  "packed_source_sha256": "485e9f0132d124a8dcdb67a7a29ff31f668fb7b2f44703f59c70dd99fa688a67",
-  "string_blob_bytes": 68955,
+  "packed_source_sha256": "8575cd9a92b70684e00529dfc6c48c723cf1a7786755858613593ff8e7c31b2c",
+  "string_blob_bytes": 70049,
   "string_blob_path": "crates/lumen/src/cldr_dates.data",
-  "string_blob_sha256": "413e041a163667cc76ad7c2b37fb36b9bcf43ad67439e12afb36b6345d4587f9",
-  "text_reference_count": 116352,
-  "unique_string_count": 4489
+  "string_blob_sha256": "a578823daa783f241308a014c27d0d4918c11c68630ca3555f9db92703adff48",
+  "text_reference_count": 118188,
+  "unique_string_count": 4610
 }

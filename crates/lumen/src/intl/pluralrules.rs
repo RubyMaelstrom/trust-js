@@ -235,22 +235,16 @@ fn resolve_plural(
     object: &Gc,
     value: &Value,
 ) -> Result<(&'static str, String), Value> {
-    let exact = super::numberformat::exact_of(value);
-    let number = super::numberformat::to_intl_number(i, value)?;
-    if number.is_nan() {
-        return Ok(("other", "NaN".to_string()));
-    }
-    if number.is_infinite() && exact.is_none() {
-        return Ok((
-            "other",
-            if number.is_sign_negative() {
-                "-Infinity"
-            } else {
-                "Infinity"
-            }
-            .to_string(),
-        ));
-    }
+    let decimal = match super::numberformat::to_intl_mv(i, value)? {
+        super::numberformat::IntlMv::Finite(decimal) => decimal,
+        super::numberformat::IntlMv::NotANumber => return Ok(("other", "NaN".to_string())),
+        super::numberformat::IntlMv::PositiveInfinity => {
+            return Ok(("other", "Infinity".to_string()))
+        }
+        super::numberformat::IntlMv::NegativeInfinity => {
+            return Ok(("other", "-Infinity".to_string()))
+        }
+    };
 
     let min_int = number_slot(object, "#\u{0}pr_minint").unwrap_or(1);
     let min_frac = number_slot(object, "#\u{0}pr_minfrac").unwrap_or(0);
@@ -261,38 +255,19 @@ fn resolve_plural(
     let mode = string_slot(object, "#\u{0}pr_roundingmode");
     let rounding_type = string_slot(object, "#\u{0}pr_roundingtype");
     let notation = string_slot(object, "#\u{0}pr_notation");
-    let decimal = exact
-        .as_ref()
-        .and_then(|exact| {
-            // FormatNumericToString itself is notation-independent. Passing standard here allows
-            // exact BigInt/decimal digits while the already-resolved compact digit defaults still
-            // control rounding.
-            super::numberformat::exact_magnitude_options(
-                exact,
-                min_int,
-                min_frac,
-                max_frac,
-                min_sig,
-                max_sig,
-                increment,
-                &mode,
-                &rounding_type,
-                "standard",
-            )
-        })
-        .unwrap_or_else(|| {
-            super::numberformat::format_magnitude_options(
-                number,
-                min_int,
-                min_frac,
-                max_frac,
-                min_sig,
-                max_sig,
-                increment,
-                &mode,
-                &rounding_type,
-            )
-        });
+    // FormatNumericToString is notation-independent; the already-resolved compact digit
+    // defaults still control rounding.
+    let decimal = super::numberformat::exact_magnitude_options(
+        &decimal,
+        min_int,
+        min_frac,
+        max_frac,
+        min_sig,
+        max_sig,
+        increment,
+        &mode,
+        &rounding_type,
+    );
     let exponent = if notation == "compact" {
         compact_exponent(&decimal)
     } else {

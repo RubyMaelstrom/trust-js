@@ -122,28 +122,18 @@ pub fn install(it: &mut Interp, ns: &Gc) {
         hour_cycles_of_locale(i, &this)
     });
     it.def_method(&proto, "getNumberingSystems", 0, |i, this, _| {
-        info_list(i, &this, "#\u{0}locale_nu", &["latn"])
+        numbering_systems_of_locale(i, &this)
     });
     it.def_method(&proto, "getTimeZones", 0, |i, this, _| {
-        // Defined only for a locale with a region; otherwise `undefined`.
-        let region = {
-            let o = this.as_obj().ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-            if !o.borrow().props.contains("#\u{0}locale_tag") {
-                return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
-            }
-            matches!(o.borrow().props.get("#\u{0}locale_region").map(|p| p.value()), Some(Value::Str(s)) if !s.is_empty())
-        };
-        if region {
-            Ok(i.make_array(vec![Value::lstr("UTC")]))
-        } else {
-            Ok(Value::Undefined)
-        }
+        time_zones_of_locale(i, &this)
     });
     it.def_method(&proto, "getTextInfo", 0, |i, this, _| {
-        let _ = slot(i, &this, "#\u{0}locale_tag")?;
-        let o = i.new_object();
-        set_data(&o, "direction", Value::lstr("ltr"));
-        Ok(Value::Obj(o))
+        // ECMA-402 #sec-Intl.Locale.prototype.getTextInfo.
+        let tag = slot(i, &this, "#\u{0}locale_tag")?;
+        let info = i.new_object();
+        let direction = text_direction_of_locale(&tag).map_or(Value::Undefined, Value::lstr);
+        set_data(&info, "direction", direction);
+        Ok(Value::Obj(info))
     });
     it.def_method(&proto, "getWeekInfo", 0, |i, this, _| {
         week_info_of_locale(i, &this)
@@ -249,6 +239,37 @@ fn calendars_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
     Ok(string_array(i, vec!["gregory"]))
 }
 
+/// The locale's default calendar for Intl.DateTimeFormat's [[LocaleData]] `ca` (UTS #35 Calendar
+/// Preference Data, by the RegionPreference order CalendarsOfLocale uses): the first preferred
+/// calendar DateTimeFormat supports, with the observational Islamic calendars resolved to
+/// `islamic-civil` as DateTimeFormat resolves them.
+pub(super) fn default_calendar(tag: &str) -> String {
+    let Some(parsed) = tags::parse(tag) else {
+        return "gregory".to_string();
+    };
+    let mut base = parsed;
+    base.unicode = None;
+    base.transform = None;
+    base.other_ext.clear();
+    base.private.clear();
+    let preference = region_preference(&tags::render(&base));
+    for region in preference
+        .region_override
+        .iter()
+        .chain(std::iter::once(&preference.region))
+    {
+        if let Some(calendars) = crate::cldr_locale_info::calendar_preferences(region) {
+            if let Some(first) = calendars.first() {
+                return match *first {
+                    "islamic" | "islamic-rgsa" => "islamic-civil".to_string(),
+                    other => other.to_string(),
+                };
+            }
+        }
+    }
+    "gregory".to_string()
+}
+
 /// ECMA-402 CollationsOfLocale. Locale data is shared with `Intl.Collator`; unavailable languages
 /// use the specification's fixed root list.
 fn collations_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
@@ -316,29 +337,55 @@ fn week_info_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
     Ok(Value::Obj(object))
 }
 
-/// The value list for a `getX` info method: `[keyword]` if the locale carries that keyword, else the
-/// data default. Brand-checks the receiver.
-fn info_list(
-    i: &mut Interp,
-    this: &Value,
-    slot_name: &str,
-    default: &[&str],
-) -> Result<Value, Value> {
-    let o = this
-        .as_obj()
-        .ok_or_else(|| i.make_error("TypeError", "not a Locale"))?;
-    if !o.borrow().props.contains("#\u{0}locale_tag") {
-        return Err(i.make_error("TypeError", "receiver is not an Intl.Locale"));
+/// ECMA-402 #sec-numberingsystemsoflocale: the `nu` keyword, else the default numbering system of
+/// the Intl.NumberFormat available locale LookupMatchingLocaleByPrefix finds, else "latn".
+fn numbering_systems_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
+    if let Some(numbering_system) = locale_keyword(i, this, "#\u{0}locale_nu")? {
+        return Ok(string_array(i, vec![numbering_system]));
     }
-    let kw = match o.borrow().props.get(slot_name).map(|p| p.value()) {
-        Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
+    let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
+    let numbering_system = if super::service::supported_language(&parsed.language) {
+        // The matched available locale is the tag's base name or a prefix of it with the same
+        // language, which determines the default numbering system.
+        let mut base = parsed.clone();
+        base.unicode = None;
+        base.transform = None;
+        base.other_ext.clear();
+        base.private.clear();
+        super::service::default_numbering_system(&tags::render(&base))
+    } else {
+        "latn"
     };
-    let items: Vec<Value> = match kw {
-        Some(v) => vec![Value::lstr(v)],
-        None => default.iter().map(|s| Value::lstr(*s)).collect(),
+    Ok(string_array(i, vec![numbering_system]))
+}
+
+/// ECMA-402 #sec-timezonesoflocale: `undefined` without a region subtag, else the region's
+/// primary IANA zones in common use (zone.tab), in code unit order.
+fn time_zones_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
+    let tag = slot(i, this, "#\u{0}locale_tag")?;
+    let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
+    if parsed.region.is_empty() {
+        return Ok(Value::Undefined);
+    }
+    let zones = crate::tz::region_zones(&parsed.region).to_vec();
+    Ok(string_array(i, zones))
+}
+
+/// ECMA-402 #sec-textdirectionoflocale: the default line direction of the locale's script, or of
+/// the script Add Likely Subtags supplies, from UTS #35 Script Metadata.
+fn text_direction_of_locale(tag: &str) -> Option<&'static str> {
+    let parsed = tags::parse(tag)?;
+    let script = if parsed.script.is_empty() {
+        let (_, script, _) = add_likely(&parsed.language, "", &parsed.region)?;
+        script
+    } else {
+        parsed.script
     };
-    Ok(i.make_array(items))
+    if script.is_empty() {
+        return None;
+    }
+    crate::cldr_locale_info::script_direction(&titlecase(&script))
 }
 
 fn slot(i: &mut Interp, this: &Value, name: &str) -> Result<String, Value> {
@@ -629,11 +676,7 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
     if let Some((_a, keywords)) = &p.unicode {
         for (k, types) in keywords {
             let slot = format!("#\u{0}locale_{k}");
-            set_builtin(
-                &obj,
-                Box::leak(slot.into_boxed_str()),
-                Value::lstr(types.join("-")),
-            );
+            set_builtin(&obj, &slot, Value::lstr(types.join("-")));
         }
     }
     Ok(Value::Obj(obj))
@@ -641,7 +684,11 @@ fn build_locale_object(i: &mut Interp, tag: &str) -> Result<Value, Value> {
 
 /// Add Likely Subtags (UTS #35): resolve the most likely (language, script, region) for a partial
 /// identifier, keeping any originally-present subtags. Returns None only if nothing matches at all.
-fn add_likely(lang: &str, script: &str, region: &str) -> Option<(String, String, String)> {
+pub(super) fn add_likely(
+    lang: &str,
+    script: &str,
+    region: &str,
+) -> Option<(String, String, String)> {
     use crate::cldr_likely::likely;
     // "und" behaves as an absent language for override purposes.
     let orig_lang = if lang == "und" { "" } else { lang };

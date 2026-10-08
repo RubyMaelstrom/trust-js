@@ -3160,8 +3160,8 @@ impl Parser {
                 }
                 Some('<') => {
                     self.bump();
-                    // Named group (?<name>...) -> treat as a normal capturing group; lookbehind
-                    // (?<= / (?<! is approximated as a non-capturing group (best effort).
+                    // Lookbehind (?<= / (?<! (a backward-matching assertion), else a named
+                    // capturing group (?<name>...).
                     match self.peek() {
                         Some(c @ ('=' | '!')) => {
                             self.bump();
@@ -5595,8 +5595,9 @@ fn builtin_class_set(b: char) -> ClassSet {
     set
 }
 
-/// The derivable Unicode "properties of strings" (UTS #51 definitions built from the bundled
-/// emoji binary-property tables). The RGI_* curated lists are not derivable and stay unsupported.
+/// The Unicode "properties of strings" (ECMA-262 table-binary-unicode-properties-of-strings): the
+/// UTS #51 definitions derivable from the bundled emoji binary-property tables, and the curated
+/// RGI_* sequence lists from `crate::regex_emoji`.
 fn property_of_strings(name: &str) -> Option<ClassSet> {
     let ranges_of = |prop: &str| -> Vec<(u32, u32)> {
         crate::unicode_props::lookup(prop, None)

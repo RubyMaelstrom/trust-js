@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Recompute the primary/non-primary time zone identifiers in tzdata.rs.
+"""Recompute the primary/non-primary time zone identifiers and region zones in tzdata.rs.
 
 usage: scripts/gen-tz-primaries.py TZDATA_SOURCE_DIR [crates/lumen/src/tzdata.rs]
 
-TZDATA_SOURCE_DIR is an IANA tz source tree (tzdata.zi, zone.tab, backward).
+TZDATA_SOURCE_DIR is an IANA tz source tree (tzdata.zi, zone.tab, backward). A
+tzdata release tarball omits tzdata.zi; only its Zone (`Z name`) and Link
+(`L target name`) lines are read, so they can be listed from the source files.
+REGION_ZONES lists each zone.tab region's zones for Intl.Locale's getTimeZones.
 The offset tables in tzdata.rs are kept; only its ZONES and LINKS lists are
 rewritten, following ECMA-402 #sec-use-of-iana-time-zone-database:
 
@@ -42,11 +45,16 @@ def main():
         m = re.match(r"Link\s+\S+\s+(\S+)\s+#=\s*(\S+)", line)
         if m:
             annotated[m.group(1)] = m.group(2)
-    tab = {
-        line.split("\t")[2].strip()
+    tab_rows = [
+        line.split("\t")
         for line in open(f"{src}/zone.tab")
         if line.strip() and not line.startswith("#")
-    }
+    ]
+    tab = {row[2].strip() for row in tab_rows}
+    # ECMA-402 TimeZonesOfLocale: the zones in common use in each ISO 3166-1 region.
+    region_zones = {}
+    for row in tab_rows:
+        region_zones.setdefault(row[0].strip(), set()).add(row[2].strip())
 
     text = open(path).read()
     zstart = text.index("pub static ZONES")
@@ -117,6 +125,22 @@ def main():
         + "];"
         + text[lend:]
     )
+    region_lines = "".join(
+        f'    ("{region}", &[{", ".join(f"{chr(34)}{z}{chr(34)}" for z in sorted(zones))}]),\n'
+        for region, zones in sorted(region_zones.items())
+    )
+    region_table = (
+        "/// (ISO 3166-1 region, the primary zones its zone.tab rows list), sorted by region and then\n"
+        "/// zone, for ECMA-402 TimeZonesOfLocale.\n"
+        "#[cfg(feature = \"intl\")]\n"
+        "pub static REGION_ZONES: &[(&str, &[&str])] = &[\n" + region_lines + "];\n"
+    )
+    if "pub static REGION_ZONES" in out:
+        rstart = out.index("/// (ISO 3166-1 region")
+        rend = out.index("];", out.index("pub static REGION_ZONES")) + 3
+        out = out[:rstart] + region_table + out[rend:]
+    else:
+        out = out.rstrip("\n") + "\n\n" + region_table
     # Drop offset tables no primary identifier uses any more.
     used = {data(n)[1] for n in primary}
     out = re.sub(

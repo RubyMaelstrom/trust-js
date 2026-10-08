@@ -505,11 +505,9 @@ fn regexp_escape_cp(cp: u32, first: bool) -> String {
         '\u{0b}' => "\\v".into(),
         '\u{0c}' => "\\f".into(),
         '\r' => "\\r".into(),
-        _ if ",-=<>#&!%:;@~'`\"".contains(c)
-            || c.is_whitespace()
-            || c == '\u{FEFF}'
-            || c.is_control() =>
-        {
+        // EncodeForRegExpEscape step 5: the other punctuators, WhiteSpace and LineTerminator
+        // (not U+0085 or other control characters, which are returned as themselves).
+        _ if ",-=<>#&!%:;@~'`\"".contains(c) || crate::regex::js_whitespace(c) => {
             if cp <= 0xff {
                 format!("\\x{cp:02x}")
             } else if cp <= 0xffff {

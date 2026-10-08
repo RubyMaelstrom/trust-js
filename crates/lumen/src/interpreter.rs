@@ -4148,8 +4148,56 @@ impl Interp {
         Value::Obj(global)
     }
 
-    /// Run `src` as a script in the realm whose global is `realm_global`.
+    /// Run the Rust text `src` as a Script in the Realm whose global is `realm_global`:
+    /// ParseScript then ScriptEvaluation (ECMA-262 #sec-scriptevaluation), so top-level
+    /// `let`/`const`/`class` declarations join that Realm's global lexical environment, unlike
+    /// an indirect `eval`. A parse failure is that Realm's SyntaxError.
     pub fn eval_in_realm(&mut self, realm_global: &Value, src: &str) -> Result<Value, Abrupt> {
+        let text = crate::jstr::from_text(src);
+        self.eval_script_in_realm(realm_global, &text)
+    }
+
+    /// [`Self::eval_in_realm`] for source already in the engine's string representation.
+    pub(crate) fn eval_script_in_realm(
+        &mut self,
+        realm_global: &Value,
+        src: &str,
+    ) -> Result<Value, Abrupt> {
+        self.in_realm(
+            realm_global,
+            |interp| match crate::parser::parse_script_from(
+                src,
+                false,
+                crate::stack_trace::SourceKind::Script,
+                None,
+            ) {
+                Ok((body, source)) => interp.run_program_from(&body, Some(source)),
+                Err(error) => Err(interp.throw("SyntaxError", error.message)),
+            },
+        )
+    }
+
+    /// A call of another Realm's %eval%: PerformEval(x, strictCaller = false, direct = false)
+    /// in that function's Realm (ECMA-262 #sec-eval-x), so its `var`s and sloppy assignments
+    /// reach that Realm's global object.
+    pub(crate) fn indirect_eval_in_realm(
+        &mut self,
+        realm_global: &Value,
+        src: &str,
+    ) -> Result<Value, Abrupt> {
+        self.in_realm(realm_global, |interp| {
+            let env = interp.global_env.clone();
+            interp.perform_eval(src, &env, false)
+        })
+    }
+
+    /// Run `body` with the Realm whose global is `realm_global` current, keeping that Realm's
+    /// updated state afterwards.
+    fn in_realm(
+        &mut self,
+        realm_global: &Value,
+        body: impl FnOnce(&mut Self) -> Result<Value, Abrupt>,
+    ) -> Result<Value, Abrupt> {
         let ptr = match realm_global {
             Value::Obj(o) => Rc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
@@ -4160,9 +4208,7 @@ impl Interp {
         };
         let saved = self.snapshot_realm();
         self.restore_realm(&realm);
-        let env = self.global_env.clone();
-        // Indirect eval semantics, in the target realm's global scope.
-        let result = self.perform_eval(src, &env, false);
+        let result = body(self);
         let updated = self.snapshot_realm();
         self.realms.insert(ptr, updated);
         self.restore_realm(&saved);
@@ -5468,11 +5514,37 @@ impl Interp {
         self.drain_microtasks();
     }
 
-    /// `Object.getPrototypeOf(v)` — the value's `[[Prototype]]` (`null` when there is none).
+    /// The `[[Prototype]]` slot of `ToObject(v)` without running author code: an object's stored
+    /// prototype (a Proxy's own slot; its `getPrototypeOf` trap is not called), the current
+    /// Realm's wrapper prototype for a primitive (`%Number.prototype%` for a Number, …), and
+    /// `null` for `null`/`undefined` or an object without a prototype. Use
+    /// [`Self::get_prototype_of`] for the full `Object.getPrototypeOf` semantics.
     pub fn prototype_of(&self, v: &Value) -> Value {
-        match v.as_obj().and_then(|o| o.borrow().proto.clone()) {
-            Some(p) => Value::Obj(p),
-            None => Value::Null,
+        match v {
+            Value::Obj(o) => o.borrow().proto.clone().map_or(Value::Null, Value::Obj),
+            Value::Str(_) => Value::Obj(self.string_proto.clone()),
+            Value::Num(_) => Value::Obj(self.number_proto.clone()),
+            Value::Bool(_) => Value::Obj(self.boolean_proto.clone()),
+            Value::Sym(_) => Value::Obj(self.symbol_proto.clone()),
+            Value::BigInt(_) => self
+                .extra_protos
+                .get("BigInt")
+                .cloned()
+                .map_or(Value::Null, Value::Obj),
+            _ => Value::Null,
+        }
+    }
+
+    /// `Object.getPrototypeOf(v)` (ECMA-262 #sec-object.getprototypeof): ToObject (a TypeError
+    /// for `null`/`undefined`), then `[[GetPrototypeOf]]`, which runs a Proxy's trap and its
+    /// invariant checks. `Err` carries the thrown value.
+    pub fn get_prototype_of(&mut self, v: &Value) -> Result<Value, Value> {
+        match v {
+            Value::Obj(_) => crate::builtins::js_get_prototype_of(self, v),
+            Value::Undefined | Value::Empty | Value::Null => {
+                Err(self.make_error("TypeError", "Cannot convert undefined or null to object"))
+            }
+            primitive => Ok(self.prototype_of(primitive)),
         }
     }
 
@@ -5806,7 +5878,9 @@ impl Interp {
         if length > limit as f64 {
             return None;
         }
-        let mut values = Vec::with_capacity(length as usize);
+        // Reserve only what a bounded prefix needs: a large sparse `length` must not allocate
+        // before its first hole ends the copy.
+        let mut values = Vec::with_capacity((length as usize).min(4096));
         for index in 0..length as u32 {
             let property = object.props.get_index(index)?;
             if property.accessor() {
@@ -6077,10 +6151,11 @@ impl Interp {
                 .is_some_and(|(_, realm)| *realm == Rc::as_ptr(&self.global) as usize)
     }
 
-    /// Create the callable `[[IsHTMLDDA]]` exotic used by the web platform's legacy
-    /// `document.all` object (ECMA-262 Annex B.3.6). The engine, rather than the embedder, must
-    /// mint this value because its falsiness, `typeof`, and loose-null equality are language-level
-    /// exceptions with dedicated interpreter and JIT handling.
+    /// Create a minimal callable `[[IsHTMLDDA]]` exotic (ECMA-262 Annex B.3.6): falsy, `typeof`
+    /// "undefined" and loosely equal to `null`/`undefined`, with a [[Call]] that returns `null`, as
+    /// test262's `$262.IsHTMLDDA` specifies (INTERPRETING.md). A browser's `document.all` is the
+    /// complete [`Self::make_html_all_collection`]. The engine mints both because these are
+    /// language-level exceptions with dedicated interpreter and JIT handling.
     pub fn make_html_dda(&mut self) -> Value {
         let dda = self.make_native("IsHTMLDDA", 0, |_i, _this, _args| Ok(Value::Null));
         self.htmldda
@@ -6195,8 +6270,47 @@ impl Interp {
 
     /// [`call`](Interp::call) with an abrupt completion lowered to the thrown value — the
     /// shape a [`NativeFn`] returns, for native fns that call back into JS.
+    ///
+    /// A host interruption (`RuntimeInterrupt`) is not a JavaScript exception and cannot be a
+    /// thrown value: it surfaces here as `Err(undefined)`. Inside a [`NativeFn`] that is enough,
+    /// because the engine resumes the interruption when the native function returns. Host code
+    /// calling outside a native function should use [`Self::invoke_interruptible`] (or check
+    /// [`Self::pending_interrupt`]); the same holds for the other lowering helpers below.
     pub fn invoke(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Value> {
         self.call_callback(callee, this, args).map_err(abrupt_value)
+    }
+
+    /// [`Self::invoke`] keeping a host interruption distinct from a JavaScript throw.
+    #[cfg(feature = "embed")]
+    pub fn invoke_interruptible(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, crate::embed::EvalError> {
+        // Callback entry polls without the cadence divider, as the engine-level entry points do.
+        self.interrupt_poll_force()
+            .and_then(|()| self.call_callback(callee, this, args))
+            .map_err(|abrupt| match abrupt {
+                Abrupt::Interrupt(reason) => crate::embed::EvalError::Interrupted(reason),
+                other => crate::embed::EvalError::Throw(abrupt_value(other)),
+            })
+    }
+
+    /// The host interruption currently in force, if any: the reason a lowered `Err(undefined)`
+    /// from [`Self::invoke`] or a coercion helper was an interruption rather than a throw.
+    pub fn pending_interrupt(&self) -> Option<crate::InterruptReason> {
+        self.runtime_interrupt.current_reason()
+    }
+
+    /// The `typeof` operator's result for `v` (ECMA-262 #sec-typeof-operator), including the
+    /// Annex B.3.6 [[IsHTMLDDA]] exception ("undefined"), which [`Value::type_of`] cannot see.
+    pub fn type_of(&self, v: &Value) -> &'static str {
+        if self.is_htmldda(v) {
+            "undefined"
+        } else {
+            v.type_of()
+        }
     }
 
     /// [`construct`](Interp::construct) with an abrupt completion lowered to the thrown value —
@@ -6540,9 +6654,9 @@ impl Interp {
         removed
     }
 
-    /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
-    /// a bounds-checked no-op, matching the engine's internal write semantics). `false` when
-    /// `v` isn't a typed array.
+    /// Overwrite a TypedArray's leading bytes. The write must fit the view's current byte length:
+    /// `false` (and no write) when `v` isn't a typed array, its buffer is detached or out of
+    /// bounds, or `bytes` is longer than the view; bytes beyond the view are never touched.
     pub fn typed_array_set_bytes(&mut self, v: &Value, bytes: &[u8]) -> bool {
         let Some(obj) = v.as_obj() else {
             return false;
@@ -6550,22 +6664,24 @@ impl Interp {
         let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(obj) as usize)).copied() else {
             return false;
         };
+        let Some(length) = self.ta_len(&info) else {
+            return false;
+        };
+        if bytes.len() > length * info.kind.elsize() {
+            return false;
+        }
         self.ta_write_bytes(&info, 0, bytes);
         true
     }
 
-    /// A fresh `Uint8Array` holding `bytes`, constructed through the realm's own
-    /// `Uint8Array` constructor.
+    /// A fresh `Uint8Array` holding `bytes`: AllocateTypedArray with the current Realm's
+    /// intrinsic %Uint8Array.prototype% over a new ArrayBuffer. No author code runs, so a replaced
+    /// `globalThis.Uint8Array` cannot observe or substitute the result.
     pub fn make_uint8array(&mut self, bytes: &[u8]) -> Result<Value, Value> {
-        let global = Value::Obj(self.global.clone());
-        let ctor = self
-            .get_member(&global, "Uint8Array")
-            .map_err(abrupt_value)?;
-        let ta = self
-            .construct(ctor, &[Value::Num(bytes.len() as f64)])
-            .map_err(abrupt_value)?;
-        self.typed_array_set_bytes(&ta, bytes);
-        Ok(ta)
+        Ok(
+            crate::builtins::typed_array_from_bytes(self, crate::value::TaKind::U8, bytes.to_vec())
+                .0,
+        )
     }
 
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
@@ -11465,7 +11581,7 @@ impl Interp {
                 return match args.first() {
                     Some(Value::Str(s)) => {
                         let s = s.clone();
-                        self.eval_in_realm(&realm_g, &s)
+                        self.indirect_eval_in_realm(&realm_g, &s)
                     }
                     Some(other) => Ok(other.clone()),
                     None => Ok(Value::Undefined),

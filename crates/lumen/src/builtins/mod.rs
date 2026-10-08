@@ -34,7 +34,7 @@ mod reflect;
 mod regexp;
 mod shadowrealm;
 mod typedarray;
-pub(crate) use typedarray::array_buffer_with_storage;
+pub(crate) use typedarray::{array_buffer_with_storage, typed_array_from_bytes};
 mod weakrefs;
 
 #[cfg(test)]
@@ -169,6 +169,22 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// A `'static` copy of an intrinsic name built at Realm creation (`%Intl.Collator%`,
+/// `%AsyncFunction.prototype%`, …), allocated once per process: every Realm of every Agent
+/// shares the copy, so creating Realms (one per browsing context) allocates no new names.
+pub(crate) fn static_name(name: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&existing) = names.iter().find(|&&existing| existing == name) {
+        return existing;
+    }
+    let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.push(interned);
+    interned
 }
 
 /// Define an internal-slot-style data property: writable, non-enumerable, non-configurable.
@@ -11748,8 +11764,6 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     }))
 }
 
-/// Compute the replacement text for String.prototype.replace/replaceAll. A function replacer is
-/// called with (match, position, whole-string); otherwise `$&` etc. patterns are honored minimally.
 /// thisStringValue: a String primitive or wrapper; anything else is a TypeError (the
 /// String.prototype toString/valueOf methods are not generic).
 fn string_this_value(i: &mut Interp, this: &Value) -> Result<Value, Value> {
