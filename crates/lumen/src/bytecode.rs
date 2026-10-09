@@ -3638,6 +3638,20 @@ impl CaptureScan {
                 names.insert(n.clone());
             }
         }
+        // ECMA-262 e28783d5 FunctionDeclarationInstantiation step 28: when the formals contain
+        // expressions, the body's declarations get an Environment Record of their own, "to ensure
+        // that closures created by expressions in the formal parameter list do not have
+        // visibility of declarations in the function body". An inner function's parameter
+        // expressions therefore resolve through a scope of its parameters (with `arguments` and a
+        // function expression's own name) to the enclosing function, even where the body
+        // redeclares a name. The compiled function itself keeps its one top scope, which the
+        // activation bookkeeping below is built around.
+        let parameter_scope =
+            self.fn_depth > 0 && crate::interpreter::params_have_expr(&func.params);
+        if parameter_scope {
+            self.push_scope(names.clone());
+            self.parameter_expressions(func)?;
+        }
         if !hoisted_vars(&func.body, true, func.is_strict, &mut names) {
             return None;
         }
@@ -3660,16 +3674,29 @@ impl CaptureScan {
             self.top_names = names.clone();
         }
         self.push_scope(names);
-        // Parameter defaults evaluate in the function scope.
-        for p in &func.params {
-            if let Some(d) = &p.default {
-                self.expr(d)?;
-            }
+        if !parameter_scope {
+            self.parameter_expressions(func)?;
         }
         for s in &func.body {
             self.stmt(s)?;
         }
         self.scopes.pop();
+        if parameter_scope {
+            self.scopes.pop();
+        }
+        Some(())
+    }
+
+    /// A function's parameter expressions: each parameter's default and, as ECMA-262 e28783d5
+    /// ContainsExpression counts them, the initializers and computed keys nested in its binding
+    /// pattern (`function f({ c = outer }) {}`).
+    fn parameter_expressions(&mut self, func: &Function) -> Option<()> {
+        for p in &func.params {
+            if let Some(d) = &p.default {
+                self.expr(d)?;
+            }
+            self.pat_decl_exprs(&p.pattern)?;
+        }
         Some(())
     }
 

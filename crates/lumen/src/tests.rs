@@ -1825,6 +1825,56 @@ fn compiled_captured_default_parameters_bind_their_initialized_value() {
     }
 }
 
+/// ECMA-262 ContainsExpression: initializers and computed keys nested in a parameter's binding
+/// pattern are parameter expressions, evaluated by IteratorBindingInitialization in the function's
+/// parameter scope. A compiled outer function must therefore keep the bindings they name in its
+/// environment when they are the inner function's only reference (Webflow IX2's
+/// `function eT({comparator: a = eI})`); otherwise the call threw a ReferenceError. Per
+/// FunctionDeclarationInstantiation step 28 those expressions cannot see the inner body's own
+/// declarations, so a body `var`/`let` of the same name still leaves them reading the outer one.
+#[test]
+fn compiled_outer_bindings_reach_nested_parameter_pattern_expressions() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let source = r#"
+            function outer() {
+                for (var i = 0; i < 2; i++);
+                let same = (a, b) => a === b, fallback = 5, key = "k", tail = 7, nested = "n";
+                var shadow = "outer";
+                function object({ compare: c = same, value = fallback }) { return [c(1, 1), value]; }
+                function array([first = fallback, , third = tail] = []) { return first + third; }
+                function computed({ [key]: picked }) { return picked; }
+                function deep({ a: { b: [c = nested] = [] } = {} }) { return c; }
+                const arrow = ({ x = fallback * 2 }) => x;
+                class C { method({ y = tail } = {}) { return y; } }
+                function laterVar({ s = shadow }) { var shadow = "inner"; return s; }
+                function laterLet(s = shadow) { let shadow = "inner"; return s; }
+                function laterClosure(read = () => shadow) { var shadow = "inner"; return read(); }
+                return [
+                    object({}).join(","), object({ compare: () => 0, value: 1 }).join(","),
+                    array(), array([1, 0, 2]), computed({ k: "hit" }), deep({}),
+                    arrow({}), new C().method(), laterVar({}), laterLet(), laterClosure()
+                ].join("|");
+            }
+            var shadow = "global";
+            outer() + "/" + outer()
+        "#;
+        let expected = "true,5|0,1|12|3|hit|n|10|7|outer|outer|outer";
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => {
+                assert_eq!(value, format!("{expected}/{expected}"), "{tier:?}")
+            }
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
 /// ECMA-262 FunctionDeclarationInstantiation binds a trailing rest parameter to a fresh Array of
 /// the remaining arguments, for every entry path: direct and cached calls, apply/spread, native
 /// callbacks, constructors, methods and arrows, captured or not, with and without defaults.
