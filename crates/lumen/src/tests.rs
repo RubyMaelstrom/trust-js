@@ -4680,6 +4680,15 @@ fn regex_literal_can_begin_a_control_statement_body() {
              String(count)"),
         "3"
     );
+    // A Catch without a binding ends the TryStatement at its Block, so the next statement may
+    // begin with a regex literal. ChatGPT's application bundle has exactly this shape.
+    assert_eq!(
+        run("let hit = false;
+             try { throw 1 } catch { hit = 1 } /^\\/a$/u.test('/a') && (hit = 2);
+             try {} catch {} finally {} /b/.test('b') && hit++;
+             String(hit)"),
+        "3"
+    );
     // An ordinary grouping close remains a value position: this slash is division.
     assert_eq!(run("String((12) / 3)"), "4");
     // A control keyword used as a property name is also an ordinary call, not a control head.

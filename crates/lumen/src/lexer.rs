@@ -204,7 +204,9 @@ impl Lexer<'_> {
         match self.out.last().map(|t| &t.kind) {
             None => true,
             Some(Tok::Punct(p)) => matches!(*p, ";" | "{" | "}" | "=>"),
-            Some(Tok::Keyword(k)) => matches!(*k, "else" | "do" | "try" | "finally"),
+            // `catch {` is a Catch without a CatchParameter (ECMA-262 TryStatement): its Block
+            // ends the TryStatement, so a following `/` begins a regex literal.
+            Some(Tok::Keyword(k)) => matches!(*k, "else" | "do" | "try" | "catch" | "finally"),
             _ => false,
         }
     }
