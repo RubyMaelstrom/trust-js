@@ -2,19 +2,235 @@
   "cldr_json_commit": "4d06be52b51bb2f75688d0abe55c52a66afed790",
   "cldr_json_repository": "https://github.com/unicode-org/cldr-json",
   "cldr_json_tag": "48.0.0",
-  "compact_max_record_count": 58,
-  "compact_record_count": 1364,
-  "currency_name_record_count": 5582,
-  "currency_record_count": 6480,
-  "currency_unit_record_count": 27,
-  "distinct_input_count": 49,
+  "compact_max_record_count": 62,
+  "compact_record_count": 1570,
+  "currency_name_record_count": 5938,
+  "currency_record_count": 7060,
+  "currency_unit_record_count": 33,
+  "distinct_input_count": 605,
   "generator": "scripts/gen-cldr-numbers.py",
-  "generator_sha256": "3171ddced7afe0d88d1e141d1127f085b6da4e57dadc0310e86ec284c8d40c2d",
+  "generator_sha256": "74921e613abe8c5b25c4cfd46ad4ab128df019af3f81fe841ae7975cb196e67f",
   "input_url_base": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json",
   "inputs": [
     {
       "sha256": "ab007c5bb654a11601d6328f73a9b5b504334c556f3edb760020d6e2cc408472",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-core/supplemental/currencyData.json"
+    },
+    {
+      "sha256": "732e5fa2c5e695a81a0265f38db45807416d348e393f157b502d37cd6a554b05",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-AE/currencies.json"
+    },
+    {
+      "sha256": "90ccbbbeddd6b41ddb83c3a1838e2eab22f416dfdc5ef2db6a9a98a1824c3031",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-AE/numbers.json"
+    },
+    {
+      "sha256": "ba996a99f40fe97d2aabde75e0ecbbdcefacfbfcbbc362a57dca17ffd881ba45",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-BH/currencies.json"
+    },
+    {
+      "sha256": "30a6b282e8f0469dce73ba464a9f1cf9ae3b6f5e584f9e0c6463fa61cac0d54c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-BH/numbers.json"
+    },
+    {
+      "sha256": "d0620f3a26e765aa0916a1b3eebc2dc78da1cef23264e533f183ce88c34edc9d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-DJ/currencies.json"
+    },
+    {
+      "sha256": "9d2cf0099027c77a9dc379de352f7cd6bf319b2d5229ce54d2e01802e75d8be0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-DJ/numbers.json"
+    },
+    {
+      "sha256": "925f03aeb59027b3de7a0c650a724bf3781d1c594bdd68c021dfb65437f8c99d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-DZ/currencies.json"
+    },
+    {
+      "sha256": "06ebafe7c2aed3e581803887a464824f7b38a6224e5c45aed63d4a78f3751637",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-DZ/numbers.json"
+    },
+    {
+      "sha256": "c4f7c3a95569e3022d346c444b5924b5e90e62ee787b6a028b0bdd9076f14237",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-EG/currencies.json"
+    },
+    {
+      "sha256": "6290d12c3f2700eff99e05790419a8af6020efd1213c4dd497171c0bd1a673f7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-EG/numbers.json"
+    },
+    {
+      "sha256": "1b07c7ed787002f968ea26499b39c7b392ddf252c9a06e2f317d7268623327db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-EH/currencies.json"
+    },
+    {
+      "sha256": "6c64ec4eaff1dde174cc12bbc4ae17d384661c9d9c296df3c95bb38665b264e2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-EH/numbers.json"
+    },
+    {
+      "sha256": "4fca2278a902c3b9143ddf9663bf87f5559a329a2001c241eab340d35539a721",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-ER/currencies.json"
+    },
+    {
+      "sha256": "93d25ff97112472041a59ce6c979f09da40bea40da0c18c59e8cbca398f78866",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-ER/numbers.json"
+    },
+    {
+      "sha256": "c2ea05ef323747c75e35382f8db00b7d46ce9d9f5c17a4962745bf8cce0b1dc4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-IL/currencies.json"
+    },
+    {
+      "sha256": "afba356485c9d62a45fc7b114c3cd86a7518b8b526ce4aa941477dcab4f4ca84",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-IL/numbers.json"
+    },
+    {
+      "sha256": "8ddf5059093b306cfc434e5af91fe5420d3a2ceb387a1a7b7682061a3b1526db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-IQ/currencies.json"
+    },
+    {
+      "sha256": "00841bb56e915a98f0447054170ef12022f8cc33561a6486136ae9183ea27a8c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-IQ/numbers.json"
+    },
+    {
+      "sha256": "e47d4703af0dc28b7879598d028adbd16706dffcfbab5aeeacece2c484e9867d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-JO/currencies.json"
+    },
+    {
+      "sha256": "9e7f1fb9419be005045949ea7061649e95d86d3cd6a304aa99e63c695c8ce41c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-JO/numbers.json"
+    },
+    {
+      "sha256": "ec794a1a52018f421bde6fe65ba6d329f40cdfd7ff2dd5d449408627e38425aa",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-KM/currencies.json"
+    },
+    {
+      "sha256": "78486a81c1766f41d1f2f2a20d4a563063868039ea341333007097d5f3780eab",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-KM/numbers.json"
+    },
+    {
+      "sha256": "f9f8fc9f43d2bf7fcc979a4bba1e95e811d03b1ea0eaa441898b97cbb559f844",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-KW/currencies.json"
+    },
+    {
+      "sha256": "c4f50bb52821597f091bf9c325d21a30f317860a459b90a92fe164f75c7cbedf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-KW/numbers.json"
+    },
+    {
+      "sha256": "ced1cdf85a578d75bd58c24c2f29a5dd48edce05ea47284c6a8c87c7a629cd6c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-LB/currencies.json"
+    },
+    {
+      "sha256": "2f179a9415b1572decda32f77c40d46690e13002287ad36a196f70eda9de4e39",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-LB/numbers.json"
+    },
+    {
+      "sha256": "20b520f869db4fae18e3bbfa674eb32d09f8f54b682a3a5719402afdebdf7e0d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-LY/currencies.json"
+    },
+    {
+      "sha256": "fb724a9184f78bff0ee572f173b0f5b2a463301e9c41bdadd3ae5c633ef585c5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-LY/numbers.json"
+    },
+    {
+      "sha256": "373a3606f9343467e8479233e963b65cb7c8ca612a022f6dd44f6d584761af53",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-MA/currencies.json"
+    },
+    {
+      "sha256": "b3d07438c285c87ad068dc30f2c67fe7dd88f57e011bbda05188114603de5b0a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-MA/numbers.json"
+    },
+    {
+      "sha256": "b5dde1496e6cbcacfea649885c048e06f594361b83b33ef37c52548baeb2f034",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-MR/currencies.json"
+    },
+    {
+      "sha256": "d123d8350271000c915e9d7828cfbebb104fc079f75c445a4215c61a405c60f7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-MR/numbers.json"
+    },
+    {
+      "sha256": "1e9cf4cca94963c221980470afa3f9cc96d6db09f9f4510ae47a0761474be2f9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-OM/currencies.json"
+    },
+    {
+      "sha256": "e2d1dc317288a52850f115d7149264594a674116d9de4e2e513001ad7c1bcb8e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-OM/numbers.json"
+    },
+    {
+      "sha256": "0185b539ac668c670fb3e7db0d753d4267df56a9b4b77b2dd4407e029c526d0d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-PS/currencies.json"
+    },
+    {
+      "sha256": "a55d4a2be8aff6b2b8543c67af9ce9d3d9b4e31e229ef6161e16dd1d3135f5a2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-PS/numbers.json"
+    },
+    {
+      "sha256": "447245fd2fb85c7dd713e085ea069c5e19240577c9fea0b337a68df5582ba684",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-QA/currencies.json"
+    },
+    {
+      "sha256": "e6c946cc36f416345a55ff9de5a3ba5109faaaeed446124a4e4904155383e27f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-QA/numbers.json"
+    },
+    {
+      "sha256": "299748bac425aba1b96b1a377286062d47295ea48bcd555e0c80aa576f9087f5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SA/currencies.json"
+    },
+    {
+      "sha256": "410c7be0abf41f29653011487eca30e909a0efcac08fb14c1ae703e1b27c8ccc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SA/numbers.json"
+    },
+    {
+      "sha256": "4e03d60f5c30987ad8034bac7d8e4d7471c9cef77264c9e7a4e148aa5a5597c7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SD/currencies.json"
+    },
+    {
+      "sha256": "2df2dc7c1b1422bc7c27fedbad7a3d2a0477167b00831c4b809481b0ed9af0d3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SD/numbers.json"
+    },
+    {
+      "sha256": "f7a2c7bf4b6e1c3b0bf384873b5a0a356cc5506abd817a9c644eb2965d6f2d0d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SO/currencies.json"
+    },
+    {
+      "sha256": "dd84adf240002803e53c8e54d1863c8084e85b6f3165f7ed773f177eb9f6e1a2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SO/numbers.json"
+    },
+    {
+      "sha256": "d2345223d8bfaf0d18828691e56a6c06895288e6e753fbc7b0ae8ce97d9dafe6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SS/currencies.json"
+    },
+    {
+      "sha256": "30256d571f2304847f04e880ed1ecc0f411d9cf428a301b0bd389d8bf159190c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SS/numbers.json"
+    },
+    {
+      "sha256": "576f396d639e1eed8cb3ca86a2481470deed40ea13168a0cd7794ebbb973b3e7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SY/currencies.json"
+    },
+    {
+      "sha256": "4fc7eb795bc01a32efe1fa91958c5ebfbad34208ea8e2b7774c958240b12d176",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-SY/numbers.json"
+    },
+    {
+      "sha256": "62dec2a3706c1a79392d793a8e5094cbee4533d11af745418dc41562d8e59350",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-TD/currencies.json"
+    },
+    {
+      "sha256": "79bc13ba12ef4c783e49382cb421fe16676876ad4309320a95280e8f191415f1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-TD/numbers.json"
+    },
+    {
+      "sha256": "6adffb749eb7b973c6a25f93f154cbfba03b5a275e74e3c81b1b6391e281b922",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-TN/currencies.json"
+    },
+    {
+      "sha256": "c3c68e6beb1a7939577bede06938e42e1beff1c9f8db9226f620f22f93f9a303",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-TN/numbers.json"
+    },
+    {
+      "sha256": "a60103f3506f3c303791c5127a70aab50d39c6e82a65a152b40d93eb6ff3993c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-YE/currencies.json"
+    },
+    {
+      "sha256": "2baa3675ee43d57eb0ce7903823d8a106dc887074ad8ca466a2db36e49a24d5e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar-YE/numbers.json"
     },
     {
       "sha256": "b39cc3d2cc55822e94ef2c4842d759ca60e3f85ae4bf7106268d0d0116168b23",
@@ -25,12 +241,476 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ar/numbers.json"
     },
     {
+      "sha256": "b034ec10a17a054a28e8c62ceb5b87dee0b1e1a483a997e2e5c608c0c99ecfd2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-AT/currencies.json"
+    },
+    {
+      "sha256": "dabf5fbdac0ef929e0e23f84f0ba7e161f76768292c53a104dc78632d037e6ba",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-AT/numbers.json"
+    },
+    {
+      "sha256": "1c7dcf44d0a31a9ddf61566feb723fe949fce7590952b9dfec677f5efa7ca669",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-BE/currencies.json"
+    },
+    {
+      "sha256": "74f638ea8c44ac5d260b6a739f7102a7ee8811dca898e0dad22a48a6da33d8ff",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-BE/numbers.json"
+    },
+    {
+      "sha256": "ea8c56e7ef4f4b3574f7e1c53e9f0ca216b1e853d86000ba5a1aedce0bbe4fa7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-CH/currencies.json"
+    },
+    {
+      "sha256": "a8c549493048b45126df9d7176e0e81041641c0a3f5d1df6c63a7a21f03dc381",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-CH/numbers.json"
+    },
+    {
+      "sha256": "43b9db82f2bdea2583f163d71a93e07903ff12a4b0a19a79eb29e721710536bb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-IT/currencies.json"
+    },
+    {
+      "sha256": "3fae149c308bb60919ad81a9b4e677a596e527ed3e3da92ae7d1237658cfa9da",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-IT/numbers.json"
+    },
+    {
+      "sha256": "7b7632ba652c5512b9ae7ce0aa804e0980f5d04cb76e222e7029a6f0c1fb646d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-LI/currencies.json"
+    },
+    {
+      "sha256": "e93253306a5def137e09cff8298ea55bdd742a5c4fe49c9e5457cc005cfaf293",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-LI/numbers.json"
+    },
+    {
+      "sha256": "c146b8b34e223212678818f89098b40438280cec87bcedad9f2a0bf3f74b04c9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-LU/currencies.json"
+    },
+    {
+      "sha256": "211f0334be7bc723c5d711e7316655a30bd5296668c2fd47d03142945e3ed706",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de-LU/numbers.json"
+    },
+    {
       "sha256": "6ebdb4ee634cabd431adf1df8c9e6e36f442802c149a46f1515a3fe62b37788d",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de/currencies.json"
     },
     {
       "sha256": "e8ab22c6d7a1ed1f1fc71c4bf0da7ba57a32a46c7ead5ad8e36f40563c18c00f",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/de/numbers.json"
+    },
+    {
+      "sha256": "875b5bc23e315de8c156218acb7f19a001f91f540fe565c25b63c772eefbbf1e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-001/currencies.json"
+    },
+    {
+      "sha256": "1ad77da0f617a9452448df209825d93671b67020cc607cf2b80c1dfcad64658f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-001/numbers.json"
+    },
+    {
+      "sha256": "fe526a55c6b5f9bf8670fb2c3178b121d0bb8aaabe7537db18f52e837d8334b2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-150/currencies.json"
+    },
+    {
+      "sha256": "83e6d810706db27d1d633bd28f9e2ccbe29e107ef855a31f1becb27a9424e7a0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-150/numbers.json"
+    },
+    {
+      "sha256": "f5a63fae28fe41f2775839a66e98b3c717124e08a2b332b5f79ca8226c519efc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AE/currencies.json"
+    },
+    {
+      "sha256": "2d98e579014e8a6171abc49809bf01978d3321fbad342b7b1716fa064336acb0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AE/numbers.json"
+    },
+    {
+      "sha256": "9a2d564be4fd6bc17c89a16a1a29088d6e2530868904d0edbb2914adc00aa0ec",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AG/currencies.json"
+    },
+    {
+      "sha256": "4ce6cd03ffb5558afd78ad2ca477c02b867b54f37acddadd79e7e4371995b54e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AG/numbers.json"
+    },
+    {
+      "sha256": "9eaf16092bd0da2ca9f847c1f1d22b374964dcea3dd73c402495a3d56c4f4cde",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AI/currencies.json"
+    },
+    {
+      "sha256": "fd2f78befbcc5cd43b4b738bc19b4a45bce2ca110f9afb319052c02d405988b4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AI/numbers.json"
+    },
+    {
+      "sha256": "05a86fa7a9ee9e2e506ac954fbf898dba912fb63531e5df0a9587d96cd5b4551",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AS/currencies.json"
+    },
+    {
+      "sha256": "b4f22d2f3dab1768db742a93316d8f3ef3301cef73c16af972e24d97efae6637",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AS/numbers.json"
+    },
+    {
+      "sha256": "f1bd51b00926f94592fe5bba3fb2a05f6a0135c62893134fb44dab0b9dded694",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AT/currencies.json"
+    },
+    {
+      "sha256": "fac1ebf52c62524858f083bd11d77c02d8fb80b0c4008f5cd647a1d3d4bf23bc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AT/numbers.json"
+    },
+    {
+      "sha256": "d26ab4fd757a5570184bc521e685dda5fc244f0ae6085ef0f79414de08f0652a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AU/currencies.json"
+    },
+    {
+      "sha256": "88ca6281fd48810422071bbbb0c2f2394227dc754958d9bf7201398031d70917",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-AU/numbers.json"
+    },
+    {
+      "sha256": "902e230c153706b33cdbe0ddc4b50efabc20cdc16f18ca29460a72a4e4dc026a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BB/currencies.json"
+    },
+    {
+      "sha256": "ebcd348d46ddc64551b20727f3b26cfd49e5990a1e6a5e76392ebaca1cf03e91",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BB/numbers.json"
+    },
+    {
+      "sha256": "0dce2afe5cb7b57da51e6b303259b854508d43636a937e5ea8dd52ecfa874e00",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BE/currencies.json"
+    },
+    {
+      "sha256": "504efa259c4eb2d9ac4efbcfefd81b89ef6177ea0f5635a11e28603329d9006e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BE/numbers.json"
+    },
+    {
+      "sha256": "c9f8ea8edc0ac548a48cac2309d78f7c40716fa5d2d73b202c5373db3b9bf379",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BI/currencies.json"
+    },
+    {
+      "sha256": "93cccdf1a0b6cac917cfd900b00b535d3112a91173c29d5c6e951f94f70af633",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BI/numbers.json"
+    },
+    {
+      "sha256": "321c0e9994d489ea6ea2b56a050235c20c41383c9bb7a7366bcaa1b3e72517e4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BM/currencies.json"
+    },
+    {
+      "sha256": "983130f9cd8c5f26d88801541b77b725e09462aeb1a27242e492ec03710bcda6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BM/numbers.json"
+    },
+    {
+      "sha256": "e725756bc5470d093e40efa03dc9408142b119be8a68cebbb04d1c98e6d761c1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BS/currencies.json"
+    },
+    {
+      "sha256": "7dd770d73ea121c76cc5734ead5d7c791a9bc876cb0c1a15aa25caf385c2a970",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BS/numbers.json"
+    },
+    {
+      "sha256": "2a06cf65e70fa7f6e976ad162ff430a59c49c51febaa9be40a0fc661bcb06c27",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BW/currencies.json"
+    },
+    {
+      "sha256": "8838d58e54de417bbea4de7764aa162e59a2467ab57ee8bb4d91e4801cb5f419",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BW/numbers.json"
+    },
+    {
+      "sha256": "1d937d45759476a6ba78337fdd744c15243b809b904d532a3e9350740ebdf21f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BZ/currencies.json"
+    },
+    {
+      "sha256": "6c9aa13a05099d9955331cfa1b72dcebd77938d49957311a35a75b960482d10a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-BZ/numbers.json"
+    },
+    {
+      "sha256": "59fd684dbd6df5f76f37887ea6781ec67b09146327b694f04113f60e26e2550f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CA/currencies.json"
+    },
+    {
+      "sha256": "241021eda4ba99538a7813097ba4baa7367dfdd59d037d7980b66fcd5df9a3b9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CA/numbers.json"
+    },
+    {
+      "sha256": "9cd8976dc09e7d2cf7900635975ebe0bc41a210a422716e8abd0caeeec1bbca0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CC/currencies.json"
+    },
+    {
+      "sha256": "852f70c5f25a07fd3a4b7f37f6d06a73101f05c6759f36e1860669b311a5128b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CC/numbers.json"
+    },
+    {
+      "sha256": "91611e2bdb5da37f6d778811f851945a417f2b9adf707b7e68a010147937befc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CH/currencies.json"
+    },
+    {
+      "sha256": "bf3dcfcaad5f3c466db274bba99d929b3d1741b5eaa1b8333089f7bb414a8eb5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CH/numbers.json"
+    },
+    {
+      "sha256": "b43865a504d98a025222b47ab5233792077aca89d7a45e0521956a973a22e1f6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CK/currencies.json"
+    },
+    {
+      "sha256": "a74dca2c6c059734ff6e9567f7055916b7acb8cf169cdfa1f7d8426cc2bb8d0c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CK/numbers.json"
+    },
+    {
+      "sha256": "744679060f19c448173e3368ccf7b856f531440d73eeac5c82892f6f722fc718",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CM/currencies.json"
+    },
+    {
+      "sha256": "216adc3758a7fa6ca9bf154ffaf83fd096ca90ed6c65b9944cb016ba33d71c52",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CM/numbers.json"
+    },
+    {
+      "sha256": "039868a07d64ce1681a767a7f7a102690718aa3d4cfba3011be034d8f7d3dee5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CX/currencies.json"
+    },
+    {
+      "sha256": "7b5376fc24b87b551adccdad39def10e16761f2f159d97202adedf95d1ff27c3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CX/numbers.json"
+    },
+    {
+      "sha256": "a761409142f1e44fbd7cb1fe18f58df6084adb433746754cf3009b19d9998792",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CY/currencies.json"
+    },
+    {
+      "sha256": "c9700ea1ac7199ee0d965ec2fb781480cdd2c8c0069ed13369efd4771fb952f6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CY/numbers.json"
+    },
+    {
+      "sha256": "aaef99eaf256d76d15ce75a066978d24d4a15f6b2fa416ca4b86d1e2e4a518a4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CZ/currencies.json"
+    },
+    {
+      "sha256": "3192a0e75891dc2510fa8a4725eb10813f6e9bf40de65aa6249facc9dbdc4690",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-CZ/numbers.json"
+    },
+    {
+      "sha256": "7806332e8e13ec05dc928c0b3d89e14ccb0ab47e37b46ee4e9badb0bf2d60400",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DE/currencies.json"
+    },
+    {
+      "sha256": "0e9b226137b1cbddc3706abec7f1faf465650d52a53e9d9b09e8a238b580e394",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DE/numbers.json"
+    },
+    {
+      "sha256": "95000537e29e388e343be8f24f297b75d7532bedec190f7807ed5cc34ba09eb1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DG/currencies.json"
+    },
+    {
+      "sha256": "eac22cbb32a133e2926d921fe71d0f891eab46c4ea1ee9f1696f6035f16c8d47",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DG/numbers.json"
+    },
+    {
+      "sha256": "4353114c6a6c5d769053d3da234dff4b1aeb2f1585e6d11c395d072c40fdf20b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DK/currencies.json"
+    },
+    {
+      "sha256": "80d1a7255432d299a2b41f193b44e2b673e1ff430041239d48a2d21b9395eedf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DK/numbers.json"
+    },
+    {
+      "sha256": "b3e442856b9093b9ab364718b22aa42b19a456afbcec84100b8e2852fc95d90c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DM/currencies.json"
+    },
+    {
+      "sha256": "69d775eaf1f3c8bd6d90bf652b097d3db0a4e96ad33f1eae6a2a4a71328b43db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-DM/numbers.json"
+    },
+    {
+      "sha256": "e7a8f501b0e7150ca5557ae19c60ff3dfc2342d0bf9f6817fbd8876ac00fff6b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-Dsrt/currencies.json"
+    },
+    {
+      "sha256": "ccdf484b6576074b2e67a9b447d8931b28e049d97f2eda78813955a2a54f1393",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-Dsrt/numbers.json"
+    },
+    {
+      "sha256": "7ded079ec038711d57803cb9f30c7db774e9dbbfa03b788970c24c5bf044cfed",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-EE/currencies.json"
+    },
+    {
+      "sha256": "f534b760728cc272a578af1fdb45805065396f66c017d7a60282e7f59620ac37",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-EE/numbers.json"
+    },
+    {
+      "sha256": "0bbe7035c62af868e08b61419e860e89807d6838a442783ca0991fc2fbcba5b7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ER/currencies.json"
+    },
+    {
+      "sha256": "cc436ed661cd7ae24b991d927cbaa177bd18805b3a8d44d0873ab12116d5569d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ER/numbers.json"
+    },
+    {
+      "sha256": "5528e4bee421aae001df222009a453f39bf4a1a53b8e091f5c1c06e93ca06eff",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ES/currencies.json"
+    },
+    {
+      "sha256": "ff75f6def9d9c6e9f81278caf00fd0ff441f9a8659449b45d7ecfbf7528e5a71",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ES/numbers.json"
+    },
+    {
+      "sha256": "2ac47625f15eb22e2461743ddffb6f7a807846c717bb19ee3328cba4d5f15d42",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FI/currencies.json"
+    },
+    {
+      "sha256": "2fe4ce38a406b26d5c18bf26dce1bd4fbf9bd2b5495326cb4990cf246ec1c667",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FI/numbers.json"
+    },
+    {
+      "sha256": "9d927e9e91927b16e7962407cfdf4968e45fe1a7d6eb18e8e6e25d11d3101b63",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FJ/currencies.json"
+    },
+    {
+      "sha256": "09ee95d0e2aa4fb66fe2454a819f808a7c5be30a08deba5c2ac4cbd311185845",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FJ/numbers.json"
+    },
+    {
+      "sha256": "7a963201f42066f4b979e2e4f54fbff781259e8f32ae5c3802109affa04f6214",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FK/currencies.json"
+    },
+    {
+      "sha256": "79365b925e1ffc73cfd405b1a5f2f05f50853d183b6a98965734f6ab4bd8021c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FK/numbers.json"
+    },
+    {
+      "sha256": "5ea60b71e19adf5c914865b41d77f9c97dde072d90aca44ecc289f54b4827528",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FM/currencies.json"
+    },
+    {
+      "sha256": "c5dfda0059346a570b67c7d8e6ddf1097abad86bcef62c5834df93ac1af3d47a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FM/numbers.json"
+    },
+    {
+      "sha256": "5264e9f76ff343096cbab0786e0327e290677726a283743bbcaa9fabbdc8d208",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FR/currencies.json"
+    },
+    {
+      "sha256": "236175a74ffd18794cfcd084d444453b01d548c62f8c23e308b789e965ae2e74",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-FR/numbers.json"
+    },
+    {
+      "sha256": "8bb63460257c4731b7f6db10a40c6969c9f71e3fb593fe23f38a9b80c981c91c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GB/currencies.json"
+    },
+    {
+      "sha256": "8c46c332ad4f2c4786d169e87f1c2d45e1d845b71fd04d4171f3c6ee8914addc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GB/numbers.json"
+    },
+    {
+      "sha256": "2120e7fe18424cfbc60ec870abc6c12c944128b119d240a510377aa5f7e6785c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GD/currencies.json"
+    },
+    {
+      "sha256": "4e21d3444d405dfd113d6d0a1f75d89a3b58200b8e11e0e9ef48106300f9e17c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GD/numbers.json"
+    },
+    {
+      "sha256": "61211f2dc0a89efde63eb19a609a4857f8a8c4c32a652cf48ef33cdc465d122a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GE/currencies.json"
+    },
+    {
+      "sha256": "1257acee21020f8dce02d0ec6dc71072c36000473b4a830a8f3a6c004a5bb79f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GE/numbers.json"
+    },
+    {
+      "sha256": "326c5960db346c32ab794565a19fa5283d42a44c32bfcb0237e443f6875c2b6e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GG/currencies.json"
+    },
+    {
+      "sha256": "e6766b1d2457e517167dbc17328a57abc6c89a91f2cf68ef684e8b9d70041556",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GG/numbers.json"
+    },
+    {
+      "sha256": "e90fd7665f6a8e59caafc8d96f14097439b2e1061ea1889a948a2db25666c09c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GH/currencies.json"
+    },
+    {
+      "sha256": "637325886fd3ba66f2a91a93a2961e8e585b08033e78401e98758e7a78a696cb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GH/numbers.json"
+    },
+    {
+      "sha256": "5c717a66b746cf06456228eb3f6b29d0717a5b5b5d3d1a824b0dd07b8cab9edb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GI/currencies.json"
+    },
+    {
+      "sha256": "44705b0c0fa4347a9ce1fef2e6667acd61a92bccb37ef3500a37501efbe0b3cf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GI/numbers.json"
+    },
+    {
+      "sha256": "e89e836d4c16af3e2f363f34a0cc535060883607a6927ee6ee9c153ddb3681a1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GM/currencies.json"
+    },
+    {
+      "sha256": "a2a864ebd64b998c94df5a002667d9526a3c8ddbf73f6ed2a4067b5453d1b713",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GM/numbers.json"
+    },
+    {
+      "sha256": "c05240de1e065b52ebfc1738b8dacfa9c50d789ac208ff1c60d01c9266772635",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GS/currencies.json"
+    },
+    {
+      "sha256": "8c22a1e76cce69f34584f60b075a4c93c75e4b2b232f39c9a702ee5b9a188f98",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GS/numbers.json"
+    },
+    {
+      "sha256": "1757b55f414640fe6bf3798b73dc7ecc180a56369ca099e68d7d1cc0c0c7c834",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GU/currencies.json"
+    },
+    {
+      "sha256": "36467586047bdc1a161e2f6e49c4351c4761e71f082bb65e4652bd3fa8a7d445",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GU/numbers.json"
+    },
+    {
+      "sha256": "569cfeb3d05468b75019899b06eaee4f4e9e5ba6d36df7cb6e3dda49166207d2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GY/currencies.json"
+    },
+    {
+      "sha256": "501622c37fe595d3fd0bcc907e55f1fa4cef9dea758bf50f50e26eb0963ec8dd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-GY/numbers.json"
+    },
+    {
+      "sha256": "5bc70fc293cdf6baa6029f6fe4f492eb57becbd4f865c542709efbfb82fcfcb8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-HK/currencies.json"
+    },
+    {
+      "sha256": "01b3f4c1ed719e462b0620884e94daef6679f34238b1a95673907806f914341e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-HK/numbers.json"
+    },
+    {
+      "sha256": "21398cda912f20adb59a29bc3e567d7b043404aee5dd2b54518138853efddc69",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-HU/currencies.json"
+    },
+    {
+      "sha256": "521bdf6ee1d47ecdcb9871fa87c9b3cb00e5454014b3b8319aa655cb5d8bd42b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-HU/numbers.json"
+    },
+    {
+      "sha256": "733eced2e0ec2749e38e37a72262b0c170914877cd8f2b02e3315ca7d89f3921",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ID/currencies.json"
+    },
+    {
+      "sha256": "32cde31818c8a6480bdb3ef33954670c83eba01eb8852713a35e5abc34513ad7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ID/numbers.json"
+    },
+    {
+      "sha256": "edc88ba63995bad4377a420bd421dd9a9725e68b806a99ba100189703280f69c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IE/currencies.json"
+    },
+    {
+      "sha256": "106b7352ba78b4da2f85b59e3e81b0bbcfeed9ae5e9cbbebf81b10a076186a16",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IE/numbers.json"
+    },
+    {
+      "sha256": "4f6e61ab235bb496368c3246f0282db1f96aa6519769632c5ebdcd9d5c29e5e8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IL/currencies.json"
+    },
+    {
+      "sha256": "b8c6df71de34316fc09c75b627451e622ce308d78862536f3c440d7752ab7221",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IL/numbers.json"
+    },
+    {
+      "sha256": "0b70d153e2fbbbcc5166f4043eb9a22217ff7175e46f900074bceede194e503d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IM/currencies.json"
+    },
+    {
+      "sha256": "daab99753bb3b8007cbcc3eb17bb0b321faf1cbd93d4b6e90b854bb86bfc6e4e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IM/numbers.json"
     },
     {
       "sha256": "885e7c613144a7e0bcb15ff70fcee75d6545170bf580422698afb9e2b9674090",
@@ -41,6 +721,582 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IN/numbers.json"
     },
     {
+      "sha256": "9ef1fc96f4ac7e3fdba709fe2968aae7f7fba1e4be977b7b5598f7662622324b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IO/currencies.json"
+    },
+    {
+      "sha256": "8449aa7b3d81326a0e3937db43f1e899e068769c87294cf3c1464bc326f0379e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IO/numbers.json"
+    },
+    {
+      "sha256": "ded786b58fdd42866ce95cc6a5adb96168f0aba3cc29e758a75a3df68d5d780a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IT/currencies.json"
+    },
+    {
+      "sha256": "a45d5575277199e3345935b3426f7dcf40a0efb4e5ec024de5be30f8823f8b11",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-IT/numbers.json"
+    },
+    {
+      "sha256": "1aa4b04bd1a64cd42120efb9b0363134b0f6168005351f9c77ac4fc964763f45",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JE/currencies.json"
+    },
+    {
+      "sha256": "621b8a4e656755510c2326f582037a59b073364805811161e7747546d3a6afa8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JE/numbers.json"
+    },
+    {
+      "sha256": "9b5f83ddd826d5a108db873a906260be165900e67bf62aba12878db69a4d7169",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JM/currencies.json"
+    },
+    {
+      "sha256": "346bbf92cbfb3915d5938145406a3b0bde64b0275904ad7c6b12617a5a57f979",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JM/numbers.json"
+    },
+    {
+      "sha256": "d3b9a985d68dd791ff21412bc9f89ad6420e5200563f57abe76b0e3d3c2be2e0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JP/currencies.json"
+    },
+    {
+      "sha256": "6b26181889dbe926c1f5ad0b89142dec59133baec4f6eec2284f49edddcf0c9b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-JP/numbers.json"
+    },
+    {
+      "sha256": "682c644ffce6529c949ddc3bd78724cae5a7fede2a7c35fb3c8692630ebe71e3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KE/currencies.json"
+    },
+    {
+      "sha256": "99cd33384a0b44b44f2e1fba1fbf150b74557f5925e9d111935481cfb033fcb4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KE/numbers.json"
+    },
+    {
+      "sha256": "fa08d930d8b3317350c7839d40f7338e5ac3880d6d283ab2a01fc28fbb56c9ab",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KI/currencies.json"
+    },
+    {
+      "sha256": "8662028e5eb065ba20b6a9851ff9c16fc94372edd7c9771aae0833e6cbda72d6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KI/numbers.json"
+    },
+    {
+      "sha256": "6a155b8d6b5550ff9a0394a17d33fd224d6d5c05f3da01d01021380930561040",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KN/currencies.json"
+    },
+    {
+      "sha256": "274d3c2d045962fd8678f7ada6d894998caef571f7bf1d7c932430562755ad71",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KN/numbers.json"
+    },
+    {
+      "sha256": "9efa17f88d5b3b1482277268d9dcb0c787ab1e895e62e35dfaafd00eb773954e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KY/currencies.json"
+    },
+    {
+      "sha256": "00b6308fd1736962799507bd1ab4f4964a572f74ddfb10c18cc740bc3454618f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-KY/numbers.json"
+    },
+    {
+      "sha256": "352567b9b77a29c0515485d55a6b039ac2a8a13b9bba6d213c3bb8ff9e680fe5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LC/currencies.json"
+    },
+    {
+      "sha256": "fc9e873a3c87b84b8f1388a978c71b673604b8596549d8cd07ac9f1dce73895a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LC/numbers.json"
+    },
+    {
+      "sha256": "fb785ae893053c857bf44df842ce6726da12e609d3d831c1c3a33df52903309f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LR/currencies.json"
+    },
+    {
+      "sha256": "64623b17eb96f0c5109cc1d8005efca9ca39fe424a0e65e72d30c5368452e4bf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LR/numbers.json"
+    },
+    {
+      "sha256": "51ca8a5ae7d8cc260f7e1ffe32d26482f5f411bb416bb66793b2ba455234ed46",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LS/currencies.json"
+    },
+    {
+      "sha256": "0c98906a06da5000dfe18253319be27b34e625a1475d617b657cbabeffb2b828",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LS/numbers.json"
+    },
+    {
+      "sha256": "aaca31101e14e1c37979b4d3663f53ebf9c0568a0ace31c89d9ce67518ac8941",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LT/currencies.json"
+    },
+    {
+      "sha256": "f03b7a70fe48fbb4a1efef7dbdadaf876e70df00ecdbe0dfb8888ec128947685",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LT/numbers.json"
+    },
+    {
+      "sha256": "e4cb17ee09651596093f93f891aab3af043e4be4442952a335fe903903a6061f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LV/currencies.json"
+    },
+    {
+      "sha256": "ab94cd152a64ea131daca89b4b65c9db421740c64744f093d9081dc7bf52b94d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-LV/numbers.json"
+    },
+    {
+      "sha256": "c416824a6363cc16c2d088d953a9c22e1fd3abfb7206a5b423eb7f1ada654cea",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MG/currencies.json"
+    },
+    {
+      "sha256": "a0888b47542a1ce3446a425282975c297ef06abf83167263a1bb9f5bf8959afe",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MG/numbers.json"
+    },
+    {
+      "sha256": "95a9316bfde076e868258b3887c8b339a18e15889a5517c735397a6c0440d7ad",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MH/currencies.json"
+    },
+    {
+      "sha256": "0c3e955162175482154837e703a1f74cc2e2b2dddaafda330c6ee8078b9b3e3a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MH/numbers.json"
+    },
+    {
+      "sha256": "0eab526bb5235f5ed7f77b629fe50995cbe727932100e9c6ab93028943f72312",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MO/currencies.json"
+    },
+    {
+      "sha256": "8def49256aff36c435ef5b73fb14df8eb13689e75034f49766bd64cd0a2d8e4e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MO/numbers.json"
+    },
+    {
+      "sha256": "21fa087aef69ce5a2677ddb7f747e6266ddcdb4591633ff450abeca0945951a7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MP/currencies.json"
+    },
+    {
+      "sha256": "385ee3d893c5e65f1991f02793e59691ea186d9e9d18df94ca7b809bfae8b07c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MP/numbers.json"
+    },
+    {
+      "sha256": "e67a6026cb69607b3f776f7ca4fd434aeef4ecfc77b088102986e27c56b87a83",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MS/currencies.json"
+    },
+    {
+      "sha256": "7d8285ec3a2de7d7161ad4aa69eb02f38811711151172fa5728755824f9b3989",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MS/numbers.json"
+    },
+    {
+      "sha256": "5f99a805581f5d7f0981d05effe1babf8b72f0f2c14b05d6fbea9a5b0f6056d0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MT/currencies.json"
+    },
+    {
+      "sha256": "7384c22e1c5066220fb120842dfeb6723f9a1f91205d5e243ff938082156663e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MT/numbers.json"
+    },
+    {
+      "sha256": "39514bf59222616c9c686c9f2dd9c4e21bcd3bf909d7ca2c3f3e106e9be35512",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MU/currencies.json"
+    },
+    {
+      "sha256": "e8758ace92ff4684cdd3a6b623fc08701983d5d2f60cded5913e4f93d99b9f87",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MU/numbers.json"
+    },
+    {
+      "sha256": "a97ceafcecc0108cb3c02bc2eb8a473820a7091b3edab8d37c82b1550d4cfabc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MV/currencies.json"
+    },
+    {
+      "sha256": "305bc4d5e4b22f3cb520760dc8e55ade76a9433a877097f3625a6f318675725c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MV/numbers.json"
+    },
+    {
+      "sha256": "0b1ea1c29326cc225f484add2fa7c78406f62a06923775c86f63fe9ba270a6d2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MW/currencies.json"
+    },
+    {
+      "sha256": "6871b88b0e03113af0dc513446f0ff3c7be7b21b5ee69553fc64d44def751ba2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MW/numbers.json"
+    },
+    {
+      "sha256": "9bce9e044604277c0d8a0507121d15af7a3c621de8ba67fd722a86765b773bb7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MY/currencies.json"
+    },
+    {
+      "sha256": "3b7ebd08050f2e340934c656b2a391d52d6b34b3c5203af98f9c8c54889ae055",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-MY/numbers.json"
+    },
+    {
+      "sha256": "8a9ccaca003ff62d3a7af57496c97dd638cd8d8128b241ecbeb918404b29bc1d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NA/currencies.json"
+    },
+    {
+      "sha256": "d257b113c039d5993d7ce33d8b17b3261a81d3e5879cba3eedfba90faebd758d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NA/numbers.json"
+    },
+    {
+      "sha256": "cadd4e0afd94a782e7f1fe678adeb7df43effa55ad1a31a45407b1c0d4c886c9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NF/currencies.json"
+    },
+    {
+      "sha256": "cfc3cdc49d67e262714b23ce0edcdce9a76347b644fbf701d4ff836c7bc7f322",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NF/numbers.json"
+    },
+    {
+      "sha256": "b3ded81b9a1245c611978829e9a77ae7f442b47af93118ef5488d979632c3997",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NG/currencies.json"
+    },
+    {
+      "sha256": "898b46e5bfcbea625f651c0c6259fe44686dbdd45784c76d02fe311113fd1c9b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NG/numbers.json"
+    },
+    {
+      "sha256": "5c4251a618d49eee7757e1c035e72c2669cfb5d6c02ebad8175d4b36908a7b17",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NL/currencies.json"
+    },
+    {
+      "sha256": "e835f723ee77d6ed7595b25df5ce06dbec7c0f2c33f945bc0d4bc22da8ff66a1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NL/numbers.json"
+    },
+    {
+      "sha256": "ff7827c91f08919453e116a60bf1c3062bd11c3bd8f5b191eb352cdf22c05070",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NO/currencies.json"
+    },
+    {
+      "sha256": "f845192daf9cd3c83d5afd945543aae7832f15b0d240079a660303df13ef0120",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NO/numbers.json"
+    },
+    {
+      "sha256": "5b64d46871e46905a6d7a8740251aa0df8b65652d36a5cda816faf328c126481",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NR/currencies.json"
+    },
+    {
+      "sha256": "3e1006165c064107c51ab9a09e8bdd955cce1d5e6269674a75a4dd7d2b74206d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NR/numbers.json"
+    },
+    {
+      "sha256": "0d755ed3435224059cbd52805ff4be692b79abbee8f535700fa1c415281eefbc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NU/currencies.json"
+    },
+    {
+      "sha256": "8035b1006bda389a132d6e51e0af806687e82e6abfbf16bcc92c2485a1e4835c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NU/numbers.json"
+    },
+    {
+      "sha256": "47126d372219e4625c457b5df1d576e4dc14ac0c27f47e2825bee4c496344c41",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NZ/currencies.json"
+    },
+    {
+      "sha256": "0a1ff5bfb5b74d79e80c522fe2cf9f77aebca77eb9d8554fffcfc349e99b9123",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-NZ/numbers.json"
+    },
+    {
+      "sha256": "eae773edad4caa8d4e29145dd6ef26c72daf09bb14afdc24b4aa4670b483d30c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PG/currencies.json"
+    },
+    {
+      "sha256": "6bfdbc50a5a495587d4ea45759987403f77012a97ca9c5b141de34c6dd38e420",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PG/numbers.json"
+    },
+    {
+      "sha256": "e0228cd4b0f808fa7f4966b80a9146e4d7628683b1f116ba4cd6cc9eaea966a2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PH/currencies.json"
+    },
+    {
+      "sha256": "322458e0b4123e5ed41b0e7c4187ef01d4a285127c1843e3bdd350570ffbeb06",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PH/numbers.json"
+    },
+    {
+      "sha256": "5826040e7afff2bd0d51fd67c8a75ed7fc82e21d10050a018a69af62d64ce01e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PK/currencies.json"
+    },
+    {
+      "sha256": "264160a7a8d0aba0eb4c88753c49bba3bf0cbe2319c0e761cac48516a88bd02d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PK/numbers.json"
+    },
+    {
+      "sha256": "1fa2fdad4de8d17d219baac7d47210ee25fceb5dd18bc93a6f84fe9efec9149b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PL/currencies.json"
+    },
+    {
+      "sha256": "c5674fb8eaf4d20b4500b7eecae4d53e60639f770c9b5e46c97d13c0da8e8608",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PL/numbers.json"
+    },
+    {
+      "sha256": "3aefd70dbf2e97e39a9bda8ff5cf8180d59fa8d1d14c26eff9331bdd08c664ae",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PN/currencies.json"
+    },
+    {
+      "sha256": "e95448f90fb44e0dd45f2760b4507c6b48692557b8d5a0be7e6c74f96d8bcf73",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PN/numbers.json"
+    },
+    {
+      "sha256": "ae8ab7c181bc705f31180b0dbd15444e347538c50c972799014d45096f8f0e69",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PR/currencies.json"
+    },
+    {
+      "sha256": "fafeb47b1e3a6008bf19d3da67555ccebf425f6c535bd3a1cf663b7126e1cfc1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PR/numbers.json"
+    },
+    {
+      "sha256": "624f83fe9d18e2b085dfbe27327edc88ee4678e2dac1fd0e433be1d2b600e44c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PT/currencies.json"
+    },
+    {
+      "sha256": "b01a1dfe63d0e391fb097b8b827daf7a6d2bc3bd23e51879c08b8635b3b47bcf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PT/numbers.json"
+    },
+    {
+      "sha256": "ab822e2353fcfcfef75ca91d501e5c0631aef32bb809acd0344b0cfae52e9f43",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PW/currencies.json"
+    },
+    {
+      "sha256": "a3d6dab4eca438df50f2982b194cf68dd59045b66e71f6075ca193de7856aacd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-PW/numbers.json"
+    },
+    {
+      "sha256": "e348811c1cfe57425e4b9fa622a34502b180e5f168034f7c8ef5347cd5dad047",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-RO/currencies.json"
+    },
+    {
+      "sha256": "6c15c504ea36ce34c7ee3c51276f6334c5312ac2e8fbe5b1bdbbfc5e19f1430e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-RO/numbers.json"
+    },
+    {
+      "sha256": "8e00ba9ab4895c09eab48ed7f54fb2fccb60839c9916c9a7ebb9c54919b766df",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-RW/currencies.json"
+    },
+    {
+      "sha256": "36ad236214382ef9a06528376be26dc29a2e1c91b7287b1287632b185ec8d6b0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-RW/numbers.json"
+    },
+    {
+      "sha256": "595ab711df4517c4798ad1f881ecc22dadb530de173024eea54e697d034a2d3f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SB/currencies.json"
+    },
+    {
+      "sha256": "4141580d543d66558cf7c051c9ffbd70d6d924df5f9815a8fc9c585de1ecc5bf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SB/numbers.json"
+    },
+    {
+      "sha256": "fe59bfb94f40dc23a6090c667582264664c5c94fb31414d39091e14b1f3cf2a3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SC/currencies.json"
+    },
+    {
+      "sha256": "1cd918003ee58593668a8dc16aad4086a2461900ce6142c5f50c58992694423f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SC/numbers.json"
+    },
+    {
+      "sha256": "e313b22facaa64877b1ba461d890a58ba0db6f3859184077828082ea314da1ce",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SD/currencies.json"
+    },
+    {
+      "sha256": "0c4d5b5ed8277e9fc0f610988d869dff89e8e00d18d53752e72954d722dc2693",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SD/numbers.json"
+    },
+    {
+      "sha256": "e66d6b91cf3a7e20ebdb8511bf2d955e9410a703c6d89a45be5a1577d5c12367",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SE/currencies.json"
+    },
+    {
+      "sha256": "c855def23358ca5b8c6568394908ef2841ca423c1d134d06d0e8bbf87369b1ce",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SE/numbers.json"
+    },
+    {
+      "sha256": "013102e37916abb423a2ef4fc5d7c1218452e7153cb3b1d0de80b5ef964f5d13",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SG/currencies.json"
+    },
+    {
+      "sha256": "9eee25d727ff3c5e9755277f1d3ef3a027188c818f6d554f5c1b3e0e27b54598",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SG/numbers.json"
+    },
+    {
+      "sha256": "e8e2ced919b640268b619b83b5885d4e8850a906ae93c3713a7c751944589964",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SH/currencies.json"
+    },
+    {
+      "sha256": "a722cb9503394ed4868aeb60f6f5239354ce7a204fe09a49457bdeefdcee6d72",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SH/numbers.json"
+    },
+    {
+      "sha256": "f41df0b5f61721d6748601314e41c5fd4d00cd05219aa329d6bb4c3db1d07e63",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SI/currencies.json"
+    },
+    {
+      "sha256": "f1d633b57c7bbe61823efdaadf1c847ba63f1a7ec24a828d7f2611664d9b7bf8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SI/numbers.json"
+    },
+    {
+      "sha256": "3c1ea24cc3e0af2df02b189b09a84a0e5ba4ff205dcc10da5a1e7cbafee453b6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SK/currencies.json"
+    },
+    {
+      "sha256": "22b6567ced038996efa041fe2e9e47cf013cd36dfea12202e7662644699ac350",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SK/numbers.json"
+    },
+    {
+      "sha256": "2c13c2ab751e0ba6913d7e41c90b954ac590e7b8f8732512b8e9af75b5a6aa02",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SL/currencies.json"
+    },
+    {
+      "sha256": "ce4020bd96c1883b5be76e6b645e71231a31c8a17c26e8ff872a18cea143a956",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SL/numbers.json"
+    },
+    {
+      "sha256": "3149b6d859d802c9c5954fd876999860a047bde9022b6d4a611efb1e2ac96fdf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SS/currencies.json"
+    },
+    {
+      "sha256": "012fdc0ca1a0628d2818435719d367a6f3f5f8d5839d26d2793ba47c50112240",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SS/numbers.json"
+    },
+    {
+      "sha256": "f78e7a6611adaf8512372deee45051db68dcd74ced1837242ec0a2ed2a9d62a5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SX/currencies.json"
+    },
+    {
+      "sha256": "d9e6c5b104dace9725b79443eb5c7adb1140b0d8916b59174b07ca1b39b2167a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SX/numbers.json"
+    },
+    {
+      "sha256": "8fa4bcbeb6e5b52786161d5ecc89def717689d3892470b3563314ccbdc142c9f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SZ/currencies.json"
+    },
+    {
+      "sha256": "1f4c9856bca6ad0e363bbc44531a9da7cb0614869c5074846950c599400b9723",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-SZ/numbers.json"
+    },
+    {
+      "sha256": "b4d1d3283e9f11a377932d884b2376e6152746b4af49d5a664f835d7f6bebd61",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-Shaw/currencies.json"
+    },
+    {
+      "sha256": "7d359b95666a8bed6663fa2cbc0ca6200ad02a31d1e9f7b6c52ab3da72c35de2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-Shaw/numbers.json"
+    },
+    {
+      "sha256": "434ca7088aa264526100fdc99003d9c15fd458a1b046158cf4a16f4f75df4c2b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TC/currencies.json"
+    },
+    {
+      "sha256": "0ffe0ff5051816fee5e5eeb983e3181cc0fba7652a275f1b0550fa4bb76e7e3d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TC/numbers.json"
+    },
+    {
+      "sha256": "e464bd5e781f88e2d9986508277cb0acd7a1bbe68aecfb6dfc454849d22769e7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TK/currencies.json"
+    },
+    {
+      "sha256": "80e5aececc09e461c4880196a9a5fb6e9a7df98c368c6019202f49dc6aea2fa3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TK/numbers.json"
+    },
+    {
+      "sha256": "ff181491f51f551f510a724b2223b93f4ac62ac4f98df478c4c9681091598250",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TO/currencies.json"
+    },
+    {
+      "sha256": "3e900a219555c1324fcab66096a88f2467d8c471f29d45af02b0c9735a83c11a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TO/numbers.json"
+    },
+    {
+      "sha256": "7777853309c66df0e4bef71fa9ea94f052d420bc5d826682ddfbd61151ecc4fa",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TT/currencies.json"
+    },
+    {
+      "sha256": "bed784e0af27edd495566c19208d29980df3163a5b32508bca20de9a56dc15f1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TT/numbers.json"
+    },
+    {
+      "sha256": "9dcf03653e9e440480c6929549eb50e69b62fa9937f638373e74674a1e006574",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TV/currencies.json"
+    },
+    {
+      "sha256": "8734095a3d45671c98ba4307aed2b70db6d375a9dc81512af75df920fafa8a62",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TV/numbers.json"
+    },
+    {
+      "sha256": "92813437d173b9c72d7b68b90e05280cc2119fd55196a40c4efbd30fe32893e5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TZ/currencies.json"
+    },
+    {
+      "sha256": "653556dc62b70b0a674ba02df7b07a6ce4c41c4931706c8cb5cec672ee5bd84e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-TZ/numbers.json"
+    },
+    {
+      "sha256": "871915ee25eb22df31d8101a490777714b5041e7ec54d2c2c1d07451cc0610b3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UA/currencies.json"
+    },
+    {
+      "sha256": "946632ed1d1c2c01922dbb011ed2968ed657c92bdf812c4979f10c2b34951efb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UA/numbers.json"
+    },
+    {
+      "sha256": "dd2cc56f9270abdcab1d9570d42c59ef6acf2ea4069945c8a6b06f91bcb3a5b0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UG/currencies.json"
+    },
+    {
+      "sha256": "9da674d5891c00e05b499774e8476ca2e7411173ef0aa463d566c992f01a8bc2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UG/numbers.json"
+    },
+    {
+      "sha256": "4ff8d76f4401625670be5d99be982bf57009a6ef8c3689e3fd265c597199c6c3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UM/currencies.json"
+    },
+    {
+      "sha256": "5832eae88209dfd2611bf193ed8fd94cdd77e211a4640e74319d00c6537d2f37",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-UM/numbers.json"
+    },
+    {
+      "sha256": "85754ecad7d2b9970884487fad0b27d2950ee126d4e4492a0263c4429c12eadb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VC/currencies.json"
+    },
+    {
+      "sha256": "49b2400680c911e20436a47e3e685b281b3052804bf9f5743045b97314ee3e2b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VC/numbers.json"
+    },
+    {
+      "sha256": "f62ba9921905a745161b208627ef13b1537403afdbf3a0f5d14addbc120928a8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VG/currencies.json"
+    },
+    {
+      "sha256": "560d256531b68a5421d559e3cab0fc0489e5559d431bba62921c1e0e52e086e2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VG/numbers.json"
+    },
+    {
+      "sha256": "d66c39baedf2ae2741d6ae49a6dcb03bdc26700b8157e9cc84e815b07b4b2343",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VI/currencies.json"
+    },
+    {
+      "sha256": "80c91189fc4f5f5997ffe0c88d8291c9631b2f5c536640a5be0a3e9bf254c679",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VI/numbers.json"
+    },
+    {
+      "sha256": "731c89a59b69b00fc6ec0f9828d44d05e041d6cdc03ec67bef1910aeb7b11bb8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VU/currencies.json"
+    },
+    {
+      "sha256": "886e833e72fe1458c5c581c1bc9473378ba1bb28e4e73c5164c1d286e683bf9b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-VU/numbers.json"
+    },
+    {
+      "sha256": "9c0978efe80392cbeecea6227bc3b0f4d21aaf81a1bf966113372fc75167a711",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-WS/currencies.json"
+    },
+    {
+      "sha256": "7dc32ac66104a2042946c873912725cbf76fcd40c575ffc9512472b43527904c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-WS/numbers.json"
+    },
+    {
+      "sha256": "855eead204db9a4774fb9eb4c895228d56a68975752b834bfb109016bf46f65b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZA/currencies.json"
+    },
+    {
+      "sha256": "eb693dd57a4e2e158bd409d1141fb473e0250aac677632aefcc2408a45b08f0a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZA/numbers.json"
+    },
+    {
+      "sha256": "2aeca1c8656f7050e167892469cf83a8ed60651c53a92f18c961a17b4770b47f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZM/currencies.json"
+    },
+    {
+      "sha256": "20dae318f05329ec25863b0b65ca3dd870f83250b1efe14ceea46a1ef78a80cf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZM/numbers.json"
+    },
+    {
+      "sha256": "41025c2f053fede10bafe3047999d6fb3701eedc5e13dd9c2dfe3433dc1ee732",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZW/currencies.json"
+    },
+    {
+      "sha256": "61b972d0e186e3d4b0c8ac63087c36a4f5dfc2d94f222ba3639ea09d348ac4a8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en-ZW/numbers.json"
+    },
+    {
       "sha256": "a6c41b28f4035f65ae698b53a66866982b4ff49bc0de7e840f91d2c6e6bdc23b",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en/currencies.json"
     },
@@ -49,12 +1305,588 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/en/numbers.json"
     },
     {
+      "sha256": "1f5a657cca93d44aab17e363d5c7314092107e42d333b69cdac95dae5f0a1688",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-419/currencies.json"
+    },
+    {
+      "sha256": "1384f61d61f1422d89c3f48abbd64f305a0d8817714f1f3ecb6a50390a6b007f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-419/numbers.json"
+    },
+    {
+      "sha256": "3710c8fef81fe67c6e415f45fff9e9cec38a5e512c45562b475b1b67c796ec19",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-AR/currencies.json"
+    },
+    {
+      "sha256": "a0e0e9816d5fa4f4c84360328281d297ff6fb0a4e387f8c4c2b709502756515a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-AR/numbers.json"
+    },
+    {
+      "sha256": "6b807e6c4b1af7cbd1dd64c14b0c5284fe5c53d6b313ba54e68a9b230830ffc4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BO/currencies.json"
+    },
+    {
+      "sha256": "fb385941ccb486752d14a7fb04e72caddee11f6225393bdc8c36bbfd5198a863",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BO/numbers.json"
+    },
+    {
+      "sha256": "08b1e8a4b38fc7f58f290676863e6df1a540dba0ba14cac74561d806f68d51b5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BR/currencies.json"
+    },
+    {
+      "sha256": "cb8b4f11319662c70d62e456979cdf84eb24b6ea0b6c1be74d0bfce5bd8eb91a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BR/numbers.json"
+    },
+    {
+      "sha256": "10fd083fbe24a92d9d82d2d680a2e874cef202b3f1dc5ea9cf31b3c5be132ca5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BZ/currencies.json"
+    },
+    {
+      "sha256": "2c8369fb45b295b8d9ad022427814ac439e1c3250f10c59f522a39e57563fbd9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-BZ/numbers.json"
+    },
+    {
+      "sha256": "f56693c88dae454a4e7e7b0f51c53610c9d2368c223b0d88c813e55db28df225",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CL/currencies.json"
+    },
+    {
+      "sha256": "7e5e4706f6a57116e0f7caf02dbd0df3597a7dd35ccda33ed2ace284f7f093f0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CL/numbers.json"
+    },
+    {
+      "sha256": "ad5d3f935e1981580056dc14ccc1479d68acf126aa4745e724220caca104cffc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CO/currencies.json"
+    },
+    {
+      "sha256": "00b8e641382831548590f258188086d8100a91b08d0f9dfd604b686f464c788f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CO/numbers.json"
+    },
+    {
+      "sha256": "90843f828d45131277b1734fd1bf6193724a3967a8190d9a867305ad3a6f1fdc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CR/currencies.json"
+    },
+    {
+      "sha256": "1c2f97d925056d6dc310919a91b8065d298959468c86990a1e0098cc7cd5bc0a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CR/numbers.json"
+    },
+    {
+      "sha256": "62a0274094331d975794e8c66235fd3cf14a18613803360768e932e7fec9dd6e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CU/currencies.json"
+    },
+    {
+      "sha256": "2c755d9f28757ca872000f90f84cd2871a88c6a89f16ceb15c631be1462f9232",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-CU/numbers.json"
+    },
+    {
+      "sha256": "b65acf43984c10856e3c2cf1bd164731b2cc5ff109d994e047830fb4c8080acc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-DO/currencies.json"
+    },
+    {
+      "sha256": "0dad803bca927cf7598cf295c67d777893bd7fc473f12b63775a831b333b18df",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-DO/numbers.json"
+    },
+    {
+      "sha256": "f4d259595f21e3654564450af24a93e2961a1048d8a464de9f077cfc1aab477c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-EA/currencies.json"
+    },
+    {
+      "sha256": "1d8f40ba8ee6f7650c88aaa25e7bb5f919d33e1d12f71fa90c5c5fad42133e4c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-EA/numbers.json"
+    },
+    {
+      "sha256": "75001cea7b52d0b81ff1b900ab57d67f30ffa7011ed7b82779a8e92af2bb9590",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-EC/currencies.json"
+    },
+    {
+      "sha256": "57ae605edf760e18612234799c6e3a3100a9bf4ca26181ce12e56ad845932d4a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-EC/numbers.json"
+    },
+    {
+      "sha256": "8821b383fe44964992dc23dfd6c66c7f51bcb42a0ee41b3629bba56013ccbf13",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-GQ/currencies.json"
+    },
+    {
+      "sha256": "ee4262bb84c321a35691e75a4f0d70d3e48ba312a475cfba05b11b3a96793d65",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-GQ/numbers.json"
+    },
+    {
+      "sha256": "4cc1bb85aef3bda309752dfc5c1a625602d9eebb99c69d9b389b36e463c6d50c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-GT/currencies.json"
+    },
+    {
+      "sha256": "8bdd3aca6ffb07d773dcf4125e1ced8a8788cf37e404103cd13f179c7777d693",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-GT/numbers.json"
+    },
+    {
+      "sha256": "1452235c7f34f3275bd71f7db467ac64b8e4a7d45a5baf9df15d3565120fe833",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-HN/currencies.json"
+    },
+    {
+      "sha256": "b82b9378231c398fede35fb1d0f2780aba207dc7584b4c5b120dc7b1ef53848e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-HN/numbers.json"
+    },
+    {
+      "sha256": "fa8bdfff0d38a624a7eeb706318ae4acc902911a50cdbc35f2aa64ab12b59d2e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-IC/currencies.json"
+    },
+    {
+      "sha256": "68978cf8980e2a8d06a0435d6ab12152ea12bcd1515250a2a84b44e8526959be",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-IC/numbers.json"
+    },
+    {
+      "sha256": "2a48522c9657db7910b167ed69d35f3963fb6d069ada95074fabdc8126ad64e5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-MX/currencies.json"
+    },
+    {
+      "sha256": "c3f9b054f8c770cb18040c6b65081ddbdc26e7e7a73be6be186e8224c168d7a0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-MX/numbers.json"
+    },
+    {
+      "sha256": "efd2056231170229e93c52b2926d10805eb470f8191e19204417328f97f91b0d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-NI/currencies.json"
+    },
+    {
+      "sha256": "aa3ebcd3f044993b645f70645ad76df1de66f07ebdd88261123cbb3dd6115738",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-NI/numbers.json"
+    },
+    {
+      "sha256": "b14ee97b9a98f4cd4fa7b63b1ab202b6e3508898a74c701e68cb2a32b0468c40",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PA/currencies.json"
+    },
+    {
+      "sha256": "8b056b1aaff109e84ec4745dbf122d6f5213d8018c05b8e2d50b645d025f293e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PA/numbers.json"
+    },
+    {
+      "sha256": "479292484a03cab9d76352830c81928a335f28e499c3d5422904aeaa7f89f45b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PE/currencies.json"
+    },
+    {
+      "sha256": "b65b1c152c5f6d73c760052e0fd5d8c0f3b6cb50c05049830f30476f50821288",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PE/numbers.json"
+    },
+    {
+      "sha256": "4d8cfd1b7dce34a65dccf7660632cdf581988e086ab6451dffbcb322d8737cd4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PH/currencies.json"
+    },
+    {
+      "sha256": "0dc837b2d8e68ca22eb6e0bcb0b5bf9b3bbbc75553469388cf426298a536f648",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PH/numbers.json"
+    },
+    {
+      "sha256": "e4bd92b9c7a4b4cb1a726c16a1311ba905dacf05aa0bf634f5a9a736eadd56be",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PR/currencies.json"
+    },
+    {
+      "sha256": "e86ecb3a9b5f3bd4054d3a03bfe91b04c835c0d77e2d5f02ed16e6345ffaf5d8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PR/numbers.json"
+    },
+    {
+      "sha256": "3b557adc12f7090b39bad00d96b435ffff695e21f0bbd8ce1fd6d00181e53f57",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PY/currencies.json"
+    },
+    {
+      "sha256": "341f753f7200f7ee1a1b757c243bc16aa1c576a9762b54f48d7019e8b0fbdff1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-PY/numbers.json"
+    },
+    {
+      "sha256": "d60e2e7021b271a8cd53e86673317cbf7930cb5ccde04ca8e5b10e6f02d69941",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-SV/currencies.json"
+    },
+    {
+      "sha256": "4344ec606ee8db1bd2ff45676c41d266037384333b62c407a5b0d9624ed145a1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-SV/numbers.json"
+    },
+    {
+      "sha256": "f4626225d35b641d7313c052e35925181f58b03b723b7f668d79b54b339d4465",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-US/currencies.json"
+    },
+    {
+      "sha256": "44123c99c6ee9718de009971d8586018d887be5317239a1f7710ae4dc112cab1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-US/numbers.json"
+    },
+    {
+      "sha256": "2586bb36f62a7e24d07853fa312c9ca6ff02560331787533b9e3c49ab3138c1e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-UY/currencies.json"
+    },
+    {
+      "sha256": "e70e50bdb1cbe81322dfff99d9e7e6a83c9e3e2fedb389067d8fe91428e13d26",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-UY/numbers.json"
+    },
+    {
+      "sha256": "94d7236dbf5a023cafa2a3388810ec18cb2a3d80f88a146d248a4ff3c09821db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-VE/currencies.json"
+    },
+    {
+      "sha256": "1c621b849df6328707b3839c9faa2f3502f0e308598107b2d29e11891f8eb5ef",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es-VE/numbers.json"
+    },
+    {
       "sha256": "521e4e42144dcacfef3d42fa00ffa6b1161637163671bc4e5d382dfa1bc4d9e1",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es/currencies.json"
     },
     {
       "sha256": "c479642ce277f82b1c40ea0d7092cc5894a38767fb6c7d33c47fbef26eed3c0b",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/es/numbers.json"
+    },
+    {
+      "sha256": "78b4e4c094ba229baa6bd3e6fc6b1778816db087a620292f9afc307f32285e05",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BE/currencies.json"
+    },
+    {
+      "sha256": "a979cb24690917cce8ea17676d7d70f69ca4b14519fb265608056155271e362d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BE/numbers.json"
+    },
+    {
+      "sha256": "bccd264057fd8f8bd9f66fcd547d78ccd9f74eeea8aa0e76f31d0299632aca9b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BF/currencies.json"
+    },
+    {
+      "sha256": "64a122ff5b15e2227883bdf9df1920de8d47e8a20377c3554d161fefcedc8f89",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BF/numbers.json"
+    },
+    {
+      "sha256": "1cf8ada8914275856b32e2c0cdb6aa66c3502c405a176aea7cb9b63f2ba48ad9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BI/currencies.json"
+    },
+    {
+      "sha256": "c02fa80caa944763cfa7c2590c87df82ebeffa9b883b109da1df037a2b5a76ba",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BI/numbers.json"
+    },
+    {
+      "sha256": "f91a5c516d78529f10e3a4acc7f14ac84ed6303f449b8515d21053ec8fb60719",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BJ/currencies.json"
+    },
+    {
+      "sha256": "6704528aaa14d973a1b5f78017a527b3699e9f0c0f4447a91838bf62d614c444",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BJ/numbers.json"
+    },
+    {
+      "sha256": "3abe959048d856a7ebd887bf7810b6c3e1ce476f2d0a6356151c5a2c05a856d8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BL/currencies.json"
+    },
+    {
+      "sha256": "e59f2fc5abf32ee1ff65c587ae439b087f69a678ca58453dd5e1fe500aa59478",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-BL/numbers.json"
+    },
+    {
+      "sha256": "97285a93acbbc102144872554de58ad162bf183c87c5bb1266c41ef467025208",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CA/currencies.json"
+    },
+    {
+      "sha256": "c4a035fbb78c3e0c534f09cda4e2699832322f639b9e3156b595a98361687638",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CA/numbers.json"
+    },
+    {
+      "sha256": "c9ec8664da2e719e278e6a062b0e6065a3a78cf4dcbf37d060ec4e95be2b6dd3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CD/currencies.json"
+    },
+    {
+      "sha256": "5ed25ef4d75fce47d0a4ddf932458b589224cf6b67a63eb6bb30c40ac9001cbf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CD/numbers.json"
+    },
+    {
+      "sha256": "edc066defada6fd437be4abfb876bcf3de3a8d8358825bd429d74f3785b9687e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CF/currencies.json"
+    },
+    {
+      "sha256": "1a0c598b2736da0623e611862fe594ccdc8fede5510b90ce64d369f6df183891",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CF/numbers.json"
+    },
+    {
+      "sha256": "069502d13d804582bcdfe1571743e15439c95d8d8c2a7abb790f34bf1000df23",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CG/currencies.json"
+    },
+    {
+      "sha256": "cc3609e1f61eff3fbd87c8308547a0c534e5ffeb101b4cc9bbbc140a7aaaf7f4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CG/numbers.json"
+    },
+    {
+      "sha256": "04abca7d5e20a3d8f9a16e8b62fd3fa13fd72f620fd24629340cec47c8bb2a0a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CH/currencies.json"
+    },
+    {
+      "sha256": "96675bab0fcb1dc75f34f4a7995562996e28a4227311f002293b0a11641cc7f0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CH/numbers.json"
+    },
+    {
+      "sha256": "ffb2211d81a8fe0c83ac05eef2ee2e5caf0c2da3282651bc00cafc7e9647de68",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CI/currencies.json"
+    },
+    {
+      "sha256": "39bf9f7874006279f1bf7c9926ceb439edbcc7b1ba886f332a0220ade8837a59",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CI/numbers.json"
+    },
+    {
+      "sha256": "80f77ab96815f704b87f4b85b499ba413c44c5b5a047f708f07a417ec832c616",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CM/currencies.json"
+    },
+    {
+      "sha256": "578284d59866ad85fc139640232c5a3a20b1f20e503e2e0cc184ca66e034c551",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-CM/numbers.json"
+    },
+    {
+      "sha256": "17f679d2a38c7e9f971761138f2a1d0f027b8aee9c57b212f03d048d082de40d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-DJ/currencies.json"
+    },
+    {
+      "sha256": "7a53b64902bdc06abd960c10239432cc5390e09c92d6f2bda6f0a3e581a2e636",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-DJ/numbers.json"
+    },
+    {
+      "sha256": "6a82378063124fd64157335e29ad2e40d3a55ba88284d0c5746d16c4e31a6616",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-DZ/currencies.json"
+    },
+    {
+      "sha256": "7fcff3843cc5c39d0fc60b11b4255a16afd020712bb2970c1e337b95a6ebd5d4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-DZ/numbers.json"
+    },
+    {
+      "sha256": "4673913344f87a149efa66eb61769bf776eb5abe15629d101f79bfc5300750f9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GA/currencies.json"
+    },
+    {
+      "sha256": "1572c42ccb37e3c21fb50654c69fdc0094fa921589e7cdcc805c1e9c8f263897",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GA/numbers.json"
+    },
+    {
+      "sha256": "9db6f8eaa3e8406d07a3c79cee2d3eb0a153e2251eef0b52ef8ae9f7c9ce348f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GF/currencies.json"
+    },
+    {
+      "sha256": "9e29a0d24ebab675230d924a6ee0655bcc633fc4d1fd14a21e47d444cbb6ca8c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GF/numbers.json"
+    },
+    {
+      "sha256": "d67fb327b323b859d7c6758667579ef9a28438c477d39a3cad9d5de5bab5180d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GN/currencies.json"
+    },
+    {
+      "sha256": "b6a97407ba6aee2f05e510c0ca129b3d322656698a59c7bc1ef68601cc7b3ac0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GN/numbers.json"
+    },
+    {
+      "sha256": "c47ce9614881192d3686846ce53d890e47832d327e127ecdc4e93a7efb216bd6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GP/currencies.json"
+    },
+    {
+      "sha256": "6b5d928379124da450991d824b6e8b5d628f942c22fab5acd750cdc621fa81a2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GP/numbers.json"
+    },
+    {
+      "sha256": "4990d23c65bdd7ebdad33cd4899e4975b05e932b0cc776c4b45ab824d18ef9d1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GQ/currencies.json"
+    },
+    {
+      "sha256": "f1dc864e81fe0d251c8861ee1307ceaf9ffdfd9ca2e40f066500a7e8cb7ba8f7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-GQ/numbers.json"
+    },
+    {
+      "sha256": "06dae737cd63d95663fd5924a661cf6c7bd6f91318c0a9cec3ea119d353ce07b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-HT/currencies.json"
+    },
+    {
+      "sha256": "153143530962f775b48a54a01ff916f44b4077b6e04f19701613021c522c366d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-HT/numbers.json"
+    },
+    {
+      "sha256": "7aad4bc5e293573cb55934b96460266650af7fd4e8bfe0fb0bc665aa37b64e97",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-KM/currencies.json"
+    },
+    {
+      "sha256": "6a5d5e7df419b94172363e26f1cd92c4d9c2598b6a9a913b966b1d1491c48fff",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-KM/numbers.json"
+    },
+    {
+      "sha256": "0a55746eae70472589bf45a1979ed596f3be5a26321d046f38e6410594e85e7f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-LU/currencies.json"
+    },
+    {
+      "sha256": "6c83a541138387cc8ee4e01ce875aebcf3a5ea5c7025ea8930b2bbfc33d491ae",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-LU/numbers.json"
+    },
+    {
+      "sha256": "1ecf601569d557808b9bdc6b2c623f07d9de7849e707107a70bc0d21f181b515",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MA/currencies.json"
+    },
+    {
+      "sha256": "310865b1accdf2c1bf9ecb809e06f5847ad77d8ba4ec11f2d43f0d8180c139ab",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MA/numbers.json"
+    },
+    {
+      "sha256": "9c7f21a4ac9fdacb524ea9fb2f357125bfb5bd6b7788d37782ccd790623d09c6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MC/currencies.json"
+    },
+    {
+      "sha256": "3ca4aaacc3161238bde6839b8fddd010726bb61664b49509d2d8d4b9b03dc260",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MC/numbers.json"
+    },
+    {
+      "sha256": "1714602fd26af0e474df540fbe21b2e77157d00440333ae0e5247c03ceca959a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MF/currencies.json"
+    },
+    {
+      "sha256": "b0f48e2afbd25c6a8e18504b266c4d4367101ec6ed216f4d1859805219e2df2d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MF/numbers.json"
+    },
+    {
+      "sha256": "7b2cdfd5bea45836ca110504001c620ba6f8b00bbe07119c3d47ef5fb71676dd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MG/currencies.json"
+    },
+    {
+      "sha256": "624270eb66639f06f09bb2473e9a98c3f62cf5d90708898cf541c6402e456a56",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MG/numbers.json"
+    },
+    {
+      "sha256": "1c4db9531546f9fd393b977f3378dc8db6136aff55001435fb33dada376d205a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-ML/currencies.json"
+    },
+    {
+      "sha256": "c969b075a2908c696a19bd4f27fb36c5898bbd8646e72791ef4a477a24053649",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-ML/numbers.json"
+    },
+    {
+      "sha256": "10b745c8822f84b34ef2d941f3d7878130757d72149f32bc68c6c139611149aa",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MQ/currencies.json"
+    },
+    {
+      "sha256": "2892f62eb1d787935c632be70e7816242159a519ef14cead8ddb72da48ae0877",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MQ/numbers.json"
+    },
+    {
+      "sha256": "da3f1bd435031a58ff9e21211c17c75874f4709c1c6e08229ddc39c956edc63c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MR/currencies.json"
+    },
+    {
+      "sha256": "749b45bfc5ab5e8295551c5ebc7971bd1463d547b3923d6daf4b1c07844089b0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MR/numbers.json"
+    },
+    {
+      "sha256": "b0804de01942694d26f71918de94545bdaeb997f66746521a022042e1fe8f823",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MU/currencies.json"
+    },
+    {
+      "sha256": "68a800a3da7e3e9002f4b4aefc3fb4da5b05c5a7415597817a1d6e7017c50665",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-MU/numbers.json"
+    },
+    {
+      "sha256": "8ae450386527b49c9b731a7d7f8c251638add7d7f05d94e92e63871f03a0fafb",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-NC/currencies.json"
+    },
+    {
+      "sha256": "f2e1fd5ccd5d5c4f6af5f4836d0b7ae6223b3982cdf0704f3080b05b4d20aa8c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-NC/numbers.json"
+    },
+    {
+      "sha256": "4df1416b85d3cc23225eb7311dfded477df895aa481199c2d249bd867c4e290f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-NE/currencies.json"
+    },
+    {
+      "sha256": "227842dda24083c92d0c7731649d07a02b800ab16f71ef34d3c86993a6f80cc9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-NE/numbers.json"
+    },
+    {
+      "sha256": "4d3ffb652a5187c54a3ccae5c066a843c24201f4916ca43f7fa41c938c5a098a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-PF/currencies.json"
+    },
+    {
+      "sha256": "7b9653f4b89708ad88262099b315e2bdbdb23a37d3b72e93af8d7470d124f833",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-PF/numbers.json"
+    },
+    {
+      "sha256": "34d8f4a3fe00a06e7016f8279a4e687419a311b71d1442b09de7f7ed7fb5502f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-PM/currencies.json"
+    },
+    {
+      "sha256": "4ab6c9f5845082a50bb888263c37a1008c5c5a7c10a01fb191443a492a052802",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-PM/numbers.json"
+    },
+    {
+      "sha256": "5c0bb3bc2172359bb084c211db75db30d2a057d54d1ffc0b925292b41b44e2db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-RE/currencies.json"
+    },
+    {
+      "sha256": "fb837584a0db050729d84865f0a94672011aa5c209853d52bbbd58f064f8809c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-RE/numbers.json"
+    },
+    {
+      "sha256": "b47c2490b6bcd246b1d629638371241434cb3393d2eee5674fc772208a18881d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-RW/currencies.json"
+    },
+    {
+      "sha256": "494668dc3b70cd844c3ac3ef289b3d5334da21e94a4030ac60bb5417e9f013bc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-RW/numbers.json"
+    },
+    {
+      "sha256": "d14dc24ed8be44b0b47b46b4c82d1271a36973234723932fd851d6157fecd24f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SC/currencies.json"
+    },
+    {
+      "sha256": "a750e5520235d69018d7067839322c4635c43f508029b49712ebeb7196f70f17",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SC/numbers.json"
+    },
+    {
+      "sha256": "fdc67b7cb2af6454cfcbbc7b5691720488eea30e94e492ec2f8c933d21d326d0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SN/currencies.json"
+    },
+    {
+      "sha256": "b868fb53ad2d5fbc1f4c84c858579b4bf0a2874948035d3e2bedceb1e8a41663",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SN/numbers.json"
+    },
+    {
+      "sha256": "0b7390a739323198c43146d55464cd04846326faa38d99636eeb4a5120767f28",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SY/currencies.json"
+    },
+    {
+      "sha256": "9650f3a949e9e6a5c7fcfee9e252d5320a3b6aa82c2772cdba7d0132d388e404",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-SY/numbers.json"
+    },
+    {
+      "sha256": "b424c7a8b6669c4097697c1cc817b3fa24287f5b803ed403d84eafa0e8d91625",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TD/currencies.json"
+    },
+    {
+      "sha256": "8399f8bb5fc706c6658e27342ef5580db239f03166ee06b3505b38449409edf0",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TD/numbers.json"
+    },
+    {
+      "sha256": "1546780a34c4f6be8c0c2a4ddc9b9b721e09f3112662855a8e8981853a11ab98",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TG/currencies.json"
+    },
+    {
+      "sha256": "39c4e8d193497784bb57e8fb58914c2a775c52726eb3fd1d3a8e89f300f51d46",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TG/numbers.json"
+    },
+    {
+      "sha256": "657841558b6e9a30222d6f5be54f5d96fc9d93ecc19204d5aaa5303051089201",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TN/currencies.json"
+    },
+    {
+      "sha256": "2b5cd48a6d3df8af24b9390f1335996e2fcf1a7d904c3364df473e2e38fc5407",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-TN/numbers.json"
+    },
+    {
+      "sha256": "410a830e6c0b70f85bf5aeb09f7401db1c79277cd5d3e04726aa3b590f22e898",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-VU/currencies.json"
+    },
+    {
+      "sha256": "f1ce3abbf20272de09e4b185ba1030fba0144dc3c3c7ec47267e2b068d25b032",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-VU/numbers.json"
+    },
+    {
+      "sha256": "0dba0bef7363a88006d55eb978ab7a239bdf2d43216f15341fbd06fb8aaf35cd",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-WF/currencies.json"
+    },
+    {
+      "sha256": "972b132f1a405e1fb771a1387bb3cac2e3b2aef7efe514f3c2dcbc0991106346",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-WF/numbers.json"
+    },
+    {
+      "sha256": "d52d38bf56b6f69f62272f1673c667fb31051671cb525e8b58b62079481cbd8c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-YT/currencies.json"
+    },
+    {
+      "sha256": "3e5e62a5323beda8967f445934232c11870b82cdc22cce1f2c68001ef12e8b95",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/fr-YT/numbers.json"
     },
     {
       "sha256": "39fc400b745a6e056bb12d23c58f0753c01eae3cfb2c356a445dac6149760d06",
@@ -73,12 +1905,44 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/gv/numbers.json"
     },
     {
+      "sha256": "928df70dcb3c9a66fab989b1cf7081a7d867d5373fd9083c1d9b1eb7b8370c2e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/hi-Latn/currencies.json"
+    },
+    {
+      "sha256": "61de166ef7937be3f689dd4516b002a8be1fd1bde16219eb9c0ab2fd02eeaad4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/hi-Latn/numbers.json"
+    },
+    {
       "sha256": "eb12b25f6625a2e7825ffcb6321d8169f85bb9cc168b37c1a224f9f4ccaac9c9",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/hi/currencies.json"
     },
     {
       "sha256": "19ec7c61931c7fae1834d41c6a9ca9d1b06af4a38d0de92b7d578204ae99b439",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/hi/numbers.json"
+    },
+    {
+      "sha256": "a31fc6b5732d97bc51024ae7a2fa22c55d6c9b981e4549e8e0892e8e7dab7ed8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-CH/currencies.json"
+    },
+    {
+      "sha256": "43e74e8450c16457f178ccba4281e800e68d6d2723eb3fce3731a68917281c82",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-CH/numbers.json"
+    },
+    {
+      "sha256": "07f370f131d6b5b560a30ede0d2e9029594c4addcb803d70cdb5d806d9be7ff8",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-SM/currencies.json"
+    },
+    {
+      "sha256": "f584e43ef48a53975efcc1d1385de7c233e175257a7680e99bd5d4cb0c9aefa1",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-SM/numbers.json"
+    },
+    {
+      "sha256": "17de10117038552718da18d1a9025d3370d2f4a8a8d5352d0df8ce55ecef0f32",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-VA/currencies.json"
+    },
+    {
+      "sha256": "3225df7e42444b036c05667d07fa8b9a61b38276d733fb8c70afdbb34b1af9ca",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/it-VA/numbers.json"
     },
     {
       "sha256": "c5f87901cdfc7130e77d2655cb9464454c99ce6fbf7bb860c62cd9f2f06dc5f5",
@@ -97,6 +1961,22 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ja/numbers.json"
     },
     {
+      "sha256": "d5a9765647cc9b4c6fb1f313c1a9828f44638bc277730641fe7c1fd700191499",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko-CN/currencies.json"
+    },
+    {
+      "sha256": "6cdfe25a4827c31bbf1bfd1f73d93d78b4c749f6624525d7fb108d5106cdb16e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko-CN/numbers.json"
+    },
+    {
+      "sha256": "8c57f0e40e05bfda954125e63d0d52c21f309eeba746060dd73e26fa5055f09d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko-KP/currencies.json"
+    },
+    {
+      "sha256": "f58a820abedee432c3e3224155544ef95e1ceb3d7ee2d139caf792804b3633cc",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko-KP/numbers.json"
+    },
+    {
       "sha256": "3cac00a4739a7d5de5204e658bb807fff7d9f10991fda9c538ff8e7eb5a0d1e7",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko/currencies.json"
     },
@@ -105,12 +1985,84 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ko/numbers.json"
     },
     {
+      "sha256": "01b7216192dff8331ac1edb29910bdd11293945c154a8bd73873436843b4d9bf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-AO/currencies.json"
+    },
+    {
+      "sha256": "546b6fec481d57cd20f15ea5f39aeda6b2f847c1be096484011a9c5ae640d472",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-AO/numbers.json"
+    },
+    {
+      "sha256": "87d3bfc11a118c3fd5f331171a274022fbcda37ebb04dbaba98ac723378274e7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-CF/currencies.json"
+    },
+    {
+      "sha256": "c6d43158d281a2a73aec57dfa0bcbe5afabf4b34a05d4d4ef7311eefc15ea84b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-CF/numbers.json"
+    },
+    {
+      "sha256": "885ca2d4c41a715ac155b994c38dbcb54bf575815b49c71b5284515357cd0a50",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-CG/currencies.json"
+    },
+    {
+      "sha256": "25c8e4985a0ee7adcbfa47cf2eff2dc3d7a0ae8e3aa65bece850c25e4c899be7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln-CG/numbers.json"
+    },
+    {
       "sha256": "8dcd2e1bfb405c9e0319ac355a54bd5b9de6c312ec6bdcabc9a764539d910996",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln/currencies.json"
     },
     {
       "sha256": "ad7e14623a76308b32060de5523d5e16a1be9ca2f17b7d96ce6d1a017e2182a8",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ln/numbers.json"
+    },
+    {
+      "sha256": "5aa9b8bdbe5d8f99f1492c88b0b4f852ee8af5ccf351f07a8dc3ae65840ffdd6",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-AW/currencies.json"
+    },
+    {
+      "sha256": "e592c035643e818243476fcf5cb45c72f3c8e5d22823a1d528d709d6235a4ae2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-AW/numbers.json"
+    },
+    {
+      "sha256": "c91b7f827aee1b4cb998ec8792b74a3db9e18a6d1d81e4849ace877a9fc4b2b5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-BE/currencies.json"
+    },
+    {
+      "sha256": "6f092dc02df2ca7185926bb22af4ed44580a808e5c575aca59048257c8576103",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-BE/numbers.json"
+    },
+    {
+      "sha256": "bc4a4e45eb9fb70982e215b2ae666f880fd1df1c228111942674318e248d92b2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-BQ/currencies.json"
+    },
+    {
+      "sha256": "448a73e0034b27c2c237eeb652e1f969b9ececcbf6694e2255956862a9df3622",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-BQ/numbers.json"
+    },
+    {
+      "sha256": "fa8fd288ea75e34995ecc647cff0e461dc7c52a00d895477265130bdf55a0a1e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-CW/currencies.json"
+    },
+    {
+      "sha256": "10d4226cb887f384df0979ce18e02993b8edb823efccb35e8c6c3b5d3cbf4738",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-CW/numbers.json"
+    },
+    {
+      "sha256": "c350b0c54b8bc28d1344c027b9cbc6ea34853e82e4b03eb134068ff037a97283",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-SR/currencies.json"
+    },
+    {
+      "sha256": "377642dfa82ad653ccd29fec261b58d15b9c229b77c3f2691d5d4bbc53c1c359",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-SR/numbers.json"
+    },
+    {
+      "sha256": "691c31eef667f44fccbfe078213b6bfab836eb72ad46cc71e9effcfccc212a6a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-SX/currencies.json"
+    },
+    {
+      "sha256": "e3d029b8fec21c3ca7cf01d67f7d96b5f5b7866b301deebf250cfb8785f74317",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/nl-SX/numbers.json"
     },
     {
       "sha256": "1cd456686cc6603be7c70f23bd8c297504bbbb128f3414a6a7a795a7aaf505d8",
@@ -129,6 +2081,70 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pl/numbers.json"
     },
     {
+      "sha256": "a288e05b0059af5f202fc48815f4feaae52bd458e9be8c3c6bc466453c6d440d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-AO/currencies.json"
+    },
+    {
+      "sha256": "bcba3be33b296ba3b199013dd548f6ca3c040518baa5fa5d03bd46665559b2da",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-AO/numbers.json"
+    },
+    {
+      "sha256": "6c214b20ef256a15dce74fe503142448e466ab11b72db4afd0b3c36875bf70e3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-CH/currencies.json"
+    },
+    {
+      "sha256": "54dd8aed4445a8f83caef89d938f80c575f27d64530b5e857d19d74f7f35386a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-CH/numbers.json"
+    },
+    {
+      "sha256": "c6270d74c118bbde5ee1bc0c47108dc22b1c85ce72d3cdc2af8d6a0e3c5aab5e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-CV/currencies.json"
+    },
+    {
+      "sha256": "0649594ee47c206747536f7238bafa876851812b5840e635ebb61951151ddd74",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-CV/numbers.json"
+    },
+    {
+      "sha256": "73b4aef2f2e518fabbbef4946f5360a0d2cd9de3d28ca3f60903312bca4337ef",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-GQ/currencies.json"
+    },
+    {
+      "sha256": "167606031374e070ce75c3b1af954123233a33b7a332ecb976de9d5ff6970840",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-GQ/numbers.json"
+    },
+    {
+      "sha256": "a14e587efe6a098b847d671b11e1ec40005b23a945d2e67e095c3b6d31ee20ac",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-GW/currencies.json"
+    },
+    {
+      "sha256": "51024a6d9e8558013380f92e194c414c47da1945d13f26c714958ee19053ee08",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-GW/numbers.json"
+    },
+    {
+      "sha256": "0891fe1e66578ad7c030c94c9e2bba11545ccad89a6e0f2566c80d8d72c47842",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-LU/currencies.json"
+    },
+    {
+      "sha256": "a20e9ed648c647a0334d2e14096655305f97bbca1bd018a76acadd78522fa505",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-LU/numbers.json"
+    },
+    {
+      "sha256": "4160c0046d40f1bfd67cc50f5b91127a19c3479a28d3b06a4bac98603312cf63",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-MO/currencies.json"
+    },
+    {
+      "sha256": "5ed759fa08fccc92fcea61a2419fcd4a78e982dd359506fd1cf8603d974ff625",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-MO/numbers.json"
+    },
+    {
+      "sha256": "648610041aab5179beb12d1633becf93f65ccadba4b42c64b5157b7b07c25d00",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-MZ/currencies.json"
+    },
+    {
+      "sha256": "ac5db485f032ce43a31f157ccb454b4c6c64969d6548e66a3a0956dd73e6fbaf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-MZ/numbers.json"
+    },
+    {
       "sha256": "987d60f95d1de479bce646b8d6c4a9fa32140c5474324c701383fa055f908499",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-PT/currencies.json"
     },
@@ -137,12 +2153,68 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-PT/numbers.json"
     },
     {
+      "sha256": "9d39d0c9bb51edb3133f04fc869896d3923b086439bf1237c291c32a13555a80",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-ST/currencies.json"
+    },
+    {
+      "sha256": "1137bfaee9359152f3d15bc64cbbfaca824f8d147b4547cb3def9cf642be22a7",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-ST/numbers.json"
+    },
+    {
+      "sha256": "75fee9048fa31edde93168356c7eed79c04af7e4dd49c46697d6a806430dd1a5",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-TL/currencies.json"
+    },
+    {
+      "sha256": "d5003f57cff04e9bffd0a25f24610a5ca88414a87d7bf0f88369c684cfd68c49",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt-TL/numbers.json"
+    },
+    {
       "sha256": "b4a1524312a1afce2c7781c9db7448ee3ec6266de05a0e19fbd9f02648878405",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt/currencies.json"
     },
     {
       "sha256": "a9ffb67f72a8c8d185e0d12100ebe131c9b49115d2b75001fcf7782b7d63afdc",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/pt/numbers.json"
+    },
+    {
+      "sha256": "11a291b75caddee6c5d46ed36bd29c8486959a01ae28d4fc725a4cf0feb9435c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-BY/currencies.json"
+    },
+    {
+      "sha256": "e52c035bb0b5db2dc844fd4cb8d98befb8a53404dd631951329a237873e57b4c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-BY/numbers.json"
+    },
+    {
+      "sha256": "4386e418aa7cd86eed91d3653aaf24f262cadaa3cad2624671e8078213133f24",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-KG/currencies.json"
+    },
+    {
+      "sha256": "6d660a5c9f46246739c17cee301ce836f53f873e68432730cee2d02aaf1a6d6f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-KG/numbers.json"
+    },
+    {
+      "sha256": "646651b79558884e31d1f33b600a3d7606182d02f93ebd32da6755a2d8be2649",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-KZ/currencies.json"
+    },
+    {
+      "sha256": "5cc7dc86511a7710c43791c029788f54d3dc78d08e5a582653bf60cf511e46da",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-KZ/numbers.json"
+    },
+    {
+      "sha256": "388ebeda51ebc4e0da3483233d6f6fac49c6537281e5578340cdccec726ce790",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-MD/currencies.json"
+    },
+    {
+      "sha256": "ee57f0f710d5861cebe71059c1c5f288ec531edcf6129cf076b75008f893739d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-MD/numbers.json"
+    },
+    {
+      "sha256": "4a1084a084f93d2e2a85db89951f31f63a978ae913359497fb844c2768f219db",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-UA/currencies.json"
+    },
+    {
+      "sha256": "1cc86f3b65f6396ba2535953ea8796dca7d7f36bbf8e2b193938312861973f95",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/ru-UA/numbers.json"
     },
     {
       "sha256": "f8e10970ae91f3c2fa7400ab97d5fa58a79d7ab9d4fd95bc33c392bc661640b1",
@@ -169,12 +2241,92 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sl/numbers.json"
     },
     {
+      "sha256": "34e0196da054d22a521132c83a8fd69dbfdbdbd05a8afad022c7c04002c3173e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-BA/currencies.json"
+    },
+    {
+      "sha256": "cdf97098d4a1e22c00742d45da10abc2e1bceea72c3eb5bae0667c03cf59a24a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-BA/numbers.json"
+    },
+    {
+      "sha256": "2d2613120a01111dafcf3083e2fa3d0f4e5e9cde1e12b3e57d7e35a74f0534a2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-ME/currencies.json"
+    },
+    {
+      "sha256": "fe2ad6db66597b314de09e6c71d1a043be5a0f6e74117611e2218fd0cfcd4e6c",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-ME/numbers.json"
+    },
+    {
+      "sha256": "ff7cc64424b8f6491ff876e1ff4cd18f2db353b219f8bb0a046b9e5e4e7f42d2",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-XK/currencies.json"
+    },
+    {
+      "sha256": "5d9b4365ae758812850077df831c68206f153b392714219e1fd574527a51b4cf",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl-XK/numbers.json"
+    },
+    {
+      "sha256": "bd93b659e49e829f863456be2807ec1cc8f0b83a104460ba6eb3ba49811dbd74",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl/currencies.json"
+    },
+    {
+      "sha256": "1d2f9569b36fd3059277956e8299a826f62e51c34b68718f1c317c224f1334e9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Cyrl/numbers.json"
+    },
+    {
+      "sha256": "c9c75e7fb99ea499023f42d7988b2116993e64e4f1f4ef9490627f24bb3b7c13",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-BA/currencies.json"
+    },
+    {
+      "sha256": "d6f0168416abb59ec8f8a35b31be20bf193164d172c88db622bcaec649252b3e",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-BA/numbers.json"
+    },
+    {
+      "sha256": "5eb53ecf8be11c537ea8e503ebe6ddc5a5e80fbf927b3f9cfdfaa3711165a954",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-ME/currencies.json"
+    },
+    {
+      "sha256": "214bc8bad8814321fe98e7c49b07cb75d3c7b466ea679742b9b4ecb90e792036",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-ME/numbers.json"
+    },
+    {
+      "sha256": "c5e1f1a05d166dce8524a3f053035513bd197e39e14103cd9f24ae518ceed434",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-XK/currencies.json"
+    },
+    {
+      "sha256": "6a4baa7e54435148b35a563c24412a9b43acddad6eebc8aa95c3966c7f55356f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn-XK/numbers.json"
+    },
+    {
+      "sha256": "4dc09648d5fcd9c6c46611fcf23055debe3fdd5e3cbfbb4da134c7f6fd50af09",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn/currencies.json"
+    },
+    {
+      "sha256": "788f73c44f59552204341a8b5bb997686400e2b0607a0919e818e953c50ecbe3",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr-Latn/numbers.json"
+    },
+    {
       "sha256": "ac70eb9deba723d64addc9fc408ee6faf4701cced2015f84c855fffed9e96f7d",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr/currencies.json"
     },
     {
       "sha256": "c16a73e538b73abbfe0add592ec44c360a14cf648c0bf698887f125a141c1f38",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sr/numbers.json"
+    },
+    {
+      "sha256": "9d9dfde5a00aad09a89d13032f8f48c12ebe929141899d0438a96fcc092ebd39",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sv-AX/currencies.json"
+    },
+    {
+      "sha256": "98c9ac571121fc7259ee610cfcb20a90fac0a7ed51539171b8dddbae858f1453",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sv-AX/numbers.json"
+    },
+    {
+      "sha256": "63368494dd93b5bda2f40b053b893f61f540e832f5e20f7211f8bc2db890d32b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sv-FI/currencies.json"
+    },
+    {
+      "sha256": "66b1d8acfd2416c80b9f47e538fc2c0f5697ef80cccd4eb51d864441f91d47b9",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/sv-FI/numbers.json"
     },
     {
       "sha256": "a1d7639bb9a97ef197c8ecd11d7bdc70b5d3431bcf355d332735dfc40a8c62d8",
@@ -193,12 +2345,84 @@
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/th/numbers.json"
     },
     {
+      "sha256": "f6124a7f34d3bd1f9d52d1a5749c4e6a6fb5f89719a9e3c2880da24b68a7cb02",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-HK/currencies.json"
+    },
+    {
+      "sha256": "561887bce433b6e6f852d4e9d7dc4f2458f620e229702f4e919e90b05e78ce2f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-HK/numbers.json"
+    },
+    {
+      "sha256": "f0344537271d4319bb1a7e1a8d31ee2737ce1f88864f394f4083839a2e442669",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-MO/currencies.json"
+    },
+    {
+      "sha256": "773dc86dd85cdded4ee8994822099eb4b8d0c071507398def612a755a4252d75",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-MO/numbers.json"
+    },
+    {
+      "sha256": "5589b1efb02a559c31a324206c585200b3969db80d64266d8452c349a43f2a29",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-MY/currencies.json"
+    },
+    {
+      "sha256": "dbcc4c473edb8780c7f200143747d66058b89aa06e216a6c45d1a779e851cf8f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-MY/numbers.json"
+    },
+    {
+      "sha256": "c7d65e16b8941747cfc8096bdf5535ea2b489970fc5b93ba7a7c251ddb63ea01",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-SG/currencies.json"
+    },
+    {
+      "sha256": "71d438117144da538128e3717c9f4fb8f766f38a11ada72128edd36639c1844f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans-SG/numbers.json"
+    },
+    {
+      "sha256": "b00a46b7c6c0efd373737fdd1e4398c4e4e5fd2cf64809e23dd6aa04fff203ea",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans/currencies.json"
+    },
+    {
+      "sha256": "f48a99c3f88531440ea15e85f988bf87d884ba88f2a608270937e58124a2818b",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hans/numbers.json"
+    },
+    {
+      "sha256": "86129f2040e81b7580b36086ee28675b183d15054580a9bc1654ec6b8382e3d4",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-HK/currencies.json"
+    },
+    {
+      "sha256": "643ffde5cb26a9e65ca315d9d79f777dac3ad1b5aca0bf623cdc1d4b84af0c33",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-HK/numbers.json"
+    },
+    {
+      "sha256": "d324debb926274b7c0caa86f4543e4b40fe90ef7727307c177eaa0331580bf57",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-MO/currencies.json"
+    },
+    {
+      "sha256": "099001b0c5a4b44ec0b884af91fbbd05cf3ed6a7ce66bb25071afc1be831804a",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-MO/numbers.json"
+    },
+    {
+      "sha256": "bdeab6316cf685d7bf85bd214416e43d609bfb1da6f299d9d87b8da5720b243f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-MY/currencies.json"
+    },
+    {
+      "sha256": "9198f390500729d7918130945bc2d36b7749c52c15c6e76c935c32c834c25d6d",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant-MY/numbers.json"
+    },
+    {
       "sha256": "267565016b055a997bced6bd07e2f5a826fc3bb093d4db05aff08f7b1a367e54",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant/currencies.json"
     },
     {
       "sha256": "705585a92dd04b04383ada2900f743b70f42bd3928e95294fcc3e747d2bf8a4d",
       "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Hant/numbers.json"
+    },
+    {
+      "sha256": "44ed68b14cddddfafffc4734f64e4844bcabbe29487913c1d58862d2e18ef500",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Latn/currencies.json"
+    },
+    {
+      "sha256": "323b105602c6f6730bb6bb5f75530e632b4d223a76ac871a6ec1bfddfc24a70f",
+      "url": "https://raw.githubusercontent.com/unicode-org/cldr-json/4d06be52b51bb2f75688d0abe55c52a66afed790/cldr-json/cldr-numbers-full/main/zh-Latn/numbers.json"
     },
     {
       "sha256": "c23b7df1982deae53121f6665e3c27059c1e47640b167c3ce0e3bf5a64d13c8d",
@@ -214,12 +2438,12 @@
     "path": "crates/lumen/src/cldr_numbers.rs",
     "sha256": "57064f5dadeeea45a051ed5ef87c45a90af50f8679ac15a5d65deba24badc0a4"
   },
-  "packed_source_sha256": "a5df9c002fc4de5aae72791f7d145662930b2ea72111eeb6a3d02d9ac75ea096",
-  "pattern_record_count": 203,
-  "string_blob_bytes": 260533,
+  "packed_source_sha256": "ad4eca94df6cbec25db86d7ba023f5c388582d4727fca20c019879edd380d9cd",
+  "pattern_record_count": 316,
+  "string_blob_bytes": 282835,
   "string_blob_path": "crates/lumen/src/cldr_numbers.data",
-  "string_blob_sha256": "94a7e31789b1b88b25c581e939e0a750215e985c515fede66daa39a09814d26f",
-  "symbol_record_count": 29,
-  "text_reference_count": 52845,
-  "unique_string_count": 11132
+  "string_blob_sha256": "260a7f95d871e1bb59b595f95ab14116c4eed2e98a783c41c166e0804ce8c7cf",
+  "symbol_record_count": 88,
+  "text_reference_count": 58939,
+  "unique_string_count": 12327
 }

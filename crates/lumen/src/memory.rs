@@ -1554,7 +1554,13 @@ fn scan_realm(
                 interp
                     .unhandled_rejections
                     .len()
-                    .saturating_mul(size_of::<(usize, (Value, Value))>()),
+                    .saturating_mul(size_of::<(usize, (u64, Value, Value))>()),
+            )
+            .saturating_add(
+                interp
+                    .handled_rejections
+                    .capacity()
+                    .saturating_mul(size_of::<(Value, Value)>()),
             )
             .saturating_add(
                 interp
@@ -1607,7 +1613,17 @@ fn scan_realm(
             visitor.value(result);
         }
     }
-    for (promise, reason) in interp.unhandled_rejections.values() {
+    for (promise, reason) in interp
+        .unhandled_rejections
+        .values()
+        .map(|(_, promise, reason)| (promise, reason))
+        .chain(
+            interp
+                .handled_rejections
+                .iter()
+                .map(|(promise, reason)| (promise, reason)),
+        )
+    {
         visitor.value(promise);
         visitor.value(reason);
     }
@@ -1752,6 +1768,15 @@ fn scan_realm(
                     .code_frames
                     .capacity()
                     .saturating_mul(size_of::<crate::stack_trace::CodeFrame>()),
+            )
+            .saturating_add(
+                interp
+                    .job_script_contexts
+                    .capacity()
+                    .saturating_mul(size_of::<(
+                        u32,
+                        std::rc::Rc<crate::stack_trace::ScriptSource>,
+                    )>()),
             )
             .saturating_add(interp.pending_fn_name.as_ref().map_or(0, String::capacity))
             .saturating_add(

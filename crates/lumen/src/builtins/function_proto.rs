@@ -280,13 +280,18 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
             .map_err(|e| i.make_error("SyntaxError", e.message))?;
     }
     let src = format!("{prefix} anonymous({params}\n) {{\n{body}\n}}");
-    let (program, _) = crate::parser::parse_script_from(
+    let (program, source) = crate::parser::parse_script_from(
         &src,
         false,
         crate::stack_trace::SourceKind::Function,
         None,
     )
     .map_err(|e| i.make_error("SyntaxError", e.message))?;
+    // CreateDynamicFunction -> OrdinaryFunctionCreate: F.[[ScriptOrModule]] is
+    // GetActiveScriptOrModule().
+    if let Some(referrer) = i.active_script_referrer() {
+        source.set_referrer(referrer);
+    }
     match program.into_iter().next() {
         Some(crate::ast::Stmt::FuncDecl(f)) => {
             let env = i.global_env.clone();

@@ -77,6 +77,8 @@ fn every_generated_table_reference_is_valid_and_interned_once() {
             row.2.exponential,
             row.2.infinity,
             row.2.nan,
+            row.2.currency_decimal,
+            row.2.currency_group,
         ] {
             check(id);
         }
@@ -121,6 +123,26 @@ fn every_generated_table_reference_is_valid_and_interned_once() {
         check(row.0);
         check(row.1);
         check(row.2);
+    }
+    for row in DEFAULT_NUMBERING {
+        check(row.0);
+        check(row.1);
+    }
+    for row in CURRENCY_FORMATS {
+        check(row.0);
+        check(row.1);
+        check(row.2.decimal);
+        check(row.2.group);
+        if let Some(pattern) = row.2.pattern {
+            for id in [
+                pattern.positive_prefix,
+                pattern.positive_suffix,
+                pattern.negative_prefix,
+                pattern.negative_suffix,
+            ] {
+                check(id);
+            }
+        }
     }
 
     assert_eq!(ids.len(), CLDR_REFS.len(), "unused string directory entry");

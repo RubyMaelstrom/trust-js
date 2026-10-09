@@ -7,8 +7,9 @@ fn now_ms(i: &Interp) -> f64 {
 }
 
 /// ECMA-262 #sec-systemtimezoneidentifier: the host environment's current time
-/// zone, as a primary identifier. `TZ` names it first (an IANA identifier,
-/// optionally `:`-prefixed, or a zoneinfo path; empty is UTC), then the
+/// zone, as a primary identifier or a UTC offset string. `TZ` names it first (an
+/// IANA identifier, optionally `:`-prefixed, or a zoneinfo path; empty is UTC),
+/// then Windows' zone (mapped through CLDR windowsZones), or elsewhere the
 /// `/etc/localtime` link, then `/etc/timezone`. A zone Lumen's offset tables do
 /// not know is UTC. Unit tests run in UTC unless they choose a zone.
 pub(crate) fn system_time_zone() -> &'static str {
@@ -45,15 +46,270 @@ fn detect_time_zone() -> &'static str {
             return zone;
         }
     }
-    std::fs::read_link("/etc/localtime")
-        .ok()
-        .and_then(|target| from_path(&target.to_string_lossy()))
-        .or_else(|| {
-            std::fs::read_to_string("/etc/timezone")
-                .ok()
-                .and_then(|name| known(&name))
-        })
-        .unwrap_or("UTC")
+    #[cfg(windows)]
+    {
+        windows_zone::detect().unwrap_or("UTC")
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_link("/etc/localtime")
+            .ok()
+            .and_then(|target| from_path(&target.to_string_lossy()))
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone")
+                    .ok()
+                    .and_then(|name| known(&name))
+            })
+            .unwrap_or("UTC")
+    }
+}
+
+/// The system time zone for Windows' current zone: its time zone key name (and the user's
+/// region) mapped through CLDR windowsZones (UTS #35 Part 4, Windows Zones), as a primary
+/// identifier; or, when "adjust for daylight saving time automatically" is off, Windows' fixed
+/// standard offset (`bias_minutes` west of UTC).
+#[cfg(any(windows, test))]
+fn windows_time_zone(
+    key_name: &str,
+    region: Option<&str>,
+    fixed_bias_minutes: Option<i32>,
+) -> Option<&'static str> {
+    if let Some(bias) = fixed_bias_minutes {
+        return Some(fixed_offset_zone(-bias));
+    }
+    crate::cldr_windows_zones::unicode_zone(key_name, region).and_then(crate::tz::canonicalize)
+}
+
+/// A fixed UTC offset (`minutes` east of UTC) as a system time zone: UTC, else the IANA
+/// `Etc/GMT∓h` zone of a whole-hour offset (whose sign is inverted, POSIX style), else the
+/// offset string ECMA-262 #sec-systemtimezoneidentifier permits.
+#[cfg(any(windows, test))]
+fn fixed_offset_zone(minutes: i32) -> &'static str {
+    if minutes == 0 {
+        return "UTC";
+    }
+    if minutes % 60 == 0 {
+        let hours = -minutes / 60;
+        if let Some(zone) = crate::tz::canonicalize(&format!("Etc/GMT{hours:+}")) {
+            return zone;
+        }
+    }
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let (hours, minutes) = (minutes.abs() / 60, minutes.abs() % 60);
+    // Computed once per process (system_time_zone caches it).
+    Box::leak(format!("{sign}{hours:02}:{minutes:02}").into_boxed_str())
+}
+
+/// The minutes east of UTC of a `±HH:MM` offset time zone identifier.
+fn offset_zone_minutes(zone: &str) -> Option<i32> {
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = zone[1..].split_once(':')?;
+    Some(sign * (hours.parse::<i32>().ok()? * 60 + minutes.parse::<i32>().ok()?))
+}
+
+#[cfg(windows)]
+mod windows_zone {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, PartialEq)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    /// DYNAMIC_TIME_ZONE_INFORMATION (the API fills fields detection does not read).
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct DynamicTimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+        time_zone_key_name: [u16; 128],
+        dynamic_daylight_time_disabled: u8,
+    }
+
+    const TIME_ZONE_ID_INVALID: u32 = u32::MAX;
+    const GEOCLASS_NATION: u32 = 16;
+    const GEOID_NOT_AVAILABLE: i32 = -1;
+    const GEO_ISO2: u32 = 4;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+    const KEY_READ: u32 = 0x2_0019;
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    const ERROR_SUCCESS: i32 = 0;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDynamicTimeZoneInformation(information: *mut DynamicTimeZoneInformation) -> u32;
+        fn GetUserGeoID(class: u32) -> i32;
+        fn GetGeoInfoW(location: i32, kind: u32, data: *mut u16, length: i32, language: u16)
+            -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            key: isize,
+            sub_key: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut isize,
+        ) -> i32;
+        fn RegEnumKeyExW(
+            key: isize,
+            index: u32,
+            name: *mut u16,
+            name_length: *mut u32,
+            reserved: *mut u32,
+            class: *mut u16,
+            class_length: *mut u32,
+            last_write: *mut u64,
+        ) -> i32;
+        fn RegGetValueW(
+            key: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut u8,
+            data_length: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    fn until_nul(text: &[u16]) -> &[u16] {
+        &text[..text
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(text.len())]
+    }
+
+    pub(super) fn detect() -> Option<&'static str> {
+        // SAFETY: an all-zero DYNAMIC_TIME_ZONE_INFORMATION is a valid value of the plain-data
+        // structure, which the call fills in.
+        let mut information: DynamicTimeZoneInformation = unsafe { std::mem::zeroed() };
+        // SAFETY: the pointer is to a writable structure laid out as the API requires.
+        if unsafe { GetDynamicTimeZoneInformation(&mut information) } == TIME_ZONE_ID_INVALID {
+            return None;
+        }
+        let key = until_nul(&information.time_zone_key_name);
+        // With automatic daylight saving time adjustment switched off, Windows keeps the
+        // zone's standard time all year: the dynamic information then reports no transition
+        // dates (or, without a key name, the redirected zone's dates with identical start
+        // and end), as the Date and Time settings themselves test.
+        let no_dates = information.standard_date == SystemTime::default();
+        let fixed = information.dynamic_daylight_time_disabled != 0
+            && information.standard_date == information.daylight_date
+            && (key.is_empty() != no_dates);
+        // Local standard time is UTC - (Bias + StandardBias).
+        let fixed_bias = fixed.then_some(information.bias + information.standard_bias);
+        let key = if key.is_empty() && !fixed {
+            // A remote session with time zone redirection gives no key name: the zone is the
+            // registry entry whose standard name is the one reported.
+            key_for_standard_name(until_nul(&information.standard_name))?
+        } else {
+            String::from_utf16_lossy(key)
+        };
+        super::windows_time_zone(&key, user_region().as_deref(), fixed_bias)
+    }
+
+    /// The user's ISO 3166 region (GEO_ISO2 of the user's nation).
+    fn user_region() -> Option<String> {
+        // SAFETY: GetUserGeoID takes a GEOCLASS by value.
+        let nation = unsafe { GetUserGeoID(GEOCLASS_NATION) };
+        if nation == GEOID_NOT_AVAILABLE {
+            return None;
+        }
+        let mut buffer = [0u16; 16];
+        // SAFETY: the buffer is writable for the length passed.
+        let written = unsafe {
+            GetGeoInfoW(
+                nation,
+                GEO_ISO2,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                0,
+            )
+        };
+        let region = String::from_utf16(until_nul(&buffer[..written.max(0) as usize])).ok()?;
+        (region.len() == 2 && region.bytes().all(|byte| byte.is_ascii_uppercase()))
+            .then_some(region)
+    }
+
+    /// The Time Zones registry key whose `Std` name is `standard_name`.
+    fn key_for_standard_name(standard_name: &[u16]) -> Option<String> {
+        let path = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones");
+        let mut zones: isize = 0;
+        // SAFETY: the path is NUL-terminated and the result pointer writable.
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut zones) }
+            != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let std_value = wide("Std");
+        let mut found = None;
+        for index in 0.. {
+            let mut name = [0u16; 256];
+            let mut name_length = name.len() as u32;
+            // SAFETY: the name buffer is writable for name_length units; the optional
+            // outputs are null.
+            let status = unsafe {
+                RegEnumKeyExW(
+                    zones,
+                    index,
+                    name.as_mut_ptr(),
+                    &mut name_length,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                break;
+            }
+            let mut sub_key = name[..name_length as usize].to_vec();
+            sub_key.push(0);
+            let mut value = [0u16; 128];
+            let mut value_length = std::mem::size_of_val(&value) as u32;
+            // SAFETY: the strings are NUL-terminated and the data buffer is writable for
+            // value_length bytes.
+            let status = unsafe {
+                RegGetValueW(
+                    zones,
+                    sub_key.as_ptr(),
+                    std_value.as_ptr(),
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    value.as_mut_ptr().cast(),
+                    &mut value_length,
+                )
+            };
+            if status == ERROR_SUCCESS && until_nul(&value) == standard_name {
+                found = String::from_utf16(&sub_key[..name_length as usize]).ok();
+                break;
+            }
+        }
+        // SAFETY: the key was opened above.
+        unsafe { RegCloseKey(zones) };
+        found
+    }
 }
 
 /// GetNamedTimeZoneOffsetNanoseconds for the system time zone at time value
@@ -62,6 +318,9 @@ fn offset_ms(t: f64) -> f64 {
     let zone = system_time_zone();
     if zone == "UTC" || !t.is_finite() {
         return 0.0;
+    }
+    if let Some(minutes) = offset_zone_minutes(zone) {
+        return f64::from(minutes) * 60_000.0;
     }
     crate::tz::offset_at(zone, (t / 1000.0).floor() as i64).map_or(0.0, |s| f64::from(s) * 1000.0)
 }
@@ -1023,4 +1282,72 @@ pub(super) fn install_date(it: &mut Interp) {
             .insert(key, Property::data(Value::Obj(prim), false, false, true));
     }
     set_builtin(&it.global, "Date", Value::Obj(ctor));
+}
+
+#[cfg(test)]
+mod windows_zone_tests {
+    use super::{fixed_offset_zone, offset_zone_minutes, windows_time_zone};
+
+    #[test]
+    fn windows_zones_map_through_cldr_to_primary_identifiers() {
+        // UTS #35 Part 4 Windows Zones: the territory's first listed zone, else territory 001's;
+        // the result is the IANA primary identifier (CLDR's Asia/Calcutta is a link).
+        let zone = |key, region| windows_time_zone(key, region, None);
+        assert_eq!(
+            zone("Pacific Standard Time", None),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            zone("Pacific Standard Time", Some("CA")),
+            Some("America/Vancouver")
+        );
+        assert_eq!(
+            zone("Pacific Standard Time", Some("MX")),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            zone("Pacific Standard Time", Some("FR")),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            zone("India Standard Time", Some("IN")),
+            Some("Asia/Kolkata")
+        );
+        assert_eq!(
+            zone("W. Europe Standard Time", Some("DE")),
+            Some("Europe/Berlin")
+        );
+        assert_eq!(
+            zone("W. Europe Standard Time", Some("CH")),
+            Some("Europe/Zurich")
+        );
+        assert_eq!(
+            zone("SA Pacific Standard Time", Some("ZZ")),
+            Some("Etc/GMT+5")
+        );
+        assert_eq!(zone("UTC", None), Some("UTC"));
+        assert_eq!(zone("No Such Standard Time", Some("US")), None);
+    }
+
+    #[test]
+    fn disabled_daylight_adjustment_is_a_fixed_offset_zone() {
+        // Windows reports the bias west of UTC; IANA's Etc/GMT zones invert the sign too.
+        assert_eq!(
+            windows_time_zone("Pacific Standard Time", Some("US"), Some(480)),
+            Some("Etc/GMT+8")
+        );
+        assert_eq!(
+            windows_time_zone("AUS Eastern Standard Time", None, Some(-600)),
+            Some("Etc/GMT-10")
+        );
+        assert_eq!(
+            windows_time_zone("GMT Standard Time", None, Some(0)),
+            Some("UTC")
+        );
+        assert_eq!(fixed_offset_zone(-210), "-03:30");
+        assert_eq!(fixed_offset_zone(570), "+09:30");
+        assert_eq!(offset_zone_minutes("-03:30"), Some(-210));
+        assert_eq!(offset_zone_minutes("+09:30"), Some(570));
+        assert_eq!(offset_zone_minutes("America/New_York"), None);
+    }
 }

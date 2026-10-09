@@ -274,7 +274,7 @@ fn resolve_plural(
         0
     };
     let locale = string_slot(object, "#\u{0}pr_locale");
-    let language = locale.split('-').next().unwrap_or("en");
+    let language = super::service::data_locale(&locale);
     let category = if string_slot(object, "#\u{0}pr_type") == "ordinal" {
         crate::cldr_plurals::select_ordinal(language, &decimal, exponent)
     } else {
@@ -305,7 +305,7 @@ fn select_range(i: &mut Interp, this: &Value, start: &Value, end: &Value) -> Res
         return Ok(Value::lstr(start_category));
     }
     let locale = string_slot(&object, "#\u{0}pr_locale");
-    let language = locale.split('-').next().unwrap_or("en");
+    let language = super::service::data_locale(&locale);
     Ok(Value::lstr(crate::cldr_plurals::select_range(
         language,
         start_category,
@@ -338,7 +338,7 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
         set_data(&result, "maximumSignificantDigits", get("#\u{0}pr_maxsig"));
     }
     let locale = string_slot(&object, "#\u{0}pr_locale");
-    let language = locale.split('-').next().unwrap_or("en");
+    let language = super::service::data_locale(&locale);
     let kind = string_slot(&object, "#\u{0}pr_type");
     let categories = crate::cldr_plurals::categories(language, &kind)
         .iter()

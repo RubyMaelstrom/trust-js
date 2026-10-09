@@ -27,7 +27,11 @@ import json
 import os
 import pathlib
 import urllib.request
+import sys
 import xml.etree.ElementTree as ElementTree
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 TAG = "48.0.0"
@@ -35,11 +39,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "crates/lumen/src/cldr_datetime_patterns.rs"
 CLDR_JSON = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
 CLDR_XML = "https://raw.githubusercontent.com/unicode-org/cldr/release-48"
-LOCALES = [
-    "en", "en-IN", "de", "fr", "es", "it", "pt", "pt-PT", "nl", "ja",
-    "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
-    "si", "ln", "sv", "hi",
-]
+LOCALES = list(cldr_locales.locales())
 # (Lumen calendar id, cldr-json package, calendar key)
 CALENDARS = [
     ("gregory", "cldr-dates-full", "gregorian"),
@@ -329,7 +329,7 @@ def load_day_period_rules() -> dict[str, list[tuple[str, int, int]]]:
             data = json.load(response)
     sets = data["supplemental"]["dayPeriodRuleSet"]
     rules = {}
-    for language in sorted({locale.split("-")[0] for locale in LOCALES}):
+    for language in sorted(key for key in sets if key.split("-")[0] in cldr_locales.LANGUAGES):
         rows = []
         for period, rule in sets.get(language, {}).items():
             hour = lambda text: int(text.split(":")[0])
@@ -379,57 +379,53 @@ class Tables:
 
 
 def main() -> None:
-    styles: dict[str, tuple[list[str], list[str], list[str], str]] = {}
-    weekdays: dict[str, list[tuple[str, str, str]]] = {}
-    standalone_weekdays: dict[str, list[tuple[str, str, str]]] = {}
-    day_periods: dict[str, list[tuple[str, str, str]]] = {}
-    available = Tables("AV", "(&str, &str, &str)")
-    append_items = Tables("AI", "(&str, &str)")
-    intervals = Tables("IV", "(&str, &str, &str)")
-    cyclic = Tables("CY", "&str")
-    calendar_records: dict[tuple, str] = {}
-    record_order: list[tuple[str, tuple]] = []
-    by_locale_calendar: dict[tuple[str, str], str] = {}
-    cyclic_rows: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    leap_rows: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    styles: dict[str, tuple] = {}
+    weekdays: dict[str, dict] = {}
+    standalone_weekdays: dict[str, dict] = {}
+    day_periods: dict[str, dict] = {}
+    records: dict[str, dict] = {}
+    available_rows: dict[str, dict] = {}
+    interval_rows: dict[str, dict] = {}
+    append_rows: dict[str, dict] = {}
+    cyclic_rows: dict[str, dict] = {}
+    leap_rows: dict[str, dict] = {}
 
     for locale in LOCALES:
         gregorian = load("cldr-dates-full", locale, "gregorian")
-        date = [gregorian["dateFormats"][style] for style in STYLE_NAMES]
         time = [gregorian["timeFormats"][style] for style in STYLE_NAMES]
         date_time = gregorian["dateTimeFormats"]
-        # UTS #35's date+time combination uses the at-time alternative when present.  The
-        # ordinary dateTimeFormats values remain the fallback inherited by locales without it.
-        at_time = gregorian.get("dateTimeFormats-atTime", {}).get("standard", date_time)
-        connector = [at_time[style] for style in STYLE_NAMES]
-        styles[locale] = (
-            [pattern_and_numbers(value)[0] for value in date],
-            [pattern_and_numbers(value)[0] for value in time],
-            connector,
+        times = tuple(pattern_and_numbers(value)[0] for value in time)
+        styles[locale] = {(): (
+            times,
+            default_hour_cycle(times[3]),
             pattern_and_numbers(date_time["medium"])[0],
-        )
+        )}
 
         format_days = gregorian["days"]["format"]
         standalone_days = gregorian["days"]["stand-alone"]
-        weekday_rows = []
-        standalone_rows = []
+        weekdays[locale] = {}
+        standalone_weekdays[locale] = {}
         for width, key in WIDTHS:
             for day in WEEKDAY_KEYS:
-                weekday_rows.append((width, day, format_days[key][day]))
-                standalone = standalone_days.get(key, {}).get(day)
-                if standalone and standalone != format_days[key][day]:
-                    standalone_rows.append((width, day, standalone))
-        weekdays[locale] = sorted(weekday_rows)
-        standalone_weekdays[locale] = sorted(standalone_rows)
+                weekdays[locale][(width, day)] = format_days[key][day]
+                # The effective stand-alone name: CLDR's, or the format name it defaults to.
+                standalone_weekdays[locale][(width, day)] = (
+                    standalone_days.get(key, {}).get(day) or format_days[key][day]
+                )
 
-        period_rows = []
+        day_periods[locale] = {}
         periods = gregorian["dayPeriods"]["format"]
         for width, key in WIDTHS:
             for name, value in periods[key].items():
                 if isinstance(value, str) and "-alt-" not in name:
-                    period_rows.append((width, name, value))
-        day_periods[locale] = sorted(period_rows)
+                    day_periods[locale][(width, name)] = value
 
+        records[locale] = {}
+        available_rows[locale] = {}
+        interval_rows[locale] = {}
+        append_rows[locale] = {}
+        cyclic_rows[locale] = {}
+        leap_rows[locale] = {}
         for calendar, package, key in CALENDARS:
             if calendar == "gregory":
                 data = gregorian
@@ -446,178 +442,213 @@ def main() -> None:
                 pattern_and_numbers(calendar_at_time[style])[0] for style in STYLE_NAMES
             )
             interval_data = calendar_date_time["intervalFormats"]
-            interval_rows = []
+            records[locale][(calendar,)] = (
+                dates,
+                connectors,
+                pattern_and_numbers(interval_data["intervalFormatFallback"])[0],
+            )
+            for skeleton, pattern, numbers in ordinary_patterns(calendar_date_time["availableFormats"]):
+                available_rows[locale][(calendar, skeleton)] = (pattern, numbers)
             for skeleton, by_difference in interval_data.items():
                 if skeleton == "intervalFormatFallback" or not isinstance(by_difference, dict):
                     continue
                 for difference, value in by_difference.items():
                     if isinstance(value, (str, dict)):
-                        interval_rows.append(
-                            (skeleton, difference, pattern_and_numbers(value)[0])
+                        interval_rows[locale][(calendar, skeleton, difference)] = (
+                            pattern_and_numbers(value)[0]
                         )
-            record = (
-                dates,
-                connectors,
-                pattern_and_numbers(interval_data["intervalFormatFallback"])[0],
-                available.name(tuple(ordinary_patterns(calendar_date_time["availableFormats"]))),
-                intervals.name(tuple(sorted(interval_rows))),
-                append_items.name(tuple(sorted(calendar_date_time.get("appendItems", {}).items()))),
-            )
-            if record not in calendar_records:
-                name = f"CP_{len(calendar_records)}"
-                calendar_records[record] = name
-                record_order.append((name, record))
-            by_locale_calendar[(locale, calendar)] = calendar_records[record]
+            for field, pattern in calendar_date_time.get("appendItems", {}).items():
+                append_rows[locale][(calendar, field)] = pattern
 
             if calendar in CYCLIC_CALENDARS:
                 years = data.get("cyclicNameSets", {}).get("years", {}).get("format", {})
-                rows = []
                 for width, cldr_width in WIDTHS:
                     names = years.get(cldr_width)
                     if names:
-                        rows.append(
-                            (width, cyclic.name(tuple(names[str(index)] for index in range(1, 61))))
+                        cyclic_rows[locale][(calendar, width)] = tuple(
+                            names[str(index)] for index in range(1, 61)
                         )
-                cyclic_rows[(locale, calendar)] = sorted(rows)
                 month_patterns = data.get("monthPatterns", {})
-                rows = []
                 for context in ("format", "stand-alone"):
                     for width, cldr_width in WIDTHS:
                         leap = month_patterns.get(context, {}).get(cldr_width, {}).get("leap")
                         if leap:
-                            rows.append((f"{context}-{width}", leap))
+                            leap_rows[locale][(calendar, f"{context}-{width}")] = leap
                 numeric = month_patterns.get("numeric", {}).get("all", {}).get("leap")
                 if numeric:
-                    rows.append(("numeric", numeric))
-                leap_rows[(locale, calendar)] = sorted(rows)
+                    leap_rows[locale][(calendar, "numeric")] = numeric
 
+    # Each variant keeps only what differs from its CLDR parent (scripts/cldr_locales.py).
+    styles = cldr_locales.delta(styles)
+    weekdays = cldr_locales.delta(weekdays)
+    standalone_weekdays = cldr_locales.delta(standalone_weekdays)
+    day_periods = cldr_locales.delta(day_periods)
+    records = cldr_locales.delta(records)
+    available_rows = cldr_locales.delta(available_rows)
+    interval_rows = cldr_locales.delta(interval_rows)
+    append_rows = cldr_locales.delta(append_rows)
+    cyclic_rows = cldr_locales.delta(cyclic_rows)
+    leap_rows = cldr_locales.delta(leap_rows)
     day_period_rules = load_day_period_rules()
+
+    def flat(tables: dict[str, dict]) -> list[tuple]:
+        return sorted(
+            (locale, *key, *(value if isinstance(value, tuple) else (value,)))
+            for locale, table in tables.items()
+            for key, value in table.items()
+        )
+
+    cyclic_names = Tables("CY", "&str")
+    pool: dict[str, int] = {}
+
+    def sid(value: str) -> str:
+        """A string's id in the pool (CLDR_STRINGS / OFFSETS)."""
+        if value not in pool:
+            pool[value] = len(pool)
+            if len(pool) > 1 << 16:
+                raise SystemExit("more than 65536 distinct strings")
+        return str(pool[value])
 
     output = [
         "//! GENERATED by scripts/gen-cldr-datetime-patterns.py from CLDR 48. Do not edit.",
+        "//!",
+        "//! Every shipped CLDR locale ([`crate::cldr_locales`]); a regional or script variant holds",
+        "//! only what differs from its parent, and each lookup walks the locale's parent chain.",
+        "",
+        "use crate::cldr_locales::chain;",
+        "",
+        "const STRINGS: &str = include_str!(\"cldr_datetime_patterns.data\");",
+        "",
+        "/// A string id: its text is [`text`].",
+        "type Id = u16;",
+        "",
+        "fn text(id: Id) -> &'static str {",
+        "    let id = id as usize;",
+        "    &STRINGS[OFFSETS[id] as usize..OFFSETS[id + 1] as usize]",
+        "}",
         "",
         "#[derive(Clone, Copy)]",
-        "pub(crate) struct Styles {",
-        "    times: [&'static str; 4],",
-        "    hour_cycle: &'static str,",
-        "    glue: &'static str,",
+        "struct StyleIds {",
+        "    times: [Id; 4],",
+        "    hour_cycle: Id,",
+        "    glue: Id,",
         "}",
         "",
         "/// One locale's patterns for one calendar (UTS #35 Part 4): the date styles with their",
-        "/// `numbers` overrides, the at-time date-time connectors, the interval fallback, and the",
-        "/// availableFormats (skeleton, pattern, numbers), intervalFormats (skeleton, greatest",
-        "/// difference, pattern) and appendItems (field, pattern) rows, sorted.",
+        "/// `numbers` overrides, the at-time date-time connectors and the interval fallback.",
         "pub(crate) struct CalendarPatterns {",
         "    pub dates: [(&'static str, &'static str); 4],",
         "    pub connectors: [&'static str; 4],",
         "    pub fallback: &'static str,",
-        "    pub available: &'static [(&'static str, &'static str, &'static str)],",
-        "    pub intervals: &'static [(&'static str, &'static str, &'static str)],",
-        "    pub append: &'static [(&'static str, &'static str)],",
+        "}",
+        "",
+        "#[derive(Clone, Copy)]",
+        "struct CalendarIds {",
+        "    dates: [(Id, Id); 4],",
+        "    connectors: [Id; 4],",
+        "    fallback: Id,",
         "}",
         "",
     ]
-    for locale in LOCALES:
-        _date, time, _connector, glue = styles[locale]
-        output.extend(
-            [
-                f"static {ident('ST', locale)}: Styles = Styles {{",
-                "    times: [" + ", ".join(map(rust_string, time)) + "],",
-                f"    hour_cycle: {rust_string(default_hour_cycle(time[3]))},",
-                f"    glue: {rust_string(glue)},",
-                "};",
-                "",
-            ]
-        )
-        for prefix, rows in (
-            ("WD", weekdays[locale]),
-            ("WS", standalone_weekdays[locale]),
-            ("DP", day_periods[locale]),
-        ):
-            output.extend(
-                [
-                    "#[rustfmt::skip]",
-                    f"static {ident(prefix, locale)}: &[(&str, &str, &str)] = &[",
-                ]
-            )
-            for row in rows:
-                output.append("    (" + ", ".join(map(rust_string, row)) + "),")
-            output.extend(["];", ""])
-    available.emit(output)
-    intervals.emit(output)
-    append_items.emit(output)
-    cyclic.emit(output)
-    for name, (dates, connectors, fallback, available_name, interval_name, append_name) in record_order:
-        output.extend(
-            [
-                f"static {name}: CalendarPatterns = CalendarPatterns {{",
-                "    dates: ["
-                + ", ".join(f"({rust_string(p)}, {rust_string(n)})" for p, n in dates)
-                + "],",
-                "    connectors: [" + ", ".join(map(rust_string, connectors)) + "],",
-                f"    fallback: {rust_string(fallback)},",
-                f"    available: {available_name},",
-                f"    intervals: {interval_name},",
-                f"    append: {append_name},",
-                "};",
-                "",
-            ]
-        )
+    style_rows = []
+    for locale, table in sorted(styles.items()):
+        for _, (times, hour_cycle, glue) in table.items():
+            style_rows.append((locale, times, hour_cycle, glue))
+    record_rows = []
+    for locale, table in sorted(records.items()):
+        for (calendar,), record in sorted(table.items()):
+            record_rows.append((locale, calendar, record))
+    cyclic_flat = []
+    for locale, table in sorted(cyclic_rows.items()):
+        for (calendar, width), names in sorted(table.items()):
+            cyclic_flat.append((locale, calendar, width, cyclic_names.name(names)))
+    cyclic_names.emit(output)
 
-    def locale_match(prefix: str) -> list[str]:
-        return [f'        "{locale}" => {ident(prefix, locale)},' for locale in LOCALES]
+    output.extend(["#[rustfmt::skip]", "static STYLES: &[(Id, StyleIds)] = &["])
+    for locale, times, hour_cycle, glue in style_rows:
+        output.append(
+            f"    ({sid(locale)}, StyleIds {{ times: [{', '.join(map(sid, times))}], "
+            f"hour_cycle: {sid(hour_cycle)}, glue: {sid(glue)} }}),"
+        )
+    output.extend(["];", "", "#[rustfmt::skip]", "static CALENDARS: &[(Id, Id, CalendarIds)] = &["])
+    for locale, calendar, (dates, connectors, fallback) in record_rows:
+        output.append(
+            f"    ({sid(locale)}, {sid(calendar)}, CalendarIds {{ dates: ["
+            + ", ".join(f"({sid(p)}, {sid(n)})" for p, n in dates)
+            + "], connectors: ["
+            + ", ".join(map(sid, connectors))
+            + f"], fallback: {sid(fallback)} }}),"
+        )
+    output.append("];")
+    tables = [
+        ("WEEKDAYS", 4, flat(weekdays)),
+        ("STANDALONE_WEEKDAYS", 4, flat(standalone_weekdays)),
+        ("DAY_PERIODS", 4, flat(day_periods)),
+        ("AVAILABLE", 5, flat(available_rows)),
+        ("INTERVALS", 5, flat(interval_rows)),
+        ("APPEND", 4, flat(append_rows)),
+        ("LEAP", 4, flat(leap_rows)),
+    ]
+    for name, arity, rows in tables:
+        output.extend(["", "#[rustfmt::skip]", f"static {name}: &[[Id; {arity}]] = &["])
+        for row in rows:
+            output.append("    [" + ", ".join(map(sid, row)) + "],")
+        output.append("];")
+    output.extend(["", "#[rustfmt::skip]", "static CYCLIC: &[(Id, Id, Id, &[&str])] = &["])
+    for locale, calendar, width, names in cyclic_flat:
+        output.append(f"    ({sid(locale)}, {sid(calendar)}, {sid(width)}, {names}),")
+    output.append("];")
 
     output.extend(
         [
-            "pub(crate) fn locale(lang: &str, script: &str, region: &str) -> &'static str {",
-            "    match (lang, script, region) {",
-            '        ("en", _, "IN") => "en-IN",',
-            '        ("pt", _, "PT") => "pt-PT",',
-            '        ("zh", "Hant", _) | ("zh", _, "TW" | "HK" | "MO") => "zh-Hant",',
-            "        _ => match lang {",
-        ]
-    )
-    for locale in LOCALES:
-        if "-" not in locale:
-            output.append(f'            "{locale}" => "{locale}",')
-    output.extend(['            _ => "en",', "        },", "    }", "}", ""])
-
-    output.extend(["fn styles(locale: &str) -> Styles {", "    match locale {"])
-    output.extend(locale_match("ST"))
-    output.extend(["        _ => ST_EN,", "    }", "}", ""])
-
-    output.extend(
-        [
+            "",
+            "/// The first value along a locale's parent chain.",
+            "fn inherited<T>(locale: &str, mut find: impl FnMut(&str) -> Option<T>) -> Option<T> {",
+            "    chain(locale).iter().find_map(|locale| find(locale))",
+            "}",
+            "",
+            "fn styles(locale: &str) -> StyleIds {",
+            "    let find = |locale: &str| {",
+            "        STYLES.binary_search_by(|row| text(row.0).cmp(locale)).ok().map(|index| STYLES[index].1)",
+            "    };",
+            "    inherited(locale, find).or_else(|| find(\"en\")).expect(\"generated English styles\")",
+            "}",
+            "",
             "fn style_index(style: &str) -> usize {",
             '    match style { "full" => 0, "long" => 1, "medium" => 2, _ => 3 }',
             "}",
             "",
             "/// A locale's (Gregorian) time style pattern; every calendar uses the Gregorian times.",
             "pub(crate) fn time_style(locale: &str, style: &str) -> &'static str {",
-            "    styles(locale).times[style_index(style)]",
+            "    text(styles(locale).times[style_index(style)])",
             "}",
             "",
-            "pub(crate) fn default_hour_cycle(locale: &str) -> &'static str { styles(locale).hour_cycle }",
+            "pub(crate) fn default_hour_cycle(locale: &str) -> &'static str { text(styles(locale).hour_cycle) }",
             "",
             "/// The Gregorian medium dateTimeFormat (the standard, not at-time, form): the default",
             "/// combination of a date with a time, as interval formats use it.",
-            "pub(crate) fn date_time_glue(locale: &str) -> &'static str { styles(locale).glue }",
+            "pub(crate) fn date_time_glue(locale: &str) -> &'static str { text(styles(locale).glue) }",
             "",
             "/// The patterns of `calendar` (a BCP 47 calendar id; others use the Gregorian data) for a",
-            "/// locale key from [`locale`].",
-            "pub(crate) fn calendar_patterns(locale: &str, calendar: &str) -> &'static CalendarPatterns {",
-            "    match (locale, calendar) {",
-        ]
-    )
-    for (locale, calendar), name in by_locale_calendar.items():
-        if calendar != "gregory":
-            output.append(f'        ("{locale}", "{calendar}") => &{name},')
-    for locale in LOCALES:
-        output.append(f'        ("{locale}", _) => &{by_locale_calendar[(locale, "gregory")]},')
-    output.extend([f'        _ => &{by_locale_calendar[("en", "gregory")]},', "    }", "}", ""])
-
-    output.extend(
-        [
+            "/// shipped locale.",
+            "pub(crate) fn calendar_patterns(locale: &str, calendar: &str) -> CalendarPatterns {",
+            "    let find = |locale: &str, calendar: &str| {",
+            "        CALENDARS",
+            "            .binary_search_by(|row| text(row.0).cmp(locale).then_with(|| text(row.1).cmp(calendar)))",
+            "            .ok()",
+            "            .map(|index| CALENDARS[index].2)",
+            "    };",
+            "    let ids = inherited(locale, |locale| find(locale, calendar))",
+            "        .or_else(|| inherited(locale, |locale| find(locale, \"gregory\")))",
+            "        .or_else(|| find(\"en\", \"gregory\"))",
+            "        .expect(\"generated English Gregorian patterns\");",
+            "    CalendarPatterns {",
+            "        dates: ids.dates.map(|(pattern, numbers)| (text(pattern), text(numbers))),",
+            "        connectors: ids.connectors.map(text),",
+            "        fallback: text(ids.fallback),",
+            "    }",
+            "}",
+            "",
             "pub(crate) fn date_style(locale: &str, calendar: &str, style: &str) -> (&'static str, &'static str) {",
             "    calendar_patterns(locale, calendar).dates[style_index(style)]",
             "}",
@@ -626,100 +657,134 @@ def main() -> None:
             "    calendar_patterns(locale, calendar).connectors[style_index(style)]",
             "}",
             "",
+            "/// The rows of `table` (locale and calendar first, then `key_len` key ids) along a",
+            "/// locale's chain for a calendar, the nearest locale's winning per key.",
+            "fn merged<const N: usize>(table: &'static [[Id; N]], locale: &str, calendar: &str, key_len: usize) -> Vec<[Id; N]> {",
+            "    let mut result: Vec<[Id; N]> = Vec::new();",
+            "    for locale in chain(locale) {",
+            "        let start = table.partition_point(|row| (text(row[0]), text(row[1])) < (*locale, calendar));",
+            "        for row in table[start..].iter().take_while(|row| text(row[0]) == *locale && text(row[1]) == calendar) {",
+            "            if !result.iter().any(|seen| seen[2..2 + key_len] == row[2..2 + key_len]) {",
+            "                result.push(*row);",
+            "            }",
+            "        }",
+            "    }",
+            "    result",
+            "}",
+            "",
+            "/// The availableFormats (skeleton, pattern, numbers) of a calendar, sorted by skeleton.",
+            "pub(crate) fn available_formats(locale: &str, calendar: &str) -> Vec<(&'static str, &'static str, &'static str)> {",
+            "    let mut rows = merged(AVAILABLE, locale, calendar, 1);",
+            "    if rows.is_empty() {",
+            "        rows = merged(AVAILABLE, locale, \"gregory\", 1);",
+            "    }",
+            "    let mut rows: Vec<_> = rows.into_iter().map(|row| (text(row[2]), text(row[3]), text(row[4]))).collect();",
+            "    rows.sort_unstable();",
+            "    rows",
+            "}",
+            "",
+            "/// The intervalFormatItem skeletons of a calendar.",
+            "pub(crate) fn interval_skeletons(locale: &str, calendar: &str) -> Vec<&'static str> {",
+            "    let mut skeletons: Vec<&str> = merged(INTERVALS, locale, calendar, 2).into_iter().map(|row| text(row[2])).collect();",
+            "    skeletons.sort_unstable();",
+            "    skeletons.dedup();",
+            "    skeletons",
+            "}",
+            "",
+            "/// An intervalFormatItem pattern of a calendar for a skeleton and greatest difference.",
             "pub(crate) fn interval(",
             "    locale: &str,",
             "    calendar: &str,",
             "    skeleton: &str,",
             "    difference: &str,",
             ") -> Option<&'static str> {",
-            "    let rows = calendar_patterns(locale, calendar).intervals;",
-            "    rows.binary_search_by(|row| row.0.cmp(skeleton).then_with(|| row.1.cmp(difference)))",
-            "        .ok().map(|index| rows[index].2)",
+            "    inherited(locale, |locale| {",
+            "        INTERVALS",
+            "            .binary_search_by(|row| {",
+            "                (text(row[0]), text(row[1]), text(row[2]), text(row[3])).cmp(&(locale, calendar, skeleton, difference))",
+            "            })",
+            "            .ok()",
+            "            .map(|index| text(INTERVALS[index][4]))",
+            "    })",
             "}",
             "",
-        ]
-    )
-    for prefix, function, doc in (
-        ("WD", "weekday", "A format-context weekday name (`E`) for a width and CLDR day key."),
-        ("WS", "standalone_weekday_override", "A stand-alone weekday name (`c`) where it differs from the format name."),
-        ("DP", "day_period", "A format-context day-period name for a width and CLDR period key."),
-    ):
-        output.extend(
-            [
-                f"fn {function}_rows(locale: &str) -> &'static [(&'static str, &'static str, &'static str)] {{",
-                "    match locale {",
-            ]
-        )
-        output.extend(locale_match(prefix))
-        output.extend([f"        _ => {prefix}_EN,", "    }", "}", ""])
-        output.extend(
-            [
-                f"/// {doc}",
-                f"pub(crate) fn {function}(locale: &str, width: &str, key: &str) -> Option<&'static str> {{",
-                f"    let rows = {function}_rows(locale);",
-                "    rows.binary_search_by(|row| row.0.cmp(width).then_with(|| row.1.cmp(key)))",
-                "        .ok().map(|index| rows[index].2)",
-                "}",
-                "",
-            ]
-        )
-    output.extend(
-        [
+            "fn keyed(rows: &'static [[Id; 4]], locale: &str, a: &str, b: &str) -> Option<&'static str> {",
+            "    inherited(locale, |locale| {",
+            "        rows.binary_search_by(|row| (text(row[0]), text(row[1]), text(row[2])).cmp(&(locale, a, b)))",
+            "            .ok()",
+            "            .map(|index| text(rows[index][3]))",
+            "    })",
+            "}",
+            "",
+            "/// A format-context weekday name (`E`) for a width and CLDR day key.",
+            "pub(crate) fn weekday(locale: &str, width: &str, key: &str) -> Option<&'static str> {",
+            "    keyed(WEEKDAYS, locale, width, key)",
+            "}",
+            "",
+            "/// A stand-alone weekday name (`c`); CLDR's stand-alone names default to the format names.",
+            "pub(crate) fn standalone_weekday_override(locale: &str, width: &str, key: &str) -> Option<&'static str> {",
+            "    keyed(STANDALONE_WEEKDAYS, locale, width, key)",
+            "}",
+            "",
+            "/// A format-context day-period name for a width and CLDR period key.",
+            "pub(crate) fn day_period(locale: &str, width: &str, key: &str) -> Option<&'static str> {",
+            "    keyed(DAY_PERIODS, locale, width, key)",
+            "}",
+            "",
             "/// A calendar's appendItems pattern for a UTS #35 field name (`Era`, `Day-Of-Week`, …).",
             "pub(crate) fn append_item(locale: &str, calendar: &str, field: &str) -> Option<&'static str> {",
-            "    let rows = calendar_patterns(locale, calendar).append;",
-            "    rows.binary_search_by(|row| row.0.cmp(field)).ok().map(|index| rows[index].1)",
+            "    keyed(APPEND, locale, calendar, field)",
             "}",
             "",
             "/// The cyclic (sexagenary) year name, 1 ≤ `year` ≤ 60, of the Chinese or Dangi calendar.",
             "pub(crate) fn cyclic_year(locale: &str, calendar: &str, width: &str, year: u8) -> Option<&'static str> {",
-            "    let names: &[&str] = match (locale, calendar, width) {",
-        ]
-    )
-    for (locale, calendar), rows in cyclic_rows.items():
-        for width, name in rows:
-            output.append(f'        ("{locale}", "{calendar}", "{width}") => {name},')
-    output.extend(
-        [
-            "        _ => return None,",
-            "    };",
+            "    let names = inherited(locale, |locale| {",
+            "        CYCLIC",
+            "            .binary_search_by(|row| (text(row.0), text(row.1), text(row.2)).cmp(&(locale, calendar, width)))",
+            "            .ok()",
+            "            .map(|index| CYCLIC[index].3)",
+            "    })?;",
             "    names.get(usize::from(year).checked_sub(1)?).copied()",
             "}",
             "",
             "/// The leap-month pattern (`{0}` is the month) of the Chinese or Dangi calendar for a",
             "/// context-width key (`format-long`, `stand-alone-short`, …) or `numeric`.",
             "pub(crate) fn leap_month_pattern(locale: &str, calendar: &str, key: &str) -> Option<&'static str> {",
-            "    let rows: &[(&str, &str)] = match (locale, calendar) {",
-        ]
-    )
-    for (locale, calendar), rows in leap_rows.items():
-        rendered = ", ".join(f"({rust_string(k)}, {rust_string(v)})" for k, v in rows)
-        output.append(f'        ("{locale}", "{calendar}") => &[{rendered}],')
-    output.extend(
-        [
-            "        _ => return None,",
-            "    };",
-            "    rows.binary_search_by(|row| row.0.cmp(key)).ok().map(|index| rows[index].1)",
+            "    keyed(LEAP, locale, calendar, key)",
             "}",
             "",
+            "/// A locale's CLDR day-period rules as (period, from hour, before hour); an `at` rule",
+            "/// (`noon`, `midnight`) has equal hours. Ranges may wrap past midnight. Rules belong to a",
+            "/// language, with a few locale-specific sets (es-CO, hi-Latn) found by truncation.",
+            "pub(crate) fn day_period_rules(locale: &str) -> &'static [(&'static str, u8, u8)] {",
+            "    crate::cldr_locales::truncations(locale).find_map(rules_of).unwrap_or(&[])",
+            "}",
+            "",
+            "fn rules_of(key: &str) -> Option<&'static [(&'static str, u8, u8)]> {",
+            "    Some(match key {",
         ]
     )
-    output.extend(
-        [
-            "/// A language's CLDR day-period rules as (period, from hour, before hour); an `at` rule",
-            "/// (`noon`, `midnight`) has equal hours. Ranges may wrap past midnight.",
-            "pub(crate) fn day_period_rules(language: &str) -> &'static [(&'static str, u8, u8)] {",
-            "    match language {",
-        ]
-    )
-    for language, rows in day_period_rules.items():
+    for key, rows in day_period_rules.items():
         rendered = ", ".join(f"({rust_string(p)}, {a}, {b})" for p, a, b in rows)
-        output.append(f'        "{language}" => &[{rendered}],')
-    output.extend(["        _ => &[],", "    }", "}", ""])
+        output.append(f'        "{key}" => &[{rendered}],')
+    output.extend(["        _ => return None,", "    })", "}", ""])
+    offsets, blob = [], ""
+    for value in pool:
+        offsets.append(len(blob.encode("utf-8")))
+        blob += value
+    offsets.append(len(blob.encode("utf-8")))
+    output += [
+        "/// The byte offset of each string id's text in `STRINGS`, then the end of the last.",
+        f"static OFFSETS: [u32; {len(offsets)}] = [",
+    ]
+    output += ["    " + ", ".join(map(str, offsets[k : k + 16])) + "," for k in range(0, len(offsets), 16)]
+    output += ["];", ""]
+    OUTPUT.with_suffix(".data").write_text(blob, encoding="utf-8")
     OUTPUT.write_text("\n".join(output), encoding="utf-8")
     print(
-        f"wrote {OUTPUT} ({len(record_order)} calendar records, {len(available.order)} "
-        f"availableFormats tables, {len(intervals.order)} interval tables)"
+        f"wrote {OUTPUT} ({len(record_rows)} calendar records, {len(available_rows)} locales, "
+        f"{sum(map(len, available_rows.values()))} availableFormats rows, "
+        f"{sum(map(len, interval_rows.values()))} interval rows)"
     )
 
 

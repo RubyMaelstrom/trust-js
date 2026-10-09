@@ -15,6 +15,7 @@
 //! zone that observes no daylight saving time around the instant.
 
 use crate::cldr_tz_names::{self as data, text, Id, LocaleNames, MetazoneUse};
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -130,7 +131,7 @@ fn daylight_at(
 }
 
 struct Formatter<'a> {
-    names: &'static LocaleNames,
+    names: Names,
     locale: &'a str,
     region: &'a str,
 }
@@ -145,13 +146,13 @@ impl Formatter<'_> {
 
     fn zone_or_metazone_name(&self, zone: &Zone, kind: usize, long: bool) -> Option<String> {
         let width = if long { 0 } else { 3 };
-        if let Some(name) = names_of(self.names.zones, zone.cldr).map(|names| names[width + kind]) {
+        if let Some(name) = self.names.zone(zone.cldr).map(|names| names[width + kind]) {
             if name != 0 {
                 return Some(text(name).to_string());
             }
         }
         let metazone = zone.metazone?;
-        let name = names_of(self.names.metazones, text(metazone.metazone))?[width + kind];
+        let name = self.names.metazone(text(metazone.metazone))?[width + kind];
         (name != 0).then(|| text(name).to_string())
     }
 
@@ -159,8 +160,10 @@ impl Formatter<'_> {
     /// formats, with Type Fallback and the generic partial location format).
     fn generic(&self, zone: &Zone, long: bool) -> Option<String> {
         let width = if long { 0 } else { 3 };
-        if let Some(name) =
-            names_of(self.names.zones, zone.cldr).map(|names| names[width + GENERIC])
+        if let Some(name) = self
+            .names
+            .zone(zone.cldr)
+            .map(|names| names[width + GENERIC])
         {
             if name != 0 {
                 return Some(text(name).to_string());
@@ -168,7 +171,9 @@ impl Formatter<'_> {
         }
         let usage = zone.metazone?;
         let metazone = text(usage.metazone);
-        let metazone_generic = names_of(self.names.metazones, metazone)
+        let metazone_generic = self
+            .names
+            .metazone(metazone)
             .map(|names| names[width + GENERIC])
             .filter(|&name| name != 0)
             .map(text);
@@ -215,7 +220,7 @@ impl Formatter<'_> {
                 .exemplar_city(zone.cldr)
                 .unwrap_or_else(|| zone.cldr.to_string()),
         };
-        let fallback = text(self.names.formats[5]);
+        let fallback = text(self.names.formats()[5]);
         fallback.replace("{1}", name).replace("{0}", &location)
     }
 
@@ -229,17 +234,13 @@ impl Formatter<'_> {
         } else {
             self.exemplar_city(zone.cldr)?
         };
-        Some(text(self.names.formats[2]).replace("{0}", &location))
+        Some(text(self.names.formats()[2]).replace("{0}", &location))
     }
 
     /// The localized country name, or the code itself when the locale has none (UTS #35
     /// Part 4 Composition).
     fn region_name(&self, region: &str) -> String {
-        if let Some(name) = lookup_pair(self.names.regions, region) {
-            return name.to_string();
-        }
-        let language = self.locale.split('-').next().unwrap_or(self.locale);
-        crate::cldr_display_names::name(language, "region", "long", region)
+        crate::cldr_display_names::name(self.locale, "region", "long", region)
             .unwrap_or(region)
             .to_string()
     }
@@ -247,7 +248,7 @@ impl Formatter<'_> {
     /// The zone's localized exemplar city, or the last field of its identifier with `_` as a
     /// space (UTS #35 Part 4 Composition); none for zones that are not locations.
     fn exemplar_city(&self, cldr: &str) -> Option<String> {
-        if let Some(city) = lookup_pair(self.names.cities, cldr) {
+        if let Some(city) = self.names.city(cldr) {
             return Some(city.to_string());
         }
         if cldr.starts_with("Etc/") || cldr.starts_with("SystemV/") {
@@ -291,8 +292,8 @@ fn is_primary(zone: &Zone, region: &str) -> bool {
 /// The localized GMT format (UTS #35 Part 4 Time Zone Format Terminology): the gmtFormat
 /// around the hourFormat's offset, with two-digit hours and minutes (long) or unpadded hours
 /// and only nonzero minutes (short), and seconds only when nonzero. A zero offset is `+`.
-fn localized_gmt(names: &LocaleNames, offset: i32, long: bool) -> String {
-    let hour_format = text(names.formats[0]);
+fn localized_gmt(names: Names, offset: i32, long: bool) -> String {
+    let hour_format = text(names.formats()[0]);
     let (positive, negative) = hour_format
         .split_once(';')
         .unwrap_or((hour_format, hour_format));
@@ -332,7 +333,7 @@ fn localized_gmt(names: &LocaleNames, offset: i32, long: bool) -> String {
         value += &format!("{separator}{seconds:02}");
     }
     value += suffix;
-    text(names.formats[1]).replace("{0}", &value)
+    text(names.formats()[1]).replace("{0}", &value)
 }
 
 /// The signed seconds of a canonical `±HH:MM` offset time zone.
@@ -344,14 +345,48 @@ fn offset_zone_seconds(identifier: &str) -> i32 {
     sign * (hours * 3600 + minutes * 60)
 }
 
-/// The CLDR names of a locale (an advertised DateTimeFormat locale; English otherwise).
-fn locale_names(locale: &str) -> &'static LocaleNames {
-    let locales = data::LOCALES;
-    let index = locales
-        .binary_search_by(|(candidate, _)| (*candidate).cmp(locale))
-        .or_else(|_| locales.binary_search_by(|(candidate, _)| (*candidate).cmp("en")))
-        .unwrap_or(0);
-    &locales[index].1
+/// A shipped locale's time zone names: each lookup walks its parent chain.
+#[derive(Clone, Copy)]
+struct Names {
+    chain: &'static [&'static str],
+}
+
+impl Names {
+    fn each(self) -> impl Iterator<Item = &'static LocaleNames> {
+        self.chain.iter().filter_map(|locale| {
+            let locales = data::LOCALES;
+            locales
+                .binary_search_by(|(candidate, _)| (*candidate).cmp(locale))
+                .ok()
+                .map(|index| &locales[index].1)
+        })
+    }
+
+    fn formats(self) -> data::Formats {
+        self.each()
+            .find_map(|names| names.formats)
+            .or_else(|| locale_names("en").each().find_map(|names| names.formats))
+            .expect("generated English time zone formats")
+    }
+
+    fn zone(self, key: &str) -> Option<&'static data::Names> {
+        self.each().find_map(|names| names_of(names.zones, key))
+    }
+
+    fn metazone(self, key: &str) -> Option<&'static data::Names> {
+        self.each().find_map(|names| names_of(names.metazones, key))
+    }
+
+    fn city(self, key: &str) -> Option<&'static str> {
+        self.each().find_map(|names| lookup_pair(names.cities, key))
+    }
+}
+
+/// The CLDR time zone names of a shipped locale (English for any other).
+fn locale_names(locale: &str) -> Names {
+    Names {
+        chain: crate::cldr_locales::chain(locale),
+    }
 }
 
 /// The CLDR canonical identifier (UTS #35 Part 1 Time Zone Identifiers) of a zone identifier.
@@ -458,9 +493,6 @@ mod tests {
             ));
             assert!(sorted(names.zones.iter().map(|row| text(row.0)).collect()));
             assert!(sorted(names.cities.iter().map(|row| text(row.0)).collect()));
-            assert!(sorted(
-                names.regions.iter().map(|row| text(row.0)).collect()
-            ));
         }
     }
 

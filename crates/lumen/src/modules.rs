@@ -43,6 +43,17 @@ pub(crate) fn module_map_context(key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The URL a module's `import.meta.url` reports and its `import()` calls resolve against: its
+/// public module-map URL, with a filesystem path as a `file:` URL.
+fn module_meta_url(key: &str) -> String {
+    let key = module_map_url(key);
+    if key.starts_with('/') {
+        format!("file://{key}")
+    } else {
+        key.to_string()
+    }
+}
+
 pub(crate) fn module_map_url(key: &str) -> &str {
     let Some(encoded) = key.strip_prefix(MODULE_CONTEXT_SEPARATOR) else {
         return key;
@@ -455,6 +466,8 @@ impl Interp {
         let (body, source) =
             crate::parser::parse_module_from(&crate::jstr::from_text(&src), Some(&origin))
                 .map_err(|e| self.throw("SyntaxError", e.message))?;
+        // The Module Record is the ScriptOrModule of its code; it refers by its URL.
+        source.set_referrer(Rc::from(module_meta_url(key)));
         let body = Rc::new(body);
 
         // Resolve every dependency specifier to a canonical key up front (fetching its source), so
@@ -683,13 +696,9 @@ impl Interp {
     /// plain paths.
     fn build_import_meta(&mut self, key: &str) -> Value {
         let meta = Object::new(None);
+        let url = module_meta_url(key);
         let key = module_map_url(key);
         let is_path = key.starts_with('/');
-        let url = if is_path {
-            format!("file://{key}")
-        } else {
-            key.to_string()
-        };
         {
             let mut b = meta.borrow_mut();
             b.props
@@ -1709,10 +1718,20 @@ impl Interp {
         referrer: Option<Value>,
     ) -> Value {
         let promise = self.new_promise();
-        // The referrer is the importing module's `import.meta.url`. Prefer the value captured
-        // lexically at the call site (passed in) — it survives `await`, unlike `self.import_meta`,
-        // which is only set during a module's synchronous body.
-        let meta = referrer.or_else(|| self.import_meta.clone());
+        // EvaluateImportCall: the referrer is GetActiveScriptOrModule(), else the current Realm
+        // (whose host-defined base is the host's import base). Module code finds its module
+        // lexically: the `import.meta` captured at the call site survives `await`. Other code
+        // finds the active Script or Module by its execution contexts, including the script
+        // execution context a browser host pushes for a job callback (HTML HostCallJobCallback).
+        let meta = match referrer {
+            Some(meta) => Some(meta),
+            None => match self.active_script_referrer() {
+                Some(active) => {
+                    return self.dynamic_import_from(promise, specifier, attr_type, defer, &active)
+                }
+                None => self.import_meta.clone(),
+            },
+        };
         let referrer = match meta {
             Some(m) => match self.get_member(&m, "url") {
                 Ok(Value::Str(s)) => s.to_string(),
@@ -1720,11 +1739,24 @@ impl Interp {
             },
             None => self.import_base.clone(),
         };
+        self.dynamic_import_from(promise, specifier, attr_type, defer, &referrer)
+    }
+
+    /// HostLoadImportedModule for `import()` from `referrer` (a module URL or a script's base),
+    /// settling `promise`.
+    fn dynamic_import_from(
+        &mut self,
+        promise: Value,
+        specifier: &str,
+        attr_type: Option<&str>,
+        defer: bool,
+        referrer: &str,
+    ) -> Value {
         let host_context = self.host_job_context;
         if let Some(loader) = self.dynamic_module_loader.clone() {
             let request_id = self.next_dynamic_import_id;
             self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
-            if loader(request_id, host_context, specifier, &referrer, attr_type) {
+            if loader(request_id, host_context, specifier, referrer, attr_type) {
                 self.pending_dynamic_imports.insert(
                     request_id,
                     PendingDynamicImport {
@@ -1739,7 +1771,7 @@ impl Interp {
             }
         }
         let result = (|| {
-            let scoped_referrer = module_map_key(host_context, &referrer);
+            let scoped_referrer = module_map_key(host_context, referrer);
             let (canon, src) = self.fetch_module(specifier, &scoped_referrer, attr_type)?;
             let canon = match attr_type {
                 Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),

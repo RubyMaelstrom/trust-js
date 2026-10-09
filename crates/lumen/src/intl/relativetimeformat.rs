@@ -114,7 +114,7 @@ fn format(
     let unit = singular(&unit_string)
         .ok_or_else(|| i.make_error("RangeError", format!("invalid unit: {unit_string}")))?;
     let locale = string_slot(&object, "#\u{0}rtf_locale", "en-US");
-    let language = locale.split('-').next().unwrap_or("en");
+    let language = super::service::data_locale(&locale);
     let style = string_slot(&object, "#\u{0}rtf_style", "long");
     let numeric = string_slot(&object, "#\u{0}rtf_numeric", "always");
 
@@ -149,10 +149,6 @@ fn format(
     let nf_options = i.new_object();
     set_data(&nf_options, "numberingSystem", Value::lstr(numbering));
     set_data(&nf_options, "signDisplay", Value::lstr("never"));
-    if language == "pl" {
-        // CLDR's Polish number pattern has minimumGroupingDigits=2.
-        set_data(&nf_options, "useGrouping", Value::lstr("min2"));
-    }
     let number_format = new_service(i, "NumberFormat", &locale, nf_options)?;
     let format = ab(i.get_member(&number_format, "format"))?;
     let formatted = match ab(i.call(format, number_format.clone(), &[Value::Num(number)]))? {

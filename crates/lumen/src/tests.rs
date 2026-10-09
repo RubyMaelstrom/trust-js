@@ -18494,6 +18494,167 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
     assert!(!engine.ctx().realms.contains_key(&child_ptr));
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn promise_rejection_tracking_reports_handled_and_outstanding_promises() {
+    // ECMA-262 PerformPromiseThen/RejectPromise and HostPromiseRejectionTracker, with HTML
+    // #unhandled-promise-rejections' about-to-be-notified list and outstanding weak set.
+    let mut engine = Engine::new();
+    let source = "globalThis.a = Promise.reject(1); globalThis.b = Promise.reject(2);
+        globalThis.c = Promise.reject(3); globalThis.d = new Promise(() => {}); d.then();
+        globalThis.e = Promise.reject(4); e.catch(() => {});
+        globalThis.f = new Promise((_, reject) => globalThis.rejectF = reject);
+        f.catch(() => {}); rejectF(5);";
+    assert!(matches!(engine.eval_value(source), Ok(Ok(_))));
+    let global = engine.global_this();
+    let get = |engine: &mut Engine, name: &str| {
+        engine
+            .ctx()
+            .member_get(&global, name)
+            .unwrap_or_else(|_| panic!("global"))
+    };
+    let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| get(&mut engine, name));
+    assert_eq!(engine.ctx().promise_is_handled(&a), Some(false));
+    assert_eq!(engine.ctx().promise_is_handled(&d), Some(true));
+    assert_eq!(engine.ctx().promise_is_handled(&Value::Num(1.0)), None);
+    // The about-to-be-notified list, in rejection order: e and f were handled before the
+    // checkpoint.
+    let reasons: Vec<f64> = engine
+        .take_unhandled_rejections_full()
+        .into_iter()
+        .filter_map(|(_, reason)| reason.as_num_opt())
+        .collect();
+    assert_eq!(reasons, [1.0, 2.0, 3.0]);
+    let addr = |engine: &mut Engine, value: &Value| engine.ctx().object_addr(value);
+    // The host fired unhandledrejection; still-unhandled promises become outstanding.
+    assert!(engine.ctx().mark_promise_handled(&c));
+    assert_eq!(engine.ctx().promise_is_handled(&c), Some(true));
+    assert!(engine.ctx().add_outstanding_rejection(&a));
+    assert!(engine.ctx().add_outstanding_rejection(&b));
+    assert!(!engine.ctx().add_outstanding_rejection(&c));
+    assert!(!engine.ctx().add_outstanding_rejection(&d));
+    assert!(engine.take_handled_rejections().is_empty());
+    assert!(matches!(
+        engine.eval_value("a.catch(() => {}); a.then(); c.catch(() => {});"),
+        Ok(Ok(_))
+    ));
+    let handled = engine.take_handled_rejections();
+    assert_eq!(handled.len(), 1);
+    assert_eq!(addr(&mut engine, &handled[0].0), addr(&mut engine, &a));
+    assert_eq!(handled[0].1.as_num_opt(), Some(1.0));
+    assert!(matches!(
+        engine.eval_value("b.then(undefined, () => {});"),
+        Ok(Ok(_))
+    ));
+    let handled = engine.take_handled_rejections();
+    assert_eq!(handled.len(), 1);
+    assert_eq!(addr(&mut engine, &handled[0].0), addr(&mut engine, &b));
+    assert!(engine.take_handled_rejections().is_empty());
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_reactions_have_null_job_settings_and_survive_released_contexts() {
+    // Web IDL "react to a promise" steps created by the host: HTML HostEnqueuePromiseJob gives
+    // a job with a null Realm null job settings, so releasing the settings object that
+    // registered the reaction does not drop it, unlike an author reaction registered there.
+    let mut engine = Engine::new();
+    engine.ctx().set_host_job_context(91);
+    let source = "globalThis.seen = []; globalThis.p = Promise.resolve(7);
+        globalThis.q = new Promise(resolve => globalThis.resolveQ = resolve);
+        globalThis.r = Promise.reject(9);
+        q.then(v => seen.push('author ' + v));
+        new Promise(resolve => resolve(q)).then(v => seen.push('author adopted ' + v));
+        globalThis.step = v => (seen.push('host ' + v), v * 2);";
+    assert!(matches!(engine.eval_value(source), Ok(Ok(_))));
+    let global = engine.global_this();
+    let get = |engine: &mut Engine, name: &str| {
+        engine
+            .ctx()
+            .member_get(&global, name)
+            .unwrap_or_else(|_| panic!("global"))
+    };
+    let [p, q, r, step] = ["p", "q", "r", "step"].map(|name| get(&mut engine, name));
+    let from_p = engine
+        .ctx()
+        .react_to_promise(&p, step.clone(), Value::Undefined)
+        .unwrap_or_else(|_| panic!("p is a promise"));
+    let from_q = engine
+        .ctx()
+        .react_to_promise(&q, step.clone(), Value::Undefined)
+        .unwrap_or_else(|_| panic!("q is a promise"));
+    let from_r = engine
+        .ctx()
+        .react_to_promise(&r, Value::Undefined, step)
+        .unwrap_or_else(|_| panic!("r is a promise"));
+    assert_eq!(engine.ctx().promise_is_handled(&r), Some(true));
+    assert!(engine
+        .ctx()
+        .react_to_promise(&Value::Num(1.0), Value::Undefined, Value::Undefined)
+        .is_err());
+    // "A promise resolved with" a thenable: the adoption job also has null job settings.
+    let adopted = engine.ctx().promise_resolved_with(q.clone());
+    let adopted_key = engine.ctx().object_addr(&adopted).unwrap();
+    // Adoption that already began under the settings object: the thenable job ran and the
+    // resolving functions' reaction waits on `pending`, registered while 91 was current.
+    let pending = run_in(
+        &mut engine,
+        "globalThis.pending = new Promise(r => globalThis.resolvePending = r); 'ok'",
+    );
+    assert_eq!(pending, "ok");
+    let pending = get(&mut engine, "pending");
+    let begun = engine.ctx().promise_resolved_with(pending);
+    let begun_key = engine.ctx().object_addr(&begun).unwrap();
+    engine.run_microtasks();
+    engine.ctx().set_host_job_context(0);
+    assert!(engine.ctx().release_host_job_context(91));
+    assert!(matches!(
+        engine.eval_value("resolveQ(8); resolvePending(10)"),
+        Ok(Ok(_))
+    ));
+    engine.run_microtasks();
+    assert_eq!(run_in(&mut engine, "seen.join()"), "host 7,host 9,host 8");
+    let state = &engine.ctx().promises[&adopted_key];
+    assert_eq!((state.status, state.value.as_num_opt()), (1, Some(8.0)));
+    let state = &engine.ctx().promises[&begun_key];
+    assert_eq!((state.status, state.value.as_num_opt()), (1, Some(10.0)));
+    for (promise, expected) in [(from_p, 14.0), (from_q, 16.0), (from_r, 18.0)] {
+        let key = engine.ctx().object_addr(&promise).unwrap();
+        let state = &engine.ctx().promises[&key];
+        assert_eq!(
+            (state.status, state.value.as_num_opt()),
+            (1, Some(expected))
+        );
+    }
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn released_settings_keep_reactions_of_other_realms_handlers() {
+    // HTML HostEnqueuePromiseJob takes a reaction job's settings from the handler's Realm. A
+    // handler of the parent Window attached through the child Realm's `then` therefore
+    // survives the child's settings object; the child's own handler goes with it.
+    let mut engine = Engine::new();
+    let child = engine.ctx().create_embed_realm();
+    assert!(engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| ctx.set_host_job_context(5))
+        .is_ok());
+    let root = engine.global_this();
+    assert!(engine.ctx().member_set(&root, "child", child).is_ok());
+    // Both reactions are registered by child code, while its settings object is current.
+    let source = "globalThis.log = [];
+        child.parent = globalThis;
+        globalThis.handler = v => log.push('parent ' + v);
+        child.eval('globalThis.p = new Promise(r => globalThis.resolveP = r);' +
+            'p.then(v => parent.log.push(\\'child \\' + v)); p.then(parent.handler);');
+        'ok'";
+    assert_eq!(run_in(&mut engine, source), "ok");
+    assert!(engine.ctx().release_host_job_context(5));
+    assert_eq!(run_in(&mut engine, "child.resolveP(1); 'ok'"), "ok");
+    assert_eq!(run_in(&mut engine, "log.join()"), "parent 1");
+}
+
 #[test]
 fn module_live_bindings() {
     // An imported binding observes the exporter's later mutation.
@@ -23329,7 +23490,7 @@ fn numberformat_cldr_symbols_patterns_currencies_and_compact() {
     // compact notation patterns from locale data. These cases deliberately cross those axes.
     assert_eq!(
         run("[
-            new Intl.NumberFormat('ar').format(1234567.89),
+            new Intl.NumberFormat('ar-EG').format(1234567.89),
             new Intl.NumberFormat('hi').format(1234567.89),
             new Intl.NumberFormat('fr', {style: 'percent'}).format(.123),
             new Intl.NumberFormat('de', {style: 'currency', currency: 'USD'}).format(12.5),
@@ -23359,8 +23520,8 @@ fn numberformat_cldr_symbols_patterns_currencies_and_compact() {
 fn numberformat_localized_parts_ranges_and_unit_plurals() {
     assert_eq!(
         run("JSON.stringify([
-            new Intl.NumberFormat('ar').formatToParts(-1234.5),
-            new Intl.NumberFormat('ar', {style: 'percent'}).formatToParts(-.5),
+            new Intl.NumberFormat('ar-EG').formatToParts(-1234.5),
+            new Intl.NumberFormat('ar-EG', {style: 'percent'}).formatToParts(-.5),
             new Intl.NumberFormat('sv', {notation: 'scientific'}).formatToParts(-1234.5),
             new Intl.NumberFormat('fr', {notation: 'compact', compactDisplay: 'long'}).formatToParts(1000),
             new Intl.NumberFormat('si', {notation: 'compact', compactDisplay: 'long'}).formatToParts(1000)
@@ -23371,9 +23532,9 @@ fn numberformat_localized_parts_ranges_and_unit_plurals() {
     // UTS #35 unit patterns are selected by the full plural category, including placeholder-free
     // forms, and FormatNumericRange must localize every numeric part in both endpoints.
     assert_eq!(
-        run("const ar = new Intl.NumberFormat('ar', {style: 'unit', unit: 'meter', unitDisplay: 'long'});
+        run("const ar = new Intl.NumberFormat('ar-EG', {style: 'unit', unit: 'meter', unitDisplay: 'long'});
              const sl = new Intl.NumberFormat('sl', {style: 'unit', unit: 'meter', unitDisplay: 'long'});
-             const range = new Intl.NumberFormat('ar');
+             const range = new Intl.NumberFormat('ar-EG');
              [ar.format(1), ar.format(2), ar.format(3), ar.format(11),
               sl.format(2), sl.format(3), sl.format(5),
               range.formatRange(1234, 5678),
@@ -24899,8 +25060,13 @@ fn locale_info_text_direction_numbering_systems_and_time_zones() {
     // NumberingSystemsOfLocale: the nu keyword, else the matched NumberFormat locale's default,
     // agreeing with Intl.NumberFormat's own resolution.
     assert_eq!(
-        run("new Intl.Locale('ar').getNumberingSystems().join(',')"),
+        run("new Intl.Locale('ar-EG').getNumberingSystems().join(',')"),
         "arab"
+    );
+    // CLDR 48 gives Arabic itself Latin digits.
+    assert_eq!(
+        run("new Intl.Locale('ar').getNumberingSystems().join(',')"),
+        "latn"
     );
     assert_eq!(
         run("new Intl.Locale('ar-MA').getNumberingSystems().join(',')"),
@@ -29144,6 +29310,47 @@ fn date_time_format_follows_cldr_patterns_calendars_and_zone_names() {
         run("new Intl.DateTimeFormat('en', {dateStyle: 'long', timeZone: 'UTC'}).format(Date.UTC(1000, 0, 1))"),
         "January 1, 1000"
     );
+}
+
+#[cfg(feature = "intl")]
+#[test]
+fn intl_services_ship_every_cldr_regional_locale() {
+    // ECMA-402 [[AvailableLocales]] holds every CLDR 48 locale of a supported language (with
+    // default-content forms such as en-US and the language-region forms such as zh-TW); each
+    // variant's data inherits along its UTS #35 parent chain (en-GB -> en-001 -> en). Expected
+    // strings are V8's (ICU 78).
+    let cases = [
+        ("new Intl.DateTimeFormat('en-GB', {dateStyle: 'medium', timeZone: 'UTC'}).format(D)", "4 Jul 2024"),
+        ("new Intl.DateTimeFormat('en-AU', {dateStyle: 'long', timeZone: 'UTC'}).format(D)", "4 July 2024"),
+        ("new Intl.DateTimeFormat('en-CA', {dateStyle: 'short', timeZone: 'UTC'}).format(D)", "2024-07-04"),
+        ("new Intl.DateTimeFormat('fr-CA', {dateStyle: 'short', timeZone: 'UTC'}).format(D)", "2024-07-04"),
+        ("new Intl.DateTimeFormat('es-MX', {month: 'long', day: 'numeric', timeZone: 'UTC'}).format(D)", "4 de julio"),
+        ("new Intl.DateTimeFormat('zh-HK', {dateStyle: 'full', timeZone: 'UTC'}).format(D)", "2024年7月4日星期四"),
+        ("new Intl.NumberFormat('de-CH').format(1234567.5)", "1'234'567.5"),
+        ("new Intl.NumberFormat('es-MX', {style: 'currency', currency: 'MXN'}).format(1234.5)", "$1,234.50"),
+        ("new Intl.NumberFormat('en-IN').format(12345678)", "1,23,45,678"),
+        // de-AT formats currency with its currencyGroup.
+        ("new Intl.NumberFormat('de-AT', {style: 'currency', currency: 'EUR'}).format(1234.5)", "€\u{a0}1.234,50"),
+        ("new Intl.NumberFormat('ar-MA').resolvedOptions().numberingSystem + new Intl.NumberFormat('ar-EG').resolvedOptions().numberingSystem", "latnarab"),
+        ("new Intl.DisplayNames('fr-CA', {type: 'region'}).of('VN')", "Vietnam"),
+        // Plural rules inherit by truncation: pt-AO uses pt's, unlike pt-PT.
+        ("[new Intl.PluralRules('pt-PT').select(1.5), new Intl.PluralRules('pt-AO').select(1.5)].join()", "other,one"),
+        ("new Intl.RelativeTimeFormat('es-MX', {numeric: 'auto'}).format(-1, 'day')", "ayer"),
+        ("new Intl.DateTimeFormat('en-XX').resolvedOptions().locale", "en"),
+        ("new Intl.DateTimeFormat('de-CH-1996').resolvedOptions().locale", "de-CH"),
+        ("new Intl.DateTimeFormat('zh-TW').resolvedOptions().locale", "zh-TW"),
+        ("new Intl.NumberFormat('sr-ME').resolvedOptions().locale", "sr-ME"),
+        ("Intl.DateTimeFormat.supportedLocalesOf(['en-GB', 'xx-YY', 'de-AT', 'zh-Hant-TW']).join()", "en-GB,de-AT,zh-Hant-TW"),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(
+            run(&format!(
+                "const D = Date.UTC(2024, 6, 4, 15, 5, 9); {source}"
+            )),
+            expected,
+            "{source}"
+        );
+    }
 }
 
 #[test]

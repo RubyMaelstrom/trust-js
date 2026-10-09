@@ -187,7 +187,7 @@ fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<
     );
     let lang = locale.split('-').next().unwrap_or("en");
     let parts = string_list(i, list)?;
-    let patterns = crate::cldr_lists::patterns(lang, &kind, &style);
+    let patterns = crate::cldr_lists::patterns(super::service::data_locale(&locale), &kind, &style);
     let segments = assemble_segments(&parts, patterns, lang);
     if !to_parts {
         return Ok(Value::lstr(

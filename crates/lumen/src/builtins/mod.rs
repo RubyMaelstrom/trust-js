@@ -3701,6 +3701,8 @@ fn thenable_job_run(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, 
             Some(Value::Obj(global)) => Some(global.clone()),
             _ => None,
         },
+        // The queued job carries `then`'s script execution context (see `resolve_promise`).
+        active_script: None,
         internal: crate::interpreter::InternalJob::None,
     };
     let thenable = arg(args, 1);

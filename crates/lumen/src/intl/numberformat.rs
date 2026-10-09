@@ -684,30 +684,32 @@ fn get_str(o: &Gc, k: &str) -> String {
 }
 
 fn cldr_number_locale(o: &Gc) -> &'static str {
-    let locale = get_str(o, "#\u{0}nf_locale");
-    let mut parts = locale.split('-');
-    let lang = parts.next().unwrap_or("en");
-    let mut script = "";
-    let mut region = "";
-    for part in parts {
-        if script.is_empty()
-            && part.len() == 4
-            && part.as_bytes()[0].is_ascii_uppercase()
-            && part.as_bytes()[1..].iter().all(u8::is_ascii_lowercase)
-        {
-            script = part;
-        } else if region.is_empty()
-            && ((part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_uppercase()))
-                || (part.len() == 3 && part.bytes().all(|byte| byte.is_ascii_digit())))
-        {
-            region = part;
-        }
-    }
-    crate::cldr_numbers::locale(lang, script, region)
+    super::service::data_locale(&get_str(o, "#\u{0}nf_locale"))
 }
 
+/// The formatter's number symbols: a currency format separates with the locale's
+/// currencyDecimal and currencyGroup (UTS #35 Part 3 Number Symbols), which default to the
+/// ordinary decimal and group symbols.
 fn cldr_number_symbols(o: &Gc) -> crate::cldr_numbers::Symbols {
-    crate::cldr_numbers::symbols(cldr_number_locale(o), &get_str(o, "#\u{0}nf_nu"))
+    let mut symbols =
+        crate::cldr_numbers::symbols(cldr_number_locale(o), &get_str(o, "#\u{0}nf_nu"));
+    if get_str(o, "#\u{0}nf_style") == "currency" {
+        symbols.decimal = symbols.currency_decimal;
+        symbols.group = symbols.currency_group;
+        // A currency's own separators (UTS #35 Part 3 Currencies) replace the locale's.
+        if let Some(format) = crate::cldr_numbers::currency_format(
+            cldr_number_locale(o),
+            &get_str(o, "#\u{0}nf_currency"),
+        ) {
+            if !format.decimal.is_empty() {
+                symbols.decimal = format.decimal;
+            }
+            if !format.group.is_empty() {
+                symbols.group = format.group;
+            }
+        }
+    }
+    symbols
 }
 
 fn get_num(o: &Gc, k: &str) -> Option<u32> {
@@ -1409,7 +1411,7 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, mv: &IntlMv) -> FormattedNumber
     let style = get_str(o, "#\u{0}nf_style");
     let cldr_locale = cldr_number_locale(o);
     let number_system = get_str(o, "#\u{0}nf_nu");
-    let symbols = crate::cldr_numbers::symbols(cldr_locale, &number_system);
+    let symbols = cldr_number_symbols(o);
     let mut value = mv.approximate();
     let mut exact = mv.exact();
     if style == "percent" {
@@ -1712,8 +1714,16 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, mv: &IntlMv) -> FormattedNumber
                     (true, false) => "accounting",
                     (true, true) => "accountingAlpha",
                 };
+                // A currency's own pattern (UTS #35 Part 3 Currencies) replaces the locale's
+                // standard currency format.
+                let own_pattern = (!accounting)
+                    .then(|| crate::cldr_numbers::currency_format(cldr_locale, &code))
+                    .flatten()
+                    .and_then(|format| format.pattern);
                 num = apply_number_pattern(
-                    crate::cldr_numbers::pattern(cldr_locale, &number_system, kind),
+                    own_pattern.unwrap_or_else(|| {
+                        crate::cldr_numbers::pattern(cldr_locale, &number_system, kind)
+                    }),
                     sign,
                     &num,
                     &symbols,
@@ -1916,12 +1926,14 @@ fn format_to_parts(i: &mut Interp, this: &Value, x: &Value) -> Result<Value, Val
 /// literal affixes, grouped integer, decimal, fraction, and the exponent group). `suffix_type`
 /// classifies the trailing affix ("compact" for compact notation, else percent/literal by content).
 /// The formatter locale's primary language subtag.
+/// The shipped locale whose plural rules apply (rules are per language, with locale-specific
+/// sets such as pt-PT along the parent chain).
 fn o_lang(o: &Gc) -> &'static str {
-    cldr_number_locale(o).split('-').next().unwrap_or("en")
+    cldr_number_locale(o)
 }
 
 /// The CLDR unit-display pattern ("{0} km/h") for the already-selected plural
-/// category; zh is split by script and en-IN has region-specific patterns.
+/// category, along the formatter locale's parent chain.
 fn unit_pattern_for_category(o: &Gc, category: &str) -> Option<String> {
     let unit = get_str(o, "#\u{0}nf_unit");
     let disp = get_str(o, "#\u{0}nf_unitdisplay");
@@ -1931,17 +1943,15 @@ fn unit_pattern_for_category(o: &Gc, category: &str) -> Option<String> {
         disp.as_str()
     };
     let locale = cldr_number_locale(o);
-    let cldr_loc = if locale == "zh" { "zh-Hans" } else { locale };
-    let lang = o_lang(o);
     // UTS #35 Part 2: a missing narrow pattern inherits short, a missing short inherits long;
-    // a plural category without a pattern uses `other`. Every advertised locale has CLDR unit
-    // data; English is the default locale's data for any other.
+    // a plural category without a pattern uses `other`. Every shipped locale has CLDR unit
+    // data along its parent chain; English is the default locale's data for any other.
     let styles: &[&str] = match style {
         "narrow" => &["narrow", "short", "long"],
         "short" => &["short", "long"],
         _ => &["long"],
     };
-    [cldr_loc, lang, "en"].into_iter().find_map(|loc| {
+    [locale, "en"].into_iter().find_map(|loc| {
         styles
             .iter()
             .find_map(|style| {

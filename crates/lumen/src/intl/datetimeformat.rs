@@ -876,36 +876,11 @@ fn dtf_nu(o: &Gc) -> String {
     }
 }
 
+/// The shipped CLDR locale whose data serves the formatter.
 fn dtf_cldr_locale(o: &Gc) -> &'static str {
-    let locale = match o
-        .borrow()
-        .props
-        .get("#\u{0}dtf_locale")
-        .map(|property| property.value())
-    {
-        Some(Value::Str(locale)) => locale.to_string(),
-        _ => "en".to_string(),
-    };
-    let mut parts = locale.split('-');
-    let language = parts.next().unwrap_or("en");
-    let mut script = "";
-    let mut region = "";
-    for part in parts {
-        if script.is_empty()
-            && part.len() == 4
-            && part.as_bytes()[0].is_ascii_uppercase()
-            && part.as_bytes()[1..].iter().all(u8::is_ascii_lowercase)
-        {
-            script = part;
-        } else if region.is_empty()
-            && ((part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_uppercase()))
-                || (part.len() == 3 && part.bytes().all(|byte| byte.is_ascii_digit())))
-        {
-            region = part;
-        }
-    }
-    crate::cldr_datetime_patterns::locale(language, script, region)
+    super::service::data_locale(&dtf_slot(o, "#\u{0}dtf_locale").unwrap_or_default())
 }
+
 /// Format an already-resolved epoch-ms + Temporal kind to the joined string.
 fn do_format_ms(o: &Gc, ms: f64, kind: u8) -> String {
     let s: String = build_parts(o, ms, kind)
@@ -1399,8 +1374,8 @@ fn numbering_override(numbers: &str, letter: char) -> Option<&str> {
 /// The flexible day period (UTS #35 Part 4 Day Period Rules) of a time for `B`. As in ICU, noon
 /// applies at exactly 12:00 (counting the minutes and seconds the pattern shows) and midnight is
 /// not used.
-fn flexible_day_period(language: &str, hour: u32, exact_hour: bool) -> Option<&'static str> {
-    let rules = crate::cldr_datetime_patterns::day_period_rules(language);
+fn flexible_day_period(locale: &str, hour: u32, exact_hour: bool) -> Option<&'static str> {
+    let rules = crate::cldr_datetime_patterns::day_period_rules(locale);
     if hour == 12 && exact_hour && rules.iter().any(|rule| rule.0 == "noon") {
         return Some("noon");
     }
@@ -1644,7 +1619,7 @@ fn render_pattern(
                 let period = if letter == 'B' {
                     let exact = (!shows_minute || fields.minute == 0)
                         && (!shows_second || fields.second == 0);
-                    flexible_day_period(language, fields.hour, exact).unwrap_or(am_pm)
+                    flexible_day_period(locale, fields.hour, exact).unwrap_or(am_pm)
                 } else if letter == 'b' && fields.hour == 12 && fields.minute == 0 {
                     "noon"
                 } else {

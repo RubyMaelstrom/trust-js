@@ -1,19 +1,9 @@
-//! `Intl.Locale` and the shared locale-support predicate.
+//! `Intl.Locale`.
 
 use super::{ab, coerce_options, def_getter, make_service};
 use crate::interpreter::Interp;
 use crate::intl::tags;
 use crate::value::{set_builtin, set_data, Gc, Value};
-
-/// Whether a canonical tag is serviced by our (minimal) locale data.
-#[allow(dead_code)]
-pub fn is_supported(tag: &str) -> bool {
-    let lang = tag.split('-').next().unwrap_or("");
-    matches!(
-        lang,
-        "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "ja" | "zh" | "ko" | "ru" | "ar"
-    )
-}
 
 // ---- subtag validators (the option grammar) --------------------------------------------------
 
@@ -278,7 +268,7 @@ fn collations_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Value> {
         return Ok(string_array(i, vec![collation]));
     }
     let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
-    let collations = if super::service::supported_language(&parsed.language) {
+    let collations = if super::service::best_available_locale(&tag).is_some() {
         super::collator::supported_collations(&parsed.language)
     } else {
         vec!["emoji", "eor"]
@@ -344,18 +334,9 @@ fn numbering_systems_of_locale(i: &mut Interp, this: &Value) -> Result<Value, Va
     if let Some(numbering_system) = locale_keyword(i, this, "#\u{0}locale_nu")? {
         return Ok(string_array(i, vec![numbering_system]));
     }
-    let parsed = tags::parse(&tag).expect("stored Intl.Locale tags are canonical and well-formed");
-    let numbering_system = if super::service::supported_language(&parsed.language) {
-        // The matched available locale is the tag's base name or a prefix of it with the same
-        // language, which determines the default numbering system.
-        let mut base = parsed.clone();
-        base.unicode = None;
-        base.transform = None;
-        base.other_ext.clear();
-        base.private.clear();
-        super::service::default_numbering_system(&tags::render(&base))
-    } else {
-        "latn"
+    let numbering_system = match super::service::best_available_locale(&tag) {
+        Some(available) => super::service::default_numbering_system(available),
+        None => "latn",
     };
     Ok(string_array(i, vec![numbering_system]))
 }

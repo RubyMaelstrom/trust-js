@@ -83,6 +83,12 @@ pub(crate) struct ScriptSource {
     kind: SourceKind,
     /// Byte offsets of the line starts, built when a position is first formatted.
     line_starts: std::cell::OnceCell<Box<[u32]>>,
+    /// The ScriptOrModule of code from this source, as the host-defined base its `import()`
+    /// calls resolve against (see [`Interp::active_script_or_module`]): set when a Script or
+    /// Module starts to evaluate, and for eval code and dynamic functions to the active
+    /// ScriptOrModule where they are created (ECMA-262 PerformEval, OrdinaryFunctionCreate).
+    /// Unset is null, as for host snapshot code.
+    referrer: std::cell::OnceCell<Rc<str>>,
 }
 
 impl std::fmt::Debug for ScriptSource {
@@ -113,11 +119,23 @@ impl ScriptSource {
             column_offset: origin.column,
             kind,
             line_starts: std::cell::OnceCell::new(),
+            referrer: std::cell::OnceCell::new(),
         })
     }
 
     pub(crate) fn kind(&self) -> SourceKind {
         self.kind
+    }
+
+    /// The referrer of this source's ScriptOrModule, None when that is null.
+    pub(crate) fn referrer(&self) -> Option<&Rc<str>> {
+        self.referrer.get()
+    }
+
+    /// Record the referrer of this source's ScriptOrModule. A source evaluates as one
+    /// ScriptOrModule, so only the first record counts.
+    pub(crate) fn set_referrer(&self, referrer: Rc<str>) {
+        let _ = self.referrer.set(referrer);
     }
 
     pub(crate) fn text(&self) -> &Rc<str> {
@@ -439,6 +457,63 @@ impl Interp {
         if let Some(frame) = self.code_frames.pop() {
             self.call_site = frame.call_site;
         }
+    }
+
+    /// ECMA-262 GetActiveScriptOrModule: the source of the innermost execution context whose
+    /// ScriptOrModule is not null. Function contexts take their function's (built-in, self-
+    /// hosted and host snapshot functions have none); below them lie the script execution
+    /// contexts a host pushed for job callbacks (HTML HostCallJobCallback).
+    pub(crate) fn active_script_or_module(&self) -> Option<Rc<ScriptSource>> {
+        let mut function = self.fn_frames.len();
+        let mut code = self.code_frames.len();
+        let mut pushed = self.job_script_contexts.len();
+        loop {
+            let depth = function + code;
+            // A pushed context entered at depth d runs above the d contexts below it.
+            if pushed > 0 && self.job_script_contexts[pushed - 1].0 as usize >= depth {
+                pushed -= 1;
+                return Some(self.job_script_contexts[pushed].1.clone());
+            }
+            if depth == 0 {
+                return None;
+            }
+            let source = if code > 0 && self.code_frames[code - 1].depth as usize >= function {
+                code -= 1;
+                self.code_frames[code].source.clone()
+            } else {
+                function -= 1;
+                match &self.fn_frames[function].callee().borrow().call {
+                    Callable::User(user) if !user.func.self_hosted => user.func.script.clone(),
+                    _ => None,
+                }
+            };
+            if let Some(source) = source.filter(|source| source.referrer().is_some()) {
+                return Some(source);
+            }
+        }
+    }
+
+    /// The referrer of the active ScriptOrModule (see [`Self::active_script_or_module`]).
+    pub(crate) fn active_script_referrer(&self) -> Option<Rc<str>> {
+        self.active_script_or_module()
+            .and_then(|source| source.referrer().cloned())
+    }
+
+    /// HTML HostCallJobCallback steps 4-6: run `operation` with the script execution context
+    /// HostMakeJobCallback saved (`script`) pushed below it, when there is one.
+    pub(crate) fn with_job_script_context<R>(
+        &mut self,
+        script: Option<&Rc<ScriptSource>>,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(script) = script else {
+            return operation(self);
+        };
+        self.job_script_contexts
+            .push((self.context_depth(), script.clone()));
+        let result = operation(self);
+        self.job_script_contexts.pop();
+        result
     }
 
     /// Run script, module or eval code from `source` in its own code frame.

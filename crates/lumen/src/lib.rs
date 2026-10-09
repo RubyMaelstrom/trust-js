@@ -165,10 +165,16 @@ mod tzdata;
 #[rustfmt::skip]
 mod tzrules;
 #[rustfmt::skip]
+#[cfg(any(windows, test))]
+mod cldr_windows_zones;
+#[rustfmt::skip]
 mod umalqura;
 #[rustfmt::skip]
 #[cfg(feature = "intl")]
 mod cldr_likely;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_locales;
 #[cfg(feature = "intl")]
 mod cldr_locale_info;
 #[rustfmt::skip]
@@ -741,7 +747,11 @@ impl Engine {
         self.interp.finish_dynamic_module_load(request_id, result)
     }
 
-    /// The default referrer for a bare `import()` in script code (so relative specifiers resolve).
+    /// The base URL of the classic scripts evaluated from now on (HTML: a classic script's base
+    /// URL): the referrer of `import()` in their code, including functions they create, which
+    /// keep it after the base changes (ECMA-262 GetActiveScriptOrModule). It is also the referrer
+    /// when no Script or Module is active (the current Realm's), so a host restores the settings
+    /// object's API base URL after running a script.
     pub fn set_import_base(&mut self, base: &str) {
         self.interp.import_base = base.to_string();
     }
@@ -1105,10 +1115,12 @@ impl Engine {
         self.interp.host_job_context_leave = Some(leave);
     }
 
-    /// Opt in to saving the incumbent script-caller global at JobCallback registration and
-    /// restoring it while invoking the callback (HTML HostMakeJobCallback/HostCallJobCallback).
-    /// This preserves source identity independently of the callback's execution Realm. It does
-    /// not yet capture an active ScriptOrModule record for later dynamic-import base resolution.
+    /// Opt in to HTML HostMakeJobCallback/HostCallJobCallback: JobCallback registration saves
+    /// the incumbent script-caller global and the active script (as a script execution context
+    /// whose ScriptOrModule is the active Script or Module), and invoking the callback restores
+    /// both. The script caller preserves source identity independently of the callback's
+    /// execution Realm; the script execution context lets `import()` reached from a built-in
+    /// callback (`promise.then(eval)`) resolve against the registering script's base.
     /// Non-browser hosts must leave this disabled, as required by ECMA-262 §9.5.2–9.5.3.
     pub fn set_job_callback_script_caller_capture(&mut self, enabled: bool) {
         self.interp.capture_job_script_caller = enabled;
@@ -1376,9 +1388,22 @@ impl Engine {
         if self.interp.unhandled_rejections.is_empty() {
             return Vec::new();
         }
-        std::mem::take(&mut self.interp.unhandled_rejections)
+        // HTML's about-to-be-notified rejected promises list keeps rejection order.
+        let mut rejections: Vec<_> = std::mem::take(&mut self.interp.unhandled_rejections)
             .into_values()
+            .collect();
+        rejections.sort_unstable_by_key(|(order, ..)| *order);
+        rejections
+            .into_iter()
+            .map(|(_, promise, reason)| (promise, reason))
             .collect()
+    }
+
+    /// The HostPromiseRejectionTracker "handle" operations on promises the host added to its
+    /// outstanding rejected promises weak set ([`embed::Ctx::add_outstanding_rejection`]), as
+    /// `(promise, reason)`: HTML queues a `rejectionhandled` event for each.
+    pub fn take_handled_rejections(&mut self) -> Vec<(embed::Value, embed::Value)> {
+        self.interp.take_handled_rejections()
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is

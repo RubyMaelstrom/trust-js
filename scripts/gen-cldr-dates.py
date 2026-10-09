@@ -3,6 +3,10 @@
 
 The generated Rust tables refer into one deduplicated UTF-8 blob. The generator
 also writes a provenance manifest containing the hash of each distinct input.
+
+Every CLDR locale of a supported language is generated (scripts/cldr_locales.py): a regional or
+script variant keeps only the names that differ from its parent's, and each lookup walks the
+locale's parent chain (`crate::cldr_locales::chain`).
 """
 
 from __future__ import annotations
@@ -12,7 +16,11 @@ import hashlib
 import json
 import os
 import pathlib
+import sys
 import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 TAG = "48.0.0"
@@ -23,11 +31,7 @@ BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.data"
 MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.inputs.json"
 RAW = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/cldr-json"
 REPOSITORY = "https://github.com/unicode-org/cldr-json"
-LOCALES = [
-    "en", "en-IN", "de", "fr", "es", "it", "pt", "pt-PT", "nl", "ja",
-    "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
-    "si", "ln", "sv", "hi",
-]
+LOCALES = list(cldr_locales.locales())
 # (Lumen calendar id, CLDR package, file id, key inside dates.calendars)
 CALENDARS = [
     ("gregory", "cldr-dates-full", "gregorian", "gregorian"),
@@ -106,8 +110,8 @@ def rust_ref(value: str, strings: StringPool) -> str:
 
 
 def main() -> None:
-    months: dict[str, list[tuple[str, str, int, str]]] = {locale: [] for locale in LOCALES}
-    eras: dict[str, list[tuple[str, str, str, str]]] = {locale: [] for locale in LOCALES}
+    months: dict[str, dict] = {locale: {} for locale in LOCALES}
+    eras: dict[str, dict] = {locale: {} for locale in LOCALES}
     tasks = [(locale, calendar) for locale in LOCALES for calendar in CALENDARS]
     with ThreadPoolExecutor(max_workers=16) as pool:
         results = list(pool.map(download, tasks))
@@ -120,35 +124,42 @@ def main() -> None:
         standalone_data = data.get("months", {}).get("stand-alone", {})
         for width, cldr_width in (("long", "wide"), ("short", "abbreviated"), ("narrow", "narrow")):
             for month, value in month_data.get(cldr_width, {}).items():
-                if isinstance(value, str) and month.isdigit():
-                    months[locale].append((calendar, width, int(month), value))
-                elif isinstance(value, str) and month.endswith("-yeartype-leap"):
-                    # The Hebrew leap-year name of month 7 (Adar II) is month 107.
-                    months[locale].append((calendar, width, 100 + int(month.split("-")[0]), value))
-            # UTS #35 `L` patterns use the stand-alone names (nominative "июль" beside the
-            # format context's genitive "июля"); keep only those that differ.
-            for month, value in standalone_data.get(cldr_width, {}).items():
-                format_value = month_data.get(cldr_width, {}).get(month)
-                if not isinstance(value, str) or value == format_value:
+                if not isinstance(value, str):
                     continue
                 if month.isdigit():
-                    months[locale].append((calendar, f"standalone-{width}", int(month), value))
+                    number = int(month)
                 elif month.endswith("-yeartype-leap"):
+                    # The Hebrew leap-year name of month 7 (Adar II) is month 107.
                     number = 100 + int(month.split("-")[0])
-                    months[locale].append((calendar, f"standalone-{width}", number, value))
+                else:
+                    continue
+                months[locale][(calendar, width, number)] = value
+                # UTS #35 `L` patterns use the stand-alone names (nominative "июль" beside the
+                # format context's genitive "июля"), which default to the format names.
+                standalone = standalone_data.get(cldr_width, {}).get(month)
+                if not isinstance(standalone, str):
+                    standalone = value
+                months[locale][(calendar, f"standalone-{width}", number)] = standalone
         era_data = data.get("eras", {})
         for width, cldr_width in (("long", "eraNames"), ("short", "eraAbbr"), ("narrow", "eraNarrow")):
             for era, value in era_data.get(cldr_width, {}).items():
                 if isinstance(value, str) and "-alt-" not in era:
-                    eras[locale].append((calendar, width, era, value))
+                    eras[locale][(calendar, width, era)] = value
 
-    month_tables = {locale: sorted(set(months[locale])) for locale in LOCALES}
-    era_tables = {locale: sorted(set(eras[locale])) for locale in LOCALES}
+    # Each variant keeps only the names that differ from its CLDR parent's.
+    month_delta = cldr_locales.delta(months)
+    era_delta = cldr_locales.delta(eras)
+    month_tables = {
+        locale: sorted((*key, value) for key, value in month_delta[locale].items())
+        for locale in LOCALES
+    }
+    era_tables = {
+        locale: sorted((*key, value) for key, value in era_delta[locale].items())
+        for locale in LOCALES
+    }
     strings = StringPool()
     for locale in LOCALES:
         for calendar, width, month, value in month_tables[locale]:
-            if width.startswith("standalone-") or month >= 100:
-                continue
             strings.intern(calendar)
             strings.intern(width)
             strings.intern(value)
@@ -157,12 +168,6 @@ def main() -> None:
             strings.intern(width)
             strings.intern(era)
             strings.intern(value)
-    # Stand-alone and leap-year names are interned last so earlier string ids stay stable.
-    for locale in LOCALES:
-        for calendar, width, month, value in month_tables[locale]:
-            if width.startswith("standalone-") or month >= 100:
-                strings.intern(width)
-                strings.intern(value)
     output = [
         "//! GENERATED by scripts/gen-cldr-dates.py from CLDR 48. Do not edit.",
         "",
@@ -222,24 +227,26 @@ def main() -> None:
     ])
     for locale in LOCALES:
         output.append(f'        "{locale}" => &{ident("MO", locale)},')
-    output.extend(["        _ => &MO_EN,", "    }", "}", ""])
+    output.extend(["        _ => &[],", "    }", "}", ""])
     output.extend([
         "fn era_rows(locale: &str) -> &'static [EraRow] {",
         "    match locale {",
     ])
     for locale in LOCALES:
         output.append(f'        "{locale}" => &{ident("ER", locale)},')
-    output.extend(["        _ => &ER_EN,", "    }", "}", ""])
+    output.extend(["        _ => &[],", "    }", "}", ""])
     output.extend([
-        "/// The month name (1-based) for a locale/calendar/width, if shipped.",
+        "/// The month name (1-based) for a locale/calendar/width along the locale's parent chain.",
         "pub fn month_name(locale: &str, calendar: &str, width: &str, month: u8) -> Option<&'static str> {",
-        "    let rows = month_rows(locale);",
-        "    rows.binary_search_by(|row| (text(row.0), text(row.1), row.2).cmp(&(calendar, width, month)))",
-        "        .ok().map(|index| text(rows[index].3))",
+        "    crate::cldr_locales::chain(locale).iter().find_map(|locale| {",
+        "        let rows = month_rows(locale);",
+        "        rows.binary_search_by(|row| (text(row.0), text(row.1), row.2).cmp(&(calendar, width, month)))",
+        "            .ok().map(|index| text(rows[index].3))",
+        "    })",
         "}",
         "",
-        "/// The stand-alone month name (UTS #35 `L`) for a locale/calendar/width, falling back to the",
-        "/// format-context name where CLDR's two agree.",
+        "/// The stand-alone month name (UTS #35 `L`) for a locale/calendar/width; CLDR's stand-alone",
+        "/// names default to the format-context names.",
         "pub fn standalone_month_name(locale: &str, calendar: &str, width: &str, month: u8) -> Option<&'static str> {",
         "    let standalone = match width {",
         "        \"long\" => \"standalone-long\",",
@@ -249,11 +256,13 @@ def main() -> None:
         "    month_name(locale, calendar, standalone, month).or_else(|| month_name(locale, calendar, width, month))",
         "}",
         "",
-        "/// The era name for a locale/calendar/width/era-key, if shipped.",
+        "/// The era name for a locale/calendar/width/era-key along the locale's parent chain.",
         "pub fn era_name(locale: &str, calendar: &str, width: &str, era: &str) -> Option<&'static str> {",
-        "    let rows = era_rows(locale);",
-        "    rows.binary_search_by(|row| (text(row.0), text(row.1), text(row.2)).cmp(&(calendar, width, era)))",
-        "        .ok().map(|index| text(rows[index].3))",
+        "    crate::cldr_locales::chain(locale).iter().find_map(|locale| {",
+        "        let rows = era_rows(locale);",
+        "        rows.binary_search_by(|row| (text(row.0), text(row.1), text(row.2)).cmp(&(calendar, width, era)))",
+        "            .ok().map(|index| text(rows[index].3))",
+        "    })",
         "}",
         "",
         "#[cfg(test)]",

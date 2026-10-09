@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Generate the CLDR time zone display names used by Intl.DateTimeFormat's `timeZoneName`.
 
-The source is CLDR 48 (cldr-json): every advertised DateTimeFormat locale's timeZoneNames
+The source is CLDR 48 (cldr-json): every shipped locale's timeZoneNames
 (UTS #35 Part 4 Time Zone Names: the hour, GMT, region and fallback formats, zone-specific
 names and exemplar cities, and metazone names), the supplemental metazone data (UTS #35
 Part 4 Metazones: each zone's `usesMetazone` intervals and the preferred zone of a metazone
 in each territory), the primary zones, and the BCP 47 time zone aliases that map IANA
-identifiers to CLDR's stable zone identifiers. For the regional locales, the territory names
-that differ from their language's (which `cldr_display_names` already holds) are emitted too.
+identifiers to CLDR's stable zone identifiers (territory names come from `cldr_display_names`).
+Every CLDR locale of a supported language is generated (scripts/cldr_locales.py); a regional or
+script variant keeps only the names that differ from its parent's, and lookups walk the locale's
+parent chain.
 
 Usage:
     python3 scripts/gen-cldr-tz-names.py                # fetch from the CLDR CDN
@@ -21,19 +23,19 @@ import datetime
 import json
 import os
 import pathlib
+import sys
 import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 TAG = "48.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT = ROOT / "crates/lumen/src/cldr_tz_names.rs"
 CLDR_JSON = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
-# The DateTimeFormat locales (scripts/gen-cldr-datetime-patterns.py).
-LOCALES = [
-    "en", "en-IN", "de", "fr", "es", "it", "pt", "pt-PT", "nl", "ja",
-    "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
-    "si", "ln", "sv", "hi",
-]
+# Every shipped CLDR locale (scripts/cldr_locales.py).
+LOCALES = list(cldr_locales.locales())
 NAME_KEYS = [("long", "generic"), ("long", "standard"), ("long", "daylight"),
              ("short", "generic"), ("short", "standard"), ("short", "daylight")]
 # UTS #35 Part 1 Inheritance: the no-inheritance marker stands for "no value".
@@ -175,14 +177,14 @@ def main() -> None:
         "/// Long generic, standard and daylight names, then the short ones; 0 when CLDR has none.",
         "pub type Names = [Id; 6];",
         "",
-        "/// One locale's names: formats, metazone names, zone-specific names and exemplar cities",
-        "/// (each sorted by identifier), and territory names that differ from its language's.",
+        "/// One shipped locale's names that differ from its parent's (lookups walk the locale's",
+        "/// parent chain): formats, metazone names, zone-specific names and exemplar cities (each",
+        "/// sorted by identifier).",
         "pub struct LocaleNames {",
-        "    pub formats: Formats,",
+        "    pub formats: Option<Formats>,",
         "    pub metazones: &'static [(Id, Names)],",
         "    pub zones: &'static [(Id, Names)],",
         "    pub cities: &'static [(Id, Id)],",
-        "    pub regions: &'static [(Id, Id)],",
         "}",
         "",
         "/// The text of a string id.",
@@ -252,63 +254,56 @@ def main() -> None:
         tables[rows] = name
         return name
 
-    entries = []
+    full: dict[str, dict] = {"formats": {}, "metazones": {}, "zones": {}, "cities": {}}
     for locale in LOCALES:
         data = load(f"cldr-dates-full/main/{locale}/timeZoneNames.json")["main"][locale]
         names = data["dates"]["timeZoneNames"]
-        metazones = tuple(sorted(
-            (metazone, names_of(entry))
+        full["metazones"][locale] = {
+            metazone: names_of(entry)
             for metazone, entry in names.get("metazone", {}).items()
             if any(names_of(entry))
-        ))
+        }
         zone_rows = list(walk(names.get("zone", {}), [], zone_leaf))
-        zones = tuple(sorted(
-            (zone, names_of(entry)) for zone, entry in zone_rows if any(names_of(entry))
-        ))
-        cities = tuple(sorted(
-            (zone, entry["exemplarCity"])
+        full["zones"][locale] = {
+            zone: names_of(entry) for zone, entry in zone_rows if any(names_of(entry))
+        }
+        full["cities"][locale] = {
+            zone: entry["exemplarCity"]
             for zone, entry in zone_rows
             if entry.get("exemplarCity") not in (None, NO_INHERITANCE)
-        ))
-        regions: tuple = ()
-        language = locale.split("-")[0]
-        if language != locale:
-            own = load(f"cldr-localenames-full/main/{locale}/territories.json")
-            base = load(f"cldr-localenames-full/main/{language}/territories.json")
-            own = own["main"][locale]["localeDisplayNames"]["territories"]
-            base = base["main"][language]["localeDisplayNames"]["territories"]
-            regions = tuple(sorted(
-                (code, name) for code, name in own.items()
-                if "-alt-" not in code and base.get(code) != name
-            ))
-        formats = tuple(pool.id(names[key]) for key in (
+        }
+        full["formats"][locale] = {(): tuple(names[key] for key in (
             "hourFormat", "gmtFormat", "regionFormat", "regionFormat-type-standard",
             "regionFormat-type-daylight", "fallbackFormat",
-        ))
+        ))}
+    # Each variant keeps only what differs from its CLDR parent (scripts/cldr_locales.py).
+    kept = {kind: cldr_locales.delta(tables) for kind, tables in full.items()}
+    entries = []
+    for locale in LOCALES:
+        formats = kept["formats"][locale].get(())
         entries.append((
             locale,
-            formats,
-            table("MZ", locale, "names", metazones),
-            table("ZN", locale, "names", zones),
-            table("EC", locale, "pairs", cities),
-            table("RG", locale, "pairs", regions),
+            None if formats is None else tuple(pool.id(value) for value in formats),
+            table("MZ", locale, "names", tuple(sorted(kept["metazones"][locale].items()))),
+            table("ZN", locale, "names", tuple(sorted(kept["zones"][locale].items()))),
+            table("EC", locale, "pairs", tuple(sorted(kept["cities"][locale].items()))),
         ))
 
     body.append("")
     body += table_lines
     body += [
         "",
-        "/// The advertised DateTimeFormat locales' names, sorted by locale.",
+        "/// The shipped locales' names, sorted by locale.",
         "pub static LOCALES: &[(&str, LocaleNames)] = &[",
     ]
-    for locale, formats, metazones, zones, cities, regions in sorted(entries):
+    for locale, formats, metazones, zones, cities in sorted(entries):
+        rendered = "None" if formats is None else f"Some([{', '.join(map(str, formats))}])"
         body += [
             f"    ({rust_string(locale)}, LocaleNames {{",
-            f"        formats: [{', '.join(map(str, formats))}],",
+            f"        formats: {rendered},",
             f"        metazones: {metazones},",
             f"        zones: {zones},",
             f"        cities: {cities},",
-            f"        regions: {regions},",
             "    }),",
         ]
     body += ["];", ""]

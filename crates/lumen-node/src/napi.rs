@@ -60,6 +60,7 @@ pub type napi_callback = Option<unsafe extern "C" fn(napi_env, napi_callback_inf
 // napi_status values (subset of the C enum).
 const NAPI_OK: napi_status = 0;
 const NAPI_INVALID_ARG: napi_status = 1;
+const NAPI_OBJECT_EXPECTED: napi_status = 2;
 const NAPI_NUMBER_EXPECTED: napi_status = 6;
 const NAPI_BOOLEAN_EXPECTED: napi_status = 7;
 const NAPI_PENDING_EXCEPTION: napi_status = 10;
@@ -1081,9 +1082,23 @@ pub unsafe extern "C" fn napi_get_prototype(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let proto = env.interp().prototype_of(&value_of(object));
-    *result = env.handle(proto);
-    NAPI_OK
+    let value = value_of(object);
+    // Node's CHECK_TO_OBJECT: ToObject, so null and undefined are not objects.
+    if matches!(value, Value::Undefined | Value::Null) {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    // [[GetPrototypeOf]] (ECMA-262 #sec-object.getprototypeof), which runs a Proxy's
+    // getPrototypeOf trap and its invariant checks; a throw becomes the pending exception.
+    match env.interp().get_prototype_of(&value) {
+        Ok(proto) => {
+            *result = env.handle(proto);
+            NAPI_OK
+        }
+        Err(e) => {
+            env.pending = Some(e);
+            NAPI_PENDING_EXCEPTION
+        }
+    }
 }
 
 // -- references (values kept alive beyond the handle scope) --
@@ -1778,6 +1793,56 @@ mod tests {
         assert_eq!(unsafe { read_utf8(s.as_ptr(), 3) }, "hel");
         // A null pointer reads as empty.
         assert_eq!(unsafe { read_utf8(std::ptr::null(), NAPI_AUTO_LENGTH) }, "");
+    }
+
+    #[test]
+    fn get_prototype_runs_the_proxy_trap() {
+        let mut engine = lumen_host::Engine::new();
+        let Ok(Ok(values)) = engine.eval_value(
+            "globalThis.target = {}; globalThis.reported = {};
+             [new Proxy(target, {getPrototypeOf: () => reported}),
+              new Proxy(target, {getPrototypeOf() { throw new RangeError('trap'); }}),
+              Object.create(reported), null]",
+        ) else {
+            panic!("fixture evaluates")
+        };
+        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        let interp = unsafe { env.interp() };
+        let mut item = |index: &str| {
+            interp
+                .member_get(&values, index)
+                .unwrap_or_else(|_| panic!("fixture element"))
+        };
+        let (trapped, throwing, ordinary, null) = (item("0"), item("1"), item("2"), item("3"));
+        let reported = interp
+            .member_get(&interp.global_this(), "reported")
+            .unwrap_or_else(|_| panic!("reported"));
+        let mut result: napi_value = std::ptr::null_mut();
+        for subject in [trapped, ordinary] {
+            let handle = env.handle(subject);
+            assert_eq!(
+                unsafe { napi_get_prototype(&mut env, handle, &mut result) },
+                NAPI_OK
+            );
+            let Value::Obj(prototype) = (unsafe { value_of(result) }) else {
+                panic!("an object prototype")
+            };
+            let Value::Obj(expected) = &reported else {
+                panic!("an object")
+            };
+            assert!(Rc::ptr_eq(&prototype, expected));
+        }
+        let handle = env.handle(throwing);
+        assert_eq!(
+            unsafe { napi_get_prototype(&mut env, handle, &mut result) },
+            NAPI_PENDING_EXCEPTION
+        );
+        assert!(env.pending.take().is_some());
+        let handle = env.handle(null);
+        assert_eq!(
+            unsafe { napi_get_prototype(&mut env, handle, &mut result) },
+            NAPI_OBJECT_EXPECTED
+        );
     }
 
     #[test]

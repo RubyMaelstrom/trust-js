@@ -167,8 +167,8 @@ struct Builder<'a> {
     calendar: &'a str,
     decimal: &'a str,
     hour_letter: char,
-    /// The calendar's intervalFormats rows (skeleton, greatest difference, pattern), sorted.
-    rows: &'static [(&'static str, &'static str, &'static str)],
+    /// The calendar's intervalFormatItem skeletons, sorted.
+    skeletons: Vec<&'static str>,
     patterns: [Option<RangePattern>; 9],
     fallback_later_first: bool,
 }
@@ -183,14 +183,7 @@ impl Builder<'_> {
 
     /// The intervalFormatItem skeletons.
     fn skeletons(&self) -> impl Iterator<Item = &'static str> + '_ {
-        let mut previous = "";
-        self.rows.iter().filter_map(move |row| {
-            if row.0 == previous {
-                return None;
-            }
-            previous = row.0;
-            Some(row.0)
-        })
+        self.skeletons.iter().copied()
     }
 
     /// The closest intervalFormatItem skeleton (ICU DateIntervalInfo::getBestSkeleton): fields
@@ -537,7 +530,7 @@ pub(super) fn range_patterns(
         calendar,
         decimal,
         hour_letter,
-        rows: calendar_data.intervals,
+        skeletons: data::interval_skeletons(locale, calendar),
         patterns: Default::default(),
         // "{1} – {0}" puts the later date first.
         fallback_later_first: fallback.find("{1}") < fallback.find("{0}"),

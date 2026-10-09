@@ -428,8 +428,8 @@ fn candidates(locale: &str, calendar: &str) -> Vec<Candidate> {
     for (date, _) in patterns.dates {
         add(&mut entries, date.to_string(), None);
     }
-    for (key, pattern, _) in patterns.available {
-        add(&mut entries, (*pattern).to_string(), Some(key));
+    for (key, pattern, _) in data::available_formats(locale, calendar) {
+        add(&mut entries, pattern.to_string(), Some(key));
     }
     let bucket = |base: &str| match base.chars().next() {
         Some(letter @ 'A'..='Z') => letter as u32 - 'A' as u32,
@@ -673,8 +673,7 @@ fn append_field_name(locale: &str, field: usize) -> String {
         SECOND => "second",
         _ => "timeZoneName",
     };
-    let language = locale.split('-').next().unwrap_or(locale);
-    crate::cldr_display_names::name(language, "dateTimeField", "long", code)
+    crate::cldr_display_names::name(locale, "dateTimeField", "long", code)
         .unwrap_or(code)
         .to_string()
 }

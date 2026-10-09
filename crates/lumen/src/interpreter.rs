@@ -2825,6 +2825,13 @@ pub struct Interp {
     pub(crate) call_site: u32,
     /// Script, module and eval contexts, interleaved with `fn_frames` for stack traces.
     pub(crate) code_frames: Vec<crate::stack_trace::CodeFrame>,
+    /// Script execution contexts pushed for job callbacks (HTML HostCallJobCallback), each with
+    /// the context depth it was pushed at; they appear in no stack trace.
+    pub(crate) job_script_contexts: Vec<(u32, Rc<crate::stack_trace::ScriptSource>)>,
+    /// The prototype of the [[AlreadyResolved]] record shared by the resolving functions of an
+    /// embedder's platform resolution ([`Interp::promise_resolved_with`]). Never exposed to
+    /// script; it identifies those functions as platform steps (see [`InternalJob::HostReaction`]).
+    pub(crate) host_resolution_marker: Gc,
     /// The JIT's helper function table, built once (a stable address the machine code indexes
     /// through x21) instead of re-materialized on every call.
     pub(crate) jit_helpers: [usize; crate::jit::N_HELPERS],
@@ -3085,9 +3092,16 @@ pub struct Interp {
     /// Rejected promises with no handler attached at rejection time (ptr -> reason). Removed when a
     /// handler is later attached; whatever remains after a microtask checkpoint is a genuine
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
-    /// Keyed by the promise object's pointer; holds `(promise, reason)` so the runtime can hand
-    /// both to a global `unhandledrejection` handler.
-    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (Value, Value)>,
+    /// Keyed by the promise object's pointer; holds `(order, promise, reason)` so the runtime can
+    /// hand both to a global `unhandledrejection` handler in rejection order (HTML's
+    /// about-to-be-notified rejected promises list).
+    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (u64, Value, Value)>,
+    /// The order key of the next unhandled rejection.
+    pub(crate) next_unhandled_rejection: u64,
+    /// HostPromiseRejectionTracker "handle" operations on promises of the host's outstanding
+    /// rejected promises weak set, as `(promise, reason)`, until the host takes them (see
+    /// [`crate::Engine::take_handled_rejections`]) to fire `rejectionhandled`.
+    pub(crate) handled_rejections: Vec<(Value, Value)>,
     /// Temporal object internal slots, keyed by the object's pointer.
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
@@ -3293,6 +3307,8 @@ interp_memory_inventory! {
     global_env_pins => "measured",
     call_site => "non_owning",
     code_frames => "measured",
+    job_script_contexts => "measured",
+    host_resolution_marker => "measured",
     jit_helpers => "non_owning",
     jit_layout => "non_owning",
     interp_layout => "non_owning",
@@ -3364,6 +3380,8 @@ interp_memory_inventory! {
     realms => "measured",
     promises => "measured",
     unhandled_rejections => "measured",
+    next_unhandled_rejection => "non_owning",
+    handled_rejections => "measured",
     temporal => "measured",
     temporal_cal => "measured",
     microtasks => "measured",
@@ -3435,7 +3453,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 158);
+    assert_eq!(names.len(), 162);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3488,6 +3506,10 @@ pub struct Disposable {
 pub(crate) struct JobCallback {
     pub(crate) callback: Value,
     pub(crate) script_caller: Option<Gc>,
+    /// HTML HostMakeJobCallback's [[ActiveScriptContext]]: the active ScriptOrModule at
+    /// registration, which HostCallJobCallback pushes while calling the callback (browser hosts
+    /// only; see [`Interp::make_job_callback`]).
+    pub(crate) active_script: Option<Rc<crate::stack_trace::ScriptSource>>,
     /// A reaction step the specification models as an unobservable built-in function. When set,
     /// `callback` is not called; see [`InternalJob`].
     pub(crate) internal: InternalJob,
@@ -3507,17 +3529,30 @@ pub(crate) enum InternalJob {
     /// Await's onRejected (steps 5-6): resume the suspended async function with a throw
     /// completion.
     AwaitRejected { realm: usize },
+    /// An embedder's own reaction steps (Web IDL "react to a promise"; see
+    /// [`Interp::react_to_promise`]): `callback` is called like a handler, but the job belongs
+    /// to no Realm or settings object, so HTML HostEnqueuePromiseJob gives it null job settings
+    /// and it runs even after the settings object it was registered in is gone.
+    HostReaction,
 }
 
 impl InternalJob {
     /// The Realm of the built-in function this step stands for.
     pub(crate) fn realm(self) -> Option<usize> {
         match self {
-            InternalJob::None => None,
+            InternalJob::None | InternalJob::HostReaction => None,
             InternalJob::AwaitFulfilled { realm } | InternalJob::AwaitRejected { realm } => {
                 Some(realm)
             }
         }
+    }
+
+    /// Await's resumption steps, which run instead of calling `callback`.
+    pub(crate) fn resumes_await(self) -> bool {
+        matches!(
+            self,
+            InternalJob::AwaitFulfilled { .. } | InternalJob::AwaitRejected { .. }
+        )
     }
 }
 
@@ -3526,6 +3561,7 @@ impl JobCallback {
         Self {
             callback,
             script_caller: None,
+            active_script: None,
             internal: InternalJob::None,
         }
     }
@@ -3551,6 +3587,13 @@ pub struct PromiseState {
     pub value: Value,
     /// Pending reactions: `(onFulfilled, onRejected, resultPromise, hostContext)`.
     pub(crate) reactions: Vec<(JobCallback, JobCallback, Value, u64)>,
+    /// [[PromiseIsHandled]]: a reaction was ever registered (PerformPromiseThen), or the host
+    /// marked the promise handled (Web IDL "mark as handled").
+    pub(crate) handled: bool,
+    /// Membership of the host's outstanding rejected promises weak set (HTML #unhandled-
+    /// promise-rejections): the host reported this rejection as unhandled, so a later handler
+    /// is reported back ([`Interp::add_outstanding_rejection`]). Dies with the promise.
+    pub(crate) outstanding: bool,
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
@@ -4022,13 +4065,38 @@ impl Interp {
         if context == 0 || !self.retired_host_job_contexts.insert(context) {
             return false;
         }
+        // The Realms this settings object belongs to. A pending reaction registered while it was
+        // current goes with it, unless a handler is a function of another Realm: HTML
+        // HostEnqueuePromiseJob takes the job settings from the handler's Realm, so a reaction
+        // that author code of another Window attached through this Realm's `then` survives.
+        let mut owners: std::collections::HashSet<usize> = self
+            .host_settings_states
+            .keys()
+            .filter(|(_, candidate)| *candidate == context)
+            .map(|(realm, _)| *realm)
+            .collect();
+        owners.extend(
+            self.realms
+                .iter()
+                .filter(|(_, state)| state.host_job_context == context)
+                .map(|(realm, _)| *realm),
+        );
+        if self.host_job_context == context {
+            owners.insert(Rc::as_ptr(&self.global) as usize);
+        }
         self.host_settings_states
             .retain(|(_, candidate), _| *candidate != context);
         self.microtasks.retain(|job| job.host_context != context);
         for promise in self.promises.values_mut() {
             promise
                 .reactions
-                .retain(|(_, _, _, candidate)| *candidate != context);
+                .retain(|(fulfilled, rejected, _, candidate)| {
+                    *candidate != context
+                        || [fulfilled, rejected].iter().any(|handler| {
+                            function_realm_key(&handler.callback)
+                                .is_some_and(|realm| !owners.contains(&realm))
+                        })
+                });
         }
         self.pending_dynamic_imports
             .retain(|_, pending| pending.host_context != context);
@@ -4296,6 +4364,119 @@ impl Interp {
     pub fn host_job_context(&self) -> u64 {
         self.host_job_context
     }
+
+    /// The promise state of `value`, when it is a promise.
+    fn promise_state_mut(&mut self, value: &Value) -> Option<&mut PromiseState> {
+        let Value::Obj(object) = value else {
+            return None;
+        };
+        self.promises.get_mut(&(Rc::as_ptr(object) as usize))
+    }
+
+    /// A promise's [[PromiseIsHandled]] (None when `promise` is not a promise): whether a
+    /// handler was ever attached, or the host marked it handled. HTML's "notify about rejected
+    /// promises" skips a handled promise and keeps an unhandled one as outstanding.
+    pub fn promise_is_handled(&mut self, promise: &Value) -> Option<bool> {
+        self.promise_state_mut(promise).map(|state| state.handled)
+    }
+
+    /// Web IDL "mark as handled": set [[PromiseIsHandled]] to true, so the rejection is never
+    /// reported as unhandled. False when `promise` is not a promise.
+    pub fn mark_promise_handled(&mut self, promise: &Value) -> bool {
+        let Some(state) = self.promise_state_mut(promise) else {
+            return false;
+        };
+        state.handled = true;
+        state.outstanding = false;
+        if let Value::Obj(object) = promise {
+            self.unhandled_rejections
+                .remove(&(Rc::as_ptr(object) as usize));
+        }
+        true
+    }
+
+    /// Add a rejected promise whose `unhandledrejection` the host fired and which is still not
+    /// handled to the outstanding rejected promises weak set (HTML "notify about rejected
+    /// promises"). The set holds the promise weakly; when a handler is attached later,
+    /// HostPromiseRejectionTracker's "handle" removes it and reports it through
+    /// [`crate::Engine::take_handled_rejections`]. False (and no change) for anything else.
+    pub fn add_outstanding_rejection(&mut self, promise: &Value) -> bool {
+        match self.promise_state_mut(promise) {
+            Some(state) if state.status == 2 && !state.handled => {
+                state.outstanding = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The HostPromiseRejectionTracker "handle" operations since the last call on promises of
+    /// the outstanding rejected promises weak set, as `(promise, reason)` in order: each is a
+    /// `rejectionhandled` event the host queues (HTML #unhandled-promise-rejections).
+    pub fn take_handled_rejections(&mut self) -> Vec<(Value, Value)> {
+        std::mem::take(&mut self.handled_rejections)
+    }
+
+    /// Web IDL "a promise resolved with" `value` for an embedder's platform steps: a new
+    /// promise of the current Realm, resolved with `value`. When `value` is a thenable, adopting
+    /// its state is platform work as well: the NewPromiseResolveThenableJob and the reactions of
+    /// the promise's resolving functions get null job settings, like the jobs of
+    /// [`Self::react_to_promise`], so they survive [`Self::release_host_job_context`] of the
+    /// settings object that created the promise. A [`Self::react_to_promise`] step that returns
+    /// a thenable resolves its result promise the same way.
+    pub fn promise_resolved_with(&mut self, value: Value) -> Value {
+        let promise = self.new_promise();
+        self.resolve_promise_from(&promise, value, true);
+        promise
+    }
+
+    /// Web IDL "react to a promise" with embedder steps: PerformPromiseThen(`promise`,
+    /// `on_fulfilled`, `on_rejected`) into a new promise of the current Realm, which is
+    /// returned. The steps are platform-internal, not author callbacks: their jobs get null job
+    /// settings (HTML HostEnqueuePromiseJob with a null Realm), so they run in whatever settings
+    /// are current and survive [`Self::release_host_job_context`] of the settings object that
+    /// registered them. A missing step (`undefined`) passes the settlement through. Like any
+    /// PerformPromiseThen this marks `promise` handled. TypeError when `promise` is not a promise.
+    pub fn react_to_promise(
+        &mut self,
+        promise: &Value,
+        on_fulfilled: Value,
+        on_rejected: Value,
+    ) -> Result<Value, Value> {
+        if self.promise_state_mut(promise).is_none() {
+            return Err(self.make_error("TypeError", "react to a promise: not a promise"));
+        }
+        let step = |callback: Value| JobCallback {
+            internal: InternalJob::HostReaction,
+            ..JobCallback::plain(if callback.is_callable() {
+                callback
+            } else {
+                Value::Undefined
+            })
+        };
+        let result = self.new_promise();
+        self.perform_promise_then(
+            promise,
+            step(on_fulfilled),
+            step(on_rejected),
+            result.clone(),
+        );
+        Ok(result)
+    }
+}
+
+/// The Realm key of an ECMAScript function or bound function's target (None for built-ins
+/// and other callables, whose Realm is not recorded on the object).
+fn function_realm_key(callback: &Value) -> Option<usize> {
+    let Value::Obj(function) = callback else {
+        return None;
+    };
+    let function = function.borrow();
+    match &function.call {
+        Callable::User(user) => Some(user.realm),
+        Callable::Bound(bound) => function_realm_key(&Value::Obj(bound.target.clone())),
+        _ => None,
+    }
 }
 
 /// The well-known symbol names that are shared across all realms.
@@ -4416,6 +4597,8 @@ impl Interp {
             global_env_pins: Vec::new(),
             call_site: crate::stack_trace::NO_POSITION,
             code_frames: Vec::new(),
+            job_script_contexts: Vec::new(),
+            host_resolution_marker: Object::new(None),
             jit_helpers: crate::jit::helper_table(),
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
@@ -4459,6 +4642,8 @@ impl Interp {
             realms: Default::default(),
             promises: Default::default(),
             unhandled_rejections: Default::default(),
+            next_unhandled_rejection: 0,
+            handled_rejections: Vec::new(),
             temporal: Default::default(),
             temporal_cal: Default::default(),
             microtasks: std::collections::VecDeque::new(),
@@ -5275,20 +5460,53 @@ impl Interp {
         result
     }
 
+    /// HostMakeJobCallback. A browser host (see [`Self::capture_job_script_caller`]) saves the
+    /// incumbent script caller and, per HTML, the active script as a script execution context;
+    /// other hosts keep ECMA-262's default (§9.5.2), which saves neither.
     pub(crate) fn make_job_callback(&self, callback: Value) -> JobCallback {
-        let script_caller = if self.capture_job_script_caller && callback.is_callable() {
-            match self.script_caller_global() {
-                Value::Obj(global) => Some(global),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // The resolving functions of a platform resolution are platform steps themselves.
+        if self.is_host_resolver(&callback) {
+            return JobCallback {
+                internal: InternalJob::HostReaction,
+                ..JobCallback::plain(callback)
+            };
+        }
+        let (script_caller, active_script) =
+            if self.capture_job_script_caller && callback.is_callable() {
+                let script_caller = match self.script_caller_global() {
+                    Value::Obj(global) => Some(global),
+                    _ => None,
+                };
+                (script_caller, self.job_active_script(&callback))
+            } else {
+                (None, None)
+            };
         JobCallback {
             callback,
             script_caller,
+            active_script,
             internal: InternalJob::None,
         }
+    }
+
+    /// The script execution context HostMakeJobCallback saves for `callback`: the active
+    /// ScriptOrModule, unless the callback is an ECMAScript function with a ScriptOrModule of
+    /// its own, whose function context would always be found first.
+    fn job_active_script(&self, callback: &Value) -> Option<Rc<crate::stack_trace::ScriptSource>> {
+        if let Value::Obj(function) = callback {
+            if let Callable::User(user) = &function.borrow().call {
+                if !user.func.self_hosted
+                    && user
+                        .func
+                        .script
+                        .as_ref()
+                        .is_some_and(|script| script.referrer().is_some())
+                {
+                    return None;
+                }
+            }
+        }
+        self.active_script_or_module()
     }
 
     /// HostMakeJobCallback for one of Await's built-in reaction steps (see [`InternalJob`]).
@@ -5299,18 +5517,20 @@ impl Interp {
         async_promise: Value,
         fulfilled: bool,
     ) -> JobCallback {
-        let script_caller = if self.capture_job_script_caller {
-            match self.script_caller_global() {
+        let (script_caller, active_script) = if self.capture_job_script_caller {
+            let script_caller = match self.script_caller_global() {
                 Value::Obj(global) => Some(global),
                 _ => None,
-            }
+            };
+            (script_caller, self.active_script_or_module())
         } else {
-            None
+            (None, None)
         };
         let realm = Rc::as_ptr(&self.global) as usize;
         JobCallback {
             callback: async_promise,
             script_caller,
+            active_script,
             internal: if fulfilled {
                 InternalJob::AwaitFulfilled { realm }
             } else {
@@ -5335,13 +5555,15 @@ impl Interp {
             .unwrap_or(Rc::as_ptr(&self.global) as usize);
             self.host_entry_realm = Some(key);
         }
-        let result = if let Some(global) = &callback.script_caller {
-            self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+        let result = self.with_job_script_context(callback.active_script.as_ref(), |ctx| {
+            if let Some(global) = &callback.script_caller {
+                ctx.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+                    ctx.call_callback(callback.callback.clone(), this, args)
+                })
+            } else {
                 ctx.call_callback(callback.callback.clone(), this, args)
-            })
-        } else {
-            self.call_callback(callback.callback.clone(), this, args)
-        };
+            }
+        });
         self.host_entry_realm = previous_entry;
         result
     }
@@ -15290,6 +15512,13 @@ impl Interp {
         body: &[Stmt],
         source: Option<Rc<crate::stack_trace::ScriptSource>>,
     ) -> Result<Value, Abrupt> {
+        // ScriptEvaluation: the Script Record is the ScriptOrModule of its code; its host-
+        // defined base is the host's current script base (HTML: the classic script's base URL).
+        if let Some(source) = &source {
+            if source.kind() == crate::stack_trace::SourceKind::Script {
+                source.set_referrer(Rc::from(self.import_base.as_str()));
+            }
+        }
         self.in_code(source, |this| {
             this.with_script_entry(|this| this.run_program_body(body))
         })

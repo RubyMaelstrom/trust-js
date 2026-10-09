@@ -437,28 +437,6 @@ pub(crate) fn def_getter(it: &mut Interp, proto: &Gc, name: &str, f: crate::valu
 }
 
 #[allow(dead_code)]
-pub(crate) fn install_service_common(it: &mut Interp, ctor: &Gc, proto: &Gc) {
-    // Intl.<Service>.supportedLocalesOf(locales, options).
-    let f = it.make_native("supportedLocalesOf", 1, |i, _t, a| {
-        let requested = canonicalize_locale_list(i, &arg(a, 0))?;
-        // A minimal (best-fit == lookup) matcher: `en` and any exactly-supported tag pass through.
-        let out: Vec<Value> = requested
-            .into_iter()
-            .filter(|t| locale::is_supported(t))
-            .map(Value::lstr)
-            .collect();
-        Ok(i.make_array(out))
-    });
-    ctor.borrow_mut()
-        .props
-        .insert("supportedLocalesOf", Property::builtin(Value::Obj(f)));
-
-    // resolvedOptions / the per-service format methods are attached by each service; here we just
-    // ensure `prototype` is non-configurable already (done in make_service).
-    let _ = proto;
-}
-
-#[allow(dead_code)]
 pub(crate) fn tag_of_str(v: &Value) -> Option<Rc<str>> {
     match v {
         Value::Str(s) => Some(s.clone().into()),

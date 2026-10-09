@@ -8,14 +8,23 @@ Authoritative inputs:
 The CLDR condition grammar is compiled to straight-line Rust. Runtime selection therefore performs
 no parsing, hashing, locale allocation, or rule allocation. Decimal operands remain digit slices so
 modulo tests stay exact even for BigInt and 100-digit fraction inputs.
+
+Rule sets are keyed by language with a few locale-specific sets (pt-PT); a shipped locale uses the
+first set among its truncations (plural rules have no parent-locale overrides).
+`CLDR_DIR` names a local copy of the pinned cldr-json tree.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
+import sys
 import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 CLDR_VERSION = "48"
@@ -26,20 +35,22 @@ BASE = (
     f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/"
     "cldr-json/cldr-core/supplemental"
 )
-SUPPORTED = [
-    "en", "de", "fr", "es", "it", "pt", "nl", "ja", "zh", "ko", "ru", "ar",
-    "sr", "th", "gv", "sl", "pl", "si", "ln", "sv", "hi",
-]
+SUPPORTED = cldr_locales.LANGUAGES
 CATEGORIES = ["zero", "one", "two", "few", "many", "other"]
 RELATION = re.compile(r"^([niftvwce])(?:\s*%\s*(\d+))?\s*(!?=)\s*([0-9.,]+)$")
 
 
 def fetch(name: str) -> dict:
-    request = urllib.request.Request(
-        f"{BASE}/{name}", headers={"User-Agent": "Lumen CLDR plural generator"}
-    )
-    with urllib.request.urlopen(request) as response:
-        data = json.load(response)
+    cldr_dir = os.environ.get("CLDR_DIR")
+    if cldr_dir:
+        with open(os.path.join(cldr_dir, "cldr-core/supplemental", name), encoding="utf-8") as file:
+            data = json.load(file)
+    else:
+        request = urllib.request.Request(
+            f"{BASE}/{name}", headers={"User-Agent": "Lumen CLDR plural generator"}
+        )
+        with urllib.request.urlopen(request) as response:
+            data = json.load(response)
     version = data["supplemental"]["version"]["_cldrVersion"]
     if version != CLDR_VERSION:
         raise RuntimeError(f"{name}: expected CLDR {CLDR_VERSION}, got {version}")
@@ -90,15 +101,21 @@ def rule_body(rules: dict[str, str] | None) -> list[str]:
     return output
 
 
+def rule_keys(rules: dict) -> list[str]:
+    """The rule sets of supported languages: languages and locale-specific sets (pt-PT)."""
+    return sorted(key for key in rules if key.split("-")[0] in SUPPORTED)
+
+
 def emit_selector(output: list[str], name: str, rules: dict[str, dict[str, str]]) -> None:
+    keys = rule_keys(rules)
     output.extend(
         [
-            f"pub(crate) fn {name}(lang: &str, decimal: &str, compact_exponent: u32) -> &'static str {{",
+            f"pub(crate) fn {name}(locale: &str, decimal: &str, compact_exponent: u32) -> &'static str {{",
             "    let p = Operands::new(decimal, compact_exponent);",
-            "    match lang {",
+            f"    match rule_set(locale, &[{', '.join(json.dumps(key) for key in keys)}]) {{",
         ]
     )
-    for lang in SUPPORTED:
+    for lang in keys:
         output.append(f'        "{lang}" => {{')
         output.extend(rule_body(rules.get(lang)))
         output.append("        }")
@@ -132,7 +149,7 @@ def expand_compact_sample(sample: str) -> tuple[str, int]:
 
 def official_samples(rules: dict[str, dict[str, str]]) -> list[tuple[str, str, int, str]]:
     samples = []
-    for lang in SUPPORTED:
+    for lang in rule_keys(rules):
         for key, rule in (rules.get(lang) or {}).items():
             category = key.removeprefix("pluralRule-count-")
             for section in re.findall(r"@(?:integer|decimal)\s+([^@]+)", rule):
@@ -218,18 +235,32 @@ def main() -> None:
         "}",
         "",
     ]
+    output.extend(
+        [
+            "/// The rule set of a shipped locale: the first of `keys` among the locale's truncations",
+            "/// (plural rules have no parent-locale overrides, so pt-AO uses pt's).",
+            "fn rule_set(locale: &str, keys: &[&'static str]) -> &'static str {",
+            "    crate::cldr_locales::truncations(locale)",
+            "        .find_map(|candidate| keys.iter().copied().find(|key| *key == candidate))",
+            "        .unwrap_or(\"\")",
+            "}",
+            "",
+        ]
+    )
     emit_selector(output, "select_cardinal", cardinals)
     emit_selector(output, "select_ordinal", ordinals)
 
     output.extend(
         [
-            "pub(crate) fn categories(lang: &str, kind: &str) -> &'static [&'static str] {",
-            "    match (kind, lang) {",
+            "pub(crate) fn categories(locale: &str, kind: &str) -> &'static [&'static str] {",
+            f"    let cardinal = rule_set(locale, &[{', '.join(json.dumps(key) for key in rule_keys(cardinals))}]);",
+            f"    let ordinal = rule_set(locale, &[{', '.join(json.dumps(key) for key in rule_keys(ordinals))}]);",
+            "    match (kind, if kind == \"ordinal\" { ordinal } else { cardinal }) {",
         ]
     )
     for kind, rules in [("cardinal", cardinals), ("ordinal", ordinals)]:
         groups: dict[tuple[str, ...], list[str]] = {}
-        for lang in SUPPORTED:
+        for lang in rule_keys(rules):
             groups.setdefault(tuple(categories(rules.get(lang))), []).append(lang)
         for values, languages in groups.items():
             pattern = " | ".join(f'\"{lang}\"' for lang in languages)
@@ -237,13 +268,14 @@ def main() -> None:
             output.append(f'        ("{kind}", {pattern}) => &[{array}],')
     output.extend(["        _ => &[\"other\"],", "    }", "}", ""])
 
+    range_keys = rule_keys(plural_ranges)
     output.extend(
         [
-            "pub(crate) fn select_range(lang: &str, start: &str, end: &str) -> &'static str {",
-            "    match (lang, start, end) {",
+            "pub(crate) fn select_range(locale: &str, start: &str, end: &str) -> &'static str {",
+            f"    match (rule_set(locale, &[{', '.join(json.dumps(key) for key in range_keys)}]), start, end) {{",
         ]
     )
-    for lang in SUPPORTED:
+    for lang in range_keys:
         for key, result in plural_ranges.get(lang, {}).items():
             match = re.fullmatch(r"pluralRange-start-(\w+)-end-(\w+)", key)
             if not match:

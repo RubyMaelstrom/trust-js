@@ -5,15 +5,25 @@ Sources are the pinned unicode-org/cldr-json 48.0.0 localenames, numbers, dates,
 and BCP-47 packages.  Long/base names and sparse short/narrow overrides are kept
 separate so the generated binary does not repeat the overwhelmingly identical
 style fallbacks.
+
+Every CLDR locale of a supported language is generated (scripts/cldr_locales.py): a regional or
+script variant keeps only the names that differ from its parent's, and each lookup walks the
+locale's parent chain (`crate::cldr_locales::chain`). `CLDR_DIR` names a local copy of the
+pinned cldr-json tree.
 """
 
 from __future__ import annotations
 
 import json
 import hashlib
+import os
 import pathlib
+import sys
 import urllib.request
 from urllib.error import HTTPError
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 TAG = "48.0.0"
@@ -27,10 +37,7 @@ BASE = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}
 U16_MAX = (1 << 16) - 1
 U32_MAX = (1 << 32) - 1
 INPUT_HASHES: dict[str, tuple[int, str | None]] = {}
-LOCALES = [
-    "en", "de", "fr", "es", "it", "pt", "nl", "ja", "zh", "ko", "ru", "ar",
-    "sr", "th", "gv", "sl", "pl", "si", "ln", "sv", "hi",
-]
+LOCALES = list(cldr_locales.locales())
 DATE_FIELDS = {
     "era": "era",
     "year": "year",
@@ -70,15 +77,23 @@ class StringPool:
 
 
 def fetch_json(url: str) -> dict:
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "Lumen CLDR DisplayNames generator"}
-    )
-    try:
-        with urllib.request.urlopen(request) as response:
-            payload = response.read()
-    except HTTPError as error:
-        INPUT_HASHES[url] = (error.code, None)
-        raise
+    cldr_dir = os.environ.get("CLDR_DIR")
+    if cldr_dir:
+        path = pathlib.Path(cldr_dir) / url.removeprefix(f"{BASE}/")
+        if not path.exists():
+            INPUT_HASHES[url] = (404, None)
+            raise HTTPError(url, 404, "not in the local cldr-json tree", None, None)
+        payload = path.read_bytes()
+    else:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "Lumen CLDR DisplayNames generator"}
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = response.read()
+        except HTTPError as error:
+            INPUT_HASHES[url] = (error.code, None)
+            raise
     digest = hashlib.sha256(payload).hexdigest()
     previous = INPUT_HASHES.setdefault(url, (200, digest))
     if previous != (200, digest):
@@ -208,7 +223,20 @@ def main() -> None:
     # writer wins deterministically.
     base_rows = sorted({row[:3]: row for row in base_rows}.values())
     alt_rows = sorted({row[:4]: row for row in alt_rows}.values())
-    patterns.sort()
+
+    # Each variant keeps only the names that differ from its CLDR parent's.
+    def delta_rows(rows: list[tuple], key_length: int) -> list[tuple]:
+        tables: dict[str, dict] = {locale: {} for locale in LOCALES}
+        for row in rows:
+            tables[row[0]][row[1 : 1 + key_length]] = row[1 + key_length :]
+        kept = cldr_locales.delta(tables)
+        return sorted(
+            (locale, *key, *value) for locale, table in kept.items() for key, value in table.items()
+        )
+
+    base_rows = delta_rows(base_rows, 2)
+    alt_rows = delta_rows(alt_rows, 3)
+    patterns = delta_rows(patterns, 0)
 
     def ident(prefix: str, *parts: str) -> str:
         text = "_".join((prefix, *parts)).upper()
@@ -291,14 +319,24 @@ def main() -> None:
             "        .map(|index| text(rows[index].1))",
             "}",
             "",
-            "pub(crate) fn name(lang: &str, kind: &str, style: &str, code: &str) -> Option<&'static str> {",
-            "    // CLDR style fallback is narrow → short → long.",
+            "/// A display name for a shipped locale: the requested style along the locale's parent",
+            "/// chain, then (CLDR style fallback narrow → short → long) the wider ones.",
+            "pub(crate) fn name(locale: &str, kind: &str, style: &str, code: &str) -> Option<&'static str> {",
+            "    let chain = crate::cldr_locales::chain(locale);",
             "    for &candidate in match style {",
             '        "narrow" => &["narrow", "short"][..],',
             '        "short" => &["short"][..],',
             "        _ => &[][..],",
             "    } {",
-            "        let rows: &[Name] = match (lang, kind, candidate) {",
+            "        if let Some(value) = chain.iter().find_map(|lang| lookup(alternate_rows(lang, kind, candidate), code)) {",
+            "            return Some(value);",
+            "        }",
+            "    }",
+            "    chain.iter().find_map(|lang| lookup(base_rows(lang, kind), code))",
+            "}",
+            "",
+            "fn alternate_rows(lang: &str, kind: &str, style: &str) -> &'static [Name] {",
+            "    match (lang, kind, style) {",
         ]
     )
     output.extend(
@@ -308,12 +346,11 @@ def main() -> None:
     output.extend(
         [
             "            _ => &[],",
-            "        };",
-            "        if let Some(value) = lookup(rows, code) {",
-            "            return Some(value);",
-            "        }",
             "    }",
-            "    let rows: &[Name] = match (lang, kind) {",
+            "}",
+            "",
+            "fn base_rows(lang: &str, kind: &str) -> &'static [Name] {",
+            "    match (lang, kind) {",
         ]
     )
     output.extend(
@@ -323,12 +360,19 @@ def main() -> None:
     output.extend(
         [
             "        _ => &[],",
-            "    };",
-            "    lookup(rows, code)",
+            "    }",
             "}",
             "",
-            "pub(crate) fn locale_patterns(lang: &str) -> (&'static str, &'static str) {",
-            "    match lang {",
+            "/// The localeDisplayPattern (pattern, separator) of a shipped locale.",
+            "pub(crate) fn locale_patterns(locale: &str) -> (&'static str, &'static str) {",
+            "    crate::cldr_locales::chain(locale)",
+            "        .iter()",
+            "        .find_map(|lang| own_locale_patterns(lang))",
+            f"        .unwrap_or((text({default_pattern_id}), text({default_separator_id})))",
+            "}",
+            "",
+            "fn own_locale_patterns(lang: &str) -> Option<(&'static str, &'static str)> {",
+            "    Some(match lang {",
         ]
     )
     output.extend(
@@ -337,8 +381,8 @@ def main() -> None:
     )
     output.extend(
         [
-            f"        _ => (text({default_pattern_id}), text({default_separator_id})),",
-            "    }",
+            "        _ => return None,",
+            "    })",
             "}",
             "",
             "#[cfg(test)]",

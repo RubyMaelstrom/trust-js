@@ -168,7 +168,7 @@ fn of(i: &mut Interp, this: &Value, code: &Value) -> Result<Value, Value> {
         _ => s.clone(),
     };
     let locale = string_slot(&o, "#\u{0}dn_locale", "en-US");
-    let language = locale.split('-').next().unwrap_or("en");
+    let language = super::service::data_locale(&locale);
     let style = string_slot(&o, "#\u{0}dn_style", "long");
     let name = if kind == "language" {
         let language_display = string_slot(&o, "#\u{0}dn_langdisplay", "dialect");

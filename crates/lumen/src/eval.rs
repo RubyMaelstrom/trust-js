@@ -4353,7 +4353,40 @@ impl Interp {
         )
     }
 
+    /// The resolver pair of an embedder's platform resolution: its [[AlreadyResolved]] record
+    /// carries the private marker that [`Self::is_host_resolver`] recognizes.
+    fn make_host_resolver_pair(&mut self, promise: &Value) -> (Value, Value) {
+        let flag = Object::new(Some(self.host_resolution_marker.clone()));
+        (
+            self.make_resolver_with(promise, true, &flag),
+            self.make_resolver_with(promise, false, &flag),
+        )
+    }
+
+    /// Whether `callback` is a resolving function made by [`Self::make_host_resolver_pair`]:
+    /// a bound resolver whose [[AlreadyResolved]] record has the private marker prototype.
+    pub(crate) fn is_host_resolver(&self, callback: &Value) -> bool {
+        let Value::Obj(function) = callback else {
+            return false;
+        };
+        let function = function.borrow();
+        let Callable::Bound(bound) = &function.call else {
+            return false;
+        };
+        matches!(bound.args.first(), Some(Value::Obj(flag))
+        if flag.borrow().proto.as_ref().is_some_and(|proto| {
+            Rc::ptr_eq(proto, &self.host_resolution_marker)
+        }))
+    }
+
     pub(crate) fn resolve_promise(&mut self, promise: &Value, value: Value) {
+        self.resolve_promise_from(promise, value, false);
+    }
+
+    /// Promise Resolve Functions steps 7-16 for `promise`. `host_steps` marks an embedder's
+    /// platform resolution (see [`Interp::promise_resolved_with`]): adopting a thenable's state
+    /// then belongs to no Realm or settings object.
+    pub(crate) fn resolve_promise_from(&mut self, promise: &Value, value: Value, host_steps: bool) {
         // Follow a subclass graft's forwarding link (see run_constructor_on's native arm).
         let mut promise = promise.clone();
         if let Value::Obj(o) = &promise {
@@ -4384,14 +4417,29 @@ impl Interp {
         if matches!(value, Value::Obj(_)) {
             match self.get_member(&value, "then") {
                 Ok(then) if then.is_callable() => {
-                    let (realm, host_context) =
-                        self.promise_job_target(&then, self.host_job_context);
-                    let (res, rej) = self.make_resolver_pair(promise);
-                    let then = self.make_job_callback(then);
+                    // HostEnqueuePromiseJob(job, GetFunctionRealm(then)); embedder platform
+                    // steps pass a null Realm instead (null job settings).
+                    let (realm, host_context) = if host_steps {
+                        (None, 0)
+                    } else {
+                        self.promise_job_target(&then, self.host_job_context)
+                    };
+                    let (res, rej) = if host_steps {
+                        self.make_host_resolver_pair(promise)
+                    } else {
+                        self.make_resolver_pair(promise)
+                    };
+                    let mut then = self.make_job_callback(then);
+                    // The job's own callback is a built-in that calls `then`, so HostCallJob-
+                    // Callback's script execution context for `then` sits below both.
+                    let active_script = then.active_script.take();
                     let runner =
                         crate::builtins::make_thenable_job(self, then, value.clone(), res, rej);
                     self.microtasks.push_back(crate::interpreter::Job {
-                        handler: crate::interpreter::JobCallback::plain(runner),
+                        handler: crate::interpreter::JobCallback {
+                            active_script,
+                            ..crate::interpreter::JobCallback::plain(runner)
+                        },
                         result: Value::Undefined,
                         value: Value::Undefined,
                         fulfilled: true,
@@ -4426,19 +4474,21 @@ impl Interp {
             Value::Obj(o) => Rc::as_ptr(o) as usize,
             _ => return,
         };
-        let reactions = match self.promises.get_mut(&ptr) {
+        let (reactions, handled) = match self.promises.get_mut(&ptr) {
             Some(s) if s.status == 0 => {
                 s.status = if fulfilled { 1 } else { 2 };
                 s.value = value.clone();
-                std::mem::take(&mut s.reactions)
+                (std::mem::take(&mut s.reactions), s.handled)
             }
             _ => return,
         };
-        // A rejection with no reactions attached yet is (so far) unhandled — track it. A later
-        // `.then`/`.catch` clears it (see `promise_then_into`).
-        if !fulfilled && reactions.is_empty() {
+        // RejectPromise: HostPromiseRejectionTracker(promise, "reject") unless
+        // [[PromiseIsHandled]]. A later handler clears it (see `perform_promise_then`).
+        if !fulfilled && !handled {
+            let order = self.next_unhandled_rejection;
+            self.next_unhandled_rejection += 1;
             self.unhandled_rejections
-                .insert(ptr, (promise.clone(), value.clone()));
+                .insert(ptr, (order, promise.clone(), value.clone()));
         }
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
@@ -4493,7 +4543,7 @@ impl Interp {
 
     /// PerformPromiseThen (ECMA-262 `#sec-performpromisethen`) for already-made JobCallbacks.
     /// `result` is the capability's promise, or `undefined` when there is no capability.
-    fn perform_promise_then(
+    pub(crate) fn perform_promise_then(
         &mut self,
         promise: &Value,
         on_f: crate::interpreter::JobCallback,
@@ -4504,10 +4554,34 @@ impl Interp {
             Value::Obj(o) => Rc::as_ptr(o) as usize,
             _ => return,
         };
-        let status = self.promises.get(&ptr).map(|s| s.status).unwrap_or(0);
-        let host_context = self.host_job_context;
-        // Attaching a handler marks the rejection handled (HostPromiseRejectionTracker "handle").
-        self.unhandled_rejections.remove(&ptr);
+        let (status, handled, outstanding) =
+            self.promises
+                .get_mut(&ptr)
+                .map_or((0, true, false), |state| {
+                    let flags = (state.status, state.handled, state.outstanding);
+                    // Step 12: set promise.[[PromiseIsHandled]] to true.
+                    state.handled = true;
+                    state.outstanding = false;
+                    flags
+                });
+        // Embedder reaction steps belong to no settings object (see `InternalJob::HostReaction`).
+        let host_context = if on_f.internal == crate::interpreter::InternalJob::HostReaction {
+            0
+        } else {
+            self.host_job_context
+        };
+        // Step 11: a rejected, unhandled promise gets HostPromiseRejectionTracker(promise,
+        // "handle"). HTML: one still on the about-to-be-notified list just leaves it; one in the
+        // outstanding rejected promises weak set leaves that and is reported for
+        // `rejectionhandled`.
+        if status == 2
+            && !handled
+            && self.unhandled_rejections.remove(&ptr).is_none()
+            && outstanding
+        {
+            let reason = self.promises[&ptr].value.clone();
+            self.handled_rejections.push((promise.clone(), reason));
+        }
         match status {
             0 => {
                 if let Some(s) = self.promises.get_mut(&ptr) {
@@ -4548,6 +4622,10 @@ impl Interp {
         handler: &crate::interpreter::JobCallback,
         same_realm_context: u64,
     ) -> (Option<usize>, u64) {
+        if handler.internal == crate::interpreter::InternalJob::HostReaction {
+            // HTML HostEnqueuePromiseJob with a null Realm: null job settings.
+            return (None, 0);
+        }
         let Some(realm) = handler.internal.realm() else {
             return self.promise_job_target(&handler.callback, same_realm_context);
         };
@@ -4778,7 +4856,7 @@ impl Interp {
     fn run_internal_job(&mut self, handler: &crate::interpreter::JobCallback, value: Value) {
         use crate::interpreter::InternalJob;
         let signal = match handler.internal {
-            InternalJob::None => return,
+            InternalJob::None | InternalJob::HostReaction => return,
             InternalJob::AwaitFulfilled { .. } => crate::coroutine::Resume::Next(value),
             InternalJob::AwaitRejected { .. } => crate::coroutine::Resume::Throw(value),
         };
@@ -4791,13 +4869,15 @@ impl Interp {
             self.host_entry_realm = handler.internal.realm();
         }
         let async_promise = handler.callback.clone();
-        if let Some(global) = &handler.script_caller {
-            self.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
-                ctx.drive_async(key, async_promise, signal)
-            });
-        } else {
-            self.drive_async(key, async_promise, signal);
-        }
+        self.with_job_script_context(handler.active_script.as_ref(), |ctx| {
+            if let Some(global) = &handler.script_caller {
+                ctx.with_callback_script_caller(&Value::Obj(global.clone()), |ctx| {
+                    ctx.drive_async(key, async_promise, signal)
+                });
+            } else {
+                ctx.drive_async(key, async_promise, signal);
+            }
+        });
         self.host_entry_realm = previous_entry;
     }
 
@@ -4813,7 +4893,7 @@ impl Interp {
             }
             self.switch_host_job_context(job.host_context);
         }
-        if job.handler.internal != crate::interpreter::InternalJob::None {
+        if job.handler.internal.resumes_await() {
             // Await's reaction built-ins return undefined and have no result capability; the
             // resumed function reports its own completion through its result promise.
             self.run_internal_job(&job.handler, job.value);
@@ -4823,7 +4903,12 @@ impl Interp {
                 Value::Undefined,
                 std::slice::from_ref(&job.value),
             ) {
-                Ok(r) => self.resolve_promise(&job.result, r),
+                // A platform step's result is a platform resolution too.
+                Ok(r) => self.resolve_promise_from(
+                    &job.result,
+                    r,
+                    job.handler.internal == crate::interpreter::InternalJob::HostReaction,
+                ),
                 Err(Abrupt::Throw(e)) => self.reject_promise(&job.result, e),
                 Err(Abrupt::Interrupt(reason)) => {
                     if switch_host_context {
@@ -5004,6 +5089,11 @@ impl Interp {
             &private_names,
         )
         .map_err(|e| self.throw("SyntaxError", e.message))?;
+        // PerformEval: eval code runs with the caller's ScriptOrModule, which its functions also
+        // capture (OrdinaryFunctionCreate takes GetActiveScriptOrModule()).
+        if let Some(referrer) = self.active_script_referrer() {
+            source.set_referrer(referrer);
+        }
         // A direct `eval` inherits the caller's lexical super-call context: a `super(...)` in the
         // eval is an early SyntaxError unless GetThisEnvironment reaches a derived constructor
         // (possibly through arrows). Check before any eval-body side effect.

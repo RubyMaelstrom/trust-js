@@ -61,7 +61,10 @@ fn lookup_fallback_and_locale_patterns_remain_unchanged() {
     assert_eq!(name("fr", "region", "short", "US"), Some("É.-U."));
     assert_eq!(name("fr", "region", "narrow", "US"), Some("É.-U."));
     assert_eq!(name("en", "currency", "long", "USD"), Some("US Dollar"));
-    assert_eq!(name("unknown", "region", "long", "US"), None);
+    // A regional locale stores only its differences and inherits the rest along its parent
+    // chain (en-GB -> en-001 -> en); an unshipped locale falls back to English.
+    assert_eq!(name("en-GB", "language", "long", "fr"), Some("French"));
+    assert_eq!(name("unknown", "region", "long", "US"), Some("United States"));
     assert_eq!(locale_patterns("en"), ("{0} ({1})", "{0}, {1}"));
     assert_eq!(locale_patterns("unknown"), ("{0} ({1})", "{0}, {1}"));
 }

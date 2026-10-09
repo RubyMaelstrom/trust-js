@@ -1,4 +1,8 @@
 //! `Intl.Segmenter` using the Unicode 17.0 UAX #29 default grapheme, word, and sentence rules.
+//!
+//! Every locale segments with these default rules: Lumen ships no locale tailorings and no
+//! dictionary-based word segmentation, so runs of Thai, Lao, Khmer, Myanmar or CJK text break as
+//! UAX #29 alone defines (ECMA-402 leaves the boundaries implementation-dependent).
 
 use super::service::{
     brand_slot, get_option, install_supported_locales, instance_proto, read_locale_matcher,

@@ -10,32 +10,59 @@ use crate::value::{Gc, Property, Value};
 /// caller supplies no supported locale, matching TRust's primary compatibility target.
 pub const DEFAULT_LOCALE: &str = "en-US";
 
-/// The languages we ship formatting data for (plus common ones the conformance tests negotiate).
-/// Unknown languages resolve to [`DEFAULT_LOCALE`].
-pub fn supported_language(lang: &str) -> bool {
-    matches!(
-        lang,
-        "en" | "de"
-            | "fr"
-            | "es"
-            | "it"
-            | "pt"
-            | "nl"
-            | "ja"
-            | "zh"
-            | "ko"
-            | "ru"
-            | "ar"
-            | "sr"
-            | "th"
-            | "gv"
-            | "sl"
-            | "pl"
-            | "si"
-            | "ln"
-            | "sv"
-            | "hi"
-    )
+/// LookupMatchingLocaleByPrefix (ECMA-402 #sec-lookupmatchinglocalebyprefix) of one requested
+/// locale against Lumen's [[AvailableLocales]] ([`crate::cldr_locales::AVAILABLE`], shared by
+/// every service): its longest available prefix, ignoring Unicode locale extension sequences.
+/// LookupMatchingLocaleByBestFit uses the same matching: the available locales include each
+/// default-content and script-less form (`en-US`, `zh-TW`), so a prefix is the best fit.
+pub fn best_available_locale(requested: &str) -> Option<&'static str> {
+    let without_extension = strip_unicode_extension(requested);
+    let mut prefix = without_extension.as_str();
+    while !prefix.is_empty() {
+        if let Ok(index) = crate::cldr_locales::AVAILABLE.binary_search_by(|row| row.0.cmp(prefix))
+        {
+            return Some(crate::cldr_locales::AVAILABLE[index].0);
+        }
+        let mut position = prefix.rfind('-').unwrap_or(0);
+        // A singleton subtag is removed together with the subtag after it.
+        while position >= 2 && prefix.as_bytes()[position - 2] == b'-' {
+            position -= 2;
+        }
+        prefix = &prefix[..position];
+    }
+    None
+}
+
+/// A language tag without its Unicode locale extension sequences (`-u-…`).
+fn strip_unicode_extension(tag: &str) -> String {
+    let subtags: Vec<&str> = tag.split('-').collect();
+    let mut kept = Vec::with_capacity(subtags.len());
+    let mut index = 0;
+    while index < subtags.len() {
+        let subtag = subtags[index];
+        if subtag.eq_ignore_ascii_case("x") {
+            kept.extend_from_slice(&subtags[index..]);
+            break;
+        }
+        if subtag.eq_ignore_ascii_case("u") && index > 0 {
+            index += 1;
+            while index < subtags.len() && subtags[index].len() != 1 {
+                index += 1;
+            }
+            continue;
+        }
+        kept.push(subtag);
+        index += 1;
+    }
+    kept.join("-")
+}
+
+/// The shipped CLDR locale whose data serves a resolved locale (an available tag, possibly
+/// with a Unicode extension); English for anything else.
+pub fn data_locale(resolved: &str) -> &'static str {
+    best_available_locale(resolved)
+        .and_then(crate::cldr_locales::data_locale)
+        .unwrap_or("en")
 }
 
 /// The result of ResolveLocale: the chosen locale's base name plus the Unicode `-u-` keywords it
@@ -46,9 +73,9 @@ pub struct ResolvedLocale {
     pub keywords: Vec<(String, String)>,
 }
 
-/// A minimal ResolveLocale (lookup matcher): the first requested locale whose language we service
-/// wins, preserving its script/region; otherwise [`DEFAULT_LOCALE`]. Relevant `-u-` keywords are
-/// extracted.
+/// ResolveLocale's matching (ECMA-402 #sec-resolvelocale): the first requested locale with an
+/// available match supplies the available locale and its requested Unicode extension keywords
+/// for `relevant_keys`; with none, [`DEFAULT_LOCALE`].
 pub fn resolve_locale(
     _i: &mut Interp,
     requested: &[String],
@@ -56,16 +83,8 @@ pub fn resolve_locale(
 ) -> ResolvedLocale {
     for tag in requested {
         if let Some(parsed) = tags::parse(tag) {
-            if supported_language(&parsed.language) {
-                // base name (language-script-region-variants), no extensions.
-                let base = {
-                    let mut b = parsed.clone();
-                    b.unicode = None;
-                    b.transform = None;
-                    b.other_ext.clear();
-                    b.private.clear();
-                    tags::render(&b)
-                };
+            if let Some(base) = best_available_locale(tag) {
+                let base = base.to_string();
                 let mut keywords = Vec::new();
                 if let Some((_a, kws)) = &parsed.unicode {
                     for (k, types) in kws {
@@ -101,13 +120,8 @@ pub fn resolve_locale_nu(requested: &[String], option: Option<&str>) -> (String,
     let mut ext_value: Option<String> = None;
     for tag in requested {
         if let Some(parsed) = tags::parse(tag) {
-            if supported_language(&parsed.language) {
-                let mut b = parsed.clone();
-                b.unicode = None;
-                b.transform = None;
-                b.other_ext.clear();
-                b.private.clear();
-                base = tags::render(&b);
+            if let Some(available) = best_available_locale(tag) {
+                base = available.to_string();
                 if let Some((_a, kws)) = &parsed.unicode {
                     for (k, types) in kws {
                         if k == "nu" {
@@ -140,19 +154,9 @@ pub fn resolve_locale_nu(requested: &[String], option: Option<&str>) -> (String,
     (locale, value)
 }
 
-/// The default numbering system (CLDR `defaultNumberingSystem`) of an available locale's base
-/// name: most are latn; Arabic uses arab outside the Maghreb, Persian and Pashto arabext.
+/// The default numbering system of an available locale: its CLDR `defaultNumberingSystem`.
 pub fn default_numbering_system(base: &str) -> &'static str {
-    let lang = base.split('-').next().unwrap_or("");
-    let region = base
-        .split('-')
-        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
-        .unwrap_or("");
-    match lang {
-        "ar" if !matches!(region, "DZ" | "MA" | "TN" | "LY" | "EH" | "MR") => "arab",
-        "fa" | "ps" => "arabext",
-        _ => "latn",
-    }
+    crate::cldr_numbers::default_numbering_system(data_locale(base))
 }
 
 /// GetOption(options, "localeMatcher", string, «"lookup","best fit"», "best fit"). Validated then
@@ -197,13 +201,10 @@ pub fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
         if !matches!(options, Value::Undefined) {
             read_locale_matcher(i, &options)?;
         }
+        // FilterLocales: the requested locales with an available match.
         let out: Vec<Value> = requested
             .into_iter()
-            .filter(|t| {
-                tags::parse(t)
-                    .map(|p| supported_language(&p.language))
-                    .unwrap_or(false)
-            })
+            .filter(|t| best_available_locale(t).is_some())
             .map(Value::lstr)
             .collect();
         Ok(i.make_array(out))

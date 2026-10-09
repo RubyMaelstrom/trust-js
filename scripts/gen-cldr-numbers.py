@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Generate NumberFormat locale data for every locale Lumen advertises from CLDR 48."""
+"""Generate NumberFormat locale data for every locale Lumen advertises from CLDR 48.
+
+Every CLDR locale of a supported language is generated (scripts/cldr_locales.py): a regional or
+script variant keeps only the rows that differ from its parent's, and every lookup walks the
+locale's parent chain (`crate::cldr_locales::chain`). `CLDR_DIR` names a local copy of the pinned
+cldr-json tree; the manifest still records each input's pinned URL and hash.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import re
+import sys
 import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import cldr_locales  # noqa: E402
 
 
 TAG = "48.0.0"
@@ -21,33 +32,43 @@ BASE = (
     f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/"
     "cldr-json"
 )
-LOCALES = [
-    "en", "en-IN", "de", "fr", "es", "it", "pt", "pt-PT", "nl", "ja",
-    "zh", "zh-Hant", "ko", "ru", "ar", "sr", "th", "gv", "sl", "pl",
-    "si", "ln", "sv", "hi",
-]
+LOCALES = list(cldr_locales.locales())
 INPUT_HASHES: dict[str, str] = {}
 
 
-def download(package: str, locale: str, file: str) -> dict:
-    url = f"{BASE}/{package}/main/{locale}/{file}.json"
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
-    )
-    with urllib.request.urlopen(request) as response:
-        payload = response.read()
+def fetch(relative: str) -> bytes:
+    url = f"{BASE}/{relative}"
+    cldr_dir = os.environ.get("CLDR_DIR")
+    if cldr_dir:
+        payload = (pathlib.Path(cldr_dir) / relative).read_bytes()
+    else:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = response.read()
     INPUT_HASHES[url] = hashlib.sha256(payload).hexdigest()
-    return json.loads(payload)["main"][locale]
+    return payload
+
+
+def download(package: str, locale: str, file: str) -> dict:
+    return json.loads(fetch(f"{package}/main/{locale}/{file}.json"))["main"][locale]
 
 
 def download_url(url: str) -> dict:
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
+    return json.loads(fetch(url.removeprefix(f"{BASE}/")))
+
+
+def delta_rows(rows: list[tuple], key_length: int) -> list[tuple]:
+    """Rows (locale first, then `key_length` key fields, then values) reduced to each locale's
+    differences from its CLDR parent (cldr_locales.delta)."""
+    tables: dict[str, dict] = {locale: {} for locale in LOCALES}
+    for row in rows:
+        tables[row[0]][row[1 : 1 + key_length]] = row[1 + key_length :]
+    kept = cldr_locales.delta(tables)
+    return sorted(
+        (locale, *key, *value) for locale, table in kept.items() for key, value in table.items()
     )
-    with urllib.request.urlopen(request) as response:
-        payload = response.read()
-    INPUT_HASHES[url] = hashlib.sha256(payload).hexdigest()
-    return json.loads(payload)
 
 
 def rust_string(value: str) -> str:
@@ -117,6 +138,8 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "COMPACT": "static COMPACT: &[(TextId, TextId, TextId, u8, TextId, CompactIds)] = &[",
         "COMPACT_MAX": "static COMPACT_MAX: &[(TextId, TextId, TextId, u8)] = &[",
         "CURRENCY_UNITS": "static CURRENCY_UNITS: &[(TextId, TextId, TextId)] = &[",
+        "DEFAULT_NUMBERING": "static DEFAULT_NUMBERING: &[(TextId, TextId)] = &[",
+        "CURRENCY_FORMATS": "static CURRENCY_FORMATS: &[(TextId, TextId, CurrencyFormatIds)] = &[",
     }
 
     for line in source.splitlines():
@@ -161,9 +184,12 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
                     line = line.replace("Compact {", "CompactIds {")
                 elif active == "CURRENCY":
                     line = line.replace("Currency {", "CurrencyIds {")
+                elif active == "CURRENCY_FORMATS":
+                    line = line.replace("CurrencyFormat {", "CurrencyFormatIds {")
+                    line = line.replace("Some(Pattern {", "Some(PatternIds {")
         output.append(line)
 
-    expected_tables = 4 + len(LOCALES) * 2 + 1
+    expected_tables = 6 + len(LOCALES) * 2 + 1
     if table_count != expected_tables:
         raise ValueError(
             f"expected {expected_tables} CLDR number tables, transformed {table_count}"
@@ -186,6 +212,8 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "    exponential: TextId,",
         "    infinity: TextId,",
         "    nan: TextId,",
+        "    currency_decimal: TextId,",
+        "    currency_group: TextId,",
         "    primary_group: usize,",
         "    secondary_group: usize,",
         "    minimum_grouping: usize,",
@@ -203,6 +231,12 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "    has_number: bool,",
         "    prefix: TextId,",
         "    suffix: TextId,",
+        "}",
+        "#[derive(Clone, Copy)]",
+        "struct CurrencyFormatIds {",
+        "    pattern: Option<PatternIds>,",
+        "    decimal: TextId,",
+        "    group: TextId,",
         "}",
         "#[derive(Clone, Copy)]",
         "struct CurrencyIds {",
@@ -300,20 +334,24 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
                     exponential: text(value.exponential),
                     infinity: text(value.infinity),
                     nan: text(value.nan),
+                    currency_decimal: text(value.currency_decimal),
+                    currency_group: text(value.currency_group),
                     primary_group: value.primary_group,
                     secondary_group: value.secondary_group,
                     minimum_grouping: value.minimum_grouping,
                 }
             })
     };
+    let chain = crate::cldr_locales::chain(loc);
+    let in_chain = |system: &str| chain.iter().find_map(|locale| find(locale, system));
     let system_fallback = match nu {
         "arab" | "arabext" => find("ar", "arab"),
         "deva" => find("hi", "deva"),
         _ => None,
     };
-    find(loc, nu)
+    in_chain(nu)
         .or(system_fallback)
-        .or_else(|| find(loc, "latn"))
+        .or_else(|| in_chain("latn"))
         .or_else(|| find("en", "latn"))
         .expect("generated English number symbols")
 }''',
@@ -341,8 +379,10 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
                 }
             })
     };
-    find(loc, nu)
-        .or_else(|| find(loc, "latn"))
+    let chain = crate::cldr_locales::chain(loc);
+    let in_chain = |system: &str| chain.iter().find_map(|locale| find(locale, system));
+    in_chain(nu)
+        .or_else(|| in_chain("latn"))
         .or_else(|| find("en", "latn"))
         .expect("generated English number pattern")
 }''',
@@ -382,18 +422,20 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "fn compact_max(",
         "pub(crate) fn compact(",
         '''fn compact_max(loc: &str, nu: &str, display: &str) -> Option<u8> {
-    let find = |system: &str| {
+    let find = |locale: &str, system: &str| {
         COMPACT_MAX
             .binary_search_by(|row| {
                 text(row.0)
-                    .cmp(loc)
+                    .cmp(locale)
                     .then_with(|| text(row.1).cmp(system))
                     .then_with(|| text(row.2).cmp(display))
             })
             .ok()
             .map(|index| COMPACT_MAX[index].3)
     };
-    find(nu).or_else(|| find("latn"))
+    let chain = crate::cldr_locales::chain(loc);
+    let in_chain = |system: &str| chain.iter().find_map(|locale| find(locale, system));
+    in_chain(nu).or_else(|| in_chain("latn"))
 }''',
     )
     replace_function(
@@ -410,16 +452,19 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
     // ComputeExponentForMagnitude caps an out-of-range magnitude at the largest
     // available compact pattern before deriving that pattern's exponent.
     let magnitude = magnitude.min(compact_max(loc, nu, display)?);
-    let get = |locale: &str, system: &str, selector: &str| {
-        compact_find(locale, system, display, magnitude, selector)
+    let chain = crate::cldr_locales::chain(loc);
+    let get = |system: &str, selector: &str| {
+        chain
+            .iter()
+            .find_map(|locale| compact_find(locale, system, display, magnitude, selector))
     };
     if exact_one {
-        if let Some(value) = get(loc, nu, "1").or_else(|| get(loc, "latn", "1")) {
+        if let Some(value) = get(nu, "1").or_else(|| get("latn", "1")) {
             return Some(value);
         }
     }
     for selector in [category, "other"] {
-        if let Some(value) = get(loc, nu, selector).or_else(|| get(loc, "latn", selector)) {
+        if let Some(value) = get(nu, selector).or_else(|| get("latn", selector)) {
             return Some(value);
         }
     }
@@ -442,21 +487,27 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "pub(crate) fn currency(loc:",
         "static CURRENCY_UNITS:",
         '''pub(crate) fn currency(loc: &str, code: &str, category: &str) -> Option<Currency> {
-    let rows = currency_rows(loc);
-    let index = rows.binary_search_by(|row| text(row.0).cmp(code)).ok()?;
-    let packed = rows[index].1;
+    let chain = crate::cldr_locales::chain(loc);
+    let packed = chain.iter().find_map(|locale| {
+        let rows = currency_rows(locale);
+        rows.binary_search_by(|row| text(row.0).cmp(code))
+            .ok()
+            .map(|index| rows[index].1)
+    })?;
     let mut value = Currency {
         name: text(packed.name),
         symbol: text(packed.symbol),
         narrow: text(packed.narrow),
     };
-    let names = currency_name_rows(loc);
-    if let Ok(index) = names.binary_search_by(|row| {
-        text(row.0)
-            .cmp(code)
-            .then_with(|| text(row.1).cmp(category))
+    // The plural form's name, where the locale's differs from its display name.
+    if let Some(name) = chain.iter().find_map(|locale| {
+        let names = currency_name_rows(locale);
+        names
+            .binary_search_by(|row| text(row.0).cmp(code).then_with(|| text(row.1).cmp(category)))
+            .ok()
+            .map(|index| text(names[index].2))
     }) {
-        value.name = text(names[index].2);
+        value.name = name;
     }
     Some(value)
 }''',
@@ -465,17 +516,52 @@ def pack_generated_source(source: str) -> tuple[str, bytes, int]:
         "pub(crate) fn currency_unit(",
         "pub(crate) fn currency_digits(",
         '''pub(crate) fn currency_unit(loc: &str, category: &str) -> &'static str {
-    CURRENCY_UNITS
-        .binary_search_by(|row| text(row.0).cmp(loc).then_with(|| text(row.1).cmp(category)))
-        .ok()
-        .map(|index| text(CURRENCY_UNITS[index].2))
-        .or_else(|| {
+    let chain = crate::cldr_locales::chain(loc);
+    let find = |category: &str| {
+        chain.iter().find_map(|locale| {
             CURRENCY_UNITS
-                .binary_search_by(|row| text(row.0).cmp(loc).then_with(|| text(row.1).cmp("other")))
+                .binary_search_by(|row| text(row.0).cmp(locale).then_with(|| text(row.1).cmp(category)))
                 .ok()
                 .map(|index| text(CURRENCY_UNITS[index].2))
         })
-        .unwrap_or("{0} {1}")
+    };
+    find(category).or_else(|| find("other")).unwrap_or("{0} {1}")
+}
+
+/// A currency's own format in a locale (UTS #35 Part 3 Currencies: a `pattern` replacing the
+/// locale's currency format, and `decimal`/`group` replacing its separators; "" when absent).
+pub(crate) fn currency_format(loc: &str, code: &str) -> Option<CurrencyFormat> {
+    crate::cldr_locales::chain(loc).iter().find_map(|locale| {
+        CURRENCY_FORMATS
+            .binary_search_by(|row| text(row.0).cmp(locale).then_with(|| text(row.1).cmp(code)))
+            .ok()
+            .map(|index| {
+                let value = CURRENCY_FORMATS[index].2;
+                CurrencyFormat {
+                    pattern: value.pattern.map(|ids| Pattern {
+                        positive_prefix: text(ids.positive_prefix),
+                        positive_suffix: text(ids.positive_suffix),
+                        negative_prefix: text(ids.negative_prefix),
+                        negative_suffix: text(ids.negative_suffix),
+                    }),
+                    decimal: text(value.decimal),
+                    group: text(value.group),
+                }
+            })
+    })
+}
+
+/// The locale's default numbering system (CLDR `defaultNumberingSystem`).
+pub(crate) fn default_numbering_system(loc: &str) -> &'static str {
+    crate::cldr_locales::chain(loc)
+        .iter()
+        .find_map(|locale| {
+            DEFAULT_NUMBERING
+                .binary_search_by(|row| text(row.0).cmp(locale))
+                .ok()
+                .map(|index| text(DEFAULT_NUMBERING[index].1))
+        })
+        .unwrap_or("latn")
 }''',
     )
 
@@ -600,9 +686,12 @@ def main() -> None:
     currency_base: dict[str, list[tuple[str, str, str, str]]] = {}
     currency_names: dict[str, list[tuple[str, str, str]]] = {}
     currency_unit_rows: list[tuple[str, str, str]] = []
+    default_numbering_rows: list[tuple[str, str]] = []
+    currency_format_rows: list[tuple] = []
 
     for locale in LOCALES:
         numbers = download("cldr-numbers-full", locale, "numbers")["numbers"]
+        default_numbering_rows.append((locale, numbers.get("defaultNumberingSystem", "latn")))
         minimum_grouping = int(numbers.get("minimumGroupingDigits", "1"))
         number_systems = {
             key.removeprefix("symbols-numberSystem-")
@@ -629,6 +718,8 @@ def main() -> None:
                     values.get("exponential", "E"),
                     values.get("infinity", "∞"),
                     values.get("nan", "NaN"),
+                    values.get("currencyDecimal", values.get("decimal", ".")),
+                    values.get("currencyGroup", values.get("group", ",")),
                     primary,
                     secondary,
                     minimum_grouping,
@@ -726,6 +817,16 @@ def main() -> None:
         bases = currency_base.setdefault(locale, [])
         names = currency_names.setdefault(locale, [])
         for code, record in currencies.items():
+            if any(key in record for key in ("pattern", "decimal", "group")):
+                currency_format_rows.append(
+                    (
+                        locale,
+                        code,
+                        parse_pattern(record["pattern"]) if "pattern" in record else None,
+                        record.get("decimal", ""),
+                        record.get("group", ""),
+                    )
+                )
             display_name = record.get("displayName", code)
             symbol = record.get("symbol", code)
             narrow = record.get("symbol-alt-narrow", symbol)
@@ -754,23 +855,52 @@ def main() -> None:
     symbols_rows = sorted({row[:2]: row for row in symbols_rows}.values())
     pattern_rows = sorted({row[:3]: row for row in pattern_rows}.values())
     compact_rows = sorted({row[:5]: row for row in compact_rows}.values())
-    compact_max_rows = sorted(
-        (
-            locale,
-            number_system,
-            display,
-            max(row[3] for row in compact_rows if row[:3] == key),
-        )
-        for key in {row[:3] for row in compact_rows}
-        for locale, number_system, display in [key]
-    )
+    compact_maxima: dict[tuple, int] = {}
+    for row in compact_rows:
+        compact_maxima[row[:3]] = max(compact_maxima.get(row[:3], 0), row[3])
+    compact_max_rows = sorted((*key, value) for key, value in compact_maxima.items())
     currency_unit_rows = sorted(
         {row[:2]: row for row in currency_unit_rows}.values()
     )
-    for rows in currency_base.values():
-        rows.sort()
-    for rows in currency_names.values():
-        rows.sort()
+    # A plural form's name applies where the locale's differs from its display name; the
+    # effective name of each form decides a variant's difference from its parent.
+    effective_names: dict[str, dict] = {}
+    for locale in LOCALES:
+        display = {row[0]: row[1] for row in currency_base[locale]}
+        names = {(code, category): name for code, category, name in currency_names[locale]}
+        effective_names[locale] = (display, names)
+    named_rows: list[tuple] = []
+    for locale in LOCALES:
+        display, names = effective_names[locale]
+        base_locale = cldr_locales.parent(locale)
+        if base_locale is None:
+            named_rows.extend((locale, code, category, name) for (code, category), name in names.items())
+            continue
+        base_display, base_names = effective_names[base_locale]
+        categories = {category for _, category in names} | {category for _, category in base_names}
+        for code in display:
+            for category in categories:
+                own = names.get((code, category), display[code])
+                inherited = base_names.get((code, category), base_display.get(code))
+                if own != inherited:
+                    named_rows.append((locale, code, category, own))
+    # Each variant keeps only what differs from its CLDR parent.
+    symbols_rows = delta_rows(symbols_rows, 1)
+    pattern_rows = delta_rows(pattern_rows, 2)
+    compact_rows = delta_rows(compact_rows, 4)
+    compact_max_rows = delta_rows(compact_max_rows, 2)
+    currency_unit_rows = delta_rows(currency_unit_rows, 1)
+    default_numbering_rows = delta_rows(default_numbering_rows, 0)
+    currency_format_rows = delta_rows(currency_format_rows, 1)
+    base_rows = delta_rows(
+        [(locale, *row) for locale in LOCALES for row in currency_base[locale]], 1
+    )
+    currency_base = {locale: [] for locale in LOCALES}
+    for locale, *row in base_rows:
+        currency_base[locale].append(tuple(row))
+    currency_names = {locale: [] for locale in LOCALES}
+    for locale, *row in sorted(named_rows):
+        currency_names[locale].append(tuple(row))
 
     output = [
         "//! GENERATED by scripts/gen-cldr-numbers.py from CLDR 48. Do not edit.",
@@ -786,6 +916,9 @@ def main() -> None:
         "    pub exponential: &'static str,",
         "    pub infinity: &'static str,",
         "    pub nan: &'static str,",
+        "    /// UTS #35 Part 3 currencyDecimal/currencyGroup: the separators of currency formats.",
+        "    pub currency_decimal: &'static str,",
+        "    pub currency_group: &'static str,",
         "    pub primary_group: usize,",
         "    pub secondary_group: usize,",
         "    pub minimum_grouping: usize,",
@@ -808,6 +941,13 @@ def main() -> None:
         "}",
         "",
         "#[derive(Clone, Copy)]",
+        "pub(crate) struct CurrencyFormat {",
+        "    pub pattern: Option<Pattern>,",
+        "    pub decimal: &'static str,",
+        "    pub group: &'static str,",
+        "}",
+        "",
+        "#[derive(Clone, Copy)]",
         "pub(crate) struct Currency {",
         "    pub name: &'static str,",
         "    pub symbol: &'static str,",
@@ -818,16 +958,15 @@ def main() -> None:
     ]
     for row in symbols_rows:
         locale, number_system, *values = row
-        strings = ", ".join(rust_string(value) for value in values[:9])
-        groups = ", ".join(str(value) for value in values[9:])
         output.append(
             f"    ({rust_string(locale)}, {rust_string(number_system)}, "
             f"Symbols {{ decimal: {rust_string(values[0])}, group: {rust_string(values[1])}, "
             f"percent: {rust_string(values[2])}, plus: {rust_string(values[3])}, "
             f"minus: {rust_string(values[4])}, approximately: {rust_string(values[5])}, "
             f"exponential: {rust_string(values[6])}, infinity: {rust_string(values[7])}, "
-            f"nan: {rust_string(values[8])}, primary_group: {values[9]}, "
-            f"secondary_group: {values[10]}, minimum_grouping: {values[11]} }}),"
+            f"nan: {rust_string(values[8])}, currency_decimal: {rust_string(values[9])}, "
+            f"currency_group: {rust_string(values[10])}, primary_group: {values[11]}, "
+            f"secondary_group: {values[12]}, minimum_grouping: {values[13]} }}),"
         )
     output.extend(["];", "", "static PATTERNS: &[(&str, &str, &str, Pattern)] = &["])
     for locale, number_system, kind, values in pattern_rows:
@@ -858,6 +997,20 @@ def main() -> None:
             f"    ({rust_string(locale)}, {rust_string(number_system)}, "
             f"{rust_string(display)}, {magnitude}),"
         )
+    output.extend(["];", "", "static DEFAULT_NUMBERING: &[(&str, &str)] = &["])
+    for locale, number_system in default_numbering_rows:
+        output.append(f"    ({rust_string(locale)}, {rust_string(number_system)}),")
+    output.extend(["];", "", "static CURRENCY_FORMATS: &[(&str, &str, CurrencyFormat)] = &["])
+    for locale, code, pattern, decimal, group in currency_format_rows:
+        rendered = "None" if pattern is None else (
+            "Some(Pattern { "
+            f"positive_prefix: {rust_string(pattern[0])}, positive_suffix: {rust_string(pattern[1])}, "
+            f"negative_prefix: {rust_string(pattern[2])}, negative_suffix: {rust_string(pattern[3])} }})"
+        )
+        output.append(
+            f"    ({rust_string(locale)}, {rust_string(code)}, CurrencyFormat {{ pattern: {rendered}, "
+            f"decimal: {rust_string(decimal)}, group: {rust_string(group)} }}),"
+        )
     output.extend(["];", ""])
 
     for locale, rows in currency_base.items():
@@ -882,28 +1035,6 @@ def main() -> None:
 
     output.extend(
         [
-            "fn data_locale(lang: &str, script: &str, region: &str) -> &'static str {",
-            "    match (lang, script, region) {",
-            '        ("en", _, "IN") => "en-IN",',
-            '        ("pt", _, "PT") => "pt-PT",',
-            '        ("zh", "Hant", _) | ("zh", _, "TW" | "HK" | "MO") => "zh-Hant",',
-            "        _ => match lang {",
-        ]
-    )
-    for locale in LOCALES:
-        if "-" not in locale:
-            output.append(f"            {rust_string(locale)} => {rust_string(locale)},")
-    output.extend(
-        [
-            '            _ => "en",',
-            "        },",
-            "    }",
-            "}",
-            "",
-            "pub(crate) fn locale(lang: &str, script: &str, region: &str) -> &'static str {",
-            "    data_locale(lang, script, region)",
-            "}",
-            "",
             "pub(crate) fn symbols(loc: &str, nu: &str) -> Symbols {",
             "    let find = |locale: &str, system: &str| {",
             "        SYMBOLS.binary_search_by(|row| row.0.cmp(locale).then_with(|| row.1.cmp(system)))",
@@ -975,7 +1106,7 @@ def main() -> None:
         output.append(f"        {rust_string(locale)} => {ident('C', locale)},")
     output.extend(
         [
-            "        _ => C_EN,",
+            "        _ => &[],",
             "    }",
             "}",
             "",
@@ -993,7 +1124,7 @@ def main() -> None:
         output.append(f"        {rust_string(locale)} => {ident('CN', locale)},")
     output.extend(
         [
-            "        _ => CN_EN,",
+            "        _ => &[],",
             "    }",
             "}",
             "",
