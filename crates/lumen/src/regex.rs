@@ -33,7 +33,7 @@ const SUBJECT_TWO_BYTE: u8 = 1 << 2;
 const SUBJECT_ASTRAL: u8 = 1 << 3;
 
 /// Number of [`Inst`] variants, one counter per kind for the opt-in matcher profiling report.
-const REGEXP_PROF_INST_KINDS: usize = 22;
+const REGEXP_PROF_INST_KINDS: usize = 25;
 const REGEXP_PROF_INST_NAMES: [&str; REGEXP_PROF_INST_KINDS] = [
     "char",
     "any",
@@ -57,6 +57,9 @@ const REGEXP_PROF_INST_NAMES: [&str; REGEXP_PROF_INST_KINDS] = [
     "pop_flags",
     "set_mark",
     "check_progress",
+    "counter_reset",
+    "counter_incr",
+    "counted_branch",
 ];
 
 /// Opt-in matcher profiling (`LUMEN_REGEXP_PROF=1`): per-instruction dispatch counts, scan
@@ -159,6 +162,9 @@ fn regexp_prof_kind(inst: &Inst) -> usize {
         Inst::PopFlags => 19,
         Inst::SetMark(_) => 20,
         Inst::CheckProgress(_) => 21,
+        Inst::CounterReset(_) => 22,
+        Inst::CounterIncr(_) => 23,
+        Inst::CountedBranch { .. } => 24,
     }
 }
 
@@ -1360,6 +1366,23 @@ enum Inst {
     /// the loop) when the iteration consumed nothing.
     SetMark(usize),
     CheckProgress(usize),
+    /// ECMA-262 RepeatMatcher for a counted quantifier too large to unroll (`(?:ab){0,5000}`):
+    /// `CounterReset` starts the loop's iteration count, kept in a `marks` slot; `CounterIncr`
+    /// ends an iteration. Both roll back on backtracking. `CountedBranch` is the loop head: it
+    /// takes a mandatory iteration (`required`) while the count is below `min`, leaves the loop
+    /// once the count reaches `max`, and otherwise branches between an optional iteration
+    /// (`optional`, which applies the empty-iteration rule) and `exit`, greedy first or lazy first.
+    CounterReset(usize),
+    CounterIncr(usize),
+    CountedBranch {
+        id: usize,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+        required: usize,
+        optional: usize,
+        exit: usize,
+    },
 }
 
 /// A single-codepoint matcher, for the `Inst::Many` fast path.
@@ -1398,7 +1421,22 @@ fn first_filter(prog: &[Inst], multiline: bool) -> FirstFilter {
         }
         seen[pc] = true;
         match &prog[pc] {
-            Inst::Save(_) | Inst::ClearCaps(..) | Inst::SetMark(_) => stack.push(pc + 1),
+            Inst::Save(_)
+            | Inst::ClearCaps(..)
+            | Inst::SetMark(_)
+            | Inst::CounterReset(_)
+            | Inst::CounterIncr(_) => stack.push(pc + 1),
+            // Every way out of a counted loop's head may begin a path.
+            Inst::CountedBranch {
+                required,
+                optional,
+                exit,
+                ..
+            } => {
+                stack.push(*required);
+                stack.push(*optional);
+                stack.push(*exit);
+            }
             Inst::Jmp(t) => stack.push(*t),
             Inst::Split(a, b) => {
                 stack.push(*a);
@@ -4119,6 +4157,62 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
     Ok(())
 }
 
+/// ECMA-262 RepeatMatcher (§22.2.2.3.1) for a counted quantifier too large to unroll, as a loop
+/// whose iteration count lives in a `marks` slot (see `Inst::CountedBranch`):
+///
+/// ```text
+///       CounterReset(c)
+/// head: CountedBranch { c, min, max, greedy, required, optional, exit }
+/// required: ClearCaps; body; CounterIncr(c); Jmp(head)
+/// optional: SetMark(m); ClearCaps; body; CheckProgress(m); CounterIncr(c); Jmp(head)
+/// exit:
+/// ```
+///
+/// Each iteration clears the captures inside the atom first (RepeatMatcher step 4), and only an
+/// optional iteration, one past `min`, fails when it consumes nothing (step 2.b).
+fn compile_counted_repeat(
+    inner: &Node,
+    min: usize,
+    max: Option<usize>,
+    greedy: bool,
+    prog: &mut Vec<Inst>,
+    nmarks: &mut usize,
+) -> Result<(), String> {
+    let span = cap_span(inner);
+    let counter = *nmarks;
+    let progress = *nmarks + 1;
+    *nmarks += 2;
+    let iteration = |prog: &mut Vec<Inst>, nmarks: &mut usize| -> Result<(), String> {
+        if let Some((lo, hi)) = span {
+            prog.push(Inst::ClearCaps(lo, hi));
+        }
+        compile(inner, prog, nmarks)
+    };
+    prog.push(Inst::CounterReset(counter));
+    let head = prog.len();
+    prog.push(Inst::Match); // Patched to the loop head below.
+    let required = prog.len();
+    iteration(prog, nmarks)?;
+    prog.push(Inst::CounterIncr(counter));
+    prog.push(Inst::Jmp(head));
+    let optional = prog.len();
+    prog.push(Inst::SetMark(progress));
+    iteration(prog, nmarks)?;
+    prog.push(Inst::CheckProgress(progress));
+    prog.push(Inst::CounterIncr(counter));
+    prog.push(Inst::Jmp(head));
+    prog[head] = Inst::CountedBranch {
+        id: counter,
+        min,
+        max,
+        greedy,
+        required,
+        optional,
+        exit: prog.len(),
+    };
+    Ok(())
+}
+
 fn compile_repeat(
     inner: &Node,
     min: usize,
@@ -4150,9 +4244,11 @@ fn compile_repeat(
         });
         return Ok(());
     }
-    // The general path unrolls `min` copies, so bound it to keep compiled programs small.
-    if min > MAX_REPEAT || max.map(|m| m > MAX_REPEAT).unwrap_or(false) {
-        return Err("repetition count too large".into());
+    // The general path unrolls `min` copies and one optional copy per extra iteration, which
+    // keeps short counted loops straight-line. ECMA-262 places no bound on the counts, so larger
+    // ones run as a counted loop whose program size doesn't depend on them.
+    if min > MAX_REPEAT || max.is_some_and(|m| m > MAX_REPEAT) {
+        return compile_counted_repeat(inner, min, max, greedy, prog, nmarks);
     }
     // RepeatMatcher clears the captures inside the atom at the start of every iteration.
     let span = cap_span(inner);
@@ -5050,13 +5146,14 @@ impl<I: ReInput> Matcher<'_, I> {
                     }
                     pc += 1;
                 }
-                Inst::SetMark(_) => pc += 1,
+                Inst::SetMark(_) | Inst::CounterReset(_) | Inst::CounterIncr(_) => pc += 1,
                 // These affect the next predicate or can branch on mutable state.
                 Inst::Look { .. }
                 | Inst::LookBehind { .. }
                 | Inst::PushFlags(..)
                 | Inst::PopFlags
-                | Inst::CheckProgress(_) => return None,
+                | Inst::CheckProgress(_)
+                | Inst::CountedBranch { .. } => return None,
             }
         }
         None
@@ -5197,6 +5294,45 @@ impl<I: ReInput> Matcher<'_, I> {
                         pc += 1;
                         continue;
                     }
+                }
+                Inst::CounterReset(id) | Inst::CounterIncr(id) => {
+                    let id = *id;
+                    let old = self.marks[id];
+                    self.marks[id] = Some(match &prog[pc] {
+                        Inst::CounterReset(_) => 0,
+                        _ => old.map_or(1, |count| count + 1),
+                    });
+                    return if self.run(prog, pc + 1, pos) {
+                        true
+                    } else {
+                        self.marks[id] = old;
+                        false
+                    };
+                }
+                Inst::CountedBranch {
+                    id,
+                    min,
+                    max,
+                    greedy,
+                    required,
+                    optional,
+                    exit,
+                } => {
+                    let count = self.marks[*id].unwrap_or(0);
+                    if count < *min {
+                        pc = *required;
+                        continue;
+                    }
+                    if max.is_some_and(|max| count >= max) {
+                        pc = *exit;
+                        continue;
+                    }
+                    let (first, second) = if *greedy {
+                        (*optional, *exit)
+                    } else {
+                        (*exit, *optional)
+                    };
+                    return self.run(prog, first, pos) || self.run(prog, second, pos);
                 }
                 Inst::Many {
                     rep,

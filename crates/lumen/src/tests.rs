@@ -22573,6 +22573,54 @@ fn regexp_u_mode_early_errors() {
 }
 
 #[test]
+fn regexp_counted_quantifiers_have_no_size_limit() {
+    // ECMA-262 RepeatMatcher (§22.2.2.3.1) puts no bound on `{n,m}`. Counts past the matcher's
+    // unroll threshold run as a counted loop with the same semantics; they used to be rejected
+    // as an early SyntaxError, failing whole scripts that merely contain such a literal.
+    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1500)))"), "true");
+    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1499)))"), "false");
+    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1501)))"), "false");
+    assert_eq!(run("String(/^(?:ab){0,100000}$/.test('ab'.repeat(20)))"), "true");
+    assert_eq!(run("String(/^(?:ab){2,5000}$/.test('ab'))"), "false");
+    assert_eq!(run("String(/(?:ab){0,4294967296}/.test('abab'))"), "true");
+    // Greedy loops take as many iterations as succeed; lazy ones as few.
+    assert_eq!(
+        run("JSON.stringify('xaxbxc'.match(/(?:x(.)){1,2000}/))"),
+        r#"["xaxbxc","c"]"#
+    );
+    assert_eq!(
+        run("JSON.stringify('xaxbxc'.match(/(?:x(.)){1,2000}?/))"),
+        r#"["xa","a"]"#
+    );
+    // Step 4: every iteration clears the captures inside the atom.
+    assert_eq!(
+        run("JSON.stringify(/^(?:(a)|b){0,2000}$/.exec('ab'))"),
+        r#"["ab",null]"#
+    );
+    // Step 2.b: an optional iteration that consumes nothing fails; mandatory ones may be empty.
+    assert_eq!(run("/(?:a?){0,5000}/.exec('aa')[0]"), "aa");
+    assert_eq!(run("String(/^(?:a?){1100}$/.test(''))"), "true");
+    // Backtracking restores the count: the loop gives back an iteration for the sequel.
+    assert_eq!(
+        run("JSON.stringify(/^((?:ab|a){1,2000})(b.*)$/.exec('ababab'))"),
+        r#"["ababab","ababa","b"]"#
+    );
+    // Nested counted loops and lookbehind.
+    assert_eq!(
+        run("String(/^(?:(?:ab){2}c){0,3000}$/.test('ababc'.repeat(10)))"),
+        "true"
+    );
+    assert_eq!(
+        run("String(/(?<=(?:ab){1001})c/.test('ab'.repeat(1001) + 'c'))"),
+        "true"
+    );
+    assert_eq!(
+        run("String(/(?<=(?:ab){1001})c/.test('ab'.repeat(1000) + 'c'))"),
+        "false"
+    );
+}
+
+#[test]
 fn regexp_u_surrogates_and_case_mapping() {
     // A surrogate escape pair in /u combines into one code point.
     assert_eq!(run("String(/\\uD834\\uDF06/u.test('\u{1D306}'))"), "true");
