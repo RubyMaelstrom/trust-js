@@ -1363,12 +1363,13 @@ fn errors_have_names() {
 #[test]
 fn regexp_resource_exhaustion_throws_instead_of_becoming_no_match() {
     // RegExpBuiltinExec returns null only for the matcher's failure result. An implementation
-    // limit is an abrupt completion, not permission to silently select the no-match branch.
+    // limit (here the matcher's native recursion bound) is an abrupt completion, not permission
+    // to silently select the no-match branch.
     assert_eq!(
         run(r#"
-            const re = /(a|aa)*b/y;
+            const re = /(?:ab)*c/y;
             try {
-                re.test("a".repeat(40));
+                re.test("ab".repeat(4000));
                 "returned";
             } catch (error) {
                 error.name + ":" + re.lastIndex;
@@ -22586,10 +22587,22 @@ fn regexp_counted_quantifiers_have_no_size_limit() {
     // ECMA-262 RepeatMatcher (§22.2.2.3.1) puts no bound on `{n,m}`. Counts past the matcher's
     // unroll threshold run as a counted loop with the same semantics; they used to be rejected
     // as an early SyntaxError, failing whole scripts that merely contain such a literal.
-    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1500)))"), "true");
-    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1499)))"), "false");
-    assert_eq!(run("String(/^(?:ab){1500}$/.test('ab'.repeat(1501)))"), "false");
-    assert_eq!(run("String(/^(?:ab){0,100000}$/.test('ab'.repeat(20)))"), "true");
+    assert_eq!(
+        run("String(/^(?:ab){1500}$/.test('ab'.repeat(1500)))"),
+        "true"
+    );
+    assert_eq!(
+        run("String(/^(?:ab){1500}$/.test('ab'.repeat(1499)))"),
+        "false"
+    );
+    assert_eq!(
+        run("String(/^(?:ab){1500}$/.test('ab'.repeat(1501)))"),
+        "false"
+    );
+    assert_eq!(
+        run("String(/^(?:ab){0,100000}$/.test('ab'.repeat(20)))"),
+        "true"
+    );
     assert_eq!(run("String(/^(?:ab){2,5000}$/.test('ab'))"), "false");
     assert_eq!(run("String(/(?:ab){0,4294967296}/.test('abab'))"), "true");
     // Greedy loops take as many iterations as succeed; lazy ones as few.

@@ -5,15 +5,16 @@
 //! the commonly-used syntax: literals, `.`, character classes (`[...]`, `\d\w\s` and negations),
 //! anchors (`^ $ \b \B`), quantifiers (`* + ? {n} {n,} {n,m}`, greedy + lazy), groups (capturing,
 //! `(?:)`), alternation, backreferences, and lookahead (`(?= )` / `(?! )`), with the `g i m s y`
-//! flags. Backtracking is bounded by a step budget so pathological patterns terminate with an
-//! explicit resource error instead of hanging or being mistaken for an ordinary no-match.
+//! flags. As ECMA-262 requires, backtracking is not bounded in time: a pathological pattern runs
+//! until it finishes or the host interrupts the script, which the matcher polls for. Only native
+//! recursion is bounded, and exceeding it is an explicit resource error rather than an ordinary
+//! no-match.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
 const MAX_REPEAT: usize = 1000;
-const STEP_LIMIT: u64 = 2_000_000;
 const INLINE_CAPTURES: usize = 4;
 const INTERRUPT_POLL_MASK: usize = 0x3fff;
 /// Keep cold patterns on the compact matcher program. A pattern is promoted only after repeated
@@ -2739,10 +2740,8 @@ impl Regex {
             m.caps.fill(None);
             m.marks.fill(None);
             m.flags.truncate(1);
-            // The implementation limit bounds one invocation of the compiled matcher, matching
+            // The recursion bound applies to one invocation of the compiled matcher, matching
             // RegExpBuiltinExec's repeated invocation of the matcher at successive input indices.
-            // Keeping it per candidate avoids rejecting an otherwise linear scan of a long input.
-            m.steps = 0;
             m.depth = 0;
             if m.run(&self.prog, 0, from) {
                 break 'scan Ok(Some(project(&m.caps)));
@@ -4477,9 +4476,8 @@ fn clone_class(cc: &CharClass) -> CharClass {
 // Backtracking matcher
 // ---------------------------------------------------------------------------------------------
 
-/// Recursion-depth ceiling for the backtracking matcher (separate from the step budget): a long
-/// input against a greedy quantifier recurses once per consumed char, which would overflow the
-/// native stack on big inputs.
+/// Recursion-depth ceiling for the backtracking matcher: a long input against a quantified group
+/// recurses once per iteration, which would overflow the native stack on big inputs.
 const MAX_MATCH_DEPTH: u32 = 3000;
 
 fn find_ascii_literal(
@@ -4668,7 +4666,11 @@ struct Matcher<'a, I: ReInput> {
     input: I,
     caps: Vec<Option<usize>>,
     marks: Vec<Option<usize>>,
+    /// Executed instructions, counted only to poll for host interruption: ECMA-262 bounds no
+    /// matcher's running time, so a long match runs until it ends or the host stops the script.
     steps: u64,
+    /// Native recursion depth, bounded by `MAX_MATCH_DEPTH` so the matcher cannot overflow the
+    /// native stack.
     depth: u32,
     /// Matching direction: a lookbehind body (compiled from the reversed AST) consumes leftward.
     back: bool,
@@ -4692,10 +4694,6 @@ impl<I: ReInput> Matcher<'_, I> {
             return false;
         }
         self.steps += 1;
-        if self.steps > STEP_LIMIT {
-            self.abort = Some(MatchError::ResourceExhausted);
-            return false;
-        }
         if self.steps as usize & INTERRUPT_POLL_MASK == 0 {
             if let Err(error) = poll_interrupt(self.control) {
                 self.abort = Some(error);
@@ -5179,7 +5177,7 @@ impl<I: ReInput> Matcher<'_, I> {
     fn run_inner(&mut self, prog: &[Inst], mut pc: usize, mut pos: usize) -> bool {
         // Straight-line regexp bytecode is overwhelmingly common. Execute it iteratively and
         // reserve Rust recursion for genuine backtracking points and state that needs rollback.
-        // Besides avoiding a host call per character, this keeps the semantic step budget exact.
+        // Besides avoiding a host call per character, this keeps the interrupt-poll cadence exact.
         loop {
             if !self.tick() {
                 return false;
@@ -5976,12 +5974,26 @@ mod internal_engine_diagnostics {
 
     #[test]
     fn backtracking_exhaustion_is_distinct_from_no_match() {
-        let re = super::Regex::new("(a|aa)*b", "y").unwrap();
-        let input = crate::lstr::LStr::from("a".repeat(40));
+        // The native recursion bound is an implementation limit, not a match failure.
+        let re = super::Regex::new("(?:ab)*c", "y").unwrap();
+        let input = crate::lstr::LStr::from("ab".repeat(4000));
         let text = super::ReText::new_rc(false, &input);
         assert!(matches!(
             re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
             Err(super::MatchError::ResourceExhausted)
+        ));
+    }
+
+    #[test]
+    fn long_backtracking_runs_to_its_ecmascript_result() {
+        // ECMA-262 bounds no matcher's running time: exponential backtracking that used to stop
+        // at a 2,000,000-step budget (a RangeError) now finds its result like other engines.
+        let re = super::Regex::new("(a|aa)*b", "y").unwrap();
+        let input = crate::lstr::LStr::from("a".repeat(28));
+        let text = super::ReText::new_rc(false, &input);
+        assert!(matches!(
+            re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default()),
+            Ok(None)
         ));
     }
 
