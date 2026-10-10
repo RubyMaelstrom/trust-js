@@ -83,6 +83,9 @@ pub(crate) struct ScriptSource {
     kind: SourceKind,
     /// Byte offsets of the line starts, built when a position is first formatted.
     line_starts: std::cell::OnceCell<Box<[u32]>>,
+    /// UTF-16 unit counts at sampled byte offsets, built when a column far from its line start
+    /// is first formatted (minified bundles are a few very long lines).
+    unit_samples: std::cell::OnceCell<Box<[(u32, u32)]>>,
     /// The ScriptOrModule of code from this source, as the host-defined base its `import()`
     /// calls resolve against (see [`Interp::active_script_or_module`]): set when a Script or
     /// Module starts to evaluate, and for eval code and dynamic functions to the active
@@ -119,6 +122,7 @@ impl ScriptSource {
             column_offset: origin.column,
             kind,
             line_starts: std::cell::OnceCell::new(),
+            unit_samples: std::cell::OnceCell::new(),
             referrer: std::cell::OnceCell::new(),
         })
     }
@@ -153,7 +157,8 @@ impl ScriptSource {
         let units = self
             .text
             .get(start..offset)
-            .map_or(offset - start, crate::jstr::unit_len) as u32;
+            .map_or(offset - start, |slice| self.units_in(start, offset, slice))
+            as u32;
         let column = if line == 0 {
             units.saturating_add(self.column_offset)
         } else {
@@ -165,6 +170,23 @@ impl ScriptSource {
                 .saturating_add(1),
             column.saturating_add(1),
         )
+    }
+
+    /// The UTF-16 length of `text[start..offset]` (`slice`), both ends character boundaries.
+    /// A short span is counted directly; a long one, such as a column deep into a minified
+    /// bundle's single line, is the difference of two prefix counts that each scan at most
+    /// one sample block, so formatting a stack frame no longer reads the whole line.
+    fn units_in(&self, start: usize, offset: usize, slice: &str) -> usize {
+        if slice.len() <= 2 * UNIT_BLOCK {
+            return crate::jstr::unit_len(slice);
+        }
+        let samples = self.unit_samples.get_or_init(|| unit_samples(&self.text));
+        let units_before = |at: usize| {
+            let k = samples.partition_point(|&(byte, _)| byte as usize <= at) - 1;
+            let (byte, units) = samples[k];
+            units as usize + crate::jstr::unit_len(&self.text[byte as usize..at])
+        };
+        units_before(offset) - units_before(start)
     }
 
     fn write_location(&self, out: &mut String, offset: u32) {
@@ -181,7 +203,33 @@ impl ScriptSource {
                 .line_starts
                 .get()
                 .map_or(0, |starts| starts.len() * std::mem::size_of::<u32>())
+            + self.unit_samples.get().map_or(0, |samples| {
+                samples.len() * std::mem::size_of::<(u32, u32)>()
+            })
     }
+}
+
+/// Bytes between the sampled UTF-16 prefix counts of [`ScriptSource::units_in`].
+const UNIT_BLOCK: usize = 4096;
+
+/// (byte offset, UTF-16 units before it) at every `UNIT_BLOCK` bytes, rounded up to a character
+/// boundary; the first entry is (0, 0).
+fn unit_samples(text: &str) -> Box<[(u32, u32)]> {
+    let mut samples = vec![(0u32, 0u32)];
+    let mut at = 0usize;
+    let mut units = 0usize;
+    while at < text.len() {
+        let mut next = (at + UNIT_BLOCK).min(text.len());
+        while !text.is_char_boundary(next) {
+            next += 1;
+        }
+        units += crate::jstr::unit_len(&text[at..next]);
+        at = next;
+        if at < text.len() {
+            samples.push((at as u32, units as u32));
+        }
+    }
+    samples.into_boxed_slice()
 }
 
 fn line_starts(text: &str) -> Box<[u32]> {
@@ -735,5 +783,36 @@ mod tests {
         let shifted = ScriptSource::new(text.clone(), SourceKind::Script, Some(&origin));
         assert_eq!(shifted.line_column(at("b")), (10, 6));
         assert_eq!(shifted.line_column(at("y")), (12, 1));
+    }
+
+    /// A column far from its line start is the difference of sampled prefix counts: it must
+    /// equal the direct UTF-16 count at every character boundary, across sample blocks, for
+    /// text mixing ASCII, two- and three-byte characters, astral characters and the scalars
+    /// that stand for lone surrogates (ECMA-262 §6.1.4 string code units).
+    #[test]
+    fn long_line_columns_match_a_direct_utf16_count() {
+        let pieces = ["a", "bc", "é", "€", "😀", "\u{10F800}", "\u{10FFFF}", "xyz"];
+        let mut text = String::new();
+        let mut seed = 0x2545f491u32;
+        while text.len() < 5 * UNIT_BLOCK + 300 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            text.push_str(pieces[(seed >> 24) as usize % pieces.len()]);
+            if seed.is_multiple_of(2503) {
+                text.push('\n');
+            }
+        }
+        let text: Rc<str> = text.into();
+        let source = ScriptSource::new(text.clone(), SourceKind::Script, None);
+        let starts = line_starts(&text);
+        for (offset, _) in text.char_indices().step_by(7) {
+            let line = starts.partition_point(|&start| start as usize <= offset) - 1;
+            let start = starts[line] as usize;
+            let expected = crate::jstr::unit_len(&text[start..offset]) as u32 + 1;
+            assert_eq!(
+                source.line_column(offset as u32).1,
+                expected,
+                "offset {offset}"
+            );
+        }
     }
 }
