@@ -1234,9 +1234,32 @@ fn ta_native(
                 if !element.is_empty() || start == end {
                     let count = end.saturating_sub(start);
                     let total = count.saturating_mul(element.len());
-                    let mut bytes = Vec::with_capacity(total);
-                    for _ in 0..count {
-                        bytes.extend_from_slice(&element);
+                    // Zeroed storage is free (calloc) and is already the encoding of a zero
+                    // fill; any other element is stored once per slot by an indexed copy loop
+                    // rather than appended one slot at a time.
+                    let mut bytes = vec![0u8; total];
+                    if element.iter().any(|&byte| byte != 0) {
+                        // Constant-width stores: a runtime-width copy per slot is a memcpy call.
+                        match element.len() {
+                            1 => bytes.fill(element[0]),
+                            2 => {
+                                let one = <[u8; 2]>::try_from(&element[..]).unwrap();
+                                bytes.as_chunks_mut::<2>().0.fill(one);
+                            }
+                            4 => {
+                                let one = <[u8; 4]>::try_from(&element[..]).unwrap();
+                                bytes.as_chunks_mut::<4>().0.fill(one);
+                            }
+                            8 => {
+                                let one = <[u8; 8]>::try_from(&element[..]).unwrap();
+                                bytes.as_chunks_mut::<8>().0.fill(one);
+                            }
+                            width => {
+                                for slot in bytes.chunks_exact_mut(width) {
+                                    slot.copy_from_slice(&element);
+                                }
+                            }
+                        }
                     }
                     i.ta_write_bytes(&info, start, &bytes);
                     return Ok(this.clone());

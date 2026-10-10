@@ -16759,6 +16759,49 @@ fn jit_math_intrinsics_preserve_coercion_this_and_replacement() {
     );
 }
 
+/// ECMA-262 §23.2.3.9 %TypedArray%.prototype.fill: the value is converted once, then stored in
+/// every selected slot. The byte-range implementation must equal an element-wise loop for every
+/// element width, zero and non-zero encodings, relative bounds and conversions.
+#[test]
+fn typed_array_fill_matches_elementwise_stores_for_every_element_type() {
+    assert_eq!(
+        run(
+            "var kinds=[Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,
+                        Uint32Array,Float32Array,Float64Array,BigInt64Array,BigUint64Array];
+             var values=[0,1,-1,255,256,-129,65535,65536,2147483648,4294967295,1.5,-0.5,NaN,
+                         Infinity,-Infinity,300.7,0x123456789abc];
+             var ranges=[[],[3],[2,7],[-4],[1,-2],[5,2],[0,100],[-100,100]];
+             var bad=0,checked=0;
+             for(var k of kinds){
+               var big=k===BigInt64Array||k===BigUint64Array;
+               for(var v of values){
+                 var value=big?BigInt(Number.isFinite(v)?Math.trunc(v):0):v;
+                 for(var r of ranges){
+                   var a=new k(13),b=new k(13);
+                   var seed=big?7n:7; for(var i=0;i<13;i++){a[i]=seed;b[i]=seed;}
+                   a.fill(value,...r);
+                   var n=13,start=r.length>0?r[0]:0,end=r.length>1?r[1]:n;
+                   start=start<0?Math.max(n+start,0):Math.min(start,n);
+                   end=end<0?Math.max(n+end,0):Math.min(end,n);
+                   for(var i=start;i<end;i++)b[i]=value;
+                   checked++;
+                   for(var i=0;i<13;i++)if(!Object.is(a[i],b[i]))bad++;
+                 }
+               }
+             }
+             [bad,checked].join(':')"
+        ),
+        "0:1496"
+    );
+    assert_eq!(
+        run(
+            "var a=new Uint32Array(5).fill(0xff102030);var b=new Uint8Array(a.buffer);
+             [a.join(),Array.from(b.slice(0,4)).join()].join('|')"
+        ),
+        "4279246896,4279246896,4279246896,4279246896,4279246896|48,32,16,255"
+    );
+}
+
 #[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
