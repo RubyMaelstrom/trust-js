@@ -3,7 +3,9 @@
 //! between the fresh backing-store checks and the access. X10 and D0 remain intact for receiver
 //! ownership and deferred local-key updates. Scratch: X9, X12..X17, D1..D2.
 
-use super::{asm, emit_exec_number_guard, emit_exec_word_load, C_GE, C_HI, C_HS, C_LO, C_VS};
+use super::{
+    asm, emit_exec_number_guard, emit_exec_word_load, C_EQ, C_GE, C_HI, C_HS, C_LO, C_LS, C_VS,
+};
 use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
 use crate::value::JitLayout;
 use std::mem::offset_of;
@@ -111,17 +113,18 @@ pub(super) fn emit(
 }
 
 fn emit_load(a: &mut asm::Asm) {
-    let labels: Vec<_> = (0..8).map(|_| a.new_label()).collect();
+    let labels: Vec<_> = (0..9).map(|_| a.new_label()).collect();
     let done = a.new_label();
-    for (kind, &label) in labels.iter().enumerate().take(7) {
-        a.cmp_imm_w(17, kind as u32);
-        a.b_cond(super::C_EQ, label);
+    // Kind 7 (Float64) is the fall-through; Uint8Clamped (8) reads as Uint8.
+    for kind in [0, 1, 2, 3, 4, 5, 6, 8] {
+        a.cmp_imm_w(17, kind);
+        a.b_cond(super::C_EQ, labels[kind as usize]);
     }
     a.b(labels[7]);
     for (kind, &label) in labels.iter().enumerate() {
         a.bind(label);
         match kind {
-            0 => {
+            0 | 8 => {
                 a.ldrb_imm(14, 16, 0);
                 a.ucvtf_d_w(1, 14);
             }
@@ -166,6 +169,10 @@ fn emit_store(a: &mut asm::Asm, slow: usize) {
     let half = a.new_label();
     let word = a.new_label();
     let done = a.new_label();
+    let clamped = a.new_label();
+    let store_byte = a.new_label();
+    a.cmp_imm_w(17, 8);
+    a.b_cond(C_EQ, clamped);
     a.cmp_imm_w(17, 6);
     a.b_cond(super::C_EQ, float32);
     a.b_cond(C_HI, float64);
@@ -199,5 +206,21 @@ fn emit_store(a: &mut asm::Asm, slow: usize) {
     a.b(done);
     a.bind(float64);
     a.str_d_imm(1, 16, 0);
+    a.b(done);
+    // Uint8ClampedArray (ECMA-262 ToUint8Clamp): round to nearest, ties to even, then clamp
+    // to [0, 255]. FCVTNS saturates and maps NaN to 0, so no value declines.
+    a.bind(clamped);
+    a.fcvtns_w_d(14, 1);
+    a.cmp_imm_w(14, 0);
+    let non_negative = a.new_label();
+    a.b_cond(C_GE, non_negative);
+    a.movz(14, 0, 0);
+    a.b(store_byte);
+    a.bind(non_negative);
+    a.cmp_imm_w(14, 255);
+    a.b_cond(C_LS, store_byte);
+    a.movz(14, 255, 0);
+    a.bind(store_byte);
+    a.strb_imm(14, 16, 0);
     a.bind(done);
 }

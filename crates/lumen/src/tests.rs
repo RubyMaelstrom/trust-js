@@ -16802,6 +16802,37 @@ fn typed_array_fill_matches_elementwise_stores_for_every_element_type() {
     );
 }
 
+/// ECMA-262 §7.1.12 ToUint8Clamp: NaN is 0, the value is clamped to [0, 255] and rounded to
+/// the nearest integer, ties to even. Uint8ClampedArray element stores and loads run natively
+/// in the JIT (kind 8 of the native typed-array view); every edge value must equal the
+/// specification's algorithm, in compiled loops over both a local and a closure receiver.
+#[test]
+fn jit_uint8_clamped_array_stores_round_and_clamp_natively() {
+    assert_eq!(
+        run_jit(
+            "var vals=[0,-0,0.5,1.5,2.5,3.5,254.5,255,255.5,256,1e9,-1,-0.5,-0.4999999,-1e300,1e300,
+                       NaN,Infinity,-Infinity,127.5,128.5,0.49999999999999994,2147483647.5,
+                       2147483648,-2147483649,4294967296.5,5e-324];
+             function spec(x){if(x!==x)return 0;if(x<=0)return 0;if(x>=255)return 255;
+               var f=Math.floor(x);if(f+0.5<x)return f+1;if(x<f+0.5)return f;return f%2===1?f+1:f;}
+             var closure=new Uint8ClampedArray(vals.length);
+             function viaClosure(){for(var i=0;i<vals.length;i++)closure[i]=vals[i];}
+             function viaLocal(a){for(var i=0;i<vals.length;i++)a[i]=vals[i];}
+             var local=new Uint8ClampedArray(vals.length);
+             for(var rep=0;rep<400;rep++){viaClosure();viaLocal(local);}
+             var bad=[];
+             for(var i=0;i<vals.length;i++){
+               var want=spec(vals[i]);
+               if(closure[i]!==want||local[i]!==want)bad.push(vals[i]+'='+closure[i]+'/'+local[i]+'/'+want);
+             }
+             var sum=0;function readBack(a){var s=0;for(var i=0;i<a.length;i++)s=s+a[i]|0;return s;}
+             for(var rep=0;rep<400;rep++)sum=readBack(closure);
+             [bad.join(';'),sum===closure.reduce(function(p,c){return p+c;},0)].join('|')"
+        ),
+        "|true"
+    );
+}
+
 #[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {

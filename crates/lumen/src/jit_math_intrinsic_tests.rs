@@ -1,4 +1,4 @@
-//! A64 encodings of the instructions the inline Math intrinsics use, against the Arm ARM
+//! A64 encodings of the instructions the inline Math intrinsics and Uint8Clamped stores use, against the Arm ARM
 //! (100076_0100): FRINTM/FRINTP/FABS (C7.2), FMIN/FMAX (C7.2.51-52), CLZ (C6.2.57), MUL (MADD
 //! with WZR, C6.2.194). The expected words are the assembler's output for the same operands.
 
@@ -21,4 +21,5 @@ fn math_intrinsic_instruction_encodings() {
     assert_eq!(word(|a| a.fminmax(true, 3, 5, 7)), 0x1e67_48a3); // fmax d3, d5, d7
     assert_eq!(word(|a| a.clz_w(3, 5)), 0x5ac0_10a3); // clz w3, w5
     assert_eq!(word(|a| a.mul_w(3, 5, 7)), 0x1b07_7ca3); // mul w3, w5, w7
+    assert_eq!(word(|a| a.fcvtns_w_d(3, 5)), 0x1e60_00a3); // fcvtns w3, d5 (Uint8Clamped stores)
 }

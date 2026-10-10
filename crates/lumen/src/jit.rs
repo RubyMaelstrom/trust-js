@@ -2867,6 +2867,11 @@ mod asm {
         pub fn ucvtf_d_w(&mut self, rd: u32, rn: u32) {
             self.emit(0x1E63_0000 | (rn << 5) | rd);
         }
+        /// fcvtns wd, dn (float → signed 32-bit, round to nearest with ties to even, saturating;
+        /// NaN gives 0): the rounding of ECMA-262 ToUint8Clamp before its [0, 255] clamp.
+        pub fn fcvtns_w_d(&mut self, rd: u32, rn: u32) {
+            self.emit(0x1E60_0000 | (rn << 5) | rd);
+        }
         /// fcvtzs xd, dn (float → signed 64-bit, round toward zero, saturating)
         pub fn fcvtzs_x_d(&mut self, rd: u32, rn: u32) {
             self.emit(0x9E78_0000 | (rn << 5) | rd);

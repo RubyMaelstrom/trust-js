@@ -44,6 +44,7 @@ impl Interp {
             TaKind::I32 => 5,
             TaKind::F32 => 6,
             TaKind::F64 => 7,
+            TaKind::U8Clamped => 8,
             _ => return,
         };
         if self.shared_buffers.contains_key(&info.buffer) {
