@@ -6611,6 +6611,29 @@ impl Interp {
         self.ta_read_bytes(&info, 0, len)
     }
 
+    /// Run `f` over the bytes a TypedArray view covers, in place: the same view, bounds and
+    /// detached rules as [`Interp::typed_array_bytes`] without copying them. The bytes stay
+    /// borrowed while `f` runs, so `f` must not call back into the engine (it may use the
+    /// embedder's own state).
+    pub fn with_typed_array_bytes<R>(&self, v: &Value, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let obj = v.as_obj()?;
+        let info = self
+            .typed_arrays
+            .get(&(Rc::as_ptr(obj) as usize))
+            .copied()?;
+        let len = self.ta_len(&info)?;
+        let es = info.kind.elsize();
+        let (start, end) = (info.offset, info.offset + len * es);
+        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+            let mem = shared_mem_get(id)?;
+            let buf = mem.lock().unwrap();
+            return (end <= buf.len()).then(|| f(&buf[start..end]));
+        }
+        let storage = self.array_buffers.get(&info.buffer)?;
+        let buf = storage.borrow();
+        (end <= buf.len()).then(|| f(&buf[start..end]))
+    }
+
     /// Snapshot a matching TypedArray over fixed backing storage for Web IDL unions.
     /// Brand, view bounds, detached state and resizability come from intrinsic slots;
     /// user properties and @@iterator are never read. None requires normal conversion
