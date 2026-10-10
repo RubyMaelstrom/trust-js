@@ -888,6 +888,23 @@ pub const INTRINSIC_NUMERIC_ONLY: u8 = 17;
 /// argument list is called directly (see `jit_call_hit`).
 pub const INTRINSIC_REFLECT_APPLY: u8 = 18;
 
+/// Math numeric functions the call template finishes inline (a Number argument list, no
+/// coercion): ECMA-262 §21.3.2.16 floor, .10 ceil, .35 trunc, .1 abs, .17 fround, .11 clz32
+/// (one argument) and .20 imul, .25/.26 max/min (two arguments). Every one is also a
+/// numeric-only native, so a call whose arguments are not all Numbers (or whose site cannot use
+/// the template) reaches the operand-only helper exactly like [`INTRINSIC_NUMERIC_ONLY`].
+pub const INTRINSIC_MATH_FLOOR: u8 = 32;
+pub const INTRINSIC_MATH_CEIL: u8 = 33;
+pub const INTRINSIC_MATH_TRUNC: u8 = 34;
+pub const INTRINSIC_MATH_ABS: u8 = 35;
+pub const INTRINSIC_MATH_FROUND: u8 = 36;
+pub const INTRINSIC_MATH_CLZ32: u8 = 37;
+pub const INTRINSIC_MATH_IMUL: u8 = 38;
+pub const INTRINSIC_MATH_MAX: u8 = 39;
+pub const INTRINSIC_MATH_MIN: u8 = 40;
+pub const INTRINSIC_MATH_FIRST: u8 = INTRINSIC_MATH_FLOOR;
+pub const INTRINSIC_MATH_LAST: u8 = INTRINSIC_MATH_MIN;
+
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
         callee: 0,
@@ -2160,6 +2177,9 @@ impl SourcePositions {
 }
 
 pub struct Chunk {
+    /// Byte offset of the source function's first token and its source length (diagnostics:
+    /// `LUMEN_JIT_MAP` reports them so a profiler sample joins back to the script text).
+    pub(crate) debug_origin: (u32, u32),
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
     /// is authoritative. Lean/moved call entries must never bypass this prologue.
@@ -6856,6 +6876,12 @@ fn finish_chunk(
         .iter()
         .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
     Some(Rc::new(Chunk {
+        debug_origin: source.map_or((0, 0), |func| {
+            (
+                func.start,
+                func.source.as_ref().map_or(0, |text| text.len() as u32),
+            )
+        }),
         prepared_entry,
         lean_new_target: c.lean_new_target,
         rest_slot: c.rest_slot,
@@ -18546,6 +18572,10 @@ impl Chunk {
     pub(crate) fn jit_slot_names(&self) -> &[Rc<str>] {
         &self.slot_names
     }
+    /// Source start offset and length of the function this chunk was compiled from.
+    pub(crate) fn jit_debug_origin(&self) -> (u32, u32) {
+        self.debug_origin
+    }
     /// Guard data for a speculative-inline site (`Op::InlineGuard`'s first operand).
     pub(crate) fn jit_inline_target(&self, t: u32) -> &InlineTarget {
         &self.inline_targets[t as usize]
@@ -21732,7 +21762,9 @@ unsafe fn jit_call_hit_inner(
     let operand_only = ic.native != 0
         && match ic.intrinsic {
             INTRINSIC_OPERAND_ONLY => true,
-            INTRINSIC_NUMERIC_ONLY => (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some()),
+            INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
+                (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
+            }
             _ => false,
         };
     if ic.native != 0 && ic.intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
@@ -23050,6 +23082,9 @@ unsafe fn jit_call_inner(
                                                 as usize =>
                                         {
                                             INTRINSIC_REFLECT_APPLY
+                                        }
+                                        _ if crate::builtins::math_intrinsic(nf) != 0 => {
+                                            crate::builtins::math_intrinsic(nf)
                                         }
                                         _ if crate::builtins::is_operand_only_native(nf) => {
                                             INTRINSIC_OPERAND_ONLY

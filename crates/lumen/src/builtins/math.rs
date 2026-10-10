@@ -68,6 +68,18 @@ pub(super) fn install_math(it: &mut Interp) {
             .insert(key, Property::data(Value::lstr("Math"), false, false, true));
     }
     macro_rules! unary {
+        ($name:expr, $f:expr, $intrinsic:expr) => {{
+            let f: NativeFn = |i, _t, a| {
+                if let [Value::Num(x)] = a {
+                    return Ok(Value::Num($f(*x)));
+                }
+                let x = ab(i.to_number(&arg(a, 0)))?;
+                Ok(Value::Num($f(x)))
+            };
+            register_numeric_only_native(f);
+            register_math_intrinsic(f, $intrinsic);
+            it.def_method(&math, $name, 1, f);
+        }};
         ($name:expr, $f:expr) => {{
             let f: NativeFn = |i, _t, a| {
                 // ECMA-262 ToNumber is the identity for Numbers with no observable effects
@@ -84,9 +96,9 @@ pub(super) fn install_math(it: &mut Interp) {
             it.def_method(&math, $name, 1, f);
         }};
     }
-    unary!("abs", f64::abs);
-    unary!("floor", f64::floor);
-    unary!("ceil", f64::ceil);
+    unary!("abs", f64::abs, crate::bytecode::INTRINSIC_MATH_ABS);
+    unary!("floor", f64::floor, crate::bytecode::INTRINSIC_MATH_FLOOR);
+    unary!("ceil", f64::ceil, crate::bytecode::INTRINSIC_MATH_CEIL);
     // Math.round ties toward +Inf and keeps a negative sign for [-0.5, 0). Computed from floor(x)
     // (not floor(x + 0.5), which wrongly rounds up e.g. 0.5 - ε/4 and some large odd integers).
     unary!("round", |x: f64| {
@@ -102,7 +114,7 @@ pub(super) fn install_math(it: &mut Interp) {
             }
         }
     });
-    unary!("trunc", f64::trunc);
+    unary!("trunc", f64::trunc, crate::bytecode::INTRINSIC_MATH_TRUNC);
     it.def_method(&math, "sqrt", 1, nf_math_sqrt);
     unary!("cbrt", f64::cbrt);
     unary!("sign", |x: f64| if x.is_nan() || x == 0.0 {
@@ -137,12 +149,20 @@ pub(super) fn install_math(it: &mut Interp) {
             t
         }
     });
-    unary!("fround", |x: f64| x as f32 as f64);
+    unary!(
+        "fround",
+        |x: f64| x as f32 as f64,
+        crate::bytecode::INTRINSIC_MATH_FROUND
+    );
     unary!(
         "f16round",
         |x: f64| crate::value::f16_to_f32(crate::value::f64_to_f16(x)) as f64
     );
-    unary!("clz32", |x: f64| (to_uint32(x)).leading_zeros() as f64);
+    unary!(
+        "clz32",
+        |x: f64| (to_uint32(x)).leading_zeros() as f64,
+        crate::bytecode::INTRINSIC_MATH_CLZ32
+    );
     it.def_method(&math, "sumPrecise", 1, |i, _t, a| {
         // Iterate the argument, requiring every element to be a Number; compute the correctly
         // rounded sum. Infinities dominate (mixed signs → NaN), any NaN → NaN, empty → -0.
@@ -223,7 +243,7 @@ pub(super) fn install_math(it: &mut Interp) {
         }
         Ok(Value::Num(hypot_converted(&nums)))
     });
-    it.def_method(&math, "imul", 2, |i, _t, a| {
+    let imul_fn: NativeFn = |i, _t, a| {
         if let [Value::Num(x), Value::Num(y)] = a {
             let x = to_uint32(*x) as i32;
             let y = to_uint32(*y) as i32;
@@ -232,7 +252,11 @@ pub(super) fn install_math(it: &mut Interp) {
         let x = to_uint32(ab(i.to_number(&arg(a, 0)))?) as i32;
         let y = to_uint32(ab(i.to_number(&arg(a, 1)))?) as i32;
         Ok(Value::Num(x.wrapping_mul(y) as f64))
-    });
+    };
+    // With two Number arguments no coercion runs (ECMA-262 §21.3.2.20 ToUint32 on a Number).
+    register_numeric_only_native(imul_fn);
+    register_math_intrinsic(imul_fn, crate::bytecode::INTRINSIC_MATH_IMUL);
+    it.def_method(&math, "imul", 2, imul_fn);
     let random_stream = Rc::new(RandomStream::new());
     let captured = random_stream.clone();
     let random = it.new_native_fn_with_retained_memory(
@@ -295,6 +319,7 @@ pub(super) fn install_math(it: &mut Interp) {
         Ok(Value::Num(if saw_nan { f64::NAN } else { highest }))
     };
     register_numeric_only_native(max_fn);
+    register_math_intrinsic(max_fn, crate::bytecode::INTRINSIC_MATH_MAX);
     it.def_method(&math, "max", 2, max_fn);
     let min_fn: NativeFn = |i, _t, a| {
         // See Math.max above: the all-Number case has no observable coercion work to perform
@@ -319,6 +344,7 @@ pub(super) fn install_math(it: &mut Interp) {
         Ok(Value::Num(if saw_nan { f64::NAN } else { lowest }))
     };
     register_numeric_only_native(min_fn);
+    register_math_intrinsic(min_fn, crate::bytecode::INTRINSIC_MATH_MIN);
     it.def_method(&math, "min", 2, min_fn);
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
@@ -485,6 +511,27 @@ thread_local! {
 
 fn register_numeric_only_native(f: NativeFn) {
     NUMERIC_ONLY_NATIVES.with(|set| set.borrow_mut().insert(f as *const () as usize));
+}
+
+thread_local! {
+    /// Math functions with an inline call-template implementation, keyed by native identity
+    /// (see `bytecode::INTRINSIC_MATH_FIRST`).
+    static MATH_INTRINSICS: std::cell::RefCell<crate::fasthash::FastMap<usize, u8>> =
+        std::cell::RefCell::new(Default::default());
+}
+
+fn register_math_intrinsic(f: NativeFn, id: u8) {
+    MATH_INTRINSICS.with(|map| map.borrow_mut().insert(f as *const () as usize, id));
+}
+
+/// The inline Math intrinsic id of native `f`, or 0.
+pub(crate) fn math_intrinsic(f: NativeFn) -> u8 {
+    MATH_INTRINSICS.with(|map| {
+        map.borrow()
+            .get(&(f as *const () as usize))
+            .copied()
+            .unwrap_or(0)
+    })
 }
 
 /// Whether `f` was registered by [`register_numeric_only_native`].

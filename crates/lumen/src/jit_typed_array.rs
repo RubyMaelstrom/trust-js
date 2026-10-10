@@ -27,6 +27,11 @@ pub(super) fn emit(
         a.b(slow);
         return;
     };
+    a.mark_push(if write.is_some() {
+        "typed-store"
+    } else {
+        "typed-load"
+    });
     a.ldr_imm(12, 11, layout.object_view as u32);
     a.cbz(12, true, slow); // proxies, namespaces and unsupported typed-array kinds
     if let Some(value) = write {
@@ -101,6 +106,7 @@ pub(super) fn emit(
         a.mov_imm64(12, crate::value::PACK_CANON_NAN);
         a.bind(number);
     }
+    a.mark_pop();
     a.b(hit);
 }
 

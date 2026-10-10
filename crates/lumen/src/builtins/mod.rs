@@ -47,7 +47,7 @@ mod array_shift_tests;
 
 pub(crate) use function_proto::nf_function_call;
 pub(crate) use globals::nf_is_nan;
-pub(crate) use math::{is_numeric_only_native, nf_math_sqrt};
+pub(crate) use math::{is_numeric_only_native, math_intrinsic, nf_math_sqrt};
 pub(crate) use primitives::nf_number_is_nan;
 pub(crate) use reflect::nf_reflect_apply;
 

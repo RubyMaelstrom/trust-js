@@ -110,6 +110,14 @@ mod inline_context_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_math_intrinsic_tests.rs"]
+mod math_intrinsic_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_constant_tests.rs"]
 mod constant_tests;
 
@@ -1741,6 +1749,17 @@ impl JitCtx {
     }
 }
 
+thread_local! {
+    /// Attribution markers of the chunk most recently finished by [`asm::Asm::finish_with_offsets`].
+    static LAST_MARKS: std::cell::RefCell<Vec<(u32, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether `LUMEN_JIT_MAP` profiler output is requested (attribution markers are emitted).
+pub(crate) fn jit_map_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMEN_JIT_MAP").is_some())
+}
+
 #[inline]
 /// Whether generated code may use FJCVTZS (ARMv8.3 FEAT_JSCVT) for ECMAScript ToInt32
 /// (ECMA-262 §7.1.6). `LUMEN_JIT_NO_JSCVT` forces the portable guarded sequence.
@@ -2450,6 +2469,10 @@ mod asm {
         /// The code being emitted runs once per loop iteration: sites keep their fast paths in
         /// line instead of calling a shared stub (see `super::use_shared_stub`).
         hot: bool,
+        /// Profiler attribution markers (`LUMEN_JIT_MAP` only): a bound label and the template
+        /// family whose code starts there. Nested families restore their parent when they end.
+        marks: Vec<(usize, &'static str)>,
+        mark_stack: Vec<&'static str>,
     }
 
     #[derive(Clone, Copy)]
@@ -2468,7 +2491,30 @@ mod asm {
                 labels: Vec::new(),
                 stubs: Vec::new(),
                 hot: false,
+                marks: Vec::new(),
+                mark_stack: Vec::new(),
             }
+        }
+        /// Start a profiler attribution region (a no-op unless `LUMEN_JIT_MAP` is set).
+        pub fn mark_push(&mut self, name: &'static str) {
+            if !super::jit_map_enabled() {
+                return;
+            }
+            self.mark_stack.push(name);
+            let label = self.new_label();
+            self.bind(label);
+            self.marks.push((label, name));
+        }
+        /// End the innermost attribution region, resuming its parent's.
+        pub fn mark_pop(&mut self) {
+            if !super::jit_map_enabled() {
+                return;
+            }
+            self.mark_stack.pop();
+            let parent = self.mark_stack.last().copied().unwrap_or("-");
+            let label = self.new_label();
+            self.bind(label);
+            self.marks.push((label, parent));
         }
         /// Whether any emitted branch targets `label`.
         pub fn label_referenced(&self, label: usize) -> bool {
@@ -2506,6 +2552,7 @@ mod asm {
             self.labels.truncate(checkpoint.2);
             // A stub first requested by the discarded emission loses its label with it.
             self.stubs.retain(|&(_, label)| label < checkpoint.2);
+            self.marks.retain(|&(label, _)| label < checkpoint.2);
         }
         /// Labels actually referenced by an optional emission, before relaxation. A region
         /// uses this to omit unreachable deoptimization stubs and unnecessary baseline entries.
@@ -2846,6 +2893,31 @@ mod asm {
         pub fn frintz(&mut self, rd: u32, rn: u32) {
             self.emit(0x1E65_C000 | (rn << 5) | rd);
         }
+        /// frintm dd, dn (round toward minus infinity to integral)
+        pub fn frintm(&mut self, rd: u32, rn: u32) {
+            self.emit(0x1E65_4000 | (rn << 5) | rd);
+        }
+        /// frintp dd, dn (round toward plus infinity to integral)
+        pub fn frintp(&mut self, rd: u32, rn: u32) {
+            self.emit(0x1E64_C000 | (rn << 5) | rd);
+        }
+        /// fabs dd, dn
+        pub fn fabs(&mut self, rd: u32, rn: u32) {
+            self.emit(0x1E60_C000 | (rn << 5) | rd);
+        }
+        /// fmin/fmax dd, dn, dm — NaN in, NaN out; -0 orders below +0 (ECMA-262 §21.3.2.25-26).
+        pub fn fminmax(&mut self, max: bool, rd: u32, rn: u32, rm: u32) {
+            let bits = if max { 0x1E60_4800u32 } else { 0x1E60_5800 };
+            self.emit(bits | (rm << 16) | (rn << 5) | rd);
+        }
+        /// clz wd, wn
+        pub fn clz_w(&mut self, rd: u32, rn: u32) {
+            self.emit(0x5AC0_1000 | (rn << 5) | rd);
+        }
+        /// mul wd, wn, wm (MADD wd, wn, wm, wzr; the low 32 bits of the product)
+        pub fn mul_w(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x1B00_7C00 | (rm << 16) | (rn << 5) | rd);
+        }
         /// fmov dd, xn (bit move)
         pub fn fmov_d_x(&mut self, rd: u32, rn: u32) {
             self.emit(0x9E67_0000 | (rn << 5) | rd);
@@ -3049,6 +3121,14 @@ mod asm {
                     u32::try_from(insn * 4).expect("JIT label offset exceeds u32")
                 })
                 .collect();
+            if !self.marks.is_empty() {
+                let resolved = self
+                    .marks
+                    .iter()
+                    .filter_map(|&(label, name)| Some((self.labels[label]? as u32 * 4, name)))
+                    .collect();
+                super::LAST_MARKS.with(|cell| *cell.borrow_mut() = resolved);
+            }
             (self.buf, offsets)
         }
 
@@ -4761,7 +4841,14 @@ fn compile_entry(
                 .map(|s| &**s)
                 .collect();
             let name = head.join("|");
-            eprintln!("[jit-map-range] {:x} {:x} {name}", mem as usize, len);
+            let (origin, source_len) = chunk.jit_debug_origin();
+            eprintln!(
+                "[jit-map-range] {:x} {:x} {name}@{origin}+{source_len}/{}ops/{}slots",
+                mem as usize,
+                len,
+                ops.len(),
+                chunk.jit_slot_names().len()
+            );
             for (pc, (&offset, op)) in pc_offsets.iter().zip(ops).enumerate() {
                 let property = match *op {
                     Op::GetProp(name, _)
@@ -4781,6 +4868,12 @@ fn compile_entry(
                     mem as usize, offset
                 );
             }
+            LAST_MARKS.with(|cell| {
+                for &(offset, family) in cell.borrow().iter() {
+                    eprintln!("[jit-map-mark] {:x} {offset:x} {family}", mem as usize);
+                }
+                cell.borrow_mut().clear();
+            });
         }
         Some(JitCode {
             entry_kind,
@@ -6077,6 +6170,39 @@ fn emit_call_inline(
     l_unwind: usize,
     l_direct_finish: usize,
 ) {
+    a.mark_push("call");
+    emit_call_inline_marked(
+        a,
+        chunk,
+        layout,
+        ilayout,
+        pc,
+        fast,
+        array_intrinsics_on,
+        function_call_intrinsic_on,
+        l_unwind,
+        l_direct_finish,
+    );
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_call_inline_marked(
+    a: &mut asm::Asm,
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    pc: usize,
+    fast: u32,
+    array_intrinsics_on: bool,
+    function_call_intrinsic_on: bool,
+    l_unwind: usize,
+    l_direct_finish: usize,
+) {
     use crate::bytecode::Op;
     let ops = chunk.jit_ops();
     let op = &ops[pc];
@@ -6192,6 +6318,7 @@ fn emit_call_inline(
                 } else {
                     emit_call_intrinsics1(
                         a,
+                        layout,
                         IntrinsicPc::Imm(pc as u32),
                         array_intrinsics_on,
                         discard,
@@ -6253,6 +6380,7 @@ fn emit_call_inline(
                 } else {
                     emit_call_intrinsics2(
                         a,
+                        layout,
                         IntrinsicPc::Imm(pc as u32),
                         discard,
                         no_intr,
@@ -6356,6 +6484,136 @@ fn emit_call_inline(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+/// Inline Math numeric intrinsics (ECMA-262 §21.3.2: floor, ceil, trunc, abs, fround, clz32,
+/// imul, max, min) at a `CallWithThis(argc)` hit whose call IC proved the exact builtin
+/// (x9 = its `INTRINSIC_MATH_*` id, x10 = the callee's stored Rc pointer). Stack, top last:
+/// `[this, callee, args...]`. Every guard precedes the single commit: all arguments must be
+/// Numbers (so ToNumber/ToInt32 run no author code), `this` must be Undefined (a plain
+/// identifier call, `U(a, b)`) or a shared Object (`Math.f(x)`), and the callee must be shared;
+/// any other shape takes `hit_slow`, which re-runs the exact builtin through the helper. The
+/// result Number replaces `this`. Clobbers x9, x11, x13, x14, x16, x17, d0, d1; preserves x10,
+/// x12 and x15 for the ordinary call on a decline.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_math_intrinsic(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    argc: u32,
+    no_intr: usize,
+    hit_slow: usize,
+    done: usize,
+) {
+    use crate::bytecode::{
+        INTRINSIC_MATH_ABS, INTRINSIC_MATH_CEIL, INTRINSIC_MATH_CLZ32, INTRINSIC_MATH_FLOOR,
+        INTRINSIC_MATH_FROUND, INTRINSIC_MATH_IMUL, INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN,
+        INTRINSIC_MATH_TRUNC,
+    };
+    if !(layout.valid && layout.rc_strong_off < 256) {
+        a.b(no_intr);
+        return;
+    }
+    let strong = layout.rc_strong_off as i32;
+    // Operand slots: argc arguments, the callee below them, `this` below that.
+    let arg0 = -(argc as i32) * 8;
+    let this_off = arg0 - 16;
+    // Arguments: both Numbers, in d0/d1.
+    emit_exec_word_load(a, 13, 20, arg0);
+    emit_exec_number_guard(a, 13, 0, 16, hit_slow);
+    if argc == 2 {
+        emit_exec_word_load(a, 13, 20, arg0 + 8);
+        emit_exec_number_guard(a, 13, 1, 16, hit_slow);
+    }
+    // `this`: Undefined needs no release; an Object must be shared. x11 = its pointer or 0.
+    let this_undefined = a.new_label();
+    let this_ready = a.new_label();
+    emit_exec_word_load(a, 17, 20, this_off);
+    a.mov_imm64(16, crate::value::PACK_UNDEFINED);
+    a.cmp_reg_x(17, 16);
+    a.b_cond(C_EQ, this_undefined);
+    emit_exec_tag_guard(a, 17, crate::value::PACK_OBJ, 16, hit_slow);
+    emit_exec_payload(a, 17, 11);
+    a.ldur(14, 11, strong);
+    a.cmp_imm_x(14, 1);
+    a.b_cond(C_LS, hit_slow);
+    a.b(this_ready);
+    a.bind(this_undefined);
+    a.movz(11, 0, 0);
+    a.bind(this_ready);
+    // The callee is the stored Rc of the proven builtin: release one non-final owner.
+    a.ldur(13, 10, strong);
+    a.cmp_imm_x(13, 1);
+    a.b_cond(C_LS, hit_slow);
+    // Compute (d0 <- result). Declines here still precede every state change.
+    let commit = a.new_label();
+    let ops: &[u8] = if argc == 1 {
+        &[
+            INTRINSIC_MATH_FLOOR,
+            INTRINSIC_MATH_CEIL,
+            INTRINSIC_MATH_TRUNC,
+            INTRINSIC_MATH_ABS,
+            INTRINSIC_MATH_FROUND,
+            INTRINSIC_MATH_CLZ32,
+        ]
+    } else {
+        &[INTRINSIC_MATH_IMUL, INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN]
+    };
+    let labels: Vec<usize> = ops.iter().map(|_| a.new_label()).collect();
+    for (&id, &label) in ops.iter().zip(&labels) {
+        a.cmp_imm_w(9, id as u32);
+        a.b_cond(C_EQ, label);
+    }
+    a.b(hit_slow);
+    for (&id, &label) in ops.iter().zip(&labels) {
+        a.bind(label);
+        match id {
+            INTRINSIC_MATH_FLOOR => a.frintm(0, 0),
+            INTRINSIC_MATH_CEIL => a.frintp(0, 0),
+            INTRINSIC_MATH_TRUNC => a.frintz(0, 0),
+            INTRINSIC_MATH_ABS => a.fabs(0, 0),
+            INTRINSIC_MATH_FROUND => {
+                a.fcvt_float_width(0, 0, true); // FCVT S0, D0 (round to nearest, ties to even)
+                a.fcvt_float_width(0, 0, false); // FCVT D0, S0
+            }
+            INTRINSIC_MATH_CLZ32 => {
+                if !jscvt_available() {
+                    a.b(hit_slow);
+                    continue;
+                }
+                a.fjcvtzs_w_d(16, 0); // ToUint32 has the same bits as ToInt32
+                a.clz_w(16, 16);
+                a.ucvtf_d_w(0, 16);
+            }
+            INTRINSIC_MATH_IMUL => {
+                if !jscvt_available() {
+                    a.b(hit_slow);
+                    continue;
+                }
+                a.fjcvtzs_w_d(16, 0);
+                a.fjcvtzs_w_d(17, 1);
+                a.mul_w(16, 16, 17);
+                a.scvtf_d_w(0, 16);
+            }
+            INTRINSIC_MATH_MAX => a.fminmax(true, 0, 0, 1),
+            _ => a.fminmax(false, 0, 0, 1),
+        }
+        a.b(commit);
+    }
+    // Commit: release `this` (when an Object) and the callee, then replace `this` with the result.
+    a.bind(commit);
+    let skip_this = a.new_label();
+    a.cbz(11, true, skip_this);
+    a.sub_imm(14, 14, 1);
+    a.stur(14, 11, strong);
+    a.bind(skip_this);
+    a.sub_imm(13, 13, 1);
+    a.stur(13, 10, strong);
+    emit_exec_number_store(a, 0, 20, this_off, 9);
+    a.sub_imm(20, 20, (argc + 1) * 8);
+    a.b(done);
+}
+
 #[derive(Clone, Copy)]
 enum IntrinsicPc {
     Imm(u32),
@@ -6386,6 +6644,7 @@ fn emit_intrinsic_pc(a: &mut asm::Asm, pc: IntrinsicPc) {
 #[allow(clippy::too_many_arguments)]
 fn emit_call_intrinsics1(
     a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
     pc: IntrinsicPc,
     array_push: bool,
     discard: bool,
@@ -6405,6 +6664,13 @@ fn emit_call_intrinsics1(
     let string_split = discard.then(|| a.new_label());
     let array_push = array_push.then(|| a.new_label());
     a.ldrb_imm(9, 12, 96); // ic.intrinsic (offset compile-asserted)
+    let math1 = a.new_label();
+    a.sub_imm(16, 9, crate::bytecode::INTRINSIC_MATH_FLOOR as u32);
+    a.cmp_imm_x(
+        16,
+        (crate::bytecode::INTRINSIC_MATH_CLZ32 - crate::bytecode::INTRINSIC_MATH_FLOOR) as u32 + 1,
+    );
+    a.b_cond(C_LO, math1);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_AT as u32);
     a.b_cond(C_EQ, char_at);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32);
@@ -6582,6 +6848,9 @@ fn emit_call_intrinsics1(
     // Math.sqrt(number): the call IC already proved builtin identity.
     // The receiver is ignored semantically; require an object so it and
     // the distinct function handle can be released by guarded decrements.
+    a.bind(math1);
+    emit_math_intrinsic(a, layout, 1, no_intr, hit_slow, done);
+
     a.bind(sqrt);
     emit_exec_word_load(a, 9, 20, -24);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
@@ -6677,6 +6946,7 @@ fn emit_call_intrinsics1(
 #[allow(clippy::too_many_arguments)]
 fn emit_call_intrinsics2(
     a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
     pc: IntrinsicPc,
     discard: bool,
     no_intr: usize,
@@ -6689,6 +6959,13 @@ fn emit_call_intrinsics2(
     let apply = a.new_label();
     let replace = discard.then(|| a.new_label());
     a.ldrb_imm(9, 12, 96);
+    let math2 = a.new_label();
+    a.sub_imm(16, 9, crate::bytecode::INTRINSIC_MATH_IMUL as u32);
+    a.cmp_imm_x(
+        16,
+        (crate::bytecode::INTRINSIC_MATH_MIN - crate::bytecode::INTRINSIC_MATH_IMUL) as u32 + 1,
+    );
+    a.b_cond(C_LO, math2);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_STRING_SLICE as u32);
     a.b_cond(C_EQ, slice);
     a.cmp_imm_w(9, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32);
@@ -6700,6 +6977,9 @@ fn emit_call_intrinsics2(
         a.b_cond(C_EQ, replace);
     }
     a.b(no_intr);
+
+    a.bind(math2);
+    emit_math_intrinsic(a, layout, 2, no_intr, hit_slow, done);
 
     // ASCII String#slice(start, end), both bounds already Numbers: no
     // user code or exotic conversion can run in the dedicated helper.
@@ -10053,6 +10333,32 @@ fn emit_load_name_inline(
     preferred_number: Option<u64>,
     pc: u32,
     l_unwind: usize,
+    for_call: bool,
+) {
+    a.mark_push("load-name");
+    emit_load_name_inline_marked(
+        a,
+        layout,
+        cache_ptr,
+        preferred_number,
+        pc,
+        l_unwind,
+        for_call,
+    );
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_load_name_inline_marked(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    cache_ptr: usize,
+    preferred_number: Option<u64>,
+    pc: u32,
+    l_unwind: usize,
     // `LoadNameForCall`: the fast path pushes the `this` slot (Undefined — a depth-0 hit can't
     // come through a `with` object) below the value; the slow path runs the full op.
     for_call: bool,
@@ -10459,6 +10765,7 @@ impl SharedStub {
                         discard,
                     } => emit_call_intrinsics1(
                         a,
+                        layout,
                         IntrinsicPc::InW8,
                         array_push,
                         discard,
@@ -10469,6 +10776,7 @@ impl SharedStub {
                     ),
                     SharedStub::Intrinsics2 { discard } => emit_call_intrinsics2(
                         a,
+                        layout,
                         IntrinsicPc::InW8,
                         discard,
                         none,
@@ -11135,6 +11443,21 @@ fn emit_get_elem_inline(
     pc: u32,
     l_unwind: usize,
 ) {
+    a.mark_push("get-elem");
+    emit_get_elem_inline_marked(a, layout, pc, l_unwind);
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_get_elem_inline_marked(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    pc: u32,
+    l_unwind: usize,
+) {
     let strong = layout.rc_strong_off as i32;
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
@@ -11411,6 +11734,22 @@ fn emit_mirror_store(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_set_elem_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    pc: u32,
+    l_unwind: usize,
+    keep: bool,
+) {
+    a.mark_push("set-elem");
+    emit_set_elem_inline_marked(a, layout, pc, l_unwind, keep);
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_set_elem_inline_marked(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     pc: u32,
@@ -13550,6 +13889,22 @@ mod numeric_chain_tests {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_chain(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    chain: &[(ChainOp, usize)],
+    pc_labels: &[usize],
+    l_unwind: usize,
+) {
+    a.mark_push("chain");
+    emit_chain_marked(a, layout, chain, pc_labels, l_unwind);
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_chain_marked(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     chain: &[(ChainOp, usize)],
@@ -17543,6 +17898,16 @@ fn emit_exec(a: &mut asm::Asm, pc: u32, l_unwind: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_op_helper(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
+    a.mark_push("helper-call");
+    emit_op_helper_marked(a, idx, pc, l_unwind);
+    a.mark_pop();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
     a.mov(0, 19);
     a.movz(1, pc, 0);
     a.mov(2, 20);

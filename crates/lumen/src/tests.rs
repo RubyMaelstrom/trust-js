@@ -16693,6 +16693,72 @@ fn jit_math_sqrt_intrinsic_preserves_fallbacks_and_identity_guards() {
     );
 }
 
+/// ECMA-262 §21.3.2 floor, ceil, trunc, abs, fround, clz32 (one Number argument) and imul, max,
+/// min (two): the call template finishes them inline once the call IC has proved the exact
+/// builtin. The table is computed through identifier calls and member calls after warm-up and
+/// must equal the interpreter's; coercing and non-Number arguments, `this` shapes and a
+/// replaced builtin must take the checked path.
+#[test]
+fn jit_math_intrinsics_match_the_builtins_and_keep_their_identity_guards() {
+    let script = |warm: &str| {
+        format!(
+            "var vals=[0,-0,1,-1,0.5,-0.5,1.5,-1.5,2.5,-2.5,1e308,-1e308,Infinity,-Infinity,NaN,
+                4294967296,4294967295,2147483648,-2147483649,123456789.9,-123456789.9,
+                1.9999999999999998,5e-324,3e10,2147483647,-2147483648,1e21,3.4028235677973366e38];
+             var fl=Math.floor,ce=Math.ceil,tr=Math.trunc,ab=Math.abs,fr=Math.fround,cl=Math.clz32,
+                 im=Math.imul,mx=Math.max,mn=Math.min;
+             function fmt(x){{return Object.is(x,-0)?'-0':String(x);}}
+             function ident1(v){{return [fl(v),ce(v),tr(v),ab(v),fr(v),cl(v)].map(fmt).join(',');}}
+             function member1(v){{return [Math.floor(v),Math.ceil(v),Math.trunc(v),Math.abs(v),
+                 Math.fround(v),Math.clz32(v)].map(fmt).join(',');}}
+             function ident2(a,b){{return [im(a,b),mx(a,b),mn(a,b)].map(fmt).join(',');}}
+             function member2(a,b){{return [Math.imul(a,b),Math.max(a,b),Math.min(a,b)].map(fmt).join(',');}}
+             for(var w=0;w<{warm};w++){{ident1(w);member1(w);ident2(w,3);member2(w,3);}}
+             var out=[];
+             for(var i=0;i<vals.length;i++){{
+               out.push(ident1(vals[i]),member1(vals[i]));
+               for(var j=0;j<vals.length;j++)out.push(ident2(vals[i],vals[j]),member2(vals[i],vals[j]));
+             }}
+             var h=0;for(var k=0;k<out.length;k++){{var t=out[k];for(var q=0;q<t.length;q++)h=(h*31+t.charCodeAt(q))|0;}}
+             var agree=true;
+             for(var k=0;k<out.length;k+=2)if(k%(2*vals.length+2)===0&&out[k]!==out[k+1])agree=false;
+             [h,out.length,agree].join(':')"
+        )
+    };
+    // Warm-up of zero keeps every call on the plain tiers for the first table; the second run
+    // starts with hot, filled call ICs.
+    let cold = run(&script("0"));
+    let hot = run_jit(&script("600"));
+    assert_eq!(hot, cold);
+    assert!(
+        hot.ends_with(":true"),
+        "identifier and member calls agree: {hot}"
+    );
+}
+
+#[test]
+fn jit_math_intrinsics_preserve_coercion_this_and_replacement() {
+    assert_eq!(
+        run_jit(
+            "var fl=Math.floor,im=Math.imul,mx=Math.max,fr=Math.fround;
+             function f(x){return fl(x);}
+             function g(a,b){return im(a,b);}
+             function m(a,b){return mx(a,b);}
+             var holder={floor:fl}; function viaHolder(x){return holder.floor(x);}
+             for(var i=0;i<600;i++){f(i+0.5);g(i,3);m(i,2);viaHolder(i);}
+             var coercions=0,object={valueOf:function(){coercions++;return 7.9;}};
+             var seen=[f(object),g(object,2),m(object,'3'),f('4.5'),f(undefined),f(null),
+                       coercions,viaHolder(-1.5),fl.call(7,2.9),fl.call('s',2.9),mx.call(null,1,5),
+                       g(2147483647,2),g(-1,-1),g(65536,65536),f(-0)===0&&1/f(-0)===-Infinity,
+                       m(-0,0)===0&&1/m(-0,0)===Infinity].join(':');
+             try{f(Symbol());}catch(e){seen+=':'+(e instanceof TypeError);}
+             fl=function(x){return -1;};
+             seen+':'+f(2.5)"
+        ),
+        "7:14:7.9:4:NaN:0:3:-2:2:2:5:-2:1:0:true:true:true:-1"
+    );
+}
+
 #[test]
 fn global_value_property_descriptors() {
     for name in ["undefined", "NaN", "Infinity"] {
