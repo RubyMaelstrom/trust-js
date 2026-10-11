@@ -10463,6 +10463,26 @@ fn emit_store_name_value(
     );
     a.cbz(9, false, slow);
     emit_exec_word_load(a, 8, 20, -8);
+    // A Number stored over a Number (the common update of a closure variable such as a stack
+    // pointer) overwrites the payload: the discriminant stays and neither word owns anything.
+    {
+        let generic = a.new_label();
+        let number = a.new_label();
+        a.fmov_d_x(0, 8);
+        a.fcmp(0, 0);
+        a.b_cond(7, number);
+        a.mov_imm64(9, crate::value::PACK_CANON_NAN);
+        a.cmp_reg_x(8, 9);
+        a.b_cond(C_NE, generic);
+        a.bind(number);
+        a.ldurb(9, 14, 0);
+        a.cmp_imm_w(9, 4);
+        a.b_cond(C_NE, generic);
+        a.stur(8, 14, 8);
+        a.sub_imm(20, 20, 8);
+        a.b(done);
+        a.bind(generic);
+    }
     emit_exec_kind(a, 8, 9, 11, slow);
     a.ldurb(9, 14, 0);
     a.cmp_imm_w(9, 5);
@@ -10625,6 +10645,32 @@ fn emit_load_name_value(
         emit_exec_clone(a, layout, 12, 13, 16, slow);
         a.b(loaded);
         a.bind(wide);
+        // The wide lexical binding of a closure variable usually holds a Number (a counter, a
+        // stack pointer) or an Object (an array view): decode those two without the general
+        // encoder. A Number word is its payload (a NaN is the canonical one); an Object
+        // word is the Object tag over the stored Rc pointer, acquired by one increment.
+        let generic = a.new_label();
+        let wide_number = a.new_label();
+        a.ldurb(10, 14, 0);
+        a.cmp_imm_w(10, 4);
+        a.b_cond(C_EQ, wide_number);
+        a.cmp_imm_w(10, 8);
+        a.b_cond(C_NE, generic);
+        a.ldur(11, 14, 8);
+        a.mov_imm64(12, crate::value::PACK_OBJ);
+        a.logic_x(1, 12, 12, 11);
+        a.ldur(13, 11, layout.rc_strong_off as i32);
+        a.add_imm(13, 13, 1);
+        a.stur(13, 11, layout.rc_strong_off as i32);
+        a.b(loaded);
+        a.bind(wide_number);
+        a.ldur(12, 14, 8);
+        a.fmov_d_x(0, 12);
+        a.fcmp(0, 0);
+        a.b_cond(7, loaded);
+        a.mov_imm64(12, crate::value::PACK_CANON_NAN);
+        a.b(loaded);
+        a.bind(generic);
     }
     a.ldur(10, 14, 0);
     a.ldur(11, 14, 8);
@@ -11463,11 +11509,6 @@ fn emit_name_ic_value_ptr_in(
     } else {
         a.b(slow);
     }
-    // --- direct scope mode: `gen` belongs to the current env ---
-    a.bind(direct_scope);
-    a.cmp_reg_w(11, 13);
-    a.b_cond(C_NE, slow);
-    a.b(scope);
     // --- depth-1 mode: `act_gen` belongs to current env; `gen` belongs to parent ---
     a.bind(depth_one);
     a.ldr_w_imm(15, 12, NAME_IC_OFF_ACT_GEN);
@@ -11521,6 +11562,10 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_reg_w(15, 13);
     a.b_cond(C_NE, slow);
     a.b(scope);
+    // --- direct scope mode: `gen` belongs to the current env; falls into the scope tail ---
+    a.bind(direct_scope);
+    a.cmp_reg_w(11, 13);
+    a.b_cond(C_NE, slow);
     // --- scope mode: binding initialized (TDZ) ---
     a.bind(scope);
     a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);

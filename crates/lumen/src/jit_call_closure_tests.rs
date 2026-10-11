@@ -157,6 +157,102 @@ out.join('|');
     );
 }
 
+#[test]
+fn closure_variables_load_and_store_every_value_kind() {
+    all_tiers(
+        r####"var out = [];
+// closure variables of every kind through reads and writes
+var mod = (function () {
+  var num = 1, neg = -0, nan = NaN, str = 'a', obj = { v: 1 }, bool = true, un, nul = null, big = 10n, sym = Symbol('s');
+  var inf = Infinity, i32 = 7;
+  function read() { return [num, neg, nan, str, obj.v, bool, un, nul, big, typeof sym, inf, i32]; }
+  function bump() { num = num + 1; i32 = i32 | 0; i32 = (i32 + 1) | 0; }
+  function swap(k) {
+    switch (k & 7) {
+      case 0: num = 'now string'; break;
+      case 1: num = 5; break;
+      case 2: num = { v: 2 }; break;
+      case 3: num = 6n; break;
+      case 4: num = null; break;
+      case 5: num = undefined; break;
+      case 6: num = NaN; break;
+      case 7: num = -0; break;
+    }
+    return num;
+  }
+  function loop(n) { var t = 0; for (var i = 0; i < n; i++) { bump(); t += i32 & 1; } return t; }
+  return { read: read, bump: bump, swap: swap, loop: loop, get num() { return num; } };
+})();
+var r = [];
+for (var i = 0; i < 30; i++) { r.push(String(mod.swap(i))); }
+out.push(r.slice(0, 10).join(','));
+out.push(JSON.stringify(mod.read().map(function (x) { return typeof x === 'bigint' ? x + 'n' : x; })).slice(0, 80));
+out.push(mod.loop(100) + ':' + mod.num);
+// stores of Number over each kind and back
+var cell = 0;
+function setCell(v) { cell = v; return cell; }
+var seq = [1, 2.5, -3, 'x', 4, {}, 5, true, 6, null, 7, undefined, 8, 9n, 10, NaN, -0, Infinity, 11];
+var o2 = [];
+for (var k = 0; k < 3; k++) for (var i = 0; i < seq.length; i++) o2.push(typeof setCell(seq[i]) + (Object.is(cell, -0) ? 'm0' : ''));
+out.push(o2.slice(0, 20).join(',') + o2.length);
+// const and TDZ
+function tdz() { try { return later; } catch (e) { return e.constructor.name; } }
+var t1 = []; for (var i = 0; i < 20; i++) t1.push(tdz());
+let later = 5;
+var t2 = []; for (var i = 0; i < 20; i++) t2.push(tdz());
+out.push(t1[19] + t2[19]);
+const K1 = 3;
+function setConst() { try { K1 = 4; } catch (e) { return e.constructor.name; } return K1; }
+var t3 = []; for (var i = 0; i < 20; i++) t3.push(setConst());
+out.push(t3[19]);
+// reassigned from another closure mid-loop
+var shared = 10;
+function useShared() { return shared + 1; }
+function reassign() { shared = 'now'; }
+var t4 = []; for (var i = 0; i < 30; i++) { if (i === 15) reassign(); t4.push(useShared()); }
+out.push(t4[0] + ',' + t4[14] + ',' + t4[15] + ',' + t4[29]);
+// global object accessors and properties
+Object.defineProperty(globalThis, 'accessorName', { get: function () { return 42; }, set: function (v) { out.push('set' + v); }, configurable: true });
+function viaGlobal() { accessorName = 1; return accessorName; }
+var t5 = []; for (var i = 0; i < 12; i++) t5.push(viaGlobal());
+out.push(t5[11]);
+// with and eval keep names resolvable
+var wv = 'outer';
+function withTest(o) { with (o) { return wv; } }
+var t6 = []; for (var i = 0; i < 12; i++) t6.push(withTest(i & 1 ? { wv: 'inner' } : {}));
+out.push(t6.slice(0, 4).join(','));
+function evalTest() { var v = 1; eval('var added = 5'); return v + added; }
+var t7 = []; for (var i = 0; i < 12; i++) t7.push(evalTest());
+out.push(t7[11]);
+// delete and re-add through eval in sloppy mode changes resolution
+var dyn = 'global-dyn';
+function dynRead() { return dyn; }
+function shadow() { eval('var dyn = "local"'); return dyn + '/' + dynRead(); }
+var t8 = []; for (var i = 0; i < 12; i++) t8.push(shadow());
+out.push(t8[11]);
+// function calls through closure variables holding different callees
+var fn = function () { return 'A'; };
+function callFn() { return fn(); }
+var t9 = []; for (var i = 0; i < 20; i++) { if (i === 10) fn = function () { return 'B'; }; t9.push(callFn()); }
+out.push(t9[9] + t9[10]);
+// Math builtins through closure variables
+var imul = Math.imul, floor = Math.floor, sqrt = Math.sqrt;
+function mathCalls(a, b) { return imul(a, b) + floor(a / 3) + sqrt(a * a); }
+var t10 = []; for (var i = 0; i < 20; i++) t10.push(mathCalls(i + 1.5, 65537 + i));
+out.push(t10[19] + ',' + t10[0]);
+imul = function () { return 'replaced'; };
+out.push(mathCalls(3, 4));
+// getters on the scope's object via Proxy global lookups are not involved; symbol/BigInt values
+var big = 2n ** 64n; var symv = Symbol.iterator;
+function readBig() { return big + 1n; }
+var t11 = []; for (var i = 0; i < 12; i++) t11.push(readBig());
+out.push(String(t11[11]) + (symv === Symbol.iterator));
+out.join('|');
+"####,
+        "now string,5,[object Object],6,null,undefined,NaN,0,now string,5|[null,0,null,\"a\",1,true,null,null,\"10n\",\"symbol\",null,7]|50:NaN|number,number,number,string,number,object,number,boolean,number,object,number,undefined,number,bigint,number,number,numberm0,number,number,number57|ReferenceError5|TypeError|11,11,now1,now1|set1|set1|set1|set1|set1|set1|set1|set1|set1|set1|set1|set1|42|outer,inner,outer,inner|6|local/global-dyn|AB|1311146.5,65538.5|replaced13|18446744073709551617true",
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 fn owners(engine: &mut Engine, name: &str) -> usize {
     use crate::value::Value;
