@@ -94,6 +94,10 @@ mod assignment_tests;
 mod call_reference_tests;
 
 #[cfg(test)]
+#[path = "jit_call_closure_tests.rs"]
+mod call_closure_tests;
+
+#[cfg(test)]
 #[path = "jit_osr_entry_tests.rs"]
 mod osr_entry_tests;
 
@@ -2694,6 +2698,29 @@ mod asm {
             let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
             self.emit(0xA940_0000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1);
         }
+        /// stp xt1, xt2, [xn, #imm] (signed offset, any base register)
+        pub fn stp_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+            debug_assert!(
+                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
+                "AArch64 STP signed offset out of imm7 range: {imm_bytes}"
+            );
+            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
+            self.emit(0xA900_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
+        }
+        /// ldp xt1, xt2, [xn], #imm (post-index, any base register)
+        pub fn ldp_post_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+            debug_assert!(
+                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
+                "AArch64 LDP post-index offset out of imm7 range: {imm_bytes}"
+            );
+            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
+            self.emit(0xA8C0_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
+        }
+        /// ccmp xn, xm, #nzcv, cond: when `cond` holds compare, else set the flags to `nzcv`.
+        pub fn ccmp_reg_x(&mut self, rn: u32, rm: u32, nzcv: u32, cond: u32) {
+            debug_assert!(nzcv < 16 && cond < 16);
+            self.emit(0xFA40_0000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv);
+        }
         pub fn blr(&mut self, rn: u32) {
             self.emit(0xD63F_0000 | (rn << 5));
         }
@@ -3082,6 +3109,10 @@ mod asm {
         pub fn adds_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {
             debug_assert!(imm < 4096);
             self.emit(0x3100_0000 | (imm << 10) | (rn << 5) | rd);
+        }
+        /// subs wd, wn, wm (sets flags)
+        pub fn subs_reg_w(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x6B00_0000 | (rm << 16) | (rn << 5) | rd);
         }
         /// subs wd, wn, #imm12 (sets flags; V on i32 overflow)
         pub fn subs_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {
@@ -7597,18 +7628,34 @@ fn emit_direct_call(
     }
     a.bind(moved);
     // Initialize every remaining local (from slot w6) to a complete packed Undefined word.
+    // The count w4 = n_slots - w6 is stored four words per iteration (two STPs), then a pair
+    // and a single word for the remainder; x5 = n_slots survives for the installation below.
     a.ldrh_imm(5, 12, IC_NSLOTS);
-    a.movz(4, 8, 0);
     a.mov_imm64(17, crate::value::PACK_UNDEFINED);
-    let init_loop = a.new_label();
     let init_done = a.new_label();
-    a.bind(init_loop);
-    a.cmp_reg_w(6, 5);
-    a.b_cond(C_HS, init_done);
-    a.madd(3, 6, 4, 15);
-    a.stur(17, 3, 0);
-    a.add_imm(6, 6, 1);
-    a.b(init_loop);
+    a.subs_reg_w(4, 5, 6);
+    a.b_cond(C_LS, init_done); // n_slots <= first uninitialized slot: nothing left
+    a.add_shifted(3, 15, 6, 3);
+    let init_pair = a.new_label();
+    let init_single = a.new_label();
+    let init_quad = a.new_label();
+    a.lsr_imm_w(16, 4, 2);
+    a.cbz(16, false, init_pair);
+    a.bind(init_quad);
+    a.stp_base(17, 17, 3, 0);
+    a.stp_base(17, 17, 3, 16);
+    a.add_imm(3, 3, 32);
+    a.subs_imm_w(16, 16, 1);
+    a.b_cond(C_NE, init_quad);
+    a.bind(init_pair);
+    a.logic_imm_w(0, 16, 4, asm::logical_imm_w(2).unwrap());
+    a.cbz(16, false, init_single);
+    a.stp_base(17, 17, 3, 0);
+    a.add_imm(3, 3, 16);
+    a.bind(init_single);
+    a.logic_imm_w(0, 16, 4, asm::logical_imm_w(1).unwrap());
+    a.cbz(16, false, init_done);
+    a.str_imm(17, 3, 0);
     a.bind(init_done);
 
     // ---- install the callee's per-frame fields in its own record ----
@@ -8490,6 +8537,7 @@ fn emit_direct_finish_stub(
             a.ldur(10, 31, 16);
             a.movz(14, low_heap_tag, 0);
             a.movz(15, object_tag, 0);
+            a.mov_imm64(16, crate::value::PACK_BIGINT);
         };
         // callee `this`, then reset the record's binding to Undefined (a pooled invariant) on
         // every path. `jit_drop_at` destroys the Value in place without overwriting it, so a
@@ -8514,50 +8562,79 @@ fn emit_direct_finish_stub(
         a.bind(this_done);
         a.strb_imm(31, 10, cx_this);
         // slots
-        let c_loop = a.new_label();
-        let c_next = a.new_label();
-        let c_drop = a.new_label();
-        let c_done = a.new_label();
         a.ldr_imm(9, 10, cx_slots);
         a.ldr_imm(5, 10, cx_n_slots);
         a.movz(14, low_heap_tag, 0);
         a.movz(15, object_tag, 0);
-        let packed_ref = a.new_label();
-        let low_heap = a.new_label();
-        let high_heap = a.new_label();
-        a.bind(c_loop);
-        a.cbz(5, true, c_done);
-        a.ldur(11, 9, 0);
-        a.lsr_imm(13, 11, 48);
-        // Scalars (Numbers, Undefined/Null/Boolean/Empty) are the common case: two unsigned
-        // range tests classify every tag. BigInt/String/Symbol occupy the three tags from
-        // PACK_BIGINT; Object and the property-only tags start at PACK_OBJ. No Number can
-        // carry a tag at or above PACK_OBJ because packing canonicalizes NaN.
-        a.sub_reg(12, 13, 14);
-        a.cmp_imm_w(12, 2);
-        a.b_cond(C_LS, low_heap);
-        a.cmp_reg_w(13, 15);
-        a.b_cond(C_HS, high_heap);
-        a.b(c_next);
-        a.bind(low_heap);
-        a.cbz(12, false, c_drop); // BigInt → full drop
-        a.b(packed_ref); // String / Symbol
-        a.bind(high_heap);
-        a.b_cond(C_HI, c_drop); // property-only tags never get the bare decrement
-        a.bind(packed_ref);
-        emit_exec_payload(a, 11, 12);
-        a.ldur(13, 12, 0);
-        a.cmp_imm_x(13, 1);
-        a.b_cond(C_LS, c_drop); // last reference
-        a.sub_imm(13, 13, 1);
-        a.stur(13, 12, 0);
-        a.b(c_next);
-        a.bind(c_drop);
-        drop_at(a, 9, H_DROP_PACKED_AT);
-        a.bind(c_next);
+        // The classification of one slot at [x9] (x9 and x5 survive; a drop helper re-derives
+        // x10, w14, w15 and x16 afterwards).
+        let one_slot = |a: &mut asm::Asm| {
+            let c_next = a.new_label();
+            let c_drop = a.new_label();
+            let packed_ref = a.new_label();
+            let low_heap = a.new_label();
+            let high_heap = a.new_label();
+            a.ldur(11, 9, 0);
+            a.lsr_imm(13, 11, 48);
+            // Scalars (Numbers, Undefined/Null/Boolean/Empty) are the common case: two unsigned
+            // range tests classify every tag. BigInt/String/Symbol occupy the three tags from
+            // PACK_BIGINT; Object and the property-only tags start at PACK_OBJ. No Number can
+            // carry a tag at or above PACK_OBJ because packing canonicalizes NaN.
+            a.sub_reg(12, 13, 14);
+            a.cmp_imm_w(12, 2);
+            a.b_cond(C_LS, low_heap);
+            a.cmp_reg_w(13, 15);
+            a.b_cond(C_HS, high_heap);
+            a.b(c_next);
+            a.bind(low_heap);
+            a.cbz(12, false, c_drop); // BigInt → full drop
+            a.b(packed_ref); // String / Symbol
+            a.bind(high_heap);
+            a.b_cond(C_HI, c_drop); // property-only tags never get the bare decrement
+            a.bind(packed_ref);
+            emit_exec_payload(a, 11, 12);
+            a.ldur(13, 12, 0);
+            a.cmp_imm_x(13, 1);
+            a.b_cond(C_LS, c_drop); // last reference
+            a.sub_imm(13, 13, 1);
+            a.stur(13, 12, 0);
+            a.b(c_next);
+            a.bind(c_drop);
+            drop_at(a, 9, H_DROP_PACKED_AT);
+            a.bind(c_next);
+        };
+        // Pairs first. Every word below PACK_BIGINT (non-negative Numbers, Undefined, Empty,
+        // Null, Boolean) owns nothing, so one unsigned compare per word clears two slots; a
+        // pair holding anything else (a negative Number included) takes the full per-slot test
+        // above, then the scan resumes.
+        let pair_loop = a.new_label();
+        let pair_slow = a.new_label();
+        let pair_next = a.new_label();
+        let tail = a.new_label();
+        let c_done = a.new_label();
+        a.mov_imm64(16, crate::value::PACK_BIGINT);
+        a.subs_imm_w(5, 5, 2); // w5 = slots left after this pair
+        a.b_cond(C_LO, tail);
+        a.bind(pair_loop);
+        a.ldp_post_base(11, 12, 9, 16);
+        a.cmp_reg_x(11, 16);
+        a.ccmp_reg_x(12, 16, 2, C_LO); // x11 >= bound: force HS
+        a.b_cond(C_HS, pair_slow);
+        a.bind(pair_next);
+        a.subs_imm_w(5, 5, 2);
+        a.b_cond(C_HS, pair_loop);
+        a.bind(tail);
+        a.adds_imm_w(5, 5, 2); // 0 or 1 slot left
+        a.cbz(5, false, c_done);
+        one_slot(a);
+        a.b(c_done);
+        a.bind(pair_slow);
+        a.sub_imm(9, 9, 16);
+        one_slot(a);
         a.add_imm(9, 9, 8);
-        a.sub_imm(5, 5, 1);
-        a.b(c_loop);
+        one_slot(a);
+        a.add_imm(9, 9, 8);
+        a.b(pair_next);
         a.bind(c_done);
         // Bookkeeping (x14/x16/x7 may be stale after helper drops: re-read everything).
         a.ldr_imm(14, 19, 72); // ctx.interp
