@@ -15028,7 +15028,7 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::StoreConstCap(n) => {
                 pop!();
-                chunk.reject_const_cap_store(i, env, n)?;
+                chunk.reject_const_cap_store(i, cap_env, n)?;
                 unreachable!("immutable captured store always completes abruptly");
             }
             Op::UpdateConst(n, kind) => {
@@ -20629,12 +20629,15 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
             unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
         }
     } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
-        // As in jit_exec_inner, env_raw is the activation swapped for this native frame, not
-        // a borrowed pointer to the caller's environment. Its existing owner outlives the call.
+        // As in jit_exec_inner, env_raw is the running environment swapped for this native
+        // frame, not a borrowed pointer to the caller's environment. Its existing owner outlives
+        // the call. The captured binding lives in the body's activation record, which env_raw
+        // leaves inside a block or `with` scope.
         let env = std::mem::ManuallyDrop::new(unsafe {
             Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
         });
-        chunk.release_overwritten_captured_string(&env, *name, &left);
+        let cap_env = unsafe { jit_cap_env(ctx, &env) };
+        chunk.release_overwritten_captured_string(cap_env, *name, &left);
     }
 
     unsafe { base.write(PackedValue::pack(Value::Str(left.concat_owned(&right)))) };
@@ -23587,6 +23590,26 @@ fn stage_tail_call(
     Ok(())
 }
 
+/// The Environment Record holding the compiler-homed captures (`LoadCap`/`StoreCap`) of the body
+/// running in `ctx`: its activation's fixed record. The running LexicalEnvironment `env` (the
+/// swapped `env_raw`) leaves that record while a block, loop, catch, `with` or class scope of the
+/// same body is active (`PushLex`, `PushWith`, ...), whose own bindings it holds instead.
+unsafe fn jit_cap_env<'a>(ctx: &'a crate::jit::JitCtx, env: &'a Env) -> &'a Env {
+    ctx.activation
+        .as_ref()
+        .filter(|activation| activation.chunk == ctx.chunk)
+        .map_or_else(
+            || {
+                if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
+                    &*(*ctx.resume_activation).cap_env
+                } else {
+                    env
+                }
+            },
+            |activation| &activation.cap_env,
+        )
+}
+
 unsafe fn jit_exec_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
@@ -23604,20 +23627,7 @@ unsafe fn jit_exec_inner(
         Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
     });
     let env: &Env = &env_h;
-    let cap_env = ctx
-        .activation
-        .as_ref()
-        .filter(|activation| activation.chunk == ctx.chunk)
-        .map_or_else(
-            || {
-                if !ctx.resume_activation.is_null() && (*ctx.resume_activation).chunk == ctx.chunk {
-                    &*(*ctx.resume_activation).cap_env
-                } else {
-                    env
-                }
-            },
-            |activation| &activation.cap_env,
-        );
+    let cap_env = jit_cap_env(ctx, env);
     let slots = std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots);
     macro_rules! pop {
         () => {{

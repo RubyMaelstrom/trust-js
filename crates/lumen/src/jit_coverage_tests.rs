@@ -244,6 +244,28 @@ fn general_region_tagged_equality_keeps_coercion_and_nan_rules() {
     );
 }
 
+#[test]
+fn captured_const_store_inside_a_block_scope_throws() {
+    // SetMutableBinding on an immutable binding throws a TypeError (ECMA-262
+    // DeclarativeEnvironmentRecord.SetMutableBinding); the captured `const` lives in the body's
+    // activation record, not in the loop's per-iteration record running the assignment.
+    assert_tiers(
+        r#"
+        function f() {
+            const c = 1;
+            var g = function () { return c; };
+            for (let j = 0; j < 1; j++) {
+                var h = function () { return j; };
+                try { c = 2; } catch (e) { return e.constructor.name + ' ' + g() + h(); }
+            }
+            return 'no error';
+        }
+        [f(), f(), f()].join(',')
+    "#,
+        "TypeError 10,TypeError 10,TypeError 10",
+    );
+}
+
 use crate::{bytecode::Tier, Completion, Engine};
 
 fn assert_tiers(source: &str, expected: &str) {

@@ -246,6 +246,40 @@ fn string_concat_helpers_reach_compiled_tiers() {
 }
 
 #[test]
+fn captured_string_append_inside_nested_scopes() {
+    // A body's captured `s` stays in its activation record while a loop, block, catch, `with`
+    // or class scope is the running LexicalEnvironment (ECMA-262 ForBodyEvaluation and
+    // CreatePerIterationEnvironment, BlockDeclarationInstantiation, CatchClauseEvaluation,
+    // the with statement, ClassDefinitionEvaluation). The compiled `+=` into it must find the
+    // binding there; generator bodies resume on a separate continuation.
+    check(
+        r#"
+        function scopes() {
+            var s = '', read = function () { return s; };
+            for (let i = 0; i < 40; i++) {
+                var seen = function () { return i; };
+                s += 'a';
+            }
+            { let j = 1; var block = function () { return j; }; s = s + 'b'; }
+            try { throw 'e'; } catch (e) { var caught = function () { return e; }; s += 'c'; }
+            with ({ unrelated: 1 }) { s += 'd'; }
+            class A extends (s += 'e', Object) { [(s += 'f', 'k')]() { return A; } }
+            return read().length + ':' + read().slice(-6) + ':' + seen() + block() + caught();
+        }
+        function* generator() {
+            var s = '', read = () => s;
+            for (let i = 0; i < 3; i++) { var q = () => i; s += 'g'; yield s; }
+            return read();
+        }
+        var out = [];
+        for (var n = 0; n < 3; n++) out.push(scopes(), [...generator()].join(','));
+        out.join('|')
+    "#,
+        "45:abcdef:391e|g,gg,ggg|45:abcdef:391e|g,gg,ggg|45:abcdef:391e|g,gg,ggg",
+    );
+}
+
+#[test]
 fn local_string_store_preserves_rhs_changes_aliases_and_exceptions() {
     check(r#"
         function build() {
