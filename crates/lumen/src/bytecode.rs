@@ -13043,8 +13043,15 @@ impl Compiler {
             Expr::Unary { op, arg } => {
                 match *op {
                     "-" => {
-                        self.expr(arg)?;
-                        self.emit(Op::Neg);
+                        // ECMA-262 §13.5.5 unary minus of a Number literal: the negated Number
+                        // (`-0` is the negative zero), a constant.
+                        if let Expr::Num(n) = &**arg {
+                            let i = self.const_idx(Value::Num(-*n));
+                            self.emit(Op::Const(i));
+                        } else {
+                            self.expr(arg)?;
+                            self.emit(Op::Neg);
+                        }
                     }
                     "+" => {
                         self.expr(arg)?;

@@ -285,6 +285,40 @@ out.join('|');
     );
 }
 
+/// ECMA-262 §13.5.5 unary minus: literals are constants (`-0` is negative zero) and a Number
+/// operand negates exactly in the native template; BigInt, strings, objects and Symbols
+/// keep the checked ToNumeric semantics.
+#[test]
+fn unary_minus_negates_numbers_natively_and_coerces_everything_else() {
+    all_tiers(
+        r####"var out = [];
+function neg(x) { return -x; }
+function negPair(x, y) { var a = -x; var b = -y; return Object.is(a, -0) + ',' + a + ',' + b; }
+function lit() { return [-0, -5, -1.5, -(2), - -3, -NaN, -Infinity, -1e300, -0x10, -2147483648, -4294967296].map(function (v) { return Object.is(v, -0) ? '-0' : String(v); }).join(';'); }
+var vals = [0, -0, 1, -1, 2.5, NaN, Infinity, -Infinity, '5', '', 'abc', true, false, null, undefined, 7n, -7n, { valueOf: function () { return 3; } }, [4], [], { valueOf: function () { return 5n; } }];
+var res = [];
+for (var round = 0; round < 12; round++) {
+  res = [];
+  for (var i = 0; i < vals.length; i++) {
+    var v;
+    try { v = neg(vals[i]); res.push(Object.is(v, -0) ? '-0' : typeof v === 'bigint' ? v + 'n' : String(v)); } catch (e) { res.push(e.constructor.name); }
+  }
+}
+out.push(res.join(','));
+var l = []; for (var i = 0; i < 20; i++) l.push(lit()); out.push(l[19]);
+var p = []; for (var i = 0; i < 20; i++) p.push(negPair(i - 3, 0)); out.push(p[0] + '|' + p[3] + '|' + p[19]);
+try { for (var i = 0; i < 12; i++) neg(Symbol('s')); } catch (e) { out.push(e.constructor.name); }
+function loopNeg(n) { var s = 0; for (var i = 0; i < n; i++) { s = -s + i; } return s; }
+out.push(loopNeg(1000));
+function negStr(s) { return -s; }
+var ns = []; for (var i = 0; i < 12; i++) ns.push(negStr('12') + negStr(' 0x10 ') + negStr('1e3'));
+out.push(ns[11]);
+out.join('|');
+"####,
+        "-0,0,-1,1,-2.5,NaN,-Infinity,Infinity,-5,-0,NaN,-1,-0,-0,NaN,-7n,7n,-3,-4,-0,-5n|-0;-5;-1.5;-2;3;NaN;-Infinity;-1e+300;-16;-2147483648;-4294967296|false,3,0|true,0,0|false,-16,0|TypeError|500|-1028",
+    );
+}
+
 /// A hot loop body of hundreds of operations reads closure variables of every kind in line; the
 /// values, accumulations and a replaced callee agree with the interpreter.
 #[test]

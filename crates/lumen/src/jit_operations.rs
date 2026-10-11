@@ -463,6 +463,20 @@ pub(super) fn emit(
         Op::Not if fast & 131072 != 0 && eq_inlinable(layout) => {
             emit_not_inline(a, layout, pc as u32, unwind);
         }
+        Op::Neg if fast & 1 != 0 && layout.valid => {
+            // ECMA-262 §13.5.5: the negation of a Number operand is the exact Number (the
+            // store canonicalizes a NaN); every other operand takes the checked helper.
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -8);
+            emit_exec_number_guard(a, 9, 0, 11, slow);
+            a.fneg(0, 0);
+            emit_exec_number_store(a, 0, 20, -8, 9);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
+        }
         Op::SetProp(_, cache) | Op::SetPropDrop(_, cache)
             if fast & 65536 != 0 && rc_ok && set_prop_inlinable(layout) =>
         {
