@@ -13,8 +13,8 @@
 //! coercing stores.
 
 use super::{
-    asm, emit_exec_number_guard, emit_exec_word_load, jscvt_available, C_EQ, C_GE, C_HS, C_LO,
-    C_LS, C_VS,
+    asm, emit_exec_number_guard, emit_exec_word_load, jscvt_available, SharedStub, C_EQ, C_GE,
+    C_HS, C_LO, C_LS, C_VS,
 };
 use crate::native_typed_array::{
     Layout as NativeLayout, NativeBuffer as Buffer, NativeTypedArray as View,
@@ -38,6 +38,21 @@ const I32: u32 = 5;
 const F32: u32 = 6;
 const F64: u32 = 7;
 const U8_CLAMPED: u32 = 8;
+
+/// Whether element accesses call the process-wide shared stub (see [`emit_access`]) instead of
+/// carrying the sequence in line. A stub keeps every site small (the sequence is about a hundred
+/// words with its element kinds) at the price of a call and return per access.
+/// `LUMEN_JIT_TYPED_STUBS`: `0` in line everywhere, `1` stubs everywhere, anything else (the
+/// default) stubs except in loop bodies that keep their name probes in line.
+fn use_stub(a: &asm::Asm) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("LUMEN_JIT_TYPED_STUBS").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => 2,
+    });
+    super::shared_stubs_enabled() && (mode == 1 || (mode == 2 && !a.hot()))
+}
 
 /// X11 = Object, X9 = exact unsigned index. On read, X12 is a packed Number and D1 its
 /// numeric value. The caller chooses the ownership/stack commit at `hit`.
@@ -65,7 +80,20 @@ pub(super) fn emit(
         Some(WriteValue::Register(register)) => a.fmov_d_d(1, register),
         None => {}
     }
-    emit_access(a, &native, write.is_some(), hit, slow);
+    if use_stub(a) {
+        // The stub returns W13 = 1 after an access and 0 when this template declines it.
+        let stub = a.shared_stub(
+            SharedStub::TypedElement {
+                write: write.is_some(),
+            }
+            .key(),
+        );
+        a.bl_label(stub);
+        a.cbz(13, false, slow);
+        a.b(hit);
+    } else {
+        emit_access(a, &native, write.is_some(), hit, slow);
+    }
     a.mark_pop();
 }
 

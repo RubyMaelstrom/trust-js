@@ -83,6 +83,12 @@ The default tier is JIT. Useful diagnostic controls:
   `LUMEN_JIT_MAP=1` prints in its `[jit-map-range]` lines, which singles out one function among
   many that share names. Any value of `LUMEN_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base
   and length) per compiled chunk.
+- `LUMEN_JIT_NO_NAME_ELEM=1` compiles `LoadName K; <pure key>; GetElem/SetElemDrop` register
+  regions with the ordinary LoadName and element templates instead of reading a typed array
+  straight from its binding (see `NameElementPlan` in `jit_regions.rs`).
+- `LUMEN_JIT_TYPED_STUBS=0|1` carries the native typed-array element sequence in line (0) or
+  calls the process-wide shared stub from every site (1); by default sites in loop bodies that
+  keep their name probes in line also keep it in line.
 - On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

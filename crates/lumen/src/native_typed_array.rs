@@ -88,7 +88,9 @@ impl Interp {
             buffer_ptr: Rc::as_ptr(&buffer),
             offset: info.offset,
             end,
-            limit: if info.track { 0 } else { info.len },
+            // Native element counts stay within the signed 32-bit range: generated code may
+            // then reject a negative key by its unsigned magnitude alone.
+            limit: if info.track { 0 } else { info.len.min(1 << 31) },
             kind,
             shift: size.trailing_zeros() as u8,
             buffer,

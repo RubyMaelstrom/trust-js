@@ -1635,6 +1635,324 @@ fn int32_binary(
     }
 }
 
+/// `LoadName K; <key>; GetElem` and `LoadName K; <key>; <value>; SetElemDrop` where the operands
+/// between the name and the element operation are pure Number arithmetic over numeric homes and
+/// constants. Nothing there can observe or change the binding, throw, or run author code (a
+/// guard that fails resumes at the LoadName with the stack as it was), so the name is read after
+/// them (ECMA-262 §13.3.2 EvaluatePropertyAccessWithExpressionKey, TypedArrayGetElement §10.4.5.15,
+/// TypedArraySetElement §10.4.5.16): a typed array bound to the name is accessed straight from
+/// its binding, with no owning copy on the operand stack, and everything else (a different
+/// kind of receiver, a stale name cache, an out-of-bounds or detached view, a throw) runs the
+/// ordinary LoadName and element templates in a cold continuation.
+#[derive(Clone, Copy)]
+struct NameElementPlan {
+    elem_pc: usize,
+    set: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_name_element(
+    chunk: &Chunk,
+    ops: &[Op],
+    name_pc: usize,
+    end: usize,
+    source_targets: &[bool],
+    plan: &Plan,
+    layout: &crate::value::JitLayout,
+    fast: u32,
+    pre_len: usize,
+) -> Option<NameElementPlan> {
+    if env_flag!("LUMEN_JIT_NO_NAME_ELEM")
+        || !layout.valid
+        || layout.native_typed_array.is_none()
+        || layout.entry_accessor != layout.entry_value + 8
+        || fast & 8192 == 0
+        || !load_name_inlinable(layout)
+    {
+        return None;
+    }
+    let mut depth = 0usize; // operands above the (absent) name
+    for pc in name_pc + 1..end {
+        if source_targets[pc] {
+            return None;
+        }
+        match ops[pc] {
+            Op::GetElem if depth == 1 && fast & 1024 != 0 && get_elem_inlinable(layout) => {
+                return Some(NameElementPlan {
+                    elem_pc: pc,
+                    set: false,
+                });
+            }
+            Op::SetElemDrop if depth == 2 && fast & 2048 != 0 && elem_inlinable(layout) => {
+                return Some(NameElementPlan {
+                    elem_pc: pc,
+                    set: true,
+                });
+            }
+            // A numeric home, or a frame slot read as a Number (a miss replays the LoadName).
+            Op::LoadLocal(slot) if slot < 256 && plan.tagged_reg(slot).is_none() => depth += 1,
+            Op::Const(k) if chunk.jit_const_num(k).is_some() => depth += 1,
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+                if depth >= 2 =>
+            {
+                depth -= 1
+            }
+            Op::BitNot | Op::Neg if depth >= 1 => {}
+            _ => return None,
+        }
+        if pre_len + 1 + depth > 15 {
+            return None;
+        }
+    }
+    None
+}
+
+/// The cold continuation of one fused name/element site (see [`NameElementPlan`]).
+struct NameElementFallback {
+    /// The name cache did not validate, or a typed-array guard failed: run the whole LoadName.
+    name_miss: usize,
+    /// The name validated (x14 = its value, x7 = storage kind) but is not a typed array: clone
+    /// the value without probing again.
+    value_miss: usize,
+    join: usize,
+    /// The operand stack below the name, as the site found it. With `lazy` set some of it is
+    /// still virtual (registers only) and `physical` words are in memory: the continuation
+    /// publishes all of it, runs the ordinary templates, and restores the virtual picture.
+    pre: Vec<Operand>,
+    physical: usize,
+    lazy: bool,
+    cache_ptr: usize,
+    preferred: Option<u64>,
+    name_pc: usize,
+    elem_pc: usize,
+    set: bool,
+    key: Operand,
+    value: Option<Operand>,
+}
+
+/// Where an operand awaits, virtual, above the stack pointer: constants are published as their
+/// own word, registers canonicalized like any numeric stack store.
+fn stash_operand(a: &mut asm::Asm, operand: Operand, index: usize, offset: i32) {
+    match operand {
+        Operand::Constant(value) => {
+            a.mov_imm64(9, f64::from(value).to_bits());
+            emit_exec_word_store(a, 9, 20, offset);
+        }
+        _ => emit_exec_number_store(a, 16 + index as u32, 20, offset, 9),
+    }
+}
+
+/// The fast path of a fused site, entered with the operand stack canonical up to `pre_len` and
+/// the key (and value) virtual above it. On a hit the result of a get is on the stack (canonical
+/// word); a set leaves nothing.
+#[allow(clippy::too_many_arguments)]
+fn emit_name_element(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    chunk: &Chunk,
+    stack: &mut [Operand],
+    physical: usize,
+    pre: Vec<Operand>,
+    lazy: bool,
+    name_pc: usize,
+    plan: NameElementPlan,
+) -> NameElementFallback {
+    let ops = chunk.jit_ops();
+    let Op::LoadName(_, cache) = ops[name_pc] else {
+        unreachable!("planned at a LoadName")
+    };
+    let cache_ptr = chunk.jit_name_cache_ptr(cache);
+    let name_miss = a.new_label();
+    let value_miss = a.new_label();
+    let join = a.new_label();
+    let hit = a.new_label();
+    a.mark_push("name-elem");
+    let key_index = pre.len();
+    let key = stack[key_index];
+    let value = plan.set.then(|| stack[key_index + 1]);
+    // Registers for the operands (a constant key needs none: it is an immediate below).
+    for (index, operand) in [(key_index, Some(key)), (key_index + 1, value)] {
+        if let Some(operand) = operand {
+            if !matches!(operand, Operand::Constant(_)) || index != key_index {
+                number(a, stack, physical, index, name_miss);
+            }
+        }
+    }
+
+    // The binding: x14 = its value, x7 = 0 for a wide scope binding, 1 for a packed global
+    // property (the shared probe of LoadName).
+    a.mov_imm64(12, cache_ptr as u64);
+    if shared_stubs_enabled() {
+        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok: true }.key());
+        a.bl_label(stub);
+        a.cbz(9, false, name_miss);
+    } else {
+        emit_name_ic_value_ptr_body(a, layout, name_miss, true);
+    }
+    // x10 = the Object's allocation. A wide scope binding holds its Value (tag byte, then the
+    // payload word); a packed global property holds the encoded word.
+    let have = a.new_label();
+    let wide = a.new_label();
+    a.cbz(7, false, wide);
+    a.ldur(12, 14, 0);
+    emit_exec_tag_guard(a, 12, crate::value::PACK_OBJ, 13, value_miss);
+    emit_exec_payload(a, 12, 10);
+    a.b(have);
+    a.bind(wide);
+    a.ldurb(13, 14, 0);
+    a.cmp_imm_w(13, 8); // Value::Obj
+    a.b_cond(C_NE, value_miss);
+    a.ldur(10, 14, 8);
+    a.bind(have);
+    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
+    a.b_cond(C_NE, value_miss);
+    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
+    a.cbnz(12, false, value_miss);
+    // The index: exactly a u32 (negative and fractional keys, NaN and -0 miss).
+    match key {
+        Operand::Constant(index) if index >= 0 => a.mov_imm64(9, index as u64),
+        Operand::Constant(_) => a.b(value_miss),
+        _ if jscvt_available() => {
+            // FJCVTZS reports in Z that the key is an integer within int32 (so -0, fractions,
+            // NaN and anything beyond decline); a negative key is then a u32 above 2^31, which
+            // no native view's element count (at most 2^31) admits.
+            a.fjcvtzs_w_d(9, 16 + key_index as u32);
+            a.b_cond(C_NE, value_miss);
+        }
+        _ => {
+            let reg = 16 + key_index as u32;
+            a.fcvtzu_w_d(9, reg);
+            a.ucvtf_d_w(0, 9);
+            a.fcmp(reg, 0);
+            a.b_cond(C_NE, value_miss);
+        }
+    }
+    let write = value.map(|_| typed_array::WriteValue::Register(16 + key_index as u32 + 1));
+    typed_array::emit(a, layout, write, hit, name_miss);
+    a.bind(hit);
+    if !plan.set {
+        if lazy {
+            // The result stays a register: nothing touches the operand stack.
+            a.fmov_d_d(16 + key_index as u32, 1);
+        } else {
+            emit_exec_word_store(a, 12, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
+    }
+    a.bind(join);
+    a.mark_pop();
+    NameElementFallback {
+        name_miss,
+        value_miss,
+        join,
+        pre,
+        physical,
+        lazy,
+        cache_ptr,
+        preferred: chunk.jit_name_number(cache),
+        name_pc,
+        elem_pc: plan.elem_pc,
+        set: plan.set,
+        key,
+        value,
+    }
+}
+
+fn emit_name_element_fallback(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    f: &NameElementFallback,
+    unwind: usize,
+    bails: &mut Vec<Bailout>,
+) {
+    a.mark_push("name-elem-fallback");
+    let pre_len = f.pre.len();
+    let full = a.new_label();
+    let common = a.new_label();
+    // Entered with the operand stack as the fast path left it: publish what is virtual, then
+    // set the key (and value) in their slots above the name's.
+    let prefix = |a: &mut asm::Asm| {
+        if f.lazy {
+            materialize(a, layout, &f.pre, f.physical);
+        }
+        stash_operand(a, f.key, pre_len, 8);
+        if let Some(value) = f.value {
+            stash_operand(a, value, pre_len + 1, 16);
+        }
+    };
+    a.bind(f.name_miss);
+    prefix(a);
+    a.bind(full);
+    emit_load_name_inline(
+        a,
+        layout,
+        f.cache_ptr,
+        f.preferred,
+        f.name_pc as u32,
+        unwind,
+        false,
+    );
+    a.b(common);
+    a.bind(f.value_miss);
+    prefix(a);
+    emit_load_name_value(a, layout, f.preferred, full, false);
+    a.bind(common);
+    a.add_imm(20, 20, 8 * (1 + u32::from(f.set)));
+    if f.set {
+        emit_set_elem_inline(a, layout, f.elem_pc as u32, unwind, false);
+    } else {
+        emit_get_elem_inline(a, layout, f.elem_pc as u32, unwind);
+    }
+    if f.lazy {
+        // Back to the register picture of the fast path: the sums and offsets that were only
+        // in registers are reloaded from the words just published, the result (a get demanded
+        // as a Number) is guarded, and the stack pointer returns to the memory extent the
+        // fast path left.
+        let top = pre_len + usize::from(!f.set);
+        for (index, operand) in f.pre.iter().enumerate() {
+            let dirty = matches!(operand, Operand::Scalar(state) if state.canonical_slot.is_none());
+            if dirty {
+                emit_exec_word_load(a, 9, 20, (index as i32 - top as i32) * 8);
+                a.fmov_d_x(16 + index as u32, 9);
+            }
+        }
+        if !f.set {
+            let miss = a.new_label();
+            // A result that is not a Number resumes after the element operation with the
+            // whole operand stack in memory, which is where it is.
+            bails.push((
+                miss,
+                f.elem_pc + 1,
+                vec![Operand::Canonical; top],
+                top,
+                true,
+            ));
+            emit_exec_word_load(a, 9, 20, -8);
+            emit_exec_number_guard(a, 9, 16 + pre_len as u32, 10, miss);
+        }
+        // The fast path leaves the stack pointer where the site found it, which may lie beyond
+        // the words that are still live (popped numeric operands).
+        if top > f.physical {
+            a.sub_imm(20, 20, ((top - f.physical) * 8) as u32);
+        } else if top < f.physical {
+            a.add_imm(20, 20, ((f.physical - top) * 8) as u32);
+        }
+    }
+    a.b(f.join);
+    a.mark_pop();
+}
+
 /// Route only edges whose operand owners are already canonical. Internal forward
 /// edges need no stub; backedges retain the poll and external exits retain local
 /// publication. This does not apply to the unique InlineGuard success edge, which
@@ -1737,6 +2055,7 @@ pub(super) fn emit(
         .collect();
     let mut exits = Vec::new();
     let mut bails: Vec<Bailout> = Vec::new();
+    let mut fused: Vec<NameElementFallback> = Vec::new();
     let mut edges = CanonicalEdges::new(&labels);
     let mut guard_misses = Vec::new();
     let mut result_misses = Vec::new();
@@ -1826,6 +2145,8 @@ pub(super) fn emit(
                 )
             };
         let mut consumed = 0;
+        // A pending `LoadName`: its pc, the fused site's plan and the canonical stack below it.
+        let mut fusing: Option<(usize, NameElementPlan, Vec<Operand>, bool)> = None;
         // Block-local facts are established by executed stores, never imported
         // from SSA demand or a different predecessor/OSR entry. CaptureScan keeps
         // author-visible bindings out of these slots. Future live f.arguments
@@ -2171,7 +2492,7 @@ pub(super) fn emit(
                     }
                 }
             }
-            if fast & 16384 != 0 && plan.homes.is_empty() && stack.is_empty() {
+            if fast & 16384 != 0 && plan.homes.is_empty() && stack.is_empty() && fusing.is_none() {
                 // The established scalar/property/element chain has stronger local
                 // representation propagation than independent opcode templates. Reuse
                 // it only at an empty operand boundary with no private numeric locals:
@@ -2216,8 +2537,103 @@ pub(super) fn emit(
                     continue;
                 }
             }
+            // A fused name/element access (see `NameElementPlan`): the LoadName waits for the
+            // element operation, which reads the binding itself.
+            if fusing.is_none() && tdz_array_pairs.is_empty() && matches!(ops[pc], Op::LoadName(..))
+            {
+                if let Some(found) = plan_name_element(
+                    chunk,
+                    ops,
+                    pc,
+                    end,
+                    source_targets,
+                    plan,
+                    layout,
+                    fast,
+                    stack.len(),
+                ) {
+                    own_facts.clear();
+                    // A set, or a get consumed as a Number, keeps the operands below the name
+                    // in their registers; any other result is published, so is what a borrowed
+                    // view would depend on.
+                    let lazy = (found.set || plan.numeric_results.contains(&found.elem_pc))
+                        && !stack
+                            .iter()
+                            .any(|o| matches!(o, Operand::Borrowed(_) | Operand::BorrowedValue));
+                    let pre = if lazy {
+                        stack.clone()
+                    } else {
+                        let before = stack.clone();
+                        materialize(a, layout, &stack, physical);
+                        physical = stack.len();
+                        stack = vec![Operand::Canonical; physical];
+                        preserve_scalar_prefix(a, &before, &mut stack, physical);
+                        stack.clone()
+                    };
+                    saved_work += 6;
+                    fusing = Some((pc, found, pre, lazy));
+                    continue;
+                }
+            }
+            if fusing
+                .as_ref()
+                .is_some_and(|(_, found, _, _)| found.elem_pc == pc)
+            {
+                let (name_pc, found, pre, lazy) = fusing.take().unwrap();
+                saved_work += 8;
+                fused.push(emit_name_element(
+                    a,
+                    layout,
+                    chunk,
+                    &mut stack,
+                    physical,
+                    pre.clone(),
+                    lazy,
+                    name_pc,
+                    found,
+                ));
+                if lazy {
+                    // The fast path left every register where it was and (for a get) the
+                    // result in the key's register; the continuation restores the same
+                    // picture. Words the continuation published are valid, registers are not.
+                    stack = pre;
+                    for (index, operand) in stack.iter_mut().enumerate() {
+                        if let Operand::Scalar(state) = *operand {
+                            if state.canonical_slot.is_some() {
+                                *operand = Operand::clean(state.kind, index, false);
+                            }
+                        }
+                    }
+                    if !found.set {
+                        stack.push(Operand::temporary(ScalarKind::Number));
+                    }
+                } else {
+                    physical = pre.len() + usize::from(!found.set);
+                    stack = vec![Operand::Canonical; physical];
+                    preserve_scalar_prefix(a, &pre, &mut stack, physical);
+                    if !found.set {
+                        propagate_checked_result(
+                            a,
+                            plan,
+                            found.elem_pc,
+                            &mut stack,
+                            physical,
+                            &mut bails,
+                            &mut result_misses,
+                        );
+                    }
+                }
+                continue;
+            }
             let bailout = a.new_label();
             bails.push((bailout, pc, stack.clone(), physical, true));
+            if let Some((name_pc, _, pre, _)) = &fusing {
+                // Inside the pure window a miss replays from the LoadName with the stack as it
+                // was: nothing between has any effect.
+                let bail = bails.last_mut().unwrap();
+                bail.1 = *name_pc;
+                bail.2 = pre.clone();
+            }
             let depth = stack.len();
             match ops[pc] {
                 Op::InlineGuard(target, mismatch) => {
@@ -2311,6 +2727,14 @@ pub(super) fn emit(
                 Op::LoadLocal(slot) if plan.reg(slot).is_some() => {
                     saved_work += 2;
                     a.fmov_d_d(16 + depth as u32, plan.reg(slot).unwrap());
+                    stack.push(Operand::temporary(ScalarKind::Number));
+                }
+                Op::LoadLocal(slot) if fusing.is_some() && slot < 256 => {
+                    // Inside a fused name/element window: a pure Number read of the frame slot
+                    // (no owner, no stack word). Anything else replays from the LoadName.
+                    saved_work += 2;
+                    emit_exec_word_load(a, 9, 22, slot as i32 * 8);
+                    emit_exec_number_guard(a, 9, 16 + depth as u32, 10, bailout);
                     stack.push(Operand::temporary(ScalarKind::Number));
                 }
                 Op::LoadLocal(slot) if numeric_locals.contains(&slot) => {
@@ -2820,6 +3244,9 @@ pub(super) fn emit(
         a.bind(label);
         plan.flush_locals(a);
         a.b(pc_labels[target]);
+    }
+    for site in &fused {
+        emit_name_element_fallback(a, layout, site, private_unwind, &mut bails);
     }
     let referenced: crate::fasthash::FastSet<_> = a.referenced_since(emission_start).collect();
     for (label, pc, stack, physical, flush) in bails {

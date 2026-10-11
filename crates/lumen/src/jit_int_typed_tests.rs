@@ -59,6 +59,196 @@ fn typed_array_elements_match_the_specification_in_every_tier() {
     assert_clean(&in_every_tier(TYPED), 3_000);
 }
 
+/// Typed arrays reached through free names (closure variables and globals): the register regions
+/// read the binding after a pure key and fall back to the ordinary templates for everything else.
+#[test]
+fn element_access_through_free_names_matches_in_every_tier() {
+    let before = super::regions::executed_regions();
+    assert_clean(&in_every_tier(FUSED), 80);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must execute as register regions"
+    );
+}
+
+const FUSED: &str = r####"
+// Element access through free names (module-scope variables and globals) with pure keys.
+var bad = [], checked = 0, digest = [];
+function note(label, got, want) {
+  checked++;
+  if (!Object.is(got, want)) bad.push(label + ':' + String(got) + '!=' + String(want));
+}
+var G32 = new Int32Array(64), GU8 = new Uint8Array(64), GF64 = new Float64Array(16), GF32 = new Float32Array(32);
+var GArr = [];                                  // plain array behind a global name
+for (var i = 0; i < 64; i++) GArr[i] = i * 3;
+var GObj = {5: 'five', 7: 70};                  // plain object with index keys
+function makeModule(buffer) {
+  var HEAP8 = new Int8Array(buffer), HEAPU8 = new Uint8Array(buffer), HEAP16 = new Int16Array(buffer),
+      HEAPU16 = new Uint16Array(buffer), HEAP32 = new Int32Array(buffer), HEAPU32 = new Uint32Array(buffer),
+      HEAPF32 = new Float32Array(buffer), HEAPF64 = new Float64Array(buffer), PLAIN = [10, 20, 30, 40, 50, 60, 70, 80];
+  var swapped = false, tableLen = 0, other = new Int32Array(16);
+  function fill(n) {
+    n = n | 0;
+    var i = 0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      HEAP32[i & 15] = i * 3 | 0;                                // key and value are pure
+      HEAPU8[64 + (i & 31) >> 0] = i + 200;
+      HEAP16[(40 + (i & 7)) << 1 >> 1] = -i;
+      HEAPF64[(i & 3) + 16 >> 0] = i * 0.5;                      // float key >> 0 ... see below
+      HEAPF64[(i & 3) + 16] = i * 0.5;
+      HEAPF32[(i & 7) + 48] = i / 3;
+    }
+    return 0;
+  }
+  function read(n) {
+    n = n | 0;
+    var i = 0, s = 0, t = 0.0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      s = (s + (HEAP32[i & 15] | 0)) | 0;
+      s = (s + (HEAPU8[64 + (i & 31) >> 0] | 0)) | 0;
+      s = (s + (HEAP16[(40 + (i & 7)) << 1 >> 1] | 0)) | 0;
+      s = (s + (HEAP8[i & 63] | 0) + (HEAPU16[i & 31] | 0) + (HEAPU32[i & 15] >>> 0)) | 0;
+      t = t + +HEAPF64[(i & 3) + 16] + +HEAPF32[(i & 7) + 48];
+      s = (s + (PLAIN[i & 7] | 0)) | 0;                          // an Array behind the same pattern
+    }
+    return s + ':' + t;
+  }
+  // constant keys
+  function constants(n) {
+    n = n | 0;
+    var i = 0, s = 0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      HEAP32[3] = i | 0; HEAP32[5] = (i * 7) | 0; HEAPU8[200] = i | 0;
+      s = (s + (HEAP32[3] | 0) + (HEAP32[5] | 0) + (HEAPU8[200] | 0) + (HEAP32[1000] | 0) + (HEAP32[-1] | 0)) | 0;
+    }
+    return s;
+  }
+  // invalid keys read undefined / write nothing (never the prototype)
+  function odd(n) {
+    n = n | 0;
+    var i = 0, s = 0, k = 0.0, r = 0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      k = i * 0.5;
+      r = HEAP32[k] === undefined ? 1 : 0;                       // fractional index for odd i
+      s = (s + r) | 0;
+      s = (s + (HEAP32[-i] === undefined ? 1000 : 0)) | 0;       // -0 reads element 0
+      s = (s + (HEAP32[i / 0] === undefined ? 100000 : 0)) | 0;  // i/0: NaN or Infinity
+      HEAP32[i - 1000] = 1; HEAP32[k] = 2; HEAP32[1 / 0] = 3;
+    }
+    return s;
+  }
+  // the name rebinds in the middle of a loop (a call between accesses)
+  function rebind(n) {
+    n = n | 0;
+    var i = 0, s = 0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      s = (s + (HEAP32[i & 7] | 0)) | 0;
+      if ((i | 0) == 5) swap();
+      HEAP32[i & 7] = i | 0;
+    }
+    return s;
+  }
+  function swap() { var t = HEAP32; HEAP32 = other; other = t; }
+  function state() { var out = []; for (var i = 0; i < 8; i++) out.push(HEAP32[i]); out.push('|'); for (var i = 0; i < 8; i++) out.push(other[i]); return out.join(); }
+  // detach / shrink while looping
+  function reads(n) {
+    n = n | 0;
+    var i = 0, s = 0;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) { s = (s + (HEAPU8[i & 63] === undefined ? 1000 : HEAPU8[i & 63])) | 0; }
+    return s;
+  }
+  return {fill: fill, read: read, constants: constants, odd: odd, rebind: rebind, state: state, reads: reads,
+    heap32: function () { return HEAP32; }};
+}
+for (var rep = 0; rep < 4; rep++) {
+  var buffer = new ArrayBuffer(1 << 12), m = makeModule(buffer);
+  var u8 = new Uint8Array(buffer);
+  m.fill(40);
+  var first = m.read(40);
+  m.fill(40);
+  note('read.repeat', m.read(40), first);
+  note('c.read', typeof first, 'string');
+  digest.push(first);
+  var c0 = m.constants(10), c1 = m.constants(10);
+  note('constants', c0, c1);
+  note('constants.value', c0, (function () { var s = 0; for (var i = 0; i < 10; i++) { s = s + i + i * 7 + (i & 255) + 0 + 0; s = s | 0; } return s; })());
+  note('odd', m.odd(20) + 0, m.odd(20) + 0);
+  digest.push(c0, m.odd(20), m.rebind(12), m.state(), m.reads(70), m.read(40));
+}
+// Explicit semantics through free names.
+(function () {
+  var A = new Uint8Array(8), L = new Int32Array(8), S = 'str', N = 5, U = undefined, NUL = null, O = {1: 'x', length: 2};
+  var P = new Proxy([1, 2, 3], {get: function (t, k) { return k === '1' ? 'proxied' : t[k]; }});
+  var getterHits = 0, GET = {get 0() { getterHits++; return 42; }};
+  var ARR = [1, 2, 3];
+  function a(i) { i = i | 0; return A[i & 7] | 0; }
+  function s(i) { i = i | 0; return S[i & 3]; }
+  function n(i) { i = i | 0; return N[i & 3]; }
+  function u(i) { i = i | 0; return U[i & 3]; }
+  function nul(i) { i = i | 0; return NUL[i & 3]; }
+  function o(i) { i = i | 0; return O[i & 3]; }
+  function p(i) { i = i | 0; return P[i & 3]; }
+  function g(i) { i = i | 0; return GET[i & 0]; }
+  function arr(i) { i = i | 0; return ARR[i & 3]; }
+  function seta(i, v) { i = i | 0; A[i & 7] = v; }
+  function setarr(i, v) { i = i | 0; ARR[i & 3] = v; }
+  for (var rep = 0; rep < 5; rep++) {
+    seta(3, 300); seta(1, -1); seta(2, 2.7);
+    note('typed', a(3) + ':' + a(1) + ':' + a(2), '44:255:2');
+    note('string', s(1), 't'); note('number', n(1), undefined); note('object', o(1), 'x'); note('proxy', p(1), 'proxied');
+    note('getter', g(5) + ':' + getterHits, '42:' + (rep + 1));
+    var threw = '';
+    try { u(1); } catch (e) { threw = e.constructor === TypeError ? 'TypeError' : String(e); }
+    note('undefined.read', threw, 'TypeError');
+    threw = '';
+    try { nul(1); } catch (e) { threw = e.constructor === TypeError ? 'TypeError' : String(e); }
+    note('null.read', threw, 'TypeError');
+    setarr(1, 9); setarr(3, 8);
+    note('array', arr(1) + ':' + ARR.length + ':' + arr(3), '9:4:8');
+  }
+  // ReferenceError and temporal dead zone order: the name is resolved before the key is evaluated
+  var order = [];
+  function key() { order.push('key'); return 1; }
+  function dead(i) { i = i | 0; return TDZ[i & 3]; }
+  var caught = '';
+  try { dead(1); } catch (e) { caught = e.constructor.name; }
+  let TDZ = [1, 2, 3, 4];
+  note('tdz', caught, 'ReferenceError');
+  note('tdz.after', dead(2), 3);
+  function missing(i) { i = i | 0; return NOT_DEFINED_ANYWHERE[i & 3]; }
+  caught = '';
+  try { missing(1); } catch (e) { caught = e.constructor.name; }
+  note('unresolvable', caught, 'ReferenceError');
+  // coercing operands in the key: valueOf runs once, after the name is resolved
+  var calls = [];
+  var K = {valueOf: function () { calls.push('K'); return 2; }};
+  function coerce(k) { return A[k | 0]; }
+  for (var rep = 0; rep < 3; rep++) { seta(2, 77); note('valueOf', coerce(K), 77); }
+  note('valueOf.count', calls.length, 3);
+  // typed array reached through a global (property of the global object)
+  (0, eval)('var GLOBALVIEW = new Float32Array(4); function gv(i) { i = i | 0; GLOBALVIEW[i & 3] = i * 1.5; return +GLOBALVIEW[i & 3]; }');
+  for (var rep = 0; rep < 3; rep++) note('global', gv(3), 4.5);
+  // detaching and shrinking between accesses
+  var rab = new ArrayBuffer(8, {maxByteLength: 16}), RV = new Uint8Array(rab), FV = new Uint8Array(rab, 0, 8);
+  function rd(i) { i = i | 0; var v = RV[i & 15]; return v === undefined ? -1 : v; }
+  function rf(i) { i = i | 0; var v = FV[i & 7]; return v === undefined ? -1 : v; }
+  function wr(i) { i = i | 0; RV[i & 15] = 7; FV[i & 7] = 9; }
+  for (var rep = 0; rep < 3; rep++) {
+    rab.resize(8); wr(2); note('rab.8', rd(2) + ':' + rf(2) + ':' + rd(12), '9:9:-1');
+    rab.resize(16); note('rab.16', rd(12) + ':' + rf(2), '0:9');
+    rab.resize(4); note('rab.4', rd(2) + ':' + rf(2) + ':' + rd(6), '9:-1:-1');
+  }
+  var buf = new ArrayBuffer(8), DV = new Int8Array(buf);
+  function dv(i) { i = i | 0; DV[i & 7] = 5; var v = DV[i & 7]; return v === undefined ? -1 : v; }
+  for (var rep = 0; rep < 3; rep++) {
+    var ok = dv(1);
+    if (rep === 1) buf.transfer();
+    note('detach' + rep, dv(1), rep >= 1 ? -1 : 5);
+  }
+})();
+var RESULT = bad.length + ':' + checked + ':' + bad.slice(0, 20).join(';') + '|' + digest.join('~');
+"####;
+
 const INT32: &str = r####"
 function i32(x) {
   x = +x;

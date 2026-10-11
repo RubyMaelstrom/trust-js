@@ -10814,6 +10814,10 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     Intrinsics2 { discard: bool },
+    /// [`typed_array::emit_access`]: x11 = a typed array Object, x9 = its exact unsigned index
+    /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
+    /// d1 = value) or written, 0 when the access is declined before anything is written.
+    TypedElement { write: bool },
 }
 
 /// Status codes of the shared direct-call stub. The common completion is zero, so a site pays
@@ -10898,6 +10902,7 @@ impl SharedStub {
     const INTRINSICS2: u32 = 0x600;
     const NAME_LOAD: u32 = 0x700;
     const HELPER: u32 = 0x800;
+    const TYPED_ELEMENT: u32 = 0x900;
 
     fn key(self) -> u32 {
         match self {
@@ -10942,6 +10947,7 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::Intrinsics2 { discard } => Self::INTRINSICS2 | u32::from(discard),
+            SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
         }
     }
 
@@ -10995,6 +11001,9 @@ impl SharedStub {
             Self::INTRINSICS2 => SharedStub::Intrinsics2 {
                 discard: key & 1 != 0,
             },
+            Self::TYPED_ELEMENT => SharedStub::TypedElement {
+                write: key & 1 != 0,
+            },
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
     }
@@ -11041,6 +11050,20 @@ impl SharedStub {
                 a.ret();
                 a.bind(miss);
                 a.movz(9, 0, 0);
+                a.ret();
+            }
+            SharedStub::TypedElement { write } => {
+                let hit = a.new_label();
+                let miss = a.new_label();
+                match layout.native_typed_array {
+                    Some(native) => typed_array::emit_access(a, &native, write, hit, miss),
+                    None => a.b(miss),
+                }
+                a.bind(hit);
+                a.movz(13, 1, 0);
+                a.ret();
+                a.bind(miss);
+                a.movz(13, 0, 0);
                 a.ret();
             }
             #[cfg(all(
