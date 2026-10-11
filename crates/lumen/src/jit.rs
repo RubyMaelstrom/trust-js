@@ -6011,6 +6011,101 @@ fn emit_prop_load_inline(
     a.bind(done);
 }
 
+/// Method read `receiver[key]` for a Number key (ECMA-262 EvaluatePropertyAccessWithExpressionKey,
+/// GetValue): when the key is exactly an array index (u32) of a plain Object or Array receiver
+/// with a dense own data element, replace the key with a clone of that element and keep the
+/// receiver as the call's `this`. Stack `[receiver, key]` becomes `[receiver, element]`.
+/// Everything else (holes and absent elements, which consult the prototype chain; accessors;
+/// proxies, typed arrays and other side-table receivers; non-Object receivers; fractional,
+/// negative or huge keys) branches to `slow` before any state changes. Enters with d0 = the
+/// validated Number key; falls to `done` after the commit.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_method_elem_dense(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    slow: usize,
+    done: usize,
+) {
+    let rcv = layout.obj_from_rc as u32;
+    let ex = layout.obj_exotic as u32;
+    let el = (layout.obj_props + layout.props_elems) as u32;
+    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
+    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
+    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
+    let ev = layout.entry_value as i32;
+    let ea = layout.entry_accessor as u32;
+    let es = layout.entry_size as u64;
+    let none_tag = layout.exotic_none_tag as u32;
+    let arr_tag = layout.exotic_array_tag as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let commit = a.new_label();
+    emit_exec_word_load(a, 10, 20, -16);
+    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_payload(a, 10, 10);
+    // The key must be exactly a u32 (round-trip compare; NaN/negative/fractional/huge all miss).
+    a.fcvtzu_w_d(9, 0);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(0, 1);
+    a.b_cond(C_NE, slow);
+    // Object base; exotic must be None or Array, and plain (no side-table behavior).
+    a.add_imm(11, 10, rcv);
+    a.ldrb_imm(12, 11, ex);
+    let ex_ok = a.new_label();
+    a.cmp_imm_w(12, none_tag);
+    a.b_cond(C_EQ, ex_ok);
+    a.cmp_imm_w(12, arr_tag);
+    a.b_cond(C_NE, slow);
+    a.bind(ex_ok);
+    a.ldrb_imm(12, 11, plain);
+    a.cbz(12, false, slow);
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
+    if packed_elem_inlinable(layout) {
+        let classic_dense = a.new_label();
+        emit_packed_elements_base(a, layout, classic_dense);
+        a.cmp_reg_x(9, 14);
+        a.b_cond(C_HS, slow);
+        a.add_shifted(15, 15, 9, 4); // property_size == 16 (gate above)
+        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
+        a.ldur(13, 15, layout.property_value as i32);
+        a.mov_imm64(14, crate::value::PACK_EMPTY);
+        a.cmp_reg_x(13, 14);
+        a.b_cond(C_EQ, slow); // an absent own element must still consult the prototype chain
+        a.mov(12, 13);
+        emit_exec_clone(a, layout, 12, 13, 16, slow);
+        a.b(commit);
+        a.bind(classic_dense);
+    }
+    // Dense bounds, then slot = elems[n]; NO_SLOT (0xFFFF_FFFF) is a hole.
+    a.ldr_imm(14, 12, evl);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(12, 12, evp);
+    a.add_shifted(12, 12, 9, 2);
+    a.ldr_w_imm(13, 12, 0);
+    a.cmn_imm_w(13, 1);
+    a.b_cond(C_EQ, slow);
+    a.ldr_imm(15, 11, en);
+    a.mov_imm64(16, es);
+    a.madd(15, 13, 16, 15);
+    guard_prop_data(a, 9, 15, ea, slow);
+    if layout.entry_accessor == layout.entry_value + 8 {
+        a.ldur(12, 15, ev);
+    } else {
+        a.ldur(9, 15, ev);
+        a.ldur(13, 15, ev + 8);
+        emit_exec_encode_wide(a, 9, 13, 12, 14, 16, 0, slow);
+    }
+    emit_exec_clone(a, layout, 12, 13, 16, slow);
+    // Commit: the Number key owns nothing, so the element simply replaces it.
+    a.bind(commit);
+    emit_exec_word_store(a, 12, 20, -8);
+    a.b(done);
+}
+
 /// Computed method read: a pinned string identity selects a bounded resolution, then every
 /// live shape/descriptor is revalidated. The receiver stays owned on the operand stack; only
 /// the key is replaced with the method. No state changes before all guards have succeeded.
@@ -6044,10 +6139,19 @@ fn emit_computed_method_inline(
     let done = a.new_label();
     let object = a.new_label();
     let receiver = a.new_label();
+    let string_key = a.new_label();
     let shape = (layout.obj_props + layout.props_shape) as u32;
     let exotic = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let object_data = layout.obj_from_rc as u32;
+    if get_elem_inlinable(layout) {
+        // A Number key is an element read of a dense array: `table[i & mask](args)`, the
+        // shape of every function-table and virtual call of Emscripten output.
+        emit_exec_word_load(a, 9, 20, -8);
+        emit_exec_number_guard(a, 9, 0, 11, string_key);
+        emit_method_elem_dense(a, layout, slow, done);
+    }
+    a.bind(string_key);
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 11, slow);
     emit_exec_payload(a, 9, 8); // LStr identity, pinned by a matching cache way

@@ -78,6 +78,85 @@ out.join('|');
     );
 }
 
+#[test]
+fn function_table_method_reads_follow_element_semantics() {
+    all_tiers(
+        r####"var out = [];
+function f0() { return 'f0:' + (this === T); }
+function f1(a) { return 'f1:' + a; }
+function f2(a, b) { return 'f2:' + a + b; }
+var T = [f0, f1, f2, f0];
+function callT(i) { return T[i & 3](i, 'x'); }
+var s = '';
+for (var i = 0; i < 40; i++) s += callT(i) + ',';
+out.push(s.length + ':' + s.slice(0, 60));
+// receiver is the array (this), arguments evaluated after the method read
+var order = [];
+var U = [function () { order.push('call:' + (this === U)); return 1; }];
+function idx() { order.push('idx'); return 0; }
+function arg() { order.push('arg'); return 5; }
+for (var i = 0; i < 20; i++) U[idx()](arg());
+out.push(order.slice(0, 6).join(',') + ',' + order.length);
+// holes, prototype-supplied elements, accessors, absent
+var P = []; P[3] = function () { return 'p3'; };
+Array.prototype[1] = function () { return 'proto1'; };
+var r = [];
+for (var i = 0; i < 20; i++) { r.push(P[3]()); r.push(P[1]()); }
+out.push(r.slice(0, 4).join(','));
+delete Array.prototype[1];
+var res = [];
+for (var i = 0; i < 20; i++) { try { P[1](); } catch (e) { res.push(e.constructor.name); } }
+out.push(res[0] + res.length);
+var A = []; Object.defineProperty(A, 0, { get: function () { return function () { return 'getter' + (this === A); }; } });
+var g = [];
+for (var i = 0; i < 20; i++) g.push(A[0]());
+out.push(g[0] + g.length);
+// non-callable, nullish, primitive elements
+var N = [1, null, undefined, 'x', {}];
+var errs = [];
+for (var k = 0; k < 5; k++) for (var i = 0; i < 12; i++) { try { N[k](); } catch (e) { if (i === 0) errs.push(e.constructor.name); } }
+out.push(errs.join(','));
+// keys: fractional, negative, huge, NaN, -0, strings, symbols
+var K = [function () { return 'k0'; }, function () { return 'k1'; }];
+K[-1] = function () { return 'neg'; }; K[1.5] = function () { return 'frac'; };
+K['2'] = function () { return 'k2'; }; K[4294967295] = function () { return 'big'; };
+var ks = [];
+for (var i = 0; i < 12; i++) ks.push([K[0](), K[1](), K[-1](), K[1.5](), K['2'](), K[2](), K[-0](), K[4294967295]()].join(''));
+out.push(ks[11]);
+try { for (var i = 0; i < 12; i++) K[NaN](); } catch (e) { out.push(e.constructor.name); }
+// reassignment mid-loop, length change, growth
+var R = [function () { return 1; }, function () { return 2; }];
+var sum = 0;
+for (var i = 0; i < 40; i++) { sum += R[(i & 1) && R.length > 1 ? 1 : 0](); if (i === 20) R[1] = function () { return 20; }; if (i === 30) R.push(function () { return 5; }); if (i === 35) R.length = 1; }
+out.push(sum);
+// proxy, typed array, arguments, string receivers
+var px = new Proxy([function () { return 'px'; }], {});
+var ta = new Uint8Array(2);
+var sres = [];
+for (var i = 0; i < 12; i++) { sres.push(px[0]()); try { ta[0](); } catch (e) { sres.push(e.constructor.name); } }
+out.push(sres.slice(0, 4).join(',') + sres.length);
+function viaArgs() { return arguments[0](); }
+var ar = [];
+for (var i = 0; i < 12; i++) ar.push(viaArgs(function () { return 'arg' + i; }));
+out.push(ar[11]);
+var strs = [];
+for (var i = 0; i < 12; i++) { try { 'abc'[0](); } catch (e) { strs.push(e.constructor.name); } }
+out.push(strs[0] + strs.length);
+// frozen arrays and array with non-writable / non-configurable elements
+var Z = Object.freeze([function () { return 'z'; }]);
+var zs = []; for (var i = 0; i < 12; i++) zs.push(Z[0]());
+out.push(zs[11]);
+// function table in closure with local index arithmetic (asm.js shape)
+var m = (function (g, e, b) { "use asm"; var H = new g.Int32Array(b); var TT = [function (x) { x = x | 0; return x + 1 | 0; }, function (x) { x = x | 0; return x + 2 | 0; }, function (x) { x = x | 0; return x + 3 | 0; }, function (x) { x = x | 0; return x + 4 | 0; }];
+  function run(n) { n = n | 0; var i = 0, s = 0; for (i = 0; (i | 0) < (n | 0); i = i + 1 | 0) s = s + (TT[i & 3](i) | 0) | 0; return s | 0; }
+  return { run: run }; })(globalThis, {}, new ArrayBuffer(1 << 16));
+out.push(m.run(1000));
+out.join('|');
+"####,
+        "285:f0:true,f1:1,f2:2x,f0:true,f0:true,f1:5,f2:6x,f0:true,f0:tru|idx,arg,call:true,idx,arg,call:true,60|p3,proto1,p3,proto1|TypeError20|gettertrue20|TypeError,TypeError,TypeError,TypeError,TypeError|k0k1negfrack2k2k0big|TypeError|202|px,TypeError,px,TypeError24|arg11|TypeError12|z|502000",
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 fn owners(engine: &mut Engine, name: &str) -> usize {
     use crate::value::Value;
