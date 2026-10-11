@@ -679,6 +679,14 @@ pub(super) fn compile_entry(
         a.bytes(&strict_offset.to_le_bytes());
         a.code.push(u8::from(chunk.jit_is_strict()));
     }
+    // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
+    // interruption are observed here on the shared amortized cadence. Code that never takes a
+    // back-edge (loop-free recursion makes billions of calls) must still be interruptible, since
+    // a user agent may abort a running script at any time (HTML "Killing scripts"). The frame
+    // is fully established and the operand stack empty, as at a back-edge target at pc 0.
+    if !borrowed_entry {
+        a.interrupt_poll(interrupt_offset, unwind);
+    }
 
     #[cfg(feature = "optimizing-jit")]
     if !borrowed_entry {
