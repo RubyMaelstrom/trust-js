@@ -7071,6 +7071,18 @@ impl InlineBudget {
     }
 }
 
+/// Whether `test` is a literal whose ToBoolean is false (ECMA-262 ToBoolean: `0`, `-0`, `NaN`,
+/// `false`, `null`): evaluating it has no side effect.
+fn is_literal_falsy(test: &Expr) -> bool {
+    match test {
+        Expr::Paren(inner) => is_literal_falsy(inner),
+        Expr::Num(n) => *n == 0.0 || n.is_nan(),
+        Expr::Bool(value) => !*value,
+        Expr::Null => true,
+        _ => false,
+    }
+}
+
 /// For each call-cache site of `chunk`, whether its call lies inside a loop (between a backward
 /// branch's target and the branch).
 fn call_sites_in_loops(chunk: &Chunk) -> Vec<bool> {
@@ -10231,10 +10243,17 @@ impl Compiler {
                 for c in ctx.continues {
                     self.patch_to(c, cont as u32);
                 }
-                self.expr(test)?;
-                let jf = self.emit(Op::JumpIfFalse(0));
-                self.emit(Op::Jump(start as u32));
-                self.patch(jf);
+                // ECMA-262 §14.7.2.2 DoWhileStatement evaluation: a literal false test (the
+                // `do { … } while (0)` block idiom of macro-expanded and compiled code) has no
+                // side effect and always exits, so the body runs once and `continue` reaches the
+                // end. Emitting no test and no back edge keeps a once-run block from being
+                // classified as a loop (hot-loop code shapes, loop polls).
+                if !is_literal_falsy(test) {
+                    self.expr(test)?;
+                    let jf = self.emit(Op::JumpIfFalse(0));
+                    self.emit(Op::Jump(start as u32));
+                    self.patch(jf);
+                }
                 for b in ctx.breaks {
                     self.patch(b);
                 }

@@ -253,6 +253,38 @@ out.join('|');
     );
 }
 
+/// ECMA-262 §14.7.2 DoWhileStatement: a literal false test runs the body once; `continue`,
+/// labelled `break`, `finally`, closures and generators behave as in any other loop.
+#[test]
+fn do_while_with_a_literal_false_test_runs_the_body_once() {
+    all_tiers(
+        r####"var out = [];
+function a1(n) { var c = 0; do { c++; if (n > 2) continue; c += 10; } while (0); return c; }
+function a2(n) { var c = 0; l: do { c++; if (n) break l; c += 100; } while (false); return c; }
+function a3() { var c = 0; do { c++; do { c += 2; if (c > 0) continue; c += 1000; } while (null); } while (-0); return c; }
+function a4() { var i = 0; do { i++; } while (i < 3); return i; }
+function a5(n) { var c = 0, f; do { f = function () { return n + c; }; c = 5; } while (NaN); return f(); }
+function a6() { var r = []; for (var i = 0; i < 3; i++) { do { r.push(i); if (i === 1) break; r.push('x'); } while (0); } return r.join(','); }
+function a7() { var c = 0; do { try { c++; continue; } finally { c += 10; } } while (0); return c; }
+function a8() { var c = 0; do { c++; { let z = c; do { z++; c += z; } while (0); } } while (0); return c; }
+function a9(n) { var t = 0; do { switch (n) { case 1: t = 1; break; default: t = 2; } t *= 3; } while (0); return t; }
+function a10() { var c = 0; do { c++; } while (0 + 0 && c++); return c; }
+function a11() { var c = 0, side = 0; do { c++; } while ((side++, 0)); return c + ':' + side; }
+function a12() { var c = 0; do { c++; if (c < 3) continue; } while (c < 3); return c; }
+var r = [];
+for (var i = 0; i < 40; i++) r = [a1(i & 7), a2(i & 1), a3(), a4(), a5(i), a6(), a7(), a8(), a9(i & 3), a10(), a11(), a12()];
+out.push(r.join(','));
+function labeled() { var s = ''; outer: for (var i = 0; i < 3; i++) { inner: do { s += i; if (i === 1) continue outer; s += 'a'; } while (0); s += 'b'; } return s; }
+var l = []; for (var i = 0; i < 20; i++) l.push(labeled());
+out.push(l[19]);
+var gen = (function* () { do { yield 1; yield 2; } while (0); return 3; })();
+out.push([gen.next().value, gen.next().value, gen.next().value, gen.next().done].join(','));
+out.join('|');
+"####,
+        "1,1,3,3,44,0,x,1,2,x,11,3,6,1,1:1,3|0ab12ab|1,2,3,true",
+    );
+}
+
 /// A hot loop body of hundreds of operations reads closure variables of every kind in line; the
 /// values, accumulations and a replaced callee agree with the interpreter.
 #[test]
