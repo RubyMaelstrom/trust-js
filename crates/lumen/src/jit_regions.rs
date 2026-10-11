@@ -455,6 +455,8 @@ fn checked_numeric_result(op: &Op) -> bool {
         // Its canonical output therefore needs the same live post-result proof.
         | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Neg | Op::Plus
         | Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr | Op::BitNot
+        // A frame slot read for arithmetic is guarded as a Number where it is read.
+        | Op::LoadLocal(..)
     )
 }
 
@@ -1534,6 +1536,21 @@ fn region_mark(op: &Op) -> &'static str {
     let interned: &'static str = Box::leak(format!("region:{name}").into_boxed_str());
     marks.push((name, interned));
     interned
+}
+
+/// Branch to `fail` unless the frame slot at `offset` owns nothing: its word is a Number or one
+/// of the immediate kinds (undefined, empty, null, Boolean), never a BigInt, String, Symbol or
+/// Object reference whose release a plain overwrite would skip.
+fn emit_slot_owns_nothing(a: &mut asm::Asm, offset: i32, fail: usize) {
+    emit_exec_word_load(a, 9, 22, offset);
+    a.lsr_imm(10, 9, 48);
+    a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+    a.sub_reg(11, 10, 11);
+    a.cmp_imm_x(11, 2);
+    a.b_cond(C_LS, fail); // BigInt, String, Symbol
+    a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_x(10, 11);
+    a.b_cond(C_HS, fail); // Object, lazy prototype
 }
 
 /// A ToInt32 result: a compile-time constant (ToInt32 applied while compiling, so it costs no
@@ -2844,6 +2861,19 @@ pub(super) fn emit(
                         );
                     }
                 }
+                Op::LoadLocal(slot)
+                    if slot < 256
+                        && plan.tagged_reg(slot).is_none()
+                        && plan.numeric_results.contains(&pc) =>
+                {
+                    // A frame slot that is not a numeric home but feeds arithmetic: read it as
+                    // a Number straight into a register, with no owner and no stack word. A
+                    // slot that is not a Number leaves the region at this read.
+                    saved_work += 2;
+                    emit_exec_word_load(a, 9, 22, slot as i32 * 8);
+                    emit_exec_number_guard(a, 9, 16 + depth as u32, 10, bailout);
+                    stack.push(Operand::temporary(ScalarKind::Number));
+                }
                 Op::LoadLocal(slot) if plan.tagged_reg(slot).is_some() => {
                     saved_work += 2;
                     let home = plan.tagged_reg(slot).unwrap();
@@ -2881,6 +2911,24 @@ pub(super) fn emit(
                     number(a, &mut stack, physical, depth - 1, bailout);
                     a.fmov_d_d(plan.reg(slot).unwrap(), 15 + depth as u32);
                     stack.pop();
+                }
+                Op::StoreLocal(slot)
+                    if slot < 256
+                        && plan.reg(slot).is_none()
+                        && plan.tagged_reg(slot).is_none()
+                        && stack[depth - 1].numeric() =>
+                {
+                    // A Number into a frame slot that is not a numeric home. The old word owns
+                    // nothing (a slot holding a reference leaves the region instead), so the
+                    // store is a plain overwrite; no author code runs, and the slot's own-read
+                    // facts end here.
+                    saved_work += 3;
+                    own_facts.clear();
+                    number(a, &mut stack, physical, depth - 1, bailout);
+                    emit_slot_owns_nothing(a, slot as i32 * 8, bailout);
+                    emit_exec_number_store(a, 15 + depth as u32, 22, slot as i32 * 8, 9);
+                    stack.pop();
+                    numeric_locals.insert(slot);
                 }
                 Op::UpdateLocal(slot, kind) if plan.reg(slot).is_some() => {
                     saved_work += 2;

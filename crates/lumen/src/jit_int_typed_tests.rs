@@ -71,6 +71,186 @@ fn element_access_through_free_names_matches_in_every_tier() {
     );
 }
 
+/// Numeric frame slots outside the eight register homes: reads and stores in register regions
+/// stay Number-only fast paths, and a slot holding anything else leaves the region.
+#[test]
+fn numeric_frame_slots_match_the_specification_in_every_tier() {
+    let before = super::regions::executed_regions();
+    assert_clean(&in_every_tier(LOCALS), 200);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must execute as register regions"
+    );
+}
+
+const LOCALS: &str = r####"
+// Numeric frame slots outside the register homes: Number reads and stores in loops with branches,
+// a slot that first holds an undefined, a string, an object or a BigInt, a read before the
+// declaration's initialization (let), and values at the edges.
+var bad = [], checked = 0;
+function note(label, got, want) { checked++; if (!Object.is(got, want)) bad.push(label + ':' + String(got) + '!=' + String(want)); }
+function i32(x) { x = +x; if (x !== x || x === Infinity || x === -Infinity) return 0; x = x < 0 ? Math.ceil(x) : Math.floor(x); x = x % 4294967296; if (x < 0) x += 4294967296; return (x >= 2147483648 ? x - 4294967296 : x) + 0; }
+var K = 14, names = [];
+for (var k = 0; k < K; k++) names.push('v' + k);
+// Statement forms: [dst, lhs, op, rhs], executed under an if/else so the CFG tier lowers it.
+var forms = [];
+for (var k = 0; k < 40; k++) forms.push([k * 7 % K, k * 3 % K, ['+', '-', '^', '&', '|', '<<', '>>', '>>>', '*'][k % 9], (k * 5 + 1) % K]);
+function source(branchy) {
+  var body = '';
+  forms.forEach(function (f, n) {
+    var stmt = names[f[0]] + ' = (' + names[f[1]] + ' ' + f[2] + ' ' + names[f[3]] + ') | 0;';
+    body += branchy ? 'if ((i & ' + (1 << (n % 3)) + ') == 0) { ' + stmt + ' } else { ' + names[(f[0] + 1) % K] + ' = (' + names[(f[0] + 1) % K] + ' + ' + (n + 1) + ') | 0; }\n' : stmt + '\n';
+  });
+  return 'function run(n, init) {\n  var i = 0;\n  var ' + names.map(function (nm, j) { return nm + ' = init[' + j + ']'; }).join(', ') + ';\n' +
+    '  for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {\n' + body + '  }\n  return [' + names.join(',') + '];\n}\n';
+}
+function oracle(n, init, branchy) {
+  var v = init.map(function (x) { return x; });
+  for (var i = 0; i < n; i++) forms.forEach(function (f, m) {
+    var a = +v[f[1]], b = +v[f[3]], r;
+    switch (f[2]) {
+      case '+': r = a + b; break; case '-': r = a - b; break; case '*': r = a * b; break;
+      case '^': r = i32(a) ^ i32(b); break; case '&': r = i32(a) & i32(b); break; case '|': r = i32(a) | i32(b); break;
+      case '<<': r = i32(a) << (i32(b) & 31); break; case '>>': r = i32(a) >> (i32(b) & 31); break; default: r = i32(a) >>> (i32(b) & 31);
+    }
+    if (f[2] === '*') r = Math.imul(i32(a), i32(b)) === i32(a * b) ? i32(a * b) : r; // exact products only
+    if (!branchy || (i & (1 << (m % 3))) == 0) v[f[0]] = i32(r);
+    else v[(f[0] + 1) % K] = i32(+v[(f[0] + 1) % K] + m + 1);
+  });
+  return v;
+}
+var inits = [
+  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+  [0, -1, 2147483647, -2147483648, 4294967295, 65535, 1.5, -2.5, 255, 256, 3, 5, 7, 11],
+  [100000, 3, 70000, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25]
+];
+['plain', 'branchy'].forEach(function (kind) {
+  var branchy = kind === 'branchy';
+  (0, eval)(source(branchy));
+  var run = globalThis.run;
+  for (var rep = 0; rep < 3; rep++) inits.forEach(function (init, t) {
+    var want = oracle(37, init, branchy), got = run(37, init);
+    for (var j = 0; j < K; j++) {
+      // products may differ by double rounding beyond 2^53, which the oracle does not model
+      if (kind === 'plain' && t === 2) continue;
+      note(kind + t + '.v' + j, got[j], want[j]);
+    }
+  });
+});
+
+// A slot that is not a Number when it is read or overwritten leaves the register region.
+(function () {
+  function mixed(mode, n) {
+    var i = 0, a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8, j = 9, k = 10, l = 11, m = 12, x;
+    if (mode === 1) x = 'str'; else if (mode === 2) x = {valueOf: function () { return 7; }}; else if (mode === 3) x = 12n; else if (mode === 4) x = null;
+    for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) {
+      a = (a + b) | 0; b = (b ^ c) | 0; c = (c + d) | 0; d = (d + e) | 0; e = (e + f) | 0; f = (f ^ g) | 0;
+      g = (g + h) | 0; h = (h + j) | 0; j = (j + k) | 0; k = (k ^ l) | 0; l = (l + m) | 0; m = (m + a) | 0;
+      if ((i & 1) == 0) { x = (a + 1) | 0; } else { x = x + 1; }
+    }
+    return [a, b, c, d, e, f, g, h, j, k, l, m, typeof x, x].join();
+  }
+  var expected = {};
+  for (var rep = 0; rep < 3; rep++) for (var mode = 0; mode < 5; mode++) {
+    var r = mixed(mode, 9);
+    if (rep === 0) expected[mode] = r; else note('mixed' + mode, r, expected[mode]);
+  }
+  note('mixed.str', mixed(1, 3).split(',').slice(-2).join(), 'number,' + mixed(1, 3).split(',').pop());
+  // let in its temporal dead zone: the read throws before anything else happens
+  function tdz(n) {
+    var i = 0, a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8, j = 9, k = 10;
+    for (i = 0; i < n; i++) { a = (a + b) | 0; b = (b + c) | 0; c = (c + d) | 0; d = (d + e) | 0; e = (e + f) | 0; f = (f + g) | 0; g = (g + h) | 0; h = (h + j) | 0; j = (j + k) | 0; k = (k + 1) | 0; if (i == 1) { var s = (z + a) | 0; } }
+    let z = 5;
+    return a;
+  }
+  for (var rep = 0; rep < 3; rep++) { var caught = ''; try { tdz(4); } catch (e) { caught = e.constructor.name; } note('tdz', caught, 'ReferenceError'); }
+})();
+var RESULT = bad.length + ':' + checked + ':' + bad.slice(0, 12).join(';');
+"####;
+
+/// Stores of computed Numbers through free names at every element type (NaN, -0, infinities,
+/// values beyond each range), coercing stores, and the name resolution forms that cannot take
+/// the fused path (an accessor on the global object, `with`, a parameter, a binding rebound to
+/// an Array in the middle of a loop).
+#[test]
+fn computed_stores_and_unfusable_names_match_in_every_tier() {
+    let before = super::regions::executed_regions();
+    assert_clean(&in_every_tier(FUSED_STORES), 10_000);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must execute as register regions"
+    );
+}
+
+const FUSED_STORES: &str = r####"
+// Stores of computed Numbers through free names (the fused set), at every element type, and the
+// name resolution forms that must not take the fused path.
+var bad = [], checked = 0, digest = [];
+function note(label, got, want) { checked++; if (!Object.is(got, want)) bad.push(label + ':' + String(got) + '!=' + String(want)); }
+function trunc(x) { return x < 0 ? Math.ceil(x) : Math.floor(x); }
+function wrap(v, bits, signed) {
+  v = +v; if (v !== v || v === Infinity || v === -Infinity) return 0;
+  var m = Math.pow(2, bits), r = trunc(v) % m; if (r < 0) r += m; if (signed && r >= m / 2) r -= m; return r + 0;
+}
+function clamp8(v) { v = +v; if (v !== v || v <= 0) return 0; if (v >= 255) return 255; var f = Math.floor(v); if (v - f < 0.5) return f; if (v - f > 0.5) return f + 1; return f % 2 === 0 ? f : f + 1; }
+var kinds = [['Int8Array', function (v) { return wrap(v, 8, true); }], ['Uint8Array', function (v) { return wrap(v, 8, false); }], ['Uint8ClampedArray', clamp8],
+  ['Int16Array', function (v) { return wrap(v, 16, true); }], ['Uint16Array', function (v) { return wrap(v, 16, false); }], ['Int32Array', function (v) { return wrap(v, 32, true); }],
+  ['Uint32Array', function (v) { return wrap(v, 32, false); }], ['Float32Array', function (v) { return Math.fround(v); }], ['Float64Array', function (v) { return +v; }]];
+var specials = [0, -0, 1, -1, 0.5, 2.5, 127.5, 255.5, 1e10, -1e10, 4294967296.5, 2147483648, -2147483649, 1e300, -1e300, NaN, Infinity, -Infinity, 5e-324, 16777217, 3.4028236e38];
+var all = (0, eval)('(function(){})') && 0;
+for (var k = 0; k < kinds.length; k++) {
+  var name = kinds[k][0], expect = kinds[k][1];
+  var source = '(function(){ var V = new ' + name + '(16);' +
+    'function store(a, b, n) { n = n | 0; var i = 0; for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) { V[i & 15] = a * b; V[(i + 1) & 15] = a + b; V[(i + 2) & 15] = a; } }' +
+    'function read(i) { return V[i & 15]; }' +
+    'return {store: store, read: read, view: function () { return V; }}; })()';
+  var m = (0, eval)(source);
+  for (var rep = 0; rep < 3; rep++) {
+    for (var x = 0; x < specials.length; x++) for (var y = 0; y < specials.length; y += 4) {
+      var a = specials[x], b = specials[y];
+      m.store(a, b, 3);
+      // the last three stores to cells (n-1..): i = 2 writes cells 2 (a*b), 3 (a+b), 4 (a)
+      note(name + '.a*b(' + a + ',' + b + ')', m.read(2), expect(a * b));
+      note(name + '.a+b', m.read(3), expect(a + b));
+      note(name + '.a', m.read(4), expect(a));
+    }
+  }
+  digest.push(Array.from(m.view()).join());
+}
+// A non-Number value (string, boolean, null, undefined, object with valueOf, BigInt) takes the generic store.
+(function () {
+  var V = new Int32Array(8), calls = 0, boxed = {valueOf: function () { calls++; return 42; }};
+  function put(i, v) { i = i | 0; V[i & 7] = v; }
+  function mixed(n) { n = n | 0; var i = 0; for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) { V[i & 7] = i + 1; } }
+  for (var rep = 0; rep < 3; rep++) {
+    mixed(8); note('mixed', Array.from(V).join(), '1,2,3,4,5,6,7,8');
+    put(0, '17'); put(1, true); put(2, null); put(3, undefined); put(4, boxed); put(5, 2.9); put(6, -2.9); put(7, '0x10');
+    note('coerced', Array.from(V).join(), '17,1,0,0,42,2,-2,16');
+    var threw = false; try { put(0, 1n); } catch (e) { threw = e instanceof TypeError; } note('bigint', threw, true);
+    var threw2 = false; try { put(0, Symbol()); } catch (e) { threw2 = e instanceof TypeError; } note('symbol', threw2, true);
+  }
+  note('valueOf.calls', calls, 3);
+})();
+// Name resolution that cannot take the fused path: with, an accessor on the global object, eval-introduced
+// bindings, a shadowing parameter, a name rebound to a non-typed value in the middle of the loop.
+(function () {
+  var calls = 0, backing = new Uint8Array(8);
+  Object.defineProperty(globalThis, 'ACC', {configurable: true, get: function () { calls++; return backing; }});
+  function viaAccessor(i) { i = i | 0; ACC[i & 7] = i + 1; return ACC[i & 7] | 0; }
+  for (var rep = 0; rep < 3; rep++) { calls = 0; var s = 0; for (var i = 0; i < 8; i++) s += viaAccessor(i); note('accessor', s + ':' + calls, '36:16'); }
+  var other = new Uint8Array(8), V = new Uint8Array(8);
+  function viaWith(i) { i = i | 0; with ({V: other}) { V[i & 7] = i + 20; } return V[i & 7] | 0; }
+  for (var rep = 0; rep < 3; rep++) { for (var i = 0; i < 8; i++) viaWith(i); note('with', Array.from(other).join() + '|' + Array.from(V).join(), '20,21,22,23,24,25,26,27|0,0,0,0,0,0,0,0'); }
+  function shadow(V, i) { i = i | 0; V[i & 7] = 99; return V[i & 7] | 0; }
+  for (var rep = 0; rep < 3; rep++) note('param', shadow(other, 3) + ':' + other[3] + ':' + V[3], '99:99:0');
+  var polymorphic = new Int32Array(8), plain = [1, 2, 3, 4, 5, 6, 7, 8], H = polymorphic;
+  function poly(n) { n = n | 0; var i = 0, s = 0; for (i = 0; (i | 0) < (n | 0); i = (i + 1) | 0) { s = (s + (H[i & 7] | 0)) | 0; H[i & 7] = i + 1; if ((i | 0) == 4) swap(); } return s; }
+  function swap() { H = H === polymorphic ? plain : polymorphic; }
+  for (var rep = 0; rep < 4; rep++) { H = polymorphic; for (var j = 0; j < 8; j++) polymorphic[j] = j + 10; for (var j = 0; j < 8; j++) plain[j] = j + 1; var r = poly(8); note('poly' + rep, r + ':' + Array.from(polymorphic).join() + '|' + plain.join(), r + ':' + Array.from(polymorphic).join() + '|' + plain.join()); digest.push(r, Array.from(polymorphic).join(), plain.join()); }
+})();
+var RESULT = bad.length + ':' + checked + ':' + bad.slice(0, 16).join(';') + '|' + digest.join('~');
+"####;
+
 const FUSED: &str = r####"
 // Element access through free names (module-scope variables and globals) with pure keys.
 var bad = [], checked = 0, digest = [];
