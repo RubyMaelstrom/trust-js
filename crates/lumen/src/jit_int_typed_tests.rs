@@ -182,6 +182,75 @@ fn computed_stores_and_unfusable_names_match_in_every_tier() {
     );
 }
 
+/// Comparisons, branches and truthiness of bitwise results (int32 and uint32 operands and
+/// constants) in register regions, against an oracle in plain arithmetic.
+#[test]
+fn integer_comparisons_and_branches_match_in_every_tier() {
+    let before = super::regions::executed_regions();
+    assert_clean(&in_every_tier(INT_COMPARISONS), 300_000);
+    assert!(
+        super::regions::executed_regions() > before,
+        "the loops must execute as register regions"
+    );
+}
+
+const INT_COMPARISONS: &str = r####"
+// Comparisons, branches and truthiness of bitwise results (int32 and uint32 operands, constants),
+// in register regions: every operator against an oracle in plain arithmetic.
+var bad = [], checked = 0;
+function note(label, got, want) { checked++; if (!Object.is(got, want)) bad.push(label + ':' + String(got) + '!=' + String(want)); }
+function i32(x) { x = +x; if (x !== x || x === Infinity || x === -Infinity) return 0; x = x < 0 ? Math.ceil(x) : Math.floor(x); x = x % 4294967296; if (x < 0) x += 4294967296; return (x >= 2147483648 ? x - 4294967296 : x) + 0; }
+function u32(x) { var r = i32(x); return r < 0 ? r + 4294967296 : r; }
+function xor32(a, b) { var x = u32(a), y = u32(b), r = 0, p = 1; for (var k = 0; k < 32; k++) { var xb = x % 2, yb = y % 2; x = (x - xb) / 2; y = (y - yb) / 2; r += ((xb + yb) % 2) * p; p *= 2; } return i32(r); }
+// operand forms: [source, value function of (x, y)]
+var forms = [
+  ['(x|0)', function (x, y) { return i32(x); }],
+  ['(y|0)', function (x, y) { return i32(y); }],
+  ['(x>>>0)', function (x, y) { return u32(x); }],
+  ['(y>>>0)', function (x, y) { return u32(y); }],
+  ['(x&255)', function (x, y) { return u32(x) % 256; }],
+  ['(x>>>24)', function (x, y) { return Math.floor(u32(x) / 16777216); }],
+  ['(x<<8)', function (x, y) { return i32(i32(x) * 256); }],
+  ['(x^y)', function (x, y) { return xor32(x, y); }],
+  ['~x', function (x, y) { return -i32(x) - 1; }],
+  ['7', function () { return 7; }],
+  ['-1', function () { return -1; }],
+  ['2147483648', function () { return 2147483648; }],
+  ['4294967295', function () { return 4294967295; }],
+  ['0', function () { return 0; }]
+];
+var ops = ['<', '<=', '>', '>=', '==', '!=', '===', '!=='];
+function compare(op, a, b) {
+  switch (op) { case '<': return a < b; case '<=': return a <= b; case '>': return a > b; case '>=': return a >= b; case '==': case '===': return a === b; default: return a !== b; }
+}
+var values = [0, 1, -1, 2, 255, 256, 65535, 2147483647, 2147483648, 2147483649, -2147483648, -2147483649, 4294967295, 4294967296, 4294967297, 1.5, -1.5, 3000000000, NaN, Infinity, -Infinity, 100000, -100000];
+var source = '';
+var table = [];
+for (var li = 0; li < forms.length; li++) for (var ri = 0; ri < forms.length; ri++) {
+  if (li % 3 === 1 && ri % 3 === 2) continue;           // thin the cross product
+  for (var oi = 0; oi < ops.length; oi++) {
+    var name = 'C' + table.length;
+    var cmp = forms[li][0] + ' ' + ops[oi] + ' ' + forms[ri][0];
+    // branch form, value form, truthiness of the left operand
+    source += 'function ' + name + '(x, y) { var r = 0, n = 0, t = false; for (n = 0; n < 2; n = n + 1 | 0) { if (' + cmp + ') r = r + 1 | 0; else r = r + 3 | 0; t = (' + cmp + '); r = (r + (t ? 10 : 30)) | 0; if (' + forms[li][0] + ') r = r + 100 | 0; } return r; }\n';
+    table.push([name, li, ri, oi]);
+  }
+}
+(0, eval)(source);
+for (var rep = 0; rep < 3; rep++) {
+  for (var t = 0; t < table.length; t++) {
+    var fn = globalThis[table[t][0]], li = table[t][1], ri = table[t][2], oi = table[t][3];
+    for (var i = 0; i < values.length; i += 2) for (var j = 0; j < values.length; j += 3) {
+      var x = values[i], y = values[j];
+      var l = forms[li][1](x, y), r = forms[ri][1](x, y), want = compare(ops[oi], l, r), r1 = 0;
+      for (var n = 0; n < 2; n++) { r1 += want ? 1 : 3; r1 += want ? 10 : 30; if (l !== 0) r1 += 100; }
+      note(table[t][0] + '(' + x + ',' + y + ')', fn(x, y), r1);
+    }
+  }
+}
+var RESULT = bad.length + ':' + checked + ':' + bad.slice(0, 10).join(';');
+"####;
+
 const FUSED_STORES: &str = r####"
 // Stores of computed Numbers through free names (the fused set), at every element type, and the
 // name resolution forms that must not take the fused path.

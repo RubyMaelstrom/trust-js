@@ -91,6 +91,9 @@ The default tier is JIT. Useful diagnostic controls:
   the same for the fused name/element access (the sites then keep only the name probe shared).
   Compiled applications such as DOOM's emulator are bound by instruction fetch: shared stubs
   cost a call and return per access and save more in instruction cache misses.
+- `LUMEN_JIT_NO_INT_REGS=1` keeps every int32 result of a register region (bitwise operators,
+  shifts, `Math.imul`) in a floating-point register instead of leaving it in an integer
+  register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
 - On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

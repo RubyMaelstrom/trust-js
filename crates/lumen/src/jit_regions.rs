@@ -42,19 +42,37 @@ extern "C" fn record_property_path(event: usize) {
     });
 }
 
+/// The test-only event callbacks are C calls: keep the virtual stack's registers (d16..d31 and
+/// the integer operand registers x2..x7) across them.
 #[cfg(test)]
-pub(super) fn emit_property_event(a: &mut asm::Asm, event: usize) {
-    a.sub_imm(31, 31, 128);
+fn event_save(a: &mut asm::Asm) {
+    a.sub_imm(31, 31, 176);
     for index in (16..32).step_by(2) {
         a.stp_d_off(index, index + 1, (index - 16) as i32 * 8);
     }
-    a.mov_imm64(0, event as u64);
-    a.mov_imm64(16, record_property_path as *const () as u64);
-    a.blr(16);
+    for index in (2..8).step_by(2) {
+        a.stp_off(index, index + 1, 128 + (index as i32 - 2) * 8);
+    }
+}
+
+#[cfg(test)]
+fn event_restore(a: &mut asm::Asm) {
     for index in (16..32).step_by(2) {
         a.ldp_d_off(index, index + 1, (index - 16) as i32 * 8);
     }
-    a.add_imm(31, 31, 128);
+    for index in (2..8).step_by(2) {
+        a.ldp_off(index, index + 1, 128 + (index as i32 - 2) * 8);
+    }
+    a.add_imm(31, 31, 176);
+}
+
+#[cfg(test)]
+pub(super) fn emit_property_event(a: &mut asm::Asm, event: usize) {
+    event_save(a);
+    a.mov_imm64(0, event as u64);
+    a.mov_imm64(16, record_property_path as *const () as u64);
+    a.blr(16);
+    event_restore(a);
 }
 
 #[cfg(test)]
@@ -68,17 +86,11 @@ extern "C" fn record_guarded_region(event: usize) {
 
 #[cfg(test)]
 fn emit_guarded_event(a: &mut asm::Asm, event: usize) {
-    a.sub_imm(31, 31, 128);
-    for index in (16..32).step_by(2) {
-        a.stp_d_off(index, index + 1, (index - 16) as i32 * 8);
-    }
+    event_save(a);
     a.mov_imm64(0, event as u64);
     a.mov_imm64(16, record_guarded_region as *const () as u64);
     a.blr(16);
-    for index in (16..32).step_by(2) {
-        a.ldp_d_off(index, index + 1, (index - 16) as i32 * 8);
-    }
-    a.add_imm(31, 31, 128);
+    event_restore(a);
 }
 
 #[cfg(test)]
@@ -256,16 +268,10 @@ fn emit_independent_effect_live_home_event(a: &mut asm::Asm, kind: usize) {
 #[cfg(test)]
 pub(super) fn emit_lowering_event(a: &mut asm::Asm, function: u64) {
     // Record before computing the predicate; a C call clobbers NZCV and volatile GPRs.
-    a.sub_imm(31, 31, 128);
-    for index in (16..32).step_by(2) {
-        a.stp_d_off(index, index + 1, (index - 16) as i32 * 8);
-    }
+    event_save(a);
     a.mov_imm64(16, function);
     a.blr(16);
-    for index in (16..32).step_by(2) {
-        a.ldp_d_off(index, index + 1, (index - 16) as i32 * 8);
-    }
-    a.add_imm(31, 31, 128);
+    event_restore(a);
 }
 
 #[cfg(test)]
@@ -985,6 +991,15 @@ enum Operand {
     Scalar(ScalarState),
     /// A virtual int32 Number constant that has neither a register nor a canonical word yet.
     Constant(i32),
+    /// An int32 result of a bitwise operator held in the low 32 bits of x`reg` (x2..x6, by
+    /// operand index), with no floating-point register and no canonical word yet: `unsigned`
+    /// is a `>>>` result, whose Number is the register read as a uint32. Whatever needs the
+    /// double (an arithmetic operand, a store) converts it (`scvtf`/`ucvtf`); the bitwise
+    /// operators, comparisons and branches use the register as it is.
+    Int {
+        reg: u8,
+        unsigned: bool,
+    },
 }
 
 impl Operand {
@@ -1005,6 +1020,11 @@ impl Operand {
         (f64::from(int) == value && bits != (-0.0f64).to_bits()).then_some(Self::Constant(int))
     }
 
+    /// The integer register pool: operand index -> x2..x6 (x7 belongs to the name probe).
+    fn int_pool(index: usize) -> Option<u32> {
+        (index < 5 && !env_flag!("LUMEN_JIT_NO_INT_REGS")).then_some(2 + index as u32)
+    }
+
     fn immediate(self) -> Option<i32> {
         match self {
             Self::Constant(value) => Some(value),
@@ -1022,7 +1042,7 @@ impl Operand {
     }
 
     fn scalar(self) -> bool {
-        matches!(self, Self::Scalar(_) | Self::Constant(_))
+        matches!(self, Self::Scalar(_) | Self::Constant(_) | Self::Int { .. })
     }
 
     fn numeric(self) -> bool {
@@ -1032,13 +1052,14 @@ impl Operand {
                 kind: ScalarKind::Number | ScalarKind::Integer,
                 ..
             }) | Self::Constant(_)
+                | Self::Int { .. }
         )
     }
 
     fn kind(self) -> Option<ScalarKind> {
         match self {
             Self::Scalar(state) => Some(state.kind),
-            Self::Constant(_) => Some(ScalarKind::Integer),
+            Self::Constant(_) | Self::Int { .. } => Some(ScalarKind::Integer),
             _ => None,
         }
     }
@@ -1079,6 +1100,11 @@ fn preserve_scalar_prefix(
 /// Establish register residency without converting, cloning, or guarding a
 /// previously proved language scalar. Canonical identity never follows a Dup
 /// or an overwritten result slot: those operations construct a new dirty state.
+/// The floating-point register of the operand at `index`.
+fn reg_d(index: usize) -> u32 {
+    16 + index as u32
+}
+
 fn scalar_register(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, index: usize) {
     let reg = 16 + index as u32;
     if let Operand::Constant(value) = stack[index] {
@@ -1090,6 +1116,16 @@ fn scalar_register(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, ind
         } else {
             a.mov_imm64(9, f64::from(value).to_bits());
             a.fmov_d_x(reg, 9);
+        }
+        stack[index] = Operand::temporary(ScalarKind::Integer);
+        return;
+    }
+    if let Operand::Int { reg, unsigned } = stack[index] {
+        // The double of an integer operand is made when something needs it.
+        if unsigned {
+            a.ucvtf_d_w(reg_d(index), u32::from(reg));
+        } else {
+            a.scvtf_d_w(reg_d(index), u32::from(reg));
         }
         stack[index] = Operand::temporary(ScalarKind::Integer);
         return;
@@ -1110,6 +1146,11 @@ fn duplicate_operand(a: &mut asm::Asm, stack: &mut Vec<Operand>, physical: usize
     let duplicate = match *stack.last().expect("Dup has an operand") {
         // A virtual constant duplicates for free.
         value @ Operand::Constant(_) => value,
+        Operand::Int { .. } => {
+            scalar_register(a, stack, physical, depth - 1);
+            a.fmov_d_d(16 + depth as u32, 15 + depth as u32);
+            Operand::temporary(ScalarKind::Integer)
+        }
         Operand::Scalar(state) => {
             scalar_register(a, stack, physical, depth - 1);
             a.fmov_d_d(16 + depth as u32, 15 + depth as u32);
@@ -1180,6 +1221,15 @@ fn materialize(
                 a.bind(cloned);
                 emit_exec_word_store(a, 9, 20, offset);
             }
+            Operand::Int { reg, unsigned } => {
+                // An integer is always a finite Number: no NaN to canonicalize.
+                if *unsigned {
+                    a.ucvtf_d_w(0, u32::from(*reg));
+                } else {
+                    a.scvtf_d_w(0, u32::from(*reg));
+                }
+                a.stur_d(0, 20, offset);
+            }
             Operand::Constant(value) => {
                 // Never produced a register: publish the constant's own word.
                 a.mov_imm64(9, f64::from(*value).to_bits());
@@ -1224,7 +1274,7 @@ fn guard_operand(a: &mut asm::Asm, stack: &[Operand], physical: usize, index: us
         Operand::Canonical => emit_exec_word_load(a, 9, 20, (index as i32 - physical as i32) * 8),
         Operand::Borrowed(home) => a.fmov_x_d(9, home),
         Operand::BorrowedValue => a.fmov_x_d(9, 16 + index as u32),
-        Operand::Scalar(_) | Operand::Constant(_) => a.b(fail),
+        Operand::Scalar(_) | Operand::Constant(_) | Operand::Int { .. } => a.b(fail),
     }
 }
 
@@ -1236,7 +1286,7 @@ fn number(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, index: usize
         }) => {
             scalar_register(a, stack, physical, index);
         }
-        Operand::Constant(_) => scalar_register(a, stack, physical, index),
+        Operand::Constant(_) | Operand::Int { .. } => scalar_register(a, stack, physical, index),
         Operand::Scalar(_) => a.b(fail), // Boolean coercion remains in the checked operation
         Operand::Borrowed(_) | Operand::BorrowedValue => {
             let source = match stack[index] {
@@ -1553,6 +1603,118 @@ fn emit_slot_owns_nothing(a: &mut asm::Asm, offset: i32, fail: usize) {
     a.b_cond(C_HS, fail); // Object, lazy prototype
 }
 
+/// The value domain in which two integer operands compare exactly (ECMA-262 Number::lessThan and
+/// Number::equal on integral values): the operands of a bitwise operator are int32 (signed) or,
+/// for `>>>`, uint32 (unsigned); a constant is whichever domain holds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntDomain {
+    /// Both operands read as int32: a 32-bit signed compare.
+    Signed,
+    /// Both read as uint32: a 32-bit unsigned compare.
+    Unsigned,
+    /// One of each: compare the values widened to 64 bits.
+    Wide,
+}
+
+impl IntDomain {
+    /// The condition that is true when the comparison `op` holds.
+    fn condition(self, op: &Op) -> u32 {
+        const C_LT: u32 = 11;
+        const C_LE: u32 = 13;
+        match (self, op) {
+            (_, Op::EqEq | Op::StrictEq) => C_EQ,
+            (_, Op::NotEq | Op::StrictNotEq) => C_NE,
+            (Self::Unsigned, Op::Lt) => C_LO,
+            (Self::Unsigned, Op::Le) => C_LS,
+            (Self::Unsigned, Op::Gt) => C_HI,
+            (Self::Unsigned, _) => C_HS,
+            (_, Op::Lt) => C_LT,
+            (_, Op::Le) => C_LE,
+            (_, Op::Gt) => C_GT,
+            (_, _) => C_GE,
+        }
+    }
+}
+
+/// The exact integer domain of a comparison whose operands are integer registers or constants
+/// (at least one a register), else None: the operands are then Numbers in double registers.
+fn int_comparison(op: &Op, operands: &[Operand]) -> Option<IntDomain> {
+    if !matches!(
+        op,
+        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::EqEq | Op::StrictEq | Op::NotEq | Op::StrictNotEq
+    ) || !operands
+        .iter()
+        .all(|o| matches!(o, Operand::Int { .. } | Operand::Constant(_)))
+        || !operands.iter().any(|o| matches!(o, Operand::Int { .. }))
+    {
+        return None;
+    }
+    // Signed-compatible: int32 results and constants. Unsigned-compatible: uint32 results and
+    // non-negative constants.
+    let signed = operands.iter().all(|o| match o {
+        Operand::Int { unsigned, .. } => !unsigned,
+        _ => true,
+    });
+    let unsigned = operands.iter().all(|o| match o {
+        Operand::Int { unsigned, .. } => *unsigned,
+        Operand::Constant(value) => *value >= 0,
+        _ => false,
+    });
+    Some(if signed {
+        IntDomain::Signed
+    } else if unsigned {
+        IntDomain::Unsigned
+    } else {
+        IntDomain::Wide
+    })
+}
+
+/// Set NZCV for `operands[0] ? operands[1]` in the exact domain of `int_comparison`. Scratch
+/// x12/x13 for widened or immediate operands.
+fn emit_int_compare(a: &mut asm::Asm, domain: IntDomain, operands: [Operand; 2]) {
+    let widen = |a: &mut asm::Asm, operand: Operand, scratch: u32| -> u32 {
+        match operand {
+            Operand::Int { reg, unsigned } => {
+                let reg = u32::from(reg);
+                if unsigned {
+                    a.mov_w(scratch, reg); // zero-extends
+                } else {
+                    a.sxtw(scratch, reg);
+                }
+            }
+            Operand::Constant(value) => a.mov_imm64(scratch, value as i64 as u64),
+            _ => unreachable!("integer comparison operands"),
+        }
+        scratch
+    };
+    if domain == IntDomain::Wide {
+        let left = widen(a, operands[0], 12);
+        let right = widen(a, operands[1], 13);
+        a.cmp_reg_x(left, right);
+        return;
+    }
+    let narrow = |a: &mut asm::Asm, operand: Operand, scratch: u32| -> u32 {
+        match operand {
+            Operand::Int { reg, .. } => u32::from(reg),
+            Operand::Constant(value) => {
+                a.mov_imm64(scratch, u64::from(value as u32));
+                scratch
+            }
+            _ => unreachable!("integer comparison operands"),
+        }
+    };
+    match (operands[0], operands[1]) {
+        (Operand::Int { reg, .. }, Operand::Constant(value)) if (0..4096).contains(&value) => {
+            a.cmp_imm_w(u32::from(reg), value as u32);
+        }
+        _ => {
+            let left = narrow(a, operands[0], 12);
+            let right = narrow(a, operands[1], 13);
+            a.cmp_reg_w(left, right);
+        }
+    }
+}
+
 /// A ToInt32 result: a compile-time constant (ToInt32 applied while compiling, so it costs no
 /// register, conversion or guard) or the low 32 bits of an x register.
 #[derive(Clone, Copy)]
@@ -1571,6 +1733,9 @@ fn int32_operand(
 ) -> IntOperand {
     if let Some(value) = stack[index].immediate() {
         return IntOperand::Imm(value); // an int32 constant is its own ToInt32
+    }
+    if let Operand::Int { reg, .. } = stack[index] {
+        return IntOperand::Reg(u32::from(reg)); // already ToInt32 bits (also for a uint32)
     }
     to_int32(a, stack, physical, index, output, fail);
     IntOperand::Reg(output)
@@ -1890,16 +2055,16 @@ fn emit_name_element(
     let hit = a.new_label();
     a.mark_push("name-elem");
     let key_index = pre.len();
-    let key = stack[key_index];
-    let value = plan.set.then(|| stack[key_index + 1]);
     // Registers for the operands (a constant key needs none: it is an immediate below).
-    for (index, operand) in [(key_index, Some(key)), (key_index + 1, value)] {
-        if let Some(operand) = operand {
-            if !matches!(operand, Operand::Constant(_)) || index != key_index {
-                number(a, stack, physical, index, name_miss);
-            }
+    for index in [key_index, key_index + 1] {
+        if index < key_index + 1 + usize::from(plan.set)
+            && (!matches!(stack[index], Operand::Constant(_)) || index != key_index)
+        {
+            number(a, stack, physical, index, name_miss);
         }
     }
+    let key = stack[key_index];
+    let value = plan.set.then(|| stack[key_index + 1]);
 
     // The key (d3) and the value to store (d1) for the shared sequence.
     match key {
@@ -2646,6 +2811,13 @@ pub(super) fn emit(
                             .iter()
                             .any(|o| matches!(o, Operand::Borrowed(_) | Operand::BorrowedValue));
                     let pre = if lazy {
+                        // The continuation clobbers the integer registers: below the name only
+                        // double registers survive.
+                        for index in 0..stack.len() {
+                            if matches!(stack[index], Operand::Int { .. }) {
+                                scalar_register(a, &mut stack, physical, index);
+                            }
+                        }
                         stack.clone()
                     } else {
                         let before = stack.clone();
@@ -2908,8 +3080,17 @@ pub(super) fn emit(
                     // and a guarded Number PutValue into a private local cannot
                     // invoke author code or change an OrdinaryGet descriptor.
                     // A non-number leaves the region before this store commits.
-                    number(a, &mut stack, physical, depth - 1, bailout);
-                    a.fmov_d_d(plan.reg(slot).unwrap(), 15 + depth as u32);
+                    if let Operand::Int { reg, unsigned } = stack[depth - 1] {
+                        let home = plan.reg(slot).unwrap();
+                        if unsigned {
+                            a.ucvtf_d_w(home, u32::from(reg));
+                        } else {
+                            a.scvtf_d_w(home, u32::from(reg));
+                        }
+                    } else {
+                        number(a, &mut stack, physical, depth - 1, bailout);
+                        a.fmov_d_d(plan.reg(slot).unwrap(), 15 + depth as u32);
+                    }
                     stack.pop();
                 }
                 Op::StoreLocal(slot)
@@ -3031,8 +3212,11 @@ pub(super) fn emit(
                         .iter()
                         .filter(|value| value.numeric())
                         .count();
-                    number(a, &mut stack, physical, depth - 2, bailout);
-                    number(a, &mut stack, physical, depth - 1, bailout);
+                    let integers = int_comparison(&ops[pc], &stack[depth - 2..]);
+                    if integers.is_none() {
+                        number(a, &mut stack, physical, depth - 2, bailout);
+                        number(a, &mut stack, physical, depth - 1, bailout);
+                    }
                     let left = 14 + depth as u32;
                     let right = left + 1;
                     let arithmetic = match ops[pc] {
@@ -3042,19 +3226,21 @@ pub(super) fn emit(
                         Op::Div => Some(3),
                         _ => None,
                     };
+                    let operands = [stack[depth - 2], stack[depth - 1]];
                     stack.pop();
                     stack.pop();
                     if let Some(op) = arithmetic {
                         a.f_arith(op, left, left, right);
                         stack.push(Operand::temporary(ScalarKind::Number));
                     } else {
-                        let cond = match ops[pc] {
-                            Op::Lt => C_MI,
-                            Op::Gt => C_GT,
-                            Op::Le => C_LS,
-                            Op::Ge => C_GE,
-                            Op::EqEq | Op::StrictEq => C_EQ,
-                            _ => C_NE,
+                        let cond = match (integers, &ops[pc]) {
+                            (Some(domain), op) => domain.condition(op),
+                            (None, Op::Lt) => C_MI,
+                            (None, Op::Gt) => C_GT,
+                            (None, Op::Le) => C_LS,
+                            (None, Op::Ge) => C_GE,
+                            (None, Op::EqEq | Op::StrictEq) => C_EQ,
+                            (None, _) => C_NE,
                         };
                         if let Some(Op::JumpIfFalse(target)) = (pc + 1 < end).then(|| &ops[pc + 1])
                         {
@@ -3063,14 +3249,20 @@ pub(super) fn emit(
                             #[cfg(test)]
                             emit_predicate_event(a);
                             materialize(a, layout, &stack, physical);
-                            a.fcmp(left, right);
+                            match integers {
+                                Some(domain) => emit_int_compare(a, domain, operands),
+                                None => a.fcmp(left, right),
+                            }
                             let edge = edges.target(a, pc + 1, *target as usize);
                             a.b_cond(cond ^ 1, edge);
                             physical = stack.len();
                             stack.fill(Operand::Canonical);
                             consumed = 1;
                         } else {
-                            a.fcmp(left, right);
+                            match integers {
+                                Some(domain) => emit_int_compare(a, domain, operands),
+                                None => a.fcmp(left, right),
+                            }
                             a.cset_w(9, cond);
                             a.mov_imm64(10, crate::value::PACK_BOOL);
                             a.logic_x(1, 9, 9, 10);
@@ -3080,33 +3272,49 @@ pub(super) fn emit(
                     }
                 }
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
-                    let lhs = int32_operand(a, &mut stack, physical, depth - 2, 12, bailout);
+                    let index = depth - 2;
+                    let pool = Operand::int_pool(index);
+                    let lhs =
+                        int32_operand(a, &mut stack, physical, index, pool.unwrap_or(12), bailout);
                     let rhs = int32_operand(a, &mut stack, physical, depth - 1, 13, bailout);
-                    let source = int32_binary(a, &ops[pc], lhs, rhs, 11, 13);
-                    let result = 14 + depth as u32;
-                    if matches!(ops[pc], Op::UShr) {
-                        a.ucvtf_d_w(result, source);
-                    } else {
-                        a.scvtf_d_w(result, source);
-                    }
+                    let unsigned = matches!(ops[pc], Op::UShr);
+                    let source = int32_binary(a, &ops[pc], lhs, rhs, pool.unwrap_or(11), 13);
                     stack.truncate(depth - 2);
-                    stack.push(Operand::temporary(ScalarKind::Integer));
+                    if let Some(pool) = pool {
+                        if source != pool {
+                            a.mov_w(pool, source); // an identity operation of another register
+                        }
+                        stack.push(Operand::Int {
+                            reg: pool as u8,
+                            unsigned,
+                        });
+                    } else {
+                        let result = 14 + depth as u32;
+                        if unsigned {
+                            a.ucvtf_d_w(result, source);
+                        } else {
+                            a.scvtf_d_w(result, source);
+                        }
+                        stack.push(Operand::temporary(ScalarKind::Integer));
+                    }
                 }
                 Op::BitNot => {
                     // ~x is ToInt32(x) XOR -1 (ECMA-262 §13.5.6): one MVN.
-                    let source = match int32_operand(a, &mut stack, physical, depth - 1, 9, bailout)
-                    {
-                        IntOperand::Imm(value) => {
-                            a.mov_imm64(9, u64::from(!value as u32));
-                            9
-                        }
-                        IntOperand::Reg(register) => {
-                            a.mvn_w(9, register);
-                            9
-                        }
-                    };
-                    a.scvtf_d_w(15 + depth as u32, source);
-                    stack[depth - 1] = Operand::temporary(ScalarKind::Integer);
+                    let pool = Operand::int_pool(depth - 1);
+                    let target = pool.unwrap_or(9);
+                    match int32_operand(a, &mut stack, physical, depth - 1, target, bailout) {
+                        IntOperand::Imm(value) => a.mov_imm64(target, u64::from(!value as u32)),
+                        IntOperand::Reg(register) => a.mvn_w(target, register),
+                    }
+                    if let Some(pool) = pool {
+                        stack[depth - 1] = Operand::Int {
+                            reg: pool as u8,
+                            unsigned: false,
+                        };
+                    } else {
+                        a.scvtf_d_w(15 + depth as u32, target);
+                        stack[depth - 1] = Operand::temporary(ScalarKind::Integer);
+                    }
                 }
                 Op::Neg | Op::Plus => {
                     number(a, &mut stack, physical, depth - 1, bailout);
@@ -3136,6 +3344,12 @@ pub(super) fn emit(
                         a.logic_imm_w(0, 9, 9, asm::logical_imm_w(1).unwrap());
                         let edge = edges.target(a, pc, target as usize);
                         a.cbz(9, false, edge);
+                    } else if let Operand::Int { reg, .. } = stack[depth - 1] {
+                        // ToBoolean of an integral Number: false only for zero.
+                        stack.pop();
+                        materialize(a, layout, &stack, physical);
+                        let edge = edges.target(a, pc, target as usize);
+                        a.cbz(u32::from(reg), false, edge);
                     } else if stack[depth - 1].numeric() {
                         scalar_register(a, &mut stack, physical, depth - 1);
                         stack.pop();
