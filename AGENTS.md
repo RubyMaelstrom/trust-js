@@ -218,6 +218,15 @@ Every cache keyed by an object, environment or Realm identity must validate it a
 use; inline splices also require their planning Realm's global environment. Never
 share an AST between interpreters: its caches hold one heap's shapes.
 
+Such a shared snapshot keeps each function body encoded in the `&'static` snapshot bytes
+until the function runs or compiles (`ast::FunctionBody`, `snapshot::decode_static`); the
+process's first decode of the bytes still validates every body. Code that only analyzes a
+function that is not about to run (closure creation, an enclosing function's capture scan)
+must use `FunctionBody::with`, never materialize it; compiling an enclosing function
+replays an encoded inner function's `bytecode::CaptureSummary` instead of walking it, and
+test builds check each summary against the walk. Memory accounting reads only
+materialized bodies.
+
 Engine strings store a lone surrogate as the scalar U+10F800 + (unit − 0xD800) and a
 character in U+10F800..=U+10FFFF as its pair of such scalars (`jstr.rs`). Rust text
 enters through `Value::str`, `Value::from_string` and the host source entry points,

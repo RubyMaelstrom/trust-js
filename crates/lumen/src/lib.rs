@@ -97,6 +97,8 @@ mod intl;
 mod jit;
 mod jit_ir;
 mod jstr;
+#[cfg(test)]
+mod lazy_snapshot_body_tests;
 mod lexer;
 #[cfg(test)]
 mod loop_completion_tests;
@@ -1040,6 +1042,9 @@ impl interpreter::Interp {
                 line: 0,
                 at_eof: false,
             })?;
+        // The bootstrap compiles its outermost functions one inside the other; each compilation
+        // scans the functions nested in it. Summarize each still-encoded one once.
+        let _summaries = crate::bytecode::capture_summaries();
         Ok(self.eval_classic_body(&body, None))
     }
 

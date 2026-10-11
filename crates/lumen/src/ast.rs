@@ -559,6 +559,16 @@ impl FunctionBody {
         }
     }
 
+    /// The snapshot bytes of a body that is still encoded: an identity that every decode of
+    /// the same function shares.
+    #[inline]
+    pub(crate) fn encoding(&self) -> Option<&'static [u8]> {
+        match self.stmts.get() {
+            Some(_) => None,
+            None => self.encoded,
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn materialize(&self) -> &Vec<Stmt> {

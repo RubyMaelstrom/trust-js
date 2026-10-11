@@ -3210,6 +3210,7 @@ fn lexical_declaration_statement(statement: &Stmt) -> &Stmt {
 /// past the activation to the wrong binding, so everything not fully understood returns `None`
 /// (direct eval, `with`, sloppy block function declarations, module syntax, …) and the caller
 /// bails to the tree-walker.
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 struct CaptureScan {
     /// Optional conservative syntax-only query for an unobservable function
     /// self binding. Any identifier use, eval, unsupported construct or budget
@@ -3400,6 +3401,157 @@ fn hoisted_vars_stmt(
             .iter()
             .all(|c| hoisted_vars(&c.body, false, strict, out)),
         _ => true,
+    }
+}
+
+/// What walking one inner function contributes to an enclosing [`CaptureScan`], independent of
+/// where the function is nested.
+///
+/// Walking a function's body changes the enclosing scan's state in only these ways: references
+/// that its own scopes do not resolve go on to resolve against the enclosing scopes (captures and
+/// free names), `this`/`super` read through an unbroken arrow chain mark the outer `this`, and a
+/// direct `eval` or a `with` statement anywhere inside either fails the scan or marks it. Its own
+/// scopes, loops and nested functions are entered and left again, and scope serials are only
+/// compared with each other. A summary records those effects once, from a scan of the function
+/// alone that admits `eval` and `with`; [`CaptureScan::apply_summary`] replays them where the
+/// function occurs. `None` means the walk itself fails wherever the function is.
+///
+/// This lets a compilation analyze inner functions whose bodies are still encoded in a static
+/// snapshot (`ast::FunctionBody`) from one temporary decode: while a snapshot bootstraps a Realm
+/// ([`capture_summaries`]), every enclosing compilation reuses the summary, so a platform
+/// prelude's nested function bodies are neither decoded once per enclosing function nor kept.
+pub(crate) struct CaptureSummary {
+    /// Names referenced inside the function that none of its own scopes declare there.
+    free: Box<[Box<str>]>,
+    /// The function is an arrow and reads `this` (or `super`) through arrows only.
+    env_this: bool,
+    direct_eval: bool,
+    with: bool,
+}
+
+thread_local! {
+    /// Summaries of still-encoded functions by encoding identity, while a scope is open.
+    static CAPTURE_SUMMARIES: std::cell::RefCell<(
+        usize,
+        crate::fasthash::FastMap<(usize, usize), Option<Rc<CaptureSummary>>>,
+    )> = std::cell::RefCell::default();
+}
+
+/// Keep the [`CaptureSummary`] of every still-encoded function that compilation analyzes until
+/// the returned guard and every enclosing one are dropped. Static snapshot bootstraps hold one.
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+pub(crate) fn capture_summaries() -> CaptureSummaries {
+    CAPTURE_SUMMARIES.with(|cache| cache.borrow_mut().0 += 1);
+    CaptureSummaries(())
+}
+
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+pub(crate) struct CaptureSummaries(());
+
+impl Drop for CaptureSummaries {
+    fn drop(&mut self) {
+        let released = CAPTURE_SUMMARIES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.0 -= 1;
+            if cache.0 == 0 {
+                std::mem::take(&mut cache.1)
+            } else {
+                Default::default()
+            }
+        });
+        drop(released);
+    }
+}
+
+/// Test builds check every summary that a scan applies against walking the same function at
+/// the same position.
+mod capture_summary_tests {
+    #[cfg(test)]
+    use super::{CaptureScan, CaptureSummary, Function};
+
+    #[cfg(test)]
+    thread_local! {
+        static WALKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Inside a check's reference walk, inner functions are walked, never summarized.
+    #[inline(always)]
+    pub(super) fn walking() -> bool {
+        #[cfg(test)]
+        return WALKING.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn check(scan: &CaptureScan, f: &Function, summary: Option<&CaptureSummary>) {
+        let mut walked = scan.clone();
+        WALKING.with(|walking| walking.set(true));
+        let walked_result = walked.walk_inner_fn(f);
+        WALKING.with(|walking| walking.set(false));
+        let mut applied = scan.clone();
+        let applied_result = summary.and_then(|summary| applied.apply_summary(summary));
+        assert_eq!(
+            walked_result.is_some(),
+            applied_result.is_some(),
+            "capture summary outcome differs from walking {:?}",
+            f.name
+        );
+        if walked_result.is_some() {
+            // Scopes pushed inside the function take serials the summary does not; nothing
+            // records them (they are never depth-0 scopes).
+            walked.next_serial = applied.next_serial;
+            assert_eq!(
+                walked, applied,
+                "capture summary differs from walking {:?}",
+                f.name
+            );
+        }
+    }
+}
+
+impl CaptureSummary {
+    fn of(f: &Function, encoding: &'static [u8]) -> Option<Rc<CaptureSummary>> {
+        let key = (encoding.as_ptr() as usize, encoding.len());
+        let cached = CAPTURE_SUMMARIES.with(|cache| {
+            let cache = cache.borrow();
+            if cache.0 == 0 {
+                return None;
+            }
+            cache.1.get(&key).cloned()
+        });
+        if let Some(summary) = cached {
+            return summary;
+        }
+        let summary = Self::scan(f).map(Rc::new);
+        CAPTURE_SUMMARIES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.0 != 0 {
+                cache.1.insert(key, summary.clone());
+            }
+        });
+        summary
+    }
+
+    /// Walk `f` as an inner function of a scan that has no scopes of its own: every reference
+    /// its scopes leave unresolved is then free, and `env_this` holds for its own arrow chain.
+    fn scan(f: &Function) -> Option<CaptureSummary> {
+        let mut scan = CaptureScan::new(f, true);
+        scan.arrow_path = vec![false];
+        scan.walk_inner_fn(f)?;
+        let mut free: Vec<Box<str>> = scan
+            .free_refs
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect();
+        // Set order is arbitrary; replay references deterministically.
+        free.sort_unstable();
+        Some(CaptureSummary {
+            free: free.into_boxed_slice(),
+            env_this: scan.env_this,
+            direct_eval: scan.saw_direct_eval,
+            with: scan.saw_with,
+        })
     }
 }
 
@@ -4117,12 +4269,56 @@ impl CaptureScan {
 
     /// Enter an inner function (declaration, expression, method, accessor…).
     fn inner_fn(&mut self, f: &Function) -> Option<()> {
+        // A function whose body is still encoded in a static snapshot is summarized instead of
+        // walked (see `CaptureSummary`); the self-binding query keeps its budgeted walk.
+        if self.watched_name.is_none() && !capture_summary_tests::walking() {
+            if let Some(encoding) = f.body.encoding() {
+                let summary = CaptureSummary::of(f, encoding);
+                #[cfg(test)]
+                capture_summary_tests::check(self, f, summary.as_deref());
+                return self.apply_summary(&*summary?);
+            }
+        }
+        self.walk_inner_fn(f)
+    }
+
+    fn walk_inner_fn(&mut self, f: &Function) -> Option<()> {
         self.fn_depth += 1;
         self.arrow_path.push(f.is_arrow);
         let r = self.fn_body(f);
         self.arrow_path.pop();
         self.fn_depth -= 1;
         r
+    }
+
+    /// Exactly what [`CaptureScan::walk_inner_fn`] would contribute at this position for the
+    /// function `summary` describes: a direct eval or `with` statement it contains, the outer
+    /// `this` read through its arrow chain, and the names its references resolve outside it.
+    fn apply_summary(&mut self, summary: &CaptureSummary) -> Option<()> {
+        if summary.direct_eval {
+            if !self.allow_direct_eval {
+                return None;
+            }
+            self.saw_direct_eval = true;
+        }
+        if summary.with {
+            if !self.allow_with {
+                return None;
+            }
+            self.saw_with = true;
+        }
+        // The walk checks the whole path from the compiled function: the part outside the
+        // inner function here, the part inside it in the summary.
+        if summary.env_this && self.arrow_path[1..].iter().all(|a| *a) {
+            self.env_this = true;
+        }
+        // Each reference is resolved from inside the function, past its own scopes.
+        self.fn_depth += 1;
+        for name in summary.free.iter() {
+            self.reference(name);
+        }
+        self.fn_depth -= 1;
+        Some(())
     }
 
     fn class(&mut self, c: &Class) -> Option<()> {
