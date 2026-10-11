@@ -253,6 +253,38 @@ out.join('|');
     );
 }
 
+/// A hot loop body of hundreds of operations reads closure variables of every kind in line; the
+/// values, accumulations and a replaced callee agree with the interpreter.
+#[test]
+fn large_loop_bodies_read_closure_variables_of_every_kind() {
+    all_tiers(
+        r####"var out = [];
+var n1 = 1.5, n2 = -2, s1 = 'a', o1 = { v: 3 }, b1 = true, u1, nl1 = null, big1 = 5n, sy1 = Symbol('q');
+function fn1(x) { return x * n2; }
+function run(rounds) {
+  var acc = '';
+  for (var i = 0; i < rounds; i++) {
+    acc += n1 + n2 + 0; acc += s1; acc += o1.v + 0; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(0);
+    acc += n1 + n2 + 1; acc += s1; acc += o1.v + 1; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(1);
+    acc += n1 + n2 + 2; acc += s1; acc += o1.v + 2; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(2);
+    acc += n1 + n2 + 3; acc += s1; acc += o1.v + 3; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(3);
+    acc += n1 + n2 + 4; acc += s1; acc += o1.v + 4; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(4);
+    acc += n1 + n2 + 5; acc += s1; acc += o1.v + 5; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(5);
+    acc += n1 + n2 + 6; acc += s1; acc += o1.v + 6; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(6);
+    acc += n1 + n2 + 7; acc += s1; acc += o1.v + 7; acc += b1; acc += u1; acc += nl1; acc += big1; acc += typeof sy1; acc += (n1 > n2 ? 'g' : 'l'); acc += fn1(7);
+    n1 = n1 + 1; s1 = s1 + i; n2 = i & 1 ? n2 : -n2;
+    if (i === 10) { b1 = false; u1 = 7; o1 = { v: 9 }; big1 = 6n; }
+    if (i === 20) { fn1 = function (x) { return x + 100; }; }
+  }
+  return acc.length + ':' + acc.slice(0, 50) + ':' + acc.slice(-50);
+}
+for (var r = 0; r < 4; r++) out.push(run(30));
+out.join('|');
+"####,
+        "12001:-0.5a3trueundefinednull5symbolg00.5a4trueundefined:51617181920212223242526272816false7null6symbolg107|23690:33.5a012345678910111213141516171819202122232425262:51617181920212223242526272816false7null6symbolg107|35690:59.5a012345678910111213141516171819202122232425262:51617181920212223242526272816false7null6symbolg107|47886:93.5a012345678910111213141516171819202122232425262:51617181920212223242526272816false7null6symbolg107",
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 fn owners(engine: &mut Engine, name: &str) -> usize {
     use crate::value::Value;

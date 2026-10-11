@@ -2473,6 +2473,9 @@ mod asm {
         /// The code being emitted runs once per loop iteration: sites keep their fast paths in
         /// line instead of calling a shared stub (see `super::use_shared_stub`).
         hot: bool,
+        /// The chunk compiler emits the shared stubs sites request (see `super::SharedStub`);
+        /// template tests that assemble loose code leave this clear and get inline sequences.
+        stubs_ok: bool,
         /// Profiler attribution markers (`LUMEN_JIT_MAP` only): a bound label and the template
         /// family whose code starts there. Nested families restore their parent when they end.
         marks: Vec<(usize, &'static str)>,
@@ -2495,6 +2498,7 @@ mod asm {
                 labels: Vec::new(),
                 stubs: Vec::new(),
                 hot: false,
+                stubs_ok: false,
                 marks: Vec::new(),
                 mark_stack: Vec::new(),
             }
@@ -2530,6 +2534,13 @@ mod asm {
         }
         pub fn hot(&self) -> bool {
             self.hot
+        }
+        /// Declare that the compiler will emit every shared stub this code requests.
+        pub fn set_stubs_ok(&mut self, ok: bool) {
+            self.stubs_ok = ok;
+        }
+        pub fn stubs_ok(&self) -> bool {
+            self.stubs_ok
         }
         /// The entry label of the shared stub `key`, requesting its emission on first use.
         pub fn shared_stub(&mut self, key: u32) -> usize {
@@ -3857,6 +3868,7 @@ fn compile_entry(
     // without a helper call). All strong-count templates gate on this.
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
     let mut a = asm::Asm::new();
+    a.set_stubs_ok(true);
     let residency = Box::<cache::CodeResidency>::default();
     let residency_ptr = &*residency as *const cache::CodeResidency as u64;
     // One label per bytecode pc (branch/catch targets bind as we emit).
@@ -10571,6 +10583,17 @@ fn emit_load_name_inline_marked(
 ) {
     let slow = a.new_label();
     let done = a.new_label();
+    if use_shared_stub(a) {
+        // Straight-line code: the whole read is one call of the chunk's shared stub, which
+        // validates the cache and pushes the clone; a miss falls through to the checked helper.
+        a.mov_imm64(12, cache_ptr as u64);
+        let stub = a.shared_stub(SharedStub::NameLoad { for_call }.key());
+        a.bl_label(stub);
+        a.cbnz(9, false, done);
+        emit_exec(a, pc, l_unwind);
+        a.bind(done);
+        return;
+    }
     // Validate the cache and leave a pointer to the resolved Value in x14 (either mode).
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
     emit_load_name_value(a, layout, preferred_number, slow, for_call);
@@ -10707,6 +10730,14 @@ enum SharedStub {
     /// [`emit_name_ic_value_ptr_in`] from the fixed scope in x9 (`Op::LoadNameIn`), with the
     /// outputs of [`SharedStub::NameValuePtr`].
     NameValuePtrIn,
+    /// A whole free-name read (`Op::LoadName`, or `Op::LoadNameForCall` with its `this` slot):
+    /// the cache proof of [`SharedStub::NameValuePtr`], then the value's clone onto the
+    /// operand stack at x20 (advanced). x12 = the site's `NameIc` cell → w9 = 1 when the value
+    /// is pushed; w9 = 0 leaves every operand untouched for the site's checked helper.
+    NameLoad { for_call: bool },
+    /// The checked helper call of an operation's slow path (`emit_op_helper`): x1 = the
+    /// site's pc → x20 = the helper's new operand top, x1 = its flag (nonzero: threw).
+    Helper { idx: u8 },
     /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver → w9 = 0 or a
     /// `PROP_PROBE_*` landing, with x11 = holder base and x13 = slot for the data landings.
     #[cfg(all(
@@ -10824,11 +10855,15 @@ impl SharedStub {
     const NAME_VALUE_PTR_IN: u32 = 0x400;
     const INTRINSICS1: u32 = 0x500;
     const INTRINSICS2: u32 = 0x600;
+    const NAME_LOAD: u32 = 0x700;
+    const HELPER: u32 = 0x800;
 
     fn key(self) -> u32 {
         match self {
             SharedStub::NameValuePtr { packed_ok } => Self::NAME_VALUE_PTR | u32::from(packed_ok),
             SharedStub::NameValuePtrIn => Self::NAME_VALUE_PTR_IN,
+            SharedStub::NameLoad { for_call } => Self::NAME_LOAD | u32::from(for_call),
+            SharedStub::Helper { idx } => Self::HELPER | u32::from(idx),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -10875,6 +10910,12 @@ impl SharedStub {
                 packed_ok: key & 1 != 0,
             },
             Self::NAME_VALUE_PTR_IN => SharedStub::NameValuePtrIn,
+            Self::NAME_LOAD => SharedStub::NameLoad {
+                for_call: key & 1 != 0,
+            },
+            Self::HELPER => SharedStub::Helper {
+                idx: (key & 0xff) as u8,
+            },
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -10933,6 +10974,28 @@ impl SharedStub {
             SharedStub::NameValuePtrIn => {
                 let miss = a.new_label();
                 emit_name_ic_value_ptr_in(a, layout, miss, true, NameEnv::InX9);
+                a.movz(9, 1, 0);
+                a.ret();
+                a.bind(miss);
+                a.movz(9, 0, 0);
+                a.ret();
+            }
+            SharedStub::Helper { idx } => {
+                // The site has set x1 = pc; the call preserves nothing the body keeps in
+                // caller-saved registers, exactly like the inline sequence it replaces.
+                a.mov(0, 19);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (usize::from(idx) * 8) as u32);
+                a.stp_pre(29, 30, -16);
+                a.blr(16);
+                a.ldp_post(29, 30, 16);
+                a.mov(20, 0);
+                a.ret();
+            }
+            SharedStub::NameLoad { for_call } => {
+                let miss = a.new_label();
+                emit_name_ic_value_ptr_body(a, layout, miss, true);
+                emit_load_name_value(a, layout, None, miss, for_call);
                 a.movz(9, 1, 0);
                 a.ret();
                 a.bind(miss);
@@ -18139,6 +18202,15 @@ fn emit_op_helper(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
+    if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS {
+        // A slow path runs rarely and costs far more than a call and return: the sequence
+        // lives once in a shared stub, leaving three instructions at every site.
+        a.movz(1, pc, 0);
+        let stub = a.shared_stub(SharedStub::Helper { idx: idx as u8 }.key());
+        a.bl_label(stub);
+        a.cbnz(1, false, l_unwind);
+        return;
+    }
     a.mov(0, 19);
     a.movz(1, pc, 0);
     a.mov(2, 20);
