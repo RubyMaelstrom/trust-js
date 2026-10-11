@@ -275,3 +275,82 @@ fn capture_summaries_preserve_unanalyzable_inner_functions() {
         assert_eq!(eval_string(it, "out"), "2,2,true,function", "{tier:?}");
     }
 }
+
+/// The immediately invoked function of `body[0]` (`(function () { … })();`).
+fn bootstrap_function(body: &[crate::ast::Stmt]) -> Rc<crate::ast::Function> {
+    use crate::ast::{Expr, Stmt};
+    let Stmt::Expr(Expr::Call { callee, .. }) = &body[0] else {
+        panic!("an immediately invoked bootstrap function")
+    };
+    let mut callee = &**callee;
+    while let Expr::Paren(inner) = callee {
+        callee = inner;
+    }
+    let Expr::Func(function) = callee else {
+        panic!("a function expression")
+    };
+    function.clone()
+}
+
+fn has_native_code(function: &crate::ast::Function) -> bool {
+    function
+        .code
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|chunk| chunk.jit.get().is_some_and(|code| code.is_some()))
+}
+
+/// A static snapshot's run-once bootstrap function (`Function::run_once`) runs once per Realm,
+/// so its bytecode stays on the VM: it never gets native code. The functions it defines keep
+/// their tiering, and so does the same source when it is parsed.
+#[test]
+fn run_once_bootstrap_functions_never_get_native_code() {
+    const SOURCE: &str = r#"(function () {
+        let total = 0;
+        for (let i = 0; i < 50; i++) total += i;
+        function hot(n) { let sum = 0; for (let i = 0; i < n; i++) sum += i; return sum; }
+        globalThis.bootstrapTotal = total + hot(10);
+        globalThis.hot = hot;
+    })();"#;
+    static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let snapshot: &'static [u8] =
+        SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(SOURCE).expect("source parses"));
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    let it = &mut *engine.interp;
+    let program = it.shared_snapshot_program(snapshot).expect("decodes");
+    if let Err(Abrupt::Throw(error)) = it.run_classic_program(&program, None) {
+        panic!("snapshot threw: {}", render(it, &error));
+    }
+    assert_eq!(eval_string(it, "bootstrapTotal"), "1270");
+    let bootstrap = bootstrap_function(&program);
+    assert!(bootstrap.run_once);
+    assert!(
+        bootstrap.code.get().is_some_and(Option::is_some),
+        "a loop still compiles the bootstrap to bytecode on its first call"
+    );
+    assert!(!has_native_code(&bootstrap), "but it runs on the VM");
+    let hot = global_function(it, "hot");
+    assert!(!hot.run_once);
+    assert!(
+        has_native_code(&hot),
+        "the functions it defines keep their tiering"
+    );
+
+    let mut parsed_engine = Engine::new();
+    parsed_engine.set_tier(Tier::Jit);
+    let it = &mut *parsed_engine.interp;
+    let Ok(parsed) = crate::parser::parse_script(SOURCE, false) else {
+        panic!("source parses")
+    };
+    if let Err(Abrupt::Throw(error)) = it.run_classic_program(&parsed, None) {
+        panic!("parsed source threw: {}", render(it, &error));
+    }
+    assert_eq!(eval_string(it, "bootstrapTotal"), "1270");
+    let parsed_bootstrap = bootstrap_function(&parsed);
+    assert!(!parsed_bootstrap.run_once);
+    assert!(
+        has_native_code(&parsed_bootstrap),
+        "parsed source keeps today's tiering"
+    );
+}

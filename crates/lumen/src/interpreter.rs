@@ -12431,7 +12431,10 @@ impl Interp {
         // Capacity pressure is retryable. Reclamation invalidates raw ICs first
         // and preserves every active native frame and owned Rust code lease.
         let mut jit_code = None;
-        if matches!(self.tier, crate::bytecode::Tier::Jit) {
+        // A static snapshot's run-once bootstrap function (`Function::run_once`) runs once per
+        // Realm: the bytecode VM runs it about as fast as native code would, without making
+        // every Agent keep its executable code.
+        if matches!(self.tier, crate::bytecode::Tier::Jit) && !func.run_once {
             let permit = if chunk.jit.ready_to_compile()
                 && crate::jit::ensure_executable_capacity(chunk.jit_budget_wait_bytes.get())
             {

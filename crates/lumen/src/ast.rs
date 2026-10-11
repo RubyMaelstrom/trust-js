@@ -658,6 +658,12 @@ pub struct Function {
     /// that source's intrinsic operations, and rendered as a NativeFunction (it has no `source`).
     /// Never set for author code.
     pub self_hosted: bool,
+    /// Run-once bootstrap code of a static host snapshot: a function expression that the
+    /// snapshot's top-level code, or the body of another such function, calls immediately and
+    /// outside any loop or class (`(function () { … })()`), so it runs once in each Realm that
+    /// evaluates the snapshot. Its bytecode runs on the VM and never gets native code (see
+    /// `Interp::run_compiled_chunk`). Never set for parsed source or other snapshots.
+    pub(crate) run_once: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
     pub source: Option<Rc<str>>,
     /// The script, module, eval or `Function` source the function was parsed from, which its

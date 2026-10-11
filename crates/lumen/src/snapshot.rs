@@ -15,6 +15,10 @@
 //!   [`FunctionBody`]). The first static decode of a snapshot in the process still decodes, and
 //!   so validates, every body under the same budgets as [`decode`]; it drops each body after
 //!   validating it. Later decodes of those immutable bytes skip the bodies by their lengths.
+//! - **Run-once bootstrap functions are marked** in a second flags byte: the encoder knows which
+//!   function expressions run once per evaluation of the Script (`Function::run_once`). Only a
+//!   static decode keeps the mark, which changes how the function is compiled, never what it
+//!   does.
 //! - Interned `&'static str` operators are re-interned from [`KEYWORDS`]/[`PUNCTUATORS`] on
 //!   decode (every op the parser emits comes from those tables).
 //!
@@ -31,7 +35,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -92,6 +96,12 @@ fn with_codec_stack<T>(f: impl FnOnce() -> T) -> T {
 struct Writer {
     buf: Vec<u8>,
     include_source: bool,
+    /// The code being encoded runs at most once per evaluation of the Script: its top-level
+    /// statements and the bodies of the run-once functions they call immediately, outside
+    /// loops, classes and other functions (see `Function::run_once`).
+    run_once: bool,
+    /// The function expression an immediate call in run-once code is about to encode.
+    run_once_callee: *const Function,
 }
 
 impl Writer {
@@ -302,6 +312,8 @@ fn encode_with_source(body: &[Stmt], include_source: bool) -> Vec<u8> {
     let mut w = Writer {
         buf: Vec::with_capacity(body.len() * 32),
         include_source,
+        run_once: true,
+        run_once_callee: std::ptr::null(),
     };
     w.uv(MAGIC as u64);
     w.uv(VERSION as u64);
@@ -507,7 +519,11 @@ fn dec_opt_rcstr(r: &mut Reader) -> R<Option<Rc<str>>> {
 // ---- Stmt -------------------------------------------------------------------------------------
 
 fn enc_stmt(w: &mut Writer, s: &Stmt) {
+    // A loop's parts can run any number of times per evaluation of the code around it.
+    let run_once = w.run_once;
+    w.run_once = run_once && s.loop_body().is_none();
     with_codec_stack(|| enc_stmt_inner(w, s));
+    w.run_once = run_once;
 }
 
 #[inline(never)]
@@ -988,6 +1004,15 @@ fn enc_expr_inner(w: &mut Writer, e: &Expr) {
             ..
         } => {
             w.u8(24);
+            // `(function () { ... })()` in run-once code: the function object the callee
+            // creates is called here, once, and nowhere else.
+            let mut immediate = &**callee;
+            while let Expr::Paren(inner) = immediate {
+                immediate = inner;
+            }
+            if let (true, Expr::Func(function)) = (w.run_once, immediate) {
+                w.run_once_callee = Rc::as_ptr(function);
+            }
             enc_expr(w, callee);
             enc_array_elems(w, args);
             w.bool(*optional);
@@ -1435,11 +1460,14 @@ fn dec_pattern_inner(r: &mut Reader) -> R<Pattern> {
 }
 
 fn enc_function(w: &mut Writer, f: &Function) {
-    with_codec_stack(|| enc_function_inner(w, f));
+    let run_once = std::mem::replace(&mut w.run_once_callee, std::ptr::null()) == f;
+    let outer = std::mem::replace(&mut w.run_once, run_once);
+    with_codec_stack(|| enc_function_inner(w, f, run_once));
+    w.run_once = outer;
 }
 
 #[inline(never)]
-fn enc_function_inner(w: &mut Writer, f: &Function) {
+fn enc_function_inner(w: &mut Writer, f: &Function, run_once: bool) {
     enc_opt_str(w, &f.name);
     w.uv(f.params.len() as u64);
     for p in &f.params {
@@ -1458,7 +1486,7 @@ fn enc_function_inner(w: &mut Writer, f: &Function) {
         | (f.is_fn_expr as u8) << 6
         | (f.default_ctor as u8) << 7;
     w.u8(flags);
-    w.bool(f.self_hosted);
+    w.u8(f.self_hosted as u8 | (run_once as u8) << 1);
     if w.include_source {
         enc_opt_rcstr(w, &f.source);
     } else {
@@ -1485,7 +1513,13 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
     }
     let body = dec_function_body(r)?;
     let flags = r.u8()?;
-    let self_hosted = r.bool()?;
+    let more_flags = r.u8()?;
+    if more_flags > 3 {
+        return Err("snapshot: invalid function flags".into());
+    }
+    let self_hosted = more_flags & 1 != 0;
+    // Only a static snapshot's bootstrap runs in each Realm that evaluates it.
+    let run_once = more_flags & 2 != 0 && r.lazy.is_some();
     let source = dec_opt_rcstr(r)?;
     Ok(Function {
         name,
@@ -1500,6 +1534,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         is_fn_expr: flags & 64 != 0,
         default_ctor: flags & 128 != 0,
         self_hosted,
+        run_once,
         source,
         // A snapshot keeps no source positions: its frames print like built-ins (or not at all).
         script: None,
@@ -1557,7 +1592,10 @@ fn dec_function_body(r: &mut Reader) -> R<FunctionBody> {
 }
 
 fn enc_class(w: &mut Writer, c: &Class) {
+    // Class elements run per instance or per class evaluation.
+    let run_once = std::mem::replace(&mut w.run_once, false);
     with_codec_stack(|| enc_class_inner(w, c));
+    w.run_once = run_once;
 }
 
 #[inline(never)]
@@ -1755,6 +1793,8 @@ mod tests {
         let mut writer = Writer {
             buf: Vec::new(),
             include_source: true,
+            run_once: true,
+            run_once_callee: std::ptr::null(),
         };
         writer.uv(MAGIC as u64);
         writer.uv(VERSION as u64);
@@ -2208,5 +2248,193 @@ mod tests {
             outer.body.materialized().is_none(),
             "the original is untouched"
         );
+    }
+
+    /// Collect `(name, run_once)` for every named function the fixtures below contain.
+    fn function_marks(body: &[Stmt], out: &mut Vec<(String, bool)>) {
+        use crate::ast::{ArrayElem, ClassMember, ForInit, MemberKind, PropDef, PropKey};
+        fn function(f: &Function, out: &mut Vec<(String, bool)>) {
+            named(f, f.name.clone().unwrap_or_default(), out);
+        }
+        fn member(member: &ClassMember, out: &mut Vec<(String, bool)>) {
+            if let Some(func) = &member.func {
+                match (&member.kind, &member.key) {
+                    (MemberKind::StaticBlock, _) => named(func, "<static block>".into(), out),
+                    (_, PropKey::Ident(key)) => named(func, key.clone(), out),
+                    _ => function(func, out),
+                }
+            }
+        }
+        fn named(f: &Function, name: String, out: &mut Vec<(String, bool)>) {
+            out.push((name, f.run_once));
+            for param in &f.params {
+                if let Some(default) = &param.default {
+                    expr(default, out);
+                }
+            }
+            f.body.with(|body| function_marks(body, out));
+        }
+        fn expr(e: &Expr, out: &mut Vec<(String, bool)>) {
+            match e {
+                Expr::Func(f) => function(f, out),
+                Expr::Paren(inner) | Expr::Unary { arg: inner, .. } => expr(inner, out),
+                Expr::Call { callee, args, .. } => {
+                    expr(callee, out);
+                    for arg in args {
+                        if let ArrayElem::Item(arg) | ArrayElem::Spread(arg) = arg {
+                            expr(arg, out);
+                        }
+                    }
+                }
+                Expr::Member { obj, .. } => expr(obj, out),
+                Expr::Array(items) => {
+                    for item in items {
+                        if let ArrayElem::Item(item) | ArrayElem::Spread(item) = item {
+                            expr(item, out);
+                        }
+                    }
+                }
+                Expr::Object(props) => {
+                    for prop in props {
+                        match prop {
+                            PropDef::Method {
+                                key: PropKey::Ident(key),
+                                func,
+                            } => named(func, key.clone(), out),
+                            PropDef::KeyValue { value, .. } => expr(value, out),
+                            _ => {}
+                        }
+                    }
+                }
+                Expr::Class(class) => {
+                    for each in &class.members {
+                        member(each, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for statement in body {
+            match statement {
+                Stmt::Expr(e) => expr(e, out),
+                Stmt::FuncDecl(f) => function(f, out),
+                Stmt::VarDecl { decls, .. } => {
+                    for (_, init) in decls {
+                        if let Some(init) = init {
+                            expr(init, out);
+                        }
+                    }
+                }
+                Stmt::If { test, cons, alt } => {
+                    expr(test, out);
+                    function_marks(std::slice::from_ref(&**cons), out);
+                    if let Some(alt) = alt {
+                        function_marks(std::slice::from_ref(&**alt), out);
+                    }
+                }
+                Stmt::Block(body) => function_marks(body, out),
+                Stmt::Try {
+                    block, finalizer, ..
+                } => {
+                    function_marks(block, out);
+                    if let Some(finalizer) = finalizer {
+                        function_marks(finalizer, out);
+                    }
+                }
+                Stmt::For { init, body, .. } => {
+                    if let Some(ForInit::Expr(e)) = init.as_deref() {
+                        expr(e, out);
+                    }
+                    function_marks(std::slice::from_ref(&body.statement), out);
+                }
+                Stmt::While { body, .. } => {
+                    function_marks(std::slice::from_ref(&body.statement), out)
+                }
+                Stmt::ClassDecl(class) => {
+                    for each in &class.members {
+                        member(each, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A static snapshot marks exactly the function expressions that its top-level code, or the
+    /// body of another marked function, calls immediately outside loops and classes: each runs
+    /// once per evaluation of the Script.
+    #[test]
+    fn run_once_marks_only_immediately_invoked_bootstrap_functions() {
+        const SOURCE: &str = r#"(function wrapper() {
+            (function block() {})();
+            (function crockford() {}());
+            !function bang() {}();
+            var assigned = (function value() { return 1; })();
+            if (assigned) { (function inIf() {})(); }
+            try { (function inTry() {})(); } finally { (function inFinally() {})(); }
+            for (let i = 0; i < 2; i++) (function inFor() {})();
+            while (false) (function inWhile() {})();
+            function declared() { (function inDeclared() {})(); }
+            var expression = function notCalled() { (function inNotCalled() {})(); };
+            class C {
+                static { (function inStaticBlock() {})(); }
+                m() { (function inMethod() {})(); }
+            }
+            [1].forEach(function callback() { (function inCallback() {})(); });
+            ({ method() { (function inLiteralMethod() {})(); } }).method();
+            (function outer(f = function inDefault() {}) { (function inner() {})(); })();
+            (() => { (function inArrow() {})(); })();
+        })();
+        function topDeclared() { (function inTopDeclared() {})(); }
+        (function second() {})();"#;
+        let expected = [
+            ("wrapper", true),
+            ("block", true),
+            ("crockford", true),
+            ("bang", true),
+            ("value", true),
+            ("inIf", true),
+            ("inTry", true),
+            ("inFinally", true),
+            ("inFor", false),
+            ("inWhile", false),
+            ("declared", false),
+            ("inDeclared", false),
+            ("notCalled", false),
+            ("inNotCalled", false),
+            ("<static block>", false),
+            ("inStaticBlock", false),
+            ("m", false),
+            ("inMethod", false),
+            ("callback", false),
+            ("inCallback", false),
+            ("method", false),
+            ("inLiteralMethod", false),
+            ("outer", true),
+            ("inDefault", false),
+            ("inner", true),
+            ("", true), // the arrow
+            ("inArrow", true),
+            ("topDeclared", false),
+            ("inTopDeclared", false),
+            ("second", true),
+        ];
+        let bytes = crate::compile_host_snapshot(SOURCE).unwrap();
+        let mut marks = Vec::new();
+        function_marks(&decode_static(leak(&bytes)).unwrap(), &mut marks);
+        let mut sorted_marks = marks.clone();
+        sorted_marks.sort();
+        let mut sorted_expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|(name, mark)| (name.to_string(), *mark))
+            .collect();
+        sorted_expected.sort();
+        assert_eq!(sorted_marks, sorted_expected);
+        // Only a static decode keeps the marks; the encoding is the same either way.
+        let eager = decode(&bytes).unwrap();
+        let mut eager_marks = Vec::new();
+        function_marks(&eager, &mut eager_marks);
+        assert!(eager_marks.iter().all(|(_, mark)| !mark), "{eager_marks:?}");
+        assert_eq!(super::encode_host(&eager), bytes);
     }
 }

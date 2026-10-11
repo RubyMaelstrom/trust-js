@@ -8737,6 +8737,7 @@ fn default_constructor(derived: bool, class: &Class) -> Function {
         is_fn_expr: false,
         default_ctor: derived,
         self_hosted: false,
+        run_once: false,
         source: None,
         script: class.script.clone(),
         start: class.start,
