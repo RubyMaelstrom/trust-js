@@ -76,6 +76,13 @@ The default tier is JIT. Useful diagnostic controls:
 - `LUMEN_JIT_CHUNK_STUBS=1` gives each ARM64 chunk its own copy of the shared stubs instead
   of veneers to the process-wide stub table. It is a code-size ablation with the same behavior.
 - `LUMEN_TIER_LOG=1` helps diagnose compilation bailouts.
+- `LUMEN_JIT_DUMP=<names>` prints the bytecode of chunks whose first four slot names contain
+  the text, and `LUMEN_JIT_CODEDUMP=<names>[@<offset>]` the finished ARM64 words of the same
+  chunks (hex, one per line; assemble them with `clang --target=aarch64-linux-gnu -c` and
+  `objdump -d`). `@<offset>` also requires the function's source start offset, the `@N` that
+  `LUMEN_JIT_MAP=1` prints in its `[jit-map-range]` lines, which singles out one function among
+  many that share names. Any value of `LUMEN_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base
+  and length) per compiled chunk.
 - On GNU/Linux, `LUMEN_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

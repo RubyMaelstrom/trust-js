@@ -54,8 +54,10 @@ impl Interp {
             return;
         };
         let size = info.kind.elsize();
+        // A length-tracking view has no fixed element count: it registers none, with an end no
+        // buffer reaches, so generated code always takes the checked operation for it.
         let end = if info.track {
-            info.offset
+            usize::MAX
         } else {
             let Some(end) = info
                 .len
@@ -86,7 +88,7 @@ impl Interp {
             buffer_ptr: Rc::as_ptr(&buffer),
             offset: info.offset,
             end,
-            limit: if info.track { usize::MAX } else { info.len },
+            limit: if info.track { 0 } else { info.len },
             kind,
             shift: size.trailing_zeros() as u8,
             buffer,

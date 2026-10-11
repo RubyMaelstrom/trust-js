@@ -122,6 +122,14 @@ mod math_intrinsic_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_int_typed_tests.rs"]
+mod int_typed_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_constant_tests.rs"]
 mod constant_tests;
 
@@ -2796,25 +2804,9 @@ mod asm {
             debug_assert!(imm_bytes.is_multiple_of(4) && imm_bytes / 4 < 4096);
             self.emit(0xB940_0000 | ((imm_bytes / 4) << 10) | (rn << 5) | rt);
         }
-        /// LDRSB Wt / LDRSH Wt, [Xn]: packed integer reads, sign extended to 32 bits.
-        pub fn ldr_signed_packed(&mut self, rt: u32, rn: u32, half: bool) {
-            self.emit((if half { 0x79C0_0000 } else { 0x39C0_0000 }) | (rn << 5) | rt);
-        }
-        /// STRH Wt, [Xn].
-        pub fn strh(&mut self, rt: u32, rn: u32) {
-            self.emit(0x7900_0000 | (rn << 5) | rt);
-        }
-        /// LDR St / STR St, [Xn].
-        pub fn float32_memory(&mut self, rt: u32, rn: u32, store: bool) {
-            self.emit((if store { 0xBD00_0000 } else { 0xBD40_0000 }) | (rn << 5) | rt);
-        }
         /// FCVT Sd, Dn / FCVT Dd, Sn. Narrowing uses FPCR's roundTiesToEven default.
         pub fn fcvt_float_width(&mut self, rd: u32, rn: u32, narrow: bool) {
             self.emit((if narrow { 0x1E62_4000 } else { 0x1E22_C000 }) | (rn << 5) | rd);
-        }
-        /// LSLV Xd, Xn, Xm.
-        pub fn lsl_reg(&mut self, rd: u32, rn: u32, rm: u32) {
-            self.emit(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
         }
         /// sdiv wd, wn, wm (truncating; wn/0 = 0 and i32::MIN/-1 = i32::MIN, no trap)
         pub fn sdiv_w(&mut self, rd: u32, rn: u32, rm: u32) {
@@ -3107,6 +3099,45 @@ mod asm {
         /// fmov xd, dn (bit move)
         pub fn fmov_x_d(&mut self, rd: u32, rn: u32) {
             self.emit(0x9E66_0000 | (rn << 5) | rd);
+        }
+        /// Register-offset element accesses of the typed-array templates: the index register is
+        /// scaled by the element size (`lsl #log2(size)`; bytes are unscaled). Checked against
+        /// the Arm assembler's output by `typed_element_encodings_match_the_assembler`.
+        /// ldr wt, [xn, xm, lsl #2]
+        pub fn ldr_w_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xB860_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// ldrsb wt, [xn, xm]
+        pub fn ldrsb_reg(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0x38E0_6800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// ldrh wt, [xn, xm, lsl #1]
+        pub fn ldrh_lsl1(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0x7860_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// ldrsh wt, [xn, xm, lsl #1]
+        pub fn ldrsh_lsl1(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0x78E0_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// ldr st, [xn, xm, lsl #2]
+        pub fn ldr_s_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xBC60_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// strb wt, [xn, xm]
+        pub fn strb_reg(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0x3820_6800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// strh wt, [xn, xm, lsl #1]
+        pub fn strh_lsl1(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0x7820_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// str wt, [xn, xm, lsl #2]
+        pub fn str_w_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xB820_7800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// str st, [xn, xm, lsl #2]
+        pub fn str_s_lsl2(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xBC20_7800 | (rm << 16) | (rn << 5) | rt);
         }
         /// ldr dt, [xn, xm, lsl #3]
         pub fn ldr_d_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
@@ -4842,7 +4873,8 @@ fn compile_entry(
     let (words, pc_offsets) = a.finish_with_offsets(&pc_labels[..ops.len()]);
     // Debug: `LUMEN_JIT_CODEDUMP=<substr>` prints the finished code words (hex, one per line)
     // of chunks whose leading slot names contain the substring — round-trip them through
-    // `clang -c` + `objdump -d` for a disassembly of exactly what runs. Any value also prints
+    // `clang -c` + `objdump -d` for a disassembly of exactly what runs. `names@N` selects the
+    // function that starts at source offset N. Any value also prints
     // a `[jit-map]` line per compiled chunk (runtime base + length), which joins a `sample`
     // profile's raw addresses to chunk-relative offsets.
     let codedump_pat = env_value!("LUMEN_JIT_CODEDUMP");
@@ -4854,7 +4886,16 @@ fn compile_entry(
             .map(|s| &**s)
             .collect();
         let name = head.join(",");
-        if !pat.is_empty() && name.contains(pat) {
+        // `names@origin` also requires the function's source start offset (the `@N` that
+        // `LUMEN_JIT_MAP` prints), which singles out one function among many sharing names.
+        let (names_pat, origin) = match pat.split_once('@') {
+            Some((names, origin)) => (names, origin.parse::<u32>().ok()),
+            None => (pat, None),
+        };
+        if !names_pat.is_empty()
+            && name.contains(names_pat)
+            && origin.is_none_or(|origin| chunk.jit_debug_origin().0 == origin)
+        {
             eprintln!("[jit-codedump] fn({name}) {} words", words.len());
             for w in &words {
                 eprintln!("[jit-codedump] {w:08x}");
@@ -11772,12 +11813,12 @@ fn emit_get_elem_inline_marked(
     let done = a.new_label();
     let typed = a.new_label();
     let mirror_hit = a.new_label();
-    // 1. stack: [obj @ -32, key @ -16] — receiver must be Obj, key must be Num
+    // 1. stack: [obj @ -32, key @ -16] — receiver must be Obj
     emit_exec_word_load(a, 9, 20, -16);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
-    emit_exec_word_load(a, 9, 20, -8);
-    emit_exec_number_guard(a, 9, 0, 11, slow);
-    // 2. key must be exactly a u32 (round-trip compare; NaN/negative/fractional/huge all miss)
+    // 2. key must be exactly a u32 (round-trip compare; NaN/negative/fractional/huge all miss).
+    // Every non-Number word is a NaN pattern (ECMA-262 PackedValue tags), and an unordered
+    // FCMP is "not equal", so this test alone also proves the key is a Number.
     a.ldur_d(0, 20, -8);
     a.fcvtzu_w_d(9, 0);
     a.ucvtf_d_w(1, 9);
@@ -12075,9 +12116,7 @@ fn emit_set_elem_inline_marked(
     // 1. stack: [obj @ -48, key @ -32, v @ -16]
     emit_exec_word_load(a, 9, 20, -24);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
-    emit_exec_word_load(a, 9, 20, -16);
-    emit_exec_number_guard(a, 9, 0, 11, slow);
-    // 2. key must be exactly a u32
+    // 2. key must be exactly a u32; the unordered compare of a non-Number (NaN pattern) misses
     a.ldur_d(0, 20, -16);
     a.fcvtzu_w_d(9, 0);
     a.ucvtf_d_w(1, 9);

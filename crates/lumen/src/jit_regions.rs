@@ -135,6 +135,12 @@ pub(super) extern "C" fn record_local_array_legacy_get() {
     record_local_array_hit(4);
 }
 
+/// Register regions entered so far on this thread (tests only).
+#[cfg(test)]
+pub(super) fn executed_regions() -> u64 {
+    EXECUTED_REGIONS.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 pub(super) fn local_array_hits() -> [u64; 5] {
     LOCAL_ARRAY_HITS.with(std::cell::Cell::get)
@@ -975,6 +981,8 @@ enum Operand {
     /// temporary register, so Dup must copy its word into the new temporary.
     BorrowedValue,
     Scalar(ScalarState),
+    /// A virtual int32 Number constant that has neither a register nor a canonical word yet.
+    Constant(i32),
 }
 
 impl Operand {
@@ -984,6 +992,22 @@ impl Operand {
             canonical_slot: None,
             register_valid: true,
         })
+    }
+
+    /// The Number constant `value`, if it is an int32 (not -0): such a constant stays virtual
+    /// until a consumer needs its register or canonical word, so one feeding a bitwise
+    /// operation costs an immediate instead of a convert/compare/convert sequence.
+    fn int32_constant(bits: u64) -> Option<Self> {
+        let value = f64::from_bits(bits);
+        let int = value as i32;
+        (f64::from(int) == value && bits != (-0.0f64).to_bits()).then_some(Self::Constant(int))
+    }
+
+    fn immediate(self) -> Option<i32> {
+        match self {
+            Self::Constant(value) => Some(value),
+            _ => None,
+        }
     }
 
     fn clean(kind: ScalarKind, index: usize, register_valid: bool) -> Self {
@@ -996,7 +1020,7 @@ impl Operand {
     }
 
     fn scalar(self) -> bool {
-        matches!(self, Self::Scalar(_))
+        matches!(self, Self::Scalar(_) | Self::Constant(_))
     }
 
     fn numeric(self) -> bool {
@@ -1005,13 +1029,14 @@ impl Operand {
             Self::Scalar(ScalarState {
                 kind: ScalarKind::Number | ScalarKind::Integer,
                 ..
-            })
+            }) | Self::Constant(_)
         )
     }
 
     fn kind(self) -> Option<ScalarKind> {
         match self {
             Self::Scalar(state) => Some(state.kind),
+            Self::Constant(_) => Some(ScalarKind::Integer),
             _ => None,
         }
     }
@@ -1032,12 +1057,12 @@ fn preserve_scalar_prefix(
     );
     let mut restored = false;
     for (index, value) in before.iter().copied().enumerate().take(after.len()) {
-        if let Operand::Scalar(state) = value {
+        if let Some(kind) = value.kind() {
             // GetValue/Call already ran once with the whole prefix published.
             // Preserve its immutable language type and exact canonical slot,
             // not volatile register contents. Reload only at a real consumer.
             // Borrowed heap/local views are deliberately lost across effects.
-            after[index] = Operand::clean(state.kind, index, false);
+            after[index] = Operand::clean(kind, index, false);
             restored = true;
         }
     }
@@ -1053,13 +1078,27 @@ fn preserve_scalar_prefix(
 /// previously proved language scalar. Canonical identity never follows a Dup
 /// or an overwritten result slot: those operations construct a new dirty state.
 fn scalar_register(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, index: usize) {
+    let reg = 16 + index as u32;
+    if let Operand::Constant(value) = stack[index] {
+        // A virtual constant becomes an ordinary dirty Integer temporary in its register.
+        if value == 0 {
+            a.fmov_d_x(reg, 31); // XZR
+        } else if value == 1 {
+            a.fmov_one(reg);
+        } else {
+            a.mov_imm64(9, f64::from(value).to_bits());
+            a.fmov_d_x(reg, 9);
+        }
+        stack[index] = Operand::temporary(ScalarKind::Integer);
+        return;
+    }
     let Operand::Scalar(state) = &mut stack[index] else {
         unreachable!("scalar register requires a scalar proof")
     };
     if !state.register_valid {
         assert_eq!(state.canonical_slot.map(usize::from), Some(index));
         emit_exec_word_load(a, 9, 20, (index as i32 - physical as i32) * 8);
-        a.fmov_d_x(16 + index as u32, 9);
+        a.fmov_d_x(reg, 9);
         state.register_valid = true;
     }
 }
@@ -1067,6 +1106,8 @@ fn scalar_register(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, ind
 fn duplicate_operand(a: &mut asm::Asm, stack: &mut Vec<Operand>, physical: usize) {
     let depth = stack.len();
     let duplicate = match *stack.last().expect("Dup has an operand") {
+        // A virtual constant duplicates for free.
+        value @ Operand::Constant(_) => value,
         Operand::Scalar(state) => {
             scalar_register(a, stack, physical, depth - 1);
             a.fmov_d_d(16 + depth as u32, 15 + depth as u32);
@@ -1137,6 +1178,11 @@ fn materialize(
                 a.bind(cloned);
                 emit_exec_word_store(a, 9, 20, offset);
             }
+            Operand::Constant(value) => {
+                // Never produced a register: publish the constant's own word.
+                a.mov_imm64(9, f64::from(*value).to_bits());
+                emit_exec_word_store(a, 9, 20, offset);
+            }
             Operand::Scalar(state) => {
                 if let Some(slot) = state.canonical_slot {
                     assert_eq!(
@@ -1176,7 +1222,7 @@ fn guard_operand(a: &mut asm::Asm, stack: &[Operand], physical: usize, index: us
         Operand::Canonical => emit_exec_word_load(a, 9, 20, (index as i32 - physical as i32) * 8),
         Operand::Borrowed(home) => a.fmov_x_d(9, home),
         Operand::BorrowedValue => a.fmov_x_d(9, 16 + index as u32),
-        Operand::Scalar(_) => a.b(fail),
+        Operand::Scalar(_) | Operand::Constant(_) => a.b(fail),
     }
 }
 
@@ -1188,6 +1234,7 @@ fn number(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, index: usize
         }) => {
             scalar_register(a, stack, physical, index);
         }
+        Operand::Constant(_) => scalar_register(a, stack, physical, index),
         Operand::Scalar(_) => a.b(fail), // Boolean coercion remains in the checked operation
         Operand::Borrowed(_) | Operand::BorrowedValue => {
             let source = match stack[index] {
@@ -1435,9 +1482,11 @@ fn emit_borrowed_method(
 }
 
 /// ECMA-262 ToInt32/ToUint32 and NumberBitwiseOp (local snapshot e28783d5):
-/// truncate, then wrap modulo 2^32. An exact i64 conversion has the same low bits.
-/// Fractional finite inputs are valid; NaN/infinities and saturation must take the
-/// checked opcode with its original operands (including the +2^63 round-trip edge).
+/// truncate, then wrap modulo 2^32. FJCVTZS (FEAT_JSCVT) is exactly this conversion for every
+/// Number, including NaN, the infinities and values beyond the i64 range, so it never leaves
+/// the region. Without it an exact i64 conversion has the same low bits: fractional finite
+/// inputs are valid, while NaN/infinities and saturation must take the checked opcode with its
+/// original operands (including the +2^63 round-trip edge).
 fn to_int32(
     a: &mut asm::Asm,
     stack: &mut [Operand],
@@ -1456,6 +1505,10 @@ fn to_int32(
         return;
     }
     number(a, stack, physical, index, fail);
+    if jscvt_available() {
+        a.fjcvtzs_w_d(output, reg);
+        return;
+    }
     a.fcvtzs_x_d(output, reg);
     if stack[index].kind() != Some(ScalarKind::Integer) {
         a.scvtf_d_x(0, output);
@@ -1464,6 +1517,121 @@ fn to_int32(
         a.b_cond(C_NE, fail);
         a.cmn_imm_x(output, 1);
         a.b_cond(C_VS, fail);
+    }
+}
+
+/// A ToInt32 result: a compile-time constant (ToInt32 applied while compiling, so it costs no
+/// register, conversion or guard) or the low 32 bits of an x register.
+#[derive(Clone, Copy)]
+enum IntOperand {
+    Imm(i32),
+    Reg(u32),
+}
+
+fn int32_operand(
+    a: &mut asm::Asm,
+    stack: &mut [Operand],
+    physical: usize,
+    index: usize,
+    output: u32,
+    fail: usize,
+) -> IntOperand {
+    if let Some(value) = stack[index].immediate() {
+        return IntOperand::Imm(value); // an int32 constant is its own ToInt32
+    }
+    to_int32(a, stack, physical, index, output, fail);
+    IntOperand::Reg(output)
+}
+
+/// NumberBitwiseOp for the six binary operators (ECMA-262 §6.1.6.1.9-§6.1.6.1.11 and
+/// §13.9-§13.12): the operands are already ToInt32 values (ToUint32 has the same bits), shift
+/// counts use their low five bits, and `>>>` alone yields its unsigned result. Returns the
+/// x register whose low 32 bits are the result; identity operations (`x | 0`, `x & -1`,
+/// `x ^ 0`, `x << 0`, `x >> 0`, `x >>> 0`) emit nothing. `scratch` holds an unencodable
+/// immediate and `out` receives any computed result.
+fn int32_binary(
+    a: &mut asm::Asm,
+    op: &Op,
+    lhs: IntOperand,
+    rhs: IntOperand,
+    out: u32,
+    scratch: u32,
+) -> u32 {
+    use IntOperand::{Imm, Reg};
+    let load = |a: &mut asm::Asm, reg: u32, value: i32| a.mov_imm64(reg, u64::from(value as u32));
+    let commutative = matches!(op, Op::BitAnd | Op::BitOr | Op::BitXor);
+    let (lhs, rhs) = match (lhs, rhs) {
+        (Imm(_), Reg(_)) if commutative => (rhs, lhs),
+        _ => (lhs, rhs),
+    };
+    match (lhs, rhs) {
+        (Imm(x), Imm(y)) => {
+            let value = match op {
+                Op::BitAnd => x & y,
+                Op::BitOr => x | y,
+                Op::BitXor => x ^ y,
+                Op::Shl => x.wrapping_shl(y as u32 & 31),
+                Op::Shr => x >> (y as u32 & 31),
+                _ => ((x as u32) >> (y as u32 & 31)) as i32,
+            };
+            load(a, out, value);
+            out
+        }
+        (Reg(l), Imm(y)) => {
+            // `l` is x12 or, after a commutative swap, x13: keep the immediate clear of it.
+            let scratch = if l == scratch { 12 } else { scratch };
+            let logical = |a: &mut asm::Asm, code: u32| match asm::logical_imm_w(y as u32) {
+                Some(field) => a.logic_imm_w(code, out, l, field),
+                None => {
+                    load(a, scratch, y);
+                    a.logic_w(code, out, l, scratch);
+                }
+            };
+            match op {
+                Op::BitAnd if y == -1 => return l,
+                Op::BitOr | Op::BitXor if y == 0 => return l,
+                Op::BitAnd => logical(a, 0),
+                Op::BitOr => logical(a, 1),
+                Op::BitXor => logical(a, 2),
+                _ => {
+                    let count = y as u32 & 31;
+                    if count == 0 {
+                        return l;
+                    }
+                    match op {
+                        Op::Shl => a.lsl_imm_w(out, l, count),
+                        Op::Shr => a.asr_imm_w(out, l, count),
+                        _ => a.lsr_imm_w(out, l, count),
+                    }
+                }
+            }
+            out
+        }
+        (lhs, rhs) => {
+            let l = match lhs {
+                Reg(register) => register,
+                Imm(value) => {
+                    load(a, out, value);
+                    out
+                }
+            };
+            let r = match rhs {
+                Reg(register) => register,
+                Imm(value) => {
+                    load(a, scratch, value);
+                    scratch
+                }
+            };
+            match op {
+                Op::BitAnd => a.logic_w(0, out, l, r),
+                Op::BitOr => a.logic_w(1, out, l, r),
+                Op::BitXor => a.logic_w(2, out, l, r),
+                Op::Shl => a.shift_w(0, out, l, r),
+                Op::UShr => a.shift_w(1, out, l, r),
+                _ => a.shift_w(2, out, l, r),
+            }
+            out
+        }
     }
 }
 
@@ -2161,18 +2329,23 @@ pub(super) fn emit(
                     saved_work += 1;
                     let bits = chunk.jit_const_num(k).unwrap();
                     let value = f64::from_bits(bits);
-                    a.mov_imm64(9, bits);
-                    a.fmov_d_x(16 + depth as u32, 9);
-                    stack.push(
-                        if value.is_finite()
-                            && value.fract() == 0.0
-                            && value.abs() < 9223372036854775808.0
-                        {
-                            Operand::temporary(ScalarKind::Integer)
-                        } else {
-                            Operand::temporary(ScalarKind::Number)
-                        },
-                    );
+                    if let Some(constant) = Operand::int32_constant(bits) {
+                        // Emitted only if a consumer needs a register or the canonical word.
+                        stack.push(constant);
+                    } else {
+                        a.mov_imm64(9, bits);
+                        a.fmov_d_x(16 + depth as u32, 9);
+                        stack.push(
+                            if value.is_finite()
+                                && value.fract() == 0.0
+                                && value.abs() < 9223372036854775808.0
+                            {
+                                Operand::temporary(ScalarKind::Integer)
+                            } else {
+                                Operand::temporary(ScalarKind::Number)
+                            },
+                        );
+                    }
                 }
                 Op::LoadLocal(slot) if plan.tagged_reg(slot).is_some() => {
                     saved_work += 2;
@@ -2362,32 +2535,32 @@ pub(super) fn emit(
                     }
                 }
                 Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
-                    for (index, output) in [(depth - 2, 12), (depth - 1, 13)] {
-                        to_int32(a, &mut stack, physical, index, output, bailout);
-                    }
-                    match ops[pc] {
-                        Op::BitAnd => a.logic_w(0, 11, 12, 13),
-                        Op::BitOr => a.logic_w(1, 11, 12, 13),
-                        Op::BitXor => a.logic_w(2, 11, 12, 13),
-                        Op::Shl => a.shift_w(0, 11, 12, 13),
-                        Op::UShr => a.shift_w(1, 11, 12, 13),
-                        Op::Shr => a.shift_w(2, 11, 12, 13),
-                        _ => unreachable!(),
-                    }
+                    let lhs = int32_operand(a, &mut stack, physical, depth - 2, 12, bailout);
+                    let rhs = int32_operand(a, &mut stack, physical, depth - 1, 13, bailout);
+                    let source = int32_binary(a, &ops[pc], lhs, rhs, 11, 13);
                     let result = 14 + depth as u32;
                     if matches!(ops[pc], Op::UShr) {
-                        a.ucvtf_d_w(result, 11);
+                        a.ucvtf_d_w(result, source);
                     } else {
-                        a.scvtf_d_w(result, 11);
+                        a.scvtf_d_w(result, source);
                     }
                     stack.truncate(depth - 2);
                     stack.push(Operand::temporary(ScalarKind::Integer));
                 }
                 Op::BitNot => {
-                    to_int32(a, &mut stack, physical, depth - 1, 9, bailout);
-                    a.mov_imm64(10, u32::MAX as u64);
-                    a.logic_w(2, 9, 9, 10);
-                    a.scvtf_d_w(15 + depth as u32, 9);
+                    // ~x is ToInt32(x) XOR -1 (ECMA-262 §13.5.6): one MVN.
+                    let source = match int32_operand(a, &mut stack, physical, depth - 1, 9, bailout)
+                    {
+                        IntOperand::Imm(value) => {
+                            a.mov_imm64(9, u64::from(!value as u32));
+                            9
+                        }
+                        IntOperand::Reg(register) => {
+                            a.mvn_w(9, register);
+                            9
+                        }
+                    };
+                    a.scvtf_d_w(15 + depth as u32, source);
                     stack[depth - 1] = Operand::temporary(ScalarKind::Integer);
                 }
                 Op::Neg | Op::Plus => {
