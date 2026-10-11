@@ -1520,6 +1520,22 @@ fn to_int32(
     }
 }
 
+/// The attribution family of the code a region emits for `op` (see `LUMEN_JIT_MAP`): one
+/// interned string per operation kind. Only called when profiling marks are enabled.
+fn region_mark(op: &Op) -> &'static str {
+    use std::sync::Mutex;
+    static MARKS: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+    let debug = format!("{op:?}");
+    let name = debug.split('(').next().unwrap_or("?").to_owned();
+    let mut marks = MARKS.lock().unwrap();
+    if let Some((_, interned)) = marks.iter().find(|(known, _)| *known == name) {
+        return interned;
+    }
+    let interned: &'static str = Box::leak(format!("region:{name}").into_boxed_str());
+    marks.push((name, interned));
+    interned
+}
+
 /// A ToInt32 result: a compile-time constant (ToInt32 applied while compiling, so it costs no
 /// register, conversion or guard) or the low 32 bits of an x register.
 #[derive(Clone, Copy)]
@@ -1716,6 +1732,86 @@ fn plan_name_element(
     None
 }
 
+/// Whether fused sites call the process-wide routine (`LUMEN_JIT_INLINE_STUBS` and
+/// `LUMEN_JIT_NO_NAME_ELEM_STUB` carry the sequence in line).
+fn name_element_stub(a: &asm::Asm) -> bool {
+    let _ = a;
+    shared_stubs_enabled() && !env_flag!("LUMEN_JIT_NO_NAME_ELEM_STUB")
+}
+
+/// The access of a fused site once its key (d3) and value (d1) are in place and x12 holds the
+/// name cache: the binding, an ordinary non-exotic Object, an exact index, and the native
+/// typed-array element access. Registers: x7, x9-x17, d0-d3 (x13 and the status labels are the
+/// caller's). `leaf` carries the name probe and the element access in line: the shared routine
+/// calls nothing, so its link register stays the caller's.
+///
+/// * `hit`: the element is read (x12 = packed Number, d1 = value) or written.
+/// * `value_miss`: the name validated (x14 = its value, x7 = storage kind) but the receiver or
+///   index is not for the native path.
+/// * `name_miss`: the name cache did not validate or a typed-array guard failed.
+pub(super) fn emit_name_element_body(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    write: bool,
+    leaf: bool,
+    hit: usize,
+    name_miss: usize,
+    value_miss: usize,
+) {
+    // The binding: x14 = its value, x7 = 0 for a wide scope binding, 1 for a packed global
+    // property (the shared probe of LoadName).
+    if leaf || !shared_stubs_enabled() {
+        emit_name_ic_value_ptr_body(a, layout, name_miss, true);
+    } else {
+        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok: true }.key());
+        a.bl_label(stub);
+        a.cbz(9, false, name_miss);
+    }
+    // x10 = the Object's allocation. A wide scope binding holds its Value (tag byte, then the
+    // payload word); a packed global property holds the encoded word.
+    let have = a.new_label();
+    let wide = a.new_label();
+    a.cbz(7, false, wide);
+    a.ldur(12, 14, 0);
+    emit_exec_tag_guard(a, 12, crate::value::PACK_OBJ, 13, value_miss);
+    emit_exec_payload(a, 12, 10);
+    a.b(have);
+    a.bind(wide);
+    a.ldurb(13, 14, 0);
+    a.cmp_imm_w(13, 8); // Value::Obj
+    a.b_cond(C_NE, value_miss);
+    a.ldur(10, 14, 8);
+    a.bind(have);
+    // An ordinary Object that is not exotic (a typed array is neither Array nor plain).
+    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
+    a.b_cond(C_NE, value_miss);
+    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
+    a.cbnz(12, false, value_miss);
+    // The index: exactly a u32 (negative and fractional keys, NaN and -0 miss).
+    if jscvt_available() {
+        // FJCVTZS reports in Z that the key is an integer within int32 (so -0, fractions,
+        // NaN and anything beyond decline); a negative key is then a u32 above 2^31, which
+        // no native view's element count (at most 2^31) admits.
+        a.fjcvtzs_w_d(9, 3);
+        a.b_cond(C_NE, value_miss);
+    } else {
+        a.fcvtzu_w_d(9, 3);
+        a.ucvtf_d_w(0, 9);
+        a.fcmp(3, 0);
+        a.b_cond(C_NE, value_miss);
+    }
+    // The value (d1) is in place: the access reads it as a register operand.
+    match layout.native_typed_array {
+        Some(native) if leaf => typed_array::emit_access(a, &native, write, hit, name_miss),
+        _ => {
+            let value = write.then_some(typed_array::WriteValue::Register(1));
+            typed_array::emit(a, layout, value, hit, name_miss);
+        }
+    }
+}
+
 /// The cold continuation of one fused name/element site (see [`NameElementPlan`]).
 struct NameElementFallback {
     /// The name cache did not validate, or a typed-array guard failed: run the whole LoadName.
@@ -1788,58 +1884,30 @@ fn emit_name_element(
         }
     }
 
-    // The binding: x14 = its value, x7 = 0 for a wide scope binding, 1 for a packed global
-    // property (the shared probe of LoadName).
-    a.mov_imm64(12, cache_ptr as u64);
-    if shared_stubs_enabled() {
-        let stub = a.shared_stub(SharedStub::NameValuePtr { packed_ok: true }.key());
-        a.bl_label(stub);
-        a.cbz(9, false, name_miss);
-    } else {
-        emit_name_ic_value_ptr_body(a, layout, name_miss, true);
-    }
-    // x10 = the Object's allocation. A wide scope binding holds its Value (tag byte, then the
-    // payload word); a packed global property holds the encoded word.
-    let have = a.new_label();
-    let wide = a.new_label();
-    a.cbz(7, false, wide);
-    a.ldur(12, 14, 0);
-    emit_exec_tag_guard(a, 12, crate::value::PACK_OBJ, 13, value_miss);
-    emit_exec_payload(a, 12, 10);
-    a.b(have);
-    a.bind(wide);
-    a.ldurb(13, 14, 0);
-    a.cmp_imm_w(13, 8); // Value::Obj
-    a.b_cond(C_NE, value_miss);
-    a.ldur(10, 14, 8);
-    a.bind(have);
-    a.add_imm(11, 10, layout.obj_from_rc as u32);
-    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
-    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
-    a.b_cond(C_NE, value_miss);
-    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
-    a.cbnz(12, false, value_miss);
-    // The index: exactly a u32 (negative and fractional keys, NaN and -0 miss).
+    // The key (d3) and the value to store (d1) for the shared sequence.
     match key {
-        Operand::Constant(index) if index >= 0 => a.mov_imm64(9, index as u64),
-        Operand::Constant(_) => a.b(value_miss),
-        _ if jscvt_available() => {
-            // FJCVTZS reports in Z that the key is an integer within int32 (so -0, fractions,
-            // NaN and anything beyond decline); a negative key is then a u32 above 2^31, which
-            // no native view's element count (at most 2^31) admits.
-            a.fjcvtzs_w_d(9, 16 + key_index as u32);
-            a.b_cond(C_NE, value_miss);
+        Operand::Constant(index) if index >= 0 => {
+            a.mov_imm64(9, index as u64);
+            a.scvtf_d_w(3, 9);
         }
-        _ => {
-            let reg = 16 + key_index as u32;
-            a.fcvtzu_w_d(9, reg);
-            a.ucvtf_d_w(0, 9);
-            a.fcmp(reg, 0);
-            a.b_cond(C_NE, value_miss);
-        }
+        Operand::Constant(_) => a.b(name_miss), // a negative index is never an element
+        _ => a.fmov_d_d(3, 16 + key_index as u32),
     }
-    let write = value.map(|_| typed_array::WriteValue::Register(16 + key_index as u32 + 1));
-    typed_array::emit(a, layout, write, hit, name_miss);
+    if plan.set {
+        a.fmov_d_d(1, 16 + key_index as u32 + 1);
+    }
+    a.mov_imm64(12, cache_ptr as u64);
+    if name_element_stub(a) {
+        // The sequence below, in one process-wide routine: W13 = 1 after the access, 2 when the
+        // binding validated but is not a typed array (x14/x7 still describe it), else 0.
+        let stub = a.shared_stub(SharedStub::NameElement { write: plan.set }.key());
+        a.bl_label(stub);
+        a.cbz(13, false, name_miss);
+        a.cmp_imm_w(13, 1);
+        a.b_cond(C_NE, value_miss);
+    } else {
+        emit_name_element_body(a, layout, plan.set, false, hit, name_miss, value_miss);
+    }
     a.bind(hit);
     if !plan.set {
         if lazy {
@@ -2627,6 +2695,11 @@ pub(super) fn emit(
             }
             let bailout = a.new_label();
             bails.push((bailout, pc, stack.clone(), physical, true));
+            if jit_map_enabled() {
+                // Profiler attribution (`LUMEN_JIT_MAP`): the code of each region operation
+                // belongs to `region:<operation>`, not to the region as a whole.
+                a.mark_op(region_mark(&ops[pc]));
+            }
             if let Some((name_pc, _, pre, _)) = &fusing {
                 // Inside the pure window a miss replays from the LoadName with the stack as it
                 // was: nothing between has any effect.

@@ -2521,6 +2521,18 @@ mod asm {
             self.bind(label);
             self.marks.push((label, name));
         }
+        /// Make `name` the attribution of everything emitted from here on, outside any template
+        /// family that is open (`LUMEN_JIT_MAP` only).
+        pub fn mark_op(&mut self, name: &'static str) {
+            if !super::jit_map_enabled() {
+                return;
+            }
+            self.mark_stack.clear();
+            self.mark_stack.push(name);
+            let label = self.new_label();
+            self.bind(label);
+            self.marks.push((label, name));
+        }
         /// End the innermost attribution region, resuming its parent's.
         pub fn mark_pop(&mut self) {
             if !super::jit_map_enabled() {
@@ -10818,6 +10830,12 @@ enum SharedStub {
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
     TypedElement { write: bool },
+    /// [`regions::emit_name_element_body`]: a fused `LoadName K; key; GetElem/SetElemDrop` access
+    /// with x12 = the name's `NameIc` cell, d3 = the key and (for a write) d1 = the Number to
+    /// store → w13 = 1 after the access (a read leaves x12 = packed Number, d1 = value), 2 when
+    /// the binding validated but is not for the native path (x14 = its value, x7 = its storage
+    /// kind), 0 otherwise.
+    NameElement { write: bool },
 }
 
 /// Status codes of the shared direct-call stub. The common completion is zero, so a site pays
@@ -10903,6 +10921,7 @@ impl SharedStub {
     const NAME_LOAD: u32 = 0x700;
     const HELPER: u32 = 0x800;
     const TYPED_ELEMENT: u32 = 0x900;
+    const NAME_ELEMENT: u32 = 0xa00;
 
     fn key(self) -> u32 {
         match self {
@@ -10948,6 +10967,7 @@ impl SharedStub {
             ))]
             SharedStub::Intrinsics2 { discard } => Self::INTRINSICS2 | u32::from(discard),
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
+            SharedStub::NameElement { write } => Self::NAME_ELEMENT | u32::from(write),
         }
     }
 
@@ -11004,6 +11024,9 @@ impl SharedStub {
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
+            Self::NAME_ELEMENT => SharedStub::NameElement {
+                write: key & 1 != 0,
+            },
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
     }
@@ -11050,6 +11073,21 @@ impl SharedStub {
                 a.ret();
                 a.bind(miss);
                 a.movz(9, 0, 0);
+                a.ret();
+            }
+            SharedStub::NameElement { write } => {
+                let hit = a.new_label();
+                let value_miss = a.new_label();
+                let name_miss = a.new_label();
+                regions::emit_name_element_body(a, layout, write, true, hit, name_miss, value_miss);
+                a.bind(hit);
+                a.movz(13, 1, 0);
+                a.ret();
+                a.bind(value_miss);
+                a.movz(13, 2, 0);
+                a.ret();
+                a.bind(name_miss);
+                a.movz(13, 0, 0);
                 a.ret();
             }
             SharedStub::TypedElement { write } => {

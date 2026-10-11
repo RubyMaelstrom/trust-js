@@ -41,17 +41,13 @@ const U8_CLAMPED: u32 = 8;
 
 /// Whether element accesses call the process-wide shared stub (see [`emit_access`]) instead of
 /// carrying the sequence in line. A stub keeps every site small (the sequence is about a hundred
-/// words with its element kinds) at the price of a call and return per access.
-/// `LUMEN_JIT_TYPED_STUBS`: `0` in line everywhere, `1` stubs everywhere, anything else (the
-/// default) stubs except in loop bodies that keep their name probes in line.
-fn use_stub(a: &asm::Asm) -> bool {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("LUMEN_JIT_TYPED_STUBS").as_deref() {
-        Ok("0") => 0,
-        Ok("1") => 1,
-        _ => 2,
-    });
-    super::shared_stubs_enabled() && (mode == 1 || (mode == 2 && !a.hot()))
+/// words with its element kinds) at the price of a call and return per access; compiled
+/// applications are bound by instruction fetch, and DOOM's emulator spends 4% fewer cycles in
+/// spite of 5% more instructions. `LUMEN_JIT_TYPED_STUBS=0` carries it in line everywhere.
+fn use_stub() -> bool {
+    static STUBS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    super::shared_stubs_enabled()
+        && *STUBS.get_or_init(|| std::env::var("LUMEN_JIT_TYPED_STUBS").as_deref() != Ok("0"))
 }
 
 /// X11 = Object, X9 = exact unsigned index. On read, X12 is a packed Number and D1 its
@@ -80,7 +76,7 @@ pub(super) fn emit(
         Some(WriteValue::Register(register)) => a.fmov_d_d(1, register),
         None => {}
     }
-    if use_stub(a) {
+    if use_stub() {
         // The stub returns W13 = 1 after an access and 0 when this template declines it.
         let stub = a.shared_stub(
             SharedStub::TypedElement {
