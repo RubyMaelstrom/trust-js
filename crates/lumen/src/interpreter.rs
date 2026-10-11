@@ -14261,6 +14261,9 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         let realm_key = Rc::as_ptr(&self.global) as usize;
         let _profile = function_profile_enter(func, &closure, fn_obj, realm_key);
+        // The callee runs (or compiles) now: read a snapshot-encoded body once, ahead of the
+        // body-fact scan below.
+        func.body.prepare_to_run();
         // Bytecode fast call: an eligible sync callee runs on the VM. Ordinary and base-class
         // bodies use the lean activation chosen by the compiler; a derived constructor uses the
         // dedicated Function Environment Record path below so `super()` can initialize `this`.
@@ -15580,7 +15583,10 @@ impl Interp {
         {
             return Ok(entry.body.clone());
         }
-        let body = Rc::new(crate::snapshot::decode(bytes)?);
+        // Function bodies stay encoded in the static bytes until each function first needs its
+        // statements (see `ast::FunctionBody`): platform code this Agent never runs costs it
+        // nothing beyond the bytes the process already holds.
+        let body = Rc::new(crate::snapshot::decode_static(bytes)?);
         // Embedders install a handful of distinct bootstraps; keep the table bounded if one
         // instead passes many different static snapshots.
         const MAX_SHARED_SNAPSHOTS: usize = 8;

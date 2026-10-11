@@ -8727,7 +8727,7 @@ fn default_constructor(derived: bool, class: &Class) -> Function {
         env_layouts: std::cell::OnceCell::new(),
         name: None,
         params,
-        body,
+        body: body.into(),
         is_arrow: false,
         is_strict: true,
         expr_body: false,

@@ -3628,11 +3628,22 @@ impl CaptureScan {
     /// Walk a whole function: params + hoisted vars + top-level lexicals in one scope, then body.
     fn fn_body(&mut self, func: &Function) -> Option<()> {
         self.spend_watch_budget()?;
+        // The function being compiled reads its own statements, which compiling it needs anyway.
+        // Nested functions, and the self-binding query, analyze bodies that may never run: a
+        // body still encoded in a static snapshot is decoded for this walk only.
+        if self.fn_depth == 0 && self.watched_name.is_none() {
+            self.fn_statements(func, &func.body)
+        } else {
+            func.body.with(|body| self.fn_statements(func, body))
+        }
+    }
+
+    fn fn_statements(&mut self, func: &Function, body: &[Stmt]) -> Option<()> {
         if self.watched_name.is_some() {
             // No lexical-resolution proof is needed for this query: treating
             // shadowed occurrences as observable is intentionally conservative.
             // Scan parameter patterns too, including nested defaults/computed keys.
-            if func.params.len() > 64 || func.body.len() > 256 {
+            if func.params.len() > 64 || body.len() > 256 {
                 return None;
             }
             for parameter in &func.params {
@@ -3641,7 +3652,7 @@ impl CaptureScan {
                     self.expr(default)?;
                 }
             }
-            for statement in &func.body {
+            for statement in body {
                 self.stmt(statement)?;
             }
             return Some(());
@@ -3672,7 +3683,7 @@ impl CaptureScan {
             self.push_scope(names.clone());
             self.parameter_expressions(func)?;
         }
-        if !hoisted_vars(&func.body, true, func.is_strict, &mut names) {
+        if !hoisted_vars(body, true, func.is_strict, &mut names) {
             return None;
         }
         // ECMA-262 Annex B.3.2 extends FunctionDeclarationInstantiation with a mutable
@@ -3683,13 +3694,12 @@ impl CaptureScan {
         if !func.is_arrow {
             annexb_blocked.push("arguments".to_string());
         }
-        for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked)
-        {
+        for op in crate::interpreter::collect_hoist_ops(body, func.is_strict, &annexb_blocked) {
             if let HoistOp::AnnexB(name, _) = op {
                 names.insert(name);
             }
         }
-        self.declare_lexicals(&func.body, &mut names);
+        self.declare_lexicals(body, &mut names);
         if self.fn_depth == 0 {
             self.top_names = names.clone();
         }
@@ -3697,7 +3707,7 @@ impl CaptureScan {
         if !parameter_scope {
             self.parameter_expressions(func)?;
         }
-        for s in &func.body {
+        for s in body {
             self.stmt(s)?;
         }
         self.scopes.pop();
@@ -5981,7 +5991,7 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
     let function = Function {
         name: None,
         params: Vec::new(),
-        body: body.to_vec(),
+        body: body.to_vec().into(),
         is_arrow: false,
         is_strict: true,
         expr_body: false,
@@ -6024,7 +6034,7 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
     let source = Function {
         name: None,
         params: Vec::new(),
-        body: body.to_vec(),
+        body: body.to_vec().into(),
         // Capture analysis must not invent an `arguments` binding or Annex B parameter blocker.
         is_arrow: true,
         is_strict: strict,
@@ -6231,6 +6241,8 @@ fn compile_inner(
     prepared_entry: bool,
     script_body: bool,
 ) -> Option<Rc<Chunk>> {
+    // Compilation reads the statements: decode a snapshot-encoded body once, up front.
+    func.body.prepare_to_run();
     // Body facts the scanner already knows: `new.target` is an observation channel into the
     // activation that slots do not provide; `this` / `arguments` in an ordinary arrow are free
     // variables we do not model. Ordinary functions with unmapped arguments can materialize

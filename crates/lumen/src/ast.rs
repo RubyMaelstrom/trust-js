@@ -493,12 +493,139 @@ pub struct FunctionMaps {
     pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
 }
 
+/// The FunctionBody of a [`Function`]: the statements that ECMA-262 OrdinaryFunctionCreate
+/// stores as the function object's [[ECMAScriptCode]] (local ECMA-262 snapshot e28783d5).
+///
+/// A parsed function owns its statements. A function decoded from a static host snapshot
+/// (`crate::snapshot::decode_static`) instead keeps the encoded bytes of its body, which every
+/// Agent of the process shares, and decodes them when the function first needs them. A browser
+/// prelude defines thousands of platform methods that a page never calls; their Parse Nodes
+/// would otherwise be the largest part of each Agent's memory. Nothing observable depends on
+/// when an implementation materializes Parse Nodes: the source was fully parsed, with its early
+/// errors, when the snapshot was compiled, and the snapshot was fully validated when this
+/// process first decoded it.
+///
+/// Reading the statements (`Deref`) materializes them once. They then belong to the Function
+/// like parsed ones, so their node identity (template objects, loop sites) is stable and the
+/// caches built from them stay valid. [`FunctionBody::with`] serves analyses of a function that
+/// is not about to run, such as an enclosing function's capture scan, from a temporary decode
+/// that is dropped afterwards. Memory accounting reads only [`FunctionBody::materialized`].
+#[derive(Clone)]
+pub struct FunctionBody {
+    stmts: std::cell::OnceCell<Vec<Stmt>>,
+    /// The statements' snapshot encoding, while they may still be unmaterialized.
+    encoded: Option<&'static [u8]>,
+}
+
+impl FunctionBody {
+    /// A body whose statements are already in memory (parsed or eagerly decoded).
+    pub fn new(stmts: Vec<Stmt>) -> Self {
+        Self {
+            stmts: std::cell::OnceCell::from(stmts),
+            encoded: None,
+        }
+    }
+
+    /// A body left encoded in a validated static snapshot (see `crate::snapshot`).
+    pub(crate) fn encoded(encoded: &'static [u8]) -> Self {
+        Self {
+            stmts: std::cell::OnceCell::new(),
+            encoded: Some(encoded),
+        }
+    }
+
+    /// The statements, if they are in memory.
+    #[inline]
+    pub(crate) fn materialized(&self) -> Option<&Vec<Stmt>> {
+        self.stmts.get()
+    }
+
+    /// Materialize the statements of a function that is about to run or be compiled, before
+    /// any analysis of it would otherwise decode them for itself.
+    #[inline]
+    pub(crate) fn prepare_to_run(&self) {
+        if self.stmts.get().is_none() {
+            self.materialize();
+        }
+    }
+
+    /// Run `f` over the statements without materializing them: a body that is still encoded is
+    /// decoded for this call only. For syntax-directed analyses of functions that are not about
+    /// to run; running and compiling a function read the materialized statements.
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&[Stmt]) -> T) -> T {
+        match self.stmts.get() {
+            Some(stmts) => f(stmts),
+            None => f(&self.decode()),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn materialize(&self) -> &Vec<Stmt> {
+        self.stmts.get_or_init(|| self.decode())
+    }
+
+    fn decode(&self) -> Vec<Stmt> {
+        let encoded = self
+            .encoded
+            .expect("an unmaterialized function body keeps its encoding");
+        // The whole snapshot, this body included, was decoded with every budget and check of
+        // an eager decode before any of its bodies was left encoded, and its bytes are
+        // immutable: decoding them again cannot fail.
+        crate::snapshot::decode_function_body(encoded)
+            .unwrap_or_else(|error| panic!("validated snapshot function body: {error}"))
+    }
+}
+
+impl From<Vec<Stmt>> for FunctionBody {
+    fn from(stmts: Vec<Stmt>) -> Self {
+        Self::new(stmts)
+    }
+}
+
+impl std::ops::Deref for FunctionBody {
+    type Target = Vec<Stmt>;
+    #[inline]
+    fn deref(&self) -> &Vec<Stmt> {
+        match self.stmts.get() {
+            Some(stmts) => stmts,
+            None => self.materialize(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a FunctionBody {
+    type Item = &'a Stmt;
+    type IntoIter = std::slice::Iter<'a, Stmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl std::ops::DerefMut for FunctionBody {
+    fn deref_mut(&mut self) -> &mut Vec<Stmt> {
+        if self.stmts.get().is_none() {
+            let stmts = self.decode();
+            let _ = self.stmts.set(stmts);
+        }
+        // Edited statements no longer match the encoding.
+        self.encoded = None;
+        self.stmts.get_mut().expect("materialized above")
+    }
+}
+
+impl std::fmt::Debug for FunctionBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.with(|stmts| stmts.fmt(f))
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // expr_body is recorded for a future `toString`/source-fidelity pass
 pub struct Function {
     pub name: Option<String>,
     pub params: Vec<Param>,
-    pub body: Vec<Stmt>,
+    pub body: FunctionBody,
     pub is_arrow: bool,
     pub is_strict: bool,
     /// Arrow with an expression body (`x => x+1`): the single statement is a synthetic `return`.
@@ -1032,7 +1159,10 @@ pub(crate) fn scan_function_retained_memory(
             scan.expr(default);
         }
     }
-    scan.stmt_vec(&function.body);
+    // A body still encoded in a static snapshot owns no allocation: the bytes are the process's.
+    if let Some(body) = function.body.materialized() {
+        scan.stmt_vec(body);
+    }
     if let Some(source) = &function.source {
         scan.rc_str(source);
     }
@@ -1223,7 +1353,9 @@ impl Function {
                 scan_expr(d, &mut flags);
             }
         }
-        scan_stmts(&self.body, &mut flags);
+        // Closure creation asks this of methods (MakeMethod's [[HomeObject]]) and enclosing
+        // scans ask it of nested arrows; neither runs the body, so an encoded one is not kept.
+        self.body.with(|body| scan_stmts(body, &mut flags));
         self.scan
             .set(flags | (cached & (SCAN_SELF_DONE | SCAN_SELF_NEEDED)));
         flags

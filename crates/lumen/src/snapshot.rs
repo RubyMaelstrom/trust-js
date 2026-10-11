@@ -9,6 +9,12 @@
 //!   runtime caches (`Cell`/`OnceCell`); decode initializes them empty, exactly as the parser
 //!   leaves them. Ordinary snapshots preserve reflection source; the explicit host-bootstrap
 //!   variant omits only function/class source text, leaving executable AST nodes intact.
+//! - **Function bodies are length-prefixed** (a little-endian `u32` byte count before the
+//!   statements), so [`decode_static`] can leave each body of a `&'static` snapshot encoded and
+//!   [`decode_function_body`] can decode it when the function first needs it (see
+//!   [`FunctionBody`]). The first static decode of a snapshot in the process still decodes, and
+//!   so validates, every body under the same budgets as [`decode`]; it drops each body after
+//!   validating it. Later decodes of those immutable bytes skip the bodies by their lengths.
 //! - Interned `&'static str` operators are re-interned from [`KEYWORDS`]/[`PUNCTUATORS`] on
 //!   decode (every op the parser emits comes from those tables).
 //!
@@ -25,7 +31,7 @@ use crate::token::{KEYWORDS, PUNCTUATORS};
 
 const MAGIC: u32 = 0x4c_53_4e_31; // "LSN1"
 /// Bump on any AST or format change. A mismatch makes `decode` fail → caller re-parses.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// Snapshots are an optimization for trusted build-time glue, but the public embedding API can be
 /// handed arbitrary bytes. Keep corrupt data from turning its length fields into unbounded work.
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -121,6 +127,17 @@ struct Reader<'a> {
     pos: usize,
     allocated: usize,
     depth: usize,
+    /// Set when `buf` is static and function bodies stay encoded (see [`decode_static`]).
+    lazy: Option<LazyBodies>,
+}
+
+#[derive(Clone, Copy)]
+struct LazyBodies {
+    /// The bytes `Reader::buf` reads, as the `'static` slice that encoded bodies keep.
+    buf: &'static [u8],
+    /// Decode each body (and drop it) before leaving it encoded, exactly as [`decode`] would
+    /// have decoded it: the process's first decode of these bytes.
+    validate: bool,
 }
 
 type R<T> = Result<T, String>;
@@ -148,6 +165,18 @@ impl Reader<'_> {
                 return Err("snapshot: varint overflow".into());
             }
         }
+    }
+    fn u32(&mut self) -> R<u32> {
+        let end = self
+            .pos
+            .checked_add(4)
+            .ok_or("snapshot: position overflow")?;
+        let bytes = self
+            .buf
+            .get(self.pos..end)
+            .ok_or("snapshot: truncated u32")?;
+        self.pos = end;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
     fn f64(&mut self) -> R<f64> {
         let end = self
@@ -284,6 +313,31 @@ fn encode_with_source(body: &[Stmt], include_source: bool) -> Vec<u8> {
 /// Decode a snapshot blob back into a script body. `Err` (skew/truncation/corruption) tells the
 /// caller to fall back to parsing the original source.
 pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
+    decode_with(bytes, None)
+}
+
+/// [`decode`] for a static snapshot, leaving every function body encoded in `bytes` until the
+/// function first needs it (see [`FunctionBody`]). The process's first static decode of these
+/// bytes also decodes every body, under the same depth, allocation and structure checks as
+/// [`decode`], so it accepts and rejects exactly the snapshots [`decode`] does; it drops each body
+/// once it has validated it. Later decodes of the same bytes skip the bodies by their lengths.
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+pub(crate) fn decode_static(bytes: &'static [u8]) -> R<Vec<Stmt>> {
+    let validate = !validated_static_snapshot(bytes);
+    let body = decode_with(
+        bytes,
+        Some(LazyBodies {
+            buf: bytes,
+            validate,
+        }),
+    )?;
+    if validate {
+        remember_validated_static_snapshot(bytes);
+    }
+    Ok(body)
+}
+
+fn decode_with(bytes: &[u8], lazy: Option<LazyBodies>) -> R<Vec<Stmt>> {
     let perf_started = crate::jit::perf_stage_start();
     let result = (|| {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
@@ -294,6 +348,7 @@ pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
             pos: 0,
             allocated: 0,
             depth: 0,
+            lazy,
         };
         if r.uv()? != MAGIC as u64 {
             return Err("snapshot: bad magic".into());
@@ -309,6 +364,71 @@ pub fn decode(bytes: &[u8]) -> R<Vec<Stmt>> {
     })();
     crate::jit::perf_snapshot_decode_end(perf_started, result.is_ok());
     result
+}
+
+/// Decode the statements of a function body that [`decode_static`] left encoded. Its own nested
+/// function bodies stay encoded in turn.
+pub(crate) fn decode_function_body(encoded: &'static [u8]) -> R<Vec<Stmt>> {
+    let mut r = Reader {
+        buf: encoded,
+        pos: 0,
+        allocated: 0,
+        depth: 0,
+        lazy: Some(LazyBodies {
+            buf: encoded,
+            validate: false,
+        }),
+    };
+    let body = dec_stmts(&mut r)?;
+    if r.pos != encoded.len() {
+        return Err("snapshot: function body length mismatch".into());
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Function bodies decoded for validation by [`decode_static`] on this thread.
+    static VALIDATED_BODIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Static snapshots this process has decoded with full validation, by address and length.
+/// `&'static` bytes are immutable and never freed, so the key identifies their content for the
+/// rest of the process. Embedders install a handful of static bootstraps; past the bound, the
+/// oldest entry is forgotten and that snapshot is simply validated again on its next decode.
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+static VALIDATED_STATIC_SNAPSHOTS: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+const MAX_VALIDATED_STATIC_SNAPSHOTS: usize = 16;
+
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+fn static_snapshot_key(bytes: &'static [u8]) -> (usize, usize) {
+    (bytes.as_ptr() as usize, bytes.len())
+}
+
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+fn validated_static_snapshot(bytes: &'static [u8]) -> bool {
+    let key = static_snapshot_key(bytes);
+    VALIDATED_STATIC_SNAPSHOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&key)
+}
+
+#[cfg_attr(not(any(feature = "embed", test)), allow(dead_code))]
+fn remember_validated_static_snapshot(bytes: &'static [u8]) {
+    let key = static_snapshot_key(bytes);
+    let mut validated = VALIDATED_STATIC_SNAPSHOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if validated.contains(&key) {
+        return;
+    }
+    if validated.len() == MAX_VALIDATED_STATIC_SNAPSHOTS {
+        validated.remove(0);
+    }
+    validated.push(key);
 }
 
 // ---- Vec / Option helpers (monomorphized by hand to keep the reader borrow simple) ------------
@@ -1327,7 +1447,7 @@ fn enc_function_inner(w: &mut Writer, f: &Function) {
         enc_opt_expr(w, &p.default);
         w.bool(p.rest);
     }
-    enc_stmts(w, &f.body);
+    enc_function_body(w, &f.body);
     // Flags packed into one byte.
     let flags = (f.is_arrow as u8)
         | (f.is_strict as u8) << 1
@@ -1363,7 +1483,7 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
             rest: r.bool()?,
         });
     }
-    let body = dec_stmts(r)?;
+    let body = dec_function_body(r)?;
     let flags = r.u8()?;
     let self_hosted = r.bool()?;
     let source = dec_opt_rcstr(r)?;
@@ -1393,6 +1513,47 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         fn_maps: OnceCell::new(),
         env_layouts: OnceCell::new(),
     })
+}
+
+/// A function body: its statements' byte length as a little-endian `u32`, then the statements.
+fn enc_function_body(w: &mut Writer, body: &FunctionBody) {
+    let at = w.buf.len();
+    w.buf.extend_from_slice(&[0; 4]);
+    // A lazily decoded body is re-encoded from a temporary decode, as `include_source` may
+    // differ from the encoding it was read from.
+    body.with(|stmts| enc_stmts(w, stmts));
+    // No representable snapshot holds a 4 GiB body; an impossible length fails decoding.
+    let len = u32::try_from(w.buf.len() - at - 4).unwrap_or(u32::MAX);
+    w.buf[at..at + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+fn dec_function_body(r: &mut Reader) -> R<FunctionBody> {
+    let len = usize::try_from(r.u32()?).map_err(|_| "snapshot: integer too large")?;
+    let start = r.pos;
+    let end = start
+        .checked_add(len)
+        .filter(|&end| end <= r.buf.len())
+        .ok_or("snapshot: truncated function body")?;
+    let Some(lazy) = r.lazy else {
+        let body = dec_stmts(r)?;
+        if r.pos != end {
+            return Err("snapshot: function body length mismatch".into());
+        }
+        return Ok(FunctionBody::new(body));
+    };
+    if lazy.validate {
+        // Exactly the decode `decode` performs, charged to the same budgets.
+        let body = dec_stmts(r)?;
+        if r.pos != end {
+            return Err("snapshot: function body length mismatch".into());
+        }
+        drop(body);
+        #[cfg(test)]
+        VALIDATED_BODIES.with(|count| count.set(count.get() + 1));
+    } else {
+        r.pos = end;
+    }
+    Ok(FunctionBody::encoded(&lazy.buf[start..end]))
 }
 
 fn enc_class(w: &mut Writer, c: &Class) {
@@ -1586,7 +1747,9 @@ fn dec_declkind(r: &mut Reader) -> R<DeclKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode, Writer, MAGIC, VERSION};
+    use super::{decode, decode_static, encode, Writer, MAGIC, VERSION};
+    use crate::ast::{Expr, Function, Stmt};
+    use std::rc::Rc;
 
     fn snapshot_writer() -> Writer {
         let mut writer = Writer {
@@ -1755,7 +1918,7 @@ mod tests {
         let mut function_stmt = Stmt::Return(Some(Expr::Num(1.0)));
         for _ in 0..40 {
             let mut function = (**template).clone();
-            function.body = vec![function_stmt];
+            function.body = vec![function_stmt].into();
             function_stmt = Stmt::FuncDecl(Rc::new(function));
         }
         let mut class_expr = Expr::Ident("Object".into(), crate::stack_trace::NO_POSITION);
@@ -1853,5 +2016,197 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// Leak a copy: static decoding keeps `&'static` slices of its input.
+    fn leak(bytes: &[u8]) -> &'static [u8] {
+        Box::leak(bytes.to_vec().into_boxed_slice())
+    }
+
+    fn validated_bodies() -> usize {
+        super::VALIDATED_BODIES.with(std::cell::Cell::get)
+    }
+
+    /// The function declared by the first statement of `body`.
+    fn declared(body: &[Stmt]) -> Rc<Function> {
+        match &body[0] {
+            Stmt::FuncDecl(function) => function.clone(),
+            other => panic!("expected a function declaration, found {other:?}"),
+        }
+    }
+
+    const NESTED: &str = r#"function outer(a, b = () => a) {
+        let unused;
+        const inner = function named(x) { return x + a; };
+        class C extends Object { m() { return super.toString; } get g() { return 1; } static { this.s = 2; } }
+        function* gen() { yield* [1, 2]; }
+        return [inner, C, gen, { method() { return this; }, arrow: (y) => y * 2 }];
+    }
+    var later = async (z) => { await z; return z; };"#;
+
+    #[test]
+    fn static_decode_leaves_function_bodies_encoded_until_first_use() {
+        let bytes = crate::compile_snapshot(NESTED).unwrap();
+        let eager = decode(&bytes).unwrap();
+        let lazy = decode_static(leak(&bytes)).unwrap();
+        let outer = declared(&lazy);
+        assert!(
+            outer.body.materialized().is_none(),
+            "the body stays encoded"
+        );
+        assert_eq!(
+            outer.params.len(),
+            2,
+            "parameters are decoded with the function"
+        );
+        // An analysis decodes the statements without keeping them.
+        assert_eq!(outer.body.with(|stmts| stmts.len()), 5);
+        assert!(outer.body.materialized().is_none());
+        // Debug output decodes transiently and is the eager tree's.
+        assert_eq!(format!("{lazy:?}"), format!("{eager:?}"));
+        assert!(outer.body.materialized().is_none());
+        // Reading the statements materializes them once; nested bodies stay encoded.
+        assert_eq!(outer.body.len(), 5);
+        assert!(outer.body.materialized().is_some());
+        let first = outer.body.as_ptr();
+        assert_eq!(
+            outer.body.as_ptr(),
+            first,
+            "the statements keep their identity"
+        );
+        let Stmt::VarDecl { decls, .. } = &outer.body[1] else {
+            panic!("const inner")
+        };
+        let Some(Expr::Func(inner)) = &decls[0].1 else {
+            panic!("function expression")
+        };
+        assert!(
+            inner.body.materialized().is_none(),
+            "nested bodies stay encoded"
+        );
+        assert_eq!(format!("{lazy:?}"), format!("{eager:?}"));
+        // The parameter default arrow was decoded with the parameters; its body stays encoded.
+        let Some(Expr::Func(default)) = &outer.params[1].default else {
+            panic!("arrow default")
+        };
+        assert!(default.body.materialized().is_none());
+    }
+
+    #[test]
+    fn static_decode_reencodes_to_the_same_bytes() {
+        for source in [
+            NESTED,
+            "function f() { return function g() { return () => this; }; }",
+        ] {
+            let bytes = crate::compile_snapshot(source).unwrap();
+            let lazy = decode_static(leak(&bytes)).unwrap();
+            assert_eq!(encode(&lazy), bytes, "unmaterialized: {source}");
+            let outer = declared(&lazy);
+            assert!(!outer.body.is_empty());
+            assert_eq!(encode(&lazy), bytes, "materialized: {source}");
+            let host = crate::compile_host_snapshot(source).unwrap();
+            assert_eq!(
+                super::encode_host(&decode_static(leak(&host)).unwrap()),
+                host
+            );
+        }
+    }
+
+    /// Static decoding validates exactly as eager decoding: every single-byte corruption of a
+    /// snapshot with nested bodies is rejected by both or accepted by both, with the same error
+    /// and, when accepted, the same tree.
+    #[test]
+    fn static_decode_accepts_and_rejects_what_decode_does() {
+        let bytes = crate::compile_snapshot(
+            "function f(a) { function g() { return [a, 1.5, 'x']; } return g; } var v = f;",
+        )
+        .unwrap();
+        for index in 0..bytes.len() {
+            for value in [0x00, 0x01, 0x7f, 0x80, 0xff, bytes[index].wrapping_add(1)] {
+                let mut mutated = bytes.clone();
+                mutated[index] = value;
+                let eager = decode(&mutated);
+                let lazy = decode_static(leak(&mutated));
+                match (&eager, &lazy) {
+                    (Ok(eager), Ok(lazy)) => {
+                        assert_eq!(format!("{lazy:?}"), format!("{eager:?}"), "byte {index}");
+                    }
+                    (Err(eager), Err(lazy)) => assert_eq!(eager, lazy, "byte {index}"),
+                    _ => panic!("byte {index} = {value:#x}: {eager:?} / {lazy:?}"),
+                }
+            }
+        }
+        // Nesting and length checks inside a body that stays encoded. Build the deep fixture
+        // directly, so parser recursion is not under test.
+        let template = crate::parser::parse_script("function f() {}", false)
+            .ok()
+            .expect("function template parses");
+        let mut function = (*declared(&template)).clone();
+        let mut expr = Expr::Num(1.0);
+        for _ in 0..200 {
+            expr = Expr::Paren(Box::new(expr));
+        }
+        function.body = vec![Stmt::Return(Some(expr))].into();
+        let deep = encode(&[Stmt::FuncDecl(Rc::new(function))]);
+        let eager = decode(&deep).unwrap_err();
+        assert!(eager.contains("nesting limit"), "{eager}");
+        assert_eq!(decode_static(leak(&deep)).unwrap_err(), eager);
+        let mut short = crate::compile_host_snapshot("function f() { return 1; }").unwrap();
+        // The body length follows the MAGIC/VERSION header, the statement count and tag, and
+        // the function's name and empty parameter list.
+        let header = encode(&[]).len() - 1;
+        let at = header + 1 + 1 + 3 + 1;
+        let len = u32::from_le_bytes(short[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            len as usize,
+            short.len() - at - 4 - 3,
+            "the body precedes 3 flag bytes"
+        );
+        short[at..at + 4].copy_from_slice(&(len - 1).to_le_bytes());
+        let eager = decode(&short).unwrap_err();
+        assert!(eager.contains("length mismatch"), "{eager}");
+        assert_eq!(decode_static(leak(&short)).unwrap_err(), eager);
+    }
+
+    #[test]
+    fn static_decode_validates_bodies_once_per_process() {
+        let bytes = leak(&crate::compile_snapshot(NESTED).unwrap());
+        let before = validated_bodies();
+        let first = decode_static(bytes).unwrap();
+        let validated = validated_bodies() - before;
+        // Every function of the snapshot, nested ones included, exactly once.
+        let functions = format!("{:?}", decode(bytes).unwrap())
+            .matches("Function {")
+            .count();
+        assert_eq!(validated, functions);
+        assert!(functions >= 10, "{functions}");
+        let second = decode_static(bytes).unwrap();
+        assert_eq!(validated_bodies() - before, validated, "already validated");
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        // The same content at another address is validated again.
+        let copy = leak(bytes);
+        decode_static(copy).unwrap();
+        assert_eq!(validated_bodies() - before, 2 * validated);
+    }
+
+    #[test]
+    fn edited_and_cloned_bodies_keep_their_statements() {
+        let bytes = crate::compile_snapshot(NESTED).unwrap();
+        let lazy = decode_static(leak(&bytes)).unwrap();
+        let outer = declared(&lazy);
+        let clone = (*outer).clone();
+        assert!(
+            clone.body.materialized().is_none(),
+            "a clone of an encoded body stays encoded"
+        );
+        let mut edited = (*outer).clone();
+        edited.body.truncate(1);
+        assert!(edited.body.materialized().is_some());
+        assert_eq!(edited.body.len(), 1);
+        assert_eq!(clone.body.len(), 5);
+        assert!(
+            outer.body.materialized().is_none(),
+            "the original is untouched"
+        );
     }
 }
