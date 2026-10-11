@@ -3867,6 +3867,15 @@ pub(crate) struct HostSettingsState {
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
 }
 
+/// A run-once bootstrap function (`Function::run_once`) whose body has more statements than this
+/// is not compiled on its first call for containing a loop; the call-count threshold still
+/// compiles it. Its bytecode would be the largest compiled object an Agent keeps (TRust's
+/// 3,207-statement platform IIFE compiles to 21,700 operations, 4.2 MiB per Agent), while
+/// running it on the tree-walker costs each later Realm of the Agent a few milliseconds.
+/// Smaller run-once bodies still compile on their first call (and stay on the VM): interpreting
+/// them too would save less memory for a similar cost in every later Realm.
+pub(crate) const RUN_ONCE_INTERPRETED_STATEMENTS: usize = 1000;
+
 /// One decoded static host snapshot (see `Interp::shared_snapshots`). Every evaluation runs a
 /// fresh ScriptEvaluation of the same Script body in the then-active Realm: function objects,
 /// environments and template objects are created anew per Realm, while the immutable AST and
@@ -14298,11 +14307,12 @@ impl Interp {
                 func.calls.set(n);
                 // A body with a loop compiles on its first call: one call can run a million
                 // iterations, so the call-count threshold would leave it on the tree-walker.
-                // So does a self-hosted built-in: engine code gathers no useful warm-up.
-                if n > self.tier_threshold
-                    || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0
-                    || func.self_hosted
-                {
+                // So does a self-hosted built-in: engine code gathers no useful warm-up. A huge
+                // run-once bootstrap body waits for the threshold instead (see
+                // `RUN_ONCE_INTERPRETED_STATEMENTS`).
+                let loop_compiles = func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0
+                    && !(func.run_once && func.body.len() > RUN_ONCE_INTERPRETED_STATEMENTS);
+                if n > self.tier_threshold || loop_compiles || func.self_hosted {
                     let compiled = if derived_class_construct {
                         crate::bytecode::compile_derived_constructor(func)
                     } else {

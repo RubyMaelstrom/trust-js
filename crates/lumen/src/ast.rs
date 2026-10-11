@@ -662,7 +662,9 @@ pub struct Function {
     /// snapshot's top-level code, or the body of another such function, calls immediately and
     /// outside any loop or class (`(function () { … })()`), so it runs once in each Realm that
     /// evaluates the snapshot. Its bytecode runs on the VM and never gets native code (see
-    /// `Interp::run_compiled_chunk`). Never set for parsed source or other snapshots.
+    /// `Interp::run_compiled_chunk`), and a huge one is interpreted until the call-count
+    /// threshold compiles it (`RUN_ONCE_INTERPRETED_STATEMENTS`). Never set for parsed source or
+    /// other snapshots.
     pub(crate) run_once: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
     pub source: Option<Rc<str>>,

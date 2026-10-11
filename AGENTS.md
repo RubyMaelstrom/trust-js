@@ -228,7 +228,9 @@ test builds check each summary against the walk. Memory accounting reads only
 materialized bodies. The encoder marks a snapshot's run-once bootstrap functions
 (`Function::run_once`: immediately invoked from top-level code or another such function,
 outside loops and classes); after a static decode their bytecode stays on the VM and never
-gets native code, since they run once per Realm.
+gets native code, since they run once per Realm, and a body of more than
+`RUN_ONCE_INTERPRETED_STATEMENTS` statements is interpreted until the call-count threshold
+compiles it.
 
 Engine strings store a lone surrogate as the scalar U+10F800 + (unit − 0xD800) and a
 character in U+10F800..=U+10FFFF as its pair of such scalars (`jstr.rs`). Rust text

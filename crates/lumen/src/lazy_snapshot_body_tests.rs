@@ -354,3 +354,70 @@ fn run_once_bootstrap_functions_never_get_native_code() {
         "parsed source keeps today's tiering"
     );
 }
+
+/// A run-once bootstrap body of more than `RUN_ONCE_INTERPRETED_STATEMENTS` statements is not
+/// compiled on its first call although it contains a loop: each Realm interprets it until the
+/// call-count threshold compiles it (to bytecode that stays on the VM). Results are the same
+/// in every Realm and in parsed source.
+#[test]
+fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
+    fn source() -> String {
+        let limit = crate::interpreter::RUN_ONCE_INTERPRETED_STATEMENTS;
+        format!(
+            "(function () {{ let total = 0; for (let i = 0; i < 3; i++) total += i; {} \
+             globalThis.bootstrapTotal = total; }})();",
+            "total += 1; ".repeat(limit)
+        )
+    }
+    static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let snapshot: &'static [u8] =
+        SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(&source()).expect("source parses"));
+    let expected = (3 + crate::interpreter::RUN_ONCE_INTERPRETED_STATEMENTS).to_string();
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let threshold = it.tier_threshold;
+        let program = it.shared_snapshot_program(snapshot).expect("decodes");
+        let bootstrap = bootstrap_function(&program);
+        assert!(bootstrap.run_once);
+        let run = |it: &mut Interp| {
+            let program = it.shared_snapshot_program(snapshot).expect("decodes");
+            if let Err(Abrupt::Throw(error)) = it.run_classic_program(&program, None) {
+                panic!("snapshot threw: {}", render(it, &error));
+            }
+            eval_string(it, "bootstrapTotal")
+        };
+        assert_eq!(run(it), expected, "{tier:?}");
+        assert!(bootstrap.code.get().is_none(), "{tier:?}: interpreted");
+        // Each later Realm of the Agent calls it once more.
+        for realm in 1..=threshold {
+            let child = it.create_realm();
+            assert_eq!(
+                in_realm(it, &child, run),
+                expected,
+                "{tier:?} Realm {realm}"
+            );
+        }
+        assert!(
+            bootstrap.code.get().is_some_and(Option::is_some),
+            "{tier:?}: the call-count threshold compiles it"
+        );
+        assert!(!has_native_code(&bootstrap), "{tier:?}: on the VM");
+    }
+
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    let it = &mut *engine.interp;
+    let Ok(parsed) = crate::parser::parse_script(&source(), false) else {
+        panic!("source parses")
+    };
+    if let Err(Abrupt::Throw(error)) = it.run_classic_program(&parsed, None) {
+        panic!("parsed source threw: {}", render(it, &error));
+    }
+    assert_eq!(eval_string(it, "bootstrapTotal"), expected);
+    assert!(
+        has_native_code(&bootstrap_function(&parsed)),
+        "parsed source compiles on its first call"
+    );
+}
