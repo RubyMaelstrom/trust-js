@@ -2900,6 +2900,13 @@ impl Interp {
             {
                 return Ok(true);
             }
+            // ToPropertyKey of an integral Number is its decimal text: test that key along an
+            // ordinary chain without building a String (absent and sparse indices).
+            if let Some(text) = crate::value::KeyText::integer(n) {
+                if let Some(present) = Self::ordinary_chain_has_property(target, text.as_str()) {
+                    return Ok(present);
+                }
+            }
         }
         if let Value::Str(name) = key {
             if let Some(present) = Self::ordinary_chain_has_property(target, name) {
@@ -2916,7 +2923,7 @@ impl Interp {
     /// own-property test at every hop, without copying the key. `None` as soon as an object on
     /// the chain is in an interpreter side table (`ic_plain` clear: proxies, typed arrays,
     /// namespaces, Web IDL indexed objects) or is any other exotic object.
-    fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
+    pub(crate) fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
         let mut current = start.clone();
         loop {
             let next = {
@@ -2938,6 +2945,67 @@ impl Interp {
                 Some(prototype) => current = prototype,
                 None => return Some(false),
             }
+        }
+    }
+
+    /// OrdinaryGet (ECMA-262 §10.1.8.1) of a String key along a prototype chain of ordinary
+    /// objects and Arrays, as far as it runs no author code: `Some(value)` of the first data
+    /// property found, `Some(undefined)` when no object on the chain has the key, `None` for an
+    /// accessor or when an object on the chain has other internal methods (see
+    /// [`Interp::ordinary_chain_has_property`]); the caller then takes the general [[Get]].
+    pub(crate) fn ordinary_chain_get_data(start: &Gc, key: &str) -> Option<Value> {
+        let mut current = start.clone();
+        loop {
+            let next = {
+                let object = current.borrow();
+                if !object.ic_plain.get()
+                    || !matches!(
+                        object.exotic,
+                        crate::value::Exotic::None | crate::value::Exotic::Array
+                    )
+                {
+                    return None;
+                }
+                if let Some(property) = object.props.get(key) {
+                    return (!property.accessor()).then(|| property.value());
+                }
+                object.proto.clone()
+            };
+            match next {
+                Some(prototype) => current = prototype,
+                None => return Some(Value::Undefined),
+            }
+        }
+    }
+
+    /// `object[index] = value` for an existing own writable data property of an ordinary
+    /// object or Array whose key is `index`'s decimal text: OrdinarySetWithOwnDescriptor then
+    /// only replaces [[Value]] (for an Array the index is below `length`). Gives the value
+    /// back for every other case. Reached after `fast_set_elem` declined, so the property is
+    /// not a dense element (a sparse index, typically).
+    pub(crate) fn ordinary_set_existing_index(
+        object: &Gc,
+        index: f64,
+        value: Value,
+    ) -> Result<(), Value> {
+        let Some(text) = crate::value::KeyText::integer(index) else {
+            return Err(value);
+        };
+        let mut object = object.borrow_mut();
+        if !object.ic_plain.get()
+            || !matches!(
+                object.exotic,
+                crate::value::Exotic::None | crate::value::Exotic::Array
+            )
+        {
+            return Err(value);
+        }
+        match object.props.get_mut(text.as_str()) {
+            Some(property) if !property.accessor() && property.writable() => {
+                property.set_value(value);
+                Ok(())
+            }
+            _ => Err(value),
         }
     }
 

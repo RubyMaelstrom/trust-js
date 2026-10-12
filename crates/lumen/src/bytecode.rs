@@ -22926,6 +22926,10 @@ fn get_computed_element(
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
         if let (Value::Obj(object), Value::Num(index)) = (obj, key) {
+            // A hole, an absent index or a sparse element of an ordinary chain.
+            if let Some(value) = Interp::ordinary_chain_get_data(object, text.as_str()) {
+                return Ok(value);
+            }
             if let Some(result) = i.proxy_get_integer_key(object, *index, text.as_str()) {
                 return result;
             }
@@ -22962,7 +22966,10 @@ fn set_computed_element(
     let value = if let (Value::Obj(object), Value::Num(index)) = (object, key) {
         match i.fast_set_elem(object, *index, value) {
             Ok(()) => return Ok(()),
-            Err(value) => value,
+            Err(value) => match Interp::ordinary_set_existing_index(object, *index, value) {
+                Ok(()) => return Ok(()),
+                Err(value) => value,
+            },
         }
     } else {
         value

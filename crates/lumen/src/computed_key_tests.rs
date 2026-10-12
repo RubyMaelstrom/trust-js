@@ -1,7 +1,9 @@
-//! Integer-keyed reads of Strings and Proxies, String-keyed `in`, and StringToNumber of
-//! decimal digit strings. Local ECMA-262 e28783d5: §10.4.3.5 StringGetOwnProperty, §10.5.8
-//! Proxy [[Get]], §7.1.19 ToPropertyKey, §13.10.1 RelationalExpression `in` (HasProperty),
-//! §7.1.4.1.1 StringToNumber. Expected answers from Node.js 22.
+//! Integer-keyed reads of Strings and Proxies, String-keyed `in`, StringToNumber of decimal
+//! digit strings, and integer keys that miss dense element storage (holes, absent and sparse
+//! indices). Local ECMA-262 e28783d5: §10.4.3.5 StringGetOwnProperty, §10.5.8 Proxy [[Get]],
+//! §7.1.19 ToPropertyKey, §13.10.1 RelationalExpression `in` (HasProperty), §7.1.4.1.1
+//! StringToNumber, §10.1.8.1 OrdinaryGet, §10.1.9.2 OrdinarySetWithOwnDescriptor, §10.4.2.1
+//! Array [[DefineOwnProperty]]. Expected answers from Node.js 22.
 
 use crate::{bytecode::Tier, Completion, Engine};
 
@@ -73,5 +75,69 @@ same + "#" + first;
          true,true,false,true,true,true,false,true,false,false,true,true,true,false,true|\
          true,false,yes/no|123,7,0,0,12,1000,999999999999999,10000000000000000,\
          12345678901234567000,16,-5,5,NaN,42,4.5,0.5,5",
+    );
+}
+
+/// Holes, absent and sparse (beyond the dense range) indices: reads consult the prototype
+/// chain, writes to existing sparse elements respect writability and accessors, and chains with
+/// Proxies, typed arrays or arguments objects keep their own internal methods.
+#[test]
+fn sparse_and_absent_indices_agree_across_tiers() {
+    check(
+        r##"
+function run() {
+  var out = [];
+  function get(o, k) { return o[k]; }
+  function set(o, k, v) { o[k] = v; return o[k]; }
+  function has(k, o) { return k in o; }
+  // Sparse arrays: far indices beyond the dense range, then reads, writes and `in`.
+  var sparse = [0]; sparse[5000] = "far"; sparse[3] = "near"; sparse[70000] = "farther";
+  out.push([get(sparse, 5000), get(sparse, 3), get(sparse, 70000), get(sparse, 4999), get(sparse, 70001),
+            sparse.length, has(5000, sparse), has(4999, sparse), has(70000, sparse), has(-0, sparse)].map(String).join(","));
+  out.push([set(sparse, 5000, "again"), set(sparse, 70000, 7), set(sparse, 9000, "new"), sparse.length,
+            Object.keys(sparse).join("/")].join(","));
+  // Holes and absent indices consult the prototype chain.
+  var holey = [1, , 3];
+  out.push([get(holey, 1), get(holey, 7), has(1, holey), has(7, holey)].map(String).join(","));
+  Array.prototype[1] = "proto"; Object.prototype[7] = "objproto";
+  out.push([get(holey, 1), get(holey, 7), has(1, holey), has(7, holey), get(sparse, 4999) === undefined].map(String).join(","));
+  delete Array.prototype[1]; delete Object.prototype[7];
+  var calls = 0;
+  Object.defineProperty(Array.prototype, 2000, { get: function () { calls++; return this.length; }, configurable: true });
+  out.push([get(sparse, 2000), get(holey, 2000), calls, has(2000, holey)].join(","));
+  delete Array.prototype[2000];
+  // Non-writable and accessor sparse elements.
+  Object.defineProperty(sparse, 6000, { value: "fixed", writable: false, configurable: true });
+  var setCalls = [];
+  Object.defineProperty(sparse, 6001, { get: function () { return "g"; }, set: function (v) { setCalls.push(v); }, configurable: true });
+  out.push([set(sparse, 6000, "changed"), set(sparse, 6001, "s"), setCalls.join(),
+            (function () { "use strict"; try { sparse[6000] = 1; return "no"; } catch (e) { return e.name; } })()].join(","));
+  Object.freeze(sparse);
+  out.push([set(sparse, 5000, "frozen?"), set(sparse, 123456, "x"), sparse.length].join(","));
+  // Ordinary objects with integer keys, negative and huge keys.
+  var o = { 4096: "a", "-1": "neg" }; var child = Object.create(o);
+  out.push([get(child, 4096), get(child, -1), has(4096, child), has(-1, child), has(-2, child),
+            get(o, 4294967295), set(o, 4294967295, "big"), get(o, 4294967295), Object.keys(o).join("/"),
+            get([], 9007199254740992), has(9007199254740993, [])].map(String).join(","));
+  // Prototype objects with other internal methods take the general path.
+  var trapped = [];
+  var viaProxy = Object.create(new Proxy({}, { get: function (t, k) { trapped.push("g" + k); return "trap"; },
+                                                 has: function (t, k) { trapped.push("h" + k); return true; } }));
+  out.push([get(viaProxy, 12), has(12, viaProxy), trapped.join("/")].join(","));
+  var typed = Object.create(new Uint8Array([9, 8]));
+  out.push([get(typed, 5), has(1, typed), has(5, typed)].map(String).join(","));
+  var args = (function () { return arguments; })(1, 2);
+  out.push([get(args, 1), get(args, 9), has(1, args), has(9, args)].map(String).join(","));
+  return out.join("|");
+}
+var first = run(), same = true;
+for (var i = 0; i < 40; i++) same = same && run() === first;
+same + "#" + first;
+"##,
+        "true#far,near,farther,undefined,undefined,70001,true,false,true,true|\
+         again,7,new,70001,0/3/5000/9000/70000|undefined,undefined,false,false|\
+         proto,objproto,true,true,true|70001,3,2,true|fixed,g,s,TypeError|again,,70001|\
+         a,neg,true,true,false,undefined,big,big,4096/-1/4294967295,undefined,false|\
+         trap,true,g12/h12|undefined,true,false|2,undefined,true,false",
     );
 }
