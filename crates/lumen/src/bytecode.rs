@@ -22867,14 +22867,31 @@ fn get_computed_element(
     if let Value::Str(key) = key {
         return i.get_computed_property(obj, key);
     }
-    if let (Value::Obj(object), Value::Num(index)) = (obj, key) {
-        if let Some(value) = i.fast_get_elem(object, *index) {
-            return Ok(value);
+    match (obj, key) {
+        (Value::Obj(object), Value::Num(index)) => {
+            if let Some(value) = i.fast_get_elem(object, *index) {
+                return Ok(value);
+            }
         }
+        // A String's own integer-indexed properties are its code units (ECMA-262
+        // StringGetOwnProperty), read without the decimal key text.
+        (Value::Str(string), Value::Num(index))
+            if *index >= 0.0 && index.fract() == 0.0 && *index < u32::MAX as f64 =>
+        {
+            if let Some(unit) = i.unit_at(string, *index as usize) {
+                return Ok(Value::Str(crate::jstr::unit_lstr(unit)));
+            }
+        }
+        _ => {}
     }
     // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
+        if let (Value::Obj(object), Value::Num(index)) = (obj, key) {
+            if let Some(result) = i.proxy_get_integer_key(object, *index, text.as_str()) {
+                return result;
+            }
+        }
         return i.get_member(obj, text.as_str());
     }
     if let Value::Sym(symbol) = key {
@@ -23012,6 +23029,10 @@ pub(crate) unsafe extern "C" fn jit_get_element(
 #[cfg(test)]
 #[path = "bytecode_computed_read_tests.rs"]
 mod computed_read_helper_tests;
+
+#[cfg(test)]
+#[path = "computed_key_tests.rs"]
+mod computed_key_tests;
 
 #[cfg(test)]
 #[path = "bytecode_named_read_tests.rs"]

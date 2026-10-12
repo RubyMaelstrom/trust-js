@@ -2901,8 +2901,44 @@ impl Interp {
                 return Ok(true);
             }
         }
+        if let Value::Str(name) = key {
+            if let Some(present) = Self::ordinary_chain_has_property(target, name) {
+                return Ok(present);
+            }
+        }
         let key = self.to_property_key(key)?;
         self.js_has_property(object, &key)
+    }
+
+    /// HasProperty(O, P) for a String key along a prototype chain of ordinary objects and
+    /// Arrays (ECMA-262 §10.1.7.1 OrdinaryHasProperty: [[GetOwnProperty]], then the
+    /// prototype's [[HasProperty]]), which runs no author code: exactly `js_has_property`'s
+    /// own-property test at every hop, without copying the key. `None` as soon as an object on
+    /// the chain is in an interpreter side table (`ic_plain` clear: proxies, typed arrays,
+    /// namespaces, Web IDL indexed objects) or is any other exotic object.
+    fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
+        let mut current = start.clone();
+        loop {
+            let next = {
+                let object = current.borrow();
+                if !object.ic_plain.get()
+                    || !matches!(
+                        object.exotic,
+                        crate::value::Exotic::None | crate::value::Exotic::Array
+                    )
+                {
+                    return None;
+                }
+                if object.props.contains(key) {
+                    return Some(true);
+                }
+                object.proto.clone()
+            };
+            match next {
+                Some(prototype) => current = prototype,
+                None => return Some(false),
+            }
+        }
     }
 
     /// `[[HasProperty]]`: the trap-aware `in` check. Handles a proxy anywhere on the chain (its `has`
@@ -9184,6 +9220,15 @@ pub(crate) fn to_int32(n: f64) -> i32 {
 /// StrWhiteSpace trimmed (empty is 0), `Infinity`, decimal literals and the `0x`/`0o`/`0b`
 /// NonDecimalIntegerLiterals; anything else is NaN.
 fn parse_number(s: &str) -> f64 {
+    // StrUnsignedDecimalLiteral of at most 15 DecimalDigits (an index key, typically) is an
+    // integer below 2^53, so its mathematical value is exactly representable.
+    let digits = s.as_bytes();
+    if !digits.is_empty() && digits.len() <= 15 && digits.iter().all(u8::is_ascii_digit) {
+        return digits
+            .iter()
+            .fold(0u64, |value, &digit| value * 10 + u64::from(digit - b'0'))
+            as f64;
+    }
     // StrWhiteSpaceChar is WhiteSpace or LineTerminator: U+FEFF but not U+0085 (NEL), unlike
     // Rust's char::is_whitespace.
     let t = s.trim_matches(crate::regex::js_whitespace);

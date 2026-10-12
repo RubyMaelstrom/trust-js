@@ -8615,21 +8615,7 @@ impl Interp {
                                 None,
                             );
                         }
-                        let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")?
-                        else {
-                            // Forward to the target's [[Get]], preserving the original Receiver.
-                            return self
-                                .proxy_forward(|me| me.get_member_recv(&target, key, receiver));
-                        };
-                        let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
-                        let res = self.proxy_call_trap(
-                            PROXY_TRAP_GET,
-                            &trap,
-                            handler,
-                            [target.clone(), key_value, receiver],
-                        )?;
-                        self.proxy_get_invariant(&target, key, &res)?;
-                        return Ok(res);
+                        return self.proxy_get(target, handler, key, None, receiver);
                     }
                 }
                 // TypedArray integer-index reads come from the backing buffer, not the property map.
@@ -8721,6 +8707,64 @@ impl Interp {
                 self.get_from_chain(&o, key, &receiver, trace)
             }
         }
+    }
+
+    /// A Proxy's [[Get]] (ECMA-262 §10.5.8) of `key` with `receiver`: GetMethod(handler, "get");
+    /// without a trap the target's [[Get]], else Call(trap, handler, «target, P, Receiver») and
+    /// the invariant checks. `key_value` is P as an ECMAScript value when the caller already
+    /// has it; otherwise it is built from the internal key text.
+    fn proxy_get(
+        &mut self,
+        target: Value,
+        handler: Value,
+        key: &str,
+        key_value: Option<Value>,
+        receiver: Value,
+    ) -> Result<Value, Abrupt> {
+        let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
+            // Forward to the target's [[Get]], preserving the original Receiver.
+            return self.proxy_forward(|me| me.get_member_recv(&target, key, receiver));
+        };
+        let key_value =
+            key_value.unwrap_or_else(|| self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key)));
+        let res = self.proxy_call_trap(
+            PROXY_TRAP_GET,
+            &trap,
+            handler,
+            [target.clone(), key_value, receiver],
+        )?;
+        self.proxy_get_invariant(&target, key, &res)?;
+        Ok(res)
+    }
+
+    /// `object[index]` when `object` is a Proxy, for an integral Number key whose
+    /// ToPropertyKey is `key` (GetValue → [[Get]](P, object)); `None` for any other object. A
+    /// Proxy is never a module or deferred namespace, mapped arguments object or String
+    /// wrapper, so its [[Get]] is exactly the trap path `get_member` would reach. Small index
+    /// keys reach the trap as shared canonical strings.
+    pub(crate) fn proxy_get_integer_key(
+        &mut self,
+        object: &Gc,
+        index: f64,
+        key: &str,
+    ) -> Option<Result<Value, Abrupt>> {
+        if object.borrow().ic_plain.get() {
+            return None;
+        }
+        let (target, handler) = self.proxy_at(Rc::as_ptr(object) as usize)?;
+        let key_value = if index >= 0.0 && index < crate::jstr::INDEX_STRINGS as f64 {
+            // -0 is the index 0: ToString(-0) is "0".
+            Value::Str(crate::jstr::index_lstr(index as u32))
+        } else {
+            Value::lstr(key)
+        };
+        Some(self.proxy_get(
+            target,
+            handler,
+            key,
+            Some(key_value),
+            Value::Obj(object.clone()),
+        ))
     }
 
     fn get_from_chain(
