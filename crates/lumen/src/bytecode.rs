@@ -21984,78 +21984,41 @@ unsafe fn jit_call_hit_inner(
         Op::Call(argc, c) => (argc as usize, c, false),
         _ => unreachable!("jit_call_hit emitted only for call ops"),
     };
-    let mut ic = chunk.call_caches[c as usize].entries[way].get();
+    let entry = &chunk.call_caches[c as usize].entries[way];
+    // A native entry needs two words of the way: read them in place. Copying the whole entry
+    // first (a dozen words through vector stores) made every native call wait for the copy.
+    let (native, intrinsic) = {
+        // SAFETY: the Cell holds plain-old-data and nothing writes it during this read.
+        let entry = unsafe { &*entry.as_ptr() };
+        (entry.native, entry.intrinsic)
+    };
+    if native != 0 {
+        return jit_call_hit_native(ctx, sp, argc, with_this, native, intrinsic, entry);
+    }
+    let mut ic = entry.get();
     // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this
     // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with
     // its identity and [[Environment]], never the filling closure's (a local copy; the way is
     // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).
-    if ic.native == 0 {
-        if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {
-            let key = Rc::as_ptr(&callee) as usize;
-            if key != ic.callee {
-                if let crate::value::Callable::User(user) = &callee.borrow().call {
-                    debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
-                    ic.callee = key;
-                    ic.env = Rc::as_ptr(&user.env);
-                }
+    if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {
+        let key = Rc::as_ptr(&callee) as usize;
+        if key != ic.callee {
+            if let crate::value::Callable::User(user) = &callee.borrow().call {
+                debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
+                ic.callee = key;
+                ic.env = Rc::as_ptr(&user.env);
             }
         }
     }
     // The emitted probe already validated this epoch. Acquire before inline
     // recompilation, which may now reclaim other inactive native code.
-    let code = (ic.native == 0).then(|| crate::jit::cache::lease_raw(ic.code));
+    let code = crate::jit::cache::lease_raw(ic.code);
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
-    let operand_only = ic.native != 0
-        && match ic.intrinsic {
-            INTRINSIC_OPERAND_ONLY => true,
-            INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
-                (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
-            }
-            _ => false,
-        };
-    if ic.native != 0 && ic.intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
-        if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
-            return flag;
-        }
-    }
-    if operand_only {
-        // The exact builtin is proven and runs no author code for these operands: move the
-        // receiver and arguments into it directly, without an arbitrary native's call boundary.
-        let nf: crate::value::NativeFn = std::mem::transmute(ic.native);
-        let args_ptr = sp.sub(argc);
-        let this = if with_this {
-            sp.sub(argc + 2).read().into_value()
-        } else {
-            Value::Undefined
-        };
-        let r =
-            crate::execution_storage::with_moved_values(args_ptr, argc, |args| nf(i, this, args));
-        sp = args_ptr.sub(1);
-        drop(sp.read());
-        if with_this {
-            sp = sp.sub(1);
-        }
-        return match r {
-            Ok(v) => {
-                sp.write(PackedValue::pack(v));
-                crate::jit::SpFlag {
-                    sp: sp.add(1),
-                    flag: 0,
-                }
-            }
-            Err(error) => {
-                ctx.error = Some(Abrupt::Throw(error));
-                crate::jit::SpFlag { sp, flag: 1 }
-            }
-        };
-    }
-    if ic.native == 0 {
-        let chunk_ref = &*ic.chunk;
-        let runs = chunk_ref.jit_runs.get().saturating_add(1);
-        chunk_ref.jit_runs.set(runs);
-        if chunk_ref.inline_retry_due(runs) {
-            i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
-        }
+    let chunk_ref = &*ic.chunk;
+    let runs = chunk_ref.jit_runs.get().saturating_add(1);
+    chunk_ref.jit_runs.set(runs);
+    if chunk_ref.inline_retry_due(runs) {
+        i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
     }
     let args_ptr = sp.sub(argc);
     let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
@@ -22064,14 +22027,89 @@ unsafe fn jit_call_hit_inner(
     } else {
         &raw mut *undef as *const PackedValue
     };
-    let r = if ic.native != 0 {
-        let nf: crate::value::NativeFn = std::mem::transmute(ic.native);
-        i.call_native_committed(nf, this_slot, args_ptr, argc)
-    } else {
-        i.call_jit_committed(&ic, code.as_deref().unwrap(), this_slot, args_ptr, argc)
-    };
+    let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);
     // Arguments and `this` were moved; pop them virtually and drop only the callee slot
     // (same ownership story as jit_call_inner's Some arm).
+    sp = args_ptr.sub(1);
+    match sp.read().into_value() {
+        Value::Obj(o) => {
+            if Rc::strong_count(&o) > 1 {
+                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
+            } else {
+                drop(o);
+            }
+        }
+        other => drop(other),
+    }
+    if with_this {
+        sp = sp.sub(1); // `this` was consumed (moved) by the callee — skip, don't drop
+    }
+    match r {
+        Ok(v) => {
+            sp.write(PackedValue::pack(v));
+            crate::jit::SpFlag {
+                sp: sp.add(1),
+                flag: 0,
+            }
+        }
+        Err(ab) => {
+            ctx.error = Some(ab);
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
+/// [`jit_call_hit_inner`]'s native-entry arm: the emitted probe proved the callee is the
+/// way's builtin `native` (identity, epoch and realm). Consumes the callee, receiver and
+/// arguments exactly like the user-function arm.
+#[inline(always)]
+unsafe fn jit_call_hit_native(
+    ctx: &mut crate::jit::JitCtx,
+    mut sp: *mut PackedValue,
+    argc: usize,
+    with_this: bool,
+    native: usize,
+    intrinsic: u8,
+    entry: &std::cell::Cell<CallIc>,
+) -> crate::jit::SpFlag {
+    let i = &mut *ctx.interp;
+    if ctx.callstat_enabled {
+        jit_callstat(i, ctx, &entry.get(), argc, with_this, sp);
+    }
+    let operand_only = match intrinsic {
+        INTRINSIC_OPERAND_ONLY => true,
+        INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
+            (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
+        }
+        _ => false,
+    };
+    if intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
+        if let Some(flag) = jit_reflect_apply_operand_only(ctx, sp, with_this) {
+            return flag;
+        }
+    }
+    let nf: crate::value::NativeFn = std::mem::transmute(native);
+    let args_ptr = sp.sub(argc);
+    let r = if operand_only {
+        // The exact builtin is proven and runs no author code for these operands: move the
+        // receiver and arguments into it directly, without an arbitrary native's call boundary.
+        let this = if with_this {
+            sp.sub(argc + 2).read().into_value()
+        } else {
+            Value::Undefined
+        };
+        crate::execution_storage::with_moved_values(args_ptr, argc, |args| nf(i, this, args))
+            .map_err(Abrupt::Throw)
+    } else {
+        let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+        let this_slot: *const PackedValue = if with_this {
+            sp.sub(argc + 2)
+        } else {
+            &raw mut *undef as *const PackedValue
+        };
+        i.call_native_committed(nf, this_slot, args_ptr, argc)
+    };
+    // Arguments and `this` were moved; pop them virtually and drop only the callee slot.
     sp = args_ptr.sub(1);
     match sp.read().into_value() {
         Value::Obj(o) => {
