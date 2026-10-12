@@ -19084,6 +19084,51 @@ fn module_missing_export_is_syntax_error() {
     );
 }
 
+/// ECMA-262 §16.2.1.1 module early errors compare ExportedBindings and LexicallyDeclaredNames
+/// with the module's VarDeclaredNames, which include `var`s nested in loop heads, blocks, `if`,
+/// `try`, `switch`, labelled and loop statements, but not inside functions or class static
+/// blocks (claude.ai's ProseMirror bundle exports a `for (var a = …, b = …; …)` binding).
+#[test]
+fn module_var_declared_names_include_nested_vars() {
+    assert_eq!(
+        run_module(
+            &[
+                (
+                    "main",
+                    "import { a, b, c, d, e, e2, f, g, h, i, j, k } from 'dep';
+                     globalThis.r = [a, b, c, d, e, e2, f, g, h, i, j, k].join();"
+                ),
+                (
+                    "dep",
+                    "for (var a = 1, b = 2; ;) break;
+                     for (var c in { k: 0 });
+                     for (var [d] of [[4]]);
+                     if (true) { var e = 5; } else var e2;
+                     lbl: { var f = 6; }
+                     try { throw 0; } catch { var g = 7; } finally { var h = 8; }
+                     switch (1) { case 1: var i = 9; }
+                     while (false) var j;
+                     do var k = 10; while (false);
+                     export { a, b, c, d, e, e2, f, g, h, i, j, k };"
+                ),
+            ],
+            "r"
+        ),
+        "1,2,k,4,5,,6,7,8,9,,10"
+    );
+    for source in [
+        "let x; { var x; }",
+        "const y = 0; for (var y;;) break;",
+        "class z {} try {} finally { var z; }",
+        "import w from 'dep'; if (1) var w;",
+        "function f() { var v; } export { v };",
+        "class C { static { var s; } } export { s };",
+        "{ let t; } export { t };",
+    ] {
+        assert!(crate::parser::parse_module(source).is_err(), "{source}");
+    }
+}
+
 #[test]
 fn failed_module_graph_load_does_not_poison_a_retry() {
     let mut engine = Engine::new();

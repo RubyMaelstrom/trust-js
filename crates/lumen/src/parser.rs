@@ -292,7 +292,11 @@ fn validate_module(body: &[Stmt]) -> Result<(), ParseError> {
                 }
                 collect_top_decl(inner, &mut lexical, &mut vars);
             }
-            other => collect_top_decl(other, &mut lexical, &mut vars),
+            decl @ (Stmt::VarDecl { .. } | Stmt::FuncDecl(_) | Stmt::ClassDecl(_)) => {
+                collect_top_decl(decl, &mut lexical, &mut vars)
+            }
+            // Other statements bind the `var`s nested in them (`for (var x …)`, blocks, …).
+            other => var_declared_names(other, &mut vars),
         }
     }
 
@@ -382,12 +386,8 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
     match stmt {
         Stmt::VarDecl {
             kind: DeclKind::Var,
-            decls,
-        } => {
-            for (pat, _) in decls {
-                pattern_names(pat, vars);
-            }
-        }
+            ..
+        } => var_declared_names(stmt, vars),
         Stmt::VarDecl { decls, .. } => {
             for (pat, _) in decls {
                 pattern_names(pat, lexical);
@@ -395,6 +395,76 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
         }
         Stmt::FuncDecl(f) => lexical.extend(f.name.clone()),
         Stmt::ClassDecl(c) => lexical.extend(c.name.clone()),
+        _ => {}
+    }
+}
+
+/// ECMA-262 VarDeclaredNames of a statement (local tc39/ecma262 #sec-static-semantics-
+/// vardeclarednames): the names its `var` declarations bind, through blocks, `if`, `while`,
+/// `do`, `for` (including a `var` head of `for`, `for-in` and `for-of`), `try`/`catch`/
+/// `finally`, `switch` cases, labelled statements and `with`, but never inside a function or
+/// class. A module's `for (var a = …, b = …; …)` binds `b` for `export { b }`.
+fn var_declared_names(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::VarDecl {
+            kind: DeclKind::Var,
+            decls,
+        } => {
+            for (pat, _) in decls {
+                pattern_names(pat, out);
+            }
+        }
+        Stmt::Block(body) => {
+            for s in body {
+                var_declared_names(s, out);
+            }
+        }
+        Stmt::If { cons, alt, .. } => {
+            var_declared_names(cons, out);
+            if let Some(alt) = alt {
+                var_declared_names(alt, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => var_declared_names(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::VarDecl {
+                kind: DeclKind::Var,
+                decls,
+            }) = init.as_deref()
+            {
+                for (pat, _) in decls {
+                    pattern_names(pat, out);
+                }
+            }
+            var_declared_names(body, out);
+        }
+        Stmt::ForInOf {
+            decl, left, body, ..
+        } => {
+            if matches!(decl, Some(DeclKind::Var)) {
+                pattern_names(left, out);
+            }
+            var_declared_names(body, out);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for s in block
+                .iter()
+                .chain(handler.iter().flat_map(|(_, body)| body))
+                .chain(finalizer.iter().flatten())
+            {
+                var_declared_names(s, out);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for s in cases.iter().flat_map(|case| &case.body) {
+                var_declared_names(s, out);
+            }
+        }
+        Stmt::Labeled { body, .. } | Stmt::With { body, .. } => var_declared_names(body, out),
         _ => {}
     }
 }
