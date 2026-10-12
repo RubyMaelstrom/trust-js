@@ -1098,6 +1098,27 @@ impl Engine {
         Ok(result)
     }
 
+    /// [`Engine::with_embed_realm`] for an operation that spans its
+    /// embedder's own state as well as the engine: `realm_global`'s Realm is
+    /// the active one until the returned entry is passed to
+    /// [`Engine::leave_realm`]. Entries nest like `with_embed_realm` calls:
+    /// leave the innermost first.
+    pub fn enter_realm(
+        &mut self,
+        realm_global: &embed::Value,
+    ) -> Result<RealmEntry, embed::Value> {
+        self.interp.activate_gc_heap();
+        let (key, saved) = self.interp.enter_embed_realm(realm_global)?;
+        Ok(RealmEntry { key, saved })
+    }
+
+    /// Restore the Realm that was active when `entry` was entered, keeping
+    /// what the entered Realm's operations changed.
+    pub fn leave_realm(&mut self, entry: RealmEntry) {
+        self.interp.activate_gc_heap();
+        self.interp.leave_embed_realm(entry.key, entry.saved);
+    }
+
     /// Install this realm's wall-clock source, in milliseconds since the Unix epoch.
     ///
     /// The callback is realm-local and may capture mutable embedder state. `Date`, `Date.now`,
@@ -1494,4 +1515,13 @@ mod module_host_context_tests {
             assert!(engine.finish_dynamic_module_load(seen[1].0, None));
         }
     }
+}
+
+/// A Realm [`Engine::enter_realm`] made active, which [`Engine::leave_realm`]
+/// leaves again.
+#[cfg(feature = "embed")]
+#[must_use = "a Realm entered must be left"]
+pub struct RealmEntry {
+    key: usize,
+    saved: interpreter::RealmState,
 }

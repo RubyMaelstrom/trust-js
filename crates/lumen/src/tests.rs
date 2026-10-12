@@ -3668,6 +3668,61 @@ fn embedder_realms_isolate_intrinsics_and_native_globals() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn entered_realms_stay_active_until_left_and_nest() {
+    use crate::embed::{Ctx, Value};
+
+    fn current_context(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(ctx.host_job_context() as f64))
+    }
+
+    let mut engine = Engine::new();
+    engine.ctx().set_host_job_context(1);
+    engine
+        .ctx()
+        .define_embed_global("currentHostContext", 0, current_context);
+    let realm = |engine: &mut Engine, context: u64| {
+        let global = engine.ctx().create_embed_realm();
+        engine
+            .ctx()
+            .with_embed_realm(&global, |ctx| {
+                ctx.set_host_job_context(context);
+                ctx.define_embed_global("currentHostContext", 0, current_context);
+            })
+            .unwrap_or_else(|_| panic!("set up realm {context}"));
+        global
+    };
+    let first = realm(&mut engine, 2);
+    let second = realm(&mut engine, 3);
+    let read = |engine: &mut Engine| match engine
+        .eval("String(currentHostContext()) + ':' + typeof marker", false)
+        .unwrap_or_else(|error| panic!("parse: {error:?}"))
+    {
+        Completion::Value(value) => value,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+
+    let outer = engine
+        .enter_realm(&first)
+        .unwrap_or_else(|_| panic!("enter first"));
+    // The embedder's own work runs between entering and leaving.
+    assert!(matches!(
+        engine.eval("globalThis.marker = 1", false),
+        Ok(Completion::Value(_))
+    ));
+    assert_eq!(read(&mut engine), "2:number");
+    let inner = engine
+        .enter_realm(&second)
+        .unwrap_or_else(|_| panic!("enter second"));
+    assert_eq!(read(&mut engine), "3:undefined");
+    engine.leave_realm(inner);
+    assert_eq!(read(&mut engine), "2:number");
+    engine.leave_realm(outer);
+    assert_eq!(read(&mut engine), "1:undefined");
+    assert!(engine.enter_realm(&Value::Num(1.0)).is_err(), "not a Realm");
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn embedder_realm_snapshot_and_host_context_restore_are_isolated() {
     use crate::embed::{Ctx, Value};
 
