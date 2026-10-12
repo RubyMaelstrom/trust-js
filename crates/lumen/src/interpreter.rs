@@ -8826,6 +8826,31 @@ impl Interp {
                 }
                 return Ok(value);
             }
+            // A TypedArray on the chain (`Object.create(typedArray)[1]`) answers with its own
+            // [[Get]] (ECMA-262 §10.4.5.4): a canonical numeric key reads TypedArrayGetElement,
+            // which is undefined for an invalid index and never consults its prototype; any
+            // other key continues with OrdinaryGet. Its elements live in the buffer, not in the
+            // property map read below.
+            if !self.typed_arrays.is_empty() {
+                if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+                    let element = match self.ta_index_kind(&info, key) {
+                        TaIndex::Element(index) => Some(self.ta_read(&info, index)),
+                        TaIndex::Exotic => Some(Value::Undefined),
+                        TaIndex::Ordinary => None,
+                    };
+                    if let Some(value) = element {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(obj.borrow().props.shape()),
+                                depth,
+                                None,
+                            );
+                        }
+                        return Ok(value);
+                    }
+                }
+            }
             // OrdinaryGet (ECMA-262): a data descriptor returns its owned value directly.
             // Only getters need a snapshot across the author-code boundary. Keeping data out
             // of that snapshot also avoids copying an optional descriptor/trace tuple.

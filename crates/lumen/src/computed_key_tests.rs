@@ -78,6 +78,44 @@ same + "#" + first;
     );
 }
 
+#[test]
+fn typed_arrays_on_the_prototype_chain_answer_their_integer_keys() {
+    // ECMA-262 §10.4.5.4 TypedArray [[Get]] reached through OrdinaryGet's prototype walk
+    // (`Object.create(typedArray)[1]`): a canonical numeric key reads TypedArrayGetElement,
+    // undefined for an invalid index without consulting the TypedArray's prototype, and reads
+    // follow the buffer; other keys continue to %TypedArray.prototype%, whose accessors reject
+    // the ordinary receiver. Assignment creates an own property on the receiver (§10.4.5.5).
+    check(
+        r##"
+function run() {
+  var out = [];
+  function get(o, k) { return o[k]; }
+  function getOne(o) { return o[1]; }
+  var ta = new Uint8Array([9, 8]);
+  var o = Object.create(ta);
+  Object.prototype[5] = "objproto";
+  out.push([get(o, 1), get(o, "1"), get(o, 0), get(o, 5), get(o, "-0"), get(o, "1.5"), get(o, -1), getOne(o)].map(String).join(","));
+  delete Object.prototype[5];
+  ta[1] = 200;
+  out.push([get(o, 1), getOne(o), Reflect.get(ta, 1, o), 1 in o, 5 in o].map(String).join(","));
+  o[0] = 42;
+  out.push([get(o, 0), ta[0], Object.keys(o).join("/")].join(","));
+  var big = Object.create(new BigInt64Array([5n, -3n]));
+  var deep = Object.create(Object.create(new Float64Array([1.5, 2.5])));
+  out.push([get(big, 1), typeof get(big, 0), get(deep, 1), get(deep, 2)].map(String).join(","));
+  var len; try { len = o.length; } catch (e) { len = e.name; }
+  out.push([len, typeof o.subarray].join(","));
+  return out.join("|");
+}
+var first = run(), same = true;
+for (var i = 0; i < 40; i++) same = same && run() === first;
+same + "#" + first;
+"##,
+        "true#8,8,9,undefined,undefined,undefined,undefined,8|200,200,200,true,false|42,9,0|\
+         -3,bigint,2.5,undefined|TypeError,function",
+    );
+}
+
 /// Holes, absent and sparse (beyond the dense range) indices: reads consult the prototype
 /// chain, writes to existing sparse elements respect writability and accessors, and chains with
 /// Proxies, typed arrays or arguments objects keep their own internal methods.
