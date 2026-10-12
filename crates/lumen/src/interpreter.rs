@@ -3092,16 +3092,19 @@ pub struct Interp {
     /// Rejected promises with no handler attached at rejection time (ptr -> reason). Removed when a
     /// handler is later attached; whatever remains after a microtask checkpoint is a genuine
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
-    /// Keyed by the promise object's pointer; holds `(order, promise, reason)` so the runtime can
-    /// hand both to a global `unhandledrejection` handler in rejection order (HTML's
-    /// about-to-be-notified rejected promises list).
-    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (u64, Value, Value)>,
+    /// Keyed by the promise object's pointer; holds `(order, promise, reason, context)` so the
+    /// runtime can hand both to a global `unhandledrejection` handler in rejection order (HTML's
+    /// about-to-be-notified rejected promises list). `context` is the host settings context
+    /// active when the promise was rejected: HTML's HostPromiseRejectionTracker appends the
+    /// promise to that settings object's global's list, not to the top-level one's.
+    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (u64, Value, Value, u64)>,
     /// The order key of the next unhandled rejection.
     pub(crate) next_unhandled_rejection: u64,
     /// HostPromiseRejectionTracker "handle" operations on promises of the host's outstanding
-    /// rejected promises weak set, as `(promise, reason)`, until the host takes them (see
-    /// [`crate::Engine::take_handled_rejections`]) to fire `rejectionhandled`.
-    pub(crate) handled_rejections: Vec<(Value, Value)>,
+    /// rejected promises weak set, as `(promise, reason, context)` with the host settings context
+    /// whose global's set held the promise, until the host takes them (see
+    /// [`crate::Engine::take_handled_rejections`]) to fire `rejectionhandled` at that global.
+    pub(crate) handled_rejections: Vec<(Value, Value, u64)>,
     /// Temporal object internal slots, keyed by the object's pointer.
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
@@ -3590,10 +3593,11 @@ pub struct PromiseState {
     /// [[PromiseIsHandled]]: a reaction was ever registered (PerformPromiseThen), or the host
     /// marked the promise handled (Web IDL "mark as handled").
     pub(crate) handled: bool,
-    /// Membership of the host's outstanding rejected promises weak set (HTML #unhandled-
-    /// promise-rejections): the host reported this rejection as unhandled, so a later handler
-    /// is reported back ([`Interp::add_outstanding_rejection`]). Dies with the promise.
-    pub(crate) outstanding: bool,
+    /// Membership of a global's outstanding rejected promises weak set (HTML #unhandled-
+    /// promise-rejections), as the host settings context of that global: the host reported this
+    /// rejection as unhandled there, so a later handler is reported back to it
+    /// ([`Interp::add_outstanding_rejection`]). Dies with the promise.
+    pub(crate) outstanding: Option<u64>,
 }
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
@@ -4396,7 +4400,7 @@ impl Interp {
             return false;
         };
         state.handled = true;
-        state.outstanding = false;
+        state.outstanding = None;
         if let Value::Obj(object) = promise {
             self.unhandled_rejections
                 .remove(&(Rc::as_ptr(object) as usize));
@@ -4406,13 +4410,15 @@ impl Interp {
 
     /// Add a rejected promise whose `unhandledrejection` the host fired and which is still not
     /// handled to the outstanding rejected promises weak set (HTML "notify about rejected
-    /// promises"). The set holds the promise weakly; when a handler is attached later,
+    /// promises") of the global of the active host settings context, the one that fired the
+    /// event. The set holds the promise weakly; when a handler is attached later,
     /// HostPromiseRejectionTracker's "handle" removes it and reports it through
     /// [`crate::Engine::take_handled_rejections`]. False (and no change) for anything else.
     pub fn add_outstanding_rejection(&mut self, promise: &Value) -> bool {
+        let context = self.host_job_context;
         match self.promise_state_mut(promise) {
             Some(state) if state.status == 2 && !state.handled => {
-                state.outstanding = true;
+                state.outstanding = Some(context);
                 true
             }
             _ => false,
@@ -4420,10 +4426,23 @@ impl Interp {
     }
 
     /// The HostPromiseRejectionTracker "handle" operations since the last call on promises of
-    /// the outstanding rejected promises weak set, as `(promise, reason)` in order: each is a
+    /// an outstanding rejected promises weak set, as `(promise, reason)` in order: each is a
     /// `rejectionhandled` event the host queues (HTML #unhandled-promise-rejections).
     pub fn take_handled_rejections(&mut self) -> Vec<(Value, Value)> {
+        self.take_handled_rejections_in_contexts()
+            .into_iter()
+            .map(|(_, promise, reason)| (promise, reason))
+            .collect()
+    }
+
+    /// [`Self::take_handled_rejections`] as `(context, promise, reason)`: the host settings
+    /// context whose global's outstanding rejected promises weak set held the promise, where
+    /// HTML fires its `rejectionhandled` event.
+    pub fn take_handled_rejections_in_contexts(&mut self) -> Vec<(u64, Value, Value)> {
         std::mem::take(&mut self.handled_rejections)
+            .into_iter()
+            .map(|(promise, reason, context)| (context, promise, reason))
+            .collect()
     }
 
     /// Web IDL "a promise resolved with" `value` for an embedder's platform steps: a new

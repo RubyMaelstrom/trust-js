@@ -1411,6 +1411,19 @@ impl Engine {
     /// [`Engine::take_unhandled_rejections`], keeping the promise alongside each reason (what a
     /// global `unhandledrejection` handler receives as `event.promise` / `event.reason`).
     pub fn take_unhandled_rejections_full(&mut self) -> Vec<(embed::Value, embed::Value)> {
+        self.take_unhandled_rejections_in_contexts()
+            .into_iter()
+            .map(|(_, promise, reason)| (promise, reason))
+            .collect()
+    }
+
+    /// [`Engine::take_unhandled_rejections_full`] as `(context, promise, reason)`, with the host
+    /// settings context active when each promise was rejected: HTML's HostPromiseRejectionTracker
+    /// puts the promise on that settings object's global's about-to-be-notified rejected promises
+    /// list, so an embedder with several Window Realms notifies each global of its own.
+    pub fn take_unhandled_rejections_in_contexts(
+        &mut self,
+    ) -> Vec<(u64, embed::Value, embed::Value)> {
         if self.interp.unhandled_rejections.is_empty() {
             return Vec::new();
         }
@@ -1421,7 +1434,7 @@ impl Engine {
         rejections.sort_unstable_by_key(|(order, ..)| *order);
         rejections
             .into_iter()
-            .map(|(_, promise, reason)| (promise, reason))
+            .map(|(_, promise, reason, context)| (context, promise, reason))
             .collect()
     }
 
@@ -1430,6 +1443,15 @@ impl Engine {
     /// `(promise, reason)`: HTML queues a `rejectionhandled` event for each.
     pub fn take_handled_rejections(&mut self) -> Vec<(embed::Value, embed::Value)> {
         self.interp.take_handled_rejections()
+    }
+
+    /// [`Engine::take_handled_rejections`] as `(context, promise, reason)`, with the host
+    /// settings context whose global's outstanding rejected promises weak set held each promise:
+    /// its `rejectionhandled` event fires at that global.
+    pub fn take_handled_rejections_in_contexts(
+        &mut self,
+    ) -> Vec<(u64, embed::Value, embed::Value)> {
+        self.interp.take_handled_rejections_in_contexts()
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is

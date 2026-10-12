@@ -1554,7 +1554,7 @@ fn scan_realm(
                 interp
                     .unhandled_rejections
                     .len()
-                    .saturating_mul(size_of::<(usize, (u64, Value, Value))>()),
+                    .saturating_mul(size_of::<(usize, (u64, Value, Value, u64))>()),
             )
             .saturating_add(
                 interp
@@ -1616,12 +1616,12 @@ fn scan_realm(
     for (promise, reason) in interp
         .unhandled_rejections
         .values()
-        .map(|(_, promise, reason)| (promise, reason))
+        .map(|(_, promise, reason, _)| (promise, reason))
         .chain(
             interp
                 .handled_rejections
                 .iter()
-                .map(|(promise, reason)| (promise, reason)),
+                .map(|(promise, reason, _)| (promise, reason)),
         )
     {
         visitor.value(promise);

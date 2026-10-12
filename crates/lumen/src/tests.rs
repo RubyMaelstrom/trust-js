@@ -18751,6 +18751,67 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
 
 #[cfg(feature = "embed")]
 #[test]
+fn promise_rejections_belong_to_the_rejecting_realms_settings() {
+    // HTML #the-hostpromiserejectiontracker-implementation: a rejection is appended to the
+    // about-to-be-notified rejected promises list of the running script's settings object's
+    // global, and a later handler's rejectionhandled goes to the global whose outstanding
+    // rejected promises weak set held the promise. A child Window Realm's rejection (even one
+    // the main realm's code triggers by calling into it) is the child's, not the top-level's.
+    let mut engine = Engine::new();
+    engine.ctx().set_host_job_context(1);
+    let main = engine.global_this();
+    let child = engine.ctx().create_embed_realm();
+    let installed = engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| {
+            ctx.set_host_job_context(71);
+            matches!(
+                ctx.eval_classic_script_interruptible(
+                    "globalThis.rejectHere = reason => { globalThis.child = Promise.reject(reason); };",
+                ),
+                Ok(Ok(_))
+            )
+        })
+        .unwrap_or_else(|_| panic!("enter child realm"));
+    assert!(installed);
+    assert!(engine
+        .ctx()
+        .member_set(&main, "frame", child.clone())
+        .is_ok());
+    assert!(matches!(
+        engine.eval_value("globalThis.top1 = Promise.reject(1); frame.rejectHere(2); globalThis.top3 = Promise.reject(3);"),
+        Ok(Ok(_))
+    ));
+    let rejections: Vec<(u64, f64)> = engine
+        .take_unhandled_rejections_in_contexts()
+        .into_iter()
+        .filter_map(|(context, _, reason)| reason.as_num_opt().map(|reason| (context, reason)))
+        .collect();
+    assert_eq!(rejections, [(1, 1.0), (71, 2.0), (1, 3.0)]);
+    // The child's global fired unhandledrejection, so its set holds the promise; a handler the
+    // main realm attaches later is reported back to the child.
+    let child_promise = engine
+        .ctx()
+        .member_get(&child, "child")
+        .unwrap_or_else(|_| panic!("child promise"));
+    assert!(engine
+        .ctx()
+        .with_embed_realm(&child, |ctx| ctx.add_outstanding_rejection(&child_promise))
+        .unwrap_or_else(|_| panic!("enter child realm")));
+    assert!(matches!(
+        engine.eval_value("frame.child.catch(() => {});"),
+        Ok(Ok(_))
+    ));
+    let handled: Vec<(u64, f64)> = engine
+        .take_handled_rejections_in_contexts()
+        .into_iter()
+        .filter_map(|(context, _, reason)| reason.as_num_opt().map(|reason| (context, reason)))
+        .collect();
+    assert_eq!(handled, [(71, 2.0)]);
+}
+
+#[cfg(feature = "embed")]
+#[test]
 fn promise_rejection_tracking_reports_handled_and_outstanding_promises() {
     // ECMA-262 PerformPromiseThen/RejectPromise and HostPromiseRejectionTracker, with HTML
     // #unhandled-promise-rejections' about-to-be-notified list and outstanding weak set.

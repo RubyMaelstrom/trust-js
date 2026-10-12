@@ -4484,11 +4484,16 @@ impl Interp {
         };
         // RejectPromise: HostPromiseRejectionTracker(promise, "reject") unless
         // [[PromiseIsHandled]]. A later handler clears it (see `perform_promise_then`).
+        // HTML's implementation appends it to the about-to-be-notified list of the running
+        // script's settings object's global; the active host settings context is the one of the
+        // realm whose code is running (a cross-realm call switches it with the realm).
         if !fulfilled && !handled {
             let order = self.next_unhandled_rejection;
             self.next_unhandled_rejection += 1;
-            self.unhandled_rejections
-                .insert(ptr, (order, promise.clone(), value.clone()));
+            self.unhandled_rejections.insert(
+                ptr,
+                (order, promise.clone(), value.clone(), self.host_job_context),
+            );
         }
         for (on_f, on_r, result, host_context) in reactions {
             let handler = if fulfilled { on_f } else { on_r };
@@ -4557,11 +4562,11 @@ impl Interp {
         let (status, handled, outstanding) =
             self.promises
                 .get_mut(&ptr)
-                .map_or((0, true, false), |state| {
+                .map_or((0, true, None), |state| {
                     let flags = (state.status, state.handled, state.outstanding);
                     // Step 12: set promise.[[PromiseIsHandled]] to true.
                     state.handled = true;
-                    state.outstanding = false;
+                    state.outstanding = None;
                     flags
                 });
         // Embedder reaction steps belong to no settings object (see `InternalJob::HostReaction`).
@@ -4574,13 +4579,12 @@ impl Interp {
         // "handle"). HTML: one still on the about-to-be-notified list just leaves it; one in the
         // outstanding rejected promises weak set leaves that and is reported for
         // `rejectionhandled`.
-        if status == 2
-            && !handled
-            && self.unhandled_rejections.remove(&ptr).is_none()
-            && outstanding
-        {
-            let reason = self.promises[&ptr].value.clone();
-            self.handled_rejections.push((promise.clone(), reason));
+        if status == 2 && !handled && self.unhandled_rejections.remove(&ptr).is_none() {
+            if let Some(context) = outstanding {
+                let reason = self.promises[&ptr].value.clone();
+                self.handled_rejections
+                    .push((promise.clone(), reason, context));
+            }
         }
         match status {
             0 => {
