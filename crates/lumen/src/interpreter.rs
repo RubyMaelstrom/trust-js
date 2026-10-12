@@ -885,6 +885,14 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
 
 pub type Env = Rc<RefCell<Scope>>;
 
+/// How [`Interp::resolve_cached_call`] found a call target: a live way or overflow entry to copy
+/// as it is, or a code-sharing copy already adjusted to the live closure.
+enum CachedCall {
+    Miss,
+    Entry(*const crate::bytecode::CallIc),
+    Shared(crate::bytecode::CallIc),
+}
+
 /// A callee resolved once for a run of calls from one native algorithm; see
 /// [`Interp::prepare_call`].
 pub(crate) struct PreparedCall {
@@ -12734,52 +12742,87 @@ impl Interp {
         args: *mut crate::value::PackedValue,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
-        let ic = self.resolve_cached_call(site, callee)?;
-        if ic.native != 0 {
-            let nf: crate::value::NativeFn = unsafe { std::mem::transmute(ic.native) };
-            return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
-        }
+        let ic = match self.resolve_cached_call_entry(site, callee) {
+            CachedCall::Miss => return None,
+            CachedCall::Entry(entry) => {
+                // A native entry needs only its builtin: read it in place rather than from a
+                // copy whose stores are still in flight.
+                // SAFETY: `entry` is live and nothing re-entrant has run since the probe.
+                let native = unsafe { (*entry).native };
+                if native != 0 {
+                    let nf: crate::value::NativeFn = unsafe { std::mem::transmute(native) };
+                    return Some(unsafe { self.call_native_committed(nf, this_slot, args, argc) });
+                }
+                // The callee may refill this way; run from a copy.
+                unsafe { entry.read() }
+            }
+            CachedCall::Shared(ic) => ic,
+        };
         let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
         self.note_compiled_call(&ic);
         Some(unsafe { self.call_jit_committed(&ic, &code, this_slot, args, argc) })
     }
 
-    /// The cache resolution of [`Interp::call_jit_cached`]: the entry that would run `callee`
-    /// from `site` now, or `None` (with no side effects) when the site must revalidate.
-    /// Inlined so the hit's entry copy lands directly in the caller's frame.
+    /// The cache resolution of [`Interp::call_jit_cached`]: copy the entry that would run
+    /// `callee` from `site` now into `out` and answer `true`, or answer `false` (with no side
+    /// effects) when the site must revalidate. Inlined so the hit's entry copy lands directly
+    /// in the caller's frame, as one plain copy: returning the entry inside an `Option` made the
+    /// compiler move it around the `strict` niche in overlapping, misaligned pieces that each
+    /// waited on the previous stores.
     #[inline(always)]
     fn resolve_cached_call(
         &self,
         site: &crate::bytecode::CallSite,
         callee: &Value,
-    ) -> Option<crate::bytecode::CallIc> {
+        out: &mut std::mem::MaybeUninit<crate::bytecode::CallIc>,
+    ) -> bool {
+        match self.resolve_cached_call_entry(site, callee) {
+            CachedCall::Miss => false,
+            CachedCall::Entry(entry) => {
+                // SAFETY: `entry` points at a live way or overflow entry; nothing re-entrant
+                // runs between the probe and this copy.
+                unsafe { std::ptr::copy_nonoverlapping(entry, out.as_mut_ptr(), 1) };
+                true
+            }
+            CachedCall::Shared(ic) => {
+                out.write(ic);
+                true
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn resolve_cached_call_entry(
+        &self,
+        site: &crate::bytecode::CallSite,
+        callee: &Value,
+    ) -> CachedCall {
         #[cfg(feature = "architecture-diagnostics")]
         crate::bytecode::call_cache_diagnostics::probe(site, callee);
-        let Value::Obj(o) = callee else { return None };
+        let Value::Obj(o) = callee else {
+            return CachedCall::Miss;
+        };
         let key = Rc::as_ptr(o) as usize;
         let genv = Rc::as_ptr(&self.global_env) as usize;
         // Probe the identity fields through the Cell without copying whole entries; only the
         // hit is copied out (nothing re-entrant runs between the probe and the copy).
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         if epoch == u32::MAX {
-            return None;
+            return CachedCall::Miss;
         }
-        let mut hit = None;
         for e in &site.entries {
             let p = e.as_ptr();
             unsafe {
                 if (*p).callee == key && (*p).global_env == genv && (*p).epoch == epoch {
-                    hit = Some(*p);
-                    break;
+                    return CachedCall::Entry(p);
                 }
             }
         }
-        if hit.is_none() {
-            hit = self.call_overflow.lookup(key, genv, epoch);
+        if let Some(entry) = self.call_overflow.lookup_entry(key, genv, epoch) {
+            return CachedCall::Entry(entry);
         }
-        Some(match hit {
-            Some(ic) => ic,
-            None => {
+        {
+            {
                 // OrdinaryFunctionCreate gives each closure its own identity, [[Environment]]
                 // and [[Realm]], but closures from the same expression share immutable code.
                 // Reuse that code for BOTH activation-homed and slot-only functions. Restricting
@@ -12792,7 +12835,7 @@ impl Interp {
                     }
                 });
                 if !has_user_entry {
-                    return None;
+                    return CachedCall::Miss;
                 }
                 let object = o.borrow();
                 let (fp, ep) = match &object.call {
@@ -12807,11 +12850,11 @@ impl Interp {
                     {
                         (Rc::as_ptr(&user.func), Rc::as_ptr(&user.env))
                     }
-                    _ => return None,
+                    _ => return CachedCall::Miss,
                 };
                 drop(object);
                 if !self.class_info.is_empty() && self.class_info.contains_key(&key) {
-                    return None;
+                    return CachedCall::Miss;
                 }
                 let mut found = None;
                 for e in &site.entries {
@@ -12823,7 +12866,9 @@ impl Interp {
                         }
                     }
                 }
-                let mut ic = found?;
+                let Some(mut ic) = found else {
+                    return CachedCall::Miss;
+                };
                 // PrepareForOrdinaryCall's Function is the LIVE closure, not the
                 // instance that populated this code-sharing entry. FnFrame borrows
                 // its identity from the caller's callee Value; the old instance may
@@ -12832,9 +12877,9 @@ impl Interp {
                 // object storage. Change the local copy, not the pinned cache entry.
                 ic.callee = key;
                 ic.env = ep;
-                ic
+                CachedCall::Shared(ic)
             }
-        })
+        }
     }
 
     /// Inline-recompile trigger shared by every compiled-entry call: a chunk that keeps running
@@ -12859,7 +12904,12 @@ impl Interp {
         site: &crate::bytecode::CallSite,
         callee: &Value,
     ) -> Option<PreparedCall> {
-        let ic = self.resolve_cached_call(site, callee)?;
+        let mut entry = std::mem::MaybeUninit::uninit();
+        if !self.resolve_cached_call(site, callee, &mut entry) {
+            return None;
+        }
+        // SAFETY: a `true` resolution initialized the entry.
+        let ic = unsafe { entry.assume_init() };
         let code = (ic.native == 0).then(|| unsafe { crate::jit::cache::lease_raw(ic.code) });
         Some(PreparedCall { ic, code })
     }

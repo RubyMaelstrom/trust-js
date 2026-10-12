@@ -1229,7 +1229,22 @@ impl CallOverflow {
     /// Copy only a fully guarded hit. The caller holds a LIVE callee Value whose
     /// identity is `key`; the epoch protects resident code until the caller takes
     /// its lease (before reentrancy). A Weak identity pin alone never suffices.
+    #[cfg(test)]
     pub(crate) fn lookup(&self, key: usize, global_env: usize, epoch: u32) -> Option<CallIc> {
+        // SAFETY: the entry is live in this table for the duration of the copy.
+        self.lookup_entry(key, global_env, epoch)
+            .map(|entry| unsafe { *entry })
+    }
+
+    /// The address of the entry for `key` in `global_env` at `epoch`, valid until the table
+    /// next changes (an insertion, or a re-entrant call that fills it): copy what outlives
+    /// that.
+    pub(crate) fn lookup_entry(
+        &self,
+        key: usize,
+        global_env: usize,
+        epoch: u32,
+    ) -> Option<*const CallIc> {
         if epoch == u32::MAX {
             return None;
         }
@@ -1237,7 +1252,7 @@ impl CallOverflow {
         for entry in &set.entries {
             let call = &entry.call;
             if call.callee == key && call.global_env == global_env && call.epoch == epoch {
-                return Some(*call);
+                return Some(call as *const CallIc);
             }
         }
         None
