@@ -543,6 +543,15 @@ pub(super) fn emit(
                 unwind,
             );
         }
+        Op::UpdateElem(kind)
+            if fast & 2048 != 0
+                && fast & 65536 != 0
+                && rc_ok
+                && elem_inlinable(layout)
+                && layout.entry_accessor == layout.entry_value + 8 =>
+        {
+            emit_update_elem_inline(a, layout, *kind, pc as u32, unwind);
+        }
         Op::Lt
         | Op::Gt
         | Op::Le

@@ -90,6 +90,10 @@ mod coverage_tests;
 mod assignment_tests;
 
 #[cfg(test)]
+#[path = "jit_update_elem_tests.rs"]
+mod update_elem_tests;
+
+#[cfg(test)]
 #[path = "jit_call_reference_tests.rs"]
 mod call_reference_tests;
 
@@ -9002,6 +9006,151 @@ fn emit_update_prop_inline(
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
     a.bind(done);
+}
+
+/// Inline `obj[key]++` / `obj[key]--` (`Op::UpdateElem`, all six kinds) on an existing own
+/// writable data element holding a Number, of a plain object or Array.
+///
+/// ECMA-262 e28783d5 §13.4.2.1-§13.4.5.1 (Postfix/Prefix Increment/Decrement): GetValue(lhs),
+/// ToNumeric, Number::add/subtract(oldValue, 1), PutValue(lhs, newValue). For such an element
+/// the [[Get]] reads [[Value]] without author code, ToNumeric of a Number is the identity, and
+/// PutValue's OrdinarySetWithOwnDescriptor ends in ValidateAndApplyPropertyDescriptor on an
+/// existing writable data property (for an Array, an index below `length`), which replaces
+/// only [[Value]]: exactly `Props::set_index_value`, including its element-mirror upkeep.
+/// Stack `[obj @ -16, key @ -8]`: the key must be a Number that is exactly a u32, so ToPropertyKey
+/// is its canonical index text and runs no author code. Holes, accessors, non-writable or
+/// non-Number elements, typed arrays, proxies and other side-table objects, other exotics, a
+/// last-reference receiver and every other key take the exact-PC helper; every guard precedes
+/// the first write, so that re-run is clean.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_update_elem_inline(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    kind: UpdKind,
+    pc: u32,
+    l_unwind: usize,
+) {
+    debug_assert_eq!(layout.entry_accessor, layout.entry_value + 8);
+    let strong = layout.rc_strong_off as i32;
+    let rcv = layout.obj_from_rc as u32;
+    let ex = layout.obj_exotic as u32;
+    let el = (layout.obj_props + layout.props_elems) as u32;
+    let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
+    let evl = (layout.dense_elems + layout.vec_len_off) as u32;
+    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
+    let ev = layout.entry_value as i32;
+    let ea = layout.entry_accessor as u32;
+    let ew = layout.entry_writable as u32;
+    let es = layout.entry_size as u64;
+    let none_tag = layout.exotic_none_tag as u32;
+    let arr_tag = layout.exotic_array_tag as u32;
+    let plain = layout.obj_ic_plain as u32;
+    let slow = a.new_label();
+    let done = a.new_label();
+    let element = a.new_label();
+    a.mark_push("update-elem");
+    // 1. an Obj receiver
+    emit_exec_word_load(a, 9, 20, -16);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    // 2. the key is exactly a u32 (every non-Number word is a NaN pattern, and the unordered
+    // compare is "not equal"). d4 keeps it for the mirror store; x9 holds the index.
+    a.ldur_d(4, 20, -8);
+    a.fcvtzu_w_d(9, 4);
+    a.ucvtf_d_w(1, 9);
+    a.fcmp(4, 1);
+    a.b_cond(C_NE, slow);
+    // 3. receiver refcount > 1, so dropping the popped operand never frees it
+    emit_exec_word_load(a, 10, 20, -16);
+    emit_exec_payload(a, 10, 10);
+    a.ldur(11, 10, strong);
+    a.cmp_imm_x(11, 1);
+    a.b_cond(C_LS, slow);
+    // 4. ordinary or Array exotic, not in any side table (proxy, typed array, host object)
+    a.add_imm(11, 10, rcv);
+    a.ldrb_imm(12, 11, ex);
+    let ex_ok = a.new_label();
+    a.cmp_imm_w(12, none_tag);
+    a.b_cond(C_EQ, ex_ok);
+    a.cmp_imm_w(12, arr_tag);
+    a.b_cond(C_NE, slow);
+    a.bind(ex_ok);
+    a.ldrb_imm(12, 11, plain);
+    a.cbz(12, false, slow);
+    // 5. dense element storage; x15 → the element's Property
+    a.ldr_imm(12, 11, el);
+    a.cbz(12, true, slow);
+    if packed_elem_inlinable(layout)
+        && layout.entry_value == layout.property_value
+        && layout.entry_accessor == layout.property_meta
+    {
+        let classic = a.new_label();
+        emit_packed_elements_base(a, layout, classic);
+        a.cmp_reg_x(9, 14);
+        a.b_cond(C_HS, slow);
+        a.add_shifted(15, 15, 9, 4); // property_size == 16 (packed_elem_inlinable)
+        guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
+        guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
+        a.b(element);
+        a.bind(classic);
+    }
+    a.ldr_imm(14, 12, evl);
+    a.cmp_reg_x(9, 14);
+    a.b_cond(C_HS, slow);
+    a.ldr_imm(12, 12, evp);
+    a.add_shifted(12, 12, 9, 2);
+    a.ldr_w_imm(13, 12, 0);
+    a.cmn_imm_w(13, 1); // NO_SLOT: a hole consults the prototype chain
+    a.b_cond(C_EQ, slow);
+    a.ldr_imm(15, 11, en);
+    a.mov_imm64(16, es);
+    a.madd(15, 13, 16, 15);
+    guard_prop_data(a, 14, 15, ea, slow);
+    guard_prop_writable(a, 14, 15, ew, slow);
+    a.bind(element);
+    // 6. the old value is a Number (a packed hole and every other kind are tagged NaNs) → d5
+    a.ldur(16, 15, ev);
+    emit_exec_number_guard(a, 16, 5, 13, slow);
+    // --- commit: d6 = old ± 1 replaces [[Value]]; the old Number needs no drop ---
+    a.fmov_one(7);
+    let dec = matches!(
+        kind,
+        UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard
+    );
+    a.f_arith(if dec { 1 } else { 0 }, 6, 5, 7);
+    emit_exec_number_store(a, 6, 15, ev, 13);
+    // Keep the element mirror coherent (clobbers x9/x12/x13/d1/d2 only).
+    emit_mirror_store(
+        a,
+        layout,
+        11,
+        MirrorKey::F64InDreg(4),
+        MirrorVal::Num(6, false),
+    );
+    // drop the receiver (strong was > 1); the Number key needs no drop
+    a.ldur(13, 10, strong);
+    a.sub_imm(13, 13, 1);
+    a.stur(13, 10, strong);
+    match kind {
+        UpdKind::PreInc | UpdKind::PreDec => {
+            emit_exec_number_store(a, 6, 20, -16, 9);
+            a.sub_imm(20, 20, 8);
+        }
+        UpdKind::PostInc | UpdKind::PostDec => {
+            emit_exec_number_store(a, 5, 20, -16, 9);
+            a.sub_imm(20, 20, 8);
+        }
+        UpdKind::IncDiscard | UpdKind::DecDiscard => {
+            a.sub_imm(20, 20, 16);
+        }
+    }
+    a.b(done);
+    a.bind(slow);
+    emit_exec(a, pc, l_unwind);
+    a.bind(done);
+    a.mark_pop();
 }
 
 /// Gate for the inline equality / Not templates: the Obj arms read the receiver's `ic_plain`

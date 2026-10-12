@@ -20720,6 +20720,13 @@ pub(crate) unsafe extern "C" fn jit_exec(
     ) {
         TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(count.get() + 1));
     }
+    #[cfg(test)]
+    if matches!(
+        unsafe { &(&(*(*ctx).chunk).ops)[pc as usize] },
+        Op::UpdateElem(_)
+    ) {
+        TEST_JIT_UPDATE_ELEM_HELPERS.with(|count| count.set(count.get() + 1));
+    }
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
     let result = if makes_explicit_call(&chunk.ops[pc as usize]) {
@@ -22394,6 +22401,10 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// `Op::UpdateElem` operations that reached the exact-PC helper.
+    pub(crate) static TEST_JIT_UPDATE_ELEM_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(crate) static TEST_JIT_TO_STR_HELPERS: std::cell::Cell<usize> = const {
