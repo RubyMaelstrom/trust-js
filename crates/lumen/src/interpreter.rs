@@ -7206,6 +7206,16 @@ impl Interp {
         Ok(buffer)
     }
 
+    /// The bytes of the attached ordinary (non-shared) ArrayBuffer at `ptr`. A
+    /// SharedArrayBuffer's `array_buffers` entry only marks it attached: its bytes are in its
+    /// Shared Data Block, which has no mutation generation or dirty ranges.
+    fn local_buffer(&self, ptr: usize) -> Option<&ArrayBufferBytes> {
+        if self.shared_buffers.contains_key(&ptr) {
+            return None;
+        }
+        self.array_buffers.get(&ptr)
+    }
+
     /// Replace an ordinary, attached `ArrayBuffer`'s bytes without changing its identity. Returns
     /// `false` for another value, a shared/detached buffer, or a length mismatch. Requiring an
     /// exact length keeps existing DataView and TypedArray bounds invariant.
@@ -7214,7 +7224,7 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -7231,13 +7241,14 @@ impl Interp {
 
     /// Replace a range of an ordinary, attached `ArrayBuffer` without changing its identity or
     /// JavaScript mutation generation. This is the range-aware counterpart to
-    /// [`Self::array_buffer_set_bytes`] for embedders mirroring a host-owned data block.
+    /// [`Self::array_buffer_set_bytes`] for embedders mirroring a host-owned data block. Returns
+    /// `false` for another value, a shared/detached buffer, or a range outside the buffer.
     pub fn array_buffer_set_range(&mut self, v: &Value, start: usize, bytes: &[u8]) -> bool {
         let Some(obj) = v.as_obj() else {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -7252,6 +7263,7 @@ impl Interp {
     }
 
     /// Copies a range from an ordinary, attached `ArrayBuffer` into an embedder-owned buffer.
+    /// Returns `false` for another value, a shared/detached buffer, or a range outside either.
     pub fn array_buffer_copy_range(
         &self,
         v: &Value,
@@ -7263,7 +7275,7 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let buffer = storage.borrow();
@@ -7280,11 +7292,12 @@ impl Interp {
     /// Takes coalesced byte ranges covering JavaScript writes since the previous call. Highly
     /// fragmented writes collapse to the whole buffer, so ranges may include unchanged bytes.
     /// As with a full-buffer copy, the embedder must synchronize host writes before allowing JS
-    /// to modify the mirror. Taking the ranges does not change the mutation generation.
+    /// to modify the mirror. Taking the ranges does not change the mutation generation. `None`
+    /// for another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
         self.flush_native_buffer_writes(ptr);
-        self.array_buffers.contains_key(&ptr).then(|| {
+        self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_dirty_ranges
                 .remove(&ptr)
                 .unwrap_or_default()
@@ -7293,10 +7306,12 @@ impl Interp {
 
     /// Returns the mutation generation of an attached ordinary ArrayBuffer. The generation is
     /// intended for embedders that mirror an ArrayBuffer into another storage; it is not an
-    /// observable JavaScript value and may wrap after `u64::MAX` mutations.
+    /// observable JavaScript value and may wrap after `u64::MAX` mutations. `None` for another
+    /// value, a detached buffer or a SharedArrayBuffer: other agents write a Shared Data Block
+    /// without any generation this agent could observe.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
-        self.array_buffers.contains_key(&ptr).then(|| {
+        self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_versions
                 .get(&ptr)
                 .copied()

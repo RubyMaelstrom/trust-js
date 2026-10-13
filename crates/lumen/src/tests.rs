@@ -411,6 +411,49 @@ fn fragmented_array_buffer_writes_preserve_host_synchronization() {
     );
 }
 
+/// The embedder mirror API (mutation generations, dirty ranges, range reads and writes) covers
+/// ordinary ArrayBuffers only. A SharedArrayBuffer is rejected like a detached buffer: it used
+/// to report a generation that never changed and no dirty ranges however JavaScript wrote it,
+/// and accepted empty reads and writes as if it were an empty ordinary buffer.
+#[test]
+fn array_buffer_mirror_api_rejects_shared_array_buffers() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var sab = new SharedArrayBuffer(8), empty = new SharedArrayBuffer(0);
+         var ordinary = new ArrayBuffer(8); new Uint8Array(sab)[3] = 9",
+    );
+    let read = |engine: &mut Engine, name: &str| {
+        let global = engine.interp.global.borrow();
+        global.props.get(name).expect("global binding").value()
+    };
+    let (sab, empty, ordinary) = (
+        read(&mut engine, "sab"),
+        read(&mut engine, "empty"),
+        read(&mut engine, "ordinary"),
+    );
+    for buffer in [&sab, &empty] {
+        assert_eq!(engine.interp.array_buffer_version(buffer), None);
+        assert_eq!(engine.interp.take_array_buffer_dirty_ranges(buffer), None);
+        assert!(!engine.interp.array_buffer_set_bytes(buffer, &[]));
+        assert!(!engine.interp.array_buffer_set_range(buffer, 0, &[]));
+        assert!(!engine.interp.array_buffer_copy_range(buffer, 0, 0, &mut []));
+    }
+    assert!(!engine.interp.array_buffer_set_bytes(&sab, &[1; 8]));
+    assert_eq!(
+        engine.interp.buffer_source_bytes(&sab, true),
+        Some(vec![0, 0, 0, 9, 0, 0, 0, 0])
+    );
+    assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(0));
+    assert!(engine.interp.array_buffer_set_bytes(&ordinary, &[1; 8]));
+    run_in(&mut engine, "new Uint8Array(ordinary)[2] = 5");
+    assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(1));
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&ordinary),
+        Some(vec![2..3])
+    );
+}
+
 #[test]
 fn global_declaration_property_order_follows_instantiation_order() {
     // ECMA-262 GlobalDeclarationInstantiation: Annex B-only bindings first,
