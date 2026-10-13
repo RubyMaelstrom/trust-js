@@ -8459,7 +8459,7 @@ fn jit_linked_scan_preserves_loose_htmldda_null_semantics() {
 }
 
 #[test]
-fn jit_numeric_diamond_fills_small_holey_arrays_and_deopts_for_setters() {
+fn jit_counter_loop_fills_small_holey_arrays_and_respects_setters() {
     assert_eq!(
         run_jit(
             "var LIMIT=4;

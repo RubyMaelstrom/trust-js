@@ -57,7 +57,7 @@ fn packed_mirror_storage_only_adds_numeric_words_and_preserves_canonical_address
 
 #[test]
 fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
-    let edits: [(&str, fn(&mut Props)); 9] = [
+    let edits: [(&str, fn(&mut Props)); 8] = [
         ("get_mut", |p| {
             p.get_mut("0").unwrap().set_value(Value::Num(8.0));
         }),
@@ -75,9 +75,6 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
             assert!(p.pop_last_element(2).is_some());
         }),
         ("truncate", |p| p.remove_indices_from(1)),
-        ("raw slots", |p| {
-            assert!(p.jit_packed_numeric_slots(3).is_some());
-        }),
         ("non-number", |p| {
             assert!(p.set_index_value(0, Value::lstr("changed")).is_ok())
         }),

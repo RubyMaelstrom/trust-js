@@ -2291,8 +2291,6 @@ pub(super) fn emit(
                     cfg,
                 )
                 .is_some()
-                    || plan_numeric_diamond(chunk, chunk.jit_ops(), head, cfg, layout, fast)
-                        .is_some()
                     || plan_linked_scan(chunk, chunk.jit_ops(), head, cfg, layout, fast).is_some()
             });
             stronger.then_some(head)

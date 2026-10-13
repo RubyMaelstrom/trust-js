@@ -1841,11 +1841,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_get_prop as *const () as usize,
         crate::bytecode::jit_intrinsic as *const () as usize,
         crate::bytecode::jit_new as *const () as usize,
-        crate::bytecode::jit_regexp_exec_loop as *const () as usize,
         crate::bytecode::jit_add_strings as *const () as usize,
-        crate::bytecode::jit_regexp_literal_exec_discard as *const () as usize,
-        crate::bytecode::jit_regexp_literal_replace_discard as *const () as usize,
-        crate::bytecode::jit_regexp_literal_match_discard as *const () as usize,
         crate::bytecode::jit_instanceof as *const () as usize,
         crate::bytecode::jit_make_array as *const () as usize,
         crate::bytecode::jit_set_elem as *const () as usize,
@@ -1891,65 +1887,23 @@ pub const H_GET_PROP: usize = 12;
 pub const H_INTRINSIC: usize = 13;
 /// Dedicated `Op::New` entry: constructor-cache probe and dispatch without generic op decode.
 pub const H_NEW: usize = 14;
-pub const H_REGEXP_EXEC_LOOP: usize = 15;
-pub const H_ADD_STRINGS: usize = 16;
-pub const H_REGEXP_LITERAL_EXEC_DISCARD: usize = 17;
-pub const H_REGEXP_LITERAL_REPLACE_DISCARD: usize = 18;
-pub const H_REGEXP_LITERAL_MATCH_DISCARD: usize = 19;
-pub const H_INSTANCEOF: usize = 20;
+pub const H_ADD_STRINGS: usize = 15;
+pub const H_INSTANCEOF: usize = 16;
 /// Dedicated `Op::MakeArray` entry: moves stack values directly into dense storage.
-pub const H_MAKE_ARRAY: usize = 21;
+pub const H_MAKE_ARRAY: usize = 17;
 /// Dedicated element-store entry for dense misses and fresh indexed writes.
-pub const H_SET_ELEM: usize = 22;
+pub const H_SET_ELEM: usize = 18;
 /// Drop a NaN-boxed property value at a validated address.
-pub const H_DROP_PACKED_AT: usize = 23;
+pub const H_DROP_PACKED_AT: usize = 19;
 /// Strict equality misses after the generated fast path: handles content comparison and
 /// last-owner destruction without entering the generic bytecode decoder.
-pub const H_STRICT_EQ: usize = 24;
+pub const H_STRICT_EQ: usize = 20;
 /// Fresh RegExp-literal allocation using the chunk's immutable compiled-program cache.
-pub const H_MAKE_REGEXP: usize = 25;
+pub const H_MAKE_REGEXP: usize = 21;
 /// Amortized host cancellation/deadline poll at generated loop backedges.
-pub const H_INTERRUPT: usize = 26;
+pub const H_INTERRUPT: usize = 22;
 /// Exact-PC loop back-edge feedback in diagnostic mode.
-pub const H_LOOP_BACKEDGE: usize = 27;
-
-/// One-time semantic guard for the numeric packed-array region. A keyless Empty slot is still a
-/// missing property, so filling it may be intercepted by an indexed setter on Array.prototype.
-/// Reuse the interpreter's live element-protector proof before returning a borrowed Vec header;
-/// generated code performs only drop-free Empty/Number overwrites until it leaves the region.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-unsafe extern "C" fn jit_prepare_numeric_packed_array(
-    ctx: *mut JitCtx,
-    raw: *const std::cell::RefCell<crate::value::Object>,
-    len: usize,
-) -> *mut u8 {
-    if ctx.is_null() || raw.is_null() || len == 0 || len > 8 {
-        return std::ptr::null_mut();
-    }
-    let ctx = unsafe { &mut *ctx };
-    let interp = unsafe { &mut *ctx.interp };
-    // `raw` is Rc::as_ptr. The frame owns the live Gc throughout this call and the generated
-    // region, so borrow an Rc view without changing its strong count.
-    let obj = std::mem::ManuallyDrop::new(unsafe { crate::value::Gc::from_raw(raw) });
-    {
-        let b = obj.borrow();
-        if !matches!(&b.exotic, crate::value::Exotic::Array) || !b.ic_plain.get() || !b.extensible {
-            return std::ptr::null_mut();
-        }
-    }
-    if interp.array_length(&obj) != len || !interp.array_append_unshadowed(&obj) {
-        return std::ptr::null_mut();
-    }
-    let slots = obj
-        .borrow_mut()
-        .props
-        .jit_packed_numeric_slots(len)
-        .map_or(std::ptr::null_mut(), |p| p.cast());
-    slots
-}
+pub const H_LOOP_BACKEDGE: usize = 23;
 
 /// Pure representation preparation: no author code or engine allocation/safepoint. The
 /// activation owns `raw`; the optional f64 mirror leaves canonical Property addresses intact.
@@ -1969,22 +1923,22 @@ unsafe extern "C" fn jit_prepare_packed_numeric_mirror(
     }
 }
 
-pub const H_GET_METHOD_ELEM: usize = 28;
+pub const H_GET_METHOD_ELEM: usize = 24;
 /// The historical method-read slot now serves every compact computed-read shape.
 /// Keep its diagnostic identity and ABI index stable.
 pub const H_GET_ELEM: usize = H_GET_METHOD_ELEM;
-pub const H_COMPLETE: usize = 29;
-pub const H_SLICE_OP: usize = 30;
-pub const H_REFERENCE_OP: usize = 31;
+pub const H_COMPLETE: usize = 25;
+pub const H_SLICE_OP: usize = 26;
+pub const H_REFERENCE_OP: usize = 27;
 #[cfg(feature = "optimizing-jit")]
-pub const H_OPT_LOOP: usize = 32;
+pub const H_OPT_LOOP: usize = 28;
 /// `Op::MakeClosure` (see `bytecode::jit_make_closure`).
-pub const H_MAKE_CLOSURE: usize = 33;
+pub const H_MAKE_CLOSURE: usize = 29;
 /// Incremental object-literal builder ops (see `bytecode::jit_object_literal`).
-pub const H_OBJECT_LITERAL: usize = 34;
+pub const H_OBJECT_LITERAL: usize = 30;
 /// Self-hosted built-ins' abstract operations (see `bytecode::jit_abstract_operation`).
-pub const H_ABSTRACT: usize = 35;
-pub const N_HELPERS: usize = 36;
+pub const H_ABSTRACT: usize = 31;
+pub const N_HELPERS: usize = 32;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2005,11 +1959,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "get_prop",
     "intrinsic",
     "new",
-    "regexp_exec_loop",
     "add_strings",
-    "regexp_literal_exec_discard",
-    "regexp_literal_replace_discard",
-    "regexp_literal_match_discard",
     "instanceof",
     "make_array",
     "set_elem",
@@ -3707,97 +3657,6 @@ mod asm {
 // Compilation
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_exec_loop_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::{Op, UpdKind};
-    let [Op::LoadLocal(local0), Op::Const(_), Op::Lt, Op::JumpIfFalse(exit), Op::LoadName(..), Op::GetMethod(..), Op::LoadName(..), Op::LoadLocal(local1), Op::GetElem, Op::CallWithThis(1, _), Op::Pop, Op::UpdateLocal(local2, UpdKind::IncDiscard), Op::Jump(back)] =
-        ops.get(pc..pc + 13)?
-    else {
-        return None;
-    };
-    (*local0 == *local1 && *local0 == *local2 && *back as usize == pc && *exit as usize == pc + 13)
-        .then_some(*exit as usize)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_exec_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    if matches!(
-        ops.get(pc..pc + 7),
-        Some([
-            Op::MakeRegExp(..),
-            Op::GetMethod(..),
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    ) {
-        return Some(pc + 7);
-    }
-    matches!(
-        ops.get(pc..pc + 5),
-        Some([
-            Op::MakeRegExp(..),
-            Op::GetMethod(..),
-            Op::Const(..),
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    )
-    .then_some(pc + 5)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_replace_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    matches!(
-        ops.get(pc..pc + 8)?,
-        [
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::GetMethod(..),
-            Op::MakeRegExp(..),
-            Op::Const(..),
-            Op::CallWithThis(2, _),
-            Op::Pop
-        ]
-    )
-    .then_some(pc + 8)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn regexp_literal_match_exit(ops: &[crate::bytecode::Op], pc: usize) -> Option<usize> {
-    use crate::bytecode::Op;
-    matches!(
-        ops.get(pc..pc + 7),
-        Some([
-            Op::LoadName(..),
-            Op::LoadLocal(..),
-            Op::GetElem,
-            Op::GetMethod(..),
-            Op::MakeRegExp(..),
-            Op::CallWithThis(1, _),
-            Op::Pop
-        ])
-    )
-    .then_some(pc + 7)
-}
-
 /// Compile `chunk` to machine code, or `None` when unsupported (non-macOS/ARM64, suspending bodies,
 /// or an op stream whose stack depths don't line up — a compiler bug caught defensively).
 #[cfg(all(
@@ -4109,69 +3968,6 @@ fn compile_entry(
             a.b(l_ret_ok);
             continue;
         }
-        // A web-trace regexp workload is dominated by tiny loops whose body is exactly
-        // `re.exec(strings[i])` with the result discarded. Let one guarded Rust entry process
-        // the dense string range; a declined guard falls through to these untouched templates.
-        // This must precede numeric-chain selection, which otherwise consumes the loop's
-        // LoadLocal/Const/Lt header.
-        if let Some(exit) =
-            regexp_exec_loop_exit(ops, pc).filter(|_| !chunk.jit_detailed_feedback_enabled())
-        {
-            if env_flag!("LUMEN_JIT_REGIONLOG") {
-                eprintln!("[jit-region] head {pc}: regexp exec loop -> {exit}");
-            }
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_EXEC_LOOP * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        // A fresh literal immediately used for a canonical `exec` whose result dies need not
-        // allocate its observable wrapper object. The helper validates the live method and
-        // side-effect-free dense subject load before performing the real match; every miss
-        // falls through to the untouched literal/GetMethod/call templates.
-        if let Some(exit) = regexp_literal_exec_exit(ops, pc).filter(|exit| {
-            !chunk.jit_detailed_feedback_enabled()
-                && !targeted[pc + 1..*exit].iter().any(|target| *target)
-        }) {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_EXEC_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        if let Some(exit) = regexp_literal_replace_exit(ops, pc).filter(|exit| {
-            !chunk.jit_detailed_feedback_enabled()
-                && !targeted[pc + 1..*exit].iter().any(|target| *target)
-        }) {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_REPLACE_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
-        if let Some(exit) = regexp_literal_match_exit(ops, pc).filter(|exit| {
-            !chunk.jit_detailed_feedback_enabled()
-                && !targeted[pc + 1..*exit].iter().any(|target| *target)
-        }) {
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.ldr_imm(16, 21, (H_REGEXP_LITERAL_MATCH_DISCARD * 8) as u32);
-            a.blr(16);
-            a.cmp_imm_w(0, 1);
-            a.b_cond(C_EQ, pc_labels[exit]);
-            a.cmp_imm_w(0, 2);
-            a.b_cond(C_EQ, l_unwind);
-        }
         // Loop-spanning chain: a fully-chainable, branch-free loop headed here runs with its
         // locals register-resident across the back edge. The plain templates for the region are
         // still emitted below (starting at `plain_h`) as the bail target; the head's canonical
@@ -4213,17 +4009,6 @@ fn compile_entry(
                 emitted_region = true;
                 if env_flag!("LUMEN_JIT_REGIONLOG") {
                     eprintln!("[jit-region] head {pc}: EMITTED linked scan");
-                }
-            } else if let Some(plan) = plan_numeric_diamond(chunk, ops, pc, &cfg, layout, fast) {
-                let plain_h =
-                    emit_numeric_diamond_region(&mut a, layout, ilayout, &plan, &pc_labels);
-                a.bind(plain_h);
-                for p in pc + 1..pc + 18 {
-                    targeted[p] = true;
-                }
-                emitted_region = true;
-                if env_flag!("LUMEN_JIT_REGIONLOG") {
-                    eprintln!("[jit-region] head {pc}: EMITTED numeric diamond");
                 }
             }
             if !emitted_region {
@@ -13597,27 +13382,6 @@ enum ChainOp {
     CmpBranch(u32, usize),
 }
 
-/// First CFG-region lowering: a helper-free numeric loop with one forward diamond.  The shape is
-/// common in indexed numeric kernels: advance a numeric `this` field, optionally wrap it, and fill
-/// a dense numeric array. All mutable state has fixed register homes across both arms; the
-/// shared [`crate::jit_ir`] graph proves the loop and its block boundaries, while the baseline JIT
-/// remains the exact-PC side-exit target.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-struct NumericDiamondPlan {
-    head: usize,
-    exit_pc: usize,
-    index_off: u32,
-    owner_off: u32,
-    limit_cache: usize,
-    counter: crate::bytecode::IcState,
-    array_prop: crate::bytecode::IcState,
-    threshold: i64,
-    reset: i64,
-}
-
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13699,137 +13463,6 @@ fn plan_linked_scan(
         peek_off,
         link,
         loose_null_compare,
-    })
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn exact_i32_const(bits: u64) -> Option<i64> {
-    let value = f64::from_bits(bits);
-    if !value.is_finite()
-        || value == 0.0 && bits == (-0.0f64).to_bits()
-        || value.fract() != 0.0
-        || value < i32::MIN as f64
-        || value > i32::MAX as f64
-    {
-        return None;
-    }
-    Some(value as i32 as i64)
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn plan_numeric_diamond(
-    chunk: &Chunk,
-    ops: &[crate::bytecode::Op],
-    head: usize,
-    cfg: &crate::jit_ir::Cfg,
-    layout: &crate::value::JitLayout,
-    fast: u32,
-) -> Option<NumericDiamondPlan> {
-    use crate::bytecode::{Op, UpdKind};
-    let end = head.checked_add(18)?;
-    let body = ops.get(head..end)?;
-    let [Op::LoadLocal(index), Op::LoadName(_, limit_cache), Op::Lt, Op::JumpIfFalse(exit), Op::LoadThis, Op::UpdateProp(counter_name, counter_update_cache, UpdKind::IncDiscard), Op::GetPropThis(counter_name_read, counter_read_cache), Op::Const(threshold), Op::Gt, Op::JumpIfFalse(no_reset), Op::Const(reset), Op::SetPropThisDrop(counter_name_set, counter_set_cache), Op::GetPropLocal(owner, _, array_cache), Op::LoadLocal(index_read), Op::GetPropThis(counter_name_store, counter_store_cache), Op::SetElemDrop, Op::UpdateLocal(index_update, UpdKind::IncDiscard), Op::Jump(back)] =
-        body
-    else {
-        return None;
-    };
-    macro_rules! reject {
-        ($why:expr) => {{
-            if env_flag!("LUMEN_JIT_REGIONLOG") {
-                eprintln!("[jit-region-plan] head {head}: reject {}", $why);
-            }
-            return None;
-        }};
-    }
-    if fast & (1 << 21) == 0 || env_flag!("LUMEN_JIT_NO_CFG_REGION") {
-        reject!("disabled");
-    }
-    if !get_prop_inlinable(layout)
-        || !set_prop_inlinable(layout)
-        || !elem_inlinable(layout)
-        || !packed_elem_inlinable(layout)
-        || layout.entry_accessor != layout.entry_value + 8
-    {
-        reject!("layout");
-    }
-    if *back as usize != head
-        || *no_reset as usize != head + 12
-        || (*exit as usize) < end
-        || index != index_read
-        || index != index_update
-        || counter_name != counter_name_read
-        || counter_name != counter_name_set
-        || counter_name != counter_name_store
-    {
-        reject!("shape");
-    }
-
-    let lp = cfg.loop_at_header(head)?;
-    if lp.latches.len() != 1
-        || cfg.blocks()[lp.latches[0].0 as usize].end != end
-        || lp.blocks.iter().any(|id| {
-            let block = &cfg.blocks()[id.0 as usize];
-            block.start < head
-                || block.end > end
-                || block.stack_in != Some(0)
-                || block.stack_out != Some(0)
-        })
-        || crate::jit_ir::RegionIr::build_loop(chunk, cfg, head).is_err()
-    {
-        reject!("cfg");
-    }
-
-    let Some(counter) = chunk.jit_cache_preferred(*counter_update_cache) else {
-        reject!("counter cache empty/polymorphic");
-    };
-    let same_counter = |cache: u32| {
-        chunk.jit_cache_preferred(cache).is_some_and(|state| {
-            state.depth == 0 && state.recv_shape == counter.recv_shape && state.slot == counter.slot
-        })
-    };
-    if counter.depth != 0
-        || !same_counter(*counter_read_cache)
-        || !same_counter(*counter_set_cache)
-        || !same_counter(*counter_store_cache)
-    {
-        reject!("counter cache");
-    }
-    let Some(array_prop) = chunk.jit_cache_preferred(*array_cache) else {
-        reject!("array cache empty/polymorphic");
-    };
-    if array_prop.depth != 0 {
-        reject!("array cache");
-    }
-    if chunk.jit_name_number(*limit_cache).is_none() {
-        reject!("limit feedback");
-    }
-    let Some(threshold) = chunk.jit_const_num(*threshold).and_then(exact_i32_const) else {
-        reject!("threshold constant");
-    };
-    let Some(reset) = chunk.jit_const_num(*reset).and_then(exact_i32_const) else {
-        reject!("reset constant");
-    };
-    let index_off = *index as u32 * 8;
-    let owner_off = *owner as u32 * 8;
-    if index_off + 8 >= 4096 || owner_off + 8 >= 4096 {
-        reject!("slot range");
-    }
-    Some(NumericDiamondPlan {
-        head,
-        exit_pc: *exit as usize,
-        index_off,
-        owner_off,
-        limit_cache: chunk.jit_name_cache_ptr(*limit_cache),
-        counter,
-        array_prop,
-        threshold,
-        reset,
     })
 }
 
@@ -16729,91 +16362,6 @@ fn emit_region_own_entry(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_region_packed_number(
-    a: &mut asm::Asm,
-    entry_reg: u32,
-    value_off: i32,
-    dreg: u32,
-    fail: usize,
-) {
-    a.ldur(13, entry_reg, value_off);
-    a.lsr_imm(9, 13, 48);
-    a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_HS, fail);
-    let number = a.new_label();
-    a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_LO, number);
-    a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_LS, fail);
-    a.bind(number);
-    a.fmov_d_x(dreg, 13);
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_region_exact_i32(a: &mut asm::Asm, dreg: u32, out: u32, fail: usize) {
-    a.fcvtzs_w_d(out, dreg);
-    a.scvtf_d_w(1, out);
-    a.fmov_x_d(13, 1);
-    a.fmov_x_d(14, dreg);
-    a.cmp_reg_x(13, 14); // also rejects -0.0, NaN, infinities, and out-of-range values
-    a.b_cond(C_NE, fail);
-    a.sxtw(out, out);
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_region_name_i32(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    cache: usize,
-    out: u32,
-    fail: usize,
-) {
-    emit_name_ic_value_ptr(a, layout, cache, fail, true);
-    let decoded = a.new_label();
-    let wide = a.new_label();
-    a.cbz(7, false, wide);
-    emit_region_packed_number(a, 14, 0, 0, fail);
-    a.b(decoded);
-    a.bind(wide);
-    a.ldurb(9, 14, 0);
-    a.cmp_imm_w(9, 4);
-    a.b_cond(C_NE, fail);
-    a.ldur_d(0, 14, 8);
-    a.bind(decoded);
-    emit_region_exact_i32(a, 0, out, fail);
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_numeric_diamond_flush(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    plan: &NumericDiamondPlan,
-) {
-    // Both locations were entry-proven Numbers and no helper ran in-region, so payload-only
-    // writeback preserves their tags and requires no ownership work.
-    a.scvtf_d_x(0, 0);
-    a.str_d_imm(0, 22, plan.index_off);
-    a.scvtf_d_x(1, 8);
-    a.fmov_x_d(9, 1);
-    a.stur(9, 2, layout.entry_value as i32);
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
 fn emit_linked_scan_materialize(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -16936,235 +16484,9 @@ fn emit_linked_scan_region(
     plain_h
 }
 
-/// Emit the first non-linear region tier.  x0=index, x1=limit, x2=counter entry, x3=array body,
-/// x4=mirror data, x5=mirror length, x6=index→entry map, x7=entry data, x8=counter.  The region
-/// is helper-free; frame/property owners remain GC roots for all borrowed pointers.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-fn emit_numeric_diamond_region(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    ilayout: &crate::interpreter::InterpLayout,
-    plan: &NumericDiamondPlan,
-    pc_labels: &[usize],
-) -> usize {
-    let plain_h = a.new_label();
-    let body = a.new_label();
-    let exit = a.new_label();
-    let store_bail = a.new_label();
-    let poll_bail = a.new_label();
-    let ev = layout.entry_value as i32;
-
-    #[cfg(test)]
-    emit_numeric_diamond_probe(a, 0);
-
-    // Invariant free-name limit.  Validation comes first because the shared name probe clobbers
-    // x9-x17; fixed homes are populated afterwards.
-    emit_region_name_i32(a, layout, plan.limit_cache, 1, plain_h);
-    #[cfg(test)]
-    emit_numeric_diamond_probe(a, 1);
-
-    // Resolve `owner.array` before populating caller-saved fixed homes. The optional C-ABI
-    // protector check may clobber x0-x18; afterwards x4 holds its packed Vec header (or null),
-    // x5 keeps the borrowed array Rc pointer, and the remainder of the preamble is helper-free.
-    a.ldr_imm(10, 22, plan.owner_off);
-    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 9, plain_h);
-    emit_exec_payload(a, 10, 10);
-    emit_region_own_entry(a, layout, 10, 11, 12, plan.array_prop, false, plain_h);
-    a.ldur(13, 12, ev);
-    a.lsr_imm(9, 13, 48);
-    a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(9, 16);
-    a.b_cond(C_NE, plain_h);
-    a.lsl_imm(13, 13, 16);
-    a.lsr_imm(13, 13, 16);
-    a.stp_pre(23, 24, -16);
-    a.mov(23, 1);
-    a.mov(24, 13);
-    a.mov(0, 19);
-    a.add_imm(1, 13, layout.gc_data_off as u32);
-    a.mov(2, 23);
-    a.mov_imm64(
-        16,
-        jit_prepare_numeric_packed_array as *const () as usize as u64,
-    );
-    a.blr(16);
-    a.mov(4, 0);
-    a.mov(1, 23);
-    a.mov(5, 24);
-    a.ldp_post(23, 24, 16);
-    #[cfg(test)]
-    emit_numeric_diamond_probe(a, 2);
-
-    // Numeric induction local, exact i32 and non-negative (dense element key invariant).
-    a.ldr_imm(9, 22, plan.index_off);
-    emit_exec_number_guard(a, 9, 0, 10, plain_h);
-    emit_region_exact_i32(a, 0, 0, plain_h);
-    a.cmp_imm_x(0, 0);
-    a.b_cond(C_MI, plain_h);
-    a.cmp_imm_x(1, 0);
-    a.b_cond(C_MI, plain_h);
-
-    // Stable own numeric `this` field.  The frame's this Value roots the receiver; x2 points at
-    // the packed Property word for deferred writeback.
-    a.ldr_imm(14, 19, 48);
-    a.ldrb_imm(9, 14, 0);
-    a.cmp_imm_w(9, 8);
-    a.b_cond(C_NE, plain_h);
-    a.ldr_imm(10, 14, 8);
-    emit_region_own_entry(a, layout, 10, 11, 2, plan.counter, true, plain_h);
-    emit_region_packed_number(a, 2, ev, 0, plain_h);
-    emit_region_exact_i32(a, 0, 8, plain_h);
-    #[cfg(test)]
-    emit_numeric_diamond_probe(a, 3);
-
-    // Pin either the packed slots or the coherent classic mirror/entry tables for the loop.
-    a.mov(13, 5);
-    a.add_imm(3, 13, layout.obj_from_rc as u32);
-    a.ldrb_imm(9, 3, layout.obj_exotic as u32);
-    let array_kind = a.new_label();
-    a.cmp_imm_w(9, layout.exotic_none_tag as u32);
-    a.b_cond(C_EQ, array_kind);
-    a.cmp_imm_w(9, layout.exotic_array_tag as u32);
-    a.b_cond(C_NE, plain_h);
-    a.bind(array_kind);
-    a.ldrb_imm(9, 3, layout.obj_ic_plain as u32);
-    a.cbz(9, false, plain_h);
-    let packed_array = a.new_label();
-    let array_ready = a.new_label();
-    a.cbnz(4, true, packed_array);
-    let mirror_flags = (layout.obj_props + layout.props_mirror_flags) as u32;
-    a.ldrb_imm(9, 3, mirror_flags);
-    // A rejected packed-slot preparation must not interpret its mirror as a classic
-    // index-to-entry map. This specialized hole-filling emitter has its own packed mode.
-    a.logic_imm_w(
-        0,
-        12,
-        9,
-        asm::logical_imm_w(crate::value::MIRROR_PACKED as u32).unwrap(),
-    );
-    a.cbnz(12, false, plain_h);
-    let need = (crate::value::MIRROR_OK | crate::value::MIRROR_NO_HOLES) as u32;
-    let mask = asm::logical_imm_w(need).expect("mirror region mask");
-    a.logic_imm_w(0, 9, 9, mask);
-    a.cmp_imm_w(9, need);
-    a.b_cond(C_NE, plain_h);
-    let dense_off = (layout.obj_props + layout.props_elems) as u32;
-    a.ldr_imm(12, 3, dense_off);
-    a.cbz(12, true, plain_h);
-    a.ldr_imm(4, 12, (layout.dense_mirror + layout.vec_ptr_off) as u32);
-    a.ldr_imm(5, 12, (layout.dense_mirror + layout.vec_len_off) as u32);
-    a.ldr_imm(6, 12, (layout.dense_elems + layout.vec_ptr_off) as u32);
-    a.ldr_imm(
-        7,
-        3,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
-    a.b(array_ready);
-    a.bind(packed_array);
-    a.ldr_imm(5, 4, layout.vec_len_off as u32);
-    a.ldr_imm(4, 4, layout.vec_ptr_off as u32);
-    a.movz(6, 0, 0); // mode marker: no classic index-to-entry vector
-    a.movz(7, 0, 0);
-    a.bind(array_ready);
-    a.cmp_reg_x(1, 5);
-    a.b_cond(C_HI, plain_h); // every possible loop key is inside the pinned mirror
-    #[cfg(test)]
-    emit_numeric_diamond_probe(a, 4);
-
-    // Rotated loop: the zero-trip condition observes no property/element write.
-    a.cmp_reg_x(0, 1);
-    a.b_cond(C_GE, exit);
-    a.bind(body);
-    a.add_imm(8, 8, 1); // this.counter++
-    a.mov_imm64(9, plan.threshold as u64);
-    a.cmp_reg_x(8, 9);
-    let no_reset = a.new_label();
-    a.b_cond(13, no_reset); // signed <=
-    a.mov_imm64(8, plan.reset as u64);
-    a.bind(no_reset);
-
-    // array[index] = counter.  NO_HOLES and limit<=mirror length make bounds invariant; retain a
-    // defensive NO_SLOT exit in case layout invariants ever change under us.
-    let packed_store = a.new_label();
-    let stored = a.new_label();
-    a.cbz(6, true, packed_store);
-    a.add_shifted(12, 6, 0, 2);
-    a.ldr_w_imm(13, 12, 0);
-    a.cmn_imm_w(13, 1);
-    a.b_cond(C_EQ, store_bail);
-    a.mov_imm64(14, layout.entry_size as u64);
-    a.madd(15, 13, 14, 7);
-    a.scvtf_d_x(0, 8);
-    let num_ev = if layout.entry_accessor == layout.entry_value + 8 {
-        ev
-    } else {
-        ev + 8
-    };
-    a.stur_d(0, 15, num_ev);
-    a.str_d_lsl3(0, 4, 0);
-    a.b(stored);
-    a.bind(packed_store);
-    a.add_shifted(15, 4, 0, 4); // packed Property stride is 16 bytes
-    a.scvtf_d_x(0, 8);
-    a.stur_d(0, 15, layout.property_value as i32);
-    a.bind(stored);
-
-    a.add_imm(0, 0, 1);
-    emit_region_poll_guard(a, ilayout, poll_bail, false);
-    a.cmp_reg_x(0, 1);
-    a.b_cond(11, body); // signed <
-    a.bind(exit);
-    emit_numeric_diamond_flush(a, layout, plan);
-    a.b(pc_labels[plan.exit_pc]);
-
-    // The update/reset has logically committed, while the element operation has not.  Restore
-    // canonical frame state and resume at GetPropLocal, exactly after those committed effects.
-    a.bind(store_bail);
-    emit_numeric_diamond_flush(a, layout, plan);
-    a.b(pc_labels[plan.head + 12]);
-    a.bind(poll_bail);
-    emit_numeric_diamond_flush(a, layout, plan);
-    a.b(pc_labels[plan.head]);
-    plain_h
-}
-
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     static TEST_NUMERIC_REGION_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static TEST_NUMERIC_DIAMOND_STAGES: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-extern "C" fn record_numeric_diamond_stage(stage: usize) {
-    TEST_NUMERIC_DIAMOND_STAGES.with(|counter| {
-        let mut counts = counter.get();
-        counts[stage] += 1;
-        counter.set(counts);
-    });
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-fn emit_numeric_diamond_probe(a: &mut asm::Asm, stage: usize) {
-    a.stp_pre(0, 1, -400);
-    for register in (2..18).step_by(2) {
-        a.stp_off(register, register + 1, register as i32 * 8);
-    }
-    for register in (0..32).step_by(2) {
-        a.stp_d_off(register, register + 1, 144 + register as i32 * 8);
-    }
-    a.mov_imm64(0, stage as u64);
-    a.mov_imm64(16, record_numeric_diamond_stage as *const () as u64);
-    a.blr(16);
-    for register in (0..32).step_by(2) {
-        a.ldp_d_off(register, register + 1, 144 + register as i32 * 8);
-    }
-    for register in (2..18).step_by(2) {
-        a.ldp_off(register, register + 1, register as i32 * 8);
-    }
-    a.ldp_post(0, 1, 400);
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]

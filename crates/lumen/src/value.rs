@@ -4520,28 +4520,6 @@ impl Props {
         self.mirror_flags = 0;
     }
 
-    /// Validate the storage contract used by the numeric CFG region and return the stable boxed
-    /// Vec header. The caller separately proves ordinary Array prototype semantics and keeps the
-    /// owning object rooted; no helper or vector resize may run while the returned pointer lives.
-    pub(crate) fn jit_packed_numeric_slots(&mut self, len: usize) -> Option<*mut Vec<Property>> {
-        if len == 0 || self.proto_flag.get() || self.has_far.get() {
-            return None;
-        }
-        let packed = self.elems.packed_ref()?;
-        if packed.len() < len
-            || packed[..len].iter().any(|p| {
-                p.accessor() || !p.writable() || !(p.is_empty() || p.number_value().is_some())
-            })
-        {
-            return None;
-        }
-        // This raw mutable view escapes mirror-maintaining setters. The existing small-hole
-        // region writes these slots directly, so it must never leave an older mirror live.
-        self.mirror_invalidate();
-        let packed = self.elems.packed_mut().unwrap();
-        Some(packed as *mut Vec<Property>)
-    }
-
     /// Add an f64 read view to a hot numeric packed array without changing its Properties,
     /// descriptor bits, keys, shape or length slot. No JavaScript, GC or canonical relocation
     /// occurs. ECMA-262 OrdinaryGet/OrdinarySetWithOwnDescriptor: only existing writable
