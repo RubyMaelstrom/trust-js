@@ -35,7 +35,7 @@ const SUBJECT_TWO_BYTE: u8 = 1 << 2;
 const SUBJECT_ASTRAL: u8 = 1 << 3;
 
 /// Number of [`Inst`] variants, one counter per kind for the opt-in matcher profiling report.
-const REGEXP_PROF_INST_KINDS: usize = 25;
+const REGEXP_PROF_INST_KINDS: usize = 26;
 const REGEXP_PROF_INST_NAMES: [&str; REGEXP_PROF_INST_KINDS] = [
     "char",
     "any",
@@ -62,6 +62,7 @@ const REGEXP_PROF_INST_NAMES: [&str; REGEXP_PROF_INST_KINDS] = [
     "counter_reset",
     "counter_incr",
     "counted_branch",
+    "check_counted_progress",
 ];
 
 /// Opt-in matcher profiling (`LUMEN_REGEXP_PROF=1`): per-instruction dispatch counts, scan
@@ -167,6 +168,7 @@ fn regexp_prof_kind(inst: &Inst) -> usize {
         Inst::CounterReset(_) => 22,
         Inst::CounterIncr(_) => 23,
         Inst::CountedBranch { .. } => 24,
+        Inst::CheckCountedProgress { .. } => 25,
     }
 }
 
@@ -1371,9 +1373,9 @@ enum Inst {
     /// ECMA-262 RepeatMatcher for a counted quantifier too large to unroll (`(?:ab){0,5000}`):
     /// `CounterReset` starts the loop's iteration count, kept in a `marks` slot; `CounterIncr`
     /// ends an iteration. Both roll back on backtracking. `CountedBranch` is the loop head: it
-    /// takes a mandatory iteration (`required`) while the count is below `min`, leaves the loop
-    /// once the count reaches `max`, and otherwise branches between an optional iteration
-    /// (`optional`, which applies the empty-iteration rule) and `exit`, greedy first or lazy first.
+    /// takes a mandatory iteration while the count is below `min`, leaves the loop once the count
+    /// reaches `max`, and otherwise branches between an optional iteration and `exit`, greedy
+    /// first or lazy first. Every iteration runs the same `body`.
     CounterReset(usize),
     CounterIncr(usize),
     CountedBranch {
@@ -1381,9 +1383,15 @@ enum Inst {
         min: usize,
         max: Option<usize>,
         greedy: bool,
-        required: usize,
-        optional: usize,
+        body: usize,
         exit: usize,
+    },
+    /// `CheckProgress` at the end of a counted loop's body: only an optional iteration, one that
+    /// began with the count in mark `counter` at or past `min`, must have consumed input.
+    CheckCountedProgress {
+        mark: usize,
+        counter: usize,
+        min: usize,
     },
 }
 
@@ -1429,14 +1437,8 @@ fn first_filter(prog: &[Inst], multiline: bool) -> FirstFilter {
             | Inst::CounterReset(_)
             | Inst::CounterIncr(_) => stack.push(pc + 1),
             // Every way out of a counted loop's head may begin a path.
-            Inst::CountedBranch {
-                required,
-                optional,
-                exit,
-                ..
-            } => {
-                stack.push(*required);
-                stack.push(*optional);
+            Inst::CountedBranch { body, exit, .. } => {
+                stack.push(*body);
                 stack.push(*exit);
             }
             Inst::Jmp(t) => stack.push(*t),
@@ -2397,8 +2399,11 @@ impl Regex {
         resolve_named_backrefs(&mut ast, &p.names);
         // Wrap the whole match in group-0 saves.
         let mut prog = vec![Inst::Save(0)];
-        let mut nmarks = 0usize;
-        compile(&ast, &mut prog, &mut nmarks, false)?;
+        let mut lowering = Lowering {
+            marks: 0,
+            unroll_budget: MAX_UNROLLED_LEN,
+        };
+        compile(&ast, &mut prog, &mut lowering, false)?;
         prog.push(Inst::Save(1));
         prog.push(Inst::Match);
         // The `flags` accessor returns flags in canonical order.
@@ -2477,7 +2482,7 @@ impl Regex {
         let memo_string_failures = p.ngroups == 0 && program_contains_string_set(&prog);
         let mut re = Regex {
             unicode,
-            nmarks,
+            nmarks: lowering.marks,
             first,
             first_byte,
             literal_ascii,
@@ -4183,16 +4188,16 @@ fn push_class_atom(cc: &mut CharClass, a: ClassAtom) {
 fn compile(
     node: &Node,
     prog: &mut Vec<Inst>,
-    nmarks: &mut usize,
+    cx: &mut Lowering,
     backward: bool,
 ) -> Result<(), String> {
-    with_pattern_stack(|| compile_node(node, prog, nmarks, backward))
+    with_pattern_stack(|| compile_node(node, prog, cx, backward))
 }
 
 fn compile_node(
     node: &Node,
     prog: &mut Vec<Inst>,
-    nmarks: &mut usize,
+    cx: &mut Lowering,
     backward: bool,
 ) -> Result<(), String> {
     match node {
@@ -4223,17 +4228,17 @@ fn compile_node(
                 opt(add.1, remove.1),
                 opt(add.2, remove.2),
             ));
-            compile(inner, prog, nmarks, backward)?;
+            compile(inner, prog, cx, backward)?;
             prog.push(Inst::PopFlags);
         }
         Node::Concat(v) => {
             if backward {
                 for n in v.iter().rev() {
-                    compile(n, prog, nmarks, backward)?;
+                    compile(n, prog, cx, backward)?;
                 }
             } else {
                 for n in v {
-                    compile(n, prog, nmarks, backward)?;
+                    compile(n, prog, cx, backward)?;
                 }
             }
         }
@@ -4244,13 +4249,13 @@ fn compile_node(
                     let sp = prog.len();
                     prog.push(Inst::Split(0, 0));
                     let a_start = prog.len();
-                    compile(alt, prog, nmarks, backward)?;
+                    compile(alt, prog, cx, backward)?;
                     jmp_ends.push(prog.len());
                     prog.push(Inst::Jmp(0));
                     let next = prog.len();
                     prog[sp] = Inst::Split(a_start, next);
                 } else {
-                    compile(alt, prog, nmarks, backward)?;
+                    compile(alt, prog, cx, backward)?;
                 }
             }
             let end = prog.len();
@@ -4262,7 +4267,7 @@ fn compile_node(
             if let Some(i) = idx {
                 prog.push(Inst::Save(2 * i));
             }
-            compile(inner, prog, nmarks, backward)?;
+            compile(inner, prog, cx, backward)?;
             if let Some(i) = idx {
                 prog.push(Inst::Save(2 * i + 1));
             }
@@ -4270,7 +4275,7 @@ fn compile_node(
         Node::Look(negate, inner) => {
             // A lookahead body always matches forward, even inside a lookbehind.
             let mut sub = Vec::new();
-            compile(inner, &mut sub, nmarks, false)?;
+            compile(inner, &mut sub, cx, false)?;
             sub.push(Inst::Match);
             prog.push(Inst::Look {
                 negate: *negate,
@@ -4280,7 +4285,7 @@ fn compile_node(
         Node::LookBehind(negate, inner) => {
             // The body is compiled backward and executed right-to-left.
             let mut sub = Vec::new();
-            compile(inner, &mut sub, nmarks, true)?;
+            compile(inner, &mut sub, cx, true)?;
             sub.push(Inst::Match);
             prog.push(Inst::LookBehind {
                 negate: *negate,
@@ -4288,55 +4293,91 @@ fn compile_node(
             });
         }
         Node::Repeat(inner, min, max, greedy) => {
-            compile_repeat(inner, *min, *max, *greedy, prog, nmarks, backward)?
+            compile_repeat(inner, *min, *max, *greedy, prog, cx, backward)?
         }
     }
     Ok(())
 }
 
-/// ECMA-262 RepeatMatcher (§22.2.2.3.1) for a counted quantifier too large to unroll, as a loop
-/// whose iteration count lives in a `marks` slot (see `Inst::CountedBranch`):
+/// Lowering state threaded through [`compile`].
+struct Lowering {
+    /// Mark and counter slots allocated so far.
+    marks: usize,
+    /// Instructions that unrolled repetitions may still add (see [`MAX_UNROLLED_LEN`]).
+    unroll_budget: usize,
+}
+
+impl Lowering {
+    fn mark(&mut self) -> usize {
+        self.marks += 1;
+        self.marks - 1
+    }
+}
+
+/// How many instructions unrolling may add to a whole program. Unrolled copies are straight-line
+/// code, but they multiply: each nesting level of counted repetition would multiply the program
+/// again. Repetitions beyond the budget run as counted loops over a single copy of their body,
+/// keeping the program linear in the pattern size.
+const MAX_UNROLLED_LEN: usize = 1 << 16;
+
+/// Append `body`, compiled as a program of its own, at the end of `prog`, rebasing its jumps.
+fn append_relocated(prog: &mut Vec<Inst>, body: &[Inst]) {
+    let base = prog.len();
+    prog.extend(body.iter().map(|instruction| match instruction {
+        Inst::Split(a, b) => Inst::Split(a + base, b + base),
+        Inst::Jmp(target) => Inst::Jmp(target + base),
+        Inst::CountedBranch {
+            id,
+            min,
+            max,
+            greedy,
+            body,
+            exit,
+        } => Inst::CountedBranch {
+            id: *id,
+            min: *min,
+            max: *max,
+            greedy: *greedy,
+            body: body + base,
+            exit: exit + base,
+        },
+        other => other.clone(),
+    }));
+}
+
+/// ECMA-262 RepeatMatcher (§22.2.2.3.1) as a loop whose iteration count lives in a `marks` slot
+/// (see `Inst::CountedBranch`), for a repetition too large to unroll:
 ///
 /// ```text
 ///       CounterReset(c)
-/// head: CountedBranch { c, min, max, greedy, required, optional, exit }
-/// required: ClearCaps; body; CounterIncr(c); Jmp(head)
-/// optional: SetMark(m); ClearCaps; body; CheckProgress(m); CounterIncr(c); Jmp(head)
+/// head: CountedBranch { c, min, max, greedy, body, exit }
+/// body: SetMark(m); ClearCaps; atom; CheckCountedProgress(m, c, min); CounterIncr(c); Jmp(head)
 /// exit:
 /// ```
 ///
 /// Each iteration clears the captures inside the atom first (RepeatMatcher step 4), and only an
 /// optional iteration, one past `min`, fails when it consumes nothing (step 2.b).
 fn compile_counted_repeat(
-    inner: &Node,
+    body: &[Inst],
     min: usize,
     max: Option<usize>,
     greedy: bool,
     prog: &mut Vec<Inst>,
-    nmarks: &mut usize,
-    backward: bool,
-) -> Result<(), String> {
-    let span = cap_span(inner);
-    let counter = *nmarks;
-    let progress = *nmarks + 1;
-    *nmarks += 2;
-    let iteration = |prog: &mut Vec<Inst>, nmarks: &mut usize| -> Result<(), String> {
-        if let Some((lo, hi)) = span {
-            prog.push(Inst::ClearCaps(lo, hi));
-        }
-        compile(inner, prog, nmarks, backward)
-    };
+    cx: &mut Lowering,
+) {
+    let counter = cx.mark();
+    let progress = cx.mark();
     prog.push(Inst::CounterReset(counter));
     let head = prog.len();
     prog.push(Inst::Match); // Patched to the loop head below.
-    let required = prog.len();
-    iteration(prog, nmarks)?;
-    prog.push(Inst::CounterIncr(counter));
-    prog.push(Inst::Jmp(head));
-    let optional = prog.len();
+    let start = prog.len();
     prog.push(Inst::SetMark(progress));
-    iteration(prog, nmarks)?;
-    prog.push(Inst::CheckProgress(progress));
+    append_relocated(prog, body);
+    prog.push(Inst::CheckCountedProgress {
+        mark: progress,
+        counter,
+        min,
+    });
     prog.push(Inst::CounterIncr(counter));
     prog.push(Inst::Jmp(head));
     prog[head] = Inst::CountedBranch {
@@ -4344,11 +4385,9 @@ fn compile_counted_repeat(
         min,
         max,
         greedy,
-        required,
-        optional,
+        body: start,
         exit: prog.len(),
     };
-    Ok(())
 }
 
 fn compile_repeat(
@@ -4357,7 +4396,7 @@ fn compile_repeat(
     max: Option<usize>,
     greedy: bool,
     prog: &mut Vec<Inst>,
-    nmarks: &mut usize,
+    cx: &mut Lowering,
     backward: bool,
 ) -> Result<(), String> {
     // A variable-length UnicodeSets atom needs explicit heap state: compiling it through the
@@ -4383,72 +4422,72 @@ fn compile_repeat(
         });
         return Ok(());
     }
-    // The general path unrolls `min` copies and one optional copy per extra iteration, which
-    // keeps short counted loops straight-line. ECMA-262 places no bound on the counts, so larger
-    // ones run as a counted loop whose program size doesn't depend on them.
-    if min > MAX_REPEAT || max.is_some_and(|m| m > MAX_REPEAT) {
-        return compile_counted_repeat(inner, min, max, greedy, prog, nmarks, backward);
+    // The atom is compiled once, as a program of its own, and copied into place. RepeatMatcher
+    // clears the captures inside it at the start of every iteration.
+    let mut body = Vec::new();
+    if let Some((lo, hi)) = cap_span(inner) {
+        body.push(Inst::ClearCaps(lo, hi));
     }
-    // RepeatMatcher clears the captures inside the atom at the start of every iteration.
-    let span = cap_span(inner);
-    let body_with_clear = |prog: &mut Vec<Inst>, nmarks: &mut usize| -> Result<(), String> {
-        if let Some((lo, hi)) = span {
-            prog.push(Inst::ClearCaps(lo, hi));
-        }
-        compile(inner, prog, nmarks, backward)
+    compile(inner, &mut body, cx, backward)?;
+    // Short repetitions unroll into `min` copies and one optional copy per further iteration,
+    // which keeps them straight-line. ECMA-262 places no bound on the counts, so larger ones run
+    // as a counted loop whose size doesn't depend on them.
+    let optional_len = match max {
+        None => body.len() + 4,
+        Some(max) => (max - min).saturating_mul(body.len() + 3),
     };
+    let unrolled_len = min.saturating_mul(body.len()).saturating_add(optional_len);
+    let added = unrolled_len.saturating_sub(body.len());
+    if min > MAX_REPEAT || max.is_some_and(|max| max > MAX_REPEAT) || added > cx.unroll_budget {
+        compile_counted_repeat(&body, min, max, greedy, prog, cx);
+        return Ok(());
+    }
+    cx.unroll_budget -= added;
     for _ in 0..min {
-        body_with_clear(prog, nmarks)?;
+        append_relocated(prog, &body);
     }
     // Optional iterations enforce the RepeatMatcher empty-iteration rule: an iteration that
     // consumes nothing fails, backtracking into the body's other alternatives or out of the loop.
-    // Mark ids are globally unique across the whole pattern (nested sub-programs included).
-    fn next_mark(nmarks: &mut usize) -> usize {
-        let id = *nmarks;
-        *nmarks += 1;
-        id
-    }
+    // The iterations run one after another, so they share one progress mark.
     match max {
         None => {
             // Greedy: L1: Split(body, end); body; Jmp(L1); end.
-            let id = next_mark(nmarks);
+            let id = cx.mark();
             let l1 = prog.len();
-            let sp = prog.len();
             prog.push(Inst::Split(0, 0));
-            let body = prog.len();
+            let start = prog.len();
             prog.push(Inst::SetMark(id));
-            body_with_clear(prog, nmarks)?;
+            append_relocated(prog, &body);
             prog.push(Inst::CheckProgress(id));
             prog.push(Inst::Jmp(l1));
             let end = prog.len();
-            prog[sp] = if greedy {
-                Inst::Split(body, end)
+            prog[l1] = if greedy {
+                Inst::Split(start, end)
             } else {
-                Inst::Split(end, body)
+                Inst::Split(end, start)
             };
         }
-        Some(m) => {
-            let extra = m.saturating_sub(min);
+        Some(max) if max > min => {
+            let id = cx.mark();
             let mut splits = Vec::new();
-            for _ in 0..extra {
-                let id = next_mark(nmarks);
-                let sp = prog.len();
+            for _ in min..max {
+                let split = prog.len();
                 prog.push(Inst::Split(0, 0));
-                let body = prog.len();
-                splits.push((sp, body));
+                splits.push((split, prog.len()));
                 prog.push(Inst::SetMark(id));
-                body_with_clear(prog, nmarks)?;
+                append_relocated(prog, &body);
                 prog.push(Inst::CheckProgress(id));
             }
             let end = prog.len();
-            for (sp, body) in splits {
-                prog[sp] = if greedy {
-                    Inst::Split(body, end)
+            for (split, start) in splits {
+                prog[split] = if greedy {
+                    Inst::Split(start, end)
                 } else {
-                    Inst::Split(end, body)
+                    Inst::Split(end, start)
                 };
             }
         }
+        Some(_) => {}
     }
     Ok(())
 }
@@ -5552,6 +5591,7 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                 | Inst::PushFlags(..)
                 | Inst::PopFlags
                 | Inst::CheckProgress(_)
+                | Inst::CheckCountedProgress { .. }
                 | Inst::CountedBranch { .. } => return None,
             }
         }
@@ -5746,6 +5786,14 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         }
                         pc += 1;
                     }
+                    Inst::CheckCountedProgress { mark, counter, min } => {
+                        if self.marks[*counter].unwrap_or(0) >= *min
+                            && self.marks[*mark] == Some(pos)
+                        {
+                            break;
+                        }
+                        pc += 1;
+                    }
                     Inst::CounterReset(id) | Inst::CounterIncr(id) => {
                         let id = *id;
                         let old = self.marks[id];
@@ -5764,20 +5812,19 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                         min,
                         max,
                         greedy,
-                        required,
-                        optional,
+                        body,
                         exit,
                     } => {
                         let count = self.marks[*id].unwrap_or(0);
                         if count < *min {
-                            pc = *required;
+                            pc = *body;
                         } else if max.is_some_and(|max| count >= max) {
                             pc = *exit;
                         } else {
                             let (first, second) = if *greedy {
-                                (*optional, *exit)
+                                (*body, *exit)
                             } else {
-                                (*exit, *optional)
+                                (*exit, *body)
                             };
                             pc = self.branch(prog, first, second, pos);
                         }
@@ -6552,6 +6599,48 @@ mod internal_engine_diagnostics {
                 .unwrap_or_else(|error| panic!("/{pattern}/{flags}: {error:?}"))
                 .map(|captures| captures.to_vec());
             assert_eq!(found, Some(expected), "/{pattern}/{flags}");
+        }
+    }
+
+    #[test]
+    fn nested_counted_repetitions_compile_to_bounded_programs() {
+        // Unrolling multiplies the program at every level of counted repetition. Past the unroll
+        // budget the repetitions become counted loops over one copy of their body, so these stay
+        // small instead of needing billions of instructions, and still match exactly.
+        let control = crate::RuntimeInterrupt::default();
+        let cases = [
+            (
+                "(?:(?:(?:ab){1000}){1000}){1000}".to_string(),
+                "ab".repeat(1000),
+                None,
+            ),
+            (
+                "(?:".repeat(30) + "a|b" + &"){2}".repeat(30),
+                "ab".repeat(100),
+                None,
+            ),
+            (
+                "(?:".repeat(10) + "a|b" + &"){2}".repeat(10),
+                "ab".repeat(600),
+                Some((0, 1024)),
+            ),
+            (
+                "(?:x(?:ab){1001}y){3}".to_string(),
+                format!("x{}y", "ab".repeat(1001)).repeat(3),
+                Some((0, 6012)),
+            ),
+        ];
+        for (pattern, subject, expected) in cases {
+            let re = super::Regex::new(&pattern, "").unwrap();
+            assert!(
+                re.prog.len() < 2 * super::MAX_UNROLLED_LEN,
+                "{} instructions",
+                re.prog.len()
+            );
+            let input = crate::lstr::LStr::from(subject.as_str());
+            let text = super::ReText::new_rc(false, &input);
+            let found = re.exec_text_shared(&text, 0, &control).unwrap();
+            assert_eq!(found.map(|captures| captures[0].unwrap()), expected);
         }
     }
 

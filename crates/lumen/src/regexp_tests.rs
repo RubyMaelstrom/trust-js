@@ -53,6 +53,31 @@ fn backtracking_restores_lookaround_and_iteration_captures() {
     );
 }
 
+/// Counted repetitions too large to unroll run as loops over one copy of their body, keeping
+/// RepeatMatcher's semantics: per-iteration capture resets, the empty-iteration rule beyond
+/// `min`, and greedy versus lazy order (§22.2.2.3.1).
+#[test]
+fn large_counted_repetitions_match_like_unrolled_ones() {
+    check(
+        r#"
+        function show(match) {
+            return match ? match[0].length + ':' + match.index + ':' + match.slice(1).join('/') : 'null';
+        }
+        [
+            show(/(?:(?:ab){1000}){1000}/.exec('ab'.repeat(1000))),
+            show(/(?:(?:ab){10}){100}/.exec('x' + 'ab'.repeat(1000))),
+            show(/(?:(a)|(b)){1500}/.exec('ab'.repeat(800))),
+            show(/^(?:(a)|(b)){2,1500}?$/.exec('ab'.repeat(700))),
+            show(/(?:a?){1001}b/.exec('aab')),
+            show(/(?:(a)|b?){1001,1002}c/.exec('abc')),
+            show(/(?:x(?:ab){1001}y){3}/.exec(('x' + 'ab'.repeat(1001) + 'y').repeat(3))),
+            show(new RegExp('(?:'.repeat(10) + 'a|b' + '){2}'.repeat(10)).exec('ab'.repeat(600))),
+        ].join()
+        "#,
+        "null,2000:1:,1500:0:/b,1400:0:/b,3:0:,3:0:,6012:0:,1024:0:",
+    );
+}
+
 /// Deeply nested patterns are an implementation limit: past it, a SyntaxError rather than a
 /// native stack overflow. Patterns at the limit compile and match (node gives the same results
 /// for them).
