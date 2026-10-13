@@ -96,6 +96,7 @@ fn parse_script_with(
         src: lexed.source,
         strict,
         depth: 0,
+        links: 0,
         in_generator: false,
         in_async: false,
         in_params: false,
@@ -194,6 +195,7 @@ pub(crate) fn parse_module_from(
         src: lexed.source,
         strict: true,
         depth: 0,
+        links: 0,
         in_generator: false,
         in_async: true,
         in_params: false,
@@ -472,19 +474,29 @@ fn var_declared_names(stmt: &Stmt, out: &mut Vec<String>) {
     }
 }
 
-/// The deepest nesting of statements, expressions, patterns and left-nested chains (`a.b.c`,
-/// `f()()`, `a + b + c`) a parse may produce; deeper source is a SyntaxError. Every later walk
-/// over the tree (early errors, scope analysis, the compiler, the tree-walking evaluator,
-/// snapshots) recurses once per level, so this bound, together with the stack growth at their
-/// recursive gateways, is what keeps pathological source from overflowing the native stack.
-/// Engines differ here: V8 runs out of stack near 2,000 parentheses, 4,000 blocks or 7,000
-/// chained calls, but accepts a million `+` operands.
+/// The deepest syntactic nesting of statements, expressions and patterns (blocks, parentheses,
+/// literals, functions, right-nested assignments, conditionals and `**`) a parse may produce;
+/// deeper source is a SyntaxError. Every later walk over the tree (early errors, scope
+/// analysis, the compiler, the tree-walking evaluator, snapshots) recurses once per level, so
+/// this bound, together with the stack growth at their recursive gateways, keeps pathological
+/// source from overflowing the native stack. Left-nested chains are bounded separately
+/// ([`MAX_CHAIN_LINKS`]). V8 runs out of stack near 2,000 parentheses or 4,000 blocks.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const MAX_PARSE_DEPTH: u32 = 5000;
 /// wasm32 cannot switch stacks, so its walks must fit the module's own stack: keep the former
 /// bound of 1,200 nested operands (two levels each in this count).
 #[cfg(target_arch = "wasm32")]
 pub(crate) const MAX_PARSE_DEPTH: u32 = 2400;
+
+/// The most links of left-nested chains (`a + b + c`, `a.b.c`, `f()()`, tagged templates, a
+/// template's concatenation) around any point of the tree. Generated and obfuscated code builds chains of
+/// hundreds of thousands of terms (node accepts millions), so they do not count against
+/// [`MAX_PARSE_DEPTH`]; the walks that follow handle a chain's depth with stack segments or
+/// iteratively, and this bound keeps that work proportionate to source a page can load.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_CHAIN_LINKS: u32 = 1 << 20;
+#[cfg(target_arch = "wasm32")]
+pub(crate) const MAX_CHAIN_LINKS: u32 = 2400;
 
 struct Parser {
     toks: Vec<Token>,
@@ -497,6 +509,8 @@ struct Parser {
     base: u32,
     strict: bool,
     depth: u32,
+    /// Links of the left-nested chains (see [`Self::deepen`]) enclosing the current position.
+    links: u32,
     /// Whether the body currently being parsed is a generator / async function — controls whether
     /// `yield` / `await` are keywords here.
     in_generator: bool,
@@ -895,12 +909,12 @@ impl Parser {
 
     /// Count one more link of a left-nested chain built in a loop (`a.b.c`, `f()()`, `a + b`, a
     /// template's concatenation): parsing it does not recurse, but each link nests the tree one
-    /// level deeper for every later walk. The function building the chain restores `depth`.
+    /// level deeper for every later walk. The function building the chain restores `links`.
     fn deepen(&mut self) -> Result<(), ParseError> {
-        if self.depth >= MAX_PARSE_DEPTH {
-            return self.err("nesting too deep");
+        if self.links >= MAX_CHAIN_LINKS {
+            return self.err("expression chain too long");
         }
-        self.depth += 1;
+        self.links += 1;
         Ok(())
     }
 
@@ -2470,9 +2484,9 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
-        let depth = self.depth;
+        let links = self.links;
         let result = self.parse_binary_chain(min_prec);
-        self.depth = depth;
+        self.links = links;
         result
     }
 
@@ -2497,11 +2511,14 @@ impl Parser {
                 return self.err("cannot mix '??' with '&&' or '||' without parentheses");
             }
             self.advance();
-            // This operator nests the tree one level, whichever side recurses: `a + b + c`
-            // builds the left side in this loop, `a ** b ** c` the right side by recursion.
-            self.deepen()?;
-            let next_min = if right_assoc { prec } else { prec + 1 };
-            let right = self.on_grown_stack(|parser| parser.parse_binary(next_min))?;
+            // A left-associative operator extends this loop's chain; `a ** b ** c` nests its
+            // right side by recursion instead, like any other nesting.
+            let right = if right_assoc {
+                self.nested(|parser| parser.parse_binary(prec))?
+            } else {
+                self.deepen()?;
+                self.on_grown_stack(|parser| parser.parse_binary(prec + 1))?
+            };
             if op == "??"
                 && !self.last_paren
                 && matches!(
@@ -2686,9 +2703,9 @@ impl Parser {
     }
 
     fn parse_lhs(&mut self) -> Result<Expr, ParseError> {
-        let depth = self.depth;
+        let links = self.links;
         let result = self.parse_lhs_chain();
-        self.depth = depth;
+        self.links = links;
         result
     }
 
@@ -2789,9 +2806,9 @@ impl Parser {
 
     /// MemberExpression without trailing calls — handles `new` and `.`/`[]` member tails.
     fn parse_member_expr(&mut self) -> Result<Expr, ParseError> {
-        let depth = self.depth;
+        let links = self.links;
         let result = self.parse_member_chain();
-        self.depth = depth;
+        self.links = links;
         result
     }
 
@@ -3146,6 +3163,7 @@ impl Parser {
             base: self.base + start,
             strict: self.strict,
             depth: self.depth,
+            links: self.links,
             in_generator: self.in_generator,
             in_async: self.in_async,
             in_params: self.in_params,
@@ -3181,9 +3199,9 @@ impl Parser {
     /// literals, `${...}` holes are sub-parsed as expressions. Starting from a string literal makes
     /// every `+` a string concatenation (which ToString-coerces each substitution).
     fn build_template(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
-        let depth = self.depth;
+        let links = self.links;
         let result = self.build_template_chain(parts);
-        self.depth = depth;
+        self.links = links;
         result
     }
 

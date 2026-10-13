@@ -752,6 +752,58 @@ impl Interp {
         }
     }
 
+    /// The right operand of a logical operator whose left operand evaluated to `left`.
+    fn eval_logical_right(
+        &mut self,
+        op: &str,
+        left: Value,
+        right: &Expr,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let take_right = match op {
+            "&&" => self.to_boolean(&left),
+            "||" => !self.to_boolean(&left),
+            "??" => matches!(left, Value::Undefined | Value::Null),
+            _ => unreachable!(),
+        };
+        if take_right {
+            self.eval(right, env)
+        } else {
+            Ok(left)
+        }
+    }
+
+    /// A left-nested chain of binary and logical operators (`a + b + c`, `a && b || c`),
+    /// evaluated left to right in a loop rather than recursing once per link: generated and
+    /// obfuscated code chains hundreds of thousands of operands.
+    fn eval_operator_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        loop {
+            node = match node {
+                Expr::Binary { op, left, right } => {
+                    links.push((true, *op, &**right));
+                    left
+                }
+                Expr::Logical { op, left, right } => {
+                    links.push((false, *op, &**right));
+                    left
+                }
+                _ => break,
+            };
+        }
+        let mut value = self.eval(node, env)?;
+        for (binary, op, right) in links.into_iter().rev() {
+            value = if binary {
+                let right = self.eval(right, env)?;
+                self.binary(op, value, right)?
+            } else {
+                self.eval_logical_right(op, value, right, env)?
+            };
+        }
+        Ok(value)
+    }
+
     /// [`Self::exec_stmt`] continued on a fresh native stack segment (see `with_ast_stack`); kept
     /// out of line so the gateway adds no frame state to the hot statement dispatch.
     #[cold]
@@ -3230,32 +3282,14 @@ impl Interp {
                     self.eval(alt, env)
                 }
             }
+            Expr::Binary { left, .. } | Expr::Logical { left, .. }
+                if matches!(**left, Expr::Binary { .. } | Expr::Logical { .. }) =>
+            {
+                self.eval_operator_chain(expr, env)
+            }
             Expr::Logical { op, left, right } => {
                 let l = self.eval(left, env)?;
-                match *op {
-                    "&&" => {
-                        if self.to_boolean(&l) {
-                            self.eval(right, env)
-                        } else {
-                            Ok(l)
-                        }
-                    }
-                    "||" => {
-                        if self.to_boolean(&l) {
-                            Ok(l)
-                        } else {
-                            self.eval(right, env)
-                        }
-                    }
-                    "??" => {
-                        if matches!(l, Value::Undefined | Value::Null) {
-                            self.eval(right, env)
-                        } else {
-                            Ok(l)
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                self.eval_logical_right(op, l, right, env)
             }
             Expr::Unary { op, arg } => self.eval_unary(op, arg, env),
             Expr::Update { op, prefix, arg } => self.eval_update(op, *prefix, arg, env),
@@ -3303,6 +3337,12 @@ impl Interp {
                     v
                 }
             }
+            Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                if matches!(&**obj, Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                    if !matches!(**obj, Expr::Super)) =>
+            {
+                self.eval_member_chain(expr, env)
+            }
             Expr::Member {
                 obj,
                 prop,
@@ -3315,6 +3355,14 @@ impl Interp {
                 optional,
                 pos,
             } => self.eval_index(obj, index, *optional, *pos, env),
+            Expr::Call { .. }
+                if expr
+                    .call_chain_link()
+                    .and_then(Expr::call_chain_link)
+                    .is_some() =>
+            {
+                self.eval_call_chain(expr, env)
+            }
             Expr::Call {
                 callee,
                 args,
@@ -3397,6 +3445,151 @@ impl Interp {
         }
         self.get_member(&base, prop)
             .map_err(|error| self.placed_error(error, position))
+    }
+
+    /// A chain of property reads (`a.b.c`, `a[0]?.b`), evaluated from its base outwards in a
+    /// loop rather than recursing once per link: generated code chains hundreds of thousands.
+    /// Each link performs the steps of [`Self::eval_member`] / [`Self::eval_index`] on the value
+    /// below it, and an error is placed at the link that raised it and then at each enclosing
+    /// link, as the recursion would.
+    fn eval_member_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        loop {
+            match node {
+                Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                    if !matches!(**obj, Expr::Super) =>
+                {
+                    links.push(node);
+                    node = obj;
+                }
+                _ => break,
+            }
+        }
+        let mut value = match self.eval(node, env) {
+            Ok(value) => value,
+            Err(error) => return Err(self.placed_chain_error(error, &links)),
+        };
+        for index in (0..links.len()).rev() {
+            value = match self.member_link(links[index], value, env) {
+                Ok(value) => value,
+                Err(error) => return Err(self.placed_chain_error(error, &links[..=index])),
+            };
+        }
+        Ok(value)
+    }
+
+    /// One link of [`Self::eval_member_chain`]: the read of `link` from the already evaluated
+    /// `base`.
+    fn member_link(&mut self, link: &Expr, base: Value, env: &Env) -> Result<Value, Abrupt> {
+        if self.short_circuit {
+            return Ok(Value::Undefined); // an earlier `?.` link short-circuited
+        }
+        let optional = matches!(
+            link,
+            Expr::Member { optional: true, .. } | Expr::Index { optional: true, .. }
+        );
+        if optional && matches!(base, Value::Undefined | Value::Null) {
+            self.short_circuit = true;
+            return Ok(Value::Undefined);
+        }
+        match link {
+            Expr::Member { prop, .. } if prop.starts_with('#') => {
+                let k = self.resolve_private(prop, env);
+                self.get_private_member(&base, &k)
+            }
+            Expr::Member { prop, .. } => self.get_member(&base, prop),
+            Expr::Index { index, .. } => {
+                let idx = self.eval(index, env)?;
+                // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
+                if matches!(base, Value::Undefined | Value::Null) {
+                    trace_nullish_property("eval-index", &idx);
+                    return Err(
+                        self.throw("TypeError", "cannot read property of null or undefined")
+                    );
+                }
+                if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+                    if let Some(v) = self.fast_get_elem(o, *n) {
+                        return Ok(v);
+                    }
+                }
+                let key = self.to_property_key(&idx)?;
+                self.get_member(&base, &key)
+            }
+            _ => unreachable!("member chain links are property reads"),
+        }
+    }
+
+    /// A chain of calls (`f()()()`, `f().m().n()`; see [`Expr::call_chain_link`]), evaluated
+    /// from its innermost call outwards in a loop rather than recursing once per link. Each link
+    /// performs the steps of [`Self::eval_call`] and [`Self::eval_callee_reference`] on the value
+    /// of the call below it.
+    fn eval_call_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        while let Some(below) = node.call_chain_link() {
+            links.push(node);
+            node = below;
+        }
+        let mut value = match self.eval(node, env) {
+            Ok(value) => value,
+            Err(error) => return Err(self.placed_chain_error(error, &links)),
+        };
+        for index in (0..links.len()).rev() {
+            value = match self.call_link(links[index], value, env) {
+                Ok(value) => value,
+                Err(error) => return Err(self.placed_chain_error(error, &links[..=index])),
+            };
+        }
+        Ok(value)
+    }
+
+    /// One link of [`Self::eval_call_chain`]: the call `link` whose callee is, or is a method
+    /// of, the value `below`.
+    fn call_link(&mut self, link: &Expr, below: Value, env: &Env) -> Result<Value, Abrupt> {
+        let Expr::Call {
+            callee, args, pos, ..
+        } = link
+        else {
+            unreachable!("call chain links are calls");
+        };
+        if self.short_circuit {
+            return Ok(Value::Undefined);
+        }
+        let (func, this) = match &**callee {
+            Expr::Member { prop, .. } if prop.starts_with('#') => {
+                let k = self.resolve_private(prop, env);
+                (self.get_private_member(&below, &k)?, below)
+            }
+            Expr::Member { prop, .. } => (self.get_member(&below, prop)?, below),
+            Expr::Index { index, .. } => {
+                let idx = self.eval(index, env)?;
+                let key = self.ref_prop_key(&below, &mut RefKey::Raw(idx))?;
+                (self.get_member(&below, &key)?, below)
+            }
+            _ => (below, Value::Undefined),
+        };
+        let argv = self.eval_args(args, env)?;
+        if !func.is_callable() {
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(callee, false),
+            ));
+        }
+        self.call_at(*pos, func, this, &argv)
+    }
+
+    /// `error`, raised inside the innermost of `links` (outermost first), placed at each of
+    /// them from the inside out.
+    #[cold]
+    #[inline(never)]
+    fn placed_chain_error(&self, error: Abrupt, links: &[&Expr]) -> Abrupt {
+        for link in links.iter().rev() {
+            if let Some(position) = link.position() {
+                self.place_thrown(&error, position);
+            }
+        }
+        error
     }
 
     /// `super.prop`.

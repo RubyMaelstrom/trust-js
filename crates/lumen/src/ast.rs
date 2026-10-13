@@ -417,6 +417,83 @@ pub enum Expr {
     NewTarget,
 }
 
+impl Expr {
+    /// The call below `self` when `self` continues a call chain: a non-optional call of the
+    /// value of another plain call (`f()()`), or a method call on it (`f().m()`, `f()[k]()`).
+    /// The compiler and the tree-walker run such chains in a loop rather than one native frame
+    /// per link.
+    pub(crate) fn call_chain_link(&self) -> Option<&Expr> {
+        let Expr::Call {
+            callee,
+            optional: false,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let below = match &**callee {
+            below @ Expr::Call { .. } => below,
+            Expr::Member {
+                obj,
+                optional: false,
+                ..
+            }
+            | Expr::Index {
+                obj,
+                optional: false,
+                ..
+            } => obj,
+            _ => return None,
+        };
+        match below {
+            Expr::Call {
+                callee,
+                optional: false,
+                ..
+            } if !matches!(&**callee, Expr::Super)
+                && !matches!(&**callee, Expr::Ident(name, _) if name == "eval") =>
+            {
+                Some(below)
+            }
+            _ => None,
+        }
+    }
+
+    /// Detach the operand a left-nested chain continues through (`a + b` → `a`, `a.b` → `a`,
+    /// `f()` → `f`, …), leaving a leaf in its place.
+    fn take_chain_link(&mut self) -> Option<Expr> {
+        let link = match self {
+            Expr::Binary { left, .. } | Expr::Logical { left, .. } => left,
+            Expr::Member { obj, .. } | Expr::Index { obj, .. } => obj,
+            Expr::Call { callee, .. } | Expr::New { callee, .. } => callee,
+            Expr::TaggedTemplate { tag, .. } => tag,
+            Expr::OptionalChain(inner) | Expr::Paren(inner) | Expr::ToStr(inner) => inner,
+            _ => return None,
+        };
+        match **link {
+            Expr::Null => None,
+            _ => Some(std::mem::replace(&mut **link, Expr::Null)),
+        }
+    }
+}
+
+impl Drop for Expr {
+    /// A chain is as deep as it is long, and chains are not bounded by `MAX_PARSE_DEPTH` (see
+    /// `parser::MAX_CHAIN_LINKS`): release it link by link instead of one native frame per link.
+    /// Other children drop recursively, through nesting the parser bounds, on a fresh stack
+    /// segment when this one runs low (an AST can be dropped wherever its last owner goes).
+    fn drop(&mut self) {
+        if crate::interpreter::ast_stack_low() {
+            let node = std::mem::replace(self, Expr::Null);
+            return crate::interpreter::with_ast_stack(move || drop(node));
+        }
+        let mut next = self.take_chain_link();
+        while let Some(mut link) = next {
+            next = link.take_chain_link();
+        }
+    }
+}
+
 /// The phase of a dynamic `import()` call: plain evaluation, `import.source(...)` (source-phase),
 /// or `import.defer(...)` (deferred-evaluation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

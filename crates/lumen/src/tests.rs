@@ -2088,19 +2088,15 @@ fn live_object_limit_error_handler_can_allocate() {
 }
 
 /// Deeply nested source either runs or is a catchable SyntaxError, on every tier and on a 1 MiB
-/// thread stack: the parser bounds the nesting of statements, expressions, patterns and chains
+/// thread stack: the parser bounds the nesting of statements, expressions and patterns
 /// (`MAX_PARSE_DEPTH`), and the parser, the AST passes, the compiler and the tree-walking
 /// evaluator continue on fresh stack segments when theirs runs low. Before, a few thousand
-/// chained calls, nested blocks or `else if`s overflowed the native stack and aborted. Values
-/// are node's (given `--stack-size` large enough to parse them).
+/// nested blocks or `else if`s overflowed the native stack and aborted. Values are node's
+/// (given `--stack-size` large enough to parse them).
 #[test]
 fn deeply_nested_source_runs_or_throws_syntax_error() {
     // (description, JavaScript building the source for `n` levels, expected completion)
     let cases: &[(&str, &str, &str)] = &[
-        ("additions", "Array(n).fill('1').join('+')", "4000"),
-        ("member chain", "'a' + '.b'.repeat(n) + ' === a'", "true"),
-        ("call chain", "'g' + '()'.repeat(n) + ' === g'", "true"),
-        ("optional chain", "'a' + '?.b'.repeat(n) + ' === a'", "true"),
         ("new chain", "'new '.repeat(n) + 'G === G'", "true"),
         ("exponents", "Array(n).fill('1').join('**')", "1"),
         ("assignments", "'x = '.repeat(n) + '3'", "3"),
@@ -2125,7 +2121,7 @@ fn deeply_nested_source_runs_or_throws_syntax_error() {
             "'(function () { return '.repeat(n / 8) + '9' + '; })()'.repeat(n / 8)",
             "9",
         ),
-        ("templates", "'`${'.repeat(n / 8) + '4' + '}`'.repeat(n / 8)", "4"),
+        ("templates", "'`${'.repeat(n / 4) + '4' + '}`'.repeat(n / 4)", "4"),
     ];
     let mut script = String::from(
         "var a = {}; a.b = a; function g() { return g; } function G() { return G; } var x = 0;
@@ -2156,6 +2152,91 @@ fn deeply_nested_source_runs_or_throws_syntax_error() {
         let expected = expected.clone();
         let outcome = std::thread::Builder::new()
             .name(format!("deep-source-{tier:?}"))
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(run_in(&mut engine, &script), expected, "{tier:?}");
+            })
+            .expect("spawn")
+            .join();
+        assert!(outcome.is_ok(), "{tier:?} failed");
+    }
+}
+
+/// Left-nested chains are as deep as they are long, but generated and obfuscated code builds
+/// them with hundreds of thousands of links (node runs a million `+` operands), so they are not
+/// bounded by the nesting limit: these 30,000-link chains, six times that limit, run on every
+/// tier on a 1 MiB thread stack, at the top level and in a function that compiles. Operator,
+/// property and call chains are compiled and evaluated in a loop; the other walks grow their
+/// stack. Values are node's where node has the stack for them (it runs out on long property,
+/// call and tagged-template chains).
+#[test]
+fn long_expression_chains_run() {
+    // (description, JavaScript building an expression of `n` links, expected value)
+    let cases: &[(&str, &str, &str)] = &[
+        ("additions", "Array(n).fill('1').join('+')", "30000"),
+        (
+            "concatenation",
+            "'(' + Array(n).fill(\"'x'\").join('+') + ').length'",
+            "30000",
+        ),
+        (
+            "logical",
+            "Array(n).fill('one').join(' && ') + ' || 2'",
+            "1",
+        ),
+        (
+            "coalescing",
+            "Array(n).fill('none').join(' ?? ') + ' ?? 3'",
+            "3",
+        ),
+        ("bitwise", "Array(n).fill('one').join(' | ')", "1"),
+        ("comma", "'(' + Array(n).fill('one').join(', ') + ')'", "1"),
+        ("template", "'`' + '${one}'.repeat(n) + '`.length'", "30000"),
+        ("member chain", "'a' + '.b'.repeat(n) + ' === a'", "true"),
+        (
+            "index chain",
+            "'a' + '[\"b\"]'.repeat(n) + ' === a'",
+            "true",
+        ),
+        ("optional chain", "'a' + '?.b'.repeat(n) + ' === a'", "true"),
+        ("call chain", "'g' + '()'.repeat(n) + ' === g'", "true"),
+        ("method chain", "'a' + '.m()'.repeat(n) + ' === a'", "true"),
+        (
+            "tagged templates",
+            "'g' + '`x`'.repeat(n) + ' === g'",
+            "true",
+        ),
+    ];
+    let mut script = String::from(
+        "var one = 1, none = null, a = { m() { return a; } }; a.b = a;
+         function g() { return g; }
+         var results = [];",
+    );
+    for (_, build, _) in cases {
+        script.push_str(&format!(
+            "results.push(String((0, eval)((function (n) {{ return {build}; }})(30000))));
+             var inner = Function('return ' + (function (n) {{ return {build}; }})(30000));
+             results.push(String(inner()) + ':' + String(inner()));"
+        ));
+    }
+    script.push_str("results.join('|')");
+    let expected = cases
+        .iter()
+        .map(|(_, _, value)| format!("{value}|{value}:{value}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let script = script.clone();
+        let expected = expected.clone();
+        let outcome = std::thread::Builder::new()
+            .name(format!("long-chains-{tier:?}"))
             .stack_size(1 << 20)
             .spawn(move || {
                 let mut engine = Engine::new();
