@@ -15250,6 +15250,48 @@ fn number_precision_and_exponential_round_exact_ties_up_in_all_tiers() {
         );
     }
 }
+/// toPrecision, toFixed and toExponential range-check ToIntegerOrInfinity of their argument, in
+/// the specification's step order relative to a non-finite receiver (ECMA-262 §21.1.3.5,
+/// §21.1.3.3, §21.1.3.2). Expected values are node's.
+#[test]
+fn number_formatting_arguments_are_integers_before_their_range_checks_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        t(function () { return (1).toPrecision(100.5).length; });
+        t(function () { return (1).toPrecision(0.5); });
+        t(function () { return (1).toPrecision(-0.5); });
+        t(function () { return (1).toPrecision(1.9); });
+        t(function () { return (NaN).toPrecision(0); });
+        t(function () { return (-Infinity).toPrecision(1000); });
+        t(function () { return (1).toPrecision(NaN); });
+        t(function () { return (1).toPrecision({ valueOf() { out.push('valueOf'); return 2; } }); });
+        t(function () { return (1).toFixed(100.9).length; });
+        t(function () { return (NaN).toFixed(101); });
+        t(function () { return (Infinity).toFixed(-1); });
+        t(function () { return (1).toExponential(100.9).length; });
+        t(function () { return (NaN).toExponential(101); });
+        t(function () { return (Infinity).toExponential(-1); });
+        t(function () { return (1).toExponential(-0.5); });
+        t(function () { return (1).toFixed(-0.5); });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "101,RangeError,RangeError,1,NaN,-Infinity,RangeError,valueOf,1.0,102,RangeError,\
+             RangeError,105,NaN,Infinity,1e+0,1",
+            "{tier:?}"
+        );
+    }
+}
 #[test]
 fn shadow_realm_basic() {
     assert_eq!(run("typeof ShadowRealm"), "function");

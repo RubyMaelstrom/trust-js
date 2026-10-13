@@ -69,7 +69,10 @@ pub(super) fn install_number(it: &mut Interp) {
         if matches!(arg(args, 0), Value::Undefined) {
             return Ok(Value::lstr(i.num_to_str(n)));
         }
+        // ToIntegerOrInfinity(precision): NaN is 0, anything else truncates toward zero, so
+        // 100.5 is 100 and in range while 0.5 is 0 and not.
         let p = ab(i.to_number(&arg(args, 0)))?;
+        let p = if p.is_nan() { 0.0 } else { p.trunc() };
         if n.is_nan() {
             return Ok(Value::lstr("NaN"));
         }
