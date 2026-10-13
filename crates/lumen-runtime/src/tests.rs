@@ -1266,6 +1266,35 @@ fn error_reporting_globals() {
 }
 
 #[test]
+fn caught_module_evaluation_error_reports_no_rejection() {
+    // A dependency's evaluation error reaches the importer through its import() promise. The
+    // engine's per-module evaluation promises are internal: catching the import leaves nothing
+    // to report, as in Node.
+    use std::fs;
+    let dir = TempDir::new("module-evaluation-error");
+    let root = dir.0.clone();
+    fs::write(
+        root.join("main.mjs"),
+        r#"
+        try { await import("./mid.mjs"); } catch (e) { console.log("caught", e.message); }
+        import("./mid.mjs").catch((e) => console.log("caught again", e.message));
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("mid.mjs"),
+        "import './dep.mjs'; export const x = 1;",
+    )
+    .unwrap();
+    fs::write(root.join("dep.mjs"), "throw new TypeError('boom');").unwrap();
+    let (mut rt, out, err) = test_runtime();
+    rt.run_module(&root.join("main.mjs").to_string_lossy())
+        .expect("module runs");
+    assert_eq!(out.lines(), ["caught boom", "caught again boom"]);
+    assert!(err.lines().is_empty(), "{:?}", err.lines());
+}
+
+#[test]
 fn message_channel_semantics() {
     // Channel messaging: data serializes synchronously at postMessage (later mutations are
     // invisible), delivery queues until the receiving port starts (assigning onmessage starts

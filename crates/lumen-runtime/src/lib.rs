@@ -527,11 +527,18 @@ impl Runtime {
         }
     }
 
+    /// The next timer deadline, or an earlier Atomics.waitAsync timeout, whose promise resolves
+    /// at the checkpoint after it (a pending wait alone does not keep the loop alive).
     fn next_timer_deadline(&mut self) -> Option<Instant> {
-        self.engine
+        let timer = self
+            .engine
             .ctx()
-            .host_mut::<lumen_timers::Timers>()?
-            .next_deadline()
+            .host_mut::<lumen_timers::Timers>()
+            .and_then(|timers| timers.next_deadline());
+        match (timer, self.engine.next_atomics_wait_deadline()) {
+            (Some(timer), Some(wait)) => Some(timer.min(wait)),
+            (timer, wait) => timer.or(wait),
+        }
     }
 
     /// Settle one completed task: decode the payload, then run the success callback — or the

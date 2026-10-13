@@ -13989,6 +13989,49 @@ fn uint8_setfrom() {
         "72,105,0"
     );
 }
+
+/// GetUint8ArrayBytes and SetUint8ArrayBytes (ECMA-262 §23.2.8) read and write the viewed
+/// buffer's Data Block: a SharedArrayBuffer's shared block, a length-tracking view's current
+/// length, and ValidateTypedArrayBounds' TypeError for a view out of bounds of a shrunk
+/// resizable buffer (which used to panic). toHex/toBase64 values are Node's.
+#[test]
+fn uint8_base64_hex_use_the_live_view() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var shared = new Uint8Array(new SharedArrayBuffer(4));
+shared[0] = 1; shared[3] = 255;
+out.push(shared.toHex(), shared.toBase64());
+var r = shared.setFromHex('0a0b');
+out.push(r.read + ':' + r.written, new Uint8Array(shared.buffer).join('|'));
+r = shared.setFromBase64('AQID');
+out.push(r.read + ':' + r.written, shared.join('|'));
+var rab = new ArrayBuffer(8, {maxByteLength: 16});
+var fixed = new Uint8Array(rab, 0, 8);
+var tracking = new Uint8Array(rab, 2);
+rab.resize(4);
+for (var f of [() => fixed.toHex(), () => fixed.toBase64(), () => fixed.setFromHex('ab'),
+               () => fixed.setFromBase64('AA==')]) {
+  try { f(); out.push('no'); } catch (e) { out.push(e.name); }
+}
+new Uint8Array(rab).set([1, 2, 3, 4]);
+out.push(tracking.toHex(), tracking.toBase64());
+r = tracking.setFromHex('ffeeddcc');
+out.push(r.read + ':' + r.written, new Uint8Array(rab).join('|'));
+rab.resize(1);
+try { tracking.toHex(); out.push('no'); } catch (e) { out.push(e.name); }
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "010000ff,AQAA/w==,4:2,10|11|0|255,4:3,1|2|3|255,TypeError,TypeError,TypeError,\
+             TypeError,0304,AwQ=,4:2,1|2|255|238,TypeError",
+            "tier {tier:?}"
+        );
+    }
+}
 #[test]
 fn float16_array() {
     // f16 round-trip correctness against known values.
@@ -17694,6 +17737,60 @@ fn shared_array_buffer_aliasing() {
     );
 }
 
+/// A growable SharedArrayBuffer's length is that of its Shared Data Block (ECMA-262
+/// ArrayBufferByteLength, SharedArrayBuffer.prototype.grow): after `grow`, length-tracking
+/// TypedArrays and DataViews see and write the new bytes, and a DataView's tracking is decided
+/// by the [[ArrayBufferMaxByteLength]] slot, not a `growable` accessor. Expected values are
+/// Node's. The engine keeps no second copy of the bytes beside the shared block.
+#[test]
+fn growable_shared_array_buffer_grows_its_shared_block() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var sab = new SharedArrayBuffer(4, {maxByteLength: 16});
+var tracking = new Uint8Array(sab);
+var fixed = new Uint8Array(sab, 0, 4);
+var dv = new DataView(sab);
+var dvFixed = new DataView(sab, 0, 4);
+fixed[1] = 7;
+sab.grow(8);
+tracking[6] = 5;
+out.push(tracking[6], tracking.length, fixed.length, sab.byteLength, dv.byteLength,
+         dvFixed.byteLength);
+out.push(dv.getUint8(6), new Uint8Array(sab)[6], tracking[1]);
+dv.setUint8(7, 9);
+out.push(tracking[7], Atomics.add(tracking, 7, 1), Atomics.load(tracking, 7));
+var late = new Uint8Array(sab, 4);
+out.push(late.length, late[2]);
+try { sab.grow(6); out.push('no'); } catch (e) { out.push(e.name); }
+try { sab.grow(17); out.push('no'); } catch (e) { out.push(e.name); }
+sab.grow(8);
+out.push(sab.byteLength, sab.slice(5, 8).byteLength, new Uint8Array(sab.slice(5, 8)).join('|'));
+Object.defineProperty(SharedArrayBuffer.prototype, 'growable', {get() { return false; }});
+var dv2 = new DataView(sab);
+sab.grow(12);
+out.push(dv2.byteLength, dv.byteLength, tracking.length);
+var big = new SharedArrayBuffer(1 << 20);
+out.push(new DataView(big).byteLength);
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "5,8,4,8,8,4,5,5,7,9,9,10,4,5,RangeError,RangeError,8,3,0|5|10,12,12,12,1048576",
+            "tier {tier:?}"
+        );
+        let local_bytes: usize = engine
+            .interp
+            .array_buffers
+            .values()
+            .map(|bytes| bytes.borrow().capacity())
+            .sum();
+        assert!(local_bytes < 1 << 20, "tier {tier:?}: {local_bytes}");
+    }
+}
+
 #[test]
 fn atomics_wait_async() {
     // A value mismatch resolves synchronously (not async).
@@ -17730,6 +17827,65 @@ fn atomics_wait_async() {
         "#),
         "true"
     );
+}
+
+/// DoWait compares the element with ToInt32(value), or ToBigInt64(value) for a BigInt64Array
+/// (ECMA-262 #sec-dowait), not with the value's mathematical integer: `2 ** 32` waits on 0.
+/// Expected values are Node's.
+#[test]
+fn atomics_wait_converts_the_expected_value_to_the_element_type() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var i32 = new Int32Array(new SharedArrayBuffer(8));
+out.push(Atomics.wait(i32, 0, 2 ** 32, 0), Atomics.wait(i32, 0, 1e300, 0),
+         Atomics.wait(i32, 0, 0.9, 0));
+i32[1] = -1;
+out.push(Atomics.wait(i32, 1, 4294967295, 0), Atomics.wait(i32, 1, -1, 0),
+         Atomics.wait(i32, 1, 2 ** 31, 0));
+out.push(Atomics.waitAsync(i32, 0, 2 ** 32, 0).value, Atomics.waitAsync(i32, 1, 2 ** 32 - 1, 0).value,
+         Atomics.waitAsync(i32, 1, 1, 0).value);
+var i64 = new BigInt64Array(new SharedArrayBuffer(16));
+i64[1] = -1n;
+out.push(Atomics.wait(i64, 0, 2n ** 64n, 0), Atomics.wait(i64, 1, 2n ** 64n - 1n, 0),
+         Atomics.wait(i64, 1, 2n ** 63n, 0), Atomics.waitAsync(i64, 0, -(2n ** 64n), 0).value);
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "timed-out,timed-out,timed-out,timed-out,timed-out,not-equal,timed-out,timed-out,\
+             not-equal,timed-out,timed-out,not-equal,timed-out",
+            "tier {tier:?}"
+        );
+    }
+}
+
+/// DoWait decides a timed-out wait inside the WaiterList's critical section: a waiter that a
+/// notify already took from the list was counted by that notify, so it reports "ok" even when
+/// its timeout elapses first; one still listed leaves the list and reports "timed-out".
+#[test]
+fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
+    use crate::interpreter::{
+        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, BlockedAgent, WaitOutcome,
+        Waiter,
+    };
+    use std::time::Duration;
+    let id = alloc_shared_mem(8);
+    let taken = BlockedAgent::default();
+    with_waiter_list(id, 0, |list| list.push(Waiter::Blocked(taken.clone())));
+    // A notify's removal, before it sets the waiter's flag.
+    with_waiter_list(id, 0, |list| list.clear());
+    let interrupt = crate::RuntimeInterrupt::default();
+    let woken = futex_block(&taken, id, 0, Some(Duration::ZERO), &interrupt);
+    assert!(matches!(woken, WaitOutcome::Woken));
+    let listed = BlockedAgent::default();
+    with_waiter_list(id, 4, |list| list.push(Waiter::Blocked(listed.clone())));
+    let timed_out = futex_block(&listed, id, 4, Some(Duration::ZERO), &interrupt);
+    assert!(matches!(timed_out, WaitOutcome::TimedOut));
+    // It left its list, so a later notify finds no waiter there.
+    assert_eq!(futex_notify(id, 4, -1, None).0, 0);
 }
 
 #[test]
@@ -19205,6 +19361,64 @@ fn failed_module_graph_load_does_not_poison_a_retry() {
     match engine.eval("String(loaded)", false).expect("read result") {
         Completion::Value(value) => assert_eq!(value, "42"),
         Completion::Throw { name, message } => panic!("read threw {name}: {message}"),
+    }
+}
+
+/// A module evaluation promise is internal: a dependency's evaluation error reaches the author
+/// through the import() promise (or the static graph's own throw), and HostPromiseRejectionTracker
+/// never reports the per-module promise. Node prints nothing for a caught `import()` whose
+/// dependency throws.
+#[test]
+fn module_evaluation_errors_report_no_internal_rejection() {
+    use crate::bytecode::Tier;
+    let files = [
+        (
+            "main",
+            "globalThis.out = [];
+             import('mid').then(() => out.push('loaded'), e => out.push('caught ' + e.message));
+             try { await import('late'); } catch (e) { out.push('awaited ' + e.message); }",
+        ),
+        ("mid", "import 'dep'; export const x = 1;"),
+        ("dep", "throw new TypeError('boom');"),
+        ("late", "import 'slow'; export const y = 2;"),
+        ("slow", "await 0; throw new RangeError('late');"),
+        ("static", "import 'dep';"),
+    ];
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let loader = move |spec: &str, _: &str| {
+            files
+                .iter()
+                .find(|(key, _)| *key == spec)
+                .map(|(key, source)| (key.to_string(), source.to_string()))
+        };
+        let completion = engine
+            .eval_module(files[0].1, "main", loader)
+            .expect("parse");
+        assert!(matches!(completion, Completion::Value(_)), "tier {tier:?}");
+        assert_eq!(
+            run_in(&mut engine, "out.join()"),
+            "caught boom,awaited late",
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.unhandled_rejections.is_empty(),
+            "tier {tier:?}"
+        );
+        // A static graph whose dependency throws reports the error once, as its completion.
+        let completion = engine
+            .eval_module(files[5].1, "static", loader)
+            .expect("parse");
+        assert!(
+            matches!(completion, Completion::Throw { ref name, .. } if name == "TypeError"),
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.unhandled_rejections.is_empty(),
+            "tier {tier:?}"
+        );
     }
 }
 
@@ -25974,6 +26188,153 @@ fn atomics_waitasync_sees_same_job_notify() {
     }
 }
 
+/// An `Atomics.waitAsync` promise settles through the agent's job queue (ECMA-262
+/// EnqueueAtomicsWaitAsyncTimeoutJob, NotifyWaiter): evaluation never blocks for a pending wait
+/// (each script with one used to take four seconds), a timeout resolves at a job checkpoint
+/// after it passes, even one a microtask loop keeps running, and a later script's notify still
+/// resolves an earlier script's promise, which used to be dropped.
+#[test]
+fn atomics_wait_async_settles_through_the_job_queue() {
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let started = std::time::Instant::now();
+        run_in(
+            &mut engine,
+            "var out = [];
+             var i32 = new Int32Array(new SharedArrayBuffer(16));
+             Atomics.waitAsync(i32, 0, 0).value.then(v => out.push('later:' + v));
+             Atomics.waitAsync(i32, 1, 0, 60000).value.then(v => out.push('long:' + v));
+             var spun = 0;
+             Atomics.waitAsync(i32, 2, 0, 0.5).value.then(v => out.push('short:' + v));
+             (function spin() { if (out.length === 0) { spun++; Promise.resolve().then(spin); } })();",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "tier {tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "out.join() + ',' + (spun > 0)"),
+            "short:timed-out,true",
+            "tier {tier:?}"
+        );
+        run_in(
+            &mut engine,
+            "Atomics.notify(i32, 0); Atomics.notify(i32, 1);",
+        );
+        assert_eq!(
+            run_in(&mut engine, "out.join()"),
+            "short:timed-out,later:ok,long:ok",
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.pending_async_waits.is_empty(),
+            "tier {tier:?}"
+        );
+    }
+}
+
+/// A notification from another agent reaches a waitAsync waiter through its agent's inbox
+/// (EnqueueResolveInAgentJob), which the host's event loop blocks on.
+#[test]
+fn atomics_wait_async_receives_another_agents_notify() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var out = 'pending';
+         var i32 = new Int32Array(new SharedArrayBuffer(8));
+         Atomics.waitAsync(i32, 0, 0).value.then(v => { out = v; });
+         $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {
+             var a = new Int32Array(sab);
+             $262.agent.report(Atomics.notify(a, 0));
+             $262.agent.leaving();
+         })`);
+         $262.agent.broadcast(i32.buffer);",
+    );
+    engine.run_agent_event_loop().expect("not interrupted");
+    assert_eq!(
+        run_in(&mut engine, "out + ',' + $262.agent.getReport()"),
+        "ok,1"
+    );
+}
+
+/// A host interruption stops an agent suspended in Atomics.wait, which cannot poll: a
+/// cancellation wakes it at once (TRust cancels a page thread, then joins it), an armed deadline
+/// when it passes. The script ends interrupted, not with a catchable error, and the waiter leaves
+/// its WaiterList. A host blocked in the agent event loop is woken the same way.
+#[test]
+fn host_interruption_wakes_a_blocked_atomics_wait() {
+    use crate::bytecode::Tier;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let cancel_soon = |control: &Arc<crate::RuntimeInterrupt>| {
+        let control = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.cancel();
+        })
+    };
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let control = Arc::new(crate::RuntimeInterrupt::default());
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.set_interrupt_handle(control.clone());
+        let canceller = cancel_soon(&control);
+        let started = Instant::now();
+        let outcome = engine
+            .eval_interruptible(
+                "var i32 = new Int32Array(new SharedArrayBuffer(8));
+                 try { Atomics.wait(i32, 0, 0); } catch (e) { 'caught' }",
+                false,
+            )
+            .expect("script parses");
+        canceller.join().expect("canceller thread");
+        assert!(
+            matches!(
+                outcome,
+                ExecutionOutcome::Interrupted {
+                    reason: InterruptReason::Cancelled
+                }
+            ),
+            "tier {tier:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "tier {tier:?}");
+    }
+
+    let control = Arc::new(crate::RuntimeInterrupt::default());
+    let mut engine = Engine::new();
+    engine.set_interrupt_handle(control.clone());
+    run_in(
+        &mut engine,
+        "var i32 = new Int32Array(new SharedArrayBuffer(8));",
+    );
+    control.set_deadline(Some(Instant::now() + Duration::from_millis(100)));
+    let outcome = engine
+        .eval_interruptible("Atomics.wait(i32, 0, 0)", false)
+        .expect("script parses");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::DeadlineExceeded
+        }
+    ));
+    control.set_deadline(None);
+    assert_eq!(run_in(&mut engine, "Atomics.notify(i32, 0)"), "0");
+
+    run_in(&mut engine, "Atomics.waitAsync(i32, 0, 0);");
+    let canceller = cancel_soon(&control);
+    let started = Instant::now();
+    assert_eq!(
+        engine.run_agent_event_loop(),
+        Err(InterruptReason::Cancelled)
+    );
+    canceller.join().expect("canceller thread");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
 #[test]
 fn super_call_early_errors() {
     // SuperCall outside a derived class constructor is a parse-time SyntaxError.
@@ -26430,6 +26791,63 @@ fn import_json_attr_distinct_from_plain_import() {
             Completion::Value(v) => assert_eq!(v, "false:raw:module", "flipped={flipped}"),
             Completion::Throw { name, message } => panic!("threw {name}: {message}"),
         }
+    }
+}
+
+/// JSON, text and bytes modules are synthetic modules whose default export the engine makes
+/// itself (ECMA-262 ParseJSONModule, CreateDefaultExportSyntheticModule): a page that replaced
+/// `JSON.parse`, `Uint8Array` or `ArrayBuffer.prototype.sliceToImmutable` does not change them.
+/// ParseJSONModule runs while loading, so invalid JSON fails the graph before any module of it
+/// evaluates. The JSON results and the unevaluated sibling match Node.
+#[test]
+fn synthetic_modules_ignore_author_replaced_globals() {
+    use crate::bytecode::Tier;
+    let files = [
+        ("/d.json", r#"{"a": 1, "s": "éx", "__proto__": [2]}"#),
+        ("/b.bin", "A\u{ff}\u{0}"),
+        ("/t.txt", "text \u{e9}"),
+        ("/side.js", "globalThis.__side = true;"),
+        (
+            "/bad.js",
+            "import '/side.js'; import b from '/bad.json' with { type: 'json' };",
+        ),
+        ("/bad.json", "{ bad"),
+    ];
+    let main = r#"
+        import data from '/d.json' with { type: 'json' };
+        import bytes from '/b.bin' with { type: 'bytes' };
+        import text from '/t.txt' with { type: 'text' };
+        globalThis.out = [JSON.stringify(data), Object.keys(data).join(),
+                          bytes.join(), bytes.buffer.immutable, text];
+        import('/bad.js').then(() => out.push('loaded'),
+                               e => out.push(e.name + ':' + globalThis.__side));
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        run_in(
+            &mut engine,
+            "JSON.parse = () => ({ hijacked: true });
+             Uint8Array = function () { return { join() { return 'fake'; } }; };
+             Object.defineProperty(ArrayBuffer.prototype, 'sliceToImmutable',
+                                   { value() { throw new Error('observed'); } });",
+        );
+        let completion = engine
+            .eval_module_attrs(main, "/main.js", move |spec, _, _| {
+                files
+                    .iter()
+                    .find(|(key, _)| *key == spec)
+                    .map(|(key, source)| (key.to_string(), source.to_string()))
+            })
+            .expect("parse");
+        assert!(matches!(completion, Completion::Value(_)), "tier {tier:?}");
+        assert_eq!(
+            run_in(&mut engine, "out.join('|')"),
+            "{\"a\":1,\"s\":\"\u{e9}x\",\"__proto__\":[2]}|a,s,__proto__|65,255,0|true|\
+             text \u{e9}|SyntaxError:undefined",
+            "tier {tier:?}"
+        );
     }
 }
 

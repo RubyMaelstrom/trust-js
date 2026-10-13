@@ -789,98 +789,223 @@ pub fn monotonic_now_ms() -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-/// A futex-like wait table for `Atomics.wait`/`notify`, keyed by `(shared-memory id, byte index)`.
-/// Each blocked waiter registers an individual wake handle so `notify` can wake an exact count.
-pub type Waiter = Arc<(Mutex<bool>, Condvar)>;
+/// A futex-like store of the WaiterList Records of `Atomics.wait`/`waitAsync`/`notify`, keyed by
+/// `(shared-memory id, byte index)`. Its one lock is the critical section of every list (ECMA-262
+/// EnterCriticalSection): DoWait compares the element and adds its waiter inside it, and notify
+/// removes waiters inside it, so a notify can never fall between the comparison and the enqueue.
+/// Each waiter has its own wake handle so `notify` can wake an exact count.
 fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
 }
-/// Add a waiter to the list for `(id, index)` without blocking. `Atomics.waitAsync` registers
-/// synchronously (so a notify later in the same job sees it) and blocks on a helper thread.
-pub fn futex_register(id: u64, index: usize) -> Waiter {
-    let waiter: Waiter = Arc::new((Mutex::new(false), Condvar::new()));
-    wait_table()
-        .lock()
-        .unwrap()
-        .entry((id, index))
-        .or_default()
-        .push(waiter.clone());
-    waiter
-}
-/// Block on `(id, index)` until notified or `timeout` elapses. Returns `true` if notified (woken),
-/// `false` if it timed out.
-pub fn futex_wait(id: u64, index: usize, timeout: Option<std::time::Duration>) -> bool {
-    let waiter = futex_register(id, index);
-    futex_block(&waiter, id, index, timeout)
-}
-/// Block on an already-registered waiter.
-pub fn futex_block(
-    waiter: &Waiter,
-    id: u64,
-    index: usize,
-    timeout: Option<std::time::Duration>,
-) -> bool {
-    let (lock, cvar) = &**waiter;
-    let mut woken = lock.lock().unwrap();
-    let result = match timeout {
-        Some(dur) => {
-            let deadline = std::time::Instant::now() + dur;
-            loop {
-                if *woken {
-                    break true;
-                }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break false;
-                }
-                let (g, res) = cvar.wait_timeout(woken, deadline - now).unwrap();
-                woken = g;
-                if *woken {
-                    break true;
-                }
-                if res.timed_out() {
-                    break false;
-                }
-            }
-        }
-        None => loop {
-            if *woken {
-                break true;
-            }
-            woken = cvar.wait(woken).unwrap();
-        },
-    };
-    // On timeout, remove ourselves from the table (a notify may have already pulled us out).
-    if !result {
-        if let Some(v) = wait_table().lock().unwrap().get_mut(&(id, index)) {
-            v.retain(|w| !Arc::ptr_eq(w, waiter));
-        }
+/// Run `f` on the WaiterList of `(id, index)` inside its critical section.
+pub fn with_waiter_list<R>(id: u64, index: usize, f: impl FnOnce(&mut Vec<Waiter>) -> R) -> R {
+    let mut lists = wait_table().lock().unwrap();
+    let list = lists.entry((id, index)).or_default();
+    let result = f(list);
+    if list.is_empty() {
+        lists.remove(&(id, index));
     }
     result
 }
-/// Wake up to `max` (`<0` ⇒ all) waiters on `(id, index)`, returning how many were woken.
-pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
-    let to_wake: Vec<Waiter> = {
-        let mut t = wait_table().lock().unwrap();
-        if let Some(v) = t.get_mut(&(id, index)) {
-            let n = if max < 0 {
-                v.len()
-            } else {
-                (max as usize).min(v.len())
-            };
-            v.drain(0..n).collect()
-        } else {
-            Vec::new()
-        }
-    };
-    let count = to_wake.len() as u64;
-    for w in to_wake {
-        let (lock, cvar) = &*w;
-        *lock.lock().unwrap() = true;
-        cvar.notify_all();
+/// A Waiter Record of a WaiterList.
+#[derive(Clone)]
+pub enum Waiter {
+    /// An agent suspended in `Atomics.wait`.
+    Blocked(BlockedAgent),
+    /// An `Atomics.waitAsync` promise: the token names it among the pending waits of the agent
+    /// that receives its notification from other agents through the inbox.
+    Async(Arc<AsyncWaitInbox>, u64),
+}
+/// The wake handle of an agent suspended in `Atomics.wait`: whether a notify woke it.
+pub type BlockedAgent = Arc<(Mutex<bool>, Condvar)>;
+
+/// The notifications of an agent's `Atomics.waitAsync` waiters that other agents delivered
+/// (ECMA-262 EnqueueResolveInAgentJob), kept until that agent's next job checkpoint resolves
+/// their promises.
+#[derive(Default)]
+pub struct AsyncWaitInbox {
+    notified: Mutex<Vec<u64>>,
+    arrived: Condvar,
+}
+
+impl AsyncWaitInbox {
+    fn deliver(&self, token: u64) {
+        self.notified.lock().unwrap().push(token);
+        self.arrived.notify_all();
     }
-    count
+    /// The tokens delivered since the last call.
+    pub(crate) fn take(&self) -> Vec<u64> {
+        std::mem::take(&mut self.notified.lock().unwrap())
+    }
+    #[cfg(feature = "embed")]
+    pub(crate) fn has_notifications(&self) -> bool {
+        !self.notified.lock().unwrap().is_empty()
+    }
+    /// Block until a notification arrives, `deadline` passes or the host interrupts the agent.
+    pub(crate) fn wait_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+        interrupt: &crate::RuntimeInterrupt,
+    ) {
+        let inbox = self.clone();
+        let wake = crate::interrupt::BlockedWake(Arc::new(move || {
+            let _held = inbox.notified.lock().unwrap();
+            inbox.arrived.notify_all();
+        }));
+        interrupt.while_blocked(wake, || {
+            let notified = self.notified.lock().unwrap();
+            if !notified.is_empty() || interrupt.current_reason().is_some() {
+                return;
+            }
+            let wake_at = interrupt
+                .armed_deadline()
+                .map_or(deadline, |armed| armed.min(deadline));
+            let now = std::time::Instant::now();
+            if wake_at > now {
+                drop(self.arrived.wait_timeout(notified, wake_at - now).unwrap());
+            }
+        });
+    }
+}
+
+/// How an agent suspended in `Atomics.wait` resumed.
+pub enum WaitOutcome {
+    /// A notify woke it ("ok").
+    Woken,
+    /// Its timeout elapsed ("timed-out").
+    TimedOut,
+    /// The host interrupted the agent (see [`crate::RuntimeInterrupt`]).
+    Interrupted,
+}
+
+/// An `Atomics.waitAsync` that went async (ECMA-262 DoWait): its promise, and the Waiter Record
+/// it keeps in the list of `(id, index)` until a notify or its timeout.
+pub(crate) struct AsyncWait {
+    pub(crate) promise: Value,
+    pub(crate) token: u64,
+    pub(crate) id: u64,
+    pub(crate) index: usize,
+    /// When its timeout job runs (EnqueueAtomicsWaitAsyncTimeoutJob); `None` never times out.
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+/// A token for a new `Atomics.waitAsync` waiter, unique in the process.
+pub(crate) fn next_async_wait_token() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Take async waiter `token` from the list of `(id, index)` for its timeout; `false` when a
+/// notify already took it.
+pub(crate) fn futex_remove_async(id: u64, index: usize, token: u64) -> bool {
+    with_waiter_list(id, index, |list| {
+        let Some(at) = list
+            .iter()
+            .position(|w| matches!(w, Waiter::Async(_, t) if *t == token))
+        else {
+            return false;
+        };
+        list.remove(at);
+        true
+    })
+}
+
+/// Block an agent waiting in the list of `(id, index)` until a notify wakes it, `timeout`
+/// elapses, or the host interrupts it: a cancellation or navigation request wakes it at once,
+/// and an armed deadline when it passes. A waiter that stops for a timeout or an interruption
+/// leaves its list in the critical section, unless a notify removed it first: that notify
+/// counted it as woken, so it reports "ok".
+pub fn futex_block(
+    agent: &BlockedAgent,
+    id: u64,
+    index: usize,
+    timeout: Option<std::time::Duration>,
+    interrupt: &crate::RuntimeInterrupt,
+) -> WaitOutcome {
+    let (lock, cvar) = &**agent;
+    // A timeout too far away to represent never elapses.
+    let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
+    let wake = {
+        let agent = agent.clone();
+        crate::interrupt::BlockedWake(Arc::new(move || {
+            let _held = agent.0.lock().unwrap();
+            agent.1.notify_all();
+        }))
+    };
+    let stopped = interrupt.while_blocked(wake, || {
+        let mut woken = lock.lock().unwrap();
+        loop {
+            if *woken {
+                return None;
+            }
+            if interrupt.current_reason().is_some() {
+                return Some(WaitOutcome::Interrupted);
+            }
+            let now = std::time::Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Some(WaitOutcome::TimedOut);
+            }
+            woken = match [deadline, interrupt.armed_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+            {
+                Some(wake_at) => {
+                    let wait = wake_at.saturating_duration_since(now);
+                    cvar.wait_timeout(woken, wait).unwrap().0
+                }
+                None => cvar.wait(woken).unwrap(),
+            };
+        }
+    });
+    let Some(outcome) = stopped else {
+        return WaitOutcome::Woken;
+    };
+    with_waiter_list(id, index, |list| {
+        let Some(at) = list
+            .iter()
+            .position(|w| matches!(w, Waiter::Blocked(b) if Arc::ptr_eq(b, agent)))
+        else {
+            return WaitOutcome::Woken;
+        };
+        list.remove(at);
+        outcome
+    })
+}
+/// Atomics.notify: take up to `max` (`<0` ⇒ all) waiters of `(id, index)` in list order and
+/// notify each (ECMA-262 NotifyWaiter): wake a blocked agent, or deliver an async waiter's token
+/// to its agent's inbox — except the calling agent's own (inbox `own`), whose tokens are
+/// returned for the caller to resolve at once. Returns the count and those tokens.
+pub fn futex_notify(
+    id: u64,
+    index: usize,
+    max: i64,
+    own: Option<&Arc<AsyncWaitInbox>>,
+) -> (u64, Vec<u64>) {
+    let taken: Vec<Waiter> = with_waiter_list(id, index, |list| {
+        let n = if max < 0 {
+            list.len()
+        } else {
+            (max as usize).min(list.len())
+        };
+        list.drain(..n).collect()
+    });
+    let mut own_tokens = Vec::new();
+    for waiter in &taken {
+        match waiter {
+            Waiter::Blocked(agent) => {
+                let (lock, cvar) = &**agent;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
+            Waiter::Async(inbox, token) if own.is_some_and(|own| Arc::ptr_eq(own, inbox)) => {
+                own_tokens.push(*token);
+            }
+            Waiter::Async(inbox, token) => inbox.deliver(*token),
+        }
+    }
+    (taken.len() as u64, own_tokens)
 }
 
 pub type Env = Rc<RefCell<Scope>>;
@@ -3084,8 +3209,9 @@ pub struct Interp {
     pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
     /// Bounded, conservative byte ranges covering writes since the last host synchronization.
     pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
-    /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
-    /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
+    /// SharedArrayBuffer pointers → their global shared-memory id. The bytes and the current
+    /// length live in the registry's Shared Data Block (see `array_buffer_byte_length`);
+    /// `array_buffers` keeps an empty entry so a SharedArrayBuffer counts as attached.
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
     /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
     /// bytes can be read but never written, resized, detached, or transferred.
@@ -3097,9 +3223,11 @@ pub struct Interp {
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
-    /// Pending `Atomics.waitAsync` operations: each carries the result promise and a channel that a
-    /// waiter thread sends "ok"/"timed-out" on. The event loop resolves them as they complete.
-    pub(crate) pending_async_waits: Vec<(Value, std::sync::mpsc::Receiver<&'static str>)>,
+    /// This agent's `Atomics.waitAsync` waiters still in a WaiterList, oldest first. Job
+    /// checkpoints resolve their promises once notified or timed out (`settle_async_waits`).
+    pub(crate) pending_async_waits: Vec<AsyncWait>,
+    /// Where other agents deliver notifications of those waiters (made on first use).
+    pub(crate) async_wait_inbox: Option<Arc<AsyncWaitInbox>>,
     /// Host timers from `$262.agent.setTimeout`: (callback, deadline).
     pub(crate) pending_timers: Vec<(Value, std::time::Instant)>,
     /// Agent-harness wiring (present only in spawned agents / a main with agents).
@@ -3434,6 +3562,7 @@ interp_memory_inventory! {
     host_keyed_buffers => "measured",
     can_block => "non_owning",
     pending_async_waits => "measured",
+    async_wait_inbox => "measured",
     pending_timers => "measured",
     agent => "measured",
     typed_arrays => "measured",
@@ -3527,7 +3656,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 162);
+    assert_eq!(names.len(), 163);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4728,6 +4857,7 @@ impl Interp {
             host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
             pending_async_waits: Vec::new(),
+            async_wait_inbox: None,
             pending_timers: Vec::new(),
             agent: None,
             typed_arrays: Default::default(),
@@ -6116,6 +6246,12 @@ impl Interp {
             crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
         };
         let byte_len = len * elem;
+        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+            // The registry keeps a Shared Data Block alive; only a grow moves its bytes.
+            let block = shared_mem_get(id)?;
+            let ptr = unsafe { block.lock().unwrap().as_mut_ptr().add(info.offset) };
+            return Some((code, byte_len, ptr));
+        }
         // N-API receives a live mutable pointer and may write through it after this call returns.
         self.mark_array_buffer_dirty(info.buffer);
         let storage = self.array_buffers.get(&info.buffer)?;
@@ -6997,6 +7133,9 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
+        if self.shared_buffers.contains_key(&ptr) {
+            return false;
+        }
         self.host_keyed_buffers.remove(&ptr);
         self.invalidate_native_buffer(ptr);
         let removed = self.array_buffers.remove(&ptr).is_some();
@@ -9853,8 +9992,19 @@ impl Interp {
     /// whose resizable buffer shrank below its range) or its buffer is detached. A length-tracking
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
-        let buflen = self.array_buffers.get(&info.buffer)?.borrow().len();
-        info.length_for_buffer(buflen)
+        info.length_for_buffer(self.array_buffer_byte_length(info.buffer)?)
+    }
+
+    /// ArrayBufferByteLength (ECMA-262 #sec-arraybufferbytelength) of the buffer object at `ptr`,
+    /// or `None` when it is detached. A SharedArrayBuffer's length is that of its Shared Data
+    /// Block, which any agent sharing it may grow; its `array_buffers` entry holds no bytes.
+    pub(crate) fn array_buffer_byte_length(&self, ptr: usize) -> Option<usize> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&ptr) {
+                return shared_mem_get(id).map(|block| block.lock().unwrap().len());
+            }
+        }
+        Some(self.array_buffers.get(&ptr)?.borrow().len())
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid

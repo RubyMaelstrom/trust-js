@@ -566,7 +566,21 @@ impl Engine {
             report_tx,
             broadcast_rx: Some(broadcast_rx),
         }));
-        let _ = self.eval(src, false);
+        if let Ok(Completion::Value(_)) = self.eval(src, false) {
+            let _ = self.run_agent_event_loop();
+        }
+    }
+
+    /// The event loop of a host whose only work is this agent's, such as a test262 runner: run
+    /// jobs until no `Atomics.waitAsync` promise or `$262.agent.setTimeout` timer is pending,
+    /// blocking between them for the next timeout or a notification from another agent. It gives
+    /// up after four seconds in which nothing settles. Evaluation entry points never block on
+    /// this work; an embedder with its own event loop uses its checkpoints instead.
+    pub fn run_agent_event_loop(&mut self) -> Result<(), crate::InterruptReason> {
+        self.interp.activate_gc_heap();
+        let result = self.interp.run_agent_event_loop();
+        self.interp.gc_task_boundary();
+        result
     }
 
     /// Parse and run `src`. `strict` forces strict mode (used for the test262 strict variant); a
@@ -605,7 +619,7 @@ impl Engine {
         match result {
             Ok(v) => {
                 // Run queued promise reactions (the microtask checkpoint after the script).
-                if let Err(reason) = self.interp.run_agent_event_loop() {
+                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
@@ -614,7 +628,7 @@ impl Engine {
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
                 crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.run_agent_event_loop() {
+                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
@@ -662,7 +676,7 @@ impl Engine {
         let result = self.interp.run_program(&body);
         match result {
             Ok(v) => {
-                if let Err(reason) = self.interp.run_agent_event_loop() {
+                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
@@ -671,7 +685,7 @@ impl Engine {
             }
             Err(interpreter::Abrupt::Throw(thrown)) => {
                 crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.run_agent_event_loop() {
+                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
@@ -793,7 +807,7 @@ impl Engine {
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
         let result = self.interp.load_module(key, src);
         Ok(match result {
-            Ok(_) => match self.interp.run_agent_event_loop() {
+            Ok(_) => match self.interp.drain_microtasks_interruptible() {
                 Ok(()) => {
                     self.interp.gc_task_boundary();
                     ExecutionOutcome::Value(String::new())
@@ -805,7 +819,7 @@ impl Engine {
             },
             Err(interpreter::Abrupt::Throw(value)) => {
                 crate::jit::perf_error_escaped();
-                if let Err(reason) = self.interp.run_agent_event_loop() {
+                if let Err(reason) = self.interp.drain_microtasks_interruptible() {
                     self.interp.gc_task_boundary();
                     return Ok(ExecutionOutcome::Interrupted { reason });
                 }
@@ -1457,7 +1471,16 @@ impl Engine {
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is
     /// really over).
     pub fn has_pending_jobs(&self) -> bool {
-        !self.interp.microtasks.is_empty() || !self.interp.pending_finalization_cleanup.is_empty()
+        !self.interp.microtasks.is_empty()
+            || !self.interp.pending_finalization_cleanup.is_empty()
+            || self.interp.async_waits_ready()
+    }
+
+    /// When the earliest pending `Atomics.waitAsync` times out. Its promise resolves at the first
+    /// job checkpoint from then on, so a host event loop should run one at this time
+    /// (HostEnqueueTimeoutJob). A pending wait does not otherwise keep the loop alive.
+    pub fn next_atomics_wait_deadline(&self) -> Option<std::time::Instant> {
+        self.interp.next_async_wait_deadline()
     }
 
     /// Run a single queued job; `false` when the queue was empty or a host interruption stopped
@@ -1469,6 +1492,9 @@ impl Engine {
     /// Run one queued job, preserving a host interruption from the job's JavaScript callback.
     pub fn run_one_job_interruptible(&mut self) -> Result<bool, crate::InterruptReason> {
         self.interp.activate_gc_heap();
+        // Resolving the Atomics.waitAsync promises that can settle is a job, which may queue
+        // reaction jobs.
+        let settled = self.interp.settle_async_waits();
         match self.interp.microtasks.pop_front() {
             Some(job) => {
                 self.interp.run_job_interruptible(job)?;
@@ -1480,7 +1506,7 @@ impl Engine {
                     self.interp.run_finalization_cleanup_job(registry)?;
                     Ok(true)
                 }
-                None => Ok(false),
+                None => Ok(settled),
             },
         }
     }

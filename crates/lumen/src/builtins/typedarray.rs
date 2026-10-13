@@ -30,12 +30,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
-        Ok(Value::Num(
-            i.array_buffers
-                .get(&p)
-                .map(|b| b.borrow().len())
-                .unwrap_or(0) as f64,
-        ))
+        Ok(Value::Num(i.array_buffer_byte_length(p).unwrap_or(0) as f64))
     });
     sab_getter(it, &proto, "maxByteLength", |i, this, _| {
         require_shared_buffer(i, &this)?;
@@ -65,21 +60,21 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
         }
         let new_len = to_index(i, &arg(a, 0))?;
-        let cur = i
-            .array_buffers
-            .get(&ptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0);
+        // The length is the Shared Data Block's, which every agent sharing the buffer sees.
+        // Holding its lock across the check and the resize orders racing grows, as the spec's
+        // compare-exchange loop on [[ArrayBufferByteLengthData]] does.
+        let Some(block) = crate::interpreter::shared_mem_get(i.shared_buffers[&ptr]) else {
+            return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
+        };
+        let mut bytes = block.lock().unwrap();
+        let cur = bytes.len();
         if new_len == cur {
             return Ok(Value::Undefined);
         }
-        if new_len < cur || new_len > max {
+        if new_len < cur || new_len > max || bytes.try_reserve_exact(new_len - cur).is_err() {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.borrow_mut().resize(new_len, 0);
-            i.mark_array_buffer_dirty(ptr);
-        }
+        bytes.resize(new_len, 0);
         Ok(Value::Undefined)
     });
     if let Some(key) = well_known_key(it, "toStringTag") {
@@ -100,11 +95,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
                 )
             })?;
         let ptr = Rc::as_ptr(o) as usize;
-        let len = i
-            .array_buffers
-            .get(&ptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0) as i64;
+        let len = i.array_buffer_byte_length(ptr).unwrap_or(0) as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -140,30 +131,21 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             ));
         }
         // The new buffer must be at least `new_len` bytes.
-        let dst_byte_len = i
-            .array_buffers
-            .get(&nptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0);
-        if dst_byte_len < new_len {
+        if i.array_buffer_byte_length(nptr).unwrap_or(0) < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
-        // A SharedArrayBuffer's bytes live in the process-global shared block keyed by `__sab_id`.
-        let src_id = match i.get_member(&this, "#\u{0}sab_id") {
-            Ok(Value::Num(n)) => n as u64,
-            _ => return Err(i.make_error("TypeError", "not a SharedArrayBuffer")),
-        };
-        let src = crate::interpreter::shared_mem_get(src_id)
-            .map(|m| m.lock().unwrap().clone())
-            .unwrap_or_default();
-        if begin < end && (end as usize) <= src.len() {
-            let slice = src[begin as usize..end as usize].to_vec();
-            if let Ok(Value::Num(dst_id)) = i.get_member(&new_buf, "#\u{0}sab_id") {
-                if let Some(m) = crate::interpreter::shared_mem_get(dst_id as u64) {
-                    let mut buf = m.lock().unwrap();
-                    let n = slice.len().min(buf.len());
-                    buf[..n].copy_from_slice(&slice[..n]);
-                }
+        // Both buffers' bytes live in their process-global Shared Data Blocks.
+        let block = |i: &Interp, p: usize| crate::interpreter::shared_mem_get(i.shared_buffers[&p]);
+        if let (true, Some(src), Some(dst)) = (begin < end, block(i, ptr), block(i, nptr)) {
+            let slice = src
+                .lock()
+                .unwrap()
+                .get(begin as usize..end as usize)
+                .map(<[u8]>::to_vec);
+            if let Some(slice) = slice {
+                let mut buf = dst.lock().unwrap();
+                let n = slice.len().min(buf.len());
+                buf[..n].copy_from_slice(&slice[..n]);
             }
         }
         Ok(new_buf)
@@ -202,8 +184,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers
-            .insert(bp, Rc::new(RefCell::new(vec![0u8; len])));
+        // The bytes live in the Shared Data Block allocated below; this entry holds none.
+        i.array_buffers.insert(bp, Default::default());
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
@@ -803,6 +785,27 @@ pub(crate) fn typed_array_from_bytes(
 ) -> (Value, TaInfo) {
     let len = bytes.len() / kind.elsize();
     let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
+    typed_array_over(i, kind, buf_val, buf_ptr, len)
+}
+
+/// A `bytes` module's default export: a Uint8Array over a fresh immutable ArrayBuffer holding
+/// `bytes` (Import Bytes proposal), from the current Realm's intrinsics without author code.
+pub(crate) fn immutable_uint8_array(i: &mut Interp, bytes: Vec<u8>) -> Value {
+    let len = bytes.len();
+    let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
+    // Immutable before the view registers, so native code never gets a writable view of it.
+    i.immutable_buffers.insert(buf_ptr);
+    typed_array_over(i, TaKind::U8, buf_val, buf_ptr, len).0
+}
+
+/// A `kind` TypedArray viewing all `len` elements of the fresh ArrayBuffer `buf_val`.
+fn typed_array_over(
+    i: &mut Interp,
+    kind: TaKind,
+    buf_val: Value,
+    buf_ptr: usize,
+    len: usize,
+) -> (Value, TaInfo) {
     let obj = Object::new(i.extra_protos.get(kind.name()).cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
@@ -1747,10 +1750,9 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 _ => None,
             };
             // Coercing byteOffset/length above may have detached the buffer.
-            if !i.array_buffers.contains_key(&bp) {
+            let Some(buflen) = i.array_buffer_byte_length(bp) else {
                 return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-            }
-            let buflen = i.array_buffers[&bp].borrow().len();
+            };
             // A resizable ArrayBuffer or a growable SharedArrayBuffer makes an auto-length view
             // length-tracking.
             let resizable = matches!(
@@ -2437,23 +2439,15 @@ fn hex_decode_spec(s: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
     (index, out, false)
 }
 
-/// Read a Uint8Array receiver's bytes; errors if `this` isn't a (non-detached) Uint8Array.
+/// ValidateUint8Array, then GetUint8ArrayBytes: the bytes the view covers now (a length-tracking
+/// view follows its buffer; a SharedArrayBuffer is read from its shared Data Block). A detached
+/// buffer or a view out of bounds of a shrunk resizable buffer is a TypeError
+/// (ValidateTypedArrayBounds).
 fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
-    let ptr = map_ptr(this).ok_or_else(|| i.make_error("TypeError", "not a Uint8Array"))?;
-    let info = *i
-        .typed_arrays
-        .get(&ptr)
-        .ok_or_else(|| i.make_error("TypeError", "not a Uint8Array"))?;
-    if !matches!(info.kind, TaKind::U8) {
-        return Err(i.make_error("TypeError", "method requires a Uint8Array"));
-    }
-    let storage = i
-        .array_buffers
-        .get(&info.buffer)
-        .cloned()
-        .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
-    let buf = storage.borrow();
-    Ok(buf[info.offset..info.offset + info.len].to_vec())
+    let info = u8_validate(i, this)?;
+    i.ta_len(&info)
+        .and_then(|len| i.ta_read_bytes(&info, 0, len))
+        .ok_or_else(|| i.make_error("TypeError", "Uint8Array is detached or out of bounds"))
 }
 /// The new Uint8Array of `Uint8Array.fromBase64`/`fromHex`: AllocateTypedArray("Uint8Array",
 /// %Uint8Array%, %Uint8Array.prototype%, length) and its bytes (proposal-arraybuffer-base64).
@@ -2625,10 +2619,8 @@ fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Res
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get(&info.buffer) {
-        buf.borrow_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
-        i.mark_array_buffer_dirty_range(info.buffer, info.offset, bytes.len());
-    }
+    // The caller decoded at most the view's current length, and decoding runs no author code.
+    i.ta_write_bytes(info, 0, bytes);
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));
     set_data(&result, "written", Value::Num(bytes.len() as f64));

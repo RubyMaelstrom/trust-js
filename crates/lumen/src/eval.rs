@@ -4781,28 +4781,92 @@ impl Interp {
         (Some(realm), host_context)
     }
 
-    /// Drain the microtask queue (called after the main script). Bounded to avoid an unbounded loop.
-    /// Drive microtasks plus any pending `Atomics.waitAsync` operations to completion: resolve each
-    /// async wait as its waiter thread reports, running the scheduled reactions in between.
+    /// Resolve this agent's `Atomics.waitAsync` promises that can settle: with "ok" those that
+    /// other agents notified (ECMA-262 EnqueueResolveInAgentJob), then, in deadline order, with
+    /// "timed-out" those whose timeout passed while they were still listed
+    /// (EnqueueAtomicsWaitAsyncTimeoutJob). A waiter a notify took just before its timeout is
+    /// that notify's, and resolves "ok" when its notification arrives. Returns whether any
+    /// promise resolved; their reactions are queued jobs.
+    pub(crate) fn settle_async_waits(&mut self) -> bool {
+        if self.pending_async_waits.is_empty() {
+            return false;
+        }
+        let mut settled = false;
+        let notified = self
+            .async_wait_inbox
+            .as_ref()
+            .map(|inbox| inbox.take())
+            .unwrap_or_default();
+        for token in notified {
+            settled |= self.resolve_async_wait(token, "ok");
+        }
+        let now = std::time::Instant::now();
+        let mut expired: Vec<_> = self
+            .pending_async_waits
+            .iter()
+            .filter(|wait| wait.deadline.is_some_and(|deadline| deadline <= now))
+            .map(|wait| (wait.deadline, wait.token, wait.id, wait.index))
+            .collect();
+        expired.sort_unstable();
+        for (_, token, id, index) in expired {
+            if crate::interpreter::futex_remove_async(id, index, token) {
+                settled |= self.resolve_async_wait(token, "timed-out");
+            }
+        }
+        settled
+    }
+
+    /// Resolve the promise of this agent's pending `Atomics.waitAsync` `token` with `result`;
+    /// `false` when no such wait is pending.
+    pub(crate) fn resolve_async_wait(&mut self, token: u64, result: &str) -> bool {
+        let Some(at) = self
+            .pending_async_waits
+            .iter()
+            .position(|wait| wait.token == token)
+        else {
+            return false;
+        };
+        let wait = self.pending_async_waits.remove(at);
+        self.resolve_promise(&wait.promise, Value::lstr(result));
+        true
+    }
+
+    /// The earliest timeout of a pending `Atomics.waitAsync`: when a host should next run a job
+    /// checkpoint for it (HostEnqueueTimeoutJob).
+    pub(crate) fn next_async_wait_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_async_waits
+            .iter()
+            .filter_map(|wait| wait.deadline)
+            .min()
+    }
+
+    /// Whether a pending `Atomics.waitAsync` can settle at the next job checkpoint.
+    #[cfg(feature = "embed")]
+    pub(crate) fn async_waits_ready(&self) -> bool {
+        !self.pending_async_waits.is_empty()
+            && (self
+                .async_wait_inbox
+                .as_ref()
+                .is_some_and(|inbox| inbox.has_notifications())
+                || self
+                    .next_async_wait_deadline()
+                    .is_some_and(|deadline| deadline <= std::time::Instant::now()))
+    }
+
+    /// The event loop of a test262 host, which has no work but this agent's: run jobs until no
+    /// `Atomics.waitAsync` promise or `$262.agent` timer is pending, blocking in between until
+    /// the next timeout or timer, or a notification from another agent. A wait that nothing can
+    /// settle would hang the host, so it gives up after four seconds without progress.
     pub(crate) fn run_agent_event_loop(&mut self) -> Result<(), crate::InterruptReason> {
+        const IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
         self.drain_microtasks_interruptible()?;
-        let mut spins = 0u32;
+        let mut idle_since = std::time::Instant::now();
         while !self.pending_async_waits.is_empty() || !self.pending_timers.is_empty() {
             self.interrupt_poll_force().map_err(|abrupt| match abrupt {
                 Abrupt::Interrupt(reason) => reason,
                 _ => unreachable!("a host-control poll only produces Interrupt"),
             })?;
-            let mut resolved_any = false;
-            let mut i = 0;
-            while i < self.pending_async_waits.len() {
-                if let Ok(res) = self.pending_async_waits[i].1.try_recv() {
-                    let (promise, _) = self.pending_async_waits.remove(i);
-                    self.resolve_promise(&promise, Value::lstr(res));
-                    resolved_any = true;
-                } else {
-                    i += 1;
-                }
-            }
+            let mut resolved_any = self.settle_async_waits();
             // Fire due host timers ($262.agent.setTimeout), earliest first.
             let now = std::time::Instant::now();
             let mut due: Vec<Value> = Vec::new();
@@ -4824,15 +4888,28 @@ impl Interp {
             }
             if resolved_any {
                 self.drain_microtasks_interruptible()?;
-                spins = 0;
-            } else {
-                spins += 1;
-                // A safety bound (~30s at 1ms) so a never-completing wait can't hang the process.
-                if spins > 4_000 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                idle_since = std::time::Instant::now();
+                continue;
             }
+            let give_up = idle_since + IDLE_LIMIT;
+            if std::time::Instant::now() >= give_up {
+                break;
+            }
+            let next_timer = self
+                .pending_timers
+                .iter()
+                .map(|(_, deadline)| *deadline)
+                .min();
+            let wake = [self.next_async_wait_deadline(), next_timer]
+                .into_iter()
+                .flatten()
+                .fold(give_up, std::cmp::min);
+            let inbox = self
+                .async_wait_inbox
+                .get_or_insert_with(Default::default)
+                .clone();
+            // A host interruption wakes it too; the poll above then reports it.
+            inbox.wait_until(wake, &self.runtime_interrupt);
         }
         Ok(())
     }
@@ -4850,6 +4927,10 @@ impl Interp {
         // The script/callback that preceded this checkpoint is a completed synchronous job.
         self.clear_kept_objects();
         loop {
+            // Resolving a notified or timed-out Atomics.waitAsync is a job of this queue too.
+            if !self.pending_async_waits.is_empty() {
+                self.settle_async_waits();
+            }
             let Some(job) = self.microtasks.pop_front() else {
                 let Some(registry) = self.pending_finalization_cleanup.pop_front() else {
                     break;
