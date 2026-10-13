@@ -2876,6 +2876,10 @@ impl Interp {
         } else {
             len as usize
         };
+        // A trap's array-like `length` is author data: bound the list before reading it.
+        if len > crate::interpreter::MAX_ARRAY_OP_LEN {
+            return Err(self.throw("RangeError", "array length exceeds engine limit"));
+        }
         let mut out = Vec::with_capacity(len.min(1024));
         for k in 0..len {
             out.push(self.get_member(obj, &k.to_string())?);

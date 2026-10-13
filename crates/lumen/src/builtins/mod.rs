@@ -2,7 +2,9 @@
 //! calls [`install`] to populate `globalThis`, the standard constructors/prototypes, `Math`, and
 //! the global functions. test262 exercises this realm as the primary conformance oracle.
 
-use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
+use crate::interpreter::{
+    Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN,
+};
 use crate::lstr::LStr;
 use crate::value::*;
 use std::cell::RefCell;
@@ -112,7 +114,8 @@ pub(crate) fn nf_function_apply(
     let list = match arg(args, 1) {
         Value::Undefined | Value::Null => i.take_native_arg_buf(0),
         Value::Obj(o) => {
-            let len = ab(i.checked_array_len(&o))?;
+            let len = ab(i.to_length(&o))?;
+            check_argument_count(i, len)?;
             let direct_dense = i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Rc::as_ptr(&o) as usize));
             let mut v = i.take_native_arg_buf(len);
@@ -2014,11 +2017,24 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
         }
     };
     let len = ab(i.to_length(&o))?;
+    check_argument_count(i, len)?;
     let mut out = Vec::with_capacity(len.min(1024));
     for k in 0..len {
         out.push(array_get_index(i, &o, v, k)?);
     }
     Ok(out)
+}
+
+/// The RangeError for an argument list longer than [`MAX_ARGUMENTS_LEN`], raised before any
+/// element is read, as for a spread argument list.
+fn check_argument_count(i: &mut Interp, len: usize) -> Result<(), Value> {
+    if len > MAX_ARGUMENTS_LEN {
+        return Err(i.make_error(
+            "RangeError",
+            "argument list exceeds engine allocation limit",
+        ));
+    }
+    Ok(())
 }
 
 /// GetFunctionRealm-style lookup: when `new.target`'s `prototype` isn't an object, the instance's
@@ -6264,7 +6280,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "at", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let len = ab(i.checked_array_len(&o))? as i64;
+        let len = ab(i.to_length(&o))? as i64;
         let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
         if idx < 0 {
             idx += len;
@@ -10594,9 +10610,6 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
         }
     }
     let s = this_string(i, &this)?;
-    if s.len() > MAX_ARRAY_OP_LEN {
-        return Err(i.make_error("RangeError", "string too large to split in this engine"));
-    }
     // `limit` (ToUint32) caps the number of pieces; 0 → empty result — but ToString of the
     // separator is observable BEFORE the zero-limit shortcut.
     let limit = match arg(args, 1) {

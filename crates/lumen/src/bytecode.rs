@@ -21266,7 +21266,7 @@ unsafe fn jit_intrinsic_inner(
                                             if n >= 0.0
                                                 && n.is_finite()
                                                 && n.fract() == 0.0
-                                                && n <= crate::interpreter::MAX_ARRAY_OP_LEN
+                                                && n <= crate::interpreter::MAX_ARGUMENTS_LEN
                                                     as f64 =>
                                         {
                                             Some(n as usize)

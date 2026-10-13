@@ -2719,8 +2719,15 @@ fn memory_caps_convert_blowups_to_rangeerror() {
     assert_eq!(throws("new Array(4294967296)"), "RangeError"); // invalid uint32 length
     assert_eq!(throws("[].length = 4294967296"), "RangeError");
     assert_eq!(throws("'x'.repeat(1e9)"), "RangeError");
-    assert_eq!(throws("Array(100000000).join(',')"), "RangeError"); // huge length op
-    assert_eq!(throws("[...Array(100000000)]"), "RangeError"); // huge spread
+    assert_eq!(throws("Array(2 ** 30).join(',')"), "RangeError"); // huge length op
+    assert_eq!(throws("[...Array(2 ** 30)]"), "RangeError"); // huge spread
+    assert_eq!(throws("Math.max(...Array(2 ** 21))"), "RangeError"); // huge argument list
+    assert_eq!(throws("Math.max.apply(null, Array(2 ** 21))"), "RangeError");
+    assert_eq!(throws("Reflect.apply(Math.max, null, { length: 2 ** 32 })"), "RangeError");
+    assert_eq!(
+        throws("Object.keys(new Proxy({}, { ownKeys: () => ({ length: 2 ** 32 }) }))"),
+        "RangeError"
+    );
     assert_eq!(throws("(123).toFixed(1e9)"), "RangeError");
     assert_eq!(throws("let s='x'; for(;;){ s += s; }"), "RangeError"); // doubling string
                                                                        // Truncating a huge sparse length must not loop over the whole range (would hang).
@@ -2728,6 +2735,44 @@ fn memory_caps_convert_blowups_to_rangeerror() {
         run("var a=[1,2,3]; a.length = 1e9; a.length = 1; a.length"),
         "1"
     );
+}
+
+/// Arrays just past the former 2^20-element engine cap (a few million rows of real data) work
+/// like in other engines; only absurd lengths throw (see above). Spreading is compiled per tier;
+/// the built-ins are tier-independent, so they run once (a million elements is slow in debug).
+#[test]
+fn million_element_array_operations_succeed() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "(function (a) { return [...a].length; })(new Array(1048577).fill(7))"
+            ),
+            "1048577",
+            "{tier:?}"
+        );
+    }
+    let source = "var n = 1048577, a = new Array(n).fill(1);
+        a[n - 1] = 7;
+        var sparse = []; sparse[n - 1] = 1; sparse[0] = 2;
+        [
+            a.join('').length,
+            'x,'.repeat(n).split(',').length,
+            ('abc,def\\n'.repeat(n) + 'z').split('\\n').length,
+            a.toReversed()[0],
+            a.with(0, 9)[0],
+            Float64Array.from(a).length,
+            sparse.sort()[1],
+            Array.prototype.at.call({ length: 2 ** 53 - 1 }, -1)
+        ].join(':')";
+    assert_eq!(run(source), "1048577:1048578:1048578:7:9:1048577:2:");
 }
 
 #[test]

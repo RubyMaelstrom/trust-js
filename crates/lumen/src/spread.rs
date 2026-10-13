@@ -5,7 +5,7 @@
 //! Snapshot e28783d5fc9dc12b3de905961e2c71410b38a202. Resource limits are host policy;
 //! they must be uniform across tiers, and interruption must never run author cleanup.
 
-use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN};
+use crate::interpreter::{Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN};
 use crate::value::{Property, Value};
 
 impl Interp {
@@ -88,7 +88,7 @@ impl Interp {
         spread: &Value,
         arguments: &mut Vec<Value>,
     ) -> Result<(), Abrupt> {
-        self.expand_spread(spread, arguments.len(), |_, value| {
+        self.expand_spread_bounded(spread, arguments.len(), MAX_ARGUMENTS_LEN, |_, value| {
             arguments.push(value);
             Ok(())
         })
@@ -99,7 +99,7 @@ impl Interp {
         arguments: &mut Vec<Value>,
         value: Value,
     ) -> Result<(), Abrupt> {
-        if arguments.len() >= MAX_ARRAY_OP_LEN {
+        if arguments.len() >= MAX_ARGUMENTS_LEN {
             return Err(self.throw(
                 "RangeError",
                 "argument list exceeds engine allocation limit",
@@ -251,12 +251,12 @@ mod tests {
             r#"
             function f(){return arguments.length;}
             var o={f}, calls=[
-                ()=>[...Array(100000000)],
-                ()=>f(...Array(100000000)),
-                ()=>o.f(1,...Array(100000000)),
-                ()=>f(...[1],...Array(100000000),2),
-                function(){'use strict';return f(...Array(100000000));},
-                ()=>new f(...Array(100000000))
+                ()=>[...Array(2**30)],
+                ()=>f(...Array(2**30)),
+                ()=>o.f(1,...Array(2**30)),
+                ()=>f(...[1],...Array(2**30),2),
+                function(){'use strict';return f(...Array(2**30));},
+                ()=>new f(...Array(2**30))
             ];
             calls.map(fn=>{try{fn();return 'miss'}catch(e){return e.name}}).join('|');
         "#,
@@ -268,18 +268,18 @@ mod tests {
     fn spread_preflight_never_skips_custom_iterators_or_index_getter_effects() {
         check(
             r#"
-            var custom=Array(100000000);
+            var custom=Array(2**30);
             custom[Symbol.iterator]=function*(){yield 9;};
             var first=[...custom].join(',');
-            var own=Array(100000000);
+            var own=Array(2**30);
             Object.defineProperty(own,'0',{get(){own.length=1;return 7;}});
             var second=[...own].join(',');
-            var inherited=Array(100000000);
+            var inherited=Array(2**30);
             Object.defineProperty(Array.prototype,'0',{configurable:true,get(){inherited.length=0;return 8;}});
             var third=[...inherited];delete Array.prototype[0];
             var iteratorPrototype=Object.getPrototypeOf([][Symbol.iterator]());
             var saved=iteratorPrototype.next;iteratorPrototype.next=function(){return {done:true};};
-            var fourth=[...Array(100000000)].length;iteratorPrototype.next=saved;
+            var fourth=[...Array(2**30)].length;iteratorPrototype.next=saved;
             [first,second,third.join(','),fourth].join('|');
         "#,
             "9|7|8|0",
@@ -350,12 +350,12 @@ mod tests {
         check(
             r#"
             var calls=[
-                ()=>{let [...a]=Array(100000000);},
-                ()=>{let a;[...a]=Array(100000000);},
-                ()=>{let [,...[a]]=Array(100000000);},
-                ()=>{let a;[,...[a]]=Array(100000000);},
-                ()=>{function f([...a]){}f(Array(100000000));},
-                ()=>{function f(...[...a]){}f(...Array(100000000));}
+                ()=>{let [...a]=Array(2**30);},
+                ()=>{let a;[...a]=Array(2**30);},
+                ()=>{let [,...[a]]=Array(2**30);},
+                ()=>{let a;[,...[a]]=Array(2**30);},
+                ()=>{function f([...a]){}f(Array(2**30));},
+                ()=>{function f(...[...a]){}f(...Array(2**30));}
             ];
             calls.map(fn=>{try{fn();return 'miss'}catch(e){return e.name}}).join('|');
         "#,
@@ -367,14 +367,14 @@ mod tests {
     fn rest_preflight_preserves_custom_iteration_and_closes_resource_errors() {
         check(
             r#"
-            var short=Array(100000000);short[Symbol.iterator]=function*(){yield 9;};
+            var short=Array(2**30);short[Symbol.iterator]=function*(){yield 9;};
             let [...first]=short;
-            var shrink=Array(100000000);
+            var shrink=Array(2**30);
             Object.defineProperty(shrink,'0',{get(){shrink.length=1;return 7;}});
             var second;[...second]=shrink;
             var closed=0,marker={};
             function source(){
-                var it=Array(100000000)[Symbol.iterator]();
+                var it=Array(2**30)[Symbol.iterator]();
                 it.return=function(){closed++;throw marker;};
                 return {[Symbol.iterator](){return it;}};
             }

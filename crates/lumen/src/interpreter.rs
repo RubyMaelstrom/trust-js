@@ -3919,9 +3919,20 @@ const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
 /// Memory safety valves. Several built-ins iterate/allocate in proportion to a user-controlled
 /// `length`, so without these a single adversarial test (e.g. `Array(4e9).join()` or `s += s`
 /// doubling a string) can exhaust all RAM. Operations that would materialize more than these
-/// bounds raise a RangeError instead. They are generous relative to real test262 tests but small
-/// enough that one runaway test stays bounded.
-pub const MAX_ARRAY_OP_LEN: usize = 1 << 20; // ~1M elements
+/// bounds raise a RangeError instead.
+///
+/// The most elements one operation materializes (`[...a]`, `join`, `sort`, `fill`, `split`,
+/// iteration into a list). It matches V8's largest elements backing store (2^27 slots), so the
+/// arrays real programs build (CSV rows, large datasets) fit, while an absurd array-like
+/// `length` still throws before anything is allocated.
+pub const MAX_ARRAY_OP_LEN: usize = 1 << 27; // ~134M elements
+/// The most arguments one call receives from a spread or an `apply`/`Reflect.apply` list. Each
+/// is copied into the callee's frame and `arguments`; V8 runs out of stack near 120,000 of them
+/// and SpiderMonkey stops at 500,000.
+pub const MAX_ARGUMENTS_LEN: usize = 1 << 20; // ~1M arguments
+// A string splits or spreads into at most one piece per byte (plus one), so string operations
+// never reach the array limit.
+const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN);
 
 /// Byte ceiling for a single ArrayBuffer/SharedArrayBuffer allocation (real programs allocate
 /// tens of MB; runaway growth is still stopped well below the process heap cap).
