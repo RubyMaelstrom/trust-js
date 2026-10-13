@@ -26,6 +26,7 @@ mod function_proto;
 mod globals;
 mod host;
 mod json;
+pub(crate) use json::parse_json;
 mod math;
 mod primitives;
 mod promise;
@@ -34,7 +35,9 @@ mod reflect;
 mod regexp;
 mod shadowrealm;
 mod typedarray;
-pub(crate) use typedarray::{array_buffer_with_storage, typed_array_from_bytes};
+pub(crate) use typedarray::{
+    array_buffer_with_storage, immutable_uint8_array, typed_array_from_bytes,
+};
 mod weakrefs;
 
 #[cfg(test)]

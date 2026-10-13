@@ -785,6 +785,27 @@ pub(crate) fn typed_array_from_bytes(
 ) -> (Value, TaInfo) {
     let len = bytes.len() / kind.elsize();
     let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
+    typed_array_over(i, kind, buf_val, buf_ptr, len)
+}
+
+/// A `bytes` module's default export: a Uint8Array over a fresh immutable ArrayBuffer holding
+/// `bytes` (Import Bytes proposal), from the current Realm's intrinsics without author code.
+pub(crate) fn immutable_uint8_array(i: &mut Interp, bytes: Vec<u8>) -> Value {
+    let len = bytes.len();
+    let (buf_val, buf_ptr) = make_array_buffer_from_bytes(i, bytes);
+    // Immutable before the view registers, so native code never gets a writable view of it.
+    i.immutable_buffers.insert(buf_ptr);
+    typed_array_over(i, TaKind::U8, buf_val, buf_ptr, len).0
+}
+
+/// A `kind` TypedArray viewing all `len` elements of the fresh ArrayBuffer `buf_val`.
+fn typed_array_over(
+    i: &mut Interp,
+    kind: TaKind,
+    buf_val: Value,
+    buf_ptr: usize,
+    len: usize,
+) -> (Value, TaInfo) {
     let obj = Object::new(i.extra_protos.get(kind.name()).cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);

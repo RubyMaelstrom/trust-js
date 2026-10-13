@@ -589,6 +589,24 @@ impl JsonInput<'_> {
     }
 }
 
+/// ParseJSON (ECMA-262 #sec-ParseJSON) of `text` in the engine's string representation: the value
+/// of a JSON module (ParseJSONModule), which must not depend on the author-replaceable
+/// `JSON.parse`. Invalid JSON is a SyntaxError.
+pub(crate) fn parse_json(i: &mut Interp, text: &str) -> Result<Value, Value> {
+    let chars = (!text.is_ascii()).then(|| text.chars().collect::<Vec<_>>());
+    let input = match chars.as_deref() {
+        Some(chars) => JsonInput::Chars(chars),
+        None => JsonInput::Bytes(text.as_bytes()),
+    };
+    let mut pos = 0;
+    let value = json_parse_value(i, input, &mut pos)?;
+    json_skip_ws(input, &mut pos);
+    if pos != input.len() {
+        return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
+    }
+    Ok(value)
+}
+
 fn json_skip_ws(input: JsonInput<'_>, pos: &mut usize) {
     while *pos < input.len() && matches!(input.get(*pos), Some(' ' | '\t' | '\n' | '\r')) {
         *pos += 1;

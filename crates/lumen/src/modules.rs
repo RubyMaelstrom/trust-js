@@ -342,7 +342,7 @@ impl Interp {
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
         let key = module_map_key(self.host_job_context, key);
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
-        self.load_requested_modules(&key, Some(src.to_string()))?;
+        self.load_requested_modules(&key, Some(ModuleSource::Source(src.to_string())))?;
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first.
         self.link_module(&key)?;
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
@@ -453,7 +453,11 @@ impl Interp {
     /// cycles, so an abrupt completion must discard records created by this attempt. Otherwise a
     /// later load of the same entry mistakes that partial graph for a complete one and linking can
     /// encounter a dependency for which no module record exists.
-    fn load_requested_modules(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+    fn load_requested_modules(
+        &mut self,
+        key: &str,
+        src: Option<ModuleSource>,
+    ) -> Result<(), Abrupt> {
         let existing: std::collections::HashSet<String> =
             self.module_recs.keys().cloned().collect();
         let result = self.parse_and_register(key, src);
@@ -467,12 +471,19 @@ impl Interp {
     /// Parse `key` and, transitively, every dependency — registering each module's environment,
     /// namespace object, and export tables. No user code runs and no linking happens yet, so a later
     /// ResolveExport can see the whole graph. Idempotent per key.
-    fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+    fn parse_and_register(&mut self, key: &str, src: Option<ModuleSource>) -> Result<(), Abrupt> {
         if self.module_recs.contains_key(key) {
             return Ok(());
         }
-        let src = match src {
-            Some(s) => s,
+        // A synthetic module (CreateDefaultExportSyntheticModule) has no code: it is an empty
+        // module whose `default` binding holds a value made here, once, from the loaded contents.
+        // An invalid JSON module fails the load (ParseJSONModule) before any module evaluates.
+        let (src, default_export) = match src {
+            Some(ModuleSource::Source(src)) => (src, None),
+            Some(ModuleSource::Synthetic(contents)) => (
+                String::new(),
+                Some(self.synthetic_default_export(contents)?),
+            ),
             None => return Err(self.throw("TypeError", format!("module not found: {key}"))),
         };
         // Module source text comes from the host (its loaders and entry points): Rust text, in
@@ -489,7 +500,7 @@ impl Interp {
         // the export tables can name dependencies by key. Duplicate specifiers resolve once.
         let mut resolved: HashMap<String, String> = HashMap::new();
         let mut dep_keys: Vec<String> = Vec::new();
-        let mut dep_srcs: Vec<(String, String)> = Vec::new();
+        let mut dep_srcs: Vec<(String, ModuleSource)> = Vec::new();
         // A dependency evaluates lazily only if *every* clause naming it is an `import defer`.
         let mut defer_specs: HashMap<String, bool> = HashMap::new();
         for stmt in body.iter() {
@@ -525,8 +536,8 @@ impl Interp {
                 continue;
             }
             let (canon, dsrc) = self.fetch_module(&spec, key, attr_type.as_deref())?;
-            // A `with { type: ... }` dependency synthesizes a wrapper module (JSON/text/bytes) —
-            // keyed separately from any ordinary module of the same file.
+            // A `with { type: ... }` dependency is a synthetic module (JSON/text/bytes) — keyed
+            // separately from any ordinary module of the same file.
             let canon = match attr_type.as_deref() {
                 Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
                 _ => canon,
@@ -557,7 +568,15 @@ impl Interp {
         // this module's object no matter who calls it.
         crate::eval::bind(&env, "%importmeta%", meta.clone());
 
-        let tables = build_export_tables(&body, &resolved);
+        let mut tables = build_export_tables(&body, &resolved);
+        if let Some(value) = default_export {
+            env.borrow_mut()
+                .vars
+                .insert("*default*".to_string(), Binding::data(value, false, true));
+            tables
+                .local_exports
+                .insert("default".to_string(), "*default*".to_string());
+        }
         let deferred_deps: Vec<String> = resolved
             .iter()
             .filter(|(spec, _)| defer_specs.get(*spec).copied().unwrap_or(false))
@@ -2020,49 +2039,58 @@ fn dynamic_import_reject(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Va
     Ok(Value::Undefined)
 }
 
-/// The source text as a JS string literal (escaped).
-fn js_string_literal(text: &str) -> String {
-    let mut lit = String::with_capacity(text.len() + 2);
-    lit.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => lit.push_str("\\\""),
-            '\\' => lit.push_str("\\\\"),
-            '\n' => lit.push_str("\\n"),
-            '\r' => lit.push_str("\\r"),
-            '\u{2028}' => lit.push_str("\\u2028"),
-            '\u{2029}' => lit.push_str("\\u2029"),
-            c if (c as u32) < 0x20 => {
-                lit.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => lit.push(c),
-        }
-    }
-    lit.push('"');
-    lit
+/// What a host loaded for one module request.
+pub(crate) enum ModuleSource {
+    /// ECMAScript source text: a Source Text Module Record.
+    Source(String),
+    /// The contents of a `with { type: ... }` import, which becomes a Synthetic Module Record.
+    Synthetic(SyntheticContents),
 }
 
-/// Synthesize the module source for a `with { type: ... }` dependency: json parses the text, text
-/// exports it verbatim, bytes exports it as a Uint8Array of its UTF-8 bytes. An unknown type keeps
-/// the source as-is (an ordinary module).
-pub(crate) fn typed_module_source(text: String, attr_type: Option<&str>) -> String {
-    match attr_type {
-        Some("json") => format!("export default JSON.parse({});", js_string_literal(&text)),
-        Some("text") => format!("export default {};", js_string_literal(&text)),
-        Some("bytes") => {
-            // The text was decoded latin-1 style (char == byte) when non-UTF-8; a UTF-8 source
-            // re-encodes to its original bytes either way.
-            let bytes: Vec<String> = if text.chars().all(|c| (c as u32) < 0x100) {
-                text.chars().map(|c| (c as u32).to_string()).collect()
-            } else {
-                text.bytes().map(|b| b.to_string()).collect()
-            };
-            format!(
-                "export default new Uint8Array(new Uint8Array([{}]).buffer.sliceToImmutable());",
-                bytes.join(",")
-            )
+/// The loaded contents of a synthetic module, by its `type` attribute.
+pub(crate) enum SyntheticContents {
+    /// `json`: JSON text, parsed by ParseJSONModule.
+    Json(String),
+    /// `text`: exported as a String.
+    Text(String),
+    /// `bytes`: the file decoded latin-1 style (one char per byte) by the host.
+    Bytes(String),
+}
+
+/// The module a `with { type: ... }` import loads from `text`: a synthetic JSON, text or bytes
+/// module, or ordinary source text for an unknown type.
+pub(crate) fn typed_module_source(text: String, attr_type: Option<&str>) -> ModuleSource {
+    ModuleSource::Synthetic(match attr_type {
+        Some("json") => SyntheticContents::Json(text),
+        Some("text") => SyntheticContents::Text(text),
+        Some("bytes") => SyntheticContents::Bytes(text),
+        _ => return ModuleSource::Source(text),
+    })
+}
+
+impl Interp {
+    /// The default export of a synthetic module, made from the current Realm's intrinsics
+    /// without running author code (ECMA-262 CreateDefaultExportSyntheticModule): a page that
+    /// replaces `JSON.parse` or `Uint8Array` cannot change what a JSON or bytes import produces.
+    fn synthetic_default_export(&mut self, contents: SyntheticContents) -> Result<Value, Abrupt> {
+        match contents {
+            // ParseJSONModule: ParseJSON of the source text, which is host text.
+            SyntheticContents::Json(text) => {
+                crate::builtins::parse_json(self, &crate::jstr::from_text(&text))
+                    .map_err(Abrupt::Throw)
+            }
+            SyntheticContents::Text(text) => Ok(Value::from_string(text)),
+            SyntheticContents::Bytes(text) => {
+                // The host decodes a binary file latin-1 style (char == byte); text holding a
+                // wider character came from a UTF-8 decoding, which re-encodes to its bytes.
+                let bytes = if text.chars().all(|c| (c as u32) < 0x100) {
+                    text.chars().map(|c| c as u8).collect()
+                } else {
+                    text.into_bytes()
+                };
+                Ok(crate::builtins::immutable_uint8_array(self, bytes))
+            }
         }
-        _ => text,
     }
 }
 

@@ -26604,6 +26604,63 @@ fn import_json_attr_distinct_from_plain_import() {
     }
 }
 
+/// JSON, text and bytes modules are synthetic modules whose default export the engine makes
+/// itself (ECMA-262 ParseJSONModule, CreateDefaultExportSyntheticModule): a page that replaced
+/// `JSON.parse`, `Uint8Array` or `ArrayBuffer.prototype.sliceToImmutable` does not change them.
+/// ParseJSONModule runs while loading, so invalid JSON fails the graph before any module of it
+/// evaluates. The JSON results and the unevaluated sibling match Node.
+#[test]
+fn synthetic_modules_ignore_author_replaced_globals() {
+    use crate::bytecode::Tier;
+    let files = [
+        ("/d.json", r#"{"a": 1, "s": "éx", "__proto__": [2]}"#),
+        ("/b.bin", "A\u{ff}\u{0}"),
+        ("/t.txt", "text \u{e9}"),
+        ("/side.js", "globalThis.__side = true;"),
+        (
+            "/bad.js",
+            "import '/side.js'; import b from '/bad.json' with { type: 'json' };",
+        ),
+        ("/bad.json", "{ bad"),
+    ];
+    let main = r#"
+        import data from '/d.json' with { type: 'json' };
+        import bytes from '/b.bin' with { type: 'bytes' };
+        import text from '/t.txt' with { type: 'text' };
+        globalThis.out = [JSON.stringify(data), Object.keys(data).join(),
+                          bytes.join(), bytes.buffer.immutable, text];
+        import('/bad.js').then(() => out.push('loaded'),
+                               e => out.push(e.name + ':' + globalThis.__side));
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        run_in(
+            &mut engine,
+            "JSON.parse = () => ({ hijacked: true });
+             Uint8Array = function () { return { join() { return 'fake'; } }; };
+             Object.defineProperty(ArrayBuffer.prototype, 'sliceToImmutable',
+                                   { value() { throw new Error('observed'); } });",
+        );
+        let completion = engine
+            .eval_module_attrs(main, "/main.js", move |spec, _, _| {
+                files
+                    .iter()
+                    .find(|(key, _)| *key == spec)
+                    .map(|(key, source)| (key.to_string(), source.to_string()))
+            })
+            .expect("parse");
+        assert!(matches!(completion, Completion::Value(_)), "tier {tier:?}");
+        assert_eq!(
+            run_in(&mut engine, "out.join('|')"),
+            "{\"a\":1,\"s\":\"\u{e9}x\",\"__proto__\":[2]}|a,s,__proto__|65,255,0|true|\
+             text \u{e9}|SyntaxError:undefined",
+            "tier {tier:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Loop-spanning JIT chains (aarch64-macos): fully-chainable loops keep locals in registers
 // across the back edge. These pin the guard/bail/flush semantics on the machine-code tier;
