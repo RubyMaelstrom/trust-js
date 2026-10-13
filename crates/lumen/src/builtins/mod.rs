@@ -5078,11 +5078,9 @@ fn to_precision(n: f64, p: usize) -> String {
         };
     }
     let neg = n < 0.0;
-    // `p` significant digits via scientific notation (`d.ddde±E`, the mantissa has exactly `p` digits).
-    let sci = format!("{:.*e}", p - 1, n.abs());
-    let (mantissa, exp_str) = sci.split_once('e').unwrap();
-    let e: i32 = exp_str.parse().unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // `p` significant digits with the spec's tie-breaking, and the exponent of the first.
+    let (digits, e) = exact_significant_digits(n.abs(), p);
+    let digits: String = digits.iter().map(|d| (d + b'0') as char).collect();
     let body = if e < -6 || e >= p as i32 {
         let sign = if e >= 0 { "+" } else { "-" };
         if p == 1 {
@@ -11991,9 +11989,58 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     }
 }
 
-/// Number.prototype.toExponential's digit selection: the exact decimal expansion of the binary
-/// value, rounded to `f` fraction digits with ties away from zero (the spec's "larger n").
-/// `shortest` (fractionDigits undefined) picks the minimal digits that round-trip.
+/// The first `n` (at least one) significant decimal digits of the finite, positive `x`, rounded
+/// from its exact binary value with ties away from zero, and the decimal exponent of the first
+/// digit: `x` is about d₀.d₁…dₙ₋₁ × 10^e. This is the choice of n and e in
+/// Number.prototype.toExponential and toPrecision (ECMA-262 §21.1.3.2 step 10.b, §21.1.3.5
+/// step 10.b): "if there are two such sets of e and n, pick the e and n for which n × 10^(e–f)
+/// is larger". Core's `{:.*e}` rounds such exact ties to even instead.
+fn exact_significant_digits(x: f64, n: usize) -> (Vec<u8>, i32) {
+    debug_assert!(x > 0.0 && x.is_finite() && n >= 1);
+    // A double is an odd integer times 2^e2; with e2 < 0 its decimal expansion ends exactly -e2
+    // places after the point. Asking for every significant digit (one more than the decimal
+    // logarithm promises, which may be one short) formats it without rounding, so the digit
+    // after the cut decides: below 5 rounds down, and anything from 5 on (a tie is a 5 followed
+    // only by zeros) rounds up.
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let significand = match biased {
+        0 => bits & 0xf_ffff_ffff_ffff,
+        _ => bits & 0xf_ffff_ffff_ffff | 1 << 52,
+    };
+    let e2 = if biased == 0 { -1074 } else { biased - 1075 } + significand.trailing_zeros() as i32;
+    let fraction_digits = (-e2).max(0);
+    let exact = (x.log10().floor() as i32 + 1 + fraction_digits).max(0) as usize;
+    let formatted = format!("{x:.*e}", exact.max(n - 1));
+    let (mantissa, exponent) = formatted.split_once('e').unwrap();
+    let mut e: i32 = exponent.parse().unwrap();
+    let mut digits: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    let round_up = digits.get(n).is_some_and(|&d| d >= 5);
+    digits.resize(n, 0);
+    if round_up {
+        match digits.iter().rposition(|&d| d != 9) {
+            Some(k) => {
+                digits[k] += 1;
+                digits[k + 1..].fill(0);
+            }
+            None => {
+                // 9.99… rounds up to 10.0…: one digit more in front, one exponent higher.
+                digits.fill(0);
+                digits[0] = 1;
+                e += 1;
+            }
+        }
+    }
+    (digits, e)
+}
+
+/// Number.prototype.toExponential's digit selection: `f` fraction digits by
+/// [`exact_significant_digits`], or with `shortest` (fractionDigits undefined) the minimal
+/// digits that round-trip.
 fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
     // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
     let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
@@ -12012,37 +12059,7 @@ fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
         };
         return format!("{sign}{m}e+0");
     }
-    // 780 fraction digits is past the longest exact decimal expansion of any f64 mantissa, so the
-    // digits (including everything after the rounding point) are exact.
-    let s = format!("{x:.780e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let mut exp: i32 = e.parse().unwrap();
-    let mut digits: Vec<u8> = m
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    if digits.len() > f + 1 && digits[f + 1] >= 5 {
-        let mut k = f + 1;
-        loop {
-            if k == 0 {
-                digits.insert(0, 1);
-                exp += 1;
-                break;
-            }
-            k -= 1;
-            if digits[k] == 9 {
-                digits[k] = 0;
-            } else {
-                digits[k] += 1;
-                break;
-            }
-        }
-    }
-    digits.truncate(f + 1);
-    while digits.len() < f + 1 {
-        digits.push(0);
-    }
+    let (digits, exp) = exact_significant_digits(x, f + 1);
     let ds: String = digits.iter().map(|d| (d + b'0') as char).collect();
     let m = if f == 0 {
         ds

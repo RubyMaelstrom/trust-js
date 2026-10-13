@@ -15221,6 +15221,35 @@ fn number_methods_fixed() {
         assert_eq!(run(src), want, "{src}");
     }
 }
+/// toPrecision and toExponential pick the larger n on an exact tie of the binary value
+/// (ECMA-262 §21.1.3.5 step 10.b, §21.1.3.2 step 10.b), not core's ties-to-even. Expected
+/// values are node's.
+#[test]
+fn number_precision_and_exponential_round_exact_ties_up_in_all_tiers() {
+    let source = "[(2.5).toPrecision(1), (0.125).toPrecision(2), (-2.5).toPrecision(1), \
+         (9.5).toPrecision(1), (99.95).toPrecision(3), (1.45).toPrecision(2), \
+         (5e-324).toPrecision(3), (1.7976931348623157e308).toPrecision(1), \
+         (0.000001).toPrecision(2), (20612.890625).toPrecision(10), (2 ** -25).toPrecision(17), \
+         (123.456).toPrecision(21), (1.25).toExponential(1), (1.35).toExponential(1), \
+         (0.5).toExponential(0), (9.95).toExponential(1), (5e-324).toExponential(2), \
+         (-1.5).toExponential(0)].join()";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "3,0.13,-3,1e+1,100,1.4,4.94e-324,2e+308,0.0000010,20612.89063,\
+             2.9802322387695313e-8,123.456000000000003070,1.3e+0,1.4e+0,5e-1,9.9e+0,4.94e-324,\
+             -2e+0",
+            "{tier:?}"
+        );
+    }
+}
 #[test]
 fn shadow_realm_basic() {
     assert_eq!(run("typeof ShadowRealm"), "function");
