@@ -45,6 +45,10 @@ mod array_length_tests;
 #[path = "../array_shift_tests.rs"]
 mod array_shift_tests;
 
+#[cfg(test)]
+#[path = "../array_dense_edit_tests.rs"]
+mod array_dense_edit_tests;
+
 pub(crate) use function_proto::nf_function_call;
 pub(crate) use globals::nf_is_nan;
 pub(crate) use math::{is_numeric_only_native, math_intrinsic, nf_math_sqrt};
@@ -6222,6 +6226,11 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if len + n > 9007199254740991 {
                 return Err(i.make_error("TypeError", "unshift result is too long"));
             }
+            if edit_plain_elements(i, &o, len, n, |elements| {
+                elements.splice(0..0, args.iter().map(|item| Property::plain(item.clone())));
+            }) {
+                return Ok(Value::Num((len + n) as f64));
+            }
             for k in (0..len).rev() {
                 let to = (k + n).to_string();
                 if let Some(v) = array_get_present_index(i, &o, &ov, k as usize)? {
@@ -6248,6 +6257,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             v => norm_index(ab(i.to_number(&v))?, len),
         };
         let count = (end - start).max(0) as usize;
+        // With the intrinsic species the result is a fresh Array, and own data elements are
+        // read without observable HasProperty/Get work: copy them in one pass.
+        if array_species_is_intrinsic(i, &o) {
+            if let Some(values) = own_data_elements(&o, start as usize..end.max(start) as usize) {
+                return Ok(i.make_array(values));
+            }
+        }
         let result = array_species_create(i, &this, count as u64)?;
         let ov = Value::Obj(o.clone());
         let mut k = start;
@@ -6386,6 +6402,18 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 if n + len > 9007199254740991 {
                     return Err(i.make_error("TypeError", "concat result is too long"));
                 }
+                // An ordinary Array's own data elements are read without observable
+                // HasProperty/Get work.
+                if let Some(values) = v
+                    .as_obj()
+                    .and_then(|object| own_data_elements(object, 0..len as usize))
+                {
+                    for value in values {
+                        cdp_index_or_throw(i, &result, n, value)?;
+                        n += 1;
+                    }
+                    continue;
+                }
                 for k in 0..len {
                     let Value::Obj(object) = v else {
                         unreachable!("spreadable values are objects")
@@ -6410,6 +6438,10 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let o = arr_to_object(i, &this)?;
         let ov = Value::Obj(o.clone());
         let len = ab(i.to_length(&o))?;
+        // Every Get/Set pair swaps two present writable elements.
+        if edit_plain_elements(i, &o, len as u64, 0, |elements| elements.reverse()) {
+            return Ok(ov);
+        }
         for k in 0..len / 2 {
             let lower = k.to_string();
             let upper = (len - 1 - k).to_string();
@@ -7046,6 +7078,51 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
 /// accessors, prototypes, proxies, host indexed objects, and other exotics. This is the same
 /// observable operation required by ECMA-262 §23.1.3 (Array methods), with the allocation-free
 /// path only replacing an unobservable own-data lookup.
+/// Batch an Array.prototype algorithm over the plain elements of `object` (see
+/// [`Props::plain_elements_mut`]) when it is an ordinary Array of length `len`: `edit` must
+/// produce exactly the element list the algorithm's gets, sets and deletes would leave, and
+/// `growth` counts the indices at or past `len` it creates. Creating them by Set consults the
+/// prototype chain and needs an extensible receiver, so growth also requires prototypes without
+/// indexed properties. The new length is recorded after `edit`. `false` changes nothing.
+fn edit_plain_elements(
+    i: &Interp,
+    object: &Gc,
+    len: u64,
+    growth: u64,
+    edit: impl FnOnce(&mut Vec<Property>),
+) -> bool {
+    if len.saturating_add(growth) > u64::from(u32::MAX)
+        || !matches!(object.borrow().exotic, Exotic::Array)
+        || !i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        || (growth != 0 && (!object.borrow().extensible || !i.array_append_unshadowed(object)))
+    {
+        return false;
+    }
+    let mut body = object.borrow_mut();
+    let Some(elements) = body.props.plain_elements_mut(len as usize) else {
+        return false;
+    };
+    edit(elements);
+    let new_len = elements.len();
+    body.props.set_array_length_value(new_len as f64);
+    true
+}
+
+/// Get of every index in `range` of an ordinary Array whose elements there are own data
+/// properties (no hole, accessor or index past its length): reads without observable work.
+fn own_data_elements(object: &Gc, range: std::ops::Range<usize>) -> Option<Vec<Value>> {
+    let body = object.borrow();
+    if !matches!(body.exotic, Exotic::Array) || !body.ic_plain.get() {
+        return None;
+    }
+    if range.end > ordinary_array_length(&body.props)? {
+        return None;
+    }
+    range
+        .map(|index| own_data_element(&body.props, index))
+        .collect()
+}
+
 fn array_get_index(
     i: &mut Interp,
     object: &Gc,
@@ -7232,6 +7309,22 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
     // A result length past 2^53-1 is a TypeError (before any mutation or species construction).
     if (len - delete_count + items.len() as i64) as u64 > 9007199254740991 {
         return Err(i.make_error("TypeError", "splice result is too long"));
+    }
+    // With the intrinsic species the removed elements go to a fresh Array; the moves, deletes
+    // and writes of plain elements are then exactly one in-place splice.
+    if array_species_is_intrinsic(i, &o) {
+        let range = start as usize..(start + delete_count) as usize;
+        let mut removed = Vec::new();
+        let growth = (items.len() as u64).saturating_sub(delete_count as u64);
+        if edit_plain_elements(i, &o, len as u64, growth, |elements| {
+            let inserted = items.iter().map(|item| Property::plain(item.clone()));
+            removed = elements
+                .splice(range, inserted)
+                .map(Property::into_value)
+                .collect();
+        }) {
+            return Ok(i.make_array(removed));
+        }
     }
     // The removed array (ArraySpeciesCreate) preserves holes via HasProperty.
     let removed = array_species_create(i, &this, delete_count.max(0) as u64)?;
