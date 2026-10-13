@@ -3021,9 +3021,9 @@ pub struct Interp {
     pub(crate) tier_threshold: u32,
     /// Bytecode VM runs a loop-free function makes before it is compiled to native code (env
     /// `LUMEN_JIT_ADMIT_RUNS`). A body with a loop is compiled on its first run: one call can
-    /// spend its whole time in the loop. Most functions of a page run only a few times: on
-    /// Speedometer's NewsSite pages, waiting 64 runs compiles 25-30% fewer functions and 12%
-    /// less machine code, with the same CPU time and Speedometer score.
+    /// spend its whole time in the loop. Off by default (0): waiting 64 runs compiled 25-30%
+    /// fewer functions and 12% less machine code on Speedometer's NewsSite pages, but cost
+    /// React and Vue interactions 7% and 2% (16 runs: about 2% each).
     pub(crate) jit_admit_runs: u32,
     /// Opt-in tagged execution slices (env `LUMEN_TAGGED_ARITHMETIC`). The flag is captured
     /// once per Agent so hot bytecode operators do not repeatedly consult process synchronization
@@ -4334,7 +4334,7 @@ pub(crate) struct HostSettingsState {
 /// Smaller run-once bodies still compile on their first call (and stay on the VM): interpreting
 /// them too would save less memory for a similar cost in every later Realm.
 /// See [`Interp::jit_admit_runs`].
-pub(crate) const DEFAULT_JIT_ADMIT_RUNS: u32 = 64;
+pub(crate) const DEFAULT_JIT_ADMIT_RUNS: u32 = 0;
 
 pub(crate) const RUN_ONCE_INTERPRETED_STATEMENTS: usize = 1000;
 

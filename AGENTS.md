@@ -55,8 +55,8 @@ The default tier is JIT. Useful diagnostic controls:
 - `LUMEN_TIER_THRESHOLD=N` changes the call threshold for tiering up; loop-containing
   bodies can tier up immediately.
 - `LUMEN_JIT_ADMIT_RUNS=N` sets how many bytecode VM runs a loop-free function makes before
-  it is compiled to native code (default 64; 0 compiles on the first VM run). A body with a
-  loop is compiled on its first run. `LUMEN_TIER_LOG=1` reports each native compile.
+  it is compiled to native code (default 0: the first VM run compiles it). A body with a loop
+  is compiled on its first run. `LUMEN_TIER_LOG=1` reports each native compile.
 - `LUMEN_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
 - `LUMEN_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
