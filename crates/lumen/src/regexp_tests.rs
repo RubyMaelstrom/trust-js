@@ -78,6 +78,54 @@ fn large_counted_repetitions_match_like_unrolled_ones() {
     );
 }
 
+/// `split`'s limit is ToUint32 (§7.1.7), which wraps modulo 2^32 for every Number rather than
+/// saturating, for string and RegExp separators alike (§22.1.3.23, §22.2.6.14 step 13).
+/// RegExp.prototype[@@split] and [@@matchAll] default SpeciesConstructor to the realm's %RegExp%
+/// intrinsic and never read the global `RegExp` binding (§22.2.6.14 step 4, §22.2.6.9 step 4).
+#[test]
+fn split_limits_wrap_and_species_defaults_to_the_intrinsic() {
+    check(
+        r#"
+        function run() {
+            var lengths = [
+                "a,b,c".split(",", -1e20).length,
+                "a,b,c".split(",", 2 ** 64).length,
+                "a,b,c".split(",", 2 ** 32 + 1).length,
+                "a,b,c".split(",", -1).length,
+                "a,b,c".split(",", -4294967294).length,
+                "a,b,c".split(/,/, -1e20).length,
+                "a,b,c".split(/,/, 2 ** 64).length,
+                "a,b,c".split(/,/, 2 ** 32 + 2).length,
+                "a,b,c".split(/,/, -4294967294).length,
+                "a,b,c".split(/,/, 1e300).length,
+            ];
+            var intrinsic = RegExp, constructed = [];
+            globalThis.RegExp = function () {
+                constructed.push(arguments.length);
+                return /x/y;
+            };
+            var splitter = /\d/;
+            splitter.constructor = undefined;
+            var parts = "a1b2c".split(splitter).join("|");
+            var matcher = /\d/g;
+            matcher.constructor = undefined;
+            var all = Array.from("a1b2c".matchAll(matcher), function (m) { return m[0]; }).join("|");
+            var reads = 0;
+            Object.defineProperty(globalThis, "RegExp", {
+                get: function () { reads++; return intrinsic; },
+                configurable: true,
+            });
+            "x,y".split(/,/);
+            Array.from("xy".matchAll(/./g));
+            Object.defineProperty(globalThis, "RegExp", { value: intrinsic, writable: true, configurable: true });
+            return [lengths.join(" "), parts, all, constructed.length, reads].join(",");
+        }
+        run()
+        "#,
+        "3 0 1 3 2 3 0 2 2 0,a|b|c,1|2,0,0",
+    );
+}
+
 /// Deeply nested patterns are an implementation limit: past it, a SyntaxError rather than a
 /// native stack overflow. Patterns at the limit compile and match (node gives the same results
 /// for them).

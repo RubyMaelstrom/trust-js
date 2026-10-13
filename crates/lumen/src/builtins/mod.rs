@@ -10579,14 +10579,11 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     if s.len() > MAX_ARRAY_OP_LEN {
         return Err(i.make_error("RangeError", "string too large to split in this engine"));
     }
-    // `limit` (ToUint32) caps the number of pieces; 0 → empty result — but ToString of the
-    // separator is observable BEFORE the zero-limit shortcut.
+    // `limit` (ToUint32, modulo 2^32) caps the number of pieces; 0 → empty result — but
+    // ToString of the separator is observable BEFORE the zero-limit shortcut.
     let limit = match arg(args, 1) {
         Value::Undefined => u32::MAX as usize,
-        v => {
-            let n = ab(i.to_number(&v))?;
-            (if n.is_finite() { n as i64 as u32 } else { 0 }) as usize
-        }
+        v => to_uint32(ab(i.to_number(&v))?) as usize,
     };
     let is_live_regexp =
         matches!(&arg(args, 0), Value::Obj(o) if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));

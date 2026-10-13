@@ -1070,10 +1070,20 @@ fn get_substitution(
     }
     Ok(out)
 }
+/// The running realm's %RegExp%: the default constructor that RegExp.prototype[@@split] and
+/// [@@matchAll] pass to SpeciesConstructor (ECMA-262 §22.2.6.14 step 4, §22.2.6.9 step 4). It is
+/// the intrinsic, not whatever the global `RegExp` binding currently holds.
+fn regexp_intrinsic(i: &Interp) -> Value {
+    i.extra_protos
+        .get("%RegExpCtor%")
+        .cloned()
+        .map_or(Value::Undefined, Value::Obj)
+}
+
 fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     require_regexp_this(i, &this, "[Symbol.matchAll]")?;
     let s = ab(i.to_string(&arg(a, 0)))?;
-    let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "RegExp"))?;
+    let default_ctor = regexp_intrinsic(i);
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
@@ -1194,19 +1204,6 @@ pub(super) fn re_sym_split_discard_fast(
             return None;
         }
     }
-    // The default constructor Get is observable, but the exact value is irrelevant here because
-    // the guarded intrinsic @@species resolves to `ctor`. A plain own data property therefore
-    // proves the Get cannot run user code even if application code replaced globalThis.RegExp.
-    let global_ctor_ok = i
-        .global
-        .borrow()
-        .props
-        .get("RegExp")
-        .is_some_and(|property| !property.accessor());
-    if !global_ctor_ok {
-        return None;
-    }
-
     // A sticky split loop that advances one unit after every miss is equivalent to one ordinary
     // forward search for its next success. Removing `y` performs that search in the matcher while
     // preserving the successful captures and their legacy-static side effects. The AArch64 class
@@ -1276,7 +1273,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     let sunits: Vec<u16> = crate::jstr::units(&s);
     let size = sunits.len();
     // SpeciesConstructor(rx, %RegExp%), then a sticky-flagged splitter constructed from it.
-    let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "RegExp"))?;
+    let default_ctor = regexp_intrinsic(i);
     let c = species_constructor(i, &this, &default_ctor)?;
     let flags_v = ab(i.get_member(&this, "flags"))?;
     let flags = ab(i.to_string(&flags_v))?;
@@ -1287,17 +1284,10 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         format!("{flags}y")
     };
     let splitter = ab(i.construct(c, &[this.clone(), Value::lstr(new_flags)]))?;
+    // ToUint32 wraps modulo 2^32 over the whole Number range: -1 is 2^32 - 1, 2^32 is 0.
     let limit = match arg(a, 1) {
         Value::Undefined => u32::MAX as usize,
-        v => {
-            // ToUint32: modular, so a negative limit is a huge one.
-            let n = ab(i.to_number(&v))?;
-            if n.is_nan() || n.is_infinite() || n == 0.0 {
-                0
-            } else {
-                (n.trunc() as i64).rem_euclid(1i64 << 32) as usize
-            }
-        }
+        v => to_uint32(ab(i.to_number(&v))?) as usize,
     };
     let mut out: Vec<Value> = Vec::new();
     if limit == 0 {
