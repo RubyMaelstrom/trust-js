@@ -3,7 +3,8 @@
 use super::*;
 
 pub(super) fn install_shared_array_buffer(it: &mut Interp) {
-    // Modeled as a plain ArrayBuffer (no real sharing) — enough for tests that just need the type.
+    // A SharedArrayBuffer's bytes live in a process-wide Shared Data Block (`BufferData::Shared`),
+    // which every agent the buffer is shared with sees.
     let proto = Object::new(Some(it.object_proto.clone()));
     Rc::make_mut(&mut it.extra_protos).insert("SharedArrayBuffer", proto.clone());
     // byteLength/maxByteLength/growable accessor getters on the prototype.
@@ -258,15 +259,28 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     // ArrayBufferCopyAndDetach: transfer() preserves the source's resizability (its
     // [[ArrayBufferMaxByteLength]] slot); transferToFixedLength() is always fixed.
     let src_max = resizable_max_byte_length(&this);
-    // Transfer ownership of the Vec rather than cloning it. This is the engine primitive behind
-    // HTML structured transfer; same-length transfers must remain O(1) in backing-store bytes.
+    // The new buffer takes over the source's block rather than a copy: this is the engine
+    // primitive behind HTML structured transfer, and same-length transfers must remain O(1) in
+    // backing-store bytes. AllocateArrayBuffer precedes DetachArrayBuffer, so the block grows
+    // (fallibly) while the source is still attached: a failure leaves it intact.
+    let bytes = i
+        .local_buffer(ptr)
+        .cloned()
+        .expect("the detached check above established the buffer's own bytes");
+    if let Some(extra) = new_len.checked_sub(len).filter(|&extra| extra > 0) {
+        i.note_buffer_allocation(extra);
+        if bytes.borrow_mut().try_reserve_exact(extra).is_err() {
+            // Unreachable buffers still hold their data until a collection finds them.
+            i.collect_for_failed_allocation();
+            if bytes.borrow_mut().try_reserve_exact(extra).is_err() {
+                return Err(i.make_error("RangeError", "Array buffer allocation failed"));
+            }
+        }
+    }
     i.invalidate_native_buffer(ptr);
-    let Some(BufferData::Local(bytes)) = i.array_buffers.remove(&ptr) else {
-        unreachable!("the detached check above established the buffer's own bytes");
-    };
+    i.array_buffers.remove(&ptr);
     bytes.borrow_mut().resize(new_len, 0);
-    let (bv, bp) = make_array_buffer(i, new_len)?;
-    i.array_buffers.insert(bp, BufferData::Local(bytes));
+    let (bv, _) = array_buffer_with_storage(i, bytes);
     if let (false, Some(src_max)) = (fixed, src_max) {
         if let Value::Obj(nb) = &bv {
             set_internal(nb, "#\u{0}abMaxByteLength", Value::Num(src_max as f64));

@@ -50,6 +50,49 @@ fn exhausted_memory_throws_range_error_for_array_buffers() {
     }
 }
 
+/// ArrayBufferCopyAndDetach (ECMA-262 §25.1.3.3) allocates the new buffer before it detaches the
+/// source, so a `transfer` whose block cannot grow throws a RangeError and leaves the source
+/// attached with its bytes.
+#[test]
+fn failed_transfer_leaves_the_source_buffer_intact() {
+    const SCRIPT: &[u8] = br#"
+        var source = new ArrayBuffer(8);
+        new Uint8Array(source)[3] = 7;
+        var outcome;
+        try { source.transfer(200 * 1024 * 1024); outcome = 'transferred'; }
+        catch (e) { outcome = e.name; }
+        console.log([outcome, source.detached, source.byteLength, new Uint8Array(source)[3]].join(' '));
+        var moved = source.transfer(16);
+        console.log([source.detached, moved.byteLength, new Uint8Array(moved)[3]].join(' '));
+    "#;
+    for tier in ["interp", "bytecode", "jit"] {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -v 196608 && exec \"$0\" --tier=\"$1\"")
+            .arg(env!("CARGO_BIN_EXE_lumen"))
+            .arg(tier)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(SCRIPT).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{tier}: {:?}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            ["RangeError false 8 7", "true 16 7"],
+            "{tier}"
+        );
+    }
+}
+
 /// A new ArrayBuffer's data comes from the allocator already zeroed, so a large one is fresh
 /// pages that become resident only when written (asm.js and emscripten heaps of hundreds of MiB
 /// are allocated up front). Filling the block with zeros made all of it resident at once.
