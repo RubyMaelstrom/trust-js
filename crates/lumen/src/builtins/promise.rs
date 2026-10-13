@@ -18,6 +18,14 @@ pub(super) fn install_promise(it: &mut Interp) {
                 "Promise.prototype.then called on a non-Promise",
             ));
         }
+        // When SpeciesConstructor(this, %Promise%) is provably %Promise%, NewPromiseCapability
+        // runs no author code and its resolving functions are reachable only through the
+        // reaction, which settles the result promise itself: a plain promise is the capability.
+        if promise_species_is_intrinsic(i, &this) {
+            let result = i.new_promise();
+            i.promise_then_into(&this, arg(a, 0), arg(a, 1), result.clone());
+            return Ok(result);
+        }
         // The result promise is built by SpeciesConstructor(this, %Promise%) via NewPromiseCapability.
         let default_ctor = intrinsic_promise(i);
         let c = species_constructor(i, &this, &default_ctor)?;
@@ -530,6 +538,16 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
     });
     install_species(it, &ctor);
+    // The identity of the intrinsic @@species getter, for `promise_species_is_intrinsic`.
+    let species_getter = well_known_key(it, "species").and_then(|key| {
+        match ctor.borrow().props.get(&key).and_then(|p| p.getter()) {
+            Some(Value::Obj(getter)) => Some(getter.clone()),
+            _ => None,
+        }
+    });
+    if let Some(getter) = species_getter {
+        Rc::make_mut(&mut it.extra_protos).insert("%PromiseSpeciesGetter%", getter);
+    }
     Rc::make_mut(&mut it.extra_protos).insert("%PromiseCtor%", ctor.clone());
     set_builtin(&it.global, "Promise", Value::Obj(ctor));
 }
@@ -542,6 +560,49 @@ fn intrinsic_promise(i: &Interp) -> Value {
         .get("%PromiseCtor%")
         .cloned()
         .map_or(Value::Undefined, Value::Obj)
+}
+
+/// Whether SpeciesConstructor(`promise`, %Promise%) (ECMA-262 §7.3.22) is unobservably the
+/// current Realm's %Promise%: `promise` has no own "constructor" and inherits from
+/// %Promise.prototype% a "constructor" data property holding %Promise%, whose @@species is still
+/// its intrinsic getter (which returns its receiver). Both Gets then read data properties or call
+/// that getter. NewPromiseCapability(%Promise%) (§27.2.1.5) runs no author code either:
+/// %Promise%'s "prototype" is non-writable and non-configurable, so its promise inherits from
+/// %Promise.prototype% exactly like one from `Interp::new_promise`.
+fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
+    let (Value::Obj(promise), Some(prototype), Some(ctor), Some(species_getter)) = (
+        promise,
+        i.extra_protos.get("Promise"),
+        i.extra_protos.get("%PromiseCtor%"),
+        i.extra_protos.get("%PromiseSpeciesGetter%"),
+    ) else {
+        return false;
+    };
+    {
+        let promise = promise.borrow();
+        if !promise
+            .proto
+            .as_ref()
+            .is_some_and(|p| Rc::ptr_eq(p, prototype))
+            || promise.props.contains("constructor")
+        {
+            return false;
+        }
+    }
+    let inherits_ctor = prototype
+        .borrow()
+        .props
+        .get("constructor")
+        .is_some_and(|p| {
+            !p.accessor() && matches!(p.value(), Value::Obj(c) if Rc::ptr_eq(&c, ctor))
+        });
+    let Some(species) = well_known_key(i, "species") else {
+        return false;
+    };
+    inherits_ctor && ctor.borrow().props.get(&species).is_some_and(|p| {
+        p.accessor()
+            && matches!(p.getter(), Some(Value::Obj(getter)) if Rc::ptr_eq(getter, species_getter))
+    })
 }
 
 /// ECMA-262 PromiseResolve: return a matching native promise unchanged, otherwise settle a new

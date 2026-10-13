@@ -2036,6 +2036,85 @@ fn await_allocates_no_reaction_functions_or_result_promise() {
     assert!(per_await < 1.5, "{per_await} objects allocated per await");
 }
 
+/// Promise.prototype.then whose SpeciesConstructor is provably %Promise% skips the generic
+/// NewPromiseCapability (an executor, resolving functions and a capability record): only the
+/// result promise is allocated. Every author-visible step of the generic path (an own or
+/// inherited accessor `constructor`, a replaced or deleted @@species, a subclass) still runs.
+#[test]
+fn promise_then_with_the_intrinsic_species_allocates_only_its_result() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var pending = new Promise(function () {}); function f() {} pending.then(f);",
+    );
+    let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
+    run_in(&mut engine, "for (var i = 0; i < 4000; i++) pending.then(f);");
+    let per_then =
+        (crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before) as f64 / 4000.0;
+    assert!(per_then < 1.5, "{per_then} objects allocated per then");
+
+    // Expected values are node's.
+    let source = r#"
+        var log = [];
+        function note(s) { log.push(s); }
+        var P = Promise, PP = Promise.prototype;
+        var species = Object.getOwnPropertyDescriptor(P, Symbol.species);
+        var r = P.resolve(1).then(function (v) { note('a' + v); return v + 1; });
+        note(Object.getPrototypeOf(r) === PP);
+        r.then(function (v) { note('b' + v); });
+        var p1 = P.resolve(2);
+        Object.defineProperty(p1, 'constructor', { get() { note('own'); return P; } });
+        p1.then(function (v) { note('c' + v); });
+        class Sub extends P {}
+        PP.constructor = Sub;
+        note(P.resolve(3).then(function (v) { note('d' + v); }) instanceof Sub);
+        PP.constructor = P;
+        Object.defineProperty(PP, 'constructor', {
+            get() { note('proto'); return P; }, configurable: true });
+        P.resolve(4).then(function () {});
+        Object.defineProperty(PP, 'constructor', {
+            value: P, writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(P, Symbol.species, {
+            get() { note('species'); return undefined; }, configurable: true });
+        note(Object.getPrototypeOf(P.resolve(5).then(function (v) { note('e' + v); })) === PP);
+        delete P[Symbol.species];
+        Object.defineProperty(Function.prototype, Symbol.species, {
+            get() { note('inherited'); return Sub; }, configurable: true });
+        note(P.resolve(6).then(function () {}) instanceof Sub);
+        delete Function.prototype[Symbol.species];
+        Object.defineProperty(P, Symbol.species, species);
+        var p5 = P.resolve(7);
+        Object.setPrototypeOf(p5, Sub.prototype);
+        note(p5.then(function (v) { note('f' + v); }) instanceof Sub);
+        note(Sub.resolve(8).then(function (v) { note('g' + v); }) instanceof Sub);
+        P.reject(9).then(null, function (e) { note('h' + e); return 'x'; })
+            .then(function (v) { note('i' + v); });
+        P.resolve(10).then(function () { return { then(res) { note('thenable'); res(11); } }; })
+            .then(function (v) { note('j' + v); });
+        log.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "true,own,true,proto,species,true,inherited,true,true,true",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "log.join()"),
+            "true,own,true,proto,species,true,inherited,true,true,true,\
+             a1,c2,d3,e5,f7,g8,h9,b2,ix,thenable,j11",
+            "{tier:?}"
+        );
+    }
+}
+
 /// Well-known Symbols are the Agent's (ECMA-262 §6.1.5.1) and %Promise%/%AggregateError% are
 /// intrinsics: replacing or watching the global `Symbol`, `Promise`, `AggregateError` and `Intl`
 /// bindings changes neither ToPrimitive, Object.prototype.toString, the iterator protocol, a
