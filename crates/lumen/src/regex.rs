@@ -2196,6 +2196,22 @@ impl ReText {
         self.n_elems
     }
 
+    /// [`Self::slice`] as an engine string, sharing an ASCII source's storage where `LStr` can.
+    pub(crate) fn slice_lstr(&self, a: usize, b: usize) -> crate::lstr::LStr {
+        match &self.ascii_src {
+            Some(src) => src.slice_bytes(a, b),
+            None => self.slice(a, b).into(),
+        }
+    }
+
+    /// Append [`Self::slice`] to `out`, copying straight out of an ASCII source.
+    pub(crate) fn push_slice(&self, out: &mut String, a: usize, b: usize) {
+        match &self.ascii_src {
+            Some(src) => out.push_str(&src.as_str()[a..b]),
+            None => out.push_str(&self.slice(a, b)),
+        }
+    }
+
     /// The canonical string for elements `a..b` (surrogate halves recombine).
     pub fn slice(&self, a: usize, b: usize) -> String {
         // ASCII subject: element index == byte index — copy straight from the source.

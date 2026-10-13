@@ -126,6 +126,202 @@ fn split_limits_wrap_and_species_defaults_to_the_intrinsic() {
     );
 }
 
+/// RegExp.prototype.test, [@@split] and [@@replace] take direct paths for ordinary RegExps (no
+/// match arrays, no splitter object); their results, `lastIndex` writes, legacy statics,
+/// captures, limits, templates and replacer calls must equal the generic algorithms'
+/// (§22.2.6.16, §22.2.6.14, §22.2.6.11).
+#[test]
+fn live_split_replace_and_test_match_the_generic_algorithms() {
+    check(
+        r###"
+        (function () {
+        function show(v) {
+            return JSON.stringify(v, function (k, x) { return x === undefined ? '<u>' : x; });
+        }
+        function run() {
+            var r = [];
+            // test
+            var g = /a/g;
+            r.push([g.test('aa'), g.lastIndex, g.test('aa'), g.lastIndex, g.test('aa'), g.lastIndex]);
+            var y = /a/y;
+            y.lastIndex = 1;
+            r.push([y.test('ba'), y.lastIndex, y.test('ba'), y.lastIndex]);
+            var far = /a/g;
+            far.lastIndex = 9;
+            r.push([far.test('aa'), far.lastIndex]);
+            var plain = /b/;
+            plain.lastIndex = 7;
+            r.push([plain.test('ab'), plain.lastIndex]);
+            /(\d)(\d)?/.test('x1y');
+            r.push([RegExp.$1, RegExp.$2, RegExp.lastMatch, RegExp['$`'], RegExp["$'"]]);
+            var own = /a/;
+            own.exec = function () { return null; };
+            r.push(own.test('a'));
+            var reads = 0, li = /a/g;
+            li.lastIndex = { valueOf: function () { reads++; return 0; } };
+            r.push([li.test('a'), reads, li.lastIndex]);
+            var frozen = /a/g;
+            Object.defineProperty(frozen, 'lastIndex', { writable: false, value: 0 });
+            try { frozen.test('a'); r.push('no throw'); } catch (e) { r.push(e.name); }
+            // split
+            r.push('btn btn-primary active large'.split(/\s+/));
+            r.push('2024-01-02'.split(/(-)/));
+            r.push('a,b,c'.split(/,/, 2), 'a1b2c'.split(/(\d)/, 2), 'a1b2c'.split(/(\d)/, 3));
+            r.push('abc'.split(/(?:)/), 'abc'.split(/x*/), ',a,'.split(/,/), ''.split(/x/), ''.split(/(?:)/));
+            r.push('😀a😀'.split(/(?:)/u).length, '😀a😀'.split(/(?:)/).length);
+            r.push('a,b'.split(/,/y), 'ab'.split(/(x)?b/), 'a1b2'.split(/(?<=\d)/));
+            var sx = /,/g;
+            sx.lastIndex = 5;
+            'a,b,c'.split(sx);
+            r.push([sx.lastIndex, RegExp.lastMatch, RegExp['$`'], RegExp["$'"]]);
+            r.push('aXbxC'.split(/x/i), 'a\nb'.split(/^/m), 'one  two'.split(/(\s)+/));
+            // replace
+            function escapeHtml(s) {
+                return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            }
+            r.push(escapeHtml('<a href="x">Tom & Jerry\'s</a>'));
+            r.push('john smith'.replace(/(\w+)\s(\w+)/, '$2, $1 [$&] {$`|$\'} $$ $3 $10'));
+            r.push('2024-01-02'.replace(/(?<y>\d+)-(?<m>\d+)/, '$<m>/$<y> $<z>.'));
+            r.push('a-b'.replace(/(-)/, '$<x>'));
+            r.push('abc'.replace(/x*/g, '-'), '😀😀'.replace(/(?:)/gu, '-').length,
+                '😀😀'.replace(/(?:)/g, '-').length);
+            var ys = /a/y;
+            ys.lastIndex = 1;
+            r.push(['aab'.replace(ys, 'X'), ys.lastIndex, 'aab'.replace(ys, 'X'), ys.lastIndex]);
+            var ng = /a/;
+            ng.lastIndex = 3;
+            r.push(['aa'.replace(ng, 'b'), ng.lastIndex]);
+            var gl = /a/g;
+            gl.lastIndex = 1;
+            r.push(['aXa'.replace(gl, 'b'), gl.lastIndex, RegExp.lastMatch, RegExp['$`']]);
+            var calls = [];
+            var fr = /(\w)(\d)?/g;
+            r.push('a1b'.replace(fr, function (m, c1, c2, pos, str) {
+                calls.push([m, c1, c2, pos, str, arguments.length, fr.lastIndex]);
+                fr.lastIndex = 0;
+                return '<' + m + '>';
+            }), calls, fr.lastIndex);
+            var named = [];
+            r.push('x=1,y=2'.replace(/(?<k>\w)=(?<v>\d)/g, function () {
+                var groups = arguments[arguments.length - 1];
+                named.push([Object.getPrototypeOf(groups), groups.k, groups.v, arguments.length]);
+                return groups.v + groups.k;
+            }), named);
+            try { 'aa'.replace(/a/g, function () { throw new Error('stop'); }); } catch (e) { r.push(e.message); }
+            var cnt = /a/g;
+            r.push('aaa'.replace(cnt, function (m, p) { return p; }), 'aaa'.replace(cnt, '$&$&'));
+            var ownExec = /a/g;
+            ownExec.exec = function () { return null; };
+            r.push('aa'.replace(ownExec, 'b'));
+            r.push('aaa'.replace(/a/gy, 'b'), 'baaa'.replace(/a/gy, 'b'));
+            return r.map(show).join('\n');
+        }
+        return run();
+        })()
+        "###,
+        r###"[true,1,true,2,false,0]
+[true,2,false,0]
+[false,0]
+[true,7]
+["1","","1","x","y"]
+false
+[true,1,1]
+"TypeError"
+["btn","btn-primary","active","large"]
+["2024","-","01","-","02"]
+["a","b"]
+["a","1"]
+["a","1","b"]
+["a","b","c"]
+["a","b","c"]
+["","a",""]
+[""]
+[]
+3
+5
+["a","b"]
+["a","<u>",""]
+["a1","b2"]
+[5,",","a,b","c"]
+["a","b","C"]
+["a\n","b"]
+["one"," ","two"]
+"&lt;a href=&quot;x&quot;&gt;Tom &amp; Jerry's&lt;/a&gt;"
+"smith, john [john smith] {|} $ $3 john0"
+"01/2024 .-02"
+"a$<x>b"
+"-a-b-c-"
+7
+9
+["aXb",2,"aab",0]
+["ba",3]
+["bXb",0,"a","aX"]
+"<a1><b>"
+[["a1","a","1",0,"a1b",5,0],["b","b","<u>",2,"a1b",5,0]]
+0
+"1x,2y"
+[[null,"x","1",6],[null,"y","2",6]]
+"stop"
+"012"
+"aaaaaa"
+"aa"
+"bbb"
+"baaa""###,
+    );
+}
+
+/// Any observable step of those algorithms (an accessor @@match read by the splitter's
+/// IsRegExp, a species constructor or getter, a replaced or own `exec`) keeps the generic path
+/// and runs in the specified order.
+#[test]
+fn regexp_fast_paths_yield_to_observable_lookups() {
+    check(
+        r###"
+        (function () {
+        function run() {
+            var log = [];
+            var match = Object.getOwnPropertyDescriptor(RegExp.prototype, Symbol.match);
+            Object.defineProperty(RegExp.prototype, Symbol.match, {
+                get: function () { log.push('match'); return match.value; },
+                configurable: true,
+            });
+            var a = 'a,b'.split(/,/).join('|');
+            Object.defineProperty(RegExp.prototype, Symbol.match, match);
+            class R extends RegExp {
+                constructor(pattern, flags) {
+                    log.push('R:' + flags);
+                    super(pattern, flags);
+                }
+            }
+            var b = 'a,b'.split(new R(',')).join('|');
+            var species = Object.getOwnPropertyDescriptor(RegExp, Symbol.species);
+            Object.defineProperty(RegExp, Symbol.species, {
+                get: function () { log.push('species'); return RegExp; },
+                configurable: true,
+            });
+            var c = 'a,b'.split(/,/).join('|');
+            Object.defineProperty(RegExp, Symbol.species, species);
+            var exec = RegExp.prototype.exec;
+            RegExp.prototype.exec = function (s) {
+                log.push('exec:' + this.lastIndex);
+                return exec.call(this, s);
+            };
+            var d = 'a,b'.split(/,/).join('|');
+            var e = 'xa'.replace(/a/g, 'b');
+            var f = /a/.test('a');
+            RegExp.prototype.exec = exec;
+            var own = /a/g;
+            own.exec = function (s) { log.push('own'); return exec.call(this, s); };
+            var g = 'aa'.replace(own, 'b') + own.test('a');
+            return [a, b, c, d, e, f, g, log.join(' ')].join(';');
+        }
+        return run();
+        })()
+        "###,
+        r###"a|b;a|b;a|b;a|b;xb;true;bbtrue;match R:undefined R:y species exec:0 exec:1 exec:2 exec:0 exec:2 exec:0 own own own own"###,
+    );
+}
+
 /// A pattern whose alternatives begin with `^` or with an element (`(^|\s)name`) is only
 /// attempted where one of them can begin, including the empty end of the input.
 #[test]

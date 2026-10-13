@@ -2285,31 +2285,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
                 });
             }
             let result = i.make_array(items);
-            // `groups`: a null-prototype object of named captures, or undefined if there are none.
-            let groups = if re.names.is_empty() {
-                Value::Undefined
-            } else {
-                let g = i.new_object();
-                g.borrow_mut().proto = None;
-                // One property per name, in first-occurrence order; for duplicate names the value
-                // comes from whichever same-named group actually matched (else undefined).
-                let mut seen: Vec<&str> = Vec::new();
-                for (name, _) in &re.names {
-                    if seen.contains(&name.as_str()) {
-                        continue;
-                    }
-                    seen.push(name.as_str());
-                    let v = re
-                        .names
-                        .iter()
-                        .filter(|(n, _)| n == name)
-                        .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
-                        .map(|(a, b)| Value::lstr(text.slice(a, b)))
-                        .unwrap_or(Value::Undefined);
-                    set_data(&g, name, v);
-                }
-                Value::Obj(g)
-            };
+            let groups = regexp_groups(i, &re, &caps, &text);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
             let indices = if re.flags.contains('d') {
@@ -2365,6 +2341,39 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
             Ok(result)
         }
     }
+}
+
+/// A match's `groups`: a null-prototype object of its named captures, or undefined if the
+/// pattern names none (RegExpBuiltinExec, ECMA-262 §22.2.7.2). One property per name, in
+/// first-occurrence order; for duplicate names the value comes from whichever same-named group
+/// actually matched (else undefined).
+pub(super) fn regexp_groups(
+    i: &mut Interp,
+    re: &crate::regex::Regex,
+    caps: &[Option<(usize, usize)>],
+    text: &crate::regex::ReText,
+) -> Value {
+    if re.names.is_empty() {
+        return Value::Undefined;
+    }
+    let g = i.new_object();
+    g.borrow_mut().proto = None;
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, _) in &re.names {
+        if seen.contains(&name.as_str()) {
+            continue;
+        }
+        seen.push(name.as_str());
+        let v = re
+            .names
+            .iter()
+            .filter(|(n, _)| n == name)
+            .find_map(|(_, idx)| caps.get(*idx).copied().flatten())
+            .map(|(a, b)| Value::lstr(text.slice(a, b)))
+            .unwrap_or(Value::Undefined);
+        set_data(&g, name, v);
+    }
+    Value::Obj(g)
 }
 
 /// Allocation-free `RegExp.prototype.exec` for a JIT call whose result is immediately discarded.
