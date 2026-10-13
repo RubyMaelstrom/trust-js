@@ -62,6 +62,15 @@ pub(super) fn install_atomics(it: &mut Interp) {
             Ok(if n.is_finite() { n.trunc() as i128 } else { 0 })
         }
     }
+    /// DoWait's `expected` (ECMA-262 #sec-dowait): ToBigInt64(value) for a BigInt64Array,
+    /// ToInt32(value) for an Int32Array, compared with the element's signed value.
+    fn wait_operand(i: &mut Interp, info: &TaInfo, v: &Value) -> Result<i128, Value> {
+        Ok(if info.kind.is_bigint() {
+            ab(i.to_bigint(v))?.to_i128_wrapping() as i64 as i128
+        } else {
+            ab(i.to_int32(v))? as i128
+        })
+    }
     fn read_i128(i: &Interp, info: &TaInfo, idx: usize) -> i128 {
         match i.ta_read(info, idx) {
             Value::Num(n) => n as i128,
@@ -180,7 +189,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             }
         };
         let (info, idx) = target(i, a)?;
-        let expected = operand(i, &info, &arg(a, 2))?;
+        let expected = wait_operand(i, &info, &arg(a, 2))?;
         // timeout: ToNumber (NaN → +Infinity), clamped at 0.
         let q = ab(i.to_number(&arg(a, 3)))?;
         let timeout = if q.is_nan() || q == f64::INFINITY {
@@ -243,7 +252,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             }
         };
         let (info, idx) = target(i, a)?;
-        let expected = operand(i, &info, &arg(a, 2))?;
+        let expected = wait_operand(i, &info, &arg(a, 2))?;
         // timeout: ToNumber (NaN → +Infinity); None means "no timeout".
         let q = ab(i.to_number(&arg(a, 3)))?;
         let timeout = if q.is_nan() || q == f64::INFINITY {

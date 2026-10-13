@@ -17788,6 +17788,39 @@ fn atomics_wait_async() {
     );
 }
 
+/// DoWait compares the element with ToInt32(value), or ToBigInt64(value) for a BigInt64Array
+/// (ECMA-262 #sec-dowait), not with the value's mathematical integer: `2 ** 32` waits on 0.
+/// Expected values are Node's.
+#[test]
+fn atomics_wait_converts_the_expected_value_to_the_element_type() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var i32 = new Int32Array(new SharedArrayBuffer(8));
+out.push(Atomics.wait(i32, 0, 2 ** 32, 0), Atomics.wait(i32, 0, 1e300, 0),
+         Atomics.wait(i32, 0, 0.9, 0));
+i32[1] = -1;
+out.push(Atomics.wait(i32, 1, 4294967295, 0), Atomics.wait(i32, 1, -1, 0),
+         Atomics.wait(i32, 1, 2 ** 31, 0));
+out.push(Atomics.waitAsync(i32, 0, 2 ** 32, 0).value, Atomics.waitAsync(i32, 1, 2 ** 32 - 1, 0).value,
+         Atomics.waitAsync(i32, 1, 1, 0).value);
+var i64 = new BigInt64Array(new SharedArrayBuffer(16));
+i64[1] = -1n;
+out.push(Atomics.wait(i64, 0, 2n ** 64n, 0), Atomics.wait(i64, 1, 2n ** 64n - 1n, 0),
+         Atomics.wait(i64, 1, 2n ** 63n, 0), Atomics.waitAsync(i64, 0, -(2n ** 64n), 0).value);
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "timed-out,timed-out,timed-out,timed-out,timed-out,not-equal,timed-out,timed-out,\
+             not-equal,timed-out,timed-out,not-equal,timed-out",
+            "tier {tier:?}"
+        );
+    }
+}
+
 #[test]
 fn dataview_length_tracking_and_toprimitive() {
     // A length-tracking DataView over a resizable buffer follows the buffer's current length.
