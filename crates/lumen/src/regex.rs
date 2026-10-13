@@ -274,6 +274,8 @@ pub struct Regex {
     /// [`FirstFilter::Atoms`] baked into a byte-indexed table (elements < 256): the scan loop
     /// becomes one load per position.
     first_lut: Option<Box<[bool; 256]>>,
+    /// Besides the [`FirstFilter::Atoms`], a match may begin wherever `^` holds.
+    first_line_start: bool,
     /// Per-pattern execution feedback. These cells add no allocation to cold patterns; the native
     /// straight-line program is compiled lazily after the tier-up threshold.
     tier_ticks: Cell<u32>,
@@ -1417,10 +1419,12 @@ enum FirstFilter {
 }
 
 /// Compute the [`FirstFilter`] by ε-walking the program from its entry: through saves, jumps,
-/// splits, capture clears and marks, collecting the first thing each path does. Anything not
-/// modelled (assertions other than a uniform leading `^`, backrefs, lookarounds, inline flags,
+/// splits, capture clears and marks, collecting the first thing each path does. A path that
+/// begins with `^` can only begin where `^` holds; the returned flag says such paths exist, so a
+/// match may also begin at the start of the input (or of a line, in multiline mode), as in
+/// `(^|\s)name`. Anything else not modelled (other assertions, backrefs, lookarounds, inline flags,
 /// or an ε-reachable `Match` — an empty-matchable pattern) disables the filter.
-fn first_filter(prog: &[Inst], multiline: bool) -> FirstFilter {
+fn first_filter(prog: &[Inst], multiline: bool) -> (FirstFilter, bool) {
     let mut atoms: Vec<Rep> = Vec::new();
     let mut asserts = 0usize;
     let mut stack = vec![0usize];
@@ -1468,19 +1472,19 @@ fn first_filter(prog: &[Inst], multiline: bool) -> FirstFilter {
                 }
             }
             Inst::AssertStart => asserts += 1,
-            _ => return FirstFilter::None,
+            _ => return (FirstFilter::None, false),
         }
     }
     if asserts > 0 {
         if atoms.is_empty() && !multiline {
-            FirstFilter::Anchored
+            (FirstFilter::Anchored, false)
         } else {
-            FirstFilter::None
+            (FirstFilter::Atoms(atoms), true)
         }
     } else if !atoms.is_empty() {
-        FirstFilter::Atoms(atoms)
+        (FirstFilter::Atoms(atoms), false)
     } else {
-        FirstFilter::None
+        (FirstFilter::None, false)
     }
 }
 
@@ -2408,8 +2412,8 @@ impl Regex {
         prog.push(Inst::Match);
         // The `flags` accessor returns flags in canonical order.
         let canonical: String = "dgimsuvy".chars().filter(|c| flags.contains(*c)).collect();
-        let first = first_filter(&prog, flags.contains('m'));
-        let first_byte = if !flags.contains('i') {
+        let (first, first_line_start) = first_filter(&prog, flags.contains('m'));
+        let first_byte = if !flags.contains('i') && !first_line_start {
             match &first {
                 FirstFilter::Atoms(atoms) if atoms.len() == 1 => match &atoms[0] {
                     Rep::Char(c) if *c < 0x80 => Some(*c as u8),
@@ -2489,6 +2493,7 @@ impl Regex {
             literal_fold,
             memo_string_failures,
             first_lut: None,
+            first_line_start,
             tier_ticks: Cell::new(0),
             subject_shapes: Cell::new(0),
             tier_up_attempted: Cell::new(false),
@@ -2793,11 +2798,22 @@ impl Regex {
                             }
                         }
                         FirstFilter::Atoms(atoms) => {
-                            // Every path consumes an element first: find the next viable one. Small
-                            // elements go through the precomputed table (one load per position).
+                            // Every path consumes an element first, or begins where `^`
+                            // holds: find the next viable position. Small elements go
+                            // through the precomputed table (one load per position).
                             let len = input.len();
+                            let line_start = |from: usize| {
+                                self.first_line_start
+                                    && (from == 0
+                                        || (self.multiline
+                                            && is_line_terminator_u32(input.at(from - 1))))
+                            };
                             loop {
                                 if from >= len {
+                                    // A path through `^` may match the empty end of the input.
+                                    if from == len && line_start(from) {
+                                        break;
+                                    }
                                     break 'scan Ok(None);
                                 }
                                 let c = input.at(from);
@@ -2805,7 +2821,7 @@ impl Regex {
                                     Some(lut) if (c as usize) < 256 => lut[c as usize],
                                     _ => self.first_matches(atoms, c),
                                 };
-                                if viable {
+                                if viable || line_start(from) {
                                     break;
                                 }
                                 from += 1;

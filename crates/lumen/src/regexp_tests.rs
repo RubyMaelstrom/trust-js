@@ -126,6 +126,64 @@ fn split_limits_wrap_and_species_defaults_to_the_intrinsic() {
     );
 }
 
+/// A pattern whose alternatives begin with `^` or with an element (`(^|\s)name`) is only
+/// attempted where one of them can begin, including the empty end of the input.
+#[test]
+fn caret_alternatives_only_start_where_caret_holds() {
+    check(
+        r###"
+        (function () {
+        function all(re, s) {
+            var found = [], m;
+            re.lastIndex = 0;
+            while ((m = re.exec(s))) {
+                found.push(m.index + ':' + m[0].length);
+                if (m[0].length === 0) re.lastIndex++;
+                if (found.length > 50) break;
+            }
+            return found.join(' ');
+        }
+        var cases = [
+            [/(^|\s)active(\s|$)/g, 'active btn active-x  active'],
+            [/(^|x)/g, ''],
+            [/(^|x)/g, 'axbx'],
+            [/(?:^|,)(\w*)/g, 'a,,b,'],
+            [/(?:^|,)(\w*)/gm, 'a\n,b\nc'],
+            [/^|a/gm, 'xa\nya\n'],
+            [/(?:^|b)/gm, 'b\n\nb'],
+            [/(?:^ +|\s)x/g, '  x x'],
+            [/(^\d+|[a-z]+)/g, '12ab 34'],
+            [/(^|\W)#(\w+)/g, '#tag and #more #'],
+            [/(?:^|[?&])id=(\d+)/g, 'id=1&x=2&id=3'],
+            [/(^|\s)a/g, 'a a a'],
+            [/(^|\s)a/gu, '😀 a'],
+            [/(?:^|\n)b/g, 'b\nb\r\nb'],
+            [/(?:^|\n)b/gm, 'b\nb b'],
+        ];
+        var lines = cases.map(function (c) { return c[0] + ' ' + all(c[0], c[1]); });
+        lines.push([/(^|\s)active(\s|$)/.test('btn active'), /(^|\s)active(\s|$)/.test('btnactive'), /(^|x)$/.test(''), /(?:^|b)c/.test('ac')].join());
+        return lines.join('\n');
+        })()
+        "###,
+        r###"/(^|\s)active(\s|$)/g 0:7 20:7
+/(^|x)/g 0:0
+/(^|x)/g 0:0 1:1 3:1
+/(?:^|,)(\w*)/g 0:1 1:1 2:2 4:1
+/(?:^|,)(\w*)/gm 0:1 2:0 5:1
+/^|a/gm 0:0 1:1 3:0 4:1 6:0
+/(?:^|b)/gm 0:0 2:0 3:0
+/(?:^ +|\s)x/g 0:3 3:2
+/(^\d+|[a-z]+)/g 0:2 2:2
+/(^|\W)#(\w+)/g 0:4 8:6
+/(?:^|[?&])id=(\d+)/g 0:4 8:5
+/(^|\s)a/g 0:1 1:2 3:2
+/(^|\s)a/gu 2:2
+/(?:^|\n)b/g 0:1 1:2 4:2
+/(?:^|\n)b/gm 0:1 1:2 4:1
+true,false,true,false"###,
+    );
+}
+
 /// Deeply nested patterns are an implementation limit: past it, a SyntaxError rather than a
 /// native stack overflow. Patterns at the limit compile and match (node gives the same results
 /// for them).
