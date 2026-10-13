@@ -2036,6 +2036,81 @@ fn await_allocates_no_reaction_functions_or_result_promise() {
     assert!(per_await < 1.5, "{per_await} objects allocated per await");
 }
 
+/// Well-known Symbols are the Agent's (ECMA-262 §6.1.5.1) and %Promise%/%AggregateError% are
+/// intrinsics: replacing or watching the global `Symbol`, `Promise`, `AggregateError` and `Intl`
+/// bindings changes neither ToPrimitive, Object.prototype.toString, the iterator protocol, a
+/// later Realm's or module namespace's symbols, nor Promise.prototype.then/finally/Promise.any.
+#[test]
+fn engine_reaches_well_known_symbols_and_intrinsics_without_global_bindings() {
+    let source = r#"
+        var out = [];
+        var S = Symbol, iter = Symbol.iterator, tag = Symbol.toStringTag;
+        class Tagged { get [Symbol.toStringTag]() { return 'Tagged'; } }
+        var prim = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 42 : hint; } };
+        var P = Promise, AE = AggregateError, settled = "", hits = 0;
+        function note() { for (var i = 0; i < arguments.length; i++) settled += arguments[i] + ","; }
+        globalThis.Symbol = function () { throw new Error('global Symbol read'); };
+        Object.defineProperty(globalThis, 'Promise', {
+            get() { hits++; return P; }, configurable: true });
+        globalThis.AggregateError = function () { throw new Error('global AggregateError read'); };
+        globalThis.Intl = undefined;
+        out.push(prim + 1, `${prim}`, +prim);
+        out.push([new Map, P.resolve(), new Tagged, new Set, function* () {}()]
+            .map(function (o) { return Object.prototype.toString.call(o); }).join());
+        out.push([...new Set([1, 2])].join(), Array.from(new Map([[3, 4]])).join());
+        var [a, b] = 'xy';
+        out.push(a + b, (1234.5).toLocaleString('en-US'));
+        var other = $262.createRealm().global;
+        out.push(other.Symbol.iterator === iter, other.Symbol.toStringTag === tag);
+        P.resolve(1).then(function (v) { note('then' + v); });
+        P.resolve(2).finally(function () { note('finally'); });
+        P.reject(3).catch(function (v) { note('catch' + v); });
+        Object.defineProperty(Array.prototype, '0', {
+            set(v) { throw new Error('errors used Set'); }, configurable: true });
+        // "A newly created AggregateError object" has no own `message` (V8 adds one).
+        P.any([P.reject(4), P.reject(5)]).catch(function (e) {
+            note(e instanceof AE, e.constructor === AE, Object.hasOwn(e, 'message'),
+                e.errors.join('+'), Object.getOwnPropertyDescriptor(e, 'errors').enumerable);
+        });
+        P.any([]).catch(function (e) { note(e instanceof AE, e.errors.length); });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "default1,string,42,[object Map],[object Promise],[object Tagged],[object Set],\
+             [object Generator],1,2,3,4,xy,1,234.5,true,true",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "delete Array.prototype[0]; settled + ';' + hits"
+            ),
+            "then1,finally,catch3,true,0,true,true,false,4+5,false,;0",
+            "{tier:?}"
+        );
+    }
+    // A module namespace created after `Symbol` is replaced still gets its @@toStringTag.
+    let mut engine = Engine::new();
+    run_in(&mut engine, "globalThis.Symbol = undefined;");
+    engine
+        .eval_module(
+            "import * as ns from '/dep.js'; globalThis.nsTag = Object.prototype.toString.call(ns);",
+            "/main.js",
+            |spec, _| (spec == "/dep.js").then(|| (spec.to_string(), "export var x;".to_string())),
+        )
+        .unwrap();
+    assert_eq!(run_in(&mut engine, "nsTag"), "[object Module]");
+}
+
 /// The live-object ceiling is an engine setting: retention below it succeeds, retention above it
 /// still throws a catchable RangeError after a full collection, and the default never falls
 /// below the former fixed ceiling.

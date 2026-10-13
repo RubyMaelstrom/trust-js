@@ -364,8 +364,7 @@ fn get_str(o: &Gc, k: &str) -> String {
 
 /// Construct `new Intl.<service>(locale, options)`.
 fn new_service(i: &mut Interp, service: &str, locale: &str, opts: Gc) -> Result<Value, Value> {
-    let intl = ab(i.get_member(&Value::Obj(i.global.clone()), "Intl"))?;
-    let ctor = ab(i.get_member(&intl, service))?;
+    let ctor = crate::builtins::intl_service(i, service)?;
     ab(i.construct(ctor, &[Value::lstr(locale.to_string()), Value::Obj(opts)]))
 }
 

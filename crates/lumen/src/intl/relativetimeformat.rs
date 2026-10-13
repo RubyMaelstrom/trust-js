@@ -194,8 +194,7 @@ fn format(
 }
 
 fn new_service(i: &mut Interp, service: &str, locale: &str, options: Gc) -> Result<Value, Value> {
-    let intl = ab(i.get_member(&Value::Obj(i.global.clone()), "Intl"))?;
-    let constructor = ab(i.get_member(&intl, service))?;
+    let constructor = crate::builtins::intl_service(i, service)?;
     ab(i.construct(
         constructor,
         &[Value::lstr(locale.to_string()), Value::Obj(options)],

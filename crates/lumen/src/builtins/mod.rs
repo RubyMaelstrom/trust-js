@@ -324,6 +324,15 @@ pub(crate) fn intl_delegate(
     }
 }
 
+/// The current Realm's %Intl.<service>% constructor, cached when Intl is installed: an
+/// intrinsic, never a read of the global `Intl` binding, which author code may replace.
+pub(crate) fn intl_service(i: &Interp, service: &str) -> Result<Value, Value> {
+    i.extra_protos
+        .get(format!("%Intl.{service}%").as_str())
+        .map(|c| Value::Obj(c.clone()))
+        .ok_or_else(|| i.make_error("TypeError", format!("Intl.{service} is unavailable")))
+}
+
 /// Construct `Intl.<service>(locales, options)` and invoke `method(args…)` on it. Used to route the
 /// `toLocale*`/`localeCompare` methods through the Intl services now that they exist.
 #[cfg(feature = "intl")]
@@ -335,14 +344,7 @@ pub(crate) fn intl_delegate(
     method: &str,
     call_args: &[Value],
 ) -> Result<Value, Value> {
-    // Use the cached intrinsic (immune to tainted Intl globals), falling back to the global.
-    let ctor = match i.extra_protos.get(format!("%Intl.{service}%").as_str()) {
-        Some(c) => Value::Obj(c.clone()),
-        None => {
-            let intl = ab(i.get_member(&Value::Obj(i.global.clone()), "Intl"))?;
-            ab(i.get_member(&intl, service))?
-        }
-    };
+    let ctor = intl_service(i, service)?;
     let inst = ab(i.construct(ctor, &[locales, options]))?;
     let f = ab(i.get_member(&inst, method))?;
     ab(i.call(f, inst, call_args))
@@ -1708,9 +1710,19 @@ fn set_internal_obj(target: &Value, key: &str, v: Value) {
     }
 }
 
-fn make_aggregate_error(i: &mut Interp, errors: Value) -> Result<Value, Value> {
-    let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "AggregateError"))?;
-    ab(i.construct(ctor, &[errors]))
+/// Promise.any's rejection value (ECMA-262 §27.2.4.3.1 PerformPromiseAny and §27.2.4.3.2
+/// Promise.any Reject Element Functions): "a newly created AggregateError object" of the current
+/// Realm, with no `message`, whose own `errors` is CreateArrayFromList(errors). Nothing here may
+/// consult the global `AggregateError` binding or iterate: `errors` is the combinator's own
+/// fully populated Array, which nothing else can reach.
+fn make_aggregate_error(i: &Interp, errors: Value) -> Value {
+    let error = i.make_error("AggregateError", "");
+    if let Value::Obj(o) = &error {
+        o.borrow_mut()
+            .props
+            .insert("errors", Property::data(errors, true, false, true));
+    }
+    error
 }
 
 /// `Promise.resolve(x)` as a value helper (returns existing promises unchanged).
@@ -3341,17 +3353,10 @@ fn ordered_enum_keys(o: &Gc) -> Vec<Rc<str>> {
         .collect()
 }
 
-/// The property key for `@@toStringTag` (`Symbol.toStringTag`), if Symbol is installed.
-pub(crate) fn to_string_tag_key(i: &Interp) -> Option<String> {
-    let sym = i.global.borrow().props.get("Symbol").map(|p| p.value())?;
-    if let Value::Obj(o) = sym {
-        if let Some(p) = o.borrow().props.get("toStringTag") {
-            if let Value::Sym(d) = p.value() {
-                return Some(Interp::sym_key(&d));
-            }
-        }
-    }
-    None
+/// The property key for `@@toStringTag`, once the well-known Symbols exist. Like every
+/// well-known Symbol it is the Agent's own, never whatever the global `Symbol` now holds.
+pub(crate) fn to_string_tag_key(i: &Interp) -> Option<Rc<str>> {
+    well_known_key(i, "toStringTag")
 }
 
 /// Install a non-enumerable, configurable `@@toStringTag` data property.
@@ -4030,12 +4035,16 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
     let errors = ab(i.get_member(&state, "#\u{0}errors"))?;
-    ab(i.set_member(&errors, &idx.to_string(), reason))?;
+    // Step 9 replaces an element of the errors List: an own data property of the internal
+    // Array, so an inherited Array.prototype index setter never runs.
+    if let Value::Obj(o) = &errors {
+        crate::value::set_data(o, &idx.to_string(), reason);
+    }
     let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
     ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
-        let agg = make_aggregate_error(i, errors)?;
+        let agg = make_aggregate_error(i, errors);
         ab(i.call(reject_fn, Value::Undefined, &[agg]))?;
     }
     Ok(Value::Undefined)

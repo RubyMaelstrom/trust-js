@@ -1852,9 +1852,9 @@ impl Interp {
     pub(crate) fn get_iterator(&mut self, v: &Value) -> Result<(Value, Value), Abrupt> {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(Value, Value), Abrupt> = (|| {
-            let key = match &self.iterator_sym {
-                Some(s) => Interp::sym_key(s),
-                None => return Err(self.throw("TypeError", "no iterator symbol")),
+            // The key formatted once when @@iterator was minted, not a new string per GetIterator.
+            let Some(key) = crate::builtins::well_known_key(self, "iterator") else {
+                return Err(self.throw("TypeError", "no iterator symbol"));
             };
             let itfn = self.get_member(v, &key)?;
             if !itfn.is_callable() {
@@ -1994,8 +1994,7 @@ impl Interp {
             _ => {}
         }
         // General iterator protocol.
-        if let Some(sym) = self.iterator_sym.clone() {
-            let key = Interp::sym_key(&sym);
+        if let Some(key) = crate::builtins::well_known_key(self, "iterator") {
             let itfn = self.get_member(v, &key)?;
             if itfn.is_callable() {
                 return self.iterate_with(v, itfn);
@@ -8474,24 +8473,6 @@ impl Interp {
         ))
     }
 
-    /// The internal property key for a well-known symbol (e.g. `Symbol.toPrimitive`).
-    fn well_known_sym_key(&self, name: &str) -> Option<String> {
-        let sym = self
-            .global
-            .borrow()
-            .props
-            .get("Symbol")
-            .map(|p| p.value())?;
-        if let Value::Obj(o) = sym {
-            if let Some(p) = o.borrow().props.get(name) {
-                if let Value::Sym(d) = p.value() {
-                    return Some(Interp::sym_key(&d));
-                }
-            }
-        }
-        None
-    }
-
     pub(crate) fn to_primitive(&mut self, v: &Value, hint: Hint) -> Result<Value, Abrupt> {
         let obj = match v {
             Value::Obj(o) => o.clone(),
@@ -8500,7 +8481,7 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<Value, Abrupt> = (|| {
             // A `@@toPrimitive` method takes precedence over valueOf/toString.
-            if let Some(key) = self.well_known_sym_key("toPrimitive") {
+            if let Some(key) = crate::builtins::well_known_key(self, "toPrimitive") {
                 let f = self.get_member(&Value::Obj(obj.clone()), &key)?;
                 // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
                 if !matches!(f, Value::Undefined | Value::Null) && !f.is_callable() {

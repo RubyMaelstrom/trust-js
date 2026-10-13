@@ -19,7 +19,7 @@ pub(super) fn install_promise(it: &mut Interp) {
             ));
         }
         // The result promise is built by SpeciesConstructor(this, %Promise%) via NewPromiseCapability.
-        let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Promise"))?;
+        let default_ctor = intrinsic_promise(i);
         let c = species_constructor(i, &this, &default_ctor)?;
         let (result, res_f, rej_f) = new_promise_capability_full(i, &c)?;
         if map_ptr(&result).map(|p| i.promises.contains_key(&p)) == Some(true) {
@@ -43,7 +43,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         if !matches!(this, Value::Obj(_)) {
             return Err(i.make_error("TypeError", "Promise.prototype.finally on non-object"));
         }
-        let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Promise"))?;
+        let default_ctor = intrinsic_promise(i);
         let c = species_constructor(i, &this, &default_ctor)?;
         let then = ab(i.get_member(&this, "then"))?;
         if !then.is_callable() {
@@ -500,7 +500,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
-            let agg = make_aggregate_error(i, errors)?;
+            let agg = make_aggregate_error(i, errors);
             let _ = i.call(reject_fn, Value::Undefined, &[agg]);
         }
         Ok(result)
@@ -530,7 +530,18 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
     });
     install_species(it, &ctor);
+    Rc::make_mut(&mut it.extra_protos).insert("%PromiseCtor%", ctor.clone());
     set_builtin(&it.global, "Promise", Value::Obj(ctor));
+}
+
+/// The current Realm's %Promise%: the defaultConstructor of SpeciesConstructor in
+/// `Promise.prototype.then` and `finally` (ECMA-262 §27.2.5.4, §27.2.5.3). It is an intrinsic,
+/// not a read of the global `Promise` binding, which author code (or a host) may replace.
+fn intrinsic_promise(i: &Interp) -> Value {
+    i.extra_protos
+        .get("%PromiseCtor%")
+        .cloned()
+        .map_or(Value::Undefined, Value::Obj)
 }
 
 /// ECMA-262 PromiseResolve: return a matching native promise unchanged, otherwise settle a new

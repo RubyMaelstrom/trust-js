@@ -4213,20 +4213,10 @@ impl Interp {
             self.realms.insert(Rc::as_ptr(&main.global) as usize, main);
         }
         let saved = self.snapshot_realm();
-        let saved_iter = self.iterator_sym.clone();
-        // The main realm's well-known symbols, to graft onto the new realm's Symbol constructor.
-        let well_known: Vec<(&'static str, Value)> = WELL_KNOWN_SYMBOLS
-            .iter()
-            .filter_map(|name| {
-                let sym = self
-                    .get_member(&Value::Obj(saved.global.clone()), "Symbol")
-                    .ok()?;
-                let v = self.get_member(&sym, name).ok()?;
-                Some((*name, v))
-            })
-            .collect();
 
-        // Fresh intrinsics, mirroring `Interp::new`.
+        // Fresh intrinsics, mirroring `Interp::new`. The new realm's Symbol constructor gets the
+        // Agent's well-known Symbols (`Interp::well_known_symbol`), so `@@iterator` etc. match
+        // cross-realm whatever the creating realm's global `Symbol` now holds.
         let object_proto = Object::new(None);
         let function_proto = Object::new(Some(object_proto.clone()));
         let array_proto = Object::new(Some(object_proto.clone()));
@@ -4266,16 +4256,6 @@ impl Interp {
                 deletable: false,
             },
         );
-        // Share the well-known symbols: overwrite the realm's freshly-minted ones with the originals.
-        if let Ok(Value::Obj(rs)) = self.get_member(&Value::Obj(self.global.clone()), "Symbol") {
-            for (name, sym) in &well_known {
-                rs.borrow_mut()
-                    .props
-                    .insert(*name, Property::data(sym.clone(), false, false, false));
-            }
-        }
-        self.iterator_sym = saved_iter;
-
         // Tag this realm's `eval` so an *indirect* call to it (`otherRealm.eval(code)`) runs the code
         // in this realm's global scope, not the caller's (see `call_inner`).
         if let Some(ef) = &self.eval_fn {
@@ -4571,26 +4551,6 @@ fn function_realm_key(callback: &Value) -> Option<usize> {
         _ => None,
     }
 }
-
-/// The well-known symbol names that are shared across all realms.
-const WELL_KNOWN_SYMBOLS: &[&str] = &[
-    "iterator",
-    "asyncIterator",
-    "hasInstance",
-    "isConcatSpreadable",
-    "match",
-    "matchAll",
-    "replace",
-    "search",
-    "species",
-    "split",
-    "toPrimitive",
-    "toStringTag",
-    "unscopables",
-    "dispose",
-    "asyncDispose",
-    "metadata",
-];
 
 impl Interp {
     pub(crate) fn new() -> Interp {
