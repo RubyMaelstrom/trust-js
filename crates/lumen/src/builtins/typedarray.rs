@@ -1348,9 +1348,9 @@ fn ta_native(
                                 }
                             }
                         });
-                        let mut sorted = Vec::with_capacity(raw.len());
-                        for n in nums {
-                            sorted.extend_from_slice(&info.kind.write(n));
+                        let mut sorted = vec![0; raw.len()];
+                        for (n, slot) in nums.into_iter().zip(sorted.chunks_exact_mut(es)) {
+                            info.kind.write_into(n, slot);
                         }
                         if in_place {
                             i.ta_write_bytes(&info, 0, &sorted);
@@ -1713,9 +1713,11 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                     kind,
                     track: false,
                 };
-                for index in 0..len {
-                    let value = i.ta_read(&source_info, index);
-                    ab(i.ta_store(&target_info, index, &value))?;
+                if !ta_convert_into(i, &source_info, 0, &target_info, 0, len) {
+                    for index in 0..len {
+                        let value = i.ta_read(&source_info, index);
+                        ab(i.ta_store(&target_info, index, &value))?;
+                    }
                 }
                 (bv, bp, 0, len, false)
             }
@@ -1884,6 +1886,81 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
     Ok(Value::Obj(obj))
 }
 
+/// Each element of `source` (encoded as `from`) converted to `to` and stored in `target`, which
+/// holds as many elements: RawBytesToNumeric, then NumericToRawBytes, for matching content types.
+fn convert_elements(from: TaKind, source: &[u8], to: TaKind, target: &mut [u8]) {
+    let pairs = source
+        .chunks_exact(from.elsize())
+        .zip(target.chunks_exact_mut(to.elsize()));
+    if to.is_bigint() {
+        for (element, slot) in pairs {
+            slot.copy_from_slice(&(from.read_bigint(element) as u64).to_le_bytes());
+        }
+    } else {
+        for (element, slot) in pairs {
+            to.write_into(from.read(element), slot);
+        }
+    }
+}
+
+/// Copy `count` elements of `source` starting at element `from` into `target` at element `to`,
+/// each through the value it denotes (TypedArrayGetElement then TypedArraySetElement, content
+/// types already matched), when both views lie within ordinary buffers. Nothing in the copy can
+/// run code or detach or resize a buffer; a source in the target's buffer is read in full first.
+/// `false` (nothing written) for shared buffers or an element range outside its buffer.
+fn ta_convert_into(
+    i: &mut Interp,
+    source: &TaInfo,
+    from: usize,
+    target: &TaInfo,
+    to: usize,
+    count: usize,
+) -> bool {
+    if i.shared_buffers.contains_key(&source.buffer)
+        || i.shared_buffers.contains_key(&target.buffer)
+    {
+        return false;
+    }
+    let (Some(source_storage), Some(target_storage)) = (
+        i.array_buffers.get(&source.buffer).cloned(),
+        i.array_buffers.get(&target.buffer).cloned(),
+    ) else {
+        return false;
+    };
+    let range = |offset: usize, start: usize, elsize: usize| {
+        let start = offset.checked_add(start.checked_mul(elsize)?)?;
+        Some(start..start.checked_add(count.checked_mul(elsize)?)?)
+    };
+    let (Some(elements), Some(slots)) = (
+        range(source.offset, from, source.kind.elsize()),
+        range(target.offset, to, target.kind.elsize()),
+    ) else {
+        return false;
+    };
+    let written = slots.clone();
+    if Rc::ptr_eq(&source_storage, &target_storage) {
+        let Some(snapshot) = source_storage.borrow().get(elements).map(<[u8]>::to_vec) else {
+            return false;
+        };
+        let mut bytes = target_storage.borrow_mut();
+        let Some(slots) = bytes.get_mut(slots) else {
+            return false;
+        };
+        convert_elements(source.kind, &snapshot, target.kind, slots);
+    } else {
+        let source_bytes = source_storage.borrow();
+        let mut target_bytes = target_storage.borrow_mut();
+        let (Some(elements), Some(slots)) =
+            (source_bytes.get(elements), target_bytes.get_mut(slots))
+        else {
+            return false;
+        };
+        convert_elements(source.kind, elements, target.kind, slots);
+    }
+    i.mark_array_buffer_dirty_range(target.buffer, written.start, written.len());
+    true
+}
+
 fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "set on non-TypedArray"))?;
     let info = *i
@@ -1943,29 +2020,11 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
                 i.ta_write_bytes(&info, offset, &bytes);
                 return Ok(Value::Undefined);
             }
-        } else if !i.shared_buffers.contains_key(&src_info.buffer)
-            && !i.shared_buffers.contains_key(&info.buffer)
-        {
+        } else if ta_convert_into(i, &src_info, 0, &info, offset, src_len) {
             // Different numeric element types still have no user-observable work between source
-            // reads and target writes. Snapshot the source encodings, convert each element once,
-            // and publish one target range; aliases therefore retain the specified source-before-
-            // target ordering without allocating a Value for every element (ECMA-262 §23.2.3.26.2).
-            if let Some(source) = i.ta_read_bytes(&src_info, 0, src_len) {
-                let source_es = src_info.kind.elsize();
-                let target_es = info.kind.elsize();
-                let mut converted = Vec::with_capacity(src_len * target_es);
-                for bytes in source.chunks_exact(source_es) {
-                    if info.kind.is_bigint() {
-                        converted.extend_from_slice(
-                            &info.kind.write_bigint(src_info.kind.read_bigint(bytes)),
-                        );
-                    } else {
-                        converted.extend_from_slice(&info.kind.write(src_info.kind.read(bytes)));
-                    }
-                }
-                i.ta_write_bytes(&info, offset, &converted);
-                return Ok(Value::Undefined);
-            }
+            // reads and target writes; aliases keep the specified source-before-target ordering
+            // (ECMA-262 §23.2.3.26.2).
+            return Ok(Value::Undefined);
         }
         // Snapshot the source first so an overlapping same-buffer copy reads pre-write values.
         let vals: Vec<Value> = (0..src_len).map(|k| i.ta_read(&src_info, k)).collect();

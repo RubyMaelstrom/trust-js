@@ -5043,19 +5043,18 @@ impl Interp {
             if start + es > buf.len() {
                 return None;
             }
-            let bytes = &buf[start..start + es];
+            let bytes = &mut buf[start..start + es];
             let old = if info.kind.is_bigint() {
                 info.kind.read_bigint(bytes)
             } else {
                 info.kind.read(bytes) as i128
             };
             if let Some(new) = f(old) {
-                let nb = if info.kind.is_bigint() {
-                    info.kind.write_bigint(new)
+                if info.kind.is_bigint() {
+                    bytes.copy_from_slice(&(new as u64).to_le_bytes());
                 } else {
-                    info.kind.write(new as f64)
-                };
-                buf[start..start + es].copy_from_slice(&nb);
+                    info.kind.write_into(new as f64, bytes);
+                }
             }
             Some(old)
         };
@@ -5107,7 +5106,8 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write_bigint(n);
+        // Element encoding of a BigInt: wrapped modulo 2^64, little-endian.
+        let bytes = (n as u64).to_le_bytes();
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
             if let Some(mem) = shared_mem_get(id) {
                 let mut buf = mem.lock().unwrap();
@@ -5138,11 +5138,10 @@ impl Interp {
                 return;
             }
             let start = info.offset + idx * es;
-            let bytes = info.kind.write(n);
             if let Some(mem) = shared_mem_get(id) {
                 let mut buf = mem.lock().unwrap();
                 if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
+                    info.kind.write_into(n, &mut buf[start..start + es]);
                 }
             }
             return;
@@ -7444,14 +7443,25 @@ impl Interp {
         if !o.borrow().ic_plain.get() {
             if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied() {
                 // TypedArraySetElement converts the value before checking current bounds. Only
-                // an already-numeric value on a Number-content view can bypass that observable
-                // step; coercions, BigInt content and immutable-buffer errors retain the
-                // general path.
-                if let Value::Num(value) = v {
-                    if !info.kind.is_bigint() && !self.immutable_buffers.contains(&info.buffer) {
-                        self.ta_write(&info, n as usize, value);
+                // a value already of the view's content type (a Number, or a BigInt for BigInt
+                // content) can bypass that observable step; coercions, mismatched content and
+                // immutable-buffer errors retain the general path.
+                match &v {
+                    Value::Num(value)
+                        if !info.kind.is_bigint()
+                            && !self.immutable_buffers.contains(&info.buffer) =>
+                    {
+                        self.ta_write(&info, n as usize, *value);
                         return Ok(());
                     }
+                    Value::BigInt(value)
+                        if info.kind.is_bigint()
+                            && !self.immutable_buffers.contains(&info.buffer) =>
+                    {
+                        self.ta_write_bigint(&info, n as usize, value.to_i128_wrapping());
+                        return Ok(());
+                    }
+                    _ => {}
                 }
                 return Err(v);
             }
