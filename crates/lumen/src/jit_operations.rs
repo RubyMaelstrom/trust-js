@@ -787,6 +787,12 @@ pub(super) fn emit(
         Op::GetElem | Op::GetElemLocal(_) => {
             emit_op_helper(a, H_GET_ELEM, pc as u32, unwind);
         }
+        Op::DestructureArr(_)
+        | Op::TryArrayBinding(..)
+        | Op::ArrayBindingStep(..)
+        | Op::IterStepL(..) => {
+            emit_op_helper(a, H_ITERATION, pc as u32, unwind);
+        }
         _ => return false,
     }
     true

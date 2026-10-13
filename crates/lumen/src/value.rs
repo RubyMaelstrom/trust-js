@@ -3006,6 +3006,16 @@ impl Property {
     pub(crate) fn clone_value_packed(&self) -> PackedValue {
         self.packed.clone()
     }
+    /// Whether this data property holds exactly the object at `expected`, compared without
+    /// creating an owner. A deferred prototype has no address yet and never matches.
+    #[inline]
+    pub(crate) fn holds_object(&self, expected: *const RefCell<Object>) -> bool {
+        !self.accessor()
+            && self
+                .packed
+                .with_object(|object| std::ptr::eq(Rc::as_ptr(object), expected))
+                .unwrap_or(false)
+    }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
     /// Callers must still prove ordinary internal methods and fall back for every other case.
     #[inline]

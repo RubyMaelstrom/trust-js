@@ -2977,6 +2977,10 @@ pub struct Interp {
     /// change to either bumps the epoch; an assignment can still replace the constructor's
     /// value, which each use re-reads.
     pub(crate) species_protector: std::cell::Cell<(u32, u32)>,
+    /// The intrinsic Array iteration protector (see [`crate::builtins::ArrayIterationProof`]):
+    /// proves without running author code that GetIterator on an ordinary Array, its steps and
+    /// IteratorClose follow the built-in algorithms.
+    pub(crate) array_iteration_protector: RefCell<crate::builtins::ArrayIterationProof>,
     /// Per-CONSTRUCTOR construct cache (`new F(...)` — keyed by callee identity, since a
     /// constructor's derived state doesn't vary per site): the same raw pointers a [`CallIc`]
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
@@ -3395,6 +3399,7 @@ interp_memory_inventory! {
     native_function_realms => "measured",
     elems_protector => "non_owning",
     species_protector => "non_owning",
+    array_iteration_protector => "non_owning",
     construct_ics => "measured",
     call_overflow => "measured",
     native_callback_cache => "measured",
@@ -3521,7 +3526,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 162);
+    assert_eq!(names.len(), 163);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4059,6 +4064,7 @@ impl Interp {
         // live, so the next use re-verifies against the restored ones.
         self.elems_protector.set((0, false));
         self.species_protector.set((0, u32::MAX));
+        *self.array_iteration_protector.borrow_mut() = Default::default();
     }
 
     /// Select the global lexical state associated with an embedder settings
@@ -4645,6 +4651,7 @@ impl Interp {
             native_function_realms: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
             species_protector: std::cell::Cell::new((0, u32::MAX)),
+            array_iteration_protector: Default::default(),
             construct_ics: Default::default(),
             call_overflow: Default::default(),
             native_callback_cache: None,
@@ -11704,16 +11711,28 @@ impl Interp {
             return None;
         }
         let object = next.as_obj()?;
-        if self.proxies.contains_key(&(Rc::as_ptr(object) as usize))
-            || (self.multi_realm() && self.callee_realm_global(object).is_some())
-        {
-            return None;
-        }
         let native = match object.borrow().call {
             Callable::Native(native) => native,
             _ => return None,
         };
         let step = crate::builtins::intrinsic_iterator_step(native)?;
+        // `ic_plain` excludes a Proxy without a table lookup.
+        if !self.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+            || (self.multi_realm() && self.callee_realm_global(object).is_some())
+        {
+            return None;
+        }
+        // A step that executes no ECMAScript code needs no activation of its own. It keeps the
+        // amortized safepoints of the call it replaces: a drain loop may consist of nothing else.
+        if let Err(error) = self
+            .interrupt_poll()
+            .and_then(|()| self.gc_check_amortized())
+        {
+            return Some(Err(error));
+        }
+        if let Some(value) = crate::builtins::inert_iterator_step(self, native, iterator) {
+            return Some(Ok(value));
+        }
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;

@@ -3542,6 +3542,105 @@ fn set_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, 
 /// ECMA-262 IteratorNext / IteratorStepValue / CreateIteratorResultObject, e28783d5.
 pub(crate) type IntrinsicIteratorStep = fn(&mut Interp, Value) -> Result<Option<Value>, Value>;
 
+/// One step of the intrinsic Array, String, Map or Set iterator `native` that provably executes
+/// no ECMAScript code: the receiver has the right internal slots, and an Array target is an
+/// ordinary Array whose requested element is an own data property (or lies past its length).
+/// `None` leaves the step, untouched, to the checked native call.
+pub(crate) fn inert_iterator_step(
+    i: &mut Interp,
+    native: NativeFn,
+    iterator: &Value,
+) -> Option<Option<Value>> {
+    let object = iterator.as_obj()?;
+    if std::ptr::fn_addr_eq(native, array_iter_next as NativeFn) {
+        return inert_array_iter_step(i, object);
+    }
+    if std::ptr::fn_addr_eq(native, string_iter_next as NativeFn) {
+        if !matches!(object.borrow().exotic, Exotic::StringIterator(_)) {
+            return None;
+        }
+        return string_iter_step(i, iterator.clone()).ok();
+    }
+    let brand = if std::ptr::fn_addr_eq(native, map_iter_next as NativeFn) {
+        crate::ordered_collection::CollectionKind::Map
+    } else if std::ptr::fn_addr_eq(native, set_iter_next as NativeFn) {
+        crate::ordered_collection::CollectionKind::Set
+    } else {
+        return None;
+    };
+    // A Map/Set iterator step reads only its private cursor; a brand mismatch must still
+    // create its TypeError inside the native call.
+    i.collection_iterators
+        .get(&(Rc::as_ptr(object) as usize))
+        .filter(|state| state.brand == brand)?;
+    map_set_iter_step(i, iterator.clone(), brand).ok()
+}
+
+/// LengthOfArrayLike of an ordinary Array: its length slot, never an accessor.
+pub(crate) fn ordinary_array_length(props: &Props) -> Option<usize> {
+    match props.length_property().map(Property::value) {
+        Some(Value::Num(length)) => Some(length as usize),
+        _ => None,
+    }
+}
+
+/// Get(object, index) of an own data element of an ordinary object, without allocating the
+/// property key. `None` for a hole or an accessor, whose Get must take the specified path.
+pub(crate) fn own_data_element(props: &Props, index: usize) -> Option<Value> {
+    let index = u32::try_from(index).ok()?;
+    if let Some(number) = props.mirror_get(index) {
+        return Some(Value::Num(number));
+    }
+    props
+        .get_index(index)
+        .filter(|property| !property.accessor())
+        .map(Property::value)
+}
+
+/// %ArrayIteratorPrototype%.next without its call boundary (see [`inert_iterator_step`]).
+fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>> {
+    let (index, element) = {
+        let object = iterator.borrow();
+        let Exotic::ArrayIterator(state) = &object.exotic else {
+            return None;
+        };
+        let target = match &state.target {
+            Value::Obj(target) => target,
+            Value::Undefined => return Some(None),
+            _ => return None,
+        };
+        let array = target.borrow();
+        // `ic_plain` excludes proxies and typed arrays.
+        if !array.ic_plain.get() || !matches!(array.exotic, Exotic::Array) {
+            return None;
+        }
+        let index = state.index;
+        if index >= ordinary_array_length(&array.props)? {
+            (index, None)
+        } else if state.kind == 1 {
+            (index, Some(Value::Num(index as f64)))
+        } else {
+            (index, Some(own_data_element(&array.props, index)?))
+        }
+    };
+    let mut object = iterator.borrow_mut();
+    let Exotic::ArrayIterator(state) = &mut object.exotic else {
+        unreachable!("checked above")
+    };
+    let Some(element) = element else {
+        // An exhausted iterator clears its target so it stays done.
+        state.target = Value::Undefined;
+        return Some(None);
+    };
+    state.index = index + 1;
+    let kind = state.kind;
+    drop(object);
+    Some(Some(match kind {
+        2 => i.make_array(vec![Value::Num(index as f64), element]),
+        _ => element,
+    }))
+}
+
 pub(crate) fn intrinsic_iterator_step(native: NativeFn) -> Option<IntrinsicIteratorStep> {
     if std::ptr::fn_addr_eq(native, array_iter_next as NativeFn) {
         Some(array_iter_step)
@@ -5611,72 +5710,26 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
     })
 }
 
-/// Closed, non-exhausting Array binding prefix. No lookup here may invoke author code.
-/// The caller preserves the captured next owner and native call boundaries, and only uses
+/// Whether `value` is %ArrayIteratorPrototype%.next of some Realm.
+#[cfg(test)]
+pub(crate) fn is_array_values_next(value: &Value) -> bool {
+    is_native_function(value, array_iter_next)
+}
+
+/// Closed, non-exhausting Array binding prefix of `count` elements. No lookup here may invoke
+/// author code: under the intrinsic protocol (see [`ArrayIterationProof`]) every index below
+/// `count` is an own data property, so each step reads it without code, and IteratorClose
+/// finds no `return` method. Returns the `next` method GetIterator reads. The caller only uses
 /// this proof between fresh lexical initializations (no defaults or old binding destructors).
-pub(crate) fn dense_array_binding_methods(
-    i: &Interp,
-    value: &Value,
-    count: usize,
-) -> Option<(Value, Value)> {
-    let object = value.as_obj()?;
-    if count > 8
-        || !array_iterator_fast_path_is_safe(i, value)
-        || !i.ordinary_get_ptr(Rc::as_ptr(&i.array_proto) as usize)
-        || i.array_length(object) < count
-    {
+pub(crate) fn dense_array_binding_next(i: &Interp, value: &Value, count: usize) -> Option<Value> {
+    if count > 8 {
         return None;
     }
-    {
-        let object = object.borrow();
-        for index in 0..count {
-            if object.props.get_index(index as u32)?.accessor() {
-                return None;
-            }
-        }
-    }
-    let key = Interp::sym_key(i.iterator_sym.as_ref()?);
-    let method = i.array_proto.borrow().props.get(&key)?.value();
-    let prototype = i.extra_protos.get("%ArrayIteratorPrototype%")?;
-    if !i.ordinary_get_ptr(Rc::as_ptr(prototype) as usize) {
-        return None;
-    }
-    let next = prototype
-        .borrow()
-        .props
-        .get("next")
-        .filter(|property| !property.accessor())?
-        .value();
-    for function in [&method, &next] {
-        let function = function.as_obj()?;
-        if !i.ordinary_get_ptr(Rc::as_ptr(function) as usize)
-            || !i.native_call_in_current_realm(function)
-        {
-            return None;
-        }
-    }
-    // IteratorClose reads return at the end. With no observers in the admitted prefix,
-    // absence (or a nullish plain value) remains valid; a getter or proxy must run normally.
-    let mut current = Some(prototype.clone());
-    for _ in 0..64 {
-        let Some(object) = current else {
-            return Some((method, next));
-        };
-        if !i.ordinary_get_ptr(Rc::as_ptr(&object) as usize) {
-            return None;
-        }
-        let object = object.borrow();
-        if !matches!(object.exotic, Exotic::None) {
-            return None;
-        }
-        if let Some(property) = object.props.get("return") {
-            return (!property.accessor()
-                && matches!(property.value(), Value::Undefined | Value::Null))
-            .then_some((method, next));
-        }
-        current = object.proto.clone();
-    }
-    None
+    let next = intrinsic_array_iteration_next(i, value)?;
+    let body = value.as_obj()?.borrow();
+    (ordinary_array_length(&body.props)? >= count
+        && (0..count).all(|index| own_data_element(&body.props, index).is_some()))
+    .then_some(next)
 }
 
 /// Snapshot an Array whose current iteration cannot execute ECMAScript code: every index below
@@ -5703,6 +5756,191 @@ pub(crate) fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Valu
         values.push(property.value());
     }
     Some(values)
+}
+
+/// [`Interp::array_iteration_protector`]: while `epoch` matches the live
+/// [`crate::value::proto_epoch`], the current Realm iterates ordinary Arrays with the intrinsic
+/// protocol. %Array.prototype% has a data property `iterator_key` (@@iterator) at
+/// `iterator_slot`, %ArrayIteratorPrototype% a data property `next` at `next_slot`, and no
+/// object on the ordinary prototype chain of %ArrayIteratorPrototype% has a `return` key, so
+/// IteratorClose finds no method. All of these objects are marked prototypes: a defineProperty,
+/// a structural change or a [[SetPrototypeOf]] bumps the epoch. An assignment can still replace
+/// either function, so each use compares the slot with the verified function. The weak pins keep
+/// those addresses from being reused while this proof lives, which makes the identity
+/// comparison exact without a strong reference to any Realm object.
+#[derive(Default)]
+pub(crate) struct ArrayIterationProof {
+    epoch: u32,
+    iterator_key: Option<Rc<str>>,
+    iterator_slot: usize,
+    next_slot: usize,
+    values: std::rc::Weak<RefCell<Object>>,
+    next: std::rc::Weak<RefCell<Object>>,
+    prototype: std::rc::Weak<RefCell<Object>>,
+}
+
+impl ArrayIterationProof {
+    /// Whether the slot at `slot` of `object` holds exactly the pinned function `expected`.
+    fn holds(object: &Gc, slot: usize, expected: &std::rc::Weak<RefCell<Object>>) -> bool {
+        object
+            .borrow()
+            .props
+            .property_at(slot)
+            .is_some_and(|property| property.holds_object(expected.as_ptr()))
+    }
+}
+
+/// Establish [`ArrayIterationProof`] from scratch, marking every object it depends on as a
+/// prototype. `None` when the current Realm's iteration protocol is not the intrinsic one.
+fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof> {
+    // A data property holding this Realm's built-in function with behaviour `expected`.
+    let intrinsic_slot = |object: &Gc, key: &str, expected: NativeFn| {
+        if !i.ordinary_get_ptr(Rc::as_ptr(object) as usize) {
+            return None;
+        }
+        let body = object.borrow();
+        let slot = body.props.slot_of(key)?;
+        let property = body.props.property_at(slot)?;
+        let function = property.value();
+        if property.accessor() || !is_native_function(&function, expected) {
+            return None;
+        }
+        let function = function.as_obj()?;
+        i.native_call_in_current_realm(function)
+            .then(|| (slot, Rc::downgrade(function)))
+    };
+    let iterator_key = well_known_key(i, "iterator")?;
+    let (iterator_slot, values) = intrinsic_slot(&i.array_proto, &iterator_key, nf_array_values)?;
+    let prototype = i.extra_protos.get("%ArrayIteratorPrototype%")?;
+    let (next_slot, next) = intrinsic_slot(prototype, "next", array_iter_next)?;
+    let mut chain = Vec::new();
+    let mut current = Some(prototype.clone());
+    while let Some(object) = current {
+        if chain.len() == 64 || !i.ordinary_get_ptr(Rc::as_ptr(&object) as usize) {
+            return None;
+        }
+        let parent = {
+            let body = object.borrow();
+            if !matches!(body.exotic, Exotic::None) || body.props.get("return").is_some() {
+                return None;
+            }
+            body.proto.clone()
+        };
+        chain.push(object);
+        current = parent;
+    }
+    i.array_proto.borrow().props.mark_proto();
+    for object in &chain {
+        object.borrow().props.mark_proto();
+    }
+    Some(ArrayIterationProof {
+        epoch,
+        iterator_key: Some(iterator_key),
+        iterator_slot,
+        next_slot,
+        values,
+        next,
+        prototype: Rc::downgrade(prototype),
+    })
+}
+
+/// Run `f` with the current [`ArrayIterationProof`], re-establishing it after an epoch change.
+/// `None` when the intrinsic protocol does not hold.
+fn with_array_iteration_proof<R>(
+    i: &Interp,
+    f: impl FnOnce(&ArrayIterationProof) -> Option<R>,
+) -> Option<R> {
+    let epoch = crate::value::proto_epoch();
+    if epoch == u32::MAX {
+        return None; // permanently invalidated: never trust a proof
+    }
+    if i.array_iteration_protector.borrow().epoch != epoch {
+        let proof = verify_array_iteration(i, epoch).unwrap_or(ArrayIterationProof {
+            epoch,
+            ..ArrayIterationProof::default()
+        });
+        *i.array_iteration_protector.borrow_mut() = proof;
+    }
+    let proof = i.array_iteration_protector.borrow();
+    proof.iterator_key.as_ref()?;
+    f(&proof)
+}
+
+/// Whether GetIterator(value, sync) is the intrinsic Array protocol: `value` is an ordinary
+/// Array of this Realm without an own @@iterator, so the @@iterator lookup, the call of
+/// %Array.prototype.values% and the read of `next` execute no ECMAScript code, and a later
+/// IteratorClose finds no `return` method (see [`ArrayIterationProof`]).
+pub(crate) fn array_iteration_is_intrinsic(i: &Interp, value: &Value) -> bool {
+    with_intrinsic_array_iteration(i, value, |_| Some(())).is_some()
+}
+
+/// [`array_iteration_is_intrinsic`], returning the `next` method GetIterator reads. `None`
+/// means "use the observable algorithm".
+pub(crate) fn intrinsic_array_iteration_next(i: &Interp, value: &Value) -> Option<Value> {
+    with_intrinsic_array_iteration(i, value, |proof| {
+        proof
+            .next
+            .upgrade()
+            .map(|next| Value::Obj(Gc::from_rc(next)))
+    })
+}
+
+fn with_intrinsic_array_iteration<R>(
+    i: &Interp,
+    value: &Value,
+    f: impl FnOnce(&ArrayIterationProof) -> Option<R>,
+) -> Option<R> {
+    let array = value.as_obj()?;
+    with_array_iteration_proof(i, |proof| {
+        {
+            let body = array.borrow();
+            if !matches!(body.exotic, Exotic::Array)
+                || !matches!(body.proto.as_ref(), Some(proto) if Rc::ptr_eq(proto, &i.array_proto))
+                || !i.ordinary_get_ptr(Rc::as_ptr(array) as usize)
+                || body.props.get(proof.iterator_key.as_deref()?).is_some()
+            {
+                return None;
+            }
+        }
+        let prototype = Gc::from_rc(proof.prototype.upgrade()?);
+        if !ArrayIterationProof::holds(&i.array_proto, proof.iterator_slot, &proof.values)
+            || !ArrayIterationProof::holds(&prototype, proof.next_slot, &proof.next)
+        {
+            return None;
+        }
+        f(proof)
+    })
+}
+
+/// CreateArrayIterator(array, value) advanced past `index` elements: the iterator that
+/// GetIterator would have returned after `index` steps that did not exhaust it.
+pub(crate) fn array_values_iterator(i: &mut Interp, array: Value, index: usize) -> Value {
+    let iterator = make_array_iterator(i, array, 0);
+    if let Some(object) = iterator.as_obj() {
+        if let Exotic::ArrayIterator(state) = &mut object.borrow_mut().exotic {
+            state.index = index;
+        }
+    }
+    iterator
+}
+
+/// Whether IteratorClose(iterator) is a no-op: `iterator` is one of this Realm's Array
+/// Iterators without own properties and the intrinsic protocol proves that GetMethod(iterator,
+/// "return") finds nothing on its prototype chain.
+pub(crate) fn array_iterator_close_is_inert(i: &Interp, iterator: &Value) -> bool {
+    let Some(object) = iterator.as_obj() else {
+        return false;
+    };
+    with_array_iteration_proof(i, |proof| {
+        let body = object.borrow();
+        (matches!(body.exotic, Exotic::ArrayIterator(_))
+            && matches!(body.proto.as_ref(),
+                Some(proto) if std::ptr::eq(Rc::as_ptr(proto), proof.prototype.as_ptr()))
+            && body.props.values().next().is_none()
+            && i.ordinary_get_ptr(Rc::as_ptr(object) as usize))
+        .then_some(())
+    })
+    .is_some()
 }
 
 fn nf_array_values(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {

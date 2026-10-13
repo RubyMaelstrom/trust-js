@@ -275,3 +275,42 @@ fn iterator_results_private_target_is_traced_and_collectable() {
         );
     }
 }
+
+#[test]
+fn array_for_of_steps_keep_holes_getters_growth_and_close() {
+    // Expected values from Node v24.
+    let source = r#"(function(){
+        var log=[],r=[];
+        function each(it){var o=[];for(const x of it)o.push(x);return o.join(',')}
+        function pairs(it){var o=[];for(const [k,v] of it)o.push(k+':'+v);return o.join(',')}
+        var AIP=Object.getPrototypeOf([].values());
+        r.push(each([5,,7]),each([5,,7].keys()),pairs(['a','b'].entries()),pairs(new Map([[1,2],[3,4]])),pairs(new Set(['x','y']).entries()),each(new Set([1,2,1])),each('hé😀'));
+        Array.prototype[1]='H';r.push(each([5,,7]),pairs([5,,7].entries()));delete Array.prototype[1];
+        var a=[1,2,3];Object.defineProperty(a,1,{get(){log.push('g');return 'G'}});r.push(each(a),pairs(a.entries()),log.splice(0).join());
+        a=[1,2];r.push((function(){var o=[];for(const x of a){o.push(x);if(a.length<5)a.push(x*10)}return o.join(',')})());
+        a=[1,2,3,4];r.push((function(){var o=[];for(const x of a){o.push(x);a.length=2}return o.join(',')})());
+        var m=new Map([[1,1]]);r.push((function(){var o=[];for(const [k] of m){o.push(k);if(k<4)m.set(k+1,1)}return o.join(',')})());
+        AIP.return=function(){log.push('closed');return {}};
+        r.push((function(){for(const x of [1,2,3])if(x===2)break;try{for(const x of [1,2])throw 0}catch(e){}return log.splice(0).join()})());
+        delete AIP.return;
+        var it=[1,2,3][Symbol.iterator]();it.return=function(){log.push('own');return {}};
+        var iterable={[Symbol.iterator](){return it}};for(const x of iterable)break;r.push(log.splice(0).join());
+        var t=Array.prototype.values.call({length:2,0:'x',1:'y'});r.push(each({[Symbol.iterator]:()=>t}));
+        var u=new Uint8Array([1,2]);r.push(each(u),pairs(u.entries()));
+        var next=AIP.next;AIP.next=function(){var x=next.call(this);if(!x.done)x.value='n'+x.value;return x};r.push(each([1,2]));AIP.next=next;
+        r.push([...[1,,3]].join(),Array.from(new Map([[1,2]])).join(';'),[...'ab'].join());
+        return r.join('|');
+    })()"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(&mut engine, source),
+            "5,,7|0,1,2|0:a,1:b|1:2,3:4|x:x,y:y|1,2|h,\u{e9},\u{1F600}|5,H,7|0:5,1:H,2:7|1,G,3|\
+             0:1,1:G,2:3|g,g|1,2,10,20,100|1,2|1,2,3,4|closed,closed|own|x,y|1,2|0:1,1:2|n1,n2|\
+             1,,3|1,2|a,b",
+            "{tier:?}"
+        );
+    }
+}
