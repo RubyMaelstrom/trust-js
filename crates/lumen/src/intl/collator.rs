@@ -7,6 +7,7 @@ use super::service::{
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
+use std::rc::Rc;
 
 const COLLATIONS: [&str; 12] = [
     "compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "searchjl", "stroke",
@@ -45,10 +46,66 @@ fn install_compare_getter(it: &mut Interp, proto: &Gc) {
     );
 }
 
+/// A Collator's internal slots as InitializeCollator (ECMA-402 #sec-initializecollator) resolves
+/// them.
+struct CollatorSlots {
+    locale: String,
+    usage: String,
+    sensitivity: String,
+    ignore_punct: bool,
+    numeric: bool,
+    collation: String,
+    case_first: String,
+}
+
+impl CollatorSlots {
+    /// The comparison parameters these slots select.
+    fn collate_opts(&self) -> CollateOpts {
+        CollateOpts {
+            locale: self.locale.clone(),
+            collation: self.collation.clone(),
+            sensitivity: self.sensitivity.clone(),
+            numeric: self.numeric,
+            ignore_punct: self.ignore_punct,
+            upper_first: self.case_first == "upper",
+            // German ä/ö/ü expand to ae/oe/ue under the phonebook collation and in search usage.
+            expand_umlaut: self.locale.split('-').next() == Some("de")
+                && (self.collation == "phonebk" || self.usage == "search"),
+        }
+    }
+}
+
 fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     // Legacy service: callable without `new` (returns a fresh instance either way).
-    let requested = canonicalize_locale_list(i, &arg(a, 0))?;
-    let options = coerce_options(i, &arg(a, 1))?;
+    let slots = initialize(i, &arg(a, 0), &arg(a, 1))?;
+    let obj = i.new_object();
+    if let Some(proto) = instance_proto(i, "Intl.Collator")? {
+        obj.borrow_mut().proto = Some(proto);
+    }
+    set_builtin(&obj, "#\u{0}co", Value::Bool(true));
+    set_builtin(&obj, "#\u{0}co_locale", Value::lstr(slots.locale));
+    set_builtin(&obj, "#\u{0}co_usage", Value::lstr(slots.usage));
+    set_builtin(&obj, "#\u{0}co_sensitivity", Value::lstr(slots.sensitivity));
+    set_builtin(
+        &obj,
+        "#\u{0}co_ignorepunct",
+        Value::Bool(slots.ignore_punct),
+    );
+    set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(slots.numeric));
+    set_builtin(&obj, "#\u{0}co_collation", Value::lstr(slots.collation));
+    set_builtin(&obj, "#\u{0}co_casefirst", Value::lstr(slots.case_first));
+    // Never reused, so `compare` can recognize the Collator whose parameters it last built.
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    set_builtin(&obj, "#\u{0}co_id", Value::Num(id as f64));
+    Ok(Value::Obj(obj))
+}
+
+/// InitializeCollator's observable steps, in order: CanonicalizeLocaleList, then each option
+/// read and conversion.
+fn initialize(i: &mut Interp, locales: &Value, options: &Value) -> Result<CollatorSlots, Value> {
+    let requested = canonicalize_locale_list(i, locales)?;
+    let options = coerce_options(i, options)?;
     let usage = get_option(i, &options, "usage", &["sort", "search"], Some("sort"))?.unwrap();
     read_locale_matcher(i, &options)?;
     let collation_opt = get_option(i, &options, "collation", &[], None)?;
@@ -164,57 +221,117 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
             .collect();
         format!("{}-u{}", resolved.locale, ext)
     };
-
-    let obj = i.new_object();
-    if let Some(proto) = instance_proto(i, "Intl.Collator")? {
-        obj.borrow_mut().proto = Some(proto);
-    }
-    set_builtin(&obj, "#\u{0}co", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}co_locale", Value::lstr(locale));
-    set_builtin(&obj, "#\u{0}co_usage", Value::lstr(usage));
-    set_builtin(&obj, "#\u{0}co_sensitivity", Value::lstr(sensitivity));
-    set_builtin(&obj, "#\u{0}co_ignorepunct", Value::Bool(ignore_punct));
-    set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(numeric));
-    set_builtin(&obj, "#\u{0}co_collation", Value::lstr(collation));
-    set_builtin(&obj, "#\u{0}co_casefirst", Value::lstr(case_first));
-    Ok(Value::Obj(obj))
+    Ok(CollatorSlots {
+        locale,
+        usage,
+        sensitivity,
+        ignore_punct,
+        numeric,
+        collation,
+        case_first,
+    })
 }
 
-fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, Value> {
-    let o = brand_slot(i, this, "#\u{0}co")?;
-    let get = |k: &str| match o.borrow().props.get(k).map(|p| p.value()) {
+thread_local! {
+    /// The comparison parameters of the Collator a `compare` function last used, by the id
+    /// `construct` gave it: a Collator's slots never change after construction.
+    static LAST_COMPARE: std::cell::RefCell<Option<(f64, Rc<CollateOpts>)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Collators that `localeCompare` constructs from undefined options and undefined (empty
+    /// key) or String locales. InitializeCollator then executes no ECMAScript code and its
+    /// result depends on nothing but the locale string.
+    static LOCALE_COMPARE: std::cell::RefCell<crate::fasthash::FastMap<String, Rc<CollateOpts>>> =
+        std::cell::RefCell::new(Default::default());
+}
+
+/// The comparison parameters stored in Collator `o`'s internal slots.
+fn stored_collate_opts(o: &Gc) -> Rc<CollateOpts> {
+    let body = o.borrow();
+    let id = body.props.get("#\u{0}co_id").and_then(|p| p.number_value());
+    if let Some(opts) = LAST_COMPARE.with_borrow(|last| {
+        last.as_ref()
+            .filter(|(last, _)| Some(*last) == id)
+            .map(|(_, opts)| opts.clone())
+    }) {
+        return opts;
+    }
+    let get = |k: &str| match body.props.get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     };
     let getb = |k: &str| {
         matches!(
-            o.borrow().props.get(k).map(|p| p.value()),
+            body.props.get(k).map(|p| p.value()),
             Some(Value::Bool(true))
         )
     };
-    let sa = ab(i.to_string(a))?.to_string();
-    let sb = ab(i.to_string(b))?.to_string();
-    let opts = CollateOpts {
-        locale: get("#\u{0}co_locale"),
-        collation: get("#\u{0}co_collation"),
-        sensitivity: get("#\u{0}co_sensitivity"),
-        numeric: getb("#\u{0}co_numeric"),
-        ignore_punct: getb("#\u{0}co_ignorepunct"),
-        upper_first: get("#\u{0}co_casefirst") == "upper",
-        // German ä/ö/ü expand to ae/oe/ue under the phonebook collation and in search usage.
-        expand_umlaut: {
-            let lang = get("#\u{0}co_locale");
-            let lang = lang.split('-').next().unwrap_or("");
-            lang == "de"
-                && (get("#\u{0}co_collation") == "phonebk" || get("#\u{0}co_usage") == "search")
-        },
-    };
-    let ord = match collate(&sa, &sb, &opts) {
+    let opts = Rc::new(
+        CollatorSlots {
+            locale: get("#\u{0}co_locale"),
+            usage: get("#\u{0}co_usage"),
+            sensitivity: get("#\u{0}co_sensitivity"),
+            ignore_punct: getb("#\u{0}co_ignorepunct"),
+            numeric: getb("#\u{0}co_numeric"),
+            collation: get("#\u{0}co_collation"),
+            case_first: get("#\u{0}co_casefirst"),
+        }
+        .collate_opts(),
+    );
+    if let Some(id) = id {
+        LAST_COMPARE.set(Some((id, opts.clone())));
+    }
+    opts
+}
+
+fn compare(i: &mut Interp, this: &Value, a: &Value, b: &Value) -> Result<Value, Value> {
+    let o = brand_slot(i, this, "#\u{0}co")?;
+    let sa = ab(i.to_string(a))?;
+    let sb = ab(i.to_string(b))?;
+    Ok(compare_strings(&sa, &sb, &stored_collate_opts(&o)))
+}
+
+/// CompareStrings (ECMA-402 #sec-collator-comparestrings) as a Number.
+fn compare_strings(a: &str, b: &str, opts: &CollateOpts) -> Value {
+    Value::Num(match collate(a, b, opts) {
         std::cmp::Ordering::Less => -1.0,
         std::cmp::Ordering::Greater => 1.0,
         std::cmp::Ordering::Equal => 0.0,
+    })
+}
+
+/// String.prototype.localeCompare (ECMA-402 #sec-string.prototype.localecompare) after the
+/// ToString conversions: CompareStrings with a Collator constructed from `locales` and
+/// `options`. Construct(%Intl.Collator%) observes nothing but InitializeCollator's reads, so
+/// only those run; with undefined options and undefined or String locales there are none, and
+/// the resolved parameters come from a cache.
+pub(crate) fn locale_compare(
+    i: &mut Interp,
+    a: &str,
+    b: &str,
+    locales: &Value,
+    options: &Value,
+) -> Result<Value, Value> {
+    let key = match (locales, options) {
+        (Value::Undefined, Value::Undefined) => Some(""),
+        (Value::Str(locale), Value::Undefined) if !locale.is_empty() => Some(locale.as_str()),
+        _ => None,
     };
-    Ok(Value::Num(ord))
+    let Some(key) = key else {
+        let opts = initialize(i, locales, options)?.collate_opts();
+        return Ok(compare_strings(a, b, &opts));
+    };
+    if let Some(opts) = LOCALE_COMPARE.with_borrow(|cache| cache.get(key).cloned()) {
+        return Ok(compare_strings(a, b, &opts));
+    }
+    let opts = Rc::new(initialize(i, locales, options)?.collate_opts());
+    LOCALE_COMPARE.with_borrow_mut(|cache| {
+        // Locale strings come from scripts; keep the cache small.
+        if cache.len() >= 16 {
+            cache.clear();
+        }
+        cache.insert(key.to_owned(), opts.clone());
+    });
+    Ok(compare_strings(a, b, &opts))
 }
 
 struct CollateOpts {
@@ -233,6 +350,10 @@ struct CollationElements {
 }
 
 fn normalized_input(s: &str, opts: &CollateOpts) -> Vec<u32> {
+    // ASCII text is already in NFD and has no umlaut to expand.
+    if s.is_ascii() {
+        return s.bytes().map(u32::from).collect();
+    }
     let cps = crate::jstr::code_points(s);
     let nfd = crate::unicode_norm_impl::decompose(&cps, false);
     if !opts.expand_umlaut {
@@ -481,8 +602,17 @@ fn append_cldr_tailoring(
     None
 }
 
+/// Whether [`append_cldr_tailoring`] has any rule for the locale's language.
+fn has_tailoring(opts: &CollateOpts) -> bool {
+    matches!(
+        opts.locale.split('-').next(),
+        Some("es" | "ln" | "pl" | "sl" | "sv" | "hi" | "si" | "ja" | "zh")
+    )
+}
+
 fn elements(s: &str, opts: &CollateOpts) -> CollationElements {
     let input = normalized_input(s, opts);
+    let tailored = has_tailoring(opts);
     let case = input
         .iter()
         .filter_map(|code_point| char::from_u32(*code_point))
@@ -498,14 +628,23 @@ fn elements(s: &str, opts: &CollateOpts) -> CollationElements {
                 continue;
             }
         }
-        if let Some(length) = append_cldr_tailoring(&input, at, opts, &mut elements) {
-            at += length;
-            continue;
+        if tailored {
+            if let Some(length) = append_cldr_tailoring(&input, at, opts, &mut elements) {
+                at += length;
+                continue;
+            }
         }
         #[cfg(test)]
         if opts.locale == "und" {
             at += crate::unicode_collation::append_ducet_mapping(&input, at, &mut elements);
             continue;
+        }
+        if input.get(at + 1).is_none_or(|next| *next < 0x80) {
+            if let Some(mapped) = crate::unicode_collation::ascii_mapping(input[at]) {
+                elements.extend_from_slice(mapped);
+                at += 1;
+                continue;
+            }
         }
         at += crate::unicode_collation::append_mapping(&input, at, &mut elements);
     }
@@ -716,5 +855,97 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 10_000, "official short CLDR corpus was truncated");
+    }
+    #[test]
+    fn ascii_fast_path_keeps_contractions_and_tailorings() {
+        let options = |locale: &str, collation: &str| CollateOpts {
+            locale: locale.to_string(),
+            collation: collation.to_string(),
+            sensitivity: "variant".to_string(),
+            numeric: false,
+            ignore_punct: false,
+            upper_first: false,
+            expand_umlaut: false,
+        };
+        let root = options("en", "default");
+        // `l` before U+00B7 starts a contraction: the following non-ASCII point disables the
+        // ASCII table for that position.
+        let contraction = elements("l\u{b7}", &root).elements;
+        let mut expected = Vec::new();
+        crate::unicode_collation::append_mapping(&[0x6c, 0xb7], 0, &mut expected);
+        assert_eq!(contraction, expected);
+        for code_point in 0..0x80u32 {
+            let text = char::from_u32(code_point).unwrap().to_string() + "a";
+            let mut slow = Vec::new();
+            let mut at = 0;
+            let input = [code_point, 'a' as u32];
+            while at < input.len() {
+                at += crate::unicode_collation::append_mapping(&input, at, &mut slow);
+            }
+            assert_eq!(elements(&text, &root).elements, slow, "{code_point:#x}");
+        }
+        // Spanish traditional ch/ll and Lingala phonetic digraphs are ASCII tailorings.
+        let trad = options("es", "trad");
+        assert_eq!(collate("cz", "ch", &trad), std::cmp::Ordering::Less);
+        assert_eq!(collate("cz", "ch", &root), std::cmp::Ordering::Greater);
+        let ln = options("ln", "phonetic");
+        assert_eq!(collate("gz", "gb", &ln), std::cmp::Ordering::Less);
+    }
+}
+
+#[cfg(test)]
+mod locale_compare_tests {
+    use crate::{bytecode::Tier, Completion, Engine};
+
+    #[test]
+    fn locale_compare_constructs_its_collator_unobservably_and_caches_by_locale() {
+        // Expected values from Node v24.
+        let source = r#"(function(){
+    var log=[],r=[];
+    function show(f){try{return f()}catch(e){return e.name}}
+    var words=['a-b','a0b','a_b','ab','Ab','aB','äb','ae','b','B','résumé','resume','Résumé','10','9','2','z','Z','ß','ss','','a b','áb'];
+    r.push(words.slice().sort(function(x,y){return x.localeCompare(y)}).join('|'));
+    r.push(words.slice().sort(function(x,y){return x.localeCompare(y,'de')}).join('|'));
+    r.push(words.slice().sort(function(x,y){return x.localeCompare(y,'sv')}).join('|'));
+    r.push(words.slice().sort(function(x,y){return x.localeCompare(y,undefined,{numeric:true,sensitivity:'base'})}).join('|'));
+    r.push(words.slice().sort(new Intl.Collator('de',{usage:'search'}).compare).join('|'));
+    var c=new Intl.Collator('en',{caseFirst:'upper'});r.push(words.slice().sort(c.compare).join('|'),c.compare('a','A'),new Intl.Collator().compare('a','A'));
+    r.push('a'.localeCompare('b'),'b'.localeCompare('a'),'a'.localeCompare('a'),'a'.localeCompare('A'),'a'.localeCompare('á',undefined,{sensitivity:'base'}));
+    r.push(show(()=>'a'.localeCompare('b','x-invalid-tag-')),show(()=>'a'.localeCompare('b',undefined,null)));
+    var opts={get sensitivity(){log.push('sensitivity');return 'base'},get numeric(){log.push('numeric');return false},get usage(){log.push('usage');return 'sort'}};
+    r.push('a'.localeCompare('A',undefined,opts),log.splice(0).join());
+    r.push('a'.localeCompare('b',['de','en']),'a'.localeCompare('b',{length:1,0:'de'}));
+    var proto=Intl.Collator.prototype,desc=Object.getOwnPropertyDescriptor(proto,'compare');
+    Object.defineProperty(proto,'compare',{configurable:true,get(){log.push('compare getter');return function(){return 42}}});
+    r.push('a'.localeCompare('b'),'a'.localeCompare('b','fr'),log.splice(0).join());Object.defineProperty(proto,'compare',desc);
+    var IC=Intl.Collator;Intl.Collator=function(){log.push('global ctor');return {compare:function(){return 7}}};
+    r.push('b'.localeCompare('a'),log.splice(0).join());Intl.Collator=IC;
+    r.push(show(()=>String.prototype.localeCompare.call(null,'a')),String.prototype.localeCompare.call(5,'5'),'x'.localeCompare({toString(){log.push('ts');return 'y'}}),log.splice(0).join());
+    var c1=new Intl.Collator('sv'),c2=new Intl.Collator('en');r.push(c1.compare('ä','z'),c2.compare('ä','z'),c1.compare('ä','z'),c2.compare('ä','z'));
+    return r.join('#');
+})()"#;
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            match engine
+                .eval(source, false)
+                .expect("collation fixture parses")
+            {
+                Completion::Value(actual) => assert_eq!(
+                    actual,
+                    "|10|2|9|a b|a_b|a-b|a0b|ab|aB|Ab|áb|äb|ae|b|B|resume|résumé|Résumé|ss|ß|z|Z\
+                     #|10|2|9|a b|a_b|a-b|a0b|ab|aB|Ab|áb|äb|ae|b|B|resume|résumé|Résumé|ss|ß|z|\
+                     Z#|10|2|9|a b|a_b|a-b|a0b|ab|aB|Ab|áb|ae|b|B|resume|résumé|Résumé|ss|ß|z|Z|\
+                     äb#|2|9|10|a b|a_b|a-b|a0b|ab|Ab|aB|äb|áb|ae|b|B|résumé|resume|Résumé|ß|ss|\
+                     z|Z#|10|2|9|a b|a_b|a-b|a0b|ab|aB|Ab|áb|ae|äb|b|B|resume|résumé|Résumé|ss|ß\
+                     |z|Z#|10|2|9|a b|a_b|a-b|a0b|Ab|aB|ab|áb|äb|ae|B|b|resume|Résumé|résumé|ss|\
+                     ß|Z|z#1#-1#-1#1#0#-1#0#RangeError#TypeError#0#usage,numeric,sensitivity#-1#-\
+                     1#-1#-1##1##TypeError#0#-1#ts#1#-1#1#-1",
+                    "{tier:?}"
+                ),
+                Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
+            }
+        }
     }
 }

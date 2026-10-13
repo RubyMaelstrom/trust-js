@@ -11450,16 +11450,19 @@ fn install_string(it: &mut Interp) {
         })
     });
     it.def_method(&sp, "localeCompare", 1, |i, this, args| {
-        // RequireObjectCoercible + ToString this, then delegate to Intl.Collator.
-        let a = Value::Str(this_string(i, &this)?);
-        let b = Value::Str(ab(i.to_string(&arg(args, 0)))?);
+        // RequireObjectCoercible + ToString this and that, then CompareStrings with a Collator.
+        let a = this_string(i, &this)?;
+        let b = ab(i.to_string(&arg(args, 0)))?;
+        #[cfg(feature = "intl")]
+        return crate::intl::locale_compare(i, &a, &b, &arg(args, 1), &arg(args, 2));
+        #[cfg(not(feature = "intl"))]
         intl_delegate(
             i,
             "Collator",
             arg(args, 1),
             arg(args, 2),
             "compare",
-            &[a, b],
+            &[Value::Str(a), Value::Str(b)],
         )
     });
     it.def_method(&sp, "toLocaleString", 0, |i, this, _| {
