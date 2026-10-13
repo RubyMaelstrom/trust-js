@@ -17821,6 +17821,30 @@ out.join(',')"#;
     }
 }
 
+/// DoWait decides a timed-out wait inside the WaiterList's critical section: a waiter that a
+/// notify already took from the list was counted by that notify, so it reports "ok" even when
+/// its timeout elapses first; one still listed leaves the list and reports "timed-out".
+#[test]
+fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
+    use crate::interpreter::{
+        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, Waiter,
+    };
+    use std::time::Duration;
+    let id = alloc_shared_mem(8);
+    let taken = Waiter::default();
+    with_waiter_list(id, 0, |list| list.push(taken.clone()));
+    // A notify's removal, before it sets the waiter's flag.
+    with_waiter_list(id, 0, |list| {
+        list.retain(|waiter| !std::sync::Arc::ptr_eq(waiter, &taken))
+    });
+    assert!(futex_block(&taken, id, 0, Some(Duration::ZERO)));
+    let listed = Waiter::default();
+    with_waiter_list(id, 4, |list| list.push(listed.clone()));
+    assert!(!futex_block(&listed, id, 4, Some(Duration::ZERO)));
+    // It left its list, so a later notify finds no waiter there.
+    assert_eq!(futex_notify(id, 4, -1), 0);
+}
+
 #[test]
 fn dataview_length_tracking_and_toprimitive() {
     // A length-tracking DataView over a resizable buffer follows the buffer's current length.

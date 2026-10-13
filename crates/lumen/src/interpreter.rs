@@ -789,32 +789,29 @@ pub fn monotonic_now_ms() -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-/// A futex-like wait table for `Atomics.wait`/`notify`, keyed by `(shared-memory id, byte index)`.
-/// Each blocked waiter registers an individual wake handle so `notify` can wake an exact count.
+/// A futex-like store of the WaiterList Records of `Atomics.wait`/`waitAsync`/`notify`, keyed by
+/// `(shared-memory id, byte index)`. Its one lock is the critical section of every list (ECMA-262
+/// EnterCriticalSection): DoWait compares the element and adds its waiter inside it, and notify
+/// removes waiters inside it, so a notify can never fall between the comparison and the enqueue.
+/// Each waiter has its own wake handle so `notify` can wake an exact count.
 pub type Waiter = Arc<(Mutex<bool>, Condvar)>;
 fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
 }
-/// Add a waiter to the list for `(id, index)` without blocking. `Atomics.waitAsync` registers
-/// synchronously (so a notify later in the same job sees it) and blocks on a helper thread.
-pub fn futex_register(id: u64, index: usize) -> Waiter {
-    let waiter: Waiter = Arc::new((Mutex::new(false), Condvar::new()));
-    wait_table()
-        .lock()
-        .unwrap()
-        .entry((id, index))
-        .or_default()
-        .push(waiter.clone());
-    waiter
+/// Run `f` on the WaiterList of `(id, index)` inside its critical section.
+pub fn with_waiter_list<R>(id: u64, index: usize, f: impl FnOnce(&mut Vec<Waiter>) -> R) -> R {
+    let mut lists = wait_table().lock().unwrap();
+    let list = lists.entry((id, index)).or_default();
+    let result = f(list);
+    if list.is_empty() {
+        lists.remove(&(id, index));
+    }
+    result
 }
-/// Block on `(id, index)` until notified or `timeout` elapses. Returns `true` if notified (woken),
-/// `false` if it timed out.
-pub fn futex_wait(id: u64, index: usize, timeout: Option<std::time::Duration>) -> bool {
-    let waiter = futex_register(id, index);
-    futex_block(&waiter, id, index, timeout)
-}
-/// Block on an already-registered waiter.
+/// Block on a waiter in the list of `(id, index)` until a notify wakes it or `timeout` elapses;
+/// `true` when notified. A timed-out waiter leaves its list in the critical section, unless a
+/// notify removed it first: that notify counted it as woken, so the wait reports "ok" too.
 pub fn futex_block(
     waiter: &Waiter,
     id: u64,
@@ -822,58 +819,43 @@ pub fn futex_block(
     timeout: Option<std::time::Duration>,
 ) -> bool {
     let (lock, cvar) = &**waiter;
+    // A timeout too far away to represent never elapses.
+    let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
     let mut woken = lock.lock().unwrap();
-    let result = match timeout {
-        Some(dur) => {
-            let deadline = std::time::Instant::now() + dur;
-            loop {
-                if *woken {
-                    break true;
-                }
+    while !*woken {
+        match deadline {
+            None => woken = cvar.wait(woken).unwrap(),
+            Some(deadline) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
-                    break false;
+                    break;
                 }
-                let (g, res) = cvar.wait_timeout(woken, deadline - now).unwrap();
-                woken = g;
-                if *woken {
-                    break true;
-                }
-                if res.timed_out() {
-                    break false;
-                }
+                woken = cvar.wait_timeout(woken, deadline - now).unwrap().0;
             }
-        }
-        None => loop {
-            if *woken {
-                break true;
-            }
-            woken = cvar.wait(woken).unwrap();
-        },
-    };
-    // On timeout, remove ourselves from the table (a notify may have already pulled us out).
-    if !result {
-        if let Some(v) = wait_table().lock().unwrap().get_mut(&(id, index)) {
-            v.retain(|w| !Arc::ptr_eq(w, waiter));
         }
     }
-    result
+    if *woken {
+        return true;
+    }
+    drop(woken);
+    with_waiter_list(id, index, |list| {
+        let Some(at) = list.iter().position(|w| Arc::ptr_eq(w, waiter)) else {
+            return true;
+        };
+        list.remove(at);
+        false
+    })
 }
-/// Wake up to `max` (`<0` ⇒ all) waiters on `(id, index)`, returning how many were woken.
+/// Wake up to `max` (`<0` ⇒ all) waiters on `(id, index)` in list order, returning how many.
 pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
-    let to_wake: Vec<Waiter> = {
-        let mut t = wait_table().lock().unwrap();
-        if let Some(v) = t.get_mut(&(id, index)) {
-            let n = if max < 0 {
-                v.len()
-            } else {
-                (max as usize).min(v.len())
-            };
-            v.drain(0..n).collect()
+    let to_wake: Vec<Waiter> = with_waiter_list(id, index, |list| {
+        let n = if max < 0 {
+            list.len()
         } else {
-            Vec::new()
-        }
-    };
+            (max as usize).min(list.len())
+        };
+        list.drain(..n).collect()
+    });
     let count = to_wake.len() as u64;
     for w in to_wake {
         let (lock, cvar) = &*w;

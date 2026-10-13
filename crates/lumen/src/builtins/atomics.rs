@@ -71,12 +71,39 @@ pub(super) fn install_atomics(it: &mut Interp) {
             ab(i.to_int32(v))? as i128
         })
     }
-    fn read_i128(i: &Interp, info: &TaInfo, idx: usize) -> i128 {
-        match i.ta_read(info, idx) {
-            Value::Num(n) => n as i128,
-            Value::BigInt(n) => n.to_i128_wrapping(),
-            _ => 0,
-        }
+    /// The signed value of a `kind` element at `byte_index` of a Shared Data Block's bytes.
+    fn element_value(kind: TaKind, bytes: &[u8], byte_index: usize) -> Option<i128> {
+        let bytes = bytes.get(byte_index..byte_index + kind.elsize())?;
+        Some(if kind.is_bigint() {
+            kind.read_bigint(bytes)
+        } else {
+            kind.read(bytes) as i128
+        })
+    }
+    /// DoWait from EnterCriticalSection through AddWaiter (ECMA-262 #sec-dowait): inside the
+    /// critical section of the element's WaiterList, read the element and, when it equals
+    /// `expected`, add a new waiter. Otherwise the synchronous result: "not-equal", or
+    /// "timed-out" for a `waitAsync` whose timeout is zero (`timeout_now`), which adds none.
+    fn enqueue_waiter(
+        info: &TaInfo,
+        idx: usize,
+        id: u64,
+        expected: i128,
+        timeout_now: bool,
+    ) -> Result<(usize, crate::interpreter::Waiter), &'static str> {
+        let byte_index = info.offset + idx * info.kind.elsize();
+        let block = crate::interpreter::shared_mem_get(id).ok_or("not-equal")?;
+        crate::interpreter::with_waiter_list(id, byte_index, |list| {
+            if element_value(info.kind, &block.lock().unwrap(), byte_index) != Some(expected) {
+                return Err("not-equal");
+            }
+            if timeout_now {
+                return Err("timed-out");
+            }
+            let waiter = crate::interpreter::Waiter::default();
+            list.push(waiter.clone());
+            Ok((byte_index, waiter))
+        })
     }
     fn write_i128(i: &mut Interp, info: &TaInfo, idx: usize, n: i128) {
         if info.kind.is_bigint() {
@@ -204,11 +231,11 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 "Atomics.wait: the calling agent cannot be suspended",
             ));
         }
-        if read_i128(i, &info, idx) != expected {
-            return Ok(Value::lstr("not-equal"));
-        }
-        let byte_index = info.offset + idx * info.kind.elsize();
-        let woken = crate::interpreter::futex_wait(id, byte_index, timeout);
+        let (byte_index, waiter) = match enqueue_waiter(&info, idx, id, expected, false) {
+            Ok(enqueued) => enqueued,
+            Err(result) => return Ok(Value::lstr(result)),
+        };
+        let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
         Ok(Value::lstr(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
@@ -261,24 +288,19 @@ pub(super) fn install_atomics(it: &mut Interp) {
             Some(std::time::Duration::from_millis(q.max(0.0) as u64))
         };
         let result = i.new_object();
-        // The value already differs ⇒ resolved synchronously (not async).
-        if read_i128(i, &info, idx) != expected {
-            set_data(&result, "async", Value::Bool(false));
-            set_data(&result, "value", Value::lstr("not-equal"));
-            return Ok(Value::Obj(result));
-        }
-        // A zero timeout times out immediately (still synchronous).
-        if matches!(timeout, Some(d) if d.is_zero()) {
-            set_data(&result, "async", Value::Bool(false));
-            set_data(&result, "value", Value::lstr("timed-out"));
-            return Ok(Value::Obj(result));
-        }
+        // A value that already differs, or a zero timeout, resolves synchronously (not async).
+        let zero = matches!(timeout, Some(d) if d.is_zero());
+        let (byte_index, waiter) = match enqueue_waiter(&info, idx, id, expected, zero) {
+            Ok(enqueued) => enqueued,
+            Err(value) => {
+                set_data(&result, "async", Value::Bool(false));
+                set_data(&result, "value", Value::lstr(value));
+                return Ok(Value::Obj(result));
+            }
+        };
         // Otherwise wait asynchronously: a waiter thread reports the outcome, which the event loop
-        // uses to resolve the returned promise.
-        let byte_index = info.offset + idx * info.kind.elsize();
-        // The waiter joins the wait list synchronously (a notify later in this same job must see
-        // it); only the blocking happens on the helper thread.
-        let waiter = crate::interpreter::futex_register(id, byte_index);
+        // uses to resolve the returned promise. The waiter joined the list synchronously, so a
+        // notify later in this same job sees it.
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
         std::thread::spawn(move || {
             let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
