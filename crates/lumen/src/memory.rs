@@ -3066,7 +3066,7 @@ mod tests {
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
         root.array_buffers.insert(1, shared_buffer.clone());
         shadow.array_buffers.insert(2, shared_buffer);
-        let shared_data_block = crate::interpreter::alloc_shared_mem(337);
+        let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
         root.shared_buffers.insert(3, shared_data_block);
         shadow.shared_buffers.insert(4, shared_data_block);
 

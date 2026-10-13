@@ -770,14 +770,18 @@ pub fn next_shared_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, AtomicOrdering::SeqCst)
 }
-/// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id.
-pub fn alloc_shared_mem(len: usize) -> u64 {
+/// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id, or `None`
+/// when the memory is not available.
+pub fn alloc_shared_mem(len: usize) -> Option<u64> {
+    let mut block = Vec::new();
+    block.try_reserve_exact(len).ok()?;
+    block.resize(len, 0);
     let id = next_shared_id();
     shared_mem_registry()
         .lock()
         .unwrap()
-        .insert(id, Arc::new(Mutex::new(vec![0u8; len])));
-    id
+        .insert(id, Arc::new(Mutex::new(block)));
+    Some(id)
 }
 pub fn shared_mem_get(id: u64) -> Option<SharedMem> {
     shared_mem_registry().lock().unwrap().get(&id).cloned()
@@ -3222,6 +3226,9 @@ pub struct Interp {
     /// graph. Collection is deferred until the operation returns so active
     /// evaluation state remains a complete root set.
     pub(crate) gc_suppressed: u32,
+    /// ArrayBuffer data allocated since the last collection, and the amount that triggers the
+    /// next one (see [`Interp::note_buffer_allocation`]).
+    pub(crate) buffer_gc: BufferPressure,
     /// Call counter for [`Interp::gc_check_amortized`]. Layered calls poll every 256 calls; direct
     /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
     /// registry maintenance.
@@ -3467,6 +3474,7 @@ interp_memory_inventory! {
     gc_next => "non_owning",
     live_object_limit => "non_owning",
     gc_suppressed => "non_owning",
+    buffer_gc => "non_owning",
     gc_tick => "non_owning",
     gc_task_allocated => "non_owning",
     gc_task_live => "non_owning",
@@ -3521,7 +3529,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 162);
+    assert_eq!(names.len(), 163);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3911,6 +3919,28 @@ pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
 pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
+
+/// ArrayBuffer data allocated since the last collection that triggers another, at least. A
+/// backing store is freed only when the collector finds its buffer unreachable, and a buffer is
+/// one object however many bytes it holds, so object pressure alone let discarded buffers pile
+/// up (a loop allocating 16 MiB arrays and keeping none reached 16 GB). Like V8's external
+/// memory limit, the trigger grows with the buffer data that survives a collection.
+const BUFFER_GC_TRIGGER: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufferPressure {
+    since_gc: usize,
+    trigger: usize,
+}
+
+impl Default for BufferPressure {
+    fn default() -> Self {
+        BufferPressure {
+            since_gc: 0,
+            trigger: BUFFER_GC_TRIGGER,
+        }
+    }
+}
 
 /// Minimum pressure that triggers an end-of-task cycle collection. Larger retained heaps scale
 /// this floor, so short-lived allocation churn alone does not force a full scan every frame.
@@ -4769,6 +4799,7 @@ impl Interp {
             gc_next: GC_TRIGGER,
             live_object_limit: default_live_object_limit(),
             gc_suppressed: 0,
+            buffer_gc: BufferPressure::default(),
             gc_tick: 0,
             gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
             gc_task_live: crate::value::heap_live_objects(&gc_heap),
@@ -10715,7 +10746,34 @@ impl Interp {
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
     }
 
+    /// Account for `len` bytes of new ArrayBuffer data, first collecting once enough has been
+    /// allocated since the last collection that discarded buffers may be holding as much again.
+    /// Called before the data block is allocated, where a collection is a safepoint like any
+    /// allocation of the buffer object itself.
+    pub(crate) fn note_buffer_allocation(&mut self, len: usize) {
+        self.buffer_gc.since_gc = self.buffer_gc.since_gc.saturating_add(len);
+        if self.buffer_gc.since_gc <= self.buffer_gc.trigger || self.gc_suppressed != 0 {
+            return;
+        }
+        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
+        let retained: usize = self
+            .array_buffers
+            .values()
+            .map(|block| block.try_borrow().map_or(0, |bytes| bytes.len()))
+            .sum();
+        self.buffer_gc.trigger = retained.max(BUFFER_GC_TRIGGER);
+    }
+
+    /// A data block could not be allocated: collect everything unreachable (discarded buffers
+    /// included) before the caller retries once.
+    pub(crate) fn collect_for_failed_allocation(&mut self) {
+        if self.gc_suppressed == 0 {
+            self.gc_collect();
+        }
+    }
+
     fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
+        self.buffer_gc.since_gc = 0;
         // Allocation and task-boundary pressure usually visit only newly allocated objects,
         // with bounded major-collection debt: a retained page heap is not rescanned for each
         // 1/8 of growth. Explicit/idle collections and released documents revisit everything.

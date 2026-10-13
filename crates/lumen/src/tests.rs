@@ -2087,6 +2087,41 @@ fn live_object_limit_error_handler_can_allocate() {
     }
 }
 
+/// A discarded ArrayBuffer keeps its data until the collector finds it, and a buffer is a single
+/// object, so buffer data drives collection too: allocating 96 MiB of typed arrays that are
+/// never kept must not retain them all (a 16 MiB-per-iteration loop used to reach 16 GB).
+#[test]
+fn discarded_array_buffer_data_triggers_collection() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "var total = 0;
+                 for (var k = 0; k < 96; k++) total += new Uint8Array(1024 * 1024).length;
+                 total"
+            ),
+            "100663296"
+        );
+        let retained: usize = engine
+            .interp
+            .array_buffers
+            .values()
+            .map(|bytes| bytes.borrow().len())
+            .sum();
+        assert!(
+            retained <= 72 * 1024 * 1024,
+            "{tier:?} retains {retained} bytes of discarded buffers"
+        );
+    }
+}
+
 /// Releasing the last reference to a long object chain must not recurse once per link. Each case
 /// runs on a deliberately small native stack, where per-link recursion overflowed at a few
 /// thousand links; the chains here are two orders of magnitude longer.
