@@ -639,7 +639,7 @@ pub(super) fn install_bigint(it: &mut Interp) {
                 r as u32
             }
         };
-        Ok(Value::lstr(n.to_string_radix(radix)))
+        Ok(Value::lstr(ab(i.bigint_to_string(&n, radix))?))
     });
     it.def_method(&proto, "valueOf", 0, |i, this, _| {
         Ok(Value::BigInt(this_bigint(i, &this)?))

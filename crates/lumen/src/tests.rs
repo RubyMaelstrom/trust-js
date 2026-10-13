@@ -4993,6 +4993,88 @@ fn bigint() {
     assert_eq!(run("String(99n)"), "99");
 }
 
+/// BigInt results are limited to 2^30 bits (V8's "Maximum BigInt size exceeded"), checked
+/// before the result is allocated, and radix conversion works a limb at a time. Expected values
+/// are node's.
+#[test]
+fn bigint_size_limit_and_radix_conversion() {
+    let source = r#"
+        function attempt(f) { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }
+        [
+            attempt(() => 2n ** 2000000000n),
+            attempt(() => 2n ** 1073741824n),
+            attempt(() => { var x = 1n; for (var k = 0; k < 10; k++) x <<= 1000000000n; return x; }),
+            attempt(() => { var x = 1n << 600000000n; return x * x; }),
+            attempt(() => (1n << 1000000000n).toString(2)),
+            attempt(() => (2n ** 1073741823n) >> 1073741821n),
+            [(-4n) ** 3n, (-4n) ** 2n, 8n ** 5n, (-1n) ** 1000000000001n, 0n ** 99999999999999n].join(),
+            [255n.toString(2), (-255n).toString(16), 12345678901234567890123456789n.toString(36),
+             (2n ** 64n).toString(), (-(10n ** 19n)).toString(), (10n ** 19n - 1n).toString(7)].join(),
+            [BigInt('0x' + 'f'.repeat(40)), BigInt('0o777'), BigInt(' -12345678901234567890123456789 '),
+             BigInt('+42'), BigInt('0'.repeat(60) + '1'), attempt(() => BigInt('-0x10'))].join(),
+            [(10n ** 50n + 12345n) / (10n ** 25n + 7n), (10n ** 50n + 12345n) % (10n ** 25n + 7n)].join(),
+            BigInt((3n ** 20000n).toString()) === 3n ** 20000n
+        ].join('|')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "RangeError: Maximum BigInt size exceeded|RangeError: Maximum BigInt size exceeded|\
+             RangeError: Maximum BigInt size exceeded|RangeError: Maximum BigInt size exceeded|\
+             RangeError: Invalid string length|4|-64,16,32768,-1,0|\
+             11111111,-ff,17384dv0z83qk7482z9,18446744073709551616,-10000000000000000000,\
+             23621642325042620603532|1461501637330902918203684832716283019655932542975,511,\
+             -12345678901234567890123456789,42,1,SyntaxError: Cannot convert string to a BigInt|\
+             9999999999999999999999993,12394|true",
+            "{tier:?}"
+        );
+    }
+}
+
+/// The quadratic BigInt digit loops poll the host interrupt: a deadline stops a multiplication,
+/// division, radix conversion or parse of huge values instead of letting it run for minutes.
+#[test]
+fn long_bigint_operations_honor_the_deadline() {
+    for operation in [
+        "var x = (1n << 4000000n) - 1n; x * (x + 2n)",
+        "((1n << 20000000n) - 1n) / ((1n << 10000000n) + 12345n)",
+        "((1n << 20000000n) - 1n).toString()",
+        "BigInt('9'.repeat(5000000))",
+        "3n ** 3000000n",
+    ] {
+        let mut engine = Engine::new();
+        let interrupt = engine.interrupt_handle();
+        interrupt.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        ));
+        let started = std::time::Instant::now();
+        match engine
+            .eval_interruptible(operation, false)
+            .expect("script parses")
+        {
+            ExecutionOutcome::Interrupted {
+                reason: InterruptReason::DeadlineExceeded,
+            } => {}
+            ExecutionOutcome::Interrupted { reason } => panic!("{operation}: {reason:?}"),
+            ExecutionOutcome::Value(value) => panic!("{operation} completed: {value}"),
+            ExecutionOutcome::Throw { name, message } => {
+                panic!("{operation} threw {name}: {message}")
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{operation} did not honor the deadline promptly"
+        );
+    }
+}
+
 #[test]
 fn proxy() {
     assert_eq!(run("var p = new Proxy({a:1}, {}); p.a"), "1"); // forward get

@@ -5,6 +5,68 @@
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use crate::interrupt::{InterruptReason, RuntimeInterrupt};
+
+/// The most bits a BigInt produced by script may have (V8's limit). Larger results throw a
+/// RangeError instead of exhausting memory: one is already 128 MiB.
+pub(crate) const MAX_BITS: usize = 1 << 30;
+
+/// Why a bounded BigInt operation stopped without a result.
+#[derive(Debug)]
+pub(crate) enum Stop {
+    /// The result would have more than [`MAX_BITS`] bits.
+    TooLarge,
+    /// The host interrupted the script during a long digit loop.
+    Interrupted(InterruptReason),
+}
+
+/// Limb operations between two interrupt polls: a few milliseconds of work.
+const POLL_WORK: usize = 1 << 22;
+
+/// Host-interrupt polling for the quadratic digit loops (schoolbook multiplication, long
+/// division, radix conversion), which run for minutes on values near [`MAX_BITS`].
+pub(crate) struct Poll<'a> {
+    interrupt: Option<&'a RuntimeInterrupt>,
+    work: usize,
+}
+
+impl<'a> Poll<'a> {
+    pub(crate) fn new(interrupt: &'a RuntimeInterrupt) -> Self {
+        Poll {
+            interrupt: Some(interrupt),
+            work: 0,
+        }
+    }
+
+    /// For the engine's own operations on small values (number formatting, literals).
+    pub(crate) fn never() -> Poll<'static> {
+        Poll {
+            interrupt: None,
+            work: 0,
+        }
+    }
+
+    /// Account for `work` limb operations, polling the host once enough have accumulated.
+    fn spend(&mut self, work: usize) -> Result<(), Stop> {
+        self.work += work;
+        if self.work >= POLL_WORK {
+            self.work = 0;
+            if let Some(reason) = self.interrupt.and_then(RuntimeInterrupt::current_reason) {
+                return Err(Stop::Interrupted(reason));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The result of an operation polled with [`Poll::never`], which cannot stop.
+fn unstoppable<T>(result: Result<T, Stop>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(_) => unreachable!("an unpolled BigInt operation has no size bound or interrupt"),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct JsBigInt(Rc<BigIntData>);
 
@@ -67,12 +129,13 @@ fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
     trim(out)
 }
 
-fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+fn mag_mul(a: &[u64], b: &[u64], poll: &mut Poll) -> Result<Vec<u64>, Stop> {
     if a.is_empty() || b.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut out = vec![0u64; a.len() + b.len()];
     for (i, &x) in a.iter().enumerate() {
+        poll.spend(b.len())?;
         let mut carry = 0u128;
         for (j, &y) in b.iter().enumerate() {
             let cur = out[i + j] as u128 + x as u128 * y as u128 + carry;
@@ -87,13 +150,13 @@ fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
             k += 1;
         }
     }
-    trim(out)
+    Ok(trim(out))
 }
 
 /// Schoolbook division: `(quotient, remainder)` of `a / b` with `b` non-zero.
-fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+fn mag_divmod(a: &[u64], b: &[u64], poll: &mut Poll) -> Result<(Vec<u64>, Vec<u64>), Stop> {
     if mag_cmp(a, b) == Ordering::Less {
-        return (Vec::new(), a.to_vec());
+        return Ok((Vec::new(), a.to_vec()));
     }
     if b.len() == 1 {
         let d = b[0] as u128;
@@ -104,13 +167,14 @@ fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
             q[i] = (cur / d) as u64;
             rem = cur % d;
         }
-        return (trim(q), trim(vec![rem as u64]));
+        return Ok((trim(q), trim(vec![rem as u64])));
     }
     // Bit-by-bit long division (slow but simple; conformance sizes are small).
     let bits = a.len() * 64;
     let mut q = vec![0u64; a.len()];
     let mut rem: Vec<u64> = Vec::new();
     for i in (0..bits).rev() {
+        poll.spend(rem.len() + 1)?;
         // rem = rem << 1 | bit(a, i)
         let mut carry = (a[i / 64] >> (i % 64)) & 1;
         for limb in rem.iter_mut() {
@@ -126,7 +190,32 @@ fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
             q[i / 64] |= 1 << (i % 64);
         }
     }
-    (trim(q), rem)
+    Ok((trim(q), rem))
+}
+
+/// `mag = mag * mul + add` in place.
+fn mag_mul_add_small(mag: &mut Vec<u64>, mul: u64, add: u64) {
+    let mut carry = add as u128;
+    for limb in mag.iter_mut() {
+        let value = *limb as u128 * mul as u128 + carry;
+        *limb = value as u64;
+        carry = value >> 64;
+    }
+    if carry != 0 {
+        mag.push(carry as u64);
+    }
+}
+
+/// The largest power of `radix` that fits in a limb, and its exponent: the digits one pass of
+/// radix conversion handles.
+fn radix_chunk(radix: u32) -> (u64, usize) {
+    let mut chunk = radix as u64;
+    let mut width = 1;
+    while let Some(next) = chunk.checked_mul(radix as u64) {
+        chunk = next;
+        width += 1;
+    }
+    (chunk, width)
 }
 
 impl JsBigInt {
@@ -228,42 +317,136 @@ impl JsBigInt {
         self.add(&o.neg())
     }
     pub fn mul(&self, o: &Self) -> Self {
-        Self::make(self.0.neg != o.0.neg, mag_mul(&self.0.mag, &o.0.mag))
+        unstoppable(self.mul_with(o, &mut Poll::never()))
+    }
+    fn mul_with(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
+        let mag = mag_mul(&self.0.mag, &o.0.mag, poll)?;
+        Ok(Self::make(self.0.neg != o.0.neg, mag))
     }
     /// Truncating division; `None` on division by zero.
     pub fn div(&self, o: &Self) -> Option<Self> {
         if o.is_zero() {
             return None;
         }
-        let (q, _) = mag_divmod(&self.0.mag, &o.0.mag);
-        Some(Self::make(self.0.neg != o.0.neg, q))
+        Some(unstoppable(self.div_bounded(o, &mut Poll::never())))
     }
     /// Remainder with the dividend's sign; `None` on division by zero.
     pub fn rem(&self, o: &Self) -> Option<Self> {
         if o.is_zero() {
             return None;
         }
-        let (_, r) = mag_divmod(&self.0.mag, &o.0.mag);
-        Some(Self::make(self.0.neg, r))
+        Some(unstoppable(self.rem_bounded(o, &mut Poll::never())))
     }
-    /// Exponentiation; `None` for a negative exponent.
+    /// Exponentiation; `None` for a negative exponent. Unbounded: for the engine's own small
+    /// powers (script exponentiation uses [`Self::pow_bounded`]).
     pub fn pow(&self, o: &Self) -> Option<Self> {
         if o.0.neg {
             return None;
         }
-        let mut e = o.to_i128().unwrap_or(i128::MAX) as u128;
+        let e = o.to_i128().unwrap_or(i128::MAX) as u128;
+        Some(unstoppable(self.pow_with(e, &mut Poll::never())))
+    }
+    fn pow_with(&self, mut e: u128, poll: &mut Poll) -> Result<Self, Stop> {
         let mut base = self.clone();
         let mut acc = Self::from_u64(1);
         while e > 0 {
             if e & 1 == 1 {
-                acc = acc.mul(&base);
+                acc = acc.mul_with(&base, poll)?;
             }
             e >>= 1;
             if e > 0 {
-                base = base.mul(&base);
+                base = base.mul_with(&base, poll)?;
             }
         }
-        Some(acc)
+        Ok(acc)
+    }
+
+    /// `Err(TooLarge)` when `self` has more than [`MAX_BITS`] bits.
+    fn within_limit(self) -> Result<Self, Stop> {
+        if self.bit_len() > MAX_BITS {
+            return Err(Stop::TooLarge);
+        }
+        Ok(self)
+    }
+
+    // Script arithmetic (ECMA-262 §6.1.6.2): results are limited to `MAX_BITS`, and the
+    // quadratic operations poll the host interrupt.
+
+    pub(crate) fn add_bounded(&self, o: &Self) -> Result<Self, Stop> {
+        self.add(o).within_limit()
+    }
+    pub(crate) fn sub_bounded(&self, o: &Self) -> Result<Self, Stop> {
+        self.sub(o).within_limit()
+    }
+    pub(crate) fn mul_bounded(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
+        // A product has `a + b - 1` or `a + b` bits; reject before computing when even the
+        // smaller is over the limit.
+        if !self.is_zero()
+            && !o.is_zero()
+            && self.bit_len() + o.bit_len() - 1 > MAX_BITS
+        {
+            return Err(Stop::TooLarge);
+        }
+        self.mul_with(o, poll)?.within_limit()
+    }
+    /// Truncating division by a non-zero divisor.
+    pub(crate) fn div_bounded(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
+        debug_assert!(!o.is_zero());
+        let (q, _) = mag_divmod(&self.0.mag, &o.0.mag, poll)?;
+        Ok(Self::make(self.0.neg != o.0.neg, q))
+    }
+    /// Remainder, with the dividend's sign, by a non-zero divisor.
+    pub(crate) fn rem_bounded(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
+        debug_assert!(!o.is_zero());
+        let (_, r) = mag_divmod(&self.0.mag, &o.0.mag, poll)?;
+        Ok(Self::make(self.0.neg, r))
+    }
+    /// Exponentiation by a non-negative exponent.
+    pub(crate) fn pow_bounded(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
+        debug_assert!(!o.0.neg);
+        if o.is_zero() {
+            return Ok(Self::from_u64(1));
+        }
+        // 0, 1 and -1 stay small for any exponent.
+        if self.0.mag.len() <= 1 && self.0.mag.first().copied().unwrap_or(0) <= 1 {
+            let odd = o.0.mag[0] & 1 == 1;
+            return Ok(if self.0.neg && !odd {
+                Self::from_u64(1)
+            } else {
+                self.clone()
+            });
+        }
+        // |base| >= 2, so base^e has at least (bits - 1) * e + 1 bits.
+        let e = match o.to_i128() {
+            Some(e) if e <= MAX_BITS as i128 => e as u128,
+            _ => return Err(Stop::TooLarge),
+        };
+        let shift = (self.bit_len() as u128 - 1) * e;
+        if shift + 1 > MAX_BITS as u128 {
+            return Err(Stop::TooLarge);
+        }
+        // (±2^k)^e is a single shift, however large.
+        let top = self.0.mag.len() - 1;
+        if self.0.mag[top].is_power_of_two() && self.0.mag[..top].iter().all(|&d| d == 0) {
+            let magnitude = Self::from_u64(1).shl(shift as u64);
+            let odd = o.0.mag[0] & 1 == 1;
+            return Ok(if self.0.neg && odd {
+                magnitude.neg()
+            } else {
+                magnitude
+            });
+        }
+        self.pow_with(e, poll)?.within_limit()
+    }
+    /// `self * 2^count`.
+    pub(crate) fn shl_bounded(&self, count: u128) -> Result<Self, Stop> {
+        if self.is_zero() {
+            return Ok(Self::zero());
+        }
+        if count > MAX_BITS.saturating_sub(self.bit_len()) as u128 {
+            return Err(Stop::TooLarge);
+        }
+        Ok(self.shl(count as u64))
     }
 
     pub fn shl(&self, count: u64) -> Self {
@@ -470,19 +653,38 @@ impl JsBigInt {
 
     /// Parse from digits (no sign) in the given radix.
     pub fn parse_radix(text: &str, radix: u32) -> Option<Self> {
-        let mut acc = Self::zero();
-        let r = Self::from_u64(radix as u64);
-        let mut any = false;
-        for c in text.chars() {
-            let d = c.to_digit(radix)?;
-            acc = acc.mul(&r).add(&Self::from_u64(d as u64));
-            any = true;
+        unstoppable(Self::parse_radix_bounded(text, radix, &mut Poll::never()))
+    }
+    /// [`Self::parse_radix`] for script input: `Ok(None)` for a malformed digit string.
+    pub(crate) fn parse_radix_bounded(
+        text: &str,
+        radix: u32,
+        poll: &mut Poll,
+    ) -> Result<Option<Self>, Stop> {
+        if text.is_empty() {
+            return Ok(None);
         }
-        if any {
-            Some(acc)
-        } else {
-            None
+        // Fold a limb's worth of digits at a time into the accumulator.
+        let (_, width) = radix_chunk(radix);
+        let mut mag = Vec::new();
+        let mut digits = text.chars();
+        loop {
+            let mut scale = 1u64;
+            let mut value = 0u64;
+            for c in digits.by_ref().take(width) {
+                let Some(digit) = c.to_digit(radix) else {
+                    return Ok(None);
+                };
+                scale *= radix as u64;
+                value = value * radix as u64 + digit as u64;
+            }
+            if scale == 1 {
+                break;
+            }
+            poll.spend(mag.len() + 1)?;
+            mag_mul_add_small(&mut mag, scale, value);
         }
+        Ok(Some(Self::make(false, mag)))
     }
     /// Decimal digits (used by StringToBigInt with an optional leading sign handled outside).
     pub fn parse_dec(text: &str) -> Option<Self> {
@@ -493,22 +695,47 @@ impl JsBigInt {
     }
 
     pub fn to_string_radix(&self, radix: u32) -> String {
+        unstoppable(self.to_string_radix_bounded(radix, &mut Poll::never()))
+    }
+    /// [`Self::to_string_radix`], polling the host interrupt.
+    pub(crate) fn to_string_radix_bounded(
+        &self,
+        radix: u32,
+        poll: &mut Poll,
+    ) -> Result<String, Stop> {
         if self.is_zero() {
-            return "0".to_string();
+            return Ok("0".to_string());
         }
+        // Each pass divides by the largest power of the radix that fits in a limb and emits
+        // that many digits (least significant first; the last pass drops leading zeros).
+        let (chunk, width) = radix_chunk(radix);
         let mut digits = Vec::new();
         let mut cur = self.0.mag.clone();
-        let r = vec![radix as u64];
         while !cur.is_empty() {
-            let (q, rem) = mag_divmod(&cur, &r);
-            let d = *rem.first().unwrap_or(&0) as u32;
-            digits.push(std::char::from_digit(d, radix).unwrap());
-            cur = q;
+            poll.spend(cur.len())?;
+            let mut rem = 0u128;
+            for limb in cur.iter_mut().rev() {
+                let value = (rem << 64) | *limb as u128;
+                *limb = (value / chunk as u128) as u64;
+                rem = value % chunk as u128;
+            }
+            while cur.last() == Some(&0) {
+                cur.pop();
+            }
+            let mut rem = rem as u64;
+            for _ in 0..width {
+                if cur.is_empty() && rem == 0 {
+                    break;
+                }
+                let digit = (rem % radix as u64) as u32;
+                digits.push(std::char::from_digit(digit, radix).unwrap());
+                rem /= radix as u64;
+            }
         }
         if self.0.neg {
             digits.push('-');
         }
-        digits.iter().rev().collect()
+        Ok(digits.iter().rev().collect())
     }
 }
 

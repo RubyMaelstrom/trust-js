@@ -8025,19 +8025,21 @@ impl Interp {
         y: &crate::bigint::JsBigInt,
     ) -> Result<Value, Abrupt> {
         use crate::bigint::JsBigInt;
+        let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+        let stop = |stop| self.bigint_stop(stop);
         let v = match op {
-            "+" => x.add(y),
-            "-" => x.sub(y),
-            "*" => x.mul(y),
-            "/" => x
-                .div(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "%" => x
-                .rem(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "**" => x
-                .pow(y)
-                .ok_or_else(|| self.throw("RangeError", "Exponent must be non-negative"))?,
+            "+" => x.add_bounded(y).map_err(stop)?,
+            "-" => x.sub_bounded(y).map_err(stop)?,
+            "*" => x.mul_bounded(y, &mut poll).map_err(stop)?,
+            "/" | "%" if y.is_zero() => {
+                return Err(self.throw("RangeError", "Division by zero"));
+            }
+            "/" => x.div_bounded(y, &mut poll).map_err(stop)?,
+            "%" => x.rem_bounded(y, &mut poll).map_err(stop)?,
+            "**" if y.is_negative() => {
+                return Err(self.throw("RangeError", "Exponent must be non-negative"));
+            }
+            "**" => x.pow_bounded(y, &mut poll).map_err(stop)?,
             "&" => x.bitand(y),
             "|" => x.bitor(y),
             "^" => x.bitxor(y),
@@ -8047,13 +8049,7 @@ impl Interp {
                 let leftward = (op == "<<") != y.is_negative();
                 let count = y.to_i128().map(|v| v.unsigned_abs()).unwrap_or(u128::MAX);
                 if leftward {
-                    if x.is_zero() {
-                        JsBigInt::zero()
-                    } else if count > (1 << 30) {
-                        return Err(self.throw("RangeError", "BigInt is too large to allocate"));
-                    } else {
-                        x.shl(count as u64)
-                    }
+                    x.shl_bounded(count).map_err(stop)?
                 } else if count >= (1 << 30) {
                     // Every bit shifted out: floor(x / 2^count) is 0 or -1 by sign.
                     if x.is_negative() {
@@ -8070,6 +8066,36 @@ impl Interp {
         Ok(Value::BigInt(v))
     }
 
+    /// The completion for a BigInt operation that stopped: V8's RangeError for a result over
+    /// the size limit, or the host's interrupt.
+    pub(crate) fn bigint_stop(&self, stop: crate::bigint::Stop) -> Abrupt {
+        match stop {
+            crate::bigint::Stop::TooLarge => {
+                self.throw("RangeError", "Maximum BigInt size exceeded")
+            }
+            crate::bigint::Stop::Interrupted(reason) => Abrupt::Interrupt(reason),
+        }
+    }
+
+    /// The digits of a BigInt in `radix` (Number::toString for BigInts, ECMA-262 §6.1.6.2.23).
+    /// A result longer than the engine's string limit throws before the quadratic conversion
+    /// runs, and a long conversion polls the host interrupt.
+    pub(crate) fn bigint_to_string(
+        &self,
+        n: &crate::bigint::JsBigInt,
+        radix: u32,
+    ) -> Result<String, Abrupt> {
+        // |n| >= 2^(bits - 1), so it has at least floor((bits - 1) * log_radix 2) + 1 digits.
+        let bits = n.bit_len().saturating_sub(1) as f64;
+        let digits = (bits * std::f64::consts::LN_2 / (radix as f64).ln()).floor();
+        if digits >= MAX_STR_LEN as f64 {
+            return Err(self.throw("RangeError", "Invalid string length"));
+        }
+        let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+        n.to_string_radix_bounded(radix, &mut poll)
+            .map_err(|stop| self.bigint_stop(stop))
+    }
+
     /// ToBigInt: BigInt stays; Boolean → 0n/1n; String parses (SyntaxError if malformed); Number /
     /// undefined / null / Symbol throw TypeError.
     pub(crate) fn to_bigint(&mut self, v: &Value) -> Result<crate::bigint::JsBigInt, Abrupt> {
@@ -8077,8 +8103,12 @@ impl Interp {
         match p {
             Value::BigInt(n) => Ok(n),
             Value::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
-            Value::Str(s) => string_to_bigint(&s)
-                .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt")),
+            Value::Str(s) => {
+                let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+                string_to_bigint_bounded(&s, &mut poll)
+                    .map_err(|stop| self.bigint_stop(stop))?
+                    .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt"))
+            }
             Value::Num(_) => Err(self.throw("TypeError", "Cannot convert a Number to a BigInt")),
             _ => Err(self.throw("TypeError", "Cannot convert value to a BigInt")),
         }
@@ -8436,7 +8466,7 @@ impl Interp {
             Value::Null => Ok(crate::lstr::LStr::from("null")),
             Value::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
             Value::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
-            Value::BigInt(n) => Ok(crate::lstr::LStr::from(n.to_string().as_str())),
+            Value::BigInt(n) => Ok(crate::lstr::LStr::from(self.bigint_to_string(n, 10)?.as_str())),
             Value::Str(s) => Ok(s.clone()),
             Value::Sym(_) => {
                 Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
@@ -9566,27 +9596,36 @@ pub(crate) fn private_display(key: &str) -> &str {
 }
 
 /// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable.
+/// StringToBigInt for comparisons with a string operand (unpolled).
 fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
+    string_to_bigint_bounded(s, &mut crate::bigint::Poll::never())
+        .ok()
+        .flatten()
+}
+
+/// StringToBigInt (ECMA-262 §7.1.14): `Ok(None)` when the string is not a valid integer.
+fn string_to_bigint_bounded(
+    s: &str,
+    poll: &mut crate::bigint::Poll,
+) -> Result<Option<crate::bigint::JsBigInt>, crate::bigint::Stop> {
     use crate::bigint::JsBigInt;
     let t = s.trim_matches(crate::regex::js_whitespace);
     if t.is_empty() {
-        return Some(JsBigInt::zero());
+        return Ok(Some(JsBigInt::zero()));
     }
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return JsBigInt::parse_radix(h, 16);
-    }
-    if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return JsBigInt::parse_radix(o, 8);
-    }
-    if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return JsBigInt::parse_radix(b, 2);
+    for (prefixes, radix) in [(["0x", "0X"], 16), (["0o", "0O"], 8), (["0b", "0B"], 2)] {
+        if let Some(digits) = prefixes.iter().find_map(|prefix| t.strip_prefix(prefix)) {
+            return JsBigInt::parse_radix_bounded(digits, radix, poll);
+        }
     }
     let (neg, digits) = match t.strip_prefix('-') {
         Some(d) => (true, d),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let v = JsBigInt::parse_dec(digits)?;
-    Some(if neg { v.neg() } else { v })
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    Ok(JsBigInt::parse_radix_bounded(digits, 10, poll)?.map(|v| if neg { v.neg() } else { v }))
 }
 
 /// The outcome of evaluating a `return` operand: a pending proper tail call, or a plain value.
