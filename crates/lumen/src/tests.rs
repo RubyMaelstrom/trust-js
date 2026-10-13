@@ -28484,9 +28484,10 @@ fn interp_layout_probes() {
     // simply disables the thunk), but a probe failure on the dev platform should be loud.
     let mut e = crate::Engine::new();
     e.set_tier(crate::bytecode::Tier::Jit);
-    // Force a JIT compile so the layout initializes through the production path.
+    // Force a JIT compile so the layout initializes through the production path (a loop-free
+    // function is compiled after `jit_admit_runs` VM runs).
     let _ = e.eval(
-        "function f(a){ return a + 1; } for (var i = 0; i < 64; i++) f(i);",
+        "function f(a){ return a + 1; } for (var i = 0; i < 200; i++) f(i);",
         false,
     );
     let l = e.interp.interp_layout.get();
