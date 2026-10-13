@@ -9,12 +9,12 @@ identify a single cause of the regression, establish a V8 gap, or justify a 60x
 prediction.
 
 This is an architectural review, not another optimizer revision. I read the
-[handoff](/big/Code/Lumen/docs/optimization-handoff-20260928.txt), the development
+[handoff](/big/Code/trust-js/docs/optimization-handoff-20260928.txt), the development
 records and source in both repositories, and reanalysed the saved measurements.
 The original artifacts and source were left intact. The independent
-[evidence record](/big/Code/Lumen/benchmark-results/architecture-reassessment-20260928/evidence.json)
+[evidence record](/big/Code/trust-js/benchmark-results/architecture-reassessment-20260928/evidence.json)
 contains input hashes, raw-run derivations, source identity and validation status.
-Its [analysis script](/big/Code/Lumen/benchmark-results/architecture-reassessment-20260928/reanalyse.py)
+Its [analysis script](/big/Code/trust-js/benchmark-results/architecture-reassessment-20260928/reanalyse.py)
 requires a new output filename on every invocation.
 
 **What the measurements actually establish.** All 16 VALUES15 runs independently
@@ -41,7 +41,7 @@ This directs investigation toward execution and compilation during interactions.
 It cannot identify pure JavaScript cost: synchronous work includes host calls
 and forced layout, and asynchronous work can execute framework JavaScript.
 
-The [official fixture runner](/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official/resources/benchmark-runner.mjs:383)
+The [official fixture runner](/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official/resources/benchmark-runner.mjs:383)
 recreates its frame across iterations and navigates it for each suite. Therefore
 “run more iterations” does not by itself isolate warmed application execution.
 Measure long-lived application interactions separately, verify actual code reuse,
@@ -57,14 +57,14 @@ call-stub ablations already failed to explain the large regression. Repeating
 them without a new hypothesis would add little.
 
 **The compiler currently optimizes too late in the representation.**
-[Compilation](/big/Code/Lumen/crates/lumen/src/jit_optimizing.rs:1059) builds control
+[Compilation](/big/Code/trust-js/crates/trust-js/src/jit_optimizing.rs:1059) builds control
 flow, local/stack plans and category facts, then translates individual bytecode
 operations into CLIF. It initially creates a block for each bytecode boundary;
 guards, ownership transactions and checked continuations create more blocks.
 Existing instruction/block budgets bound an attempt, but do not establish that
 its cost will be recovered during this page's lifetime.
 
-[Value analysis](/big/Code/Lumen/crates/lumen/src/jit_optimizing_values.rs:287)
+[Value analysis](/big/Code/trust-js/crates/trust-js/src/jit_optimizing_values.rs:287)
 starts entry states at ANY. Property results usually remain unknown. It can
 eliminate checks when categories follow from the program, but does not specialize
 parameters or property-result types from runtime observations. Compact property
@@ -72,21 +72,21 @@ guards already consume some warm IC state, so describing this tier as having
 *no feedback at all* would also be wrong.
 
 Cranelift consequently sees much of the machinery for executing dynamic
-operations before Lumen has proved which machinery is unnecessary across a
+operations before TRust JS has proved which machinery is unnecessary across a
 sequence of operations. Its machine-level optimizer cannot invent the missing
 JavaScript assumptions and recovery rules. This is a source-supported explanation
 for limited optimization opportunity, and a hypothesis for compilation/runtime
 cost. It is not a measured causal decomposition of the 32.65% score loss.
 
 **Existing feedback is useful infrastructure, but is not yet the feedback loop
-this compiler needs.** [FeedbackVector](/big/Code/Lumen/crates/lumen/src/feedback.rs:705)
+this compiler needs.** [FeedbackVector](/big/Code/trust-js/crates/trust-js/src/feedback.rs:705)
 has stable site identities and bounded observation categories. Ordinary property
 and call ICs also contain useful live observations. However, detailed feedback
-is gated by `LUMEN_FEEDBACK_PROFILE`; it is diagnostic, not a cheap continuous
+is gated by `TRUST_JS_FEEDBACK_PROFILE`; it is diagnostic, not a cheap continuous
 specialization policy. On ARM64, that mode
-[disables many template fast paths](/big/Code/Lumen/crates/lumen/src/jit.rs:3330).
+[disables many template fast paths](/big/Code/trust-js/crates/trust-js/src/jit.rs:3330).
 The optimizer declines chunks carrying detailed feedback, while
-[recompiled chunks receive unbound feedback](/big/Code/Lumen/crates/lumen/src/bytecode.rs:5846)
+[recompiled chunks receive unbound feedback](/big/Code/trust-js/crates/trust-js/src/bytecode.rs:5846)
 with detailed writes disabled. A profile collected this way must not be presented
 as an observation of the ordinary optimized execution path.
 
@@ -98,7 +98,7 @@ be expensive, so prefer observations already needed to make baseline execution
 fast, adding narrowly justified value-result feedback.
 
 **Shapes and ownership explain why native operations remain complicated.**
-[Props shapes](/big/Code/Lumen/crates/lumen/src/value.rs:3113) primarily identify
+[Props shapes](/big/Code/trust-js/crates/trust-js/src/value.rs:3113) primarily identify
 ordered keys. They do not prove descriptor kind, writability, prototype identity
 or the type of a field's current value. The property lowerer correctly checks
 live descriptors and prototype links. Adding more native property opcodes will
@@ -111,10 +111,10 @@ Consider richer immutable shape metadata or separate versioned dependencies only
 with an audit of every mutation path and their memory cost. A key-only shape
 cannot safely become a descriptor proof by convention.
 
-[Packed ownership lowering](/big/Code/Lumen/crates/lumen/src/jit_optimizing_ownership.rs:191)
+[Packed ownership lowering](/big/Code/trust-js/crates/trust-js/src/jit_optimizing_ownership.rs:191)
 retains heap values for loads/duplicates and releases them for stores/discards.
 Moving those operations into native code removes a helper call, but usually
-retains the ownership work. [Calls and observers](/big/Code/Lumen/crates/lumen/src/jit_optimizing.rs:520)
+retains the ownership work. [Calls and observers](/big/Code/trust-js/crates/trust-js/src/jit_optimizing.rs:520)
 still publish canonical owners, with selective local reloads and operand reloads.
 Local SSA therefore does not imply that the function has stopped behaving like
 an owning stack machine at these boundaries.
@@ -126,12 +126,12 @@ regions with an explicit surviving owner and safe fallback. Do not remove roots,
 last-owner destruction, or publication simply because a value exists in a register.
 
 **Tiering needs a benefit model, and code publication needs narrower dependencies.**
-The [hot threshold](/big/Code/Lumen/crates/lumen/src/jit_optimizing.rs:126) is entry
+The [hot threshold](/big/Code/trust-js/crates/trust-js/src/jit_optimizing.rs:126) is entry
 count plus bytecode size. It does not account for expected remaining execution,
 type stability, slow-path frequency or expanded IR cost. The
-[upgrade path](/big/Code/Lumen/crates/lumen/src/jit_optimizing.rs:154) recompiles
+[upgrade path](/big/Code/trust-js/crates/trust-js/src/jit_optimizing.rs:154) recompiles
 bytecode from the function with an empty inline plan, publishes `code2`, and bumps
-a [process-wide call-cache epoch](/big/Code/Lumen/crates/lumen/src/bytecode.rs:806).
+a [process-wide call-cache epoch](/big/Code/trust-js/crates/trust-js/src/bytecode.rs:806).
 Native compilation also occurs synchronously on the execution path. Every upgrade
 can therefore invalidate unrelated raw call-cache entries. Its cost is unmeasured;
 zero executable-cache evictions do not mean zero invalidation churn.
@@ -145,14 +145,14 @@ graph onto a worker thread. Moving expensive work off-thread also does not make
 unprofitable generated code profitable.
 
 **A heap rewrite is a separate hypothesis, not the immediate prerequisite.**
-[Object allocation](/big/Code/Lumen/crates/lumen/src/value.rs:1490) creates an Rc
+[Object allocation](/big/Code/trust-js/crates/trust-js/src/value.rs:1490) creates an Rc
 object, maintains a weak registry and tracks young membership. These operations,
 property storage and string ownership may be important costs. The existing
-[literal helpers](/big/Code/Lumen/crates/lumen/src/bytecode.rs:19108) already move
+[literal helpers](/big/Code/trust-js/crates/trust-js/src/bytecode.rs:19108) already move
 ordinary templated object and array operands directly into their storage. Adding
 those helpers again is not an optimization.
 
-The [central heap](/big/Code/Lumen/crates/lumen/src/heap.rs:1) is a checked migration
+The [central heap](/big/Code/trust-js/crates/trust-js/src/heap.rs:1) is a checked migration
 nucleus, not the live production heap. Its moving nursery exercises a restricted
 tagged-field family. The `heap-bridge` retains Rc authority. More tests of that
 nucleus alone will not change application allocation cost.
@@ -177,7 +177,7 @@ allocation and invalidation fanout before selecting a representation change.
 The dirty per-Document invalidation work is already present and must be assessed
 on its own evidence.
 
-The current [live extraction path](/big/Code/TRust/src/lumen_backend.rs:3410)
+The current [live extraction path](/big/Code/TRust/src/trust_js_backend.rs:3410)
 uses the canonical DOM and retained layout fragments. HTML serialization is
 diagnostic/test-only there; the controller consumes the rendered result. Thus
 “remove routine serialize/reparse” and “introduce retained geometry” are not new
@@ -212,7 +212,7 @@ in several places. Mozilla's historical
 provides a concrete example of consuming baseline IC recipes in the optimizing
 frontend. V8's historical [Maglev design](https://v8.dev/blog/maglev) shows another
 relevant choice: specialize during graph construction and keep compilation work
-small. These are architectural precedents, not Lumen performance predictions or
+small. These are architectural precedents, not TRust JS performance predictions or
 instructions to adopt another engine's implementation.
 
 Before implementing the pilot, record a savings prediction based on its measured
@@ -266,9 +266,9 @@ CSSOM computed style at `cssom-1/Overview.bs:3380`, and CSSOM View bounding boxe
 observable results and scheduling boundaries. Any implementation needs the
 focused conformance tests and broader checks required by the repository guides.
 
-**Evidence and unfinished gates retained.** Lumen HEAD remains
+**Evidence and unfinished gates retained.** TRust JS HEAD remains
 `91da1ade662d5a3e8dcdb2a2def189529575d945`; TRust remains
-`5fa5a3031df744b108d0c9b6efd726f410ab4f3a`. All 37 Lumen and two TRust files in the
+`5fa5a3031df744b108d0c9b6efd726f410ab4f3a`. All 37 TRust JS and two TRust files in the
 frozen CREATION17 changed-file manifest still match their recorded hashes. The
 VALUES15 timing binary and all four frozen CREATION17 binaries were hash-checked.
 This verifies those files, not a clean tree or completed acceptance.

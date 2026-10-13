@@ -1,7 +1,7 @@
 // RFC 6455 Autobahn fuzzing-client testee. The server selects each case; the client only echoes
 // messages with their original text/binary type and advances after the connection closes.
 const base = "ws://127.0.0.1:9001";
-const agent = "Lumen";
+const agent = "TRust JS";
 
 function socket(path) {
   const ws = new WebSocket(base + path);

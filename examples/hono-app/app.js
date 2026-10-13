@@ -2,7 +2,7 @@
 //
 // Hono's core is just a router that turns a `Request` into a `Response` via
 // `app.fetch(request)`. It needs no listening socket to run, which makes it a
-// good fit for the lumen runtime today: lumen ships the WinterTC web platform
+// good fit for the trust-js runtime today: trust-js ships the WinterTC web platform
 // (Request/Response/Headers/URL) but not yet an HTTP *server*, so we drive the
 // app by dispatching requests through `app.fetch` directly (see serve.js).
 
@@ -11,17 +11,17 @@ import { Hono } from 'hono';
 const app = new Hono();
 
 // A plain text route.
-app.get('/', (c) => c.text('Hello from Hono on lumen!'));
+app.get('/', (c) => c.text('Hello from Hono on trust-js!'));
 
 // JSON response with a header set by middleware.
 app.use('/api/*', async (c, next) => {
   await next();
-  c.header('X-Powered-By', 'lumen');
+  c.header('X-Powered-By', 'trust-js');
 });
 
 app.get('/api/hello', (c) => {
   const name = c.req.query('name') ?? 'world';
-  return c.json({ message: `hello, ${name}`, runtime: 'lumen' });
+  return c.json({ message: `hello, ${name}`, runtime: 'trust-js' });
 });
 
 // Path params.

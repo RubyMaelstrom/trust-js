@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Fetch the yt-dlp/ejs benchmark bundle from lucid-softworks/lumen#12: the ejs core solver
+# Fetch the yt-dlp/ejs benchmark bundle from the historical upstream report: the ejs core solver
 # (meriyah + astring) with a YouTube player and two n-challenges embedded, printing the solved
 # results as JSON. ~3 MB of JavaScript.
 set -euo pipefail

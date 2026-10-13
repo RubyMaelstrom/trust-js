@@ -9,11 +9,11 @@ TMP="$TMP_ROOT/$$"
 FAKE_ARES="$TMP/ARES-6"
 FAKE_BIN="$TMP/bin"
 CARGO_LOG="$TMP/cargo.log"
-LUMEN_LOG="$TMP/lumen.args"
+TRUST_JS_LOG="$TMP/trust-js.args"
 ENTRY_CAPTURE="$TMP/ares6-entry.cjs"
 STDOUT_LOG="$TMP/stdout.log"
 STDERR_LOG="$TMP/stderr.log"
-LUMEN_STUB="$FAKE_BIN/lumen-cli-stub"
+TRUST_JS_STUB="$FAKE_BIN/trust-js-cli-stub"
 
 fail() {
   echo "not ok - $*" >&2
@@ -77,22 +77,22 @@ assert_before() {
 }
 
 assert_single_entry_arg() {
-  if [ ! -f "$LUMEN_LOG" ]; then
-    fail "lumen-cli stub was not invoked"
+  if [ ! -f "$TRUST_JS_LOG" ]; then
+    fail "trust-js-cli stub was not invoked"
   fi
   local total entry
-  total="$(wc -l < "$LUMEN_LOG" | tr -d ' ')"
+  total="$(wc -l < "$TRUST_JS_LOG" | tr -d ' ')"
   if [ "$total" != "1" ]; then
-    cat "$LUMEN_LOG" >&2
-    fail "expected lumen-cli to receive exactly one entry argument"
+    cat "$TRUST_JS_LOG" >&2
+    fail "expected trust-js-cli to receive exactly one entry argument"
   fi
-  entry="$(cat "$LUMEN_LOG")"
+  entry="$(cat "$TRUST_JS_LOG")"
   case "$entry" in
     *.cjs) ;;
     *) fail "generated entry did not have .cjs suffix: $entry" ;;
   esac
   if [ ! -f "$ENTRY_CAPTURE" ]; then
-    fail "lumen-cli stub did not capture the generated entry"
+    fail "trust-js-cli stub did not capture the generated entry"
   fi
 }
 
@@ -103,16 +103,16 @@ cleanup() {
 setup_stubs() {
   mkdir -p "$TMP_ROOT" "$FAKE_BIN"
 
-  cat > "$LUMEN_STUB" <<'SH'
+  cat > "$TRUST_JS_STUB" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "$@" > "$LUMEN_LOG"
+printf '%s\n' "$@" > "$TRUST_JS_LOG"
 entry="${1:-}"
-if [ -n "${LUMEN_ENTRY_CAPTURE:-}" ] && [ -f "$entry" ]; then
-  cp "$entry" "$LUMEN_ENTRY_CAPTURE"
+if [ -n "${TRUST_JS_ENTRY_CAPTURE:-}" ] && [ -f "$entry" ]; then
+  cp "$entry" "$TRUST_JS_ENTRY_CAPTURE"
 fi
 
-if [ -n "${LUMEN_STUB_OUTPUT:-}" ]; then
-  printf '%s\n' "$LUMEN_STUB_OUTPUT"
+if [ -n "${TRUST_JS_STUB_OUTPUT:-}" ]; then
+  printf '%s\n' "$TRUST_JS_STUB_OUTPUT"
 else
   cat <<'OUT'
 ARES-6 1.0.1
@@ -125,30 +125,30 @@ Success! Benchmark is now finished.
 OUT
 fi
 
-exit "${LUMEN_STUB_STATUS:-0}"
+exit "${TRUST_JS_STUB_STATUS:-0}"
 SH
-  chmod +x "$LUMEN_STUB"
+  chmod +x "$TRUST_JS_STUB"
 
   cat > "$FAKE_BIN/cargo" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$CARGO_LOG"
 build_root="${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must be set by tests}"
 mkdir -p "$build_root/release"
-cat > "$build_root/release/lumen-cli" <<'STUB'
+cat > "$build_root/release/trust-js-cli" <<'STUB'
 #!/usr/bin/env bash
-echo "stale extensionless lumen-cli stub should not run" >&2
+echo "stale extensionless trust-js-cli stub should not run" >&2
 exit 91
 STUB
-cp "$LUMEN_STUB_TEMPLATE" "$build_root/release/lumen-cli.exe"
-chmod +x "$build_root/release/lumen-cli" "$build_root/release/lumen-cli.exe"
+cp "$TRUST_JS_STUB_TEMPLATE" "$build_root/release/trust-js-cli.exe"
+chmod +x "$build_root/release/trust-js-cli" "$build_root/release/trust-js-cli.exe"
 exit 0
 SH
   chmod +x "$FAKE_BIN/cargo"
 
   export CARGO_LOG
-  export LUMEN_LOG
-  export LUMEN_ENTRY_CAPTURE="$ENTRY_CAPTURE"
-  export LUMEN_STUB_TEMPLATE="$LUMEN_STUB"
+  export TRUST_JS_LOG
+  export TRUST_JS_ENTRY_CAPTURE="$ENTRY_CAPTURE"
+  export TRUST_JS_STUB_TEMPLATE="$TRUST_JS_STUB"
   export PATH="$FAKE_BIN:$PATH"
 }
 
@@ -171,7 +171,7 @@ REQUIRED_FILES=(
 )
 
 # Materialize a complete fake ARES-6 checkout. Empty files are enough because the
-# fake lumen-cli stub captures the generated entry and emits canned benchmark
+# fake trust-js-cli stub captures the generated entry and emits canned benchmark
 # output without executing the fake JavaScript.
 write_fake_ares() {
   rm -rf "$FAKE_ARES"
@@ -232,8 +232,8 @@ run_expect_success() {
 }
 
 test_missing_checkout_fails_before_build() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
-  run_expect_failure env -u LUMEN_BIN ARES6="$TMP/missing-ares" "$SCRIPT"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
+  run_expect_failure env -u TRUST_JS_BIN ARES6="$TMP/missing-ares" "$SCRIPT"
 
   assert_contains "$STDERR_LOG" "error: ARES-6 checkout not found at: $TMP/missing-ares"
   assert_contains "$STDERR_LOG" "ARES6=/path/to/ARES-6"
@@ -241,15 +241,15 @@ test_missing_checkout_fails_before_build() {
   if [ -f "$CARGO_LOG" ]; then
     fail "cargo must not run when the ARES-6 checkout is missing"
   fi
-  if [ -f "$LUMEN_LOG" ]; then
-    fail "lumen-cli must not run when the ARES-6 checkout is missing"
+  if [ -f "$TRUST_JS_LOG" ]; then
+    fail "trust-js-cli must not run when the ARES-6 checkout is missing"
   fi
 }
 
 test_unknown_workload_fails_before_checkout_or_build() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
 
-  run_expect_failure env -u LUMEN_BIN ARES6="$TMP/missing-ares" "$SCRIPT" air wat
+  run_expect_failure env -u TRUST_JS_BIN ARES6="$TMP/missing-ares" "$SCRIPT" air wat
 
   assert_contains "$STDERR_LOG" "error: unknown ARES-6 workload: wat"
   assert_contains "$STDERR_LOG" "valid workloads: air basic babylon ml"
@@ -257,8 +257,8 @@ test_unknown_workload_fails_before_checkout_or_build() {
   if [ -f "$CARGO_LOG" ]; then
     fail "cargo must not run when workload selection is invalid"
   fi
-  if [ -f "$LUMEN_LOG" ]; then
-    fail "lumen-cli must not run when workload selection is invalid"
+  if [ -f "$TRUST_JS_LOG" ]; then
+    fail "trust-js-cli must not run when workload selection is invalid"
   fi
   if [ -f "$ENTRY_CAPTURE" ]; then
     fail "entry must not be generated when workload selection is invalid"
@@ -266,31 +266,31 @@ test_unknown_workload_fails_before_checkout_or_build() {
 }
 
 test_missing_required_file_fails_before_build() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   rm -f "$FAKE_ARES/Air/payload-airjs-ACLj8C.js"
-  run_expect_failure env -u LUMEN_BIN ARES6="$FAKE_ARES" "$SCRIPT"
+  run_expect_failure env -u TRUST_JS_BIN ARES6="$FAKE_ARES" "$SCRIPT"
 
   assert_contains "$STDERR_LOG" "missing required source file"
   assert_contains "$STDERR_LOG" "missing: Air/payload-airjs-ACLj8C.js"
   if [ -f "$CARGO_LOG" ]; then
     fail "cargo must not run when a required ARES-6 source file is missing"
   fi
-  if [ -f "$LUMEN_LOG" ]; then
-    fail "lumen-cli must not run when a required ARES-6 source file is missing"
+  if [ -f "$TRUST_JS_LOG" ]; then
+    fail "trust-js-cli must not run when a required ARES-6 source file is missing"
   fi
 }
 
 test_selected_run_ignores_unselected_missing_payload_files() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   rm -f "$FAKE_ARES/Babylon/index.js"
   rm -f "$FAKE_ARES/ml/benchmark.js"
   local output
   output="$(air_basic_output)"
 
-  run_expect_success env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT" air basic
+  run_expect_success env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT" air basic
 
   assert_contains "$STDOUT_LOG" "Running... Air"
   assert_contains "$STDOUT_LOG" "Running... Basic"
@@ -300,16 +300,16 @@ test_selected_run_ignores_unselected_missing_payload_files() {
   assert_not_contains "$ENTRY_CAPTURE" "driver.addBenchmark(BabylonBenchmarkRunner);"
   assert_not_contains "$ENTRY_CAPTURE" "driver.addBenchmark(MLBenchmarkRunner);"
   if [ -f "$CARGO_LOG" ]; then
-    fail "cargo must not run when LUMEN_BIN is provided"
+    fail "cargo must not run when TRUST_JS_BIN is provided"
   fi
 }
 
 test_selected_missing_required_file_fails_before_build() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   rm -f "$FAKE_ARES/Basic/parser.js"
 
-  run_expect_failure env -u LUMEN_BIN ARES6="$FAKE_ARES" "$SCRIPT" basic
+  run_expect_failure env -u TRUST_JS_BIN ARES6="$FAKE_ARES" "$SCRIPT" basic
 
   assert_contains "$STDERR_LOG" "missing required source file"
   assert_contains "$STDERR_LOG" "missing: Basic/parser.js"
@@ -317,16 +317,16 @@ test_selected_missing_required_file_fails_before_build() {
   if [ -f "$CARGO_LOG" ]; then
     fail "cargo must not run when a selected required ARES-6 source file is missing"
   fi
-  if [ -f "$LUMEN_LOG" ]; then
-    fail "lumen-cli must not run when a selected required ARES-6 source file is missing"
+  if [ -f "$TRUST_JS_LOG" ]; then
+    fail "trust-js-cli must not run when a selected required ARES-6 source file is missing"
   fi
 }
 
-test_lumen_bin_skips_build_and_good_output_passes() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+test_trust_js_bin_skips_build_and_good_output_passes() {
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
 
-  run_expect_success env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" "$SCRIPT"
+  run_expect_success env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" "$SCRIPT"
 
   assert_contains "$STDOUT_LOG" "ares-6: validated checkout at $FAKE_ARES"
   assert_contains "$STDOUT_LOG" "ARES-6 1.0.1"
@@ -355,18 +355,18 @@ test_lumen_bin_skips_build_and_good_output_passes() {
   assert_before "$ENTRY_CAPTURE" "// ---- glue.js ----" "driver.start(6);"
 
   if [ -f "$CARGO_LOG" ]; then
-    fail "cargo must not run when LUMEN_BIN is provided"
+    fail "cargo must not run when TRUST_JS_BIN is provided"
   fi
 }
 
 test_selected_workloads_filter_generated_glue_wiring() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(air_basic_output)"
 
-  run_expect_success env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT" air basic
+  run_expect_success env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT" air basic
 
   assert_contains "$STDOUT_LOG" "ares-6: validated checkout at $FAKE_ARES"
   assert_contains "$STDOUT_LOG" "ARES-6 1.0.1"
@@ -397,26 +397,26 @@ test_selected_workloads_filter_generated_glue_wiring() {
   assert_before "$ENTRY_CAPTURE" "// ---- glue.js ----" "driver.start(6);"
 
   if [ -f "$CARGO_LOG" ]; then
-    fail "cargo must not run when LUMEN_BIN is provided"
+    fail "cargo must not run when TRUST_JS_BIN is provided"
   fi
 }
 
-test_build_happens_when_lumen_bin_absent() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+test_build_happens_when_trust_js_bin_absent() {
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
 
-  run_expect_success env -u LUMEN_BIN ARES6="$FAKE_ARES" \
+  run_expect_success env -u TRUST_JS_BIN ARES6="$FAKE_ARES" \
     CARGO_TARGET_DIR="$TMP/cargo-target" "$SCRIPT"
 
   if [ ! -f "$CARGO_LOG" ]; then
-    fail "a valid checkout should reach the cargo build when LUMEN_BIN is absent"
+    fail "a valid checkout should reach the cargo build when TRUST_JS_BIN is absent"
   fi
-  assert_file_equals "$CARGO_LOG" "build --release -p lumen-cli"
+  assert_file_equals "$CARGO_LOG" "build --release -p trust-js-cli"
   assert_single_entry_arg
 }
 
 test_thrown_error_output_fails() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(cat <<'OUT'
@@ -426,15 +426,15 @@ ReferenceError: currentTime is not defined
 OUT
 )"
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT"
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT"
 
   assert_contains "$STDOUT_LOG" "ReferenceError: currentTime is not defined"
   assert_contains "$STDERR_LOG" "error: ARES-6 did not report completion."
 }
 
 test_missing_success_fails() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(cat <<'OUT'
@@ -447,14 +447,14 @@ summary:            12.34 +- 0.56 ms
 OUT
 )"
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT"
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT"
 
   assert_contains "$STDERR_LOG" "error: ARES-6 did not report completion."
 }
 
 test_missing_numeric_geomean_fails() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(cat <<'OUT'
@@ -468,14 +468,14 @@ Success! Benchmark is now finished.
 OUT
 )"
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT"
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT"
 
   assert_contains "$STDERR_LOG" "error: ARES-6 did not report a numeric summary geomean."
 }
 
 test_missing_workload_fails() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(cat <<'OUT'
@@ -488,20 +488,20 @@ Success! Benchmark is now finished.
 OUT
 )"
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT"
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT"
 
   assert_contains "$STDERR_LOG" "error: ARES-6 did not run selected workload: ML"
 }
 
 test_selected_sentinel_rejects_unselected_workload_output() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
   local output
   output="$(air_basic_with_unselected_ml_output)"
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_OUTPUT="$output" "$SCRIPT" air basic
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_OUTPUT="$output" "$SCRIPT" air basic
 
   assert_contains "$STDOUT_LOG" "Running... Air"
   assert_contains "$STDOUT_LOG" "Running... Basic"
@@ -510,11 +510,11 @@ test_selected_sentinel_rejects_unselected_workload_output() {
 }
 
 test_nonzero_engine_status_fails_even_with_good_sentinel() {
-  rm -f "$CARGO_LOG" "$LUMEN_LOG" "$ENTRY_CAPTURE"
+  rm -f "$CARGO_LOG" "$TRUST_JS_LOG" "$ENTRY_CAPTURE"
   write_fake_ares
 
-  run_expect_failure env ARES6="$FAKE_ARES" LUMEN_BIN="$LUMEN_STUB" \
-    LUMEN_STUB_STATUS=7 "$SCRIPT"
+  run_expect_failure env ARES6="$FAKE_ARES" TRUST_JS_BIN="$TRUST_JS_STUB" \
+    TRUST_JS_STUB_STATUS=7 "$SCRIPT"
 
   assert_contains "$STDOUT_LOG" "Success! Benchmark is now finished."
 }
@@ -527,9 +527,9 @@ test_unknown_workload_fails_before_checkout_or_build
 test_missing_required_file_fails_before_build
 test_selected_run_ignores_unselected_missing_payload_files
 test_selected_missing_required_file_fails_before_build
-test_lumen_bin_skips_build_and_good_output_passes
+test_trust_js_bin_skips_build_and_good_output_passes
 test_selected_workloads_filter_generated_glue_wiring
-test_build_happens_when_lumen_bin_absent
+test_build_happens_when_trust_js_bin_absent
 test_thrown_error_output_fails
 test_missing_success_fails
 test_missing_numeric_geomean_fails

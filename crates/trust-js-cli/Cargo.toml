@@ -1,0 +1,18 @@
+# The node/deno-style entrypoint: dispatches repl / run-file / -e eval over the assembled
+# runtime. The binary is `trust-js-cli` for now — the engine's own `trust-js` bin (the test262 host
+# that test262.fyi runs) keeps its name until renaming is coordinated.
+[package]
+name = "trust-js-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+trust-js-host = { path = "../trust-js-host" }
+trust-js-repl = { path = "../trust-js-repl" }
+trust-js-runtime = { path = "../trust-js-runtime" }
+
+[lints]
+workspace = true

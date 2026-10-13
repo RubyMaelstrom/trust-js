@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Time the ejs benchmark (see README.md) on lumen and, when installed, node/bun/qjs.
+# Time the ejs benchmark (see README.md) on trust-js and, when installed, node/bun/qjs.
 #
-#   ./bench.sh          # lumen jit tier + node/bun/qjs if present
-#   ./bench.sh --all    # also the lumen default (interp) tier — slow
+#   ./bench.sh          # trust-js jit tier + node/bun/qjs if present
+#   ./bench.sh --all    # also the trust-js default (interp) tier — slow
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 [ -f code.js ] || ./fetch.sh
 
 ROOT="$(cd ../.. && pwd)"
-cargo build --release -q -p lumen --bin lumen
+cargo build --release -q -p trust-js --bin trust-js
 
 run() {
   local label="$1"
@@ -30,7 +30,7 @@ run() {
 run "node" node
 run "bun" bun
 run "qjs" qjs
-run "lumen (jit)" "$ROOT/target/release/lumen" --tier=jit
+run "trust-js (jit)" "$ROOT/target/release/trust-js" --tier=jit
 if [ "${1:-}" = "--all" ]; then
-  run "lumen (interp)" "$ROOT/target/release/lumen"
+  run "trust-js (interp)" "$ROOT/target/release/trust-js"
 fi

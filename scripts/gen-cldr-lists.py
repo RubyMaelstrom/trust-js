@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Intl.ListFormat patterns for every locale Lumen advertises from CLDR 48.
+"""Generate Intl.ListFormat patterns for every locale TRust JS advertises from CLDR 48.
 
 Source: unicode-org/cldr-json 48.0.0, cldr-misc-full/main/*/listPatterns.json, for every CLDR
 locale of a supported language (scripts/cldr_locales.py). A regional or script variant keeps
@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import cldr_locales  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_lists.rs"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_lists.rs"
 KINDS = {"conjunction": "standard", "disjunction": "or", "unit": "unit"}
 STYLES = ["long", "short", "narrow"]
 

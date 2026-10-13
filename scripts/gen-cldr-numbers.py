@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate NumberFormat locale data for every locale Lumen advertises from CLDR 48.
+"""Generate NumberFormat locale data for every locale TRust JS advertises from CLDR 48.
 
 Every CLDR locale of a supported language is generated (scripts/cldr_locales.py): a regional or
 script variant keeps only the rows that differ from its parent's, and every lookup walks the
@@ -24,9 +24,9 @@ import cldr_locales  # noqa: E402
 TAG = "48.0.0"
 SOURCE_COMMIT = "4d06be52b51bb2f75688d0abe55c52a66afed790"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.rs"
-BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.data"
-MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_numbers.inputs.json"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_numbers.rs"
+BLOB_OUTPUT = ROOT / "crates/trust-js/src/cldr_numbers.data"
+MANIFEST_OUTPUT = ROOT / "crates/trust-js/src/cldr_numbers.inputs.json"
 REPOSITORY = "https://github.com/unicode-org/cldr-json"
 BASE = (
     f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/"
@@ -43,7 +43,7 @@ def fetch(relative: str) -> bytes:
         payload = (pathlib.Path(cldr_dir) / relative).read_bytes()
     else:
         request = urllib.request.Request(
-            url, headers={"User-Agent": "Lumen CLDR NumberFormat generator"}
+            url, headers={"User-Agent": "TRust JS CLDR NumberFormat generator"}
         )
         with urllib.request.urlopen(request) as response:
             payload = response.read()
@@ -1191,11 +1191,11 @@ def main() -> None:
         "generator_sha256": generator_hash,
         "original_generated_snapshot": {
             "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
-            "path": "crates/lumen/src/cldr_numbers.rs",
+            "git_blob_oid": "545ca6c4c4a6f34a5e1f137fafa97e34a8953652",
             "sha256": "57064f5dadeeea45a051ed5ef87c45a90af50f8679ac15a5d65deba24badc0a4",
         },
         "packed_source_sha256": hashlib.sha256(packed_source.encode("utf-8")).hexdigest(),
-        "string_blob_path": "crates/lumen/src/cldr_numbers.data",
+        "string_blob_path": "crates/trust-js/src/cldr_numbers.data",
         "string_blob_sha256": hashlib.sha256(string_blob).hexdigest(),
         "string_blob_bytes": len(string_blob),
         "unique_string_count": string_count,

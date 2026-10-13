@@ -468,110 +468,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "lumen"
-version = "0.1.3"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-native",
- "stacker",
-]
-
-[[package]]
-name = "lumen-cli"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
- "lumen-repl",
- "lumen-runtime",
-]
-
-[[package]]
-name = "lumen-difftest"
-version = "0.1.3"
-dependencies = [
- "lumen",
-]
-
-[[package]]
-name = "lumen-fs"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
-]
-
-[[package]]
-name = "lumen-host"
-version = "0.1.3"
-dependencies = [
- "lumen",
-]
-
-[[package]]
-name = "lumen-node"
-version = "0.1.3"
-dependencies = [
- "lumen",
- "lumen-host",
- "lumen-tls",
-]
-
-[[package]]
-name = "lumen-repl"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
- "lumen-runtime",
-]
-
-[[package]]
-name = "lumen-runtime"
-version = "0.1.3"
-dependencies = [
- "lumen-fs",
- "lumen-host",
- "lumen-node",
- "lumen-timers",
- "lumen-web",
-]
-
-[[package]]
-name = "lumen-timers"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
-]
-
-[[package]]
-name = "lumen-tls"
-version = "0.1.3"
-
-[[package]]
-name = "lumen-typescript"
-version = "0.1.3"
-
-[[package]]
-name = "lumen-wasm"
-version = "0.1.3"
-dependencies = [
- "js-sys",
- "lumen",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "lumen-web"
-version = "0.1.3"
-dependencies = [
- "encoding_rs",
- "idna_adapter",
- "lumen",
- "lumen-host",
- "lumen-tls",
- "url",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -783,7 +679,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 name = "test262-runner"
 version = "0.1.3"
 dependencies = [
- "lumen",
+ "trust-js",
 ]
 
 [[package]]
@@ -794,6 +690,110 @@ checksum = "b1e27c91459209c2986af3dcf603a5a74a4368754ce37414f59acc971167f643"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "trust-js"
+version = "0.1.3"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-native",
+ "stacker",
+]
+
+[[package]]
+name = "trust-js-cli"
+version = "0.1.3"
+dependencies = [
+ "trust-js-host",
+ "trust-js-repl",
+ "trust-js-runtime",
+]
+
+[[package]]
+name = "trust-js-difftest"
+version = "0.1.3"
+dependencies = [
+ "trust-js",
+]
+
+[[package]]
+name = "trust-js-fs"
+version = "0.1.3"
+dependencies = [
+ "trust-js-host",
+]
+
+[[package]]
+name = "trust-js-host"
+version = "0.1.3"
+dependencies = [
+ "trust-js",
+]
+
+[[package]]
+name = "trust-js-node"
+version = "0.1.3"
+dependencies = [
+ "trust-js",
+ "trust-js-host",
+ "trust-js-tls",
+]
+
+[[package]]
+name = "trust-js-repl"
+version = "0.1.3"
+dependencies = [
+ "trust-js-host",
+ "trust-js-runtime",
+]
+
+[[package]]
+name = "trust-js-runtime"
+version = "0.1.3"
+dependencies = [
+ "trust-js-fs",
+ "trust-js-host",
+ "trust-js-node",
+ "trust-js-timers",
+ "trust-js-web",
+]
+
+[[package]]
+name = "trust-js-timers"
+version = "0.1.3"
+dependencies = [
+ "trust-js-host",
+]
+
+[[package]]
+name = "trust-js-tls"
+version = "0.1.3"
+
+[[package]]
+name = "trust-js-typescript"
+version = "0.1.3"
+
+[[package]]
+name = "trust-js-wasm"
+version = "0.1.3"
+dependencies = [
+ "js-sys",
+ "trust-js",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "trust-js-web"
+version = "0.1.3"
+dependencies = [
+ "encoding_rs",
+ "idna_adapter",
+ "trust-js",
+ "trust-js-host",
+ "trust-js-tls",
+ "url",
 ]
 
 [[package]]
@@ -885,7 +885,7 @@ dependencies = [
 name = "wasm-spec-runner"
 version = "0.1.3"
 dependencies = [
- "lumen-web",
+ "trust-js-web",
  "wast",
 ]
 

@@ -1,9 +1,9 @@
-// Runs the lumen engine off the main thread so a runaway script can't freeze the page —
+// Runs the trust-js engine off the main thread so a runaway script can't freeze the page —
 // the page terminates this worker to stop execution and spawns a fresh one.
 //
 // Every eval runs in a fresh realm: the session is rebuilt right after each result is posted
 // (pre-warmed, so the rebuild cost never sits in front of a run).
-import init, { Session } from './pkg/lumen_wasm.js';
+import init, { Session } from './pkg/trust_js_wasm.js';
 
 let session = null;
 

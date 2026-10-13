@@ -45,7 +45,7 @@ This is the consulted snapshot, not verified current upstream text.
 All prototype code/tests are restored. No paired throughput or peak-memory
 comparison follows the safety rejection. Source, exact patch, binaries, check
 logs and diagnostic profile remain in benchmark-results/engine-cycle13-20260930.
-Baseline production matches b1c975f; preceding HEAD is d8b675e. target/release/lumen
+Baseline production matches b1c975f; preceding HEAD is d8b675e. target/release/trust-js
 still holds the parked prototype. Installed/accepted artifacts are unchanged.
 Only this report is committed. A raw registry requires an enforceable allocation
 identity/lifetime boundary, not another admission flag or additional unit tests.

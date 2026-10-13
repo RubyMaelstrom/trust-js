@@ -56,7 +56,7 @@ need new application evidence before reconsidering this approach.
 Exact source, patch, binaries, complete application outputs, four-pair timing
 observations, analysis and check logs remain in
 benchmark-results/engine-cycle11-20260930. No owned build/test/profile overlaps
-the comparison. Desktop applications remain active. target/release/lumen still
+the comparison. Desktop applications remain active. target/release/trust-js still
 contains the parked pool, so subsequent baselines use a pinned committed-cycle
 artifact. Installed/accepted artifacts are unchanged. Only this report is
 committed.

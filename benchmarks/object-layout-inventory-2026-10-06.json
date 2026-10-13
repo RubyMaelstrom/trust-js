@@ -5,10 +5,10 @@
   "source": {
     "base_revision": "63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2",
     "source_head": "63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2",
-    "isolated_worktree": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-worktree-63f2",
-    "changed_file": "crates/lumen/src/allocation_diagnostics.rs",
+    "isolated_worktree": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-worktree-63f2",
+    "changed_file": "crates/trust-js/src/allocation_diagnostics.rs",
     "changed_file_sha256": "8f1c32b5872f2a339e8d29553115d51e572d0f3dd2d962227f2bd828b785e522",
-    "patch": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/property-inventory-final.patch",
+    "patch": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/property-inventory-final.patch",
     "patch_sha256": "ccede774c662c733d5e910a5b56cea3a7e81101d845efcdcb39dbf192030c3d1"
   },
   "instrumentation": {
@@ -136,38 +136,38 @@
   "validation": {
     "checks": [
       {
-        "command": "cargo test -p lumen --lib --features architecture-diagnostics allocation_diagnostics::tests::",
+        "command": "cargo test -p trust-js --lib --features architecture-diagnostics allocation_diagnostics::tests::",
         "result": "5 passed, 0 failed"
       },
       {
-        "command": "cargo check -p lumen --features architecture-diagnostics",
+        "command": "cargo check -p trust-js --features architecture-diagnostics",
         "result": "passed"
       },
       {
-        "command": "cargo check -p lumen --no-default-features --features architecture-diagnostics",
+        "command": "cargo check -p trust-js --no-default-features --features architecture-diagnostics",
         "result": "passed"
       },
       {
-        "command": "CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen",
+        "command": "CARGO_BUILD_JOBS=3 cargo build --release -p trust-js --features embed,architecture-diagnostics --bin trust-js",
         "result": "passed"
       }
     ],
-    "release_build_command": "CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen",
+    "release_build_command": "CARGO_BUILD_JOBS=3 cargo build --release -p trust-js --features embed,architecture-diagnostics --bin trust-js",
     "private_build_paths": {
-      "CARGO_TARGET_DIR": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/target",
-      "TMPDIR": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/tmp"
+      "CARGO_TARGET_DIR": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/target",
+      "TMPDIR": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/tmp"
     },
-    "release_binary": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/target/release/lumen",
+    "release_binary": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/target/release/trust-js",
     "release_binary_sha256": "d50f55ab3fe106157ed2182bba4e43084523f2f8f870c1775ebaba00417a00fe",
-    "diagnostic_command_template": "target/release/lumen --tier=jit INPUT (stdout and stderr captured to runs-v2/*.log)"
+    "diagnostic_command_template": "target/release/trust-js --tier=jit INPUT (stdout and stderr captured to runs-v2/*.log)"
   },
   "workloads": {
     "react": {
-      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
+      "input_path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
       "input_sha256": "c28e971ed3bdec660b0983351fc5b276032e9ad8ce9da35510dd4fe3021184f1",
       "tier": "jit",
       "exit_status": 0,
-      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/react.log",
+      "raw_log_path": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/runs-v2/react.log",
       "raw_log_sha256": "31be0dd550e4f9b763c780d7f910c80f5d07ea8b5427e56d988028737149cabf",
       "post_gc_samples": 1,
       "final_sample": {
@@ -184,11 +184,11 @@
       }
     },
     "vue": {
-      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
+      "input_path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
       "input_sha256": "3cdd03b33caf362f3541bbc2d7a5bcd4c8daa6f48dce627c0e30bd35cc8589b5",
       "tier": "jit",
       "exit_status": 0,
-      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/vue.log",
+      "raw_log_path": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/runs-v2/vue.log",
       "raw_log_sha256": "c83fa95e1c1e4c95c093b8769e5c2a86d79283eaa816331eab45e026381b6c95",
       "post_gc_samples": 3,
       "final_sample": {
@@ -205,11 +205,11 @@
       }
     },
     "djot": {
-      "input_path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
+      "input_path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
       "input_sha256": "63036f9ffa08b57d3fad97c170762eb39cb7a4220fc01f7b9bf616185667875b",
       "tier": "jit",
       "exit_status": 0,
-      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/djot.log",
+      "raw_log_path": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/runs-v2/djot.log",
       "raw_log_sha256": "f1f5afb38fca8d94a4da75accdea82a7766d6cf39ef8391952473491a2054011",
       "post_gc_samples": 4,
       "final_sample": {
@@ -226,11 +226,11 @@
       }
     },
     "ejs": {
-      "input_path": "/big/Code/Lumen/examples/ejs/code.js",
+      "input_path": "/big/Code/trust-js/examples/ejs/code.js",
       "input_sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c",
       "tier": "jit",
       "exit_status": 0,
-      "raw_log_path": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/runs-v2/ejs.log",
+      "raw_log_path": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/runs-v2/ejs.log",
       "raw_log_sha256": "469536adac418856c4f8396f631c7c675ae91cdc8c4b978311a224e08b5b0d89",
       "post_gc_samples": 11,
       "final_sample": {
@@ -531,9 +531,9 @@
     "Dense inline active-prefix bucket 0 includes sidecars with values moved to heap storage and is not a count of empty JavaScript arrays."
   ],
   "source_artifacts": {
-    "raw_summary_json": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/inventory-summary-histogram.json",
+    "raw_summary_json": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/inventory-summary-histogram.json",
     "raw_summary_json_sha256": "60f85e00f89a73142b406fb01193afd468451edf919e0301a3ddc97398c6fbf8",
-    "histogram_summary_markdown": "/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/inventory-histogram-summary.md",
+    "histogram_summary_markdown": "/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/inventory-histogram-summary.md",
     "histogram_summary_markdown_sha256": "d72685dc75ec7dcfb424dd583217e7b5607b4a9e9fb5515dd4dea26c75e661ad",
     "human_draft": "benchmark-results/property-inventory-20261006-validation/object-layout-inventory-20261006.txt"
   },

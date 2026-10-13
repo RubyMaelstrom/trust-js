@@ -1,12 +1,12 @@
-# Vite build on lumen
+# Vite build on trust-js
 
-A real [Vite](https://vitejs.dev) production build (`vite build`) running on lumen — bundling with
+A real [Vite](https://vitejs.dev) production build (`vite build`) running on trust-js — bundling with
 Rollup's **native N-API addon**, transforming with **esbuild** (a spawned service child), and
 writing a hashed, minified bundle.
 
 ```sh
 npm install
-../../target/release/lumen-cli node_modules/vite/bin/vite.js build
+../../target/release/trust-js-cli node_modules/vite/bin/vite.js build
 ```
 
 Expected output:
@@ -23,13 +23,13 @@ The process builds, writes `dist/`, and exits cleanly.
 
 ## What this exercises
 
-This is one of the most demanding npm workloads, and it drives a lot of lumen at once:
+This is one of the most demanding npm workloads, and it drives a lot of trust-js at once:
 
-- **Native addons** — `@rollup/rollup-<platform>.node` is `dlopen`ed and run through lumen's
-  from-scratch N-API implementation (`crates/lumen-node/src/napi.rs`).
-- **child_process + esbuild** — esbuild runs as a long-lived service subprocess; lumen's
+- **Native addons** — `@rollup/rollup-<platform>.node` is `dlopen`ed and run through trust-js's
+  from-scratch N-API implementation (`crates/trust-js-node/src/napi.rs`).
+- **child_process + esbuild** — esbuild runs as a long-lived service subprocess; trust-js's
   `child.ref()`/`unref()` let the build wait for transforms yet still exit when done.
-- **ESM ↔ CommonJS interop** — Vite and its deps mix ESM and CJS; lumen statically discovers a
+- **ESM ↔ CommonJS interop** — Vite and its deps mix ESM and CJS; trust-js statically discovers a
   CJS module's named exports so `import { parse } from './native.js'` links.
 - **The node: surface** — `fs` (real stat metadata), `path`, `url`, `crypto`, `zlib` (real gzip
   size reporting), `dns`, `v8`, `worker_threads`, `process`, and more.

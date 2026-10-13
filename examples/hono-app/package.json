@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "main": "app.js",
-  "description": "A small Hono app run on the lumen runtime",
+  "description": "A small Hono app run on the trust-js runtime",
   "dependencies": {
     "hono": "^4.12.28"
   }

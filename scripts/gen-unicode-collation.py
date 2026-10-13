@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Lumen's compact Unicode 17 DUCET collation-element table.
+"""Generate TRust JS's compact Unicode 17 DUCET collation-element table.
 
 The input is the normative allkeys.txt published with UTS #10. The binary layout keeps the large
 weight table out of Rust code generation while retaining binary-searchable singleton mappings,
@@ -21,21 +21,21 @@ VERSION = "17.0.0"
 # public directory for 17.0.0); the embedded header below is checked before generation.
 URL = "https://www.unicode.org/Public/UCA/latest/allkeys.txt"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/unicode_collation.bin"
-TEST_OUTPUT = ROOT / "crates/lumen/tests/unicode-17.0.0/CollationTest_NON_IGNORABLE_SHORT.txt"
+OUTPUT = ROOT / "crates/trust-js/src/unicode_collation.bin"
+TEST_OUTPUT = ROOT / "crates/trust-js/tests/unicode-17.0.0/CollationTest_NON_IGNORABLE_SHORT.txt"
 ROW = re.compile(r"^([0-9A-F ]+?)\s*;\s*(.*?)\s*(?:#.*)?$")
 ELEMENT = re.compile(r"\[([.*])([0-9A-F]{4})\.([0-9A-F]{4})\.([0-9A-F]{4})\]")
 
 
 def download() -> str:
-    request = urllib.request.Request(URL, headers={"User-Agent": "Lumen UCA table generator"})
+    request = urllib.request.Request(URL, headers={"User-Agent": "TRust JS UCA table generator"})
     with urllib.request.urlopen(request) as response:
         return response.read().decode("utf-8")
 
 
 def download_conformance_test() -> bytes:
     url = "https://www.unicode.org/Public/UCA/latest/CollationTest.zip"
-    request = urllib.request.Request(url, headers={"User-Agent": "Lumen UCA table generator"})
+    request = urllib.request.Request(url, headers={"User-Agent": "TRust JS UCA table generator"})
     with urllib.request.urlopen(request) as response:
         archive = zipfile.ZipFile(io.BytesIO(response.read()))
     return archive.read("CollationTest/CollationTest_NON_IGNORABLE_SHORT.txt")

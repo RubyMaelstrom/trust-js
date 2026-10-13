@@ -19,22 +19,22 @@ implementation. Do not spawn subagents without explicit authorization. Use
 apply_patch for source edits; use Bash's time, never /usr/bin/time. Preserve
 unrelated changes and the user's desktop sessions. Do not install or push.
 
-The previous permission interruption is RESOLVED: /big/Code/Lumen was verified
+The previous permission interruption is RESOLVED: /big/Code/trust-js was verified
 writable at 06:25 UTC. No run0 or escalation is needed. Do not repeat the old
 request to add a writable workspace.
 
 Repository/artifact identity
 ----------------------------
 TRust HEAD: 5fa5a3031df744b108d0c9b6efd726f410ab4f3a
-Lumen HEAD: 91da1ade662d5a3e8dcdb2a2def189529575d945
+TRust JS HEAD: 91da1ade662d5a3e8dcdb2a2def189529575d945
 Both trees are dirty. No commit, install or push was done in this last segment.
 TRust changes remain src/dom.rs and src/dom/invalidation.rs; this segment did
-not edit them. Lumen has extensive opt-in optimizer work, including untracked
+not edit them. TRust JS has extensive opt-in optimizer work, including untracked
 source files. Do not discard it blindly; exact snapshots preserve comparisons.
 
 Use these aliases when reading paths below:
 N = /big/Code/TRust/target/architecture-next-20260927-IddksuBs
-P = /big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk
+P = /big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk
 
 N/source-values15, N/source-heap16, N/source-creation17 contain immutable source
 snapshots, changed files, HEADs and hashes. The scripts freeze-creation17.mjs,
@@ -44,10 +44,10 @@ Do not overwrite frozen artifacts or failed-run evidence.
 Current experimental tier
 -------------------------
 Cranelift 0.135.2 is optional; BOTH the optimizing-jit feature and the runtime
-switch remain OFF by default. LUMEN_OPT_JIT=1 forces eligible compilation;
-LUMEN_OPT_JIT=hot uses size-weighted entry counts (base 512 by default).
+switch remain OFF by default. TRUST_JS_OPT_JIT=1 forces eligible compilation;
+TRUST_JS_OPT_JIT=hot uses size-weighted entry counts (base 512 by default).
 No optimizing OSR. Canonical frames and Rc ownership remain authoritative.
-Default Lumen still uses the established template JIT. The experimental backend
+Default TRust JS still uses the established template JIT. The experimental backend
 is not a production-ready optimizing JavaScript compiler or an accepted speedup.
 
 Read docs/optimizing-tier.txt and the actual source. In particular:
@@ -90,13 +90,13 @@ What changed after that measurement
 ----------------------------------
 HEAP16 added native existing own-element reads/overwrites and own-data writes,
 with descriptor/exotic guards, packed/dense representations, alias-aware owner
-transactions and numeric-mirror maintenance. LUMEN_OPT_JIT_HEAP_OPS=0 disables it.
+transactions and numeric-mirror maintenance. TRUST_JS_OPT_JIT_HEAP_OPS=0 disables it.
 
 CREATION17 adds native cached named-field creation in already reserved small
 ordinary-object storage. It validates prototype identity/epoch, extensibility,
 shape/key-layout ownership and capacity before the ownership/field transaction.
 Allocation, computed non-index creation, storage growth, prototype invalidation
-and last-owner layout destruction remain checked. LUMEN_OPT_JIT_CREATION=0
+and last-owner layout destruction remain checked. TRUST_JS_OPT_JIT_CREATION=0
 separately disables this path; HEAP_OPS=0 disables it too.
 
 Neither change has a controlled whole-application timing result yet. Do not
@@ -159,11 +159,11 @@ Frozen CREATION17 release artifacts (06:27 UTC)
 ----------------------------------------------
 N/trust-headless-opt-creation17
   df2d51a67d13dbd8a8acd00fad4ae7e0aa0f70ad1911ef6afb6b3a9dc341b2c2
-N/lumen-opt-creation17
+N/trust-js-opt-creation17
   ecf827bc7796181fa0635e9be6d672b234611b55abfe58b20f8bb96fcc35256e
 N/test262-opt-creation17
   3616a763033442e53ccd8c8cee9e3c273c42b7ff93af2cd1f73dd411d2ac110f
-N/lumen-creation17-x64-tests
+N/trust-js-creation17-x64-tests
   eb5be364de4735f3af3be57a4cd08ccc179fb4a54f1f7f258a25fed995795ec9
 
 Running jobs and immediate resumption precautions
@@ -201,7 +201,7 @@ Two attempted validations at 06:27 did NOT test the candidate:
 Use a new uncontrolled functional Speedometer run with all 20 suites/58 steps,
 forced tier and then bailout-at-7, before controlled acceptance timing. The
 creation harness supports explicit --heap-ops and --creation ablations and
-clears inherited LUMEN/TRUST flags. Do not modify the pinned official fixture.
+clears inherited TRUST_JS/TRUST flags. Do not modify the pinned official fixture.
 
 Standards/suite provenance
 -------------------------

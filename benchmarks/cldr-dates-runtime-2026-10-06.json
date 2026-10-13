@@ -5,12 +5,12 @@
   "baseline_revision": "1084161475e2e35b50a73eb06fd6885e66de9239",
   "candidate_patch_sha256": "43898691a5d66cc80e0b2228d96f232f804ef109cbec6346dacfd6b91cf715a0",
   "build_manifest": {
-    "binary": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/frozen/lumen-candidate",
+    "binary": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/frozen/trust-js-candidate",
     "binary_sha256": "e20d0eb0d09fb027242061b8b02b16c1e40db654f56fd5e36466ab08f1af58a0",
-    "build_command": "cargo build --release -p lumen --features embed --bin lumen",
+    "build_command": "cargo build --release -p trust-js --features embed --bin trust-js",
     "build_environment": {
-      "CARGO_TARGET_DIR": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-target",
-      "TMPDIR": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-tmp",
+      "CARGO_TARGET_DIR": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-target",
+      "TMPDIR": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-tmp",
       "extra_rustflags": null,
       "profile_overrides": null
     },
@@ -22,7 +22,7 @@
         "candidate_seconds_single_run": 0.851,
         "formatter_constructions": 57600,
         "iterations": 300,
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
         "sha256": "219379e6298710b9219167b4462b6e3795ddcae4fd26517a055095a6db37f1d3"
       },
       "time_command": "bash time builtin, one unpaired calibration run per binary; not acceptance timing",
@@ -33,7 +33,7 @@
         "candidate_seconds_single_run": 1.863,
         "format_calls": 38400,
         "iterations": 100,
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
         "sha256": "43f20afde83c50fc387bc308b9bd0869b9e716260e7e8460596ffa6afa0b27eb"
       }
     },
@@ -67,21 +67,21 @@
     },
     "isolated_worktree_head": "1084161475e2e35b50a73eb06fd6885e66de9239",
     "reference_snapshot_evidence": {
-      "bundle_readme": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/evidence/README.txt",
+      "bundle_readme": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/evidence/README.txt",
       "derived_comparison_snapshot": {
         "derivation": "copied from pristine source; only explanatory header and pub(super) visibility on month_rows/era_rows changed",
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/evidence/cldr_dates_derived_snapshot.rs",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/evidence/cldr_dates_derived_snapshot.rs",
         "sha256": "db98b118c56d8ad58a55f63957ef0021e2235ec6b4b18b6a3e9e1590d6475f76",
         "table_rows": "identical to pristine source; independently confirmed by coordinating parent"
       },
       "note": "Validator result was recorded before evidence was relocated; no rerun during the quiet timing window.",
       "pristine_source": {
         "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/evidence/cldr_dates_pristine_original.rs",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/evidence/cldr_dates_pristine_original.rs",
         "sha256": "7a0198abceba5fe084e7747fffcbb9525e6158b0bf2ec00a87e6e019c218e53b"
       },
       "validator": {
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/evidence/verify_tables.py",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/evidence/verify_tables.py",
         "recorded_result": "48 tables / 32,616 rows exact; all 4,489 offsets in bounds and UTF-8 valid",
         "sha256": "6487234ae4e86aadfd46b166729dd2c05d42083632a361c2bc56111c4457f06e"
       }
@@ -104,12 +104,12 @@
       "text_references": 116352,
       "unique_strings": 4489
     },
-    "source_worktree": "/tmp/lumen-cldr-date-packed",
+    "source_worktree": "/tmp/trust-js-cldr-date-packed",
     "verification": {
       "baseline_candidate_smoke_stdout_sha256": "d5c8836d59b4c857c457539e00c627f62a7de3fe7f3dfdc9b93181c3a2adbb85",
       "focused_tests": "cldr_dates filter: 2 passed; dtf_chinese_calendar_year_parts: 1 passed; datetimeformat_cldr_styles_skeletons_connectors_and_ranges: 1 passed",
       "full_lib_tests": "1,807 passed; 0 failed; 3 ignored",
-      "no_default_features_check": "cargo check -p lumen --no-default-features --lib passed",
+      "no_default_features_check": "cargo check -p trust-js --no-default-features --lib passed",
       "packed_data_equivalence": "external exhaustive source-only comparison against original generated snapshot: 48 tables / 32,616 rows exact; all 4,489 refs bounds/UTF-8 valid"
     }
   },
@@ -138,10 +138,10 @@
   "run_manifest": {
     "status": "complete",
     "started_utc": "2026-10-06T00:28:15.447474+00:00",
-    "repo_root": "/big/Code/Lumen",
-    "result_dir": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/cldr-dates-final-20261006",
+    "repo_root": "/big/Code/trust-js",
+    "result_dir": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/cldr-dates-final-20261006",
     "revision": "1084161475e2e35b50a73eb06fd6885e66de9239",
-    "git_status_short": "M crates/lumen/src/jit.rs\n M crates/lumen/src/jit_ir.rs\n M crates/lumen/src/jit_regions.rs\n M crates/lumen/src/native_array_local_tests.rs\n?? crates/lumen/src/jit_region_effect_tests.rs\n?? stack.txt",
+    "git_status_short": "M crates/trust-js/src/jit.rs\n M crates/trust-js/src/jit_ir.rs\n M crates/trust-js/src/jit_regions.rs\n M crates/trust-js/src/native_array_local_tests.rs\n?? crates/trust-js/src/jit_region_effect_tests.rs\n?? stack.txt",
     "machine": {
       "system": "Linux",
       "node": "crystal",
@@ -177,7 +177,7 @@
     },
     "environment": {
       "cleared_prefixes": [
-        "LUMEN_",
+        "TRUST_JS_",
         "TRUST_",
         "PSAMPLE_"
       ],
@@ -191,72 +191,72 @@
     },
     "binaries": {
       "baseline": {
-        "path": "/big/Code/Lumen/benchmark-results/native-array-runtime-20261006-9nhn0ka9/lumen-candidate",
+        "path": "/big/Code/trust-js/benchmark-results/native-array-runtime-20261006-9nhn0ka9/trust-js-candidate",
         "sha256": "d30ea74b4e9aa3bf41ebfa42461c9c5b9e37e316ad47405fb06a7c6a62daeb3e",
         "size_bytes": 26108888
       },
       "candidate": {
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/frozen/lumen-candidate",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/frozen/trust-js-candidate",
         "sha256": "e20d0eb0d09fb027242061b8b02b16c1e40db654f56fd5e36466ab08f1af58a0",
         "size_bytes": 21665320
       }
     },
     "sources": {
       "react": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
         "sha256": "c28e971ed3bdec660b0983351fc5b276032e9ad8ce9da35510dd4fe3021184f1",
         "size_bytes": 5443
       },
       "vue": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
         "sha256": "3cdd03b33caf362f3541bbc2d7a5bcd4c8daa6f48dce627c0e30bd35cc8589b5",
         "size_bytes": 103220
       },
       "djot": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
         "sha256": "63036f9ffa08b57d3fad97c170762eb39cb7a4220fc01f7b9bf616185667875b",
         "size_bytes": 101810
       },
       "ejs": {
-        "path": "/big/Code/Lumen/examples/ejs/code.js",
+        "path": "/big/Code/trust-js/examples/ejs/code.js",
         "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c",
         "size_bytes": 3037473
       },
       "webgl": {
-        "path": "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js",
+        "path": "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js",
         "sha256": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
         "size_bytes": 4309
       },
       "intl_warm": {
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
         "sha256": "43f20afde83c50fc387bc308b9bd0869b9e716260e7e8460596ffa6afa0b27eb",
         "size_bytes": 1771
       },
       "intl_construct": {
-        "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
+        "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
         "sha256": "219379e6298710b9219167b4462b6e3795ddcae4fd26517a055095a6db37f1d3",
         "size_bytes": 1046
       },
       "startup": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
         "sha256": "cc168e1292e40fd7c4a2aed007568b85df6a905afe0f127f42ae29820c23805e",
         "size_bytes": 379
       }
     },
     "tools": {
-      "harness": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-cldr.py",
+      "harness": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-cldr.py",
       "harness_sha256": "a1586605c67e403f9f3a89c15cb90ddf33d2af2d550325d30c08306fbdc95686",
-      "resource_helper": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
+      "resource_helper": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
       "resource_helper_sha256": "011ceaf4ac9355137c255cdec15a2280486accd0cf305fb3d9966361074df88a",
-      "resource_helper_source": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
+      "resource_helper_source": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
       "resource_helper_source_sha256": "fd4c9cb909956b7dde58bdd914532017e8c0d9242c9926646b4a6c604d958015",
       "taskset": "/usr/bin/taskset"
     },
     "command_line": [
       "benchmark-results/object-runtime-20261005-7eac91/compare-cldr.py",
-      "benchmark-results/cldr-date-packed-build/frozen/lumen-candidate",
+      "benchmark-results/cldr-date-packed-build/frozen/trust-js-candidate",
       "--baseline",
-      "benchmark-results/native-array-runtime-20261006-9nhn0ka9/lumen-candidate",
+      "benchmark-results/native-array-runtime-20261006-9nhn0ka9/trust-js-candidate",
       "--only",
       "react",
       "vue",
@@ -1849,13 +1849,13 @@
       "all_executed_passed": true,
       "run_manifest": {
         "environment": {
-          "CARGO_TARGET_DIR": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-target",
-          "LUMEN_TIER": "unset; default JIT tier",
+          "CARGO_TARGET_DIR": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-target",
+          "TRUST_JS_TIER": "unset; default JIT tier",
           "T262_WORKERS": "unset; runner default",
-          "TEST262": "/big/Code/Lumen/test262",
-          "TMPDIR": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-tmp"
+          "TEST262": "/big/Code/trust-js/test262",
+          "TMPDIR": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-tmp"
         },
-        "format_check": "cargo fmt --manifest-path /tmp/lumen-cldr-date-packed/Cargo.toml -p lumen -- --check passed",
+        "format_check": "cargo fmt --manifest-path /tmp/trust-js-cldr-date-packed/Cargo.toml -p trust-js -- --check passed",
         "logs": {
           "stderr_sha256": "d1931137fdeab088bb28d6713d2832ff270a3fa3b77737d7c5447ee931803baf",
           "stdout_sha256": "687fc4c239491166f0ed6b8620b1531a9d3cdf792a0e4b3272ccc9cdce2a6dd2"
@@ -1865,7 +1865,7 @@
           "failure_count": 0,
           "schema_version": 2,
           "skip_count": 0,
-          "summary_path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/test262-run/test262-report/summary.json",
+          "summary_path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/test262-run/test262-report/summary.json",
           "summary_sha256": "ccde875a011a1db16054374361f0a490438d245235805e73f62fa6eb6abdfd1a",
           "total": {
             "fail": 0,
@@ -1873,17 +1873,17 @@
             "skip": 0
           }
         },
-        "run_command": "TEST262=/big/Code/Lumen/test262 TMPDIR=/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-tmp CARGO_TARGET_DIR=/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr-target test262-runner intl402/DateTimeFormat",
-        "runner_binary": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/test262-run/test262-runner",
+        "run_command": "TEST262=/big/Code/trust-js/test262 TMPDIR=/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-tmp CARGO_TARGET_DIR=/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr-target test262-runner intl402/DateTimeFormat",
+        "runner_binary": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/test262-run/test262-runner",
         "runner_binary_sha256": "61361597d3ff9cb2c0987342dd4f961a0b92e9ad5cd97a6bf47ee4691478f009",
-        "runner_build_command": "cargo build --release -p test262-runner --features lumen/embed",
+        "runner_build_command": "cargo build --release -p test262-runner --features trust-js/embed",
         "runner_build_source_head": "1084161475e2e35b50a73eb06fd6885e66de9239",
         "suite": {
           "discovered_js_files": 244,
           "revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
           "target": "intl402/DateTimeFormat"
         },
-        "working_directory": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/test262-run"
+        "working_directory": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/test262-run"
       }
     },
     "row_equivalence": "All 32,616 rows in 48 tables match original source; all 4,489 string references in bounds and UTF-8 valid. Original generator first reproduced the old file byte for byte.",

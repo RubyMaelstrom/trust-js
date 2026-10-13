@@ -29,8 +29,8 @@ an indexed numerical stencil, and recursive calls provide controls against unrel
 Run it with the release engine shell:
 
 ```sh
-cargo build --release -p lumen --features embed --bin lumen
-target/release/lumen --tier=jit benchmarks/webgl-engine-kernels.js
+cargo build --release -p trust-js --features embed --bin trust-js
+target/release/trust-js --tier=jit benchmarks/webgl-engine-kernels.js
 ```
 
 Each kernel warms up and prints all five timings plus checksums. Compare fresh baseline and

@@ -5,7 +5,7 @@ import { render } from 'preact-render-to-string';
 
 function App({ items }) {
   return h('main', null,
-    h('h1', null, 'Hello from Preact on lumen'),
+    h('h1', null, 'Hello from Preact on trust-js'),
     h('ul', null, items.map((it) => h('li', null, it))),
   );
 }
@@ -17,4 +17,4 @@ const server = createServer((req, res) => {
 });
 
 const port = Number(process.env.PORT || 3000);
-server.listen(port, () => console.log(`preact SSR on lumen: http://localhost:${port}/`));
+server.listen(port, () => console.log(`preact SSR on trust-js: http://localhost:${port}/`));

@@ -1,5 +1,5 @@
 // Standalone CPU kernels for renderer-shaped JavaScript. No WebGL or browser APIs.
-// Run with a release engine shell: target/release/lumen benchmarks/webgl-engine-kernels.js
+// Run with a release engine shell: target/release/trust-js benchmarks/webgl-engine-kernels.js
 // Compare interleaved fresh processes; retain every sample and verify checksums.
 // These isolate engine costs and do not predict a whole scene's frame rate.
 "use strict";

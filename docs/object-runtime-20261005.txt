@@ -101,7 +101,7 @@ real added layout/cache metadata and more complete index-capacity accounting;
 their delta is not a like-for-like physical-memory estimate. Raw observations
 and their lower-bound qualifications are preserved in the benchmark record.
 
-Separate LUMEN_PERF_METRICS runs record compilation, generated code and GC.
+Separate TRUST_JS_PERF_METRICS runs record compilation, generated code and GC.
 Compilation counts are unchanged; generated-code totals differ by at most
 472 bytes across these workloads. Single diagnostic durations do not establish
 a compilation-latency or GC-pause improvement. The engine executable grows by
@@ -111,10 +111,10 @@ Verification
 ------------
 
 Final source:
-- cargo test -p lumen --features embed --lib: 1799 pass, 0 fail, 3 ignored
+- cargo test -p trust-js --features embed --lib: 1799 pass, 0 fail, 3 ignored
   measurement-only tests.
-- cargo test -p lumen-runtime: 179 pass, 0 fail, 1 existing ignore.
-- cargo test -p lumen --features 'embed optimizing-jit' --lib creation_tests:::
+- cargo test -p trust-js-runtime: 179 pass, 0 fail, 1 existing ignore.
+- cargo test -p trust-js --features 'embed optimizing-jit' --lib creation_tests:::
   10 pass, 0 fail; native creation/layout guards exercised.
 - cargo check --workspace --all-targets and the release build: pass.
 - Differential seeds 1..2000 plus regression-corpus replay: 1859 agree,

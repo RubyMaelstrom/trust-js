@@ -5,23 +5,23 @@
     "revision": "c899ed44e827b74245d138acb9e588ff0f1d4988",
     "patch_sha256": "65f20fdb40b56acc86a3d4791a96010b45291e5c2928870d19c37b9fd4a0877e",
     "files": {
-      "crates/lumen/src/bytecode.rs": "f9852abd0fa90ebfd94ac947ffa641043faab74af8ec2c8822927cccbdbc4da1",
-      "crates/lumen/src/bytecode_named_read_tests.rs": "32ed44fbe0dbf0e04d6c005c4a10e2ad9b5f7ea6e32568d5294795a16f033a3c",
-      "crates/lumen/src/eval.rs": "2c35798eea81b9d0ab0305dabfcf9ec1ebc3e225bce68a8dde89911da3c3b955",
-      "crates/lumen/src/execution_storage.rs": "8e75fa4444f166d4bea014380f1bf4aac352fd4f8c0bd8ad4b187fffab2db642",
-      "crates/lumen/src/for_in_cache_tests.rs": "d377c8c500a85bd552519c88ccc6df51a9cad58b19c069fd3a6ef1c67192e187",
-      "crates/lumen/src/interpreter.rs": "51da9bdd7ce6b637beb781d167b95657f1f68c19f0028f762790a2db45ccc1c4",
-      "crates/lumen/src/jit_optimizing_creation_tests.rs": "a5e05f0bc20dfcd7866c9839c8fefb2971b81322e3276c38da094f5b48f64647",
-      "crates/lumen/src/jit_optimizing_deopt_tests.rs": "d61ba7839b6c368e7f41d9aa81572cd6472d95a125bf92c998837ac2afe41d39",
-      "crates/lumen/src/memory.rs": "1b9bc03007983321379be2c5b73ef6125423659f8fe27696c0bc996377909669",
-      "crates/lumen/src/property_read.rs": "9b6418e4b78840d431c3f7f52996fd8ce56442899a5883c8181bdaa091a4722e",
-      "crates/lumen/src/property_read_tests.rs": "05b83e8f2d20268d031ac4752a225ff02178709264d6506aa393f81c599e21af",
-      "crates/lumen/src/property_shapes.rs": "bd54e5824443402959ce1591e7ac41326bbe4f767c11b474eeb0fcd8f3be47c3",
-      "crates/lumen/src/shared_layout_tests.rs": "c1a1fcee2485889e4a3826ab2d3c3da14ebd1ca91ef0cd0d556b779dd8f34474",
-      "crates/lumen/src/shared_snapshot_realm_tests.rs": "604bcf91e215128060df88ec246154cc2fd8ab44846929042da7ae5a8001c1d5",
-      "crates/lumen/src/value.rs": "3661c0179ac4daf7a1e57fe9254e6d568d2634364aa5917ccf139c72f8c6261c"
+      "crates/trust-js/src/bytecode.rs": "f9852abd0fa90ebfd94ac947ffa641043faab74af8ec2c8822927cccbdbc4da1",
+      "crates/trust-js/src/bytecode_named_read_tests.rs": "32ed44fbe0dbf0e04d6c005c4a10e2ad9b5f7ea6e32568d5294795a16f033a3c",
+      "crates/trust-js/src/eval.rs": "2c35798eea81b9d0ab0305dabfcf9ec1ebc3e225bce68a8dde89911da3c3b955",
+      "crates/trust-js/src/execution_storage.rs": "8e75fa4444f166d4bea014380f1bf4aac352fd4f8c0bd8ad4b187fffab2db642",
+      "crates/trust-js/src/for_in_cache_tests.rs": "d377c8c500a85bd552519c88ccc6df51a9cad58b19c069fd3a6ef1c67192e187",
+      "crates/trust-js/src/interpreter.rs": "51da9bdd7ce6b637beb781d167b95657f1f68c19f0028f762790a2db45ccc1c4",
+      "crates/trust-js/src/jit_optimizing_creation_tests.rs": "a5e05f0bc20dfcd7866c9839c8fefb2971b81322e3276c38da094f5b48f64647",
+      "crates/trust-js/src/jit_optimizing_deopt_tests.rs": "d61ba7839b6c368e7f41d9aa81572cd6472d95a125bf92c998837ac2afe41d39",
+      "crates/trust-js/src/memory.rs": "1b9bc03007983321379be2c5b73ef6125423659f8fe27696c0bc996377909669",
+      "crates/trust-js/src/property_read.rs": "9b6418e4b78840d431c3f7f52996fd8ce56442899a5883c8181bdaa091a4722e",
+      "crates/trust-js/src/property_read_tests.rs": "05b83e8f2d20268d031ac4752a225ff02178709264d6506aa393f81c599e21af",
+      "crates/trust-js/src/property_shapes.rs": "bd54e5824443402959ce1591e7ac41326bbe4f767c11b474eeb0fcd8f3be47c3",
+      "crates/trust-js/src/shared_layout_tests.rs": "c1a1fcee2485889e4a3826ab2d3c3da14ebd1ca91ef0cd0d556b779dd8f34474",
+      "crates/trust-js/src/shared_snapshot_realm_tests.rs": "604bcf91e215128060df88ec246154cc2fd8ab44846929042da7ae5a8001c1d5",
+      "crates/trust-js/src/value.rs": "3661c0179ac4daf7a1e57fe9254e6d568d2634364aa5917ccf139c72f8c6261c"
     },
-    "build_command": "cargo build --release -p lumen -p lumen-difftest -p test262-runner --features lumen/embed --bins",
+    "build_command": "cargo build --release -p trust-js -p trust-js-difftest -p test262-runner --features trust-js/embed --bins",
     "features": "default intl + embed; optimizing-jit off for release measurements",
     "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
     "cargo_lock_sha256": "4f1f1e856fcb3b847a2432491be2e486a6c70ef37bd31d64a3dbb0e7f21e7498",
@@ -31,7 +31,7 @@
     "followup": "Allocation-free rejected binding-getter proof, exact-depth successful proof storage; index selection comment clarified.",
     "binary_sha256": "64578e16c341c6ce99b8bef31dc1f90cd926a0cd3ea8064aa674f48e1896da96",
     "binary_size_bytes": 26104608,
-    "size_output": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n18183564\t5217360\t  78385\t23479309\t166440d\t/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/lumen-candidate\n18162596\t5217312\t  33889\t23413797\t1654425\t/big/Code/Lumen/benchmark-results/performance-review-20261005-lq2mvx5y/lumen-current\n"
+    "size_output": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n18183564\t5217360\t  78385\t23479309\t166440d\t/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/trust-js-candidate\n18162596\t5217312\t  33889\t23413797\t1654425\t/big/Code/trust-js/benchmark-results/performance-review-20261005-lq2mvx5y/trust-js-current\n"
   },
   "measurement": {
     "revision": "c899ed44e827b74245d138acb9e588ff0f1d4988",
@@ -67,7 +67,7 @@
     },
     "environment": {
       "cleared_prefixes": [
-        "LUMEN_",
+        "TRUST_JS_",
         "TRUST_",
         "PSAMPLE_"
       ],
@@ -81,52 +81,52 @@
     },
     "binaries": {
       "baseline": {
-        "path": "/big/Code/Lumen/benchmark-results/performance-review-20261005-lq2mvx5y/lumen-current",
+        "path": "/big/Code/trust-js/benchmark-results/performance-review-20261005-lq2mvx5y/trust-js-current",
         "sha256": "6083ec20315fb68ab2fdfbf17e9978d0a928b7631c9edb21c23d6b9fc5467a78",
         "size_bytes": 26082120
       },
       "candidate": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/lumen-candidate",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/trust-js-candidate",
         "sha256": "64578e16c341c6ce99b8bef31dc1f90cd926a0cd3ea8064aa674f48e1896da96",
         "size_bytes": 26104608
       }
     },
     "sources": {
       "react": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
         "sha256": "c28e971ed3bdec660b0983351fc5b276032e9ad8ce9da35510dd4fe3021184f1",
         "size_bytes": 5443
       },
       "vue": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
         "sha256": "3cdd03b33caf362f3541bbc2d7a5bcd4c8daa6f48dce627c0e30bd35cc8589b5",
         "size_bytes": 103220
       },
       "djot": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
         "sha256": "63036f9ffa08b57d3fad97c170762eb39cb7a4220fc01f7b9bf616185667875b",
         "size_bytes": 101810
       },
       "ejs": {
-        "path": "/big/Code/Lumen/examples/ejs/code.js",
+        "path": "/big/Code/trust-js/examples/ejs/code.js",
         "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c",
         "size_bytes": 3037473
       },
       "webgl": {
-        "path": "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js",
+        "path": "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js",
         "sha256": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
         "size_bytes": 4309
       },
       "startup": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
         "sha256": "cc168e1292e40fd7c4a2aed007568b85df6a905afe0f127f42ae29820c23805e",
         "size_bytes": 379
       }
     },
     "tools": {
-      "resource_helper": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
+      "resource_helper": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
       "resource_helper_sha256": "011ceaf4ac9355137c255cdec15a2280486accd0cf305fb3d9966361074df88a",
-      "resource_helper_source": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
+      "resource_helper_source": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
       "resource_helper_source_sha256": "fd4c9cb909956b7dde58bdd914532017e8c0d9242c9926646b4a6c604d958015",
       "taskset": "/usr/bin/taskset"
     },
@@ -3362,7 +3362,7 @@
       "output_sha256": "8fffa88de90c2a03792eab75ba91c1453e7a044cfe4f1041ff18b7389ba13559"
     }
   ],
-  "diagnostic_note": "Separate LUMEN_PERF_METRICS=1 runs; one sample per binary/workload. Not acceptance timings. Managed memory is a lower bound; new layout bodies/cache metadata add real storage and index-capacity accounting is more complete, so its baseline/candidate delta is not a like-for-like physical memory estimate.",
+  "diagnostic_note": "Separate TRUST_JS_PERF_METRICS=1 runs; one sample per binary/workload. Not acceptance timings. Managed memory is a lower bound; new layout bodies/cache metadata add real storage and index-capacity accounting is more complete, so its baseline/candidate delta is not a like-for-like physical memory estimate.",
   "diagnostics": [
     {
       "workload": "react",
@@ -4589,13 +4589,13 @@
           "cargo",
           "test",
           "-p",
-          "lumen",
+          "trust-js",
           "--features",
           "embed",
           "--lib"
         ],
         "exit": 0,
-        "log": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/engine-tests.log",
+        "log": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/engine-tests.log",
         "test_totals": {
           "pass": 1799,
           "fail": 0,
@@ -4608,10 +4608,10 @@
           "cargo",
           "test",
           "-p",
-          "lumen-runtime"
+          "trust-js-runtime"
         ],
         "exit": 0,
-        "log": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/runtime-tests.log",
+        "log": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/runtime-tests.log",
         "test_totals": {
           "pass": 179,
           "fail": 0,
@@ -4624,14 +4624,14 @@
           "cargo",
           "test",
           "-p",
-          "lumen",
+          "trust-js",
           "--features",
           "embed optimizing-jit",
           "--lib",
           "creation_tests::"
         ],
         "exit": 0,
-        "log": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/optional-creation-tests.log",
+        "log": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/optional-creation-tests.log",
         "test_totals": {
           "pass": 10,
           "fail": 0,
@@ -4647,7 +4647,7 @@
           "--all-targets"
         ],
         "exit": 0,
-        "log": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/workspace-check.log",
+        "log": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/workspace-check.log",
         "test_totals": {
           "pass": 0,
           "fail": 0,
@@ -4661,17 +4661,17 @@
           "build",
           "--release",
           "-p",
-          "lumen",
+          "trust-js",
           "-p",
-          "lumen-difftest",
+          "trust-js-difftest",
           "-p",
           "test262-runner",
           "--features",
-          "lumen/embed",
+          "trust-js/embed",
           "--bins"
         ],
         "exit": 0,
-        "log": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/final/release-build.log",
+        "log": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/final/release-build.log",
         "test_totals": {
           "pass": 0,
           "fail": 0,
@@ -4714,7 +4714,7 @@
         "exit": 0,
         "tail": "200/500 done (183 agree, 17 skipped)\n400/500 done (363 agree, 37 skipped)\ndone: 459 agree, 41 skipped (budget) across seeds 1..501",
         "command": [
-          "/big/Code/Lumen/target/release/lumen-difftest",
+          "/big/Code/trust-js/target/release/trust-js-difftest",
           "--count",
           "500",
           "--seed",
@@ -4729,7 +4729,7 @@
         "exit": 0,
         "tail": "200/500 done (187 agree, 13 skipped)\n400/500 done (379 agree, 21 skipped)\ndone: 473 agree, 27 skipped (budget) across seeds 501..1001",
         "command": [
-          "/big/Code/Lumen/target/release/lumen-difftest",
+          "/big/Code/trust-js/target/release/trust-js-difftest",
           "--count",
           "500",
           "--seed",
@@ -4744,7 +4744,7 @@
         "exit": 0,
         "tail": "200/500 done (184 agree, 16 skipped)\n400/500 done (375 agree, 25 skipped)\ndone: 465 agree, 35 skipped (budget) across seeds 1001..1501",
         "command": [
-          "/big/Code/Lumen/target/release/lumen-difftest",
+          "/big/Code/trust-js/target/release/trust-js-difftest",
           "--count",
           "500",
           "--seed",
@@ -4759,7 +4759,7 @@
         "exit": 0,
         "tail": "200/500 done (185 agree, 15 skipped)\n400/500 done (370 agree, 30 skipped)\ndone: 462 agree, 38 skipped (budget) across seeds 1501..2001",
         "command": [
-          "/big/Code/Lumen/target/release/lumen-difftest",
+          "/big/Code/trust-js/target/release/trust-js-difftest",
           "--count",
           "500",
           "--seed",

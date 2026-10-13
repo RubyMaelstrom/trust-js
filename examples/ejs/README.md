@@ -1,4 +1,4 @@
-# yt-dlp/ejs on lumen
+# yt-dlp/ejs on trust-js
 
 [yt-dlp/ejs](https://github.com/yt-dlp/ejs) is yt-dlp's external JavaScript challenge
 solver: it bundles **meriyah** (a JavaScript parser written in JavaScript) and **astring**
@@ -8,17 +8,17 @@ implementation — a scanner reading a ~3 MB source one `charCodeAt` at a time, 
 `slice`d out by the thousand, and the transformed source rebuilt through repeated string
 concatenation.
 
-That made it a perfect stress test: [issue #12](https://github.com/lucid-softworks/lumen/issues/12)
-reported the benchmark below taking **55.8 minutes** on lumen.
+That made it a perfect stress test: a historical upstream report
+reported the benchmark below taking **55.8 minutes** on trust-js.
 
 ## Running it
 
 ```sh
 ./fetch.sh        # downloads the benchmark bundle (solver + embedded player + challenges)
-./bench.sh        # times it on lumen (and node/bun/qjs when installed)
+./bench.sh        # times it on trust-js (and node/bun/qjs when installed)
 ```
 
-The bundle is the exact reproducer from issue #12 — the ejs core solver with a player and
+The bundle is the exact reproducer from the historical report — the ejs core solver with a player and
 two `n`-challenges baked in; it prints the solved challenge results as JSON. To build a
 fresh bundle from upstream instead, see yt-dlp/ejs's own build docs (`rollup` via
 `pnpm`/`deno`/`bun`; release assets ship the prebuilt `yt.solver.core.js`).
@@ -29,8 +29,8 @@ fresh bundle from upstream instead, see yt-dlp/ejs's own build docs (`rollup` vi
 |---|---:|---|
 | node 22 | 0.44 s | |
 | bun 1.3 | 0.47 s | |
-| qjs (quickjs-ng, brew) | 3.4 s | (the 8.2 s in issue #12 was a slower machine) |
-| **lumen** (`--tier=jit`) | **8.7 s** | was **55.8 min** at the time of issue #12 |
+| qjs (quickjs-ng, brew) | 3.4 s | (the 8.2 s in the historical report was a slower machine) |
+| **trust-js** (`--tier=jit`) | **8.7 s** | was **55.8 min** at the time of the historical report |
 
 What the 55.8 minutes was made of, in the order it fell:
 
@@ -57,4 +57,4 @@ What the 55.8 minutes was made of, in the order it fell:
 block leaked its handler, silently swallowing unrelated later throws.)
 
 The remaining ~2.5× to qjs is call overhead (meriyah's mutually recursive parse
-functions), AST-node allocation/GC, and refcount churn — tracked on issue #12.
+functions), AST-node allocation/GC, and refcount churn — recorded in the historical report.

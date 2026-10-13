@@ -1,7 +1,6 @@
 // In-process Hono benchmark: dispatch requests through `app.fetch()` and read each response body.
-// This is the common denominator across runtimes — lumen has no HTTP server, so a socket-based
-// test could not include it. Measures Hono's routing + middleware + Request/Response handling on
-// each runtime's JS engine (no network).
+// Measures Hono's routing + middleware + Request/Response handling on each runtime's JS engine
+// without network transport or HTTP server overhead.
 //
 // Usage: <runtime> bench.mjs [N]     e.g.  node bench.mjs 50000
 import { Hono } from 'hono';
@@ -20,7 +19,7 @@ const make = [
   () => new Request('http://localhost/'),
   () => new Request('http://localhost/json'),
   () => new Request('http://localhost/users/42'),
-  () => new Request('http://localhost/api/hello?name=lumen'),
+  () => new Request('http://localhost/api/hello?name=trust-js'),
 ];
 
 async function run(iters) {

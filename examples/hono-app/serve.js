@@ -1,7 +1,7 @@
 // Drive the Hono app through a series of requests and print the responses.
 //
 // This is the in-process variant: instead of binding a port (see serve-http.js for the real
-// `Lumen.serve` server) we call `app.fetch(request)` directly — the same entry point the server
+// `TRustJS.serve` server) we call `app.fetch(request)` directly — the same entry point the server
 // calls per connection. Handy for exercising routing without a socket. Touches ESM import from
 // node_modules plus the web platform: Request, Response, Headers, and URL.
 
@@ -9,7 +9,7 @@ import app from './app.js';
 
 const cases = [
   new Request('http://localhost/'),
-  new Request('http://localhost/api/hello?name=lumen'),
+  new Request('http://localhost/api/hello?name=trust-js'),
   new Request('http://localhost/users/42'),
   new Request('http://localhost/echo', {
     method: 'POST',

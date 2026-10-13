@@ -1,5 +1,5 @@
-// A tour of lumen's WinterTC Minimum Common API — every major interface, exercised end to end.
-// Run: ../../target/release/lumen-cli showcase.mjs
+// A tour of trust-js's WinterTC Minimum Common API — every major interface, exercised end to end.
+// Run: ../../target/release/trust-js-cli showcase.mjs
 
 const line = (label, value) => console.log(`  ${label.padEnd(26)} ${value}`);
 const section = (name) => console.log(`\n${name}`);
@@ -59,7 +59,7 @@ line("Compression gzip", `${original.length} -> ${gz.length} -> ${un.length} byt
 
 // ---- fetch (drive a local server) ----
 section("fetch + HTTP server");
-const server = Lumen.serve((request) => Response.json({ path: new URL(request.url).pathname, ok: true }), {
+const server = TRustJS.serve((request) => Response.json({ path: new URL(request.url).pathname, ok: true }), {
   hostname: "127.0.0.1",
   port: 0,
 });

@@ -1,4 +1,4 @@
-"""The CLDR locales Lumen's Intl services ship, and their inheritance (shared by the generators).
+"""The CLDR locales TRust JS's Intl services ship, and their inheritance (shared by the generators).
 
 Every CLDR 48 locale of a supported language is shipped: the language locales and all of their
 regional and script variants (UTS #35 Part 1 Locale Inheritance). A variant stores only the data
@@ -20,7 +20,7 @@ import urllib.request
 
 TAG = "48.0.0"
 CLDR_JSON = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
-# The languages Lumen's Intl services support.
+# The languages TRust JS's Intl services support.
 LANGUAGES = [
     "ar", "de", "en", "es", "fr", "gv", "hi", "it", "ja", "ko", "ln", "nl", "pl", "pt", "ru",
     "si", "sl", "sr", "sv", "th", "zh",
@@ -34,7 +34,7 @@ def read_json(relative: str) -> dict:
         with open(os.path.join(cldr_dir, relative), encoding="utf-8") as file:
             return json.load(file)
     request = urllib.request.Request(
-        f"{CLDR_JSON}/{relative}", headers={"User-Agent": "Lumen CLDR generator"}
+        f"{CLDR_JSON}/{relative}", headers={"User-Agent": "TRust JS CLDR generator"}
     )
     with urllib.request.urlopen(request) as response:
         return json.load(response)

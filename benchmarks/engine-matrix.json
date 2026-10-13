@@ -124,7 +124,7 @@
       "TZ": "UTC"
     },
     "clear_environment_prefixes": [
-      "LUMEN_",
+      "TRUST_JS_",
       "TRUST_"
     ]
   },
@@ -157,24 +157,24 @@
       "required": false
     },
     {
-      "id": "lumen-jit",
-      "label": "Lumen JIT",
-      "program": "target/release/lumen",
+      "id": "trust-js-jit",
+      "label": "TRust JS JIT",
+      "program": "target/release/trust-js",
       "version_args": [
         "--version"
       ],
-      "expected_version": "lumen 0.1.3",
+      "expected_version": "trust-js 0.1.3",
       "input_mode": "separate",
       "args": [
         "--tier=jit"
       ],
       "environment": {
-        "LUMEN_PERF_METRICS": "1"
+        "TRUST_JS_PERF_METRICS": "1"
       },
-      "metrics_stderr_prefix": "[lumen-perf] ",
+      "metrics_stderr_prefix": "[trust-js-perf] ",
       "allocator": "Rust system allocator",
       "required": true,
-      "artifact": "target/release/lumen",
+      "artifact": "target/release/trust-js",
       "build": [
         "cargo",
         "build",
@@ -183,16 +183,16 @@
         "--release",
         "-q",
         "-p",
-        "lumen",
+        "trust-js",
         "--bin",
-        "lumen"
+        "trust-js"
       ]
     }
   ],
   "provenance": {
     "repositories": [
       {
-        "id": "lumen",
+        "id": "trust-js",
         "path": "."
       },
       {

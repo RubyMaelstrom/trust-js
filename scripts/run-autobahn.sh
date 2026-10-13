@@ -38,20 +38,20 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
-OUTPUT="$(cargo run -q -p lumen-cli -- scripts/autobahn-testee.js)"
+OUTPUT="$(cargo run -q -p trust-js-cli -- scripts/autobahn-testee.js)"
 echo "$OUTPUT"
 if [[ "$OUTPUT" != *"AUTOBAHN COMPLETE 247"* ]]; then
   echo "Autobahn client did not complete the expected 247 applicable cases" >&2
   exit 1
 fi
 
-if rg -q '"behavior(Close)?": "(FAILED|NON-STRICT)"' "$REPORTS"/lumen_case_*.json; then
+if rg -q '"behavior(Close)?": "(FAILED|NON-STRICT)"' "$REPORTS"/trust_js_case_*.json; then
   echo "Autobahn reported a failed or non-strict case" >&2
-  rg -l '"behavior(Close)?": "(FAILED|NON-STRICT)"' "$REPORTS"/lumen_case_*.json >&2
+  rg -l '"behavior(Close)?": "(FAILED|NON-STRICT)"' "$REPORTS"/trust_js_case_*.json >&2
   exit 1
 fi
 
-rg -o '"behavior": "[^"]+"' "$REPORTS"/lumen_case_*.json \
+rg -o '"behavior": "[^"]+"' "$REPORTS"/trust_js_case_*.json \
   | sed 's/.*"behavior": "//;s/"$//' \
   | sort \
   | uniq -c

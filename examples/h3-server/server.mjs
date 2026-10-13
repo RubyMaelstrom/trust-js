@@ -5,7 +5,7 @@ import { createApp, createRouter, defineEventHandler, toNodeListener, readBody, 
 const app = createApp();
 const router = createRouter();
 
-router.get('/', defineEventHandler(() => ({ hello: 'h3 on lumen' })));
+router.get('/', defineEventHandler(() => ({ hello: 'h3 on trust-js' })));
 router.get('/users/:id', defineEventHandler((event) => ({ id: event.context.params.id })));
 router.get('/search', defineEventHandler((event) => ({ q: getQuery(event).q ?? null })));
 router.post('/echo', defineEventHandler(async (event) => ({ youSent: await readBody(event) })));
@@ -13,4 +13,4 @@ router.post('/echo', defineEventHandler(async (event) => ({ youSent: await readB
 app.use(router);
 
 const port = Number(process.env.PORT || 3000);
-createServer(toNodeListener(app)).listen(port, () => console.log(`h3 on lumen: http://localhost:${port}/`));
+createServer(toNodeListener(app)).listen(port, () => console.log(`h3 on trust-js: http://localhost:${port}/`));

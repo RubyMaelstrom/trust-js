@@ -104,7 +104,7 @@ engine/Clippy/optional/workspace/format/diff checks all pass on frozen v2.
 
 Four fresh balanced application pairs: crystal Linux ARM64 CPU5, ordinary
 release template JIT, default Intl, opt3/fat LTO/codegen-units1/panic-abort,
-LUMEN_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
+TRUST_JS_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
 supplies one reference per workload, not a comparison distribution. Inputs
 are unchanged pinned Djot@0.3.2 rendering, complete examples/ejs/code.js solver,
 Speedometer React TodoMVC reducer and Vue reactivity drivers. React/Vue are

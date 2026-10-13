@@ -1,5 +1,5 @@
 //! Runner for the official WebAssembly core `*.wast` suite and a deterministic malformed-binary
-//! corpus. It intentionally drives Lumen's own decoder, validator, linker, and interpreter rather
+//! corpus. It intentionally drives TRust JS's own decoder, validator, linker, and interpreter rather
 //! than comparing against another engine.
 
 use std::collections::HashMap;
@@ -7,9 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use lumen_web::wasm::exec::{Host, Imports, Store, Val};
-use lumen_web::wasm::parse::{FuncType, ImportKind, Module, ValType};
-use lumen_web::wasm::{self, ExportKind};
+use trust_js_web::wasm::exec::{Host, Imports, Store, Val};
+use trust_js_web::wasm::parse::{FuncType, ImportKind, Module, ValType};
+use trust_js_web::wasm::{self, ExportKind};
 use wast::core::{NanPattern, WastArgCore, WastRetCore};
 use wast::parser::{self, ParseBuffer};
 use wast::{QuoteWat, Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet, Wat};

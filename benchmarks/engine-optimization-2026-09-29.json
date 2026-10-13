@@ -8,31 +8,31 @@
     "head": "c8af769dd19b2abc8bbec540e6cdc7c544899080",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "821ee41168d4097b6baf26560247a02071aac820eb9b23a2594da44cab0ac143"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "bd54b51acc6152a2bc2d0c48d420005069905a5550affa3dba710378b0d58349"
       },
       {
-        "path": "crates/lumen/src/bytecode_osr_tests.rs",
+        "path": "crates/trust-js/src/bytecode_osr_tests.rs",
         "sha256": "86eba5b29e755772c4a34d31cee3d615c8b6904aa3bee04f205a024962c3e46a"
       },
       {
-        "path": "crates/lumen/src/eval.rs",
+        "path": "crates/trust-js/src/eval.rs",
         "sha256": "1ec9fc48a708fa7db93d6ea9569866f1155aa2dc11aa1e755fffbb1e230efa0a"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "8c7d293455e879c6d11de0c627daf5dd49498f092ad23c69d9a585c0748415d7"
       },
       {
-        "path": "crates/lumen/src/value.rs",
+        "path": "crates/trust-js/src/value.rs",
         "sha256": "f9fa560ca1cb26c2c32fde141264ce07c7383ad000dd6d028ded70b110e25a94"
       },
       {
-        "path": "crates/lumen/src/data_copy_tests.rs",
+        "path": "crates/trust-js/src/data_copy_tests.rs",
         "sha256": "ed77c91669c7adb764f1f4d85e929f94616ab5341719dbe3260591c5af2477c1"
       }
     ],
@@ -48,7 +48,7 @@
   },
   "environment": {
     "affinity_cpu": 5,
-    "build": "cargo build --release -p lumen --bin lumen; workspace opt-level=3, fat LTO, codegen-units=1, panic=abort",
+    "build": "cargo build --release -p trust-js --bin trust-js; workspace opt-level=3, fat LTO, codegen-units=1, panic=abort",
     "tier": "jit",
     "features": [
       "default",
@@ -56,7 +56,7 @@
     ],
     "optimizing_jit": false,
     "architecture_diagnostics": false,
-    "inherited_runtime_controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "inherited_runtime_controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "User desktop applications remained active; no exclusive-machine claim. No owned compilation, unit tests or profiler overlapped the application timing comparison."
   },
   "changes": [
@@ -66,12 +66,12 @@
   ],
   "artifacts": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/trust-js-baseline",
       "sha256": "5f3d090a977c5efcc07b5c7c20069458730a9e09f93982c5bf2ba7a165b5075f",
       "bytes": 25114800
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/lumen-candidate",
+      "file": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/trust-js-candidate",
       "sha256": "3172804cd1782441cfb664990fc28a786f323961d6aa24bf132dc42fc3b5aa76",
       "bytes": 25116032
     },
@@ -112,19 +112,19 @@
   },
   "sources": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },
@@ -1346,7 +1346,7 @@
   },
   "validation": {
     "default_engine_unit_tests": {
-      "command": "cargo test -p lumen --lib --quiet",
+      "command": "cargo test -p trust-js --lib --quiet",
       "passed": 1557,
       "failed": 0,
       "new_regressions": 8,
@@ -1356,10 +1356,10 @@
         "jit"
       ]
     },
-    "clippy": "cargo clippy -p lumen --all-targets -- -D warnings passed",
+    "clippy": "cargo clippy -p trust-js --all-targets -- -D warnings passed",
     "workspace": "cargo check --workspace --all-targets passed",
     "osr_fixture": {
-      "command": "cargo test -p lumen --lib --features optimizing-jit bytecode::osr_tests --quiet",
+      "command": "cargo test -p trust-js --lib --features optimizing-jit bytecode::osr_tests --quiet",
       "passed": 2,
       "failed": 0,
       "earlier_attempt": "bytecode_osr_tests filter selected zero; separate corrected log retained"
@@ -1374,7 +1374,7 @@
     ]
   },
   "diagnostic_profile": {
-    "artifact": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/ejs-audit.er",
+    "artifact": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/ejs-audit.er",
     "binary": "baseline",
     "workload": "ejs",
     "sampled_cpu_seconds": 10.383,
@@ -1396,63 +1396,63 @@
   },
   "local_evidence": [
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/comparison.json",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/comparison.json",
       "sha256": "0d90b60382f318a2bb14ee251de8f7209802806cb52968a7580aa10ec71c3f11"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/analysis.json",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/analysis.json",
       "sha256": "71e24c4e9d822f71217f3729fb82a84bc270eb195996c53c11ed27b6fabb583a"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/resources.json",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/resources.json",
       "sha256": "f9334b7f3477630b56518c164f4e00c1c5cd17bf3e070e41134e21139a81e20c"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/memory.json",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/memory.json",
       "sha256": "df24f2c200d349d48cfb248febae1df3339ee330619952ec702002e9c915dad7"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/measure.mjs",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/measure.mjs",
       "sha256": "def57cddf039bf56783162ee4ed305996bcccd2a5595fee92287d901f7a7217d"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/analyze.mjs",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/analyze.mjs",
       "sha256": "49824f18cd351918617df10206f5a623010c05a03ea0323e584beec5da107c34"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/resources.mjs",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/resources.mjs",
       "sha256": "6d9ec438bfc5b17d6b2cbf6d4228549a16a00be17795e8ec8e7cfe2e8cf2bae3"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/memory.py",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/memory.py",
       "sha256": "f279f649f44fcd5d1cb3410f4c1f12b69fcd638891b6b5b76af22caf74832518"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/source-inventory.json",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/source-inventory.json",
       "sha256": "4d2c8d8e266ab8268161b1ee6bc290cba7fd56c897d6c1b97fcb6b467de922c6"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/source.patch",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/source.patch",
       "sha256": "71597dfdf49b244d55e30d820979e84f9cfa73d376a6ddb024329fe965ed6275"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/unit-tests-final.log",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/unit-tests-final.log",
       "sha256": "0d00aeb0b24742a10fe0afc5ae08b7ee7642d4890204fadbca8cfec8212a2b42"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/workspace-check.log",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/workspace-check.log",
       "sha256": "8563c1955bf3bb0830ca44c5511a2098de00896d7fb4d6b4fafddb00abae3609"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/osr-tests.log",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/osr-tests.log",
       "sha256": "5b35e1723113b9df94334b29154bab35d3ae643a9e3823e9ae5ea6757c3f161a"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/osr-tests-corrected.log",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/osr-tests-corrected.log",
       "sha256": "7a48d23b4c38a11286c1f947d8469a128c622e8efc16375708e4581982d6d87e"
     },
     {
-      "path": "/big/Code/Lumen/benchmark-results/engine-optimization-20260929/ejs-cpu.txt",
+      "path": "/big/Code/trust-js/benchmark-results/engine-optimization-20260929/ejs-cpu.txt",
       "sha256": "22d875bef2ca5b4008d413a628db18cbc8cb8fd31eea1d2009abd9e488631ead"
     }
   ],

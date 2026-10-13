@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${WASM_SPEC:-$ROOT/wasm-spec}"
 REPO="https://github.com/WebAssembly/spec.git"
-# Lumen's advertised core subset is the WebAssembly 2.0 scalar and control-flow baseline plus
+# TRust JS's advertised core subset is the WebAssembly 2.0 scalar and control-flow baseline plus
 # multi-value, funcref tables, sign-extension, non-trapping conversions, and bulk-memory
 # instructions. It does not yet advertise SIMD, externref tables, or the GC/exception/thread
 # features folded into 3.0. Pin the matching official release suite and audit newer supported

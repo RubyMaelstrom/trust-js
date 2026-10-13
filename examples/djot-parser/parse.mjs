@@ -1,10 +1,10 @@
 // Parse Djot markup to an AST and render it to HTML, entirely in-process (pure JS parser).
-// @djot/djot ships as CommonJS, so we default-import and destructure (lumen exposes a CJS
+// @djot/djot ships as CommonJS, so we default-import and destructure (trust-js exposes a CJS
 // module's `module.exports` as the ESM default).
 import djot from '@djot/djot';
 const { parse, renderHTML } = djot;
 
-const doc = `# Djot on lumen
+const doc = `# Djot on trust-js
 
 A *fast* markup language, parsed by a **zero-native** JS engine.
 

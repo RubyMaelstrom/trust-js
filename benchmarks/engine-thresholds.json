@@ -1,12 +1,14 @@
 {
   "schema_version": 1,
   "suite": "classic-v8-v7",
-  "engine": "lumen-jit",
-  "manifest_sha256": "b217406dff45071e49e663cf00e3170efb1ce221960a66790ee60bd949afe9d6",
+  "engine": "trust-js-jit",
+  "manifest_sha256": "20e2f00b29feb74e620b1f3e3e9677389ddea8f8cfd3b4263d7bb891921386ce",
+  "historical_manifest_sha256": "b217406dff45071e49e663cf00e3170efb1ce221960a66790ee60bd949afe9d6",
+  "manifest_rebrand_note": "The current digest identifies the rebranded manifest; the historical digest identifies the manifest used for the retained baseline measurements. Baseline values and artifact digests are unchanged.",
   "baseline": {
-    "report": "benchmark-results/engine-matrix-20260902-current-baseline-node-lumen.json",
+    "report": "benchmark-results/engine-matrix-20260902-current-baseline-node-trust-js.json",
     "report_sha256": "f237a25953a5875c0c09d41a86c447ae7ba1831f399222450f12f9b7bcd683e3",
-    "lumen_artifact_sha256": "398e4980e96d41c5e43bcbb174d6d70e708f5315c5d4e82083876d744f579959",
+    "trust_js_artifact_sha256": "398e4980e96d41c5e43bcbb174d6d70e708f5315c5d4e82083876d744f579959",
     "samples": 7,
     "confidence_level": 0.95,
     "cpu_affinity": [5]

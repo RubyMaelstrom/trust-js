@@ -75,7 +75,7 @@ application outputs remain under benchmark-results/engine-cycle21-20260930.
 
 Four balanced fresh-process application pairs use crystal Linux ARM64 CPU5,
 ordinary default-Intl release JIT, opt3/fat LTO/codegen-units1/panic-abort,
-with LUMEN_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
+with TRUST_JS_*/TRUST_*/LD_PRELOAD removed. Node v24.21.0 / V8 13.6.233.17-node.53
 supplies one reference per workload, not a distribution. Inputs are unchanged
 Djot@0.3.2 rendering, complete examples/ejs/code.js solver, Speedometer React
 TodoMVC reducer and Vue reactivity drivers. React/Vue are component work,

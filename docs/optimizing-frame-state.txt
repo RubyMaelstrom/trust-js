@@ -99,7 +99,7 @@ Before-effect deoptimization (frozen deopt11 development build)
 The source implements a terminal native-to-VM transfer for one ordinary logical frame.
 Focused tests and full library suites now exercise it, but broad validation remains open and it is not a
 speculation policy. The explicit development
-stress hook LUMEN_OPT_JIT_DEOPT_AT selects a bytecode boundary at compile time; when
+stress hook TRUST_JS_OPT_JIT_DEOPT_AT selects a bytecode boundary at compile time; when
 unset, it adds no generated branch or helper call. It cannot select suspending or
 baseline-inlined bodies. The next typed middle-end must choose guards using feedback
 and precise frame states; this hook does not implement that optimizer.
@@ -134,7 +134,7 @@ entry count. An expanded cyclic-owner sweep passes on both normal return and thr
 The original failure log is retained; no semantic assertion was waived. The full library
 suite now passes 1,562 tests in both debug and release with the feature enabled (the
 ordinary default tier plus explicit native-path fixtures). The feature-off debug suite
-passes 1,517 tests. Full Test262 under forced optimization and LUMEN_OPT_JIT_DEOPT_AT=7
+passes 1,517 tests. Full Test262 under forced optimization and TRUST_JS_OPT_JIT_DEOPT_AT=7
 completes with 53,572 passes, the same two known staging/sm legacy-reflection failures,
 and four skips. The uncapped schema-2 report preserves every failed/skipped path and
 reason; no skipped test or failure was waived by this work. This is the full suite under

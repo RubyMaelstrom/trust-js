@@ -1,7 +1,7 @@
-//! test262 conformance runner for the `lumen` engine.
+//! test262 conformance runner for the `trust-js` engine.
 //!
 //! Walks a tc39/test262 checkout, parses each test's YAML frontmatter, assembles the harness +
-//! test source, runs it through lumen, and checks the outcome against the test's `negative`
+//! test source, runs it through TRust JS, and checks the outcome against the test's `negative`
 //! expectation. Prints a per-category score + a top-failure histogram and writes
 //! `test262-report/summary.json`.
 //!
@@ -23,7 +23,6 @@ mod frontmatter;
 mod report;
 
 use frontmatter::{Frontmatter, Phase};
-use lumen::{Completion, Engine};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -31,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use trust_js::{Completion, Engine};
 
 #[derive(Default, Clone, Copy)]
 struct Tally {
@@ -50,7 +50,7 @@ enum Outcome {
 /// returns all per-engine allocator and OS resources to the process.
 const CHUNK: usize = 40;
 
-/// Max concurrent worker processes. lumen's per-op allocation caps keep each worker bounded (tens
+/// Max concurrent worker processes. TRust JS's per-op allocation caps keep each worker bounded (tens
 /// of MB in practice), so this can track core count; we still cap it so a huge box doesn't spawn an
 /// absurd number of children.
 const MAX_WORKERS: usize = 16;
@@ -103,7 +103,7 @@ unsafe impl GlobalAlloc for CapAlloc {
 static ALLOC: CapAlloc = CapAlloc;
 
 /// Per-worker *virtual address-space* ceiling (passed to `ulimit -v`, in KiB). This must leave
-/// room above `MEM_CAP` for the runner's guarded native stack and lumen's lazily committed 64 MiB
+/// room above `MEM_CAP` for the runner's guarded native stack and TRust JS's lazily committed 64 MiB
 /// coroutine-stack reservations: a 2 GiB ceiling falsely rejected conforming tests before their
 /// resident allocation approached the counting allocator's 2.5 GiB cap. Enforced on Linux; macOS
 /// may not honor RLIMIT_AS, so the counting allocator remains the real resident-memory backstop.
@@ -718,7 +718,7 @@ fn rel_path(root: &Path, p: &Path) -> String {
 // Running a single test (used inside a worker process)
 // ---------------------------------------------------------------------------------------------
 
-/// Isolate ordinary panics inside lumen as a `Fail`. (A stack overflow still aborts the worker —
+/// Isolate ordinary panics inside TRust JS as a `Fail`. (A stack overflow still aborts the worker —
 /// the parent handles that as a crash.)
 fn run_one(path: &Path, harness: &Harness) -> Outcome {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -736,7 +736,7 @@ fn run_one_inner(path: &Path, harness: &Harness) -> Outcome {
     // without `excludeArgFactories: ["immutable"]`, but on an engine implementing the
     // immutable-arraybuffer proposal %TypedArray%.prototype.slice must throw a TypeError for an
     // immutable-backed species result — exactly what the companion test
-    // speciesctor-destination-backed-by-immutable-buffer.js (which lumen passes) requires.
+    // speciesctor-destination-backed-by-immutable-buffer.js (which TRust JS passes) requires.
     if path.ends_with("TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js") {
         return Outcome::Skip("upstream: missing immutable exclusion".into());
     }
@@ -746,7 +746,7 @@ fn run_one_inner(path: &Path, harness: &Harness) -> Outcome {
     // point) checks only the formal parameter names and merely creates no var binding named
     // "arguments", so evaluating the declaration replaces the arguments object, as V8,
     // SpiderMonkey and the staging tests block-scoped-functions-annex-b-arguments.js and
-    // regress-602621.js expect. Lumen follows the current specification.
+    // regress-602621.js expect. TRust JS follows the current specification.
     if path.ends_with("annexB/language/function-code/block-decl-func-skip-arguments.js") {
         return Outcome::Skip("upstream: predates the current Annex B arguments rule".into());
     }
@@ -952,7 +952,7 @@ fn run_module(path: &Path, src: &str, harness: &Harness, fm: &Frontmatter) -> Ou
     judge_module(result, fm)
 }
 
-fn judge_module(result: Result<Completion, lumen::ParseError>, fm: &Frontmatter) -> Outcome {
+fn judge_module(result: Result<Completion, trust_js::ParseError>, fm: &Frontmatter) -> Outcome {
     match (&fm.negative, result) {
         (None, Ok(Completion::Value(_))) => Outcome::Pass,
         (None, Ok(Completion::Throw { name, message })) => {

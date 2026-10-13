@@ -1,5 +1,5 @@
-// A real-world Express app on the lumen runtime — CommonJS, running unmodified on lumen's
-// node:http (which bridges to Lumen.serve). Exercises real middleware: morgan (request logging),
+// A real-world Express app on the trust-js runtime — CommonJS, running unmodified on trust-js's
+// node:http (which bridges to TRustJS.serve). Exercises real middleware: morgan (request logging),
 // cors (CORS headers), and Express's own JSON body parser and router.
 const express = require('express');
 const morgan = require('morgan');
@@ -14,7 +14,7 @@ app.use(express.json());               // parses application/json request bodies
 
 // A plain text route.
 app.get('/', (req, res) => {
-  res.send('Hello from Express on lumen!\n');
+  res.send('Hello from Express on trust-js!\n');
 });
 
 // JSON with a route param.
@@ -34,7 +34,7 @@ app.post('/echo', (req, res) => {
 
 // Custom header + status.
 app.get('/teapot', (req, res) => {
-  res.set('X-Powered-By', 'lumen').status(418).send("I'm a teapot\n");
+  res.set('X-Powered-By', 'trust-js').status(418).send("I'm a teapot\n");
 });
 
 // 404 handler (Express falls through to this).

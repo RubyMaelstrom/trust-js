@@ -20,16 +20,16 @@ import zipfile
 VERSION = "48"
 URL = f"https://unicode.org/Public/cldr/{VERSION}/core.zip"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_collation.bin"
-ROOT_OUTPUT = ROOT / "crates/lumen/src/cldr_root_collation.bin"
-TEST_OUTPUT = ROOT / "crates/lumen/tests/cldr-48/CollationTest_CLDR_NON_IGNORABLE_SHORT.txt"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_collation.bin"
+ROOT_OUTPUT = ROOT / "crates/trust-js/src/cldr_root_collation.bin"
+TEST_OUTPUT = ROOT / "crates/trust-js/tests/cldr-48/CollationTest_CLDR_NON_IGNORABLE_SHORT.txt"
 TABLES = (("ja", "standard"), ("zh", "pinyin"), ("zh", "stroke"), ("zh", "zhuyin"))
 ROW = re.compile(r"^([0-9A-F ]+?)\s*;\s*(.*?)\s*(?:#.*)?$")
 ELEMENT = re.compile(r"\[([.*])([0-9A-F]{4})\.([0-9A-F]{4})\.([0-9A-F]{4})\]")
 
 
 def download() -> zipfile.ZipFile:
-    request = urllib.request.Request(URL, headers={"User-Agent": "Lumen CLDR generator"})
+    request = urllib.request.Request(URL, headers={"User-Agent": "TRust JS CLDR generator"})
     with urllib.request.urlopen(request) as response:
         return zipfile.ZipFile(io.BytesIO(response.read()))
 

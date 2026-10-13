@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Recompute the primary/non-primary time zone identifiers and region zones in tzdata.rs.
 
-usage: scripts/gen-tz-primaries.py TZDATA_SOURCE_DIR [crates/lumen/src/tzdata.rs]
+usage: scripts/gen-tz-primaries.py TZDATA_SOURCE_DIR [crates/trust-js/src/tzdata.rs]
 
 TZDATA_SOURCE_DIR is an IANA tz source tree (tzdata.zi, zone.tab, backward). A
 tzdata release tarball omits tzdata.zi; only its Zone (`Z name`) and Link
@@ -33,7 +33,7 @@ UTC_ALIASES = {"Etc/UTC", "Etc/GMT", "GMT"}
 
 def main():
     src = sys.argv[1]
-    path = sys.argv[2] if len(sys.argv) > 2 else "crates/lumen/src/tzdata.rs"
+    path = sys.argv[2] if len(sys.argv) > 2 else "crates/trust-js/src/tzdata.rs"
     zones, links, annotated = set(), {}, {}
     for line in open(f"{src}/tzdata.zi"):
         p = line.split()

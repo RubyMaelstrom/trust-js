@@ -96,7 +96,7 @@ Final checks use source-clean63-v2 and the ordinary primary release artifacts:
   pass 2,193 library, 53 desktop, 14 headless and one replay test, with 35 existing
   ignores. Three Test262-report unit tests pass.
 - Both repositories pass default and all-feature/all-target Clippy with
-  -D warnings; Lumen covers its entire workspace. Formatting and whitespace
+  -D warnings; TRust JS covers its entire workspace. Formatting and whitespace
   checks pass. cargo build --release builds all three shipping browser binaries.
 - The final desktop and terminal releases load Archive.org's 21,819-result
   LibriVox collection, including covers, titles and further rows after scrolling.

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# lumen installer. Downloads the prebuilt `lumen` runtime CLI for this platform from the GitHub
-# `nightly` release and installs it to ~/.lumen/bin.
+# trust-js installer. Downloads the prebuilt `trust-js` runtime CLI for this platform from the GitHub
+# `nightly` release and installs it to ~/.trust-js/bin.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lucid-softworks/lumen/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/RubyMaelstrom/trust-js/main/scripts/install.sh | bash
 #
 # Environment overrides:
-#   LUMEN_INSTALL   install prefix (default: $HOME/.lumen); the binary lands in $LUMEN_INSTALL/bin
-#   LUMEN_RELEASE   release tag to pull from (default: nightly)
+#   TRUST_JS_INSTALL   install prefix (default: $HOME/.trust-js); the binary lands in $TRUST_JS_INSTALL/bin
+#   TRUST_JS_RELEASE   release tag to pull from (default: nightly)
 set -euo pipefail
 
-REPO="lucid-softworks/lumen"
-RELEASE="${LUMEN_RELEASE:-nightly}"
-INSTALL_DIR="${LUMEN_INSTALL:-$HOME/.lumen}"
+REPO="RubyMaelstrom/trust-js"
+RELEASE="${TRUST_JS_RELEASE:-nightly}"
+INSTALL_DIR="${TRUST_JS_INSTALL:-$HOME/.trust-js}"
 BIN_DIR="$INSTALL_DIR/bin"
 
 red()   { printf '\033[31m%s\033[0m\n' "$1"; }
@@ -32,13 +32,13 @@ case "$os-$arch" in
   Linux-x86_64)          target="x86_64-unknown-linux-gnu" ;;
   Linux-aarch64|Linux-arm64) target="aarch64-unknown-linux-gnu" ;;
   *)
-    error "unsupported platform '$os-$arch'. Build from source: cargo build --release -p lumen-cli" ;;
+    error "unsupported platform '$os-$arch'. Build from source: cargo build --release -p trust-js-cli" ;;
 esac
 
-asset="lumen-cli-$target"
+asset="trust-js-cli-$target"
 url="https://github.com/$REPO/releases/download/$RELEASE/$asset"
 
-bold "Installing lumen ($target, $RELEASE release)"
+bold "Installing trust-js ($target, $RELEASE release)"
 mkdir -p "$BIN_DIR"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
@@ -53,9 +53,9 @@ if head -c 4 "$tmp" | grep -q '<'; then
   error "downloaded file is not a binary (got an HTML page — the asset may be missing)"
 fi
 
-install -m 755 "$tmp" "$BIN_DIR/lumen"
-green "installed lumen -> $BIN_DIR/lumen"
-"$BIN_DIR/lumen" --version >/dev/null 2>&1 || true
+install -m 755 "$tmp" "$BIN_DIR/trust-js"
+green "installed trust-js -> $BIN_DIR/trust-js"
+"$BIN_DIR/trust-js" --version >/dev/null 2>&1 || true
 
 # PATH guidance (offer to append to the detected shell profile).
 case ":$PATH:" in
@@ -74,10 +74,10 @@ line="export PATH=\"$BIN_DIR:\$PATH\""
 [ "$shell_name" = "fish" ] && line="fish_add_path $BIN_DIR"
 
 echo
-bold "Add lumen to your PATH:"
+bold "Add trust-js to your PATH:"
 if [ -n "$profile" ] && [ -w "$(dirname "$profile")" ]; then
   if ! grep -qsF "$BIN_DIR" "$profile" 2>/dev/null; then
-    printf '\n# lumen\n%s\n' "$line" >>"$profile"
+    printf '\n# trust-js\n%s\n' "$line" >>"$profile"
     green "appended to $profile — restart your shell or: source $profile"
   else
     green "already configured in $profile"

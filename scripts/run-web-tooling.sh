@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 #
 # Run V8's Web Tooling Benchmark (babel, terser, acorn, etc. - real-world
-# JS tooling workloads) on the lumen engine, via the benchmark's pre-built
+# JS tooling workloads) on the trust-js engine, via the benchmark's pre-built
 # dist/cli.js bundle. Expects the benchmark to already exist as a sibling
 # ../web-tooling-benchmark checkout with `npm install` run (which produces
 # dist/cli.js), or set WEB_TOOLING_BENCHMARK_DIR to the checkout directory.
-# Builds the `lumen` CLI in release mode (unless LUMEN_BIN points at a
+# Builds the `trust-js` CLI in release mode (unless TRUST_JS_BIN points at a
 # prebuilt binary), then runs the bundle. `--only <name>` is implemented by
 # rebuilding the upstream bundle with webpack's build-time selector; it is not
-# forwarded to lumen or to dist/cli.js.
+# forwarded to trust-js or to dist/cli.js.
 #
 #   scripts/run-web-tooling.sh                     # full suite
 #   scripts/run-web-tooling.sh --only babel        # selected benchmark
 #   WEB_TOOLING_BENCHMARK_DIR=/path/to/web-tooling-benchmark scripts/run-web-tooling.sh --only terser
-#   LUMEN_BIN=/path/to/lumen scripts/run-web-tooling.sh --only acorn   # skip the build, use this binary
+#   TRUST_JS_BIN=/path/to/trust-js scripts/run-web-tooling.sh --only acorn   # skip the build, use this binary
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,9 +66,9 @@ if [ ! -f "$WEB_TOOLING_BENCHMARK_DIR/dist/cli.js" ]; then
   exit 1
 fi
 
-if [ -z "${LUMEN_BIN:-}" ]; then
-  cargo build --release -q -p lumen --bin lumen
-  LUMEN_BIN="$ROOT/target/release/lumen"
+if [ -z "${TRUST_JS_BIN:-}" ]; then
+  cargo build --release -q -p trust-js --bin trust-js
+  TRUST_JS_BIN="$ROOT/target/release/trust-js"
 fi
 
 WORK="$(mktemp -d)"
@@ -76,7 +76,7 @@ trap 'rm -rf "$WORK"' EXIT
 OUTPUT="$WORK/web-tooling-output"
 
 set +e
-"$LUMEN_BIN" "$WEB_TOOLING_BENCHMARK_DIR/dist/cli.js" "$@" 2>&1 | tee "$OUTPUT"
+"$TRUST_JS_BIN" "$WEB_TOOLING_BENCHMARK_DIR/dist/cli.js" "$@" 2>&1 | tee "$OUTPUT"
 status=${PIPESTATUS[0]}
 set -e
 

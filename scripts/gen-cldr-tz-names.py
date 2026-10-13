@@ -32,7 +32,7 @@ import cldr_locales  # noqa: E402
 
 TAG = "48.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_tz_names.rs"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_tz_names.rs"
 CLDR_JSON = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
 # Every shipped CLDR locale (scripts/cldr_locales.py).
 LOCALES = list(cldr_locales.locales())
@@ -48,7 +48,7 @@ def load(relative: str) -> dict:
         with open(os.path.join(cldr_dir, relative), encoding="utf-8") as file:
             return json.load(file)
     request = urllib.request.Request(
-        f"{CLDR_JSON}/{relative}", headers={"User-Agent": "Lumen CLDR time zone name generator"}
+        f"{CLDR_JSON}/{relative}", headers={"User-Agent": "TRust JS CLDR time zone name generator"}
     )
     with urllib.request.urlopen(request) as response:
         return json.load(response)

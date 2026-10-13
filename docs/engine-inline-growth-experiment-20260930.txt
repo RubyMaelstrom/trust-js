@@ -16,7 +16,7 @@ All 29 selected inlining tests and strict all-target engine Clippy pass.
 The release engine builds in 3m43s. These checks were insufficient: a later
 reflection check catches a semantic regression before performance screening.
 
-With LUMEN_TIER_THRESHOLD=0, a getter inside the small sloppy helper observes
+With TRUST_JS_TIER_THRESHOLD=0, a getter inside the small sloppy helper observes
 h.f.caller===large as true on the pinned baseline and false on the prototype.
 The tier log confirms publication of the larger caller. Narrowing growth
 to strict functions alone is insufficient: the strict equivalent capturing
@@ -31,7 +31,7 @@ Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
 (PrepareForOrdinaryCall), :19922 (EvaluateCall), :12900 (Liveness), and :13010
 (AddToKeptObjects). Ordinary calls create the callee execution context;
 optimizations must preserve observable identity/context and permitted weak
-liveness. The legacy caller and Error.stack observations are Lumen extensions,
+liveness. The legacy caller and Error.stack observations are TRust JS extensions,
 and the project's tier agreement still applies. Official clauses:
 https://tc39.es/ecma262/#sec-prepareforordinarycall
 https://tc39.es/ecma262/#sec-evaluatecall
@@ -43,6 +43,6 @@ The prototype code and test are fully restored. No throughput or memory
 comparison was run after the semantic failure. Raw source, exact patch,
 release binaries, check logs and baseline/prototype reflection outputs remain
 in benchmark-results/engine-cycle12-20260930. Baseline production matches
-b1c975f; HEAD before this report is 62f4593. target/release/lumen still holds
+b1c975f; HEAD before this report is 62f4593. target/release/trust-js still holds
 the parked prototype. Installed artifacts are unchanged. Only this report
 is committed; a larger budget must not be reintroduced without frame proofs.

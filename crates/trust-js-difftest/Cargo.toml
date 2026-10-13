@@ -1,0 +1,15 @@
+# Differential fuzzer: the same generated program runs in the interp tier (reference oracle) and
+# the bytecode tier; any observable divergence is minimized and archived. See src/main.rs.
+[package]
+name = "trust-js-difftest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+trust-js = { path = "../trust-js" }
+
+[lints]
+workspace = true

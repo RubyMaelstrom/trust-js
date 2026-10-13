@@ -27,8 +27,8 @@
       "sha256": "bcce076aedf99c810e08234c07111978ddbea05bea0e3c1c8755f152d82f9e2f"
     },
     {
-      "source": "/big/Code/TRust/target/release/lumen",
-      "frozen": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+      "source": "/big/Code/TRust/target/release/trust-js",
+      "frozen": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
       "sha256": "4bed6a55dc9f57276164fe15fe099efc49dfe31ed18add0709cbbe1cfb3df12e"
     }
   ],
@@ -43,7 +43,7 @@
           "cargo",
           "test",
           "-p",
-          "lumen",
+          "trust-js",
           "--lib",
           "--features",
           "embed,optimizing-jit",
@@ -52,7 +52,7 @@
           "retired_settings_request",
           "--nocapture"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "started": "2026-09-29T05:34:41.076783+00:00",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v1",
         "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-engine-focused.log",
@@ -65,14 +65,14 @@
           "cargo",
           "test",
           "-p",
-          "lumen",
+          "trust-js",
           "--lib",
           "--features",
           "embed,optimizing-jit",
           "--",
           "--nocapture"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "started": "2026-09-29T05:35:18.277794+00:00",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v1",
         "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-engine-debug.log",
@@ -86,14 +86,14 @@
           "test",
           "--release",
           "-p",
-          "lumen",
+          "trust-js",
           "--lib",
           "--features",
           "embed,optimizing-jit"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
-        "source_note": "All Lumen code/test hashes match v1; v2 changes only a TRust test and chronology.",
+        "source_note": "All TRust JS code/test hashes match v1; v2 changes only a TRust test and chronology.",
         "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-engine-release-v2.log",
         "exit": 0,
         "observed_finished": "2026-09-29T05:48:18.109075+00:00"
@@ -238,9 +238,9 @@
           "build",
           "--release",
           "-p",
-          "lumen",
+          "trust-js",
           "--bin",
-          "lumen"
+          "trust-js"
         ],
         "cwd": "/big/Code/TRust",
         "started": "2026-09-29T05:55:03.101319+00:00",
@@ -262,9 +262,9 @@
           "-D",
           "warnings"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
-        "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-lumen-workspace-clippy-v2.log",
+        "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-trust-js-workspace-clippy-v2.log",
         "exit": 0,
         "status_evidence": "Unified exec completed with exit0 in this conversation; production and relevant test inputs verified by hash."
       },
@@ -279,9 +279,9 @@
           "-D",
           "warnings"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
-        "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-lumen-default-clippy.log",
+        "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-trust-js-default-clippy.log",
         "exit": 0,
         "status_evidence": "Unified exec completed with exit0 in this conversation; production and relevant test inputs verified by hash."
       },
@@ -295,7 +295,7 @@
           "--",
           "report::tests"
         ],
-        "cwd": "/big/Code/Lumen",
+        "cwd": "/big/Code/trust-js",
         "source": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
         "log": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-report-tests.log",
         "exit": 0,
@@ -313,7 +313,7 @@
         "description": "Unsupported cross-workspace feature selection; no tests ran. Replaced by ordinary engine-root release test command."
       },
       {
-        "path": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-lumen-workspace-clippy-v1.log",
+        "path": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-trust-js-workspace-clippy-v1.log",
         "description": "Intermediate equivalent zero-pattern rewrite triggered needless_match; corrected without dropping negative-zero normalization."
       }
     ],
@@ -358,7 +358,7 @@
         "runner_sha256": "07b2a72e8246312c01ac2355da074d16c136eb8284ae98e782006398d04fc566",
         "controller_sha256": "119e5b667deb2d6da9031b7c2111f830a5cc27dee217efe55f4e37531ef0f75c",
         "source_snapshot": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
-        "fixture": "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official",
+        "fixture": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official",
         "test_source_revision": "Document-retirement collection request and focused lifetime regression, followed by reviewed Clippy cleanup. Full final-source engine/browser debug/release and strict default/all-feature Clippy checks recorded in clean63-validation.json. Earlier Test262, CSS WPT, and x86 evidence retained under its original source identity. Final collection controls run separately.",
         "scope": "Unmodified official Speedometer: all20 suites/58 actions/one iteration in every fresh process.",
         "build": "Candidate is the exact primary-tree ordinary cargo build --release artifact, default features; optional Cranelift and architecture diagnostics absent. Original17 is the frozen historical template-mode comparator.",
@@ -8690,7 +8690,7 @@
         "runner_sha256": "5b9a8072c42c21fd9af342d0217256b81241ccb079911bbdac084bf34d5f37c4",
         "controller_sha256": "119e5b667deb2d6da9031b7c2111f830a5cc27dee217efe55f4e37531ef0f75c",
         "source_snapshot": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/source-clean63-v2",
-        "fixture": "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official",
+        "fixture": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official",
         "test_source_revision": "Document-retirement collection request and focused lifetime regression, followed by reviewed Clippy cleanup. Full final-source engine/browser debug/release and strict default/all-feature Clippy checks recorded in clean63-validation.json. Earlier Test262, CSS WPT, and x86 evidence retained under its original source identity. Final collection controls run separately.",
         "scope": "Separate persistent workload: three pinned applications, six workflows/48 actions per process, one document load per application. No official score. Exact state parity required.",
         "build": "Candidate is the exact primary-tree ordinary cargo build --release artifact, default features; optional Cranelift and architecture diagnostics absent. Original17 is the frozen historical template-mode comparator.",
@@ -16538,18 +16538,18 @@
         "cpu": 5,
         "pairs": 4,
         "fixture": {
-          "file": "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js",
+          "file": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js",
           "sha256": "03999f6465abadea49b2b46706771a7a0ffb562bb560de062f9452fdff954052"
         },
         "variants": [
           {
             "name": "baseline",
-            "file": "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1",
+            "file": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1",
             "sha256": "2bc080f09e9afe40a5fced16bce103d1d061e2d3e094051dc2ce0c715c83ca3f"
           },
           {
             "name": "candidate",
-            "file": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+            "file": "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
             "sha256": "4bed6a55dc9f57276164fe15fe099efc49dfe31ed18add0709cbbe1cfb3df12e"
           }
         ],
@@ -16574,9 +16574,9 @@
         "statistics": "Four balanced fresh-process pairs; each contributes median of three internal samples. Paired log-t95 df3 and exact paired median bootstrap. Median paired duration loss greater than3% with log-t95 lower bound above1 blocks; all14 families and process resources retained.",
         "scope": "Current primary default-feature engine artifact versus original frozen collection baseline, unchanged fixture. This is a final accumulated-implementation control, not single-change attribution.",
         "environment": {
-          "LUMEN_OPT_JIT": "0"
+          "TRUST_JS_OPT_JIT": "0"
         },
-        "inherited_controls": "LUMEN_, TRUST_, LD_PRELOAD and shell injection variables cleared",
+        "inherited_controls": "TRUST_JS_, TRUST_, LD_PRELOAD and shell injection variables cleared",
         "runner_sha256": "ba95b530880af2f2a5d78960eb8be0c59f7243f362b27019c53cd67f7ce0d51e",
         "timing_helper_sha256": "4c23089cdb8b5b61cf219667e524d1c20eacf053e3c3cf550f8ca32bf0b726d6",
         "runs": [
@@ -16596,9 +16596,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1",
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3897416,
             "status": 0,
@@ -16889,9 +16889,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3897659,
             "status": 0,
@@ -17182,9 +17182,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3897742,
             "status": 0,
@@ -17475,9 +17475,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1",
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3897829,
             "status": 0,
@@ -17768,9 +17768,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1",
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3898072,
             "status": 0,
@@ -18061,9 +18061,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3898304,
             "status": 0,
@@ -18354,9 +18354,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1",
+              "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3898388,
             "status": 0,
@@ -18647,9 +18647,9 @@
               "taskset",
               "-c",
               "5",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1",
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1",
               "--tier=jit",
-              "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
+              "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js"
             ],
             "pid": 3898475,
             "status": 0,
@@ -19449,9 +19449,9 @@
         "blocking_components": [],
         "input_sha256": {
           "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/clean63-v1-collections/report.json": "ea7d36bf882bce679594c5322308a430a48b5f04c6c599f20a594ea0586cf7b9",
-          "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1": "2bc080f09e9afe40a5fced16bce103d1d061e2d3e094051dc2ce0c715c83ca3f",
-          "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-clean63-primary-v1": "4bed6a55dc9f57276164fe15fe099efc49dfe31ed18add0709cbbe1cfb3df12e",
-          "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js": "03999f6465abadea49b2b46706771a7a0ffb562bb560de062f9452fdff954052"
+          "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1": "2bc080f09e9afe40a5fced16bce103d1d061e2d3e094051dc2ce0c715c83ca3f",
+          "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-clean63-primary-v1": "4bed6a55dc9f57276164fe15fe099efc49dfe31ed18add0709cbbe1cfb3df12e",
+          "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js": "03999f6465abadea49b2b46706771a7a0ffb562bb560de062f9452fdff954052"
         }
       }
     }
@@ -36208,9 +36208,9 @@
       "blocking_components": [],
       "input_sha256": {
         "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/integration60-v1-collections/report.json": "1f046c8c9058a8ece94c6c2eb8110aca7f0d5a44ff706ecd9160bd7eeae2a29c",
-        "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/lumen-map-hash-baseline-pass1": "2bc080f09e9afe40a5fced16bce103d1d061e2d3e094051dc2ce0c715c83ca3f",
-        "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/lumen-integration60-primary-v2": "2c1649027ab6c220f51a6acc15123a48836fd0d2c90e6148b88291fbbd5b4485",
-        "/big/Code/Lumen/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js": "03999f6465abadea49b2b46706771a7a0ffb562bb560de062f9452fdff954052"
+        "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/trust-js-map-hash-baseline-pass1": "2bc080f09e9afe40a5fced16bce103d1d061e2d3e094051dc2ce0c715c83ca3f",
+        "/big/Code/TRust/target/architecture-rework-20260928-gGJhNCNs/trust-js-integration60-primary-v2": "2c1649027ab6c220f51a6acc15123a48836fd0d2c90e6148b88291fbbd5b4485",
+        "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/map-hash-controls-pass1.js": "03999f6465abadea49b2b46706771a7a0ffb562bb560de062f9452fdff954052"
       }
     },
     "plot_history_scope_correction": {

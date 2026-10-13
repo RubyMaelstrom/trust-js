@@ -10,14 +10,14 @@ import urllib.request
 
 VERSION = "17.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/unicode_norm.rs"
-TEST_OUTPUT = ROOT / "crates/lumen/tests/unicode-17.0.0/NormalizationTest.txt"
+OUTPUT = ROOT / "crates/trust-js/src/unicode_norm.rs"
+TEST_OUTPUT = ROOT / "crates/trust-js/tests/unicode-17.0.0/NormalizationTest.txt"
 UCD = f"https://www.unicode.org/Public/{VERSION}/ucd"
 
 
 def download(name: str) -> str:
     request = urllib.request.Request(
-        f"{UCD}/{name}", headers={"User-Agent": "Lumen Unicode normalization generator"}
+        f"{UCD}/{name}", headers={"User-Agent": "TRust JS Unicode normalization generator"}
     )
     with urllib.request.urlopen(request) as response:
         return response.read().decode("utf-8")

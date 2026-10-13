@@ -4,7 +4,7 @@ Strict large-caller inlining — application comparison, 30 September 2026
 The old whole-body 320-source-operation allowance rejects small callees in
 large callers. The solver lexer is an application target. This experiment
 adds at most 64 callee source operations to strict ordinary callers above
-320 and at most 4096 original operations. Explicit LUMEN_INLINE_BUDGET keeps
+320 and at most 4096 original operations. Explicit TRUST_JS_INLINE_BUDGET keeps
 its previous diagnostic meaning. Callees retain the existing size, private
 binding, closure-name, identity, receiver and operation allowlist proofs;
 this expanded path additionally requires strict ordinary non-suspending
@@ -37,7 +37,7 @@ Consulted local official ECMA-262 snapshot
  (PrepareForOrdinaryCall), :19922 (EvaluateCall), :12900 (Liveness), and
  :13010 (AddToKeptObjects). Ordinary calls create a callee execution context;
  the splice must preserve its observable context and permitted weak liveness.
- Error.stack and legacy caller are Lumen extensions covered by tier agreement.
+ Error.stack and legacy caller are TRust JS extensions covered by tier agreement.
  https://tc39.es/ecma262/#sec-prepareforordinarycall
  https://tc39.es/ecma262/#sec-evaluatecall
  https://tc39.es/ecma262/#sec-liveness
@@ -74,7 +74,7 @@ are preserved under benchmark-results/engine-cycle19-20260930.
 
 Measurements: crystal Linux ARM64, CPU affinity 5, release opt-level=3,
 fat LTO, codegen-units=1, panic=abort, default Intl, ordinary template JIT.
-Node reference v24.21.0 / V8 13.6.233.17-node.53. LUMEN_*, TRUST_* and
+Node reference v24.21.0 / V8 13.6.233.17-node.53. TRUST_JS_*, TRUST_* and
 LD_PRELOAD are removed. Four fresh balanced baseline/candidate pairs use
 unchanged pinned Djot@0.3.2 rendering, complete examples/ejs/code.js solver,
 Speedometer React TodoMVC reducer and Vue reactivity drivers. React/Vue

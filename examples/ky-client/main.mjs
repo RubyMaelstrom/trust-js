@@ -1,4 +1,4 @@
-// ky is a tiny HTTP client built on fetch. lumen ships fetch (http only), so ky runs unmodified.
+// ky is a tiny HTTP client built on fetch. trust-js ships fetch (http only), so ky runs unmodified.
 // To keep the demo self-contained we spin up a local node:http server and call it with ky.
 import { createServer } from 'node:http';
 import ky from 'ky';
@@ -16,7 +16,7 @@ await new Promise((r) => server.listen(0, r));
 const base = `http://127.0.0.1:${server.address().port}`;
 
 // GET with ky, parsed as JSON.
-const got = await ky.get(`${base}/hello?name=lumen`).json();
+const got = await ky.get(`${base}/hello?name=trust-js`).json();
 console.log('GET  ->', JSON.stringify(got));
 
 // POST a JSON body with ky.
@@ -25,7 +25,7 @@ console.log('POST ->', JSON.stringify(posted));
 
 // ky's retry/hooks: add a header via a beforeRequest hook.
 const withHook = await ky.get(`${base}/hooked`, {
-  hooks: { beforeRequest: [(request) => request.headers.set('x-demo', 'ky-on-lumen')] },
+  hooks: { beforeRequest: [(request) => request.headers.set('x-demo', 'ky-on-trust-js')] },
 }).json();
 console.log('HOOK ->', JSON.stringify(withHook));
 

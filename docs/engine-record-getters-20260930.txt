@@ -33,7 +33,7 @@ Consulted ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202,
 OrdinaryGet selects the live descriptor/getter and calls with the original
 receiver; PrepareForOrdinaryCall defines the execution context. The closed
 proof permits no author observer of an omitted frame. Guard misses preserve
-full calls, including Lumen's caller/Error.stack observations. Official clauses:
+full calls, including TRust JS's caller/Error.stack observations. Official clauses:
 https://tc39.es/ecma262/#sec-ordinaryget
 https://tc39.es/ecma262/#sec-prepareforordinarycall
 https://tc39.es/ecma262/#sec-ordinarycallbindthis

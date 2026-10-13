@@ -1,6 +1,6 @@
 # Offline browser replay gates
 
-These fixtures exercise TRust's production Lumen page pipeline without a terminal, window, or
+These fixtures exercise TRust's production TRust JS page pipeline without a terminal, window, or
 network. Every fixture must finish with matching nonempty `data-replay-checksum` and
 `data-replay-expected` attributes and without a JavaScript error or panic.
 
@@ -9,7 +9,7 @@ selectors, mutation delivery, and layout. `speedometer-vue-todomvc.html` runs th
 Speedometer 3.1 Vue TodoMVC workload: Vue 3.2.47 mounts the application, then the replay performs
 the official 100-add, 100-complete, and 100-delete interaction shape.
 
-Run them from the Lumen root with TRust's `trust-browser-replay` example, which prints a JSON
+Run them from the TRust JS root with TRust's `trust-browser-replay` example, which prints a JSON
 report and exits nonzero if any fixture fails:
 
 ```sh
@@ -22,6 +22,6 @@ V=browser-replay-fixtures/speedometer-3.1/resources/todomvc/architecture-example
   benchmarks/browser-replays/*.html
 ```
 
-The third-party JavaScript and CSS are not checked into Lumen. `../browser-replay-assets.json`
+The third-party JavaScript and CSS are not checked into TRust JS. `../browser-replay-assets.json`
 pins their upstream repository, revision, paths, and SHA-256 digests; place them under the
 git-ignored `browser-replay-fixtures/` directory at those paths.

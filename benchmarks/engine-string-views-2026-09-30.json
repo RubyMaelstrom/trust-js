@@ -7,27 +7,27 @@
     "head": "d3dd5112ac335ec206a621bbef364287e02671ad",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "bba1b67624248631f4d915379aa789fb0614613c2ddd9506ed1c62e8f3d5069f"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "85975c994e6b217d8729782dae7531624b7e2d30411ee90936c32e1aed776155"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "bc44142ff5cf161db31c30510bc9494808a237e9521d94afcd9f3831fdc515b9"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "1e5a9583fb321aadca91d9c7d11721a41cc7693e6998b503c8a5a366fb5f6c7d"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "791e22a847058d9aa6aa83429ab7315a3f4cdf95d1b9fa03e74a7a813535836b"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82218c1e06597faa19d5bad3c160cc431ce0686a9be52fd4f8b5c532360651e9"
       }
     ],
@@ -39,39 +39,39 @@
     "head": "d3dd5112ac335ec206a621bbef364287e02671ad",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "59eb0bc2bd4c4039f1aa3d484989de4e8eb93678cf1468848e1ea1cce1e11582"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "a5740425a667c633bf1d364dcaf7c69015af88f31418486ffd2646c1855eb8ea"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "ae88a105dd918f3e4b9183287e0efb940c7b043f4bc1c0246e05a6693b161364"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "1e5a9583fb321aadca91d9c7d11721a41cc7693e6998b503c8a5a366fb5f6c7d"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "3f7ce28dcb0caf0a83d3ca28f52dbb6dabde799d21ffafeacef073b3a13a0ccb"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "0f75ebae7351afbe4eb0a7e653e1f8e17dc802667e0ae5043ac12151c93927b1"
       },
       {
-        "path": "crates/lumen/src/lstr.rs",
+        "path": "crates/trust-js/src/lstr.rs",
         "sha256": "5e08bbb09b59c079bb9449fecbd8aa4747b802b592eb359374a4e502a3cb0b10"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "178271d8c46b2efcc2d5d751205525a805fc8c5575d1a8fe5ac9eaa0ccf8d212"
       },
       {
-        "path": "crates/lumen/src/regex.rs",
+        "path": "crates/trust-js/src/regex.rs",
         "sha256": "fc7294d2f7ff9695521ed80aaf3929bbf78ddfed826a5d9816ba687c7ad0638f"
       }
     ],
@@ -86,7 +86,7 @@
     "affinity": 5
   },
   "environment": {
-    "build": "cargo build --release -p lumen --bin lumen; opt-level=3, fat LTO, codegen-units=1, panic=abort",
+    "build": "cargo build --release -p trust-js --bin trust-js; opt-level=3, fat LTO, codegen-units=1, panic=abort",
     "tier": "jit",
     "features": [
       "default",
@@ -95,17 +95,17 @@
     "optimizing_jit": false,
     "architecture_diagnostics": false,
     "affinity_cpu": 5,
-    "controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "User desktop applications remained active. No owned build, test or profiler overlapped application timings or peak observations."
   },
   "artifacts": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle3-20260930/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle3-20260930/trust-js-baseline",
       "sha256": "a038216b2500d303a3af1da3ecb6975d67d20daf109ebe6efa71d424a2d0efb4",
       "bytes": 25120440
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle3-20260930/lumen-candidate-v2",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle3-20260930/trust-js-candidate-v2",
       "sha256": "44bdca6d488c7c30db2d15c820568bf4fb9e6db217b23a520b1e321dabfff535",
       "bytes": 25077424
     },
@@ -152,19 +152,19 @@
   },
   "sources": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle3-20260930/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle3-20260930/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle3-20260930/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle3-20260930/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle3-20260930/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle3-20260930/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },
@@ -1378,7 +1378,7 @@
   },
   "validation": {
     "engine_tests": "1568 passed, 0 failed on final source",
-    "clippy": "cargo clippy -p lumen --all-targets -- -D warnings passed",
+    "clippy": "cargo clippy -p trust-js --all-targets -- -D warnings passed",
     "workspace": "cargo check --workspace --all-targets passed",
     "regressions": "Seven additional tests beyond the Unicode-only baseline cover flattened owners, copy thresholds, packed drops, native readers, relative anchors/lookbehind/sticky/capture indices, astral mappings, cached parent sharing and memory census.",
     "native_review": "ARM64 ASCII byte-read guards, ARM64/x64 length/owner paths and optional optimizer decimal-key length guard reviewed. Views are at least 256 bytes, outside the <=10-byte inline key-reader bound.",

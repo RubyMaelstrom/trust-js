@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lumen playground</title>
-<meta name="description" content="Run JavaScript in lumen — a JS engine written in Rust, passing 100% of test262 — compiled to WebAssembly, right in your browser.">
+<title>TRust JS playground</title>
+<meta name="description" content="Run JavaScript in TRust JS — a JS engine written in Rust — compiled to WebAssembly, right in your browser.">
 <style>
   :root {
     --bg: #f7f7f8; --panel: #ffffff; --text: #1a1a20; --muted: #6b6b76;
@@ -98,11 +98,11 @@
 </head>
 <body>
 <header>
-  <h1>lumen<span class="dot">.</span>playground</h1>
+  <h1>TRust JS<span class="dot">.</span>playground</h1>
   <span class="badge">test262 <b>100%</b> · 53,284 tests</span>
   <span class="badge" id="version" hidden></span>
   <nav>
-    <a href="https://github.com/lucid-softworks/lumen">GitHub</a>
+    <a href="https://github.com/RubyMaelstrom/trust-js">GitHub</a>
     <a href="https://test262.fyi/">test262.fyi</a>
   </nav>
 </header>
@@ -127,9 +127,9 @@
   </section>
 </main>
 <footer>
-  lumen is a JavaScript engine written in Rust (zero dependencies), compiled here to WebAssembly.
+  TRust JS is a JavaScript engine written in Rust, compiled here to WebAssembly.
   Every run starts from a fresh realm. <kbd>⌘</kbd>+<kbd>Enter</kbd> runs.
-  Browser-build limits: generators and <code>async</code>/<code>await</code> throw for now (lumen's
+  Browser-build limits: generators and <code>async</code>/<code>await</code> throw for now (TRust JS's
   coroutines run on OS threads, which wasm doesn't have) — promises and everything else work;
   <code>Math.random()</code> is deterministic.
 </footer>
@@ -139,7 +139,7 @@ const src = $('src'), hl = $('hl'), out = $('out'), status = $('status');
 const runBtn = $('run');
 
 const EXAMPLES = {
-  'hello': `const who = ['world', 'lumen'];
+  'hello': `const who = ['world', 'trust-js'];
 for (const w of who) console.log(\`hello, \${w}!\`);
 'done'`,
   'bigint fib': `let [a, b] = [0n, 1n];

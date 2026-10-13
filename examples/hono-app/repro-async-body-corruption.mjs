@@ -7,12 +7,12 @@
 // Root cause: an `async`/generator body runs on a coroutine, outside `Interp::call`'s tail-call
 // trampoline. A leaked `tco_ok == true` (ambient state a promise reaction can leave set) made a
 // top-level `return f(...)` in that body get parked as a *pending tail call* that nothing ran, so
-// the function resolved to `undefined`. Fixed in crate `lumen` by forcing `tco_ok` off before
+// the function resolved to `undefined`. Fixed in crate `trust-js` by forcing `tco_ok` off before
 // each statement of a coroutine body (`run_async`/`run_generator`), plus saving/restoring it
 // across the coroutine handoff. See the unit test `async_tail_return_survives_leaked_tco`.
 //
 // Run (from examples/hono-app, after `npm install`):
-//   ../../target/release/lumen-cli repro-async-body-corruption.mjs
+//   ../../target/release/trust-js-cli repro-async-body-corruption.mjs
 // Now matches Node:  {"t":1}  then  {"plain":true}
 import { Hono } from 'hono';
 
@@ -24,5 +24,5 @@ app.get('/plain', (c) => c.json({ plain: true }));
 const read = async (p) =>
   JSON.stringify(await (await app.fetch(new Request('http://localhost' + p))).text());
 
-console.log('middleware route /t :', await read('/t'));      // -> undefined in lumen
-console.log('plain route AFTER   :', await read('/plain'));  // -> undefined in lumen (poisoned)
+console.log('middleware route /t :', await read('/t'));      // -> undefined in trust-js
+console.log('plain route AFTER   :', await read('/plain'));  // -> undefined in trust-js (poisoned)

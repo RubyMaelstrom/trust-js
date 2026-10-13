@@ -100,7 +100,7 @@ artifact is promoted.
 
 Four balanced fresh-process pairs per application use crystal Linux
 7.2.7-crystal ARM64, CPU5, ordinary default-Intl release JIT, opt3/fat LTO/
-codegen-units1/panic-abort. LUMEN_*, TRUST_* and LD_PRELOAD are removed;
+codegen-units1/panic-abort. TRUST_JS_*, TRUST_* and LD_PRELOAD are removed;
 optimizing-jit and architecture probes are off. Desktop applications remain
 active; no owned build, test or profiler overlaps timing or peak measurements.
 Node v24.21.0 / V8 13.6.233.17-node.53 supplies one output/time reference per

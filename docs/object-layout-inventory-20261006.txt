@@ -44,16 +44,16 @@ separately in `unavailable_borrows`.
 
 Validation and provenance
 -------------------------
-Validated in isolated source worktree `/big/Code/Lumen/benchmark-results/property-inventory-20261006-worktree-63f2`
+Validated in isolated source worktree `/big/Code/trust-js/benchmark-results/property-inventory-20261006-worktree-63f2`
 on base revision `63f2d404982c23a0ef5b0785c3b0fb9422ffa9f2`. The instrumentation change is only
-`crates/lumen/src/allocation_diagnostics.rs`; its full patch remains in the local investigation directory named below.
+`crates/trust-js/src/allocation_diagnostics.rs`; its full patch remains in the local investigation directory named below.
 
 The following checks passed in that isolated tree:
 
-- `cargo test -p lumen --lib --features architecture-diagnostics allocation_diagnostics::tests::` — 5 passed, 0 failed.
-- `cargo check -p lumen --features architecture-diagnostics` — passed.
-- `cargo check -p lumen --no-default-features --features architecture-diagnostics` — passed.
-- `CARGO_BUILD_JOBS=3 cargo build --release -p lumen --features embed,architecture-diagnostics --bin lumen` — passed.
+- `cargo test -p trust-js --lib --features architecture-diagnostics allocation_diagnostics::tests::` — 5 passed, 0 failed.
+- `cargo check -p trust-js --features architecture-diagnostics` — passed.
+- `cargo check -p trust-js --no-default-features --features architecture-diagnostics` — passed.
+- `CARGO_BUILD_JOBS=3 cargo build --release -p trust-js --features embed,architecture-diagnostics --bin trust-js` — passed.
 
 The frozen release binary was run at `--tier=jit` on the recorded React, Vue, Djot, and EJS
 inputs. All four commands exited 0. Their exact input/log paths and SHA-256 hashes are in
@@ -85,4 +85,4 @@ sample only. It does not establish the composition at other times, a peak, an al
 distribution, or the cause of any performance or memory result.
 
 Full detailed samples, metricwise summaries, source diff, release binary, and raw diagnostic
-logs remain under `/big/Code/Lumen/benchmark-results/property-inventory-20261006-validation/`.
+logs remain under `/big/Code/trust-js/benchmark-results/property-inventory-20261006-validation/`.

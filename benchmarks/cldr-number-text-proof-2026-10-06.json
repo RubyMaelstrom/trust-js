@@ -16,49 +16,49 @@
   },
   "source": {
     "base_commit": "8988b37c9c6064d00d62e1e5b76bb39d9851fc83",
-    "worktree": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006",
+    "worktree": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006",
     "patch": {
-      "path": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006-source.patch",
+      "path": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006-source.patch",
       "sha256": "affe5fae9f1a2db78c4015afdc4be9911ffc00d5b383225d5ff46095564b8648"
     },
     "identity_manifest": {
-      "path": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006-source.json",
+      "path": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006-source.json",
       "sha256": "edc1fb8b6b794683418b88e55c0280d0d49716603bacf9d4c31ba0fe7bfa4f88"
     },
     "files_sha256": {
-      "crates/lumen/src/cldr_numbers.rs": "a5df9c002fc4de5aae72791f7d145662930b2ea72111eeb6a3d02d9ac75ea096",
-      "crates/lumen/src/cldr_numbers_packed_tests.rs": "4f9cbb718935a90e80546ef0ccbdc51bb3490f9e454967f8912eac309eead45f",
-      "crates/lumen/src/cldr_numbers.inputs.json": "4bb128630bc5ecfaccb2180e43198442e6a6df1b6fd667f4ea9d6b0e866540c3",
+      "crates/trust-js/src/cldr_numbers.rs": "a5df9c002fc4de5aae72791f7d145662930b2ea72111eeb6a3d02d9ac75ea096",
+      "crates/trust-js/src/cldr_numbers_packed_tests.rs": "4f9cbb718935a90e80546ef0ccbdc51bb3490f9e454967f8912eac309eead45f",
+      "crates/trust-js/src/cldr_numbers.inputs.json": "4bb128630bc5ecfaccb2180e43198442e6a6df1b6fd667f4ea9d6b0e866540c3",
       "scripts/gen-cldr-numbers.py": "3171ddced7afe0d88d1e141d1127f085b6da4e57dadc0310e86ec284c8d40c2d"
     }
   },
   "build": {
-    "command": "cargo build --offline --release -p lumen -p test262-runner --features lumen/embed --bins",
+    "command": "cargo build --offline --release -p trust-js -p test262-runner --features trust-js/embed --bins",
     "result": "passed",
-    "target_cache": "/big/Code/Lumen/benchmark-results/propertykey-carrier-20261006/target",
+    "target_cache": "/big/Code/trust-js/benchmark-results/propertykey-carrier-20261006/target",
     "jobs": 3,
     "features": [
       "default/intl",
       "embed"
     ],
-    "manifest": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/build-manifest.json",
+    "manifest": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/build-manifest.json",
     "manifest_sha256": "95c8d1580597cdffb816597411c3c9c72fb189301b4c26cccdf111ed36c5d32d",
     "binaries": {
-      "lumen": {
-        "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
-        "frozen_copy": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/bin/lumen",
+      "trust-js": {
+        "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
+        "frozen_copy": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/bin/trust-js",
         "sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
         "size_bytes": 17343120
       },
-      "matched_baseline_lumen_intl": {
-        "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-intl",
+      "matched_baseline_trust_js_intl": {
+        "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-intl",
         "sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
         "size_bytes": 17346000
       }
     }
   },
   "correctness": {
-    "focused_command": "cargo test --offline -p lumen --features embed --lib cldr_numbers::packed_tests -- --test-threads=1",
+    "focused_command": "cargo test --offline -p trust-js --features embed --lib cldr_numbers::packed_tests -- --test-threads=1",
     "focused_result": {
       "passed": 5,
       "failed": 0,
@@ -72,9 +72,9 @@
       "generator_emission_audit": "all 50 proof/accessor lines match; generator not rerun against raw CLDR inputs or network"
     },
     "test262": {
-      "runner_path": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/bin/test262-runner",
+      "runner_path": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/bin/test262-runner",
       "runner_sha256": "d594643e0c43c02b2a6776bda4df5e6cb4e5989025de41527f8cbd31c691c35c",
-      "suite_path": "/big/Code/Lumen/test262",
+      "suite_path": "/big/Code/trust-js/test262",
       "suite_revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
       "revision_verified_from_checkout": true,
       "target": "intl402/NumberFormat",
@@ -85,22 +85,22 @@
         "failed": 0,
         "skipped": 0
       },
-      "retry_tmpdir": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/tmp",
+      "retry_tmpdir": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/tmp",
       "first_attempt": {
         "exit": 134,
         "signal": "SIGABRT",
         "tests_completed": false,
         "cause": "temporary test-path file write under /tmp failed with OS error 122 (Disk quota exceeded); environment failure before per-test results",
-        "record": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-initial-abort.txt",
+        "record": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-initial-abort.txt",
         "record_sha256": "ddd28ddeb02bd35ed05966726b120fd2402b7327f319d4021018e5bae02054cf",
-        "core": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-initial-abort.core",
+        "core": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-initial-abort.core",
         "core_sha256": "0f783ba65e413689ffe4fb1bde4963bea6654f7a633a63f0cd092c8c4b5b6970"
       },
-      "retry_log": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-numberformat.log",
+      "retry_log": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-numberformat.log",
       "retry_log_sha256": "f87de9a20b4e58e2ccb0dd32ec6b4c30504281448248677d65ecdbff401841da",
-      "summary": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-summary.json",
+      "summary": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-summary.json",
       "summary_sha256": "5dec804254af6cd1812422e9b7956aabc965444bff4eb5835aa3a0e0476b2afc",
-      "manifest": "/big/Code/Lumen/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-manifest.json",
+      "manifest": "/big/Code/trust-js/benchmark-results/cldr-number-text-proof-20261006/artifacts/evidence/test262-manifest.json",
       "manifest_sha256": "0dd8255be4080120beaddde04eaf926184a86acd9bbd3474e95e8939595cee28",
       "full_summary": {
         "schema_version": 2,
@@ -160,11 +160,11 @@
     "runs": [
       {
         "name": "number-proof-matched-final-20261006",
-        "baseline": "lumen-intl",
+        "baseline": "trust-js-intl",
         "pairs_per_workload": 6,
         "startup_pairs": 60,
-        "manifest": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/run-manifest.json",
-        "results": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/results.json",
+        "manifest": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/run-manifest.json",
+        "results": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/results.json",
         "candidate_over_baseline_time_wall_seconds": {
           "react": {
             "median": 1.000313574,
@@ -275,11 +275,11 @@
       },
       {
         "name": "number-proof-ejs-system-confirmation-20261006",
-        "baseline": "lumen-intl",
+        "baseline": "trust-js-intl",
         "pairs": 20,
         "diagnostics": false,
-        "manifest": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/run-manifest.json",
-        "results": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/results.json",
+        "manifest": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/run-manifest.json",
+        "results": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/results.json",
         "ejs_system_cpu": {
           "median_ratio": 0.994961688,
           "ci95": [
@@ -313,11 +313,11 @@
       },
       {
         "name": "number-proof-dates-repair-20261006",
-        "baseline": "lumen-dates",
+        "baseline": "trust-js-dates",
         "baseline_sha256": "e20d0eb0d09fb027242061b8b02b16c1e40db654f56fd5e36466ab08f1af58a0",
         "pairs": 12,
-        "manifest": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006/run-manifest.json",
-        "results": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006/results.json",
+        "manifest": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006/run-manifest.json",
+        "results": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006/results.json",
         "numbers_warm_time_wall_seconds": {
           "median_ratio": 1.007885537,
           "ci95": [
@@ -343,11 +343,11 @@
       },
       {
         "name": "number-proof-native-array-startup-20261006",
-        "baseline": "lumen-native_array",
+        "baseline": "trust-js-native_array",
         "baseline_sha256": "d30ea74b4e9aa3bf41ebfa42461c9c5b9e37e316ad47405fb06a7c6a62daeb3e",
         "pairs": 60,
-        "manifest": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006/run-manifest.json",
-        "results": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006/results.json",
+        "manifest": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006/run-manifest.json",
+        "results": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006/results.json",
         "startup_time_wall_seconds_direct_engine_child": {
           "median_ratio": 0.647393786,
           "ci95": [
@@ -371,8 +371,8 @@
       "run_manifest": {
         "status": "complete",
         "started_utc": "2026-10-06T05:28:43.993708+00:00",
-        "repo_root": "/big/Code/Lumen",
-        "result_dir": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006",
+        "repo_root": "/big/Code/trust-js",
+        "result_dir": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006",
         "revision": "8988b37c9c6064d00d62e1e5b76bb39d9851fc83",
         "git_status_short": "?? stack.txt",
         "machine": {
@@ -414,7 +414,7 @@
         },
         "environment": {
           "cleared_prefixes": [
-            "LUMEN_",
+            "TRUST_JS_",
             "TRUST_",
             "PSAMPLE_"
           ],
@@ -428,92 +428,92 @@
         },
         "binaries": {
           "baseline": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-intl",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-intl",
             "sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
             "size_bytes": 17346000
           },
           "candidate": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
             "sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
             "size_bytes": 17343120
           }
         },
         "sources": {
           "react": {
-            "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
+            "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/react_long.js",
             "sha256": "c28e971ed3bdec660b0983351fc5b276032e9ad8ce9da35510dd4fe3021184f1",
             "size_bytes": 5443
           },
           "vue": {
-            "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
+            "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/vue_long.js",
             "sha256": "3cdd03b33caf362f3541bbc2d7a5bcd4c8daa6f48dce627c0e30bd35cc8589b5",
             "size_bytes": 103220
           },
           "djot": {
-            "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
+            "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/djot_long.js",
             "sha256": "63036f9ffa08b57d3fad97c170762eb39cb7a4220fc01f7b9bf616185667875b",
             "size_bytes": 101810
           },
           "ejs": {
-            "path": "/big/Code/Lumen/examples/ejs/code.js",
+            "path": "/big/Code/trust-js/examples/ejs/code.js",
             "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c",
             "size_bytes": 3037473
           },
           "webgl": {
-            "path": "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js",
+            "path": "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js",
             "sha256": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
             "size_bytes": 4309
           },
           "startup": {
-            "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
+            "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
             "sha256": "cc168e1292e40fd7c4a2aed007568b85df6a905afe0f127f42ae29820c23805e",
             "size_bytes": 379
           },
           "intl_warm": {
-            "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
+            "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_format.js",
             "sha256": "43f20afde83c50fc387bc308b9bd0869b9e716260e7e8460596ffa6afa0b27eb",
             "size_bytes": 1771
           },
           "intl_construct": {
-            "path": "/big/Code/Lumen/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
+            "path": "/big/Code/trust-js/benchmark-results/cldr-date-packed-build/cldr_dates_construct.js",
             "sha256": "219379e6298710b9219167b4462b6e3795ddcae4fd26517a055095a6db37f1d3",
             "size_bytes": 1046
           },
           "numbers_warm": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_warm_30000.js",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_warm_30000.js",
             "sha256": "d25ebc056a488895b0d7da561bde78cf9b1d7aee08312ab9dd8af315b77081fe",
             "size_bytes": 1537
           },
           "numbers_construct": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_construct.js",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_construct.js",
             "sha256": "ac04c94e2b01844aa0bbc90b1ea0edd00d16b46c0aded4879392e9ba63cae7e4",
             "size_bytes": 1574
           },
           "display_warm": {
-            "path": "/big/Code/Lumen/benchmark-results/cldr-display-names-20261006-proto/benchmarks/cldr_display_names_warm.js",
+            "path": "/big/Code/trust-js/benchmark-results/cldr-display-names-20261006-proto/benchmarks/cldr_display_names_warm.js",
             "sha256": "d478bc1532334a539bd1d6bb920e5bff2446d6318d25d473f5a8c2ab4c76250f",
             "size_bytes": 2299
           },
           "display_construct": {
-            "path": "/big/Code/Lumen/benchmark-results/cldr-display-names-20261006-proto/benchmarks/cldr_display_names_construct.js",
+            "path": "/big/Code/trust-js/benchmark-results/cldr-display-names-20261006-proto/benchmarks/cldr_display_names_construct.js",
             "sha256": "34282ef57805b8df378f246198ec43197517636331d2d65103c30b11d284ef56",
             "size_bytes": 1794
           }
         },
         "tools": {
-          "harness": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "harness": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
           "harness_sha256": "29cadd62307426de64962f17b5b37d943f94ef584f5f2c156ed19e0716569666",
-          "resource_helper": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
+          "resource_helper": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
           "resource_helper_sha256": "011ceaf4ac9355137c255cdec15a2280486accd0cf305fb3d9966361074df88a",
-          "resource_helper_source": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
+          "resource_helper_source": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
           "resource_helper_source_sha256": "fd4c9cb909956b7dde58bdd914532017e8c0d9242c9926646b4a6c604d958015",
           "taskset": "/usr/bin/taskset"
         },
         "command_line": [
-          "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+          "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
           "--baseline",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-intl",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-intl",
           "--only",
           "react",
           "vue",
@@ -6324,8 +6324,8 @@
       "run_manifest": {
         "status": "complete",
         "started_utc": "2026-10-06T05:36:52.981372+00:00",
-        "repo_root": "/big/Code/Lumen",
-        "result_dir": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006",
+        "repo_root": "/big/Code/trust-js",
+        "result_dir": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-dates-repair-20261006",
         "revision": "8988b37c9c6064d00d62e1e5b76bb39d9851fc83",
         "git_status_short": "?? stack.txt",
         "machine": {
@@ -6357,7 +6357,7 @@
         },
         "environment": {
           "cleared_prefixes": [
-            "LUMEN_",
+            "TRUST_JS_",
             "TRUST_",
             "PSAMPLE_"
           ],
@@ -6371,42 +6371,42 @@
         },
         "binaries": {
           "baseline": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-dates",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-dates",
             "sha256": "e20d0eb0d09fb027242061b8b02b16c1e40db654f56fd5e36466ab08f1af58a0",
             "size_bytes": 21665320
           },
           "candidate": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
             "sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
             "size_bytes": 17343120
           }
         },
         "sources": {
           "numbers_warm": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_warm_30000.js",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_warm_30000.js",
             "sha256": "d25ebc056a488895b0d7da561bde78cf9b1d7aee08312ab9dd8af315b77081fe",
             "size_bytes": 1537
           },
           "numbers_construct": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_construct.js",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-triage-20261006/intl-fixtures/numberformat_construct.js",
             "sha256": "ac04c94e2b01844aa0bbc90b1ea0edd00d16b46c0aded4879392e9ba63cae7e4",
             "size_bytes": 1574
           }
         },
         "tools": {
-          "harness": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "harness": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
           "harness_sha256": "29cadd62307426de64962f17b5b37d943f94ef584f5f2c156ed19e0716569666",
-          "resource_helper": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
+          "resource_helper": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
           "resource_helper_sha256": "011ceaf4ac9355137c255cdec15a2280486accd0cf305fb3d9966361074df88a",
-          "resource_helper_source": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
+          "resource_helper_source": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
           "resource_helper_source_sha256": "fd4c9cb909956b7dde58bdd914532017e8c0d9242c9926646b4a6c604d958015",
           "taskset": "/usr/bin/taskset"
         },
         "command_line": [
-          "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+          "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
           "--baseline",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-dates",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-dates",
           "--only",
           "numbers_warm",
           "numbers_construct",
@@ -7302,8 +7302,8 @@
       "run_manifest": {
         "status": "complete",
         "started_utc": "2026-10-06T05:37:53.601489+00:00",
-        "repo_root": "/big/Code/Lumen",
-        "result_dir": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006",
+        "repo_root": "/big/Code/trust-js",
+        "result_dir": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-native-array-startup-20261006",
         "revision": "8988b37c9c6064d00d62e1e5b76bb39d9851fc83",
         "git_status_short": "?? stack.txt",
         "machine": {
@@ -7334,7 +7334,7 @@
         },
         "environment": {
           "cleared_prefixes": [
-            "LUMEN_",
+            "TRUST_JS_",
             "TRUST_",
             "PSAMPLE_"
           ],
@@ -7348,37 +7348,37 @@
         },
         "binaries": {
           "baseline": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-native_array",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-native_array",
             "sha256": "d30ea74b4e9aa3bf41ebfa42461c9c5b9e37e316ad47405fb06a7c6a62daeb3e",
             "size_bytes": 26108888
           },
           "candidate": {
-            "path": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+            "path": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
             "sha256": "031ced2ac3cc9b3cba67f0c856d7070d778ecab0c56987fbfb872c31c1d3c4aa",
             "size_bytes": 17343120
           }
         },
         "sources": {
           "startup": {
-            "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
+            "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/inputs/startup.js",
             "sha256": "cc168e1292e40fd7c4a2aed007568b85df6a905afe0f127f42ae29820c23805e",
             "size_bytes": 379
           }
         },
         "tools": {
-          "harness": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "harness": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
           "harness_sha256": "29cadd62307426de64962f17b5b37d943f94ef584f5f2c156ed19e0716569666",
-          "resource_helper": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
+          "resource_helper": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time",
           "resource_helper_sha256": "011ceaf4ac9355137c255cdec15a2280486accd0cf305fb3d9966361074df88a",
-          "resource_helper_source": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
+          "resource_helper_source": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/rusage-time.c",
           "resource_helper_source_sha256": "fd4c9cb909956b7dde58bdd914532017e8c0d9242c9926646b4a6c604d958015",
           "taskset": "/usr/bin/taskset"
         },
         "command_line": [
-          "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-number_proof",
+          "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-number_proof",
           "--baseline",
-          "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-native_array",
+          "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-native_array",
           "--only",
           "startup",
           "--pairs",
@@ -9325,15 +9325,15 @@
   "ejs_confirmation": {
     "inputs": {
       "number-proof-matched-final-20261006": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/results.json",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-matched-final-20261006/results.json",
         "sha256": "6d5cfeeb806d96e906c435e1ec6d4c870084623c0266c821b7e3c33cc790df50"
       },
       "number-proof-ejs-system-confirmation-20261006": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/results.json",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/number-proof-ejs-system-confirmation-20261006/results.json",
         "sha256": "865769dc5c1dae06818845b62c3289919d8ec2dd5a7486c4a1f9844f62c94d0b"
       },
       "ejs-matched-copy-aa-20261006": {
-        "path": "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/ejs-matched-copy-aa-20261006/results.json",
+        "path": "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/ejs-matched-copy-aa-20261006/results.json",
         "sha256": "c21e09c7c1ac0db41b7488e4c66e97e3299985f4fadcb2d578e3350885c8b478"
       }
     },

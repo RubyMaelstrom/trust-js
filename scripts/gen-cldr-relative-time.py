@@ -18,7 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import cldr_locales  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_relative_time.rs"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_relative_time.rs"
 UNITS = ["year", "quarter", "month", "week", "day", "hour", "minute", "second"]
 STYLES = ["long", "short", "narrow"]
 

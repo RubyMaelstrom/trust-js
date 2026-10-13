@@ -1,5 +1,5 @@
 # Keep downloaded Unicode conformance corpora byte-for-byte identical to their authoritative
 # upstream versions; several header comment lines intentionally retain trailing spaces.
-crates/lumen/tests/unicode-17.0.0/GraphemeBreakTest.txt whitespace=-blank-at-eol
-crates/lumen/tests/unicode-17.0.0/SentenceBreakTest.txt whitespace=-blank-at-eol
-crates/lumen/tests/unicode-17.0.0/WordBreakTest.txt whitespace=-blank-at-eol
+crates/trust-js/tests/unicode-17.0.0/GraphemeBreakTest.txt whitespace=-blank-at-eol
+crates/trust-js/tests/unicode-17.0.0/SentenceBreakTest.txt whitespace=-blank-at-eol
+crates/trust-js/tests/unicode-17.0.0/WordBreakTest.txt whitespace=-blank-at-eol

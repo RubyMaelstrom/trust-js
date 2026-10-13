@@ -1,0 +1,22 @@
+# node: compatibility: a CommonJS require() with node_modules resolution, the node:path/os/fs
+# builtins, and Buffer — so npm packages written for CommonJS run on TRust JS. The module system,
+# path, Buffer, and the node:fs shim are pure-JS glue (js_init); Rust backs only the host
+# probes (fs is-file/is-dir/read, OS info) that JS can't do. Std-only.
+[package]
+name = "trust-js-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+trust-js-host = { path = "../trust-js-host" }
+trust-js-tls = { path = "../trust-js-tls" }
+
+# Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
+[build-dependencies]
+trust-js = { path = "../trust-js" }
+
+[lints]
+workspace = true

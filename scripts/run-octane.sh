@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Run the Octane benchmark suite (chromium/octane) on the lumen engine.
+# Run the Octane benchmark suite (chromium/octane) on the trust-js engine.
 # Expects Octane to already exist as a sibling ../octane checkout, or set OCTANE
-# to the directory containing base.js and run.js. Builds the `lumen` CLI in
-# release mode (unless LUMEN_BIN points at a prebuilt binary), then prints
+# to the directory containing base.js and run.js. Builds the `trust-js` CLI in
+# release mode (unless TRUST_JS_BIN points at a prebuilt binary), then prints
 # per-benchmark scores plus the composite score. Higher is better.
 #
 #   scripts/run-octane.sh                    # full suite
 #   scripts/run-octane.sh richards crypto    # selected benchmarks
 #   OCTANE=/path/to/octane scripts/run-octane.sh gbemu
-#   LUMEN_BIN=/path/to/lumen scripts/run-octane.sh   # skip the build, use this binary
+#   TRUST_JS_BIN=/path/to/trust-js scripts/run-octane.sh   # skip the build, use this binary
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,9 +49,9 @@ for s in "${SUITES[@]}"; do
 done
 
 # Build the CLI in release mode unless the caller supplied a prebuilt binary.
-if [ -z "${LUMEN_BIN:-}" ]; then
-  cargo build --release -q -p lumen --bin lumen
-  LUMEN_BIN="$ROOT/target/release/lumen"
+if [ -z "${TRUST_JS_BIN:-}" ]; then
+  cargo build --release -q -p trust-js --bin trust-js
+  TRUST_JS_BIN="$ROOT/target/release/trust-js"
 fi
 
 WORK="$(mktemp -d)"
@@ -59,13 +59,13 @@ trap 'rm -rf "$WORK"' EXIT
 DRIVER="$WORK/octane-driver.js"
 OUTPUT="$WORK/octane-output"
 
-# The upstream driver uses the shell `load()`; the lumen CLI takes files in sequence instead.
+# The upstream driver uses the shell `load()`; the trust-js CLI takes files in sequence instead.
 sed '/^load(/d' "$OCTANE/run.js" > "$DRIVER"
 
 ARGS=("$OCTANE/base.js" "${SUITE_FILES[@]}" "$DRIVER")
 
 set +e
-"$LUMEN_BIN" "${ARGS[@]}" 2>&1 | tee "$OUTPUT"
+"$TRUST_JS_BIN" "${ARGS[@]}" 2>&1 | tee "$OUTPUT"
 status=${PIPESTATUS[0]}
 set -e
 

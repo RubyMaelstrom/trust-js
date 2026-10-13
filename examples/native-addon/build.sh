@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile addon.c into addon.node — a Node native addon. The flags mirror what node-gyp emits:
 # a shared library whose undefined napi_* symbols are resolved at load time against whatever host
-# dlopens it (lumen, or node itself).
+# dlopens it (trust-js, or node itself).
 set -euo pipefail
 cd "$(dirname "$0")"
 

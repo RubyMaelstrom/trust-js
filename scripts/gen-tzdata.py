@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the offset and daylight tables in tzdata.rs and the footer rules in tzrules.rs.
 
-usage: scripts/gen-tzdata.py ZONEINFO_DIR [crates/lumen/src/tzdata.rs] [crates/lumen/src/tzrules.rs]
+usage: scripts/gen-tzdata.py ZONEINFO_DIR [crates/trust-js/src/tzdata.rs] [crates/trust-js/src/tzrules.rs]
 
 ZONEINFO_DIR is an IANA tz release compiled with explicit transitions through
 2037, without the out-of-scope `backzone` data. The current tables are tzdata
@@ -189,8 +189,8 @@ def dst_words(transitions):
 
 def main():
     zoneinfo = sys.argv[1]
-    tzdata_path = sys.argv[2] if len(sys.argv) > 2 else "crates/lumen/src/tzdata.rs"
-    rules_path = sys.argv[3] if len(sys.argv) > 3 else "crates/lumen/src/tzrules.rs"
+    tzdata_path = sys.argv[2] if len(sys.argv) > 2 else "crates/trust-js/src/tzdata.rs"
+    rules_path = sys.argv[3] if len(sys.argv) > 3 else "crates/trust-js/src/tzrules.rs"
     text = open(tzdata_path).read()
     zones = ZONE_RE.findall(text)
     by_table, initials, footers, dst_changes, problems = {}, {}, {}, {}, []

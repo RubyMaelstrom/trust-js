@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Intl.DisplayNames data for every locale Lumen advertises from CLDR 48.
+"""Generate Intl.DisplayNames data for every locale TRust JS advertises from CLDR 48.
 
 Sources are the pinned unicode-org/cldr-json 48.0.0 localenames, numbers, dates,
 and BCP-47 packages.  Long/base names and sparse short/narrow overrides are kept
@@ -29,9 +29,9 @@ import cldr_locales  # noqa: E402
 TAG = "48.0.0"
 SOURCE_COMMIT = "4d06be52b51bb2f75688d0abe55c52a66afed790"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_display_names.rs"
-BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_display_names.data"
-MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_display_names.inputs.json"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_display_names.rs"
+BLOB_OUTPUT = ROOT / "crates/trust-js/src/cldr_display_names.data"
+MANIFEST_OUTPUT = ROOT / "crates/trust-js/src/cldr_display_names.inputs.json"
 REPOSITORY = "https://github.com/unicode-org/cldr-json"
 BASE = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/cldr-json"
 U16_MAX = (1 << 16) - 1
@@ -86,7 +86,7 @@ def fetch_json(url: str) -> dict:
         payload = path.read_bytes()
     else:
         request = urllib.request.Request(
-            url, headers={"User-Agent": "Lumen CLDR DisplayNames generator"}
+            url, headers={"User-Agent": "TRust JS CLDR DisplayNames generator"}
         )
         try:
             with urllib.request.urlopen(request) as response:
@@ -427,11 +427,11 @@ def main() -> None:
         "generator_sha256": generator_hash,
         "original_generated_snapshot": {
             "commit": "4be60d028b95e50733f9449d9948345effc5f6c8",
-            "path": "crates/lumen/src/cldr_display_names.rs",
+            "git_blob_oid": "82392c1c1ddcc27cd7478076a73c9818b249a97c",
             "sha256": "5e070cb4625de55eb1f96cb4ed52169ea7f196f9150ac46770003718a9ee052b",
         },
         "packed_source_sha256": hashlib.sha256(rust_source).hexdigest(),
-        "string_blob_path": "crates/lumen/src/cldr_display_names.data",
+        "string_blob_path": "crates/trust-js/src/cldr_display_names.data",
         "string_blob_sha256": hashlib.sha256(blob).hexdigest(),
         "string_blob_bytes": len(blob),
         "unique_string_count": len(strings.refs),

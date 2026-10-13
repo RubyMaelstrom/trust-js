@@ -7,27 +7,27 @@
     "head": "d3dd5112ac335ec206a621bbef364287e02671ad",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "bba1b67624248631f4d915379aa789fb0614613c2ddd9506ed1c62e8f3d5069f"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "85975c994e6b217d8729782dae7531624b7e2d30411ee90936c32e1aed776155"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "bc44142ff5cf161db31c30510bc9494808a237e9521d94afcd9f3831fdc515b9"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "1e5a9583fb321aadca91d9c7d11721a41cc7693e6998b503c8a5a366fb5f6c7d"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "791e22a847058d9aa6aa83429ab7315a3f4cdf95d1b9fa03e74a7a813535836b"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82218c1e06597faa19d5bad3c160cc431ce0686a9be52fd4f8b5c532360651e9"
       }
     ],
@@ -42,7 +42,7 @@
     "affinity": 5
   },
   "environment": {
-    "build": "cargo build --release -p lumen --bin lumen; opt-level=3, fat LTO, codegen-units=1, panic=abort",
+    "build": "cargo build --release -p trust-js --bin trust-js; opt-level=3, fat LTO, codegen-units=1, panic=abort",
     "tier": "jit",
     "features": [
       "default",
@@ -50,17 +50,17 @@
     ],
     "optimizing_jit": false,
     "affinity_cpu": 5,
-    "controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "User desktop applications active. No owned build, test or profiler overlapped final timing or memory observations."
   },
   "artifacts": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle2-20260929/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle2-20260929/trust-js-baseline",
       "sha256": "3172804cd1782441cfb664990fc28a786f323961d6aa24bf132dc42fc3b5aa76",
       "bytes": 25116032
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle2-20260929/lumen-candidate-v2",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle2-20260929/trust-js-candidate-v2",
       "sha256": "a038216b2500d303a3af1da3ecb6975d67d20daf109ebe6efa71d424a2d0efb4",
       "bytes": 25120440
     },
@@ -106,19 +106,19 @@
   },
   "sources": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle2-20260929/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle2-20260929/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle2-20260929/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle2-20260929/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle2-20260929/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle2-20260929/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },
@@ -1334,7 +1334,7 @@
   "validation": {
     "engine_unit_tests": "1561 passed, 0 failed on final source",
     "regressions": "4 focused tests, including interpreter/bytecode/JIT boundary and coercion cases",
-    "clippy": "cargo clippy -p lumen --all-targets -- -D warnings passed",
+    "clippy": "cargo clippy -p trust-js --all-targets -- -D warnings passed",
     "workspace": "cargo check --workspace --all-targets passed before code-placement-only final attributes",
     "limitations": "Native ARM64 only. No fresh x64/wasm or full Test262 run; no post-GC retained-memory comparison.",
     "specification": "Local ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202, spec.html:36827/36924/54429. Current upstream not verified."

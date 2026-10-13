@@ -11,43 +11,43 @@
     "inventory_sha256": "1bc715cfdeef5da45a891aa7223673a60bfa20014173b1ba09b4269e9e776e0f",
     "files": [
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "ba77d7b4159e6da5e10f5fad08c1227199a455645366a5ec19896432d20a9bc4"
       },
       {
-        "path": "crates/lumen/src/bytecode_computed_read_tests.rs",
+        "path": "crates/trust-js/src/bytecode_computed_read_tests.rs",
         "sha256": "6dd4ce654ff1a198f4056d5a26c81f4085a7c54e8bfd87deec3d889bd220a06a"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "2892d065f2e34e20516cf8fe91a407d080dabf3ac846f2c2055b817d9c6026b8"
       },
       {
-        "path": "crates/lumen/src/jit.rs",
+        "path": "crates/trust-js/src/jit.rs",
         "sha256": "33f7079e9eb46abbe4d3303162ea95640fb2af77488240c3404b687b0e7679f0"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing_ownership_tests.rs",
+        "path": "crates/trust-js/src/jit_optimizing_ownership_tests.rs",
         "sha256": "f9b2d0ec23b3ccc36793b61cfd530cf8be9ed5bc2815a606632ff4a6215ac405"
       },
       {
-        "path": "crates/lumen/src/jit_regions.rs",
+        "path": "crates/trust-js/src/jit_regions.rs",
         "sha256": "3e2d49d193baf122a3cf9497a52ba24e58d56be7b43c647be848729bc73c369f"
       },
       {
-        "path": "crates/lumen/src/jit_return_tests.rs",
+        "path": "crates/trust-js/src/jit_return_tests.rs",
         "sha256": "205080842645b87a66e8b43e23aa9146c12821c68ab62a5f40f39227578e494f"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "4e2df6ecb11847e11f7afce4785a8a4e6bc590f591c437bee101f7bbb5fbfcf5"
       },
       {
-        "path": "crates/lumen/src/property_read.rs",
+        "path": "crates/trust-js/src/property_read.rs",
         "sha256": "646eb2cc2e9c25118dc6904d595af1d79d4c2955ff99612ed885bf1cac3410c7"
       },
       {
-        "path": "crates/lumen/src/tests.rs",
+        "path": "crates/trust-js/src/tests.rs",
         "sha256": "155795649e8654feef4dfebb39513855e56fb1d3da4bdaaee86ed232bd4cde67"
       }
     ]
@@ -69,7 +69,7 @@
     "build": "Release opt-level=3, fat LTO, codegen-units=1, panic=abort; default Intl",
     "tier": "jit",
     "optimizing_jit": false,
-    "controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "Desktop applications active; no owned build/test/profile overlapped the timing or peak comparisons."
   },
   "node_reference": {
@@ -78,12 +78,12 @@
   },
   "binaries": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle19-20260930/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle19-20260930/trust-js-baseline",
       "sha256": "3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f",
       "bytes": 25109848
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle19-20260930/lumen-candidate",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle19-20260930/trust-js-candidate",
       "sha256": "7920398460d996369f483c7bd8e0e3101f17c02a551642e44ea833dff21d3727",
       "bytes": 25111912
     },
@@ -95,19 +95,19 @@
   },
   "workloads": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle19-20260930/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle19-20260930/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle19-20260930/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle19-20260930/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle19-20260930/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle19-20260930/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },

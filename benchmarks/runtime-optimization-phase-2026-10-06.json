@@ -95,7 +95,7 @@
   },
   "frozen_artifacts": {
     "header104": {
-      "build_manifest": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/build-manifest-v1.json",
+      "build_manifest": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/build-manifest-v1.json",
       "label": "ObjectBehavior header104 / compact Rc request candidate",
       "object_behavior_v3_patch_sha256": "67501be9f1c8e92ba0ee34f4f08388df7ddbdfca441147b3266be3192a4b9ec9",
       "replicas": {
@@ -107,12 +107,12 @@
       },
       "sha256": "8fff7ac8b86117bc4cf7ca295f45a065eea6866f1cc3c83dd24c96b456de73e4",
       "size_bytes": 17400512,
-      "source": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/frozen-v1/lumen",
+      "source": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/frozen-v1/trust-js",
       "source_base_commit": "596d826f9612df714621f788462323102aec8030",
-      "source_freeze": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/source-freeze-v3.json",
+      "source_freeze": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/source-freeze-v3.json",
       "source_patch_sha256": "58c0cc1e14631abd4b7bfb4ead1505f0e1b990ccfe5b671d24fe923b9ea166fb",
       "source_state": "final release-ready binary; full source verification and required validation completed",
-      "source_worktree": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006"
+      "source_worktree": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006"
     },
     "header112": {
       "label": "ObjectBehavior header112 candidate",
@@ -125,8 +125,8 @@
       },
       "sha256": "8ddaab5a8dbd94b90a7b6dc8bb1a1b0947a12b016e507f8cb93cabc6a5452ccd",
       "size_bytes": 17395136,
-      "source": "/big/Code/Lumen/benchmark-results/object-behavior-compact-20261006-validation/frozen-v3/lumen",
-      "source_freeze": "/big/Code/Lumen/benchmark-results/object-behavior-compact-20261006-validation/source-freeze-v3.json",
+      "source": "/big/Code/trust-js/benchmark-results/object-behavior-compact-20261006-validation/frozen-v3/trust-js",
+      "source_freeze": "/big/Code/trust-js/benchmark-results/object-behavior-compact-20261006-validation/source-freeze-v3.json",
       "source_patch_sha256": "67501be9f1c8e92ba0ee34f4f08388df7ddbdfca441147b3266be3192a4b9ec9",
       "source_state": "release-ready frozen binary on 596d826"
     },
@@ -140,7 +140,7 @@
         "screen": "inline2v4-screen"
       },
       "sha256": "0ed53c6de11ea4c960e03a93ba0846ebf02daadddd3ac61d6d8422e9ed0f95f6",
-      "source": "/big/Code/Lumen/benchmark-results/named-fields-inline2-20261006-validation/frozen-v4/lumen",
+      "source": "/big/Code/trust-js/benchmark-results/named-fields-inline2-20261006-validation/frozen-v4/trust-js",
       "source_state": "frozen"
     },
     "intl63f2": {
@@ -153,7 +153,7 @@
         "screen": "intl63f2-screen"
       },
       "sha256": "5fee9c8bf98536e09ab5cb256e3cc68b0883ef71109fda3ee033254a497befa9",
-      "source": "/big/Code/Lumen/benchmark-results/runtime-candidates-v3-20261006/lumen-intl",
+      "source": "/big/Code/trust-js/benchmark-results/runtime-candidates-v3-20261006/trust-js-intl",
       "source_state": "frozen"
     },
     "main596d": {
@@ -166,7 +166,7 @@
         "screen": "main596d-screen"
       },
       "sha256": "0220a65d0e7f73902cb186bb26e82c9d18aba97b012fb7cb19135d0c29c9bfc9",
-      "source": "/big/Code/Lumen/benchmark-results/accepted-array-number-integration-20261006/frozen/lumen",
+      "source": "/big/Code/trust-js/benchmark-results/accepted-array-number-integration-20261006/frozen/trust-js",
       "source_state": "frozen"
     }
   },
@@ -25495,10 +25495,10 @@
         "blocked_artifacts": [],
         "command": [
           "/usr/bin/python3",
-          "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
-          "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/header104-screen",
+          "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/header104-screen",
           "--baseline",
-          "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/main596d-screen",
+          "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/main596d-screen",
           "--only",
           "react",
           "vue",
@@ -25515,7 +25515,7 @@
         ],
         "exit": -15,
         "finished_utc": "2026-10-06T08:13:45.096072+00:00",
-        "log": "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/logs/confirmation-screen-header104-vs-main596d.log",
+        "log": "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/logs/confirmation-screen-header104-vs-main596d.log",
         "name": "confirmation-screen-header104-vs-main596d",
         "overlap_events": [
           {
@@ -25544,10 +25544,10 @@
       "record": {
         "command": [
           "/usr/bin/python3",
-          "/big/Code/Lumen/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
-          "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/header104-screen",
+          "/big/Code/trust-js/benchmark-results/object-runtime-20261005-7eac91/compare-runtime-expanded-v4.py",
+          "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/header104-screen",
           "--baseline",
-          "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/main596d-screen",
+          "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/prepared/screen-replicas/main596d-screen",
           "--only",
           "react",
           "vue",
@@ -25564,7 +25564,7 @@
         ],
         "exit": -15,
         "finished_utc": "2026-10-06T08:22:11.743389+00:00",
-        "log": "/big/Code/Lumen/benchmark-results/runtime-next-screen-20261006/logs/header104-replacement-applications-v1.log",
+        "log": "/big/Code/trust-js/benchmark-results/runtime-next-screen-20261006/logs/header104-replacement-applications-v1.log",
         "name": "header104-replacement-applications",
         "overlap_events": [
           {
@@ -25712,7 +25712,7 @@
     },
     "completed": 30,
     "outputs_match": true,
-    "scope": "One separate LUMEN_PERF_METRICS=1 execution per artifact/workload. Compilation/GC durations and instrumented RSS are observations, not acceptance timings or evidence of latency gains.",
+    "scope": "One separate TRUST_JS_PERF_METRICS=1 execution per artifact/workload. Compilation/GC durations and instrumented RSS are observations, not acceptance timings or evidence of latency gains.",
     "memory": "Requested bytes are the final post-GC lower-bound snapshot, not peak memory. Object counts are not multiplied into an RSS estimate. Instrumented process peakRSS is recorded separately.",
     "samples": [
       {
@@ -29245,17 +29245,17 @@
         "architecture": "aarch64",
         "base_commit": "596d826f9612df714621f788462323102aec8030",
         "candidate_patch_sha256": "58c0cc1e14631abd4b7bfb4ead1505f0e1b990ccfe5b671d24fe923b9ea166fb",
-        "source_freeze": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/source-freeze-v3.json",
+        "source_freeze": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/source-freeze-v3.json",
         "source_freeze_sha256": "3b818610c14fbd8bafd90618b22d2c277b46d210a9584cd10c6fd223d90779b9",
         "source_files_checked": 64,
         "source_hash_mismatches": 0,
         "utility_binaries": {
           "test262-runner": "d75dc06a07c2020c85ff795ee0391fcd1d2dedc839d50bad6b281913b064dc6e",
-          "lumen-difftest": "465c84380cd0a343762af952b43b1d680c66c066bc7dcab798360d2011654208"
+          "trust-js-difftest": "465c84380cd0a343762af952b43b1d680c66c066bc7dcab798360d2011654208"
         },
         "test262": {
-          "run_manifest": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/test262-run-v1/run-manifest.json",
-          "report": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/test262-run-v1/test262-report/summary.json",
+          "run_manifest": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/test262-run-v1/run-manifest.json",
+          "report": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/test262-run-v1/test262-report/summary.json",
           "report_sha256": "83c88f2c68d0303e2f454672817a04c4089e31662bb6c93ed2d1c6ac87f22d61",
           "exit_code": 0,
           "all_executed_passed": true,
@@ -29266,8 +29266,8 @@
           }
         },
         "difftest": {
-          "run_manifest": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/difftest-seed1-count2000-v1/run-manifest.json",
-          "full_log": "/big/Code/Lumen/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/difftest-seed1-count2000-v1/full.log",
+          "run_manifest": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/difftest-seed1-count2000-v1/run-manifest.json",
+          "full_log": "/big/Code/trust-js/benchmark-results/object-behavior-dense-metadata-20261006-validation/header104-final-conformance-20261006/difftest-seed1-count2000-v1/full.log",
           "full_log_sha256": "14d6e3b0953b27ba1daa0bc7ce9ddc750964eefc403bd71df9cda9b6b5b10850",
           "exit_code": 0,
           "result": {

@@ -26,13 +26,13 @@ import cldr_locales  # noqa: E402
 TAG = "48.0.0"
 SOURCE_COMMIT = "4d06be52b51bb2f75688d0abe55c52a66afed790"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_dates.rs"
-BLOB_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.data"
-MANIFEST_OUTPUT = ROOT / "crates/lumen/src/cldr_dates.inputs.json"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_dates.rs"
+BLOB_OUTPUT = ROOT / "crates/trust-js/src/cldr_dates.data"
+MANIFEST_OUTPUT = ROOT / "crates/trust-js/src/cldr_dates.inputs.json"
 RAW = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{SOURCE_COMMIT}/cldr-json"
 REPOSITORY = "https://github.com/unicode-org/cldr-json"
 LOCALES = list(cldr_locales.locales())
-# (Lumen calendar id, CLDR package, file id, key inside dates.calendars)
+# (TRust JS calendar id, CLDR package, file id, key inside dates.calendars)
 CALENDARS = [
     ("gregory", "cldr-dates-full", "gregorian", "gregorian"),
     ("buddhist", "cldr-cal-buddhist-full", "buddhist", "buddhist"),
@@ -97,7 +97,7 @@ def download(
         payload = (pathlib.Path(cldr_dir) / relative).read_bytes()
     else:
         request = urllib.request.Request(
-            url, headers={"User-Agent": "Lumen CLDR calendar-name generator"}
+            url, headers={"User-Agent": "TRust JS CLDR calendar-name generator"}
         )
         with urllib.request.urlopen(request) as response:
             payload = response.read()
@@ -298,11 +298,11 @@ def main() -> None:
         "generator_sha256": generator_hash,
         "original_generated_snapshot": {
             "commit": "1084161475e2e35b50a73eb06fd6885e66de9239",
-            "path": "crates/lumen/src/cldr_dates.rs",
+            "git_blob_oid": "4bb2e529bc2d12adbe120cf86feaa6648d84c371",
             "sha256": "7a0198abceba5fe084e7747fffcbb9525e6158b0bf2ec00a87e6e019c218e53b",
         },
         "packed_source_sha256": hashlib.sha256(rust_source).hexdigest(),
-        "string_blob_path": "crates/lumen/src/cldr_dates.data",
+        "string_blob_path": "crates/trust-js/src/cldr_dates.data",
         "string_blob_sha256": hashlib.sha256(blob).hexdigest(),
         "string_blob_bytes": len(blob),
         "unique_string_count": len(strings.refs),

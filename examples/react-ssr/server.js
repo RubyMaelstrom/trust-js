@@ -11,18 +11,18 @@ function Item(props) {
 }
 function App(props) {
   return h('div', { className: 'app' },
-    h('h1', null, `Hello from React ${React.version} on lumen`),
+    h('h1', null, `Hello from React ${React.version} on trust-js`),
     h('p', null, `Rendered ${props.count} items server-side:`),
     h('ul', null, props.items.map((it, i) => h(Item, { key: i }, it))),
   );
 }
 
 const server = http.createServer((req, res) => {
-  const items = ['zero-dependency engine', 'node:http on Lumen.serve', 'react-dom/server'];
+  const items = ['TRust JS engine', 'node:http on TRustJS.serve', 'react-dom/server'];
   const html = renderToString(h(App, { items, count: items.length }));
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(`<!doctype html><html><body>${html}</body></html>\n`);
 });
 
 const port = Number(process.env.PORT || 3000);
-server.listen(port, () => console.log(`react SSR on lumen: http://localhost:${port}/`));
+server.listen(port, () => console.log(`react SSR on trust-js: http://localhost:${port}/`));

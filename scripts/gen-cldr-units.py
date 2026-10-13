@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate crates/lumen/src/cldr_units.rs from CLDR unit display patterns.
+"""Generate crates/trust-js/src/cldr_units.rs from CLDR unit display patterns.
 
 Source: unicode-org/cldr-json, package `cldr-units-full` (CLDR 48.0.0).
 For each locale we read `<loc>/units.json` and emit every available plural-category unit pattern
@@ -189,7 +189,7 @@ def main():
 
     dest = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "crates", "lumen", "src", "cldr_units.rs",
+        "crates", "trust-js", "src", "cldr_units.rs",
     )
     with open(dest, "w") as f:
         f.write("\n".join(out))

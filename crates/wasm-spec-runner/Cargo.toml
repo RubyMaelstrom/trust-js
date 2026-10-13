@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-web = { path = "../lumen-web" }
+trust-js-web = { path = "../trust-js-web" }
 wast = { version = "=261.0.0", default-features = false, features = ["wasm-module"] }
 
 [lints]

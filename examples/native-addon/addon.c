@@ -1,7 +1,7 @@
 // A minimal Node native addon (N-API), written against the stable C ABI. It exports two
-// functions — `hello()` and `add(a, b)` — plus a `version` string. lumen loads this exactly as
+// functions — `hello()` and `add(a, b)` — plus a `version` string. trust-js loads this exactly as
 // Node does: `require('./addon.node')` dlopens the compiled library and calls
-// `napi_register_module_v1`, which resolves the `napi_*` symbols against the lumen executable.
+// `napi_register_module_v1`, which resolves the `napi_*` symbols against the trust-js executable.
 //
 // The N-API types and functions are declared inline so the addon needs no Node headers — it
 // depends only on the ABI, which is what makes a compiled addon portable across engines.

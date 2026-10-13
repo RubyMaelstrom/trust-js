@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Validate an ARES-6 checkout (BrowserBench) before building the lumen CLI.
+# Validate an ARES-6 checkout (BrowserBench) before building the trust-js CLI.
 #
 # Resolution order (the local agent mirror is intentionally never used):
 #   1. $ARES6            explicit override
@@ -9,7 +9,7 @@
 #   scripts/run-ares6.sh                                  # run all four workloads
 #   scripts/run-ares6.sh air basic                        # run only Air and Basic
 #   ARES6=/path/to/ARES-6 scripts/run-ares6.sh babylon ml # validate/run selected workloads
-#   LUMEN_BIN=/path/to/lumen-cli scripts/run-ares6.sh     # skip the cargo build
+#   TRUST_JS_BIN=/path/to/trust-js-cli scripts/run-ares6.sh     # skip the cargo build
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -193,17 +193,17 @@ validate_selected_glue_wiring
 
 echo "ares-6: validated checkout at $ARES6_DIR (${#REQUIRED_FILES[@]} source files present)"
 
-if [ -z "${LUMEN_BIN:-}" ]; then
-  cargo build --release -p lumen-cli
+if [ -z "${TRUST_JS_BIN:-}" ]; then
+  cargo build --release -p trust-js-cli
   target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
-  LUMEN_BIN="$target_dir/release/lumen-cli"
-  if [ -x "$LUMEN_BIN.exe" ]; then
-    LUMEN_BIN="$LUMEN_BIN.exe"
+  TRUST_JS_BIN="$target_dir/release/trust-js-cli"
+  if [ -x "$TRUST_JS_BIN.exe" ]; then
+    TRUST_JS_BIN="$TRUST_JS_BIN.exe"
   fi
 fi
 
-if [ ! -x "$LUMEN_BIN" ]; then
-  echo "error: lumen-cli binary is not executable: $LUMEN_BIN" >&2
+if [ ! -x "$TRUST_JS_BIN" ]; then
+  echo "error: trust-js-cli binary is not executable: $TRUST_JS_BIN" >&2
   exit 1
 fi
 
@@ -316,7 +316,7 @@ JS
 } > "$ENTRY"
 
 set +e
-ARES6_ROOT="$ARES6_JS_DIR" "$LUMEN_BIN" "$ENTRY" 2>&1 | tee "$OUTPUT"
+ARES6_ROOT="$ARES6_JS_DIR" "$TRUST_JS_BIN" "$ENTRY" 2>&1 | tee "$OUTPUT"
 status=${PIPESTATUS[0]}
 set -e
 

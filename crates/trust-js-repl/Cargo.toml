@@ -1,0 +1,18 @@
+# The interactive shell over trust-js-runtime: persistent realm, real incomplete-input detection
+# (the parser's at_eof flag, not brace counting), loop-to-quiescence between inputs, top-level
+# await, `_`, dot commands. Line-buffered on purpose: raw-mode editing needs termios, which
+# pure std can't do — use rlwrap for history/arrows until that's explicitly authorized.
+[package]
+name = "trust-js-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+trust-js-host = { path = "../trust-js-host" }
+trust-js-runtime = { path = "../trust-js-runtime" }
+
+[lints]
+workspace = true

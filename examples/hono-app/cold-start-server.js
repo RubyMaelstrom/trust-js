@@ -8,9 +8,9 @@ app.get('/', (c) => c.text('hello hono!!\n'));
 const port = Number(process.env.PORT || 3000);
 const fetch = app.fetch;
 
-if (globalThis.Lumen?.serve) {
-  // lumen (this repo).
-  Lumen.serve(fetch, { hostname: '127.0.0.1', port });
+if (globalThis.TRustJS?.serve) {
+  // trust-js (this repo).
+  TRustJS.serve(fetch, { hostname: '127.0.0.1', port });
 } else if (globalThis.Bun) {
   // Bun's native web-standard server.
   Bun.serve({ hostname: '127.0.0.1', port, fetch });

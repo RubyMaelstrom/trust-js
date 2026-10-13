@@ -32,16 +32,16 @@
       "diff_sha256": "f1d390a4f0fd1aafd079f0516d2d016d3fcac62a2575878fab7bdf4453565eb8",
       "new_files": {}
     },
-    "lumen_source": {
+    "trust_js_source": {
       "base_revision": "46824a3ca13e20edf3c3ddc129816cc3243d1c65",
       "diff_sha256": "a0a49ddd20ee6b1c9778390ac76df4c08a93d8e9b782e0be4bf2d94217db80a9",
       "new_files": {
-        "crates/lumen/src/jit_typed_array.rs": "2cb9c629c861e8527cc3fd782a8711818a23014b966d0a89b8c400215ca38e0c",
-        "crates/lumen/src/native_typed_array.rs": "40fc169aede0d7ad0c04b458f699aaaa8d932c828f05b77cb0dc8604b8cceae0"
+        "crates/trust-js/src/jit_typed_array.rs": "2cb9c629c861e8527cc3fd782a8711818a23014b966d0a89b8c400215ca38e0c",
+        "crates/trust-js/src/native_typed_array.rs": "40fc169aede0d7ad0c04b458f699aaaa8d932c828f05b77cb0dc8604b8cceae0"
       }
     },
-    "lumen": {
-      "path": "/big/Code/Lumen/target/release/lumen",
+    "trust-js": {
+      "path": "/big/Code/trust-js/target/release/trust-js",
       "sha256": "14a595d9f8e77e34470978a9a222b9f33bf0a1cb0183f4d360482c40e5be9775",
       "bytes": 25114800,
       "mtime_ns": 1790708617087150964
@@ -51,8 +51,8 @@
     "trust-baseline": "d839cd4c11e639dcebaee8d3feef98acb9d37267608852dbdc32a1ac4055b0b1",
     "trust-desktop-baseline": "d7a95ec2d0fc2912be034c318477c76796b60d839c4f8ffe3a3c62f180c9f8c0",
     "trust-headless-baseline": "5751897d401732498cea12213f5b1ec429fc4374a9e84e1224e0e3351c73ec9d",
-    "lumen-baseline": "fcae69121cedef78d82c810beccb6be82d949d7098207bbc281287b05a517805",
-    "lumen-preexisting": "6e64738477100e3966182eef5635d567de2bf32561e5d795f452825d00f9874c"
+    "trust-js-baseline": "fcae69121cedef78d82c810beccb6be82d949d7098207bbc281287b05a517805",
+    "trust-js-preexisting": "6e64738477100e3966182eef5635d567de2bf32561e5d795f452825d00f9874c"
   },
   "manifest": {
     "inputs": {
@@ -61,7 +61,7 @@
       "target/wasm-performance-20260929/wasm-short-calls.html": "9f88198fefa841ab23da8abd527ef91625014c831bfe571f9f36966e539ba7c7",
       "target/wasm-performance-20260929/wasm-long-calls.html": "5db1d2b7091a0dab335634c4d0869bb255d5421cae874ecd2d6f68edcf925882",
       "target/wasm-performance-20260929/canvas-probe.js": "94d01d06dafd28ff62a4333a896623e5c7379a965100c12227026d101679655f",
-      "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
+      "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
       "target/wasm-performance-20260929/optimizations/canvas-probe-phases.js": "56acd2d4763ffa4868a3021a6d27febedcc56b35110c27f3adf4858c2d5692dd",
       "target/wasm-performance-20260929/optimizations/run-benchmarks.py": "922edbdfae26c86d9e3dd1d1d7551adfecf5f706f53ea97dfc25c7570d05fa8b",
       "target/wasm-performance-20260929/optimizations/run-live.py": "0ba865a5da17133ea66491fb847f41d4757dc7f256803fbef0602b220e96fc21",
@@ -785,9 +785,9 @@
       "variant": "baseline",
       "repeat": 0,
       "command": [
-        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/lumen-baseline",
+        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/trust-js-baseline",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.144874986959621,
@@ -1000,9 +1000,9 @@
       "variant": "candidate",
       "repeat": 0,
       "command": [
-        "/big/Code/Lumen/target/release/lumen",
+        "/big/Code/trust-js/target/release/trust-js",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.064235345984343,
@@ -1215,9 +1215,9 @@
       "variant": "candidate",
       "repeat": 1,
       "command": [
-        "/big/Code/Lumen/target/release/lumen",
+        "/big/Code/trust-js/target/release/trust-js",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.096724440983962,
@@ -1430,9 +1430,9 @@
       "variant": "baseline",
       "repeat": 1,
       "command": [
-        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/lumen-baseline",
+        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/trust-js-baseline",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.150382549967617,
@@ -1645,9 +1645,9 @@
       "variant": "baseline",
       "repeat": 2,
       "command": [
-        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/lumen-baseline",
+        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/trust-js-baseline",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.133976244949736,
@@ -1860,9 +1860,9 @@
       "variant": "candidate",
       "repeat": 2,
       "command": [
-        "/big/Code/Lumen/target/release/lumen",
+        "/big/Code/trust-js/target/release/trust-js",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.086661558947526,
@@ -2075,9 +2075,9 @@
       "variant": "candidate",
       "repeat": 3,
       "command": [
-        "/big/Code/Lumen/target/release/lumen",
+        "/big/Code/trust-js/target/release/trust-js",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.072708227031399,
@@ -2290,9 +2290,9 @@
       "variant": "baseline",
       "repeat": 3,
       "command": [
-        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/lumen-baseline",
+        "/big/Code/TRust/target/wasm-performance-20260929/optimizations/trust-js-baseline",
         "--tier=jit",
-        "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js"
+        "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js"
       ],
       "exit": 0,
       "wall_seconds": 8.185006765008438,
@@ -8724,8 +8724,8 @@
         ]
       ]
     },
-    "lumen_debug": {
-      "log": "lumen-debug-detach-final.log",
+    "trust_js_debug": {
+      "log": "trust-js-debug-detach-final.log",
       "results": [
         [
           "1613",
@@ -8749,8 +8749,8 @@
         ]
       ]
     },
-    "lumen_release": {
-      "log": "lumen-release-current.log",
+    "trust_js_release": {
+      "log": "trust-js-release-current.log",
       "results": [
         [
           "1613",
@@ -8869,11 +8869,11 @@
     },
     "clippy_logs": [
       "trust-clippy-current.log",
-      "lumen-clippy-detach-final.log"
+      "trust-js-clippy-detach-final.log"
     ],
     "release_build_logs": [
       "build-release-current.log",
-      "lumen-build-final-verified.log"
+      "trust-js-build-final-verified.log"
     ]
   },
   "limitations": [

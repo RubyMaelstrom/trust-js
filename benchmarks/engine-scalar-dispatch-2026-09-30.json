@@ -12,7 +12,7 @@
     "build": "Release opt-level=3, fat LTO, codegen-units=1, panic=abort; default Intl",
     "tier": "jit",
     "optimizing_jit": false,
-    "controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "Desktop applications active; no owned build/test/profile overlapped timing or peak comparisons."
   },
   "scope": "ARM64 zero-intrinsic ordinary-call dispatch and baseline SSA private scalar helper effect proofs.",
@@ -23,139 +23,139 @@
     "note": "Early native-call zero-intrinsic branch and private scalar operation effect proofs.",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "7ae715572577646a8be573bb3200d01705beab6966b73df6c16e0fc7c1bd9fc3"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "d5a11ea3606db3785a9e6657f868151733311f3fe10f361849672261a7d23de2"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "9c7433cd16d1c980ff2a662627ecefdc77176ec6baaf3381d69e6e6acdadffae"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "73a7df11c73f93d1c96d3d06d3246b8b85fdb61b05ba50bd0019f1c4c1e9d3c4"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "c59f597c6ef348fe18b272c541d8f7caaa9e23b352933fd69ea7b5dc95f5f2aa"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82e96a284dff5e24d77058d2249e14619b8268224d9aa756885eb6381433198f"
       },
       {
-        "path": "crates/lumen/src/lstr.rs",
+        "path": "crates/trust-js/src/lstr.rs",
         "sha256": "5e08bbb09b59c079bb9449fecbd8aa4747b802b592eb359374a4e502a3cb0b10"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "562fdc0e1c9e4337300275df35243c01a111fe2fca5bed1ecc4c7633893e4259"
       },
       {
-        "path": "crates/lumen/src/regex.rs",
+        "path": "crates/trust-js/src/regex.rs",
         "sha256": "dafd81ef95ab9da44ee4d3220a2e279251817c972336f843dddb2a1ce4646ad9"
       },
       {
-        "path": "crates/lumen/src/builtins/regexp.rs",
+        "path": "crates/trust-js/src/builtins/regexp.rs",
         "sha256": "86ccaaa438dce839e8d9627d033c486b5558826ddc1123646f9717256984a12b"
       },
       {
-        "path": "crates/lumen/src/execution_storage.rs",
+        "path": "crates/trust-js/src/execution_storage.rs",
         "sha256": "78b94946afcebca3c1ec9566db0089e430330558bdbaecfa0cd678af52a45546"
       },
       {
-        "path": "crates/lumen/src/bytecode_activation.rs",
+        "path": "crates/trust-js/src/bytecode_activation.rs",
         "sha256": "acff393803d85fd4c0e2ad914d88be23912418f8a3ce8b0504e6410d326e7071"
       },
       {
-        "path": "crates/lumen/src/jit.rs",
+        "path": "crates/trust-js/src/jit.rs",
         "sha256": "99de2d33d91acf85899dd7a5f39c70f1a8a7858959d42604a42e304b54900f86"
       },
       {
-        "path": "crates/lumen/src/eval.rs",
+        "path": "crates/trust-js/src/eval.rs",
         "sha256": "f875dc77b98fcf86dd0a7ae183448242e69a252bfcc143c3be307b23bb447d3b"
       },
       {
-        "path": "crates/lumen/src/eval_prepared_reference.rs",
+        "path": "crates/trust-js/src/eval_prepared_reference.rs",
         "sha256": "ea764c789f2aa5590a8ee708ba4a25dff695beded3c6fca976e8290a2fc747d3"
       },
       {
-        "path": "crates/lumen/src/gc_diagnostics.rs",
+        "path": "crates/trust-js/src/gc_diagnostics.rs",
         "sha256": "42c9e2e48b55a99f89cd37429bd09a19b9cb48dcf2c17297dbf60e7a823ff456"
       },
       {
-        "path": "crates/lumen/src/gc_generational.rs",
+        "path": "crates/trust-js/src/gc_generational.rs",
         "sha256": "1991c524afc14a3efad2be8ae1c57c381cdba3fecd839160951314f887d4b194"
       },
       {
-        "path": "crates/lumen/src/modules.rs",
+        "path": "crates/trust-js/src/modules.rs",
         "sha256": "b2797f5210825cc86fb4c36ddc23cc3c6ad679a6c4a1e546ed96da1fa2179e2b"
       },
       {
-        "path": "crates/lumen/src/prepared_reference_tests.rs",
+        "path": "crates/trust-js/src/prepared_reference_tests.rs",
         "sha256": "38cb7598672108cd246894fd3878a73e1425cfc672855f1a36076faf1349fdf4"
       },
       {
-        "path": "crates/lumen/src/tail_tests.rs",
+        "path": "crates/trust-js/src/tail_tests.rs",
         "sha256": "3b5c407e34d8ca1f535d96c58e153a84a06656d7220aef1359ea5a181c719497"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing.rs",
+        "path": "crates/trust-js/src/jit_optimizing.rs",
         "sha256": "51113ea9c71188c2e2fd284fe8fc829e72492b2bfd867724da529166caacb961"
       },
       {
-        "path": "crates/lumen/src/loop_fragment_tests.rs",
+        "path": "crates/trust-js/src/loop_fragment_tests.rs",
         "sha256": "a046daf761b26d39278e3ac99bbe3965c0ea0804fff5f43918b885f5dbe5bd53"
       },
       {
-        "path": "crates/lumen/src/tests.rs",
+        "path": "crates/trust-js/src/tests.rs",
         "sha256": "cae88164799957c0c9ee0d4563e8672d836125e83f83d297a2aca57a6cedcd13"
       },
       {
-        "path": "crates/lumen/src/jit_native_operations_tests.rs",
+        "path": "crates/trust-js/src/jit_native_operations_tests.rs",
         "sha256": "c3721f99f2294c099ce4b84a806cda6e0457bdf53447fd051e33f2e715fd1ea7"
       },
       {
-        "path": "crates/lumen/src/value.rs",
+        "path": "crates/trust-js/src/value.rs",
         "sha256": "613ea035ff3f6b3d52aa70b63ce48cc060e83b9a0cf296b03bd556c7f6035b49"
       },
       {
-        "path": "crates/lumen/src/jit_operations.rs",
+        "path": "crates/trust-js/src/jit_operations.rs",
         "sha256": "53b3f8ba0523f1db8cf9dc96d0aad7d639177524ae4cad85dec013ebb40dbb04"
       },
       {
-        "path": "crates/lumen/src/jit_ir.rs",
+        "path": "crates/trust-js/src/jit_ir.rs",
         "sha256": "a9099c56740a0114986f2ffab951a7abb649b0d2607432ee8fe88d3784441d4e"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing_effects.rs",
+        "path": "crates/trust-js/src/jit_optimizing_effects.rs",
         "sha256": "eda855e5a06da4f72dc3c9a0514eb4efd9461293321455e69e8d3a7db1368a6a"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing_values.rs",
+        "path": "crates/trust-js/src/jit_optimizing_values.rs",
         "sha256": "052fb8120fc3a5ae4f76537988324b011d95bbbdf25ace9c3a73615d5b00ee00"
       },
       {
-        "path": "crates/lumen/src/code_point_intrinsic_tests.rs",
+        "path": "crates/trust-js/src/code_point_intrinsic_tests.rs",
         "sha256": "b8c52e50b3580a73900ff5c0dfc2694f6681d7f86ac27baee0b3059cefc55c85"
       },
       {
-        "path": "crates/lumen/src/record_enumeration_tests.rs",
+        "path": "crates/trust-js/src/record_enumeration_tests.rs",
         "sha256": "5f4dcf633878819e4de32c1f01314243a15514414be9ea5db87e218a580d361c"
       },
       {
-        "path": "crates/lumen/src/property_read.rs",
+        "path": "crates/trust-js/src/property_read.rs",
         "sha256": "d6b96d205718a12b3986e797ca5122dfc4e4648214e7f348b36ab33e8141abe0"
       },
       {
-        "path": "crates/lumen/src/property_read_tests.rs",
+        "path": "crates/trust-js/src/property_read_tests.rs",
         "sha256": "73e0805e996aeffcca8e37a46b2fcefc50894b4075c2355d94099c38dbe1590a"
       },
       {
-        "path": "crates/lumen/src/jit_region_scalar_tests.rs",
+        "path": "crates/trust-js/src/jit_region_scalar_tests.rs",
         "sha256": "0b7ca81f383264b11da75efaeef77e4186a9a447339421cfe1a22e9bb1dec384"
       }
     ],
@@ -166,135 +166,135 @@
     "note": "Committed closed numeric record-getter cycle17.",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "7ae715572577646a8be573bb3200d01705beab6966b73df6c16e0fc7c1bd9fc3"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "d5a11ea3606db3785a9e6657f868151733311f3fe10f361849672261a7d23de2"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "9c7433cd16d1c980ff2a662627ecefdc77176ec6baaf3381d69e6e6acdadffae"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "73a7df11c73f93d1c96d3d06d3246b8b85fdb61b05ba50bd0019f1c4c1e9d3c4"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "c59f597c6ef348fe18b272c541d8f7caaa9e23b352933fd69ea7b5dc95f5f2aa"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82e96a284dff5e24d77058d2249e14619b8268224d9aa756885eb6381433198f"
       },
       {
-        "path": "crates/lumen/src/lstr.rs",
+        "path": "crates/trust-js/src/lstr.rs",
         "sha256": "5e08bbb09b59c079bb9449fecbd8aa4747b802b592eb359374a4e502a3cb0b10"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "562fdc0e1c9e4337300275df35243c01a111fe2fca5bed1ecc4c7633893e4259"
       },
       {
-        "path": "crates/lumen/src/regex.rs",
+        "path": "crates/trust-js/src/regex.rs",
         "sha256": "dafd81ef95ab9da44ee4d3220a2e279251817c972336f843dddb2a1ce4646ad9"
       },
       {
-        "path": "crates/lumen/src/builtins/regexp.rs",
+        "path": "crates/trust-js/src/builtins/regexp.rs",
         "sha256": "86ccaaa438dce839e8d9627d033c486b5558826ddc1123646f9717256984a12b"
       },
       {
-        "path": "crates/lumen/src/execution_storage.rs",
+        "path": "crates/trust-js/src/execution_storage.rs",
         "sha256": "78b94946afcebca3c1ec9566db0089e430330558bdbaecfa0cd678af52a45546"
       },
       {
-        "path": "crates/lumen/src/bytecode_activation.rs",
+        "path": "crates/trust-js/src/bytecode_activation.rs",
         "sha256": "acff393803d85fd4c0e2ad914d88be23912418f8a3ce8b0504e6410d326e7071"
       },
       {
-        "path": "crates/lumen/src/jit.rs",
+        "path": "crates/trust-js/src/jit.rs",
         "sha256": "4958789d673a65c21bb2b16ea5ef2f87c980c2b46663ff322fc9a87925010265"
       },
       {
-        "path": "crates/lumen/src/eval.rs",
+        "path": "crates/trust-js/src/eval.rs",
         "sha256": "f875dc77b98fcf86dd0a7ae183448242e69a252bfcc143c3be307b23bb447d3b"
       },
       {
-        "path": "crates/lumen/src/eval_prepared_reference.rs",
+        "path": "crates/trust-js/src/eval_prepared_reference.rs",
         "sha256": "ea764c789f2aa5590a8ee708ba4a25dff695beded3c6fca976e8290a2fc747d3"
       },
       {
-        "path": "crates/lumen/src/gc_diagnostics.rs",
+        "path": "crates/trust-js/src/gc_diagnostics.rs",
         "sha256": "42c9e2e48b55a99f89cd37429bd09a19b9cb48dcf2c17297dbf60e7a823ff456"
       },
       {
-        "path": "crates/lumen/src/gc_generational.rs",
+        "path": "crates/trust-js/src/gc_generational.rs",
         "sha256": "1991c524afc14a3efad2be8ae1c57c381cdba3fecd839160951314f887d4b194"
       },
       {
-        "path": "crates/lumen/src/modules.rs",
+        "path": "crates/trust-js/src/modules.rs",
         "sha256": "b2797f5210825cc86fb4c36ddc23cc3c6ad679a6c4a1e546ed96da1fa2179e2b"
       },
       {
-        "path": "crates/lumen/src/prepared_reference_tests.rs",
+        "path": "crates/trust-js/src/prepared_reference_tests.rs",
         "sha256": "38cb7598672108cd246894fd3878a73e1425cfc672855f1a36076faf1349fdf4"
       },
       {
-        "path": "crates/lumen/src/tail_tests.rs",
+        "path": "crates/trust-js/src/tail_tests.rs",
         "sha256": "3b5c407e34d8ca1f535d96c58e153a84a06656d7220aef1359ea5a181c719497"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing.rs",
+        "path": "crates/trust-js/src/jit_optimizing.rs",
         "sha256": "51113ea9c71188c2e2fd284fe8fc829e72492b2bfd867724da529166caacb961"
       },
       {
-        "path": "crates/lumen/src/loop_fragment_tests.rs",
+        "path": "crates/trust-js/src/loop_fragment_tests.rs",
         "sha256": "a046daf761b26d39278e3ac99bbe3965c0ea0804fff5f43918b885f5dbe5bd53"
       },
       {
-        "path": "crates/lumen/src/tests.rs",
+        "path": "crates/trust-js/src/tests.rs",
         "sha256": "cae88164799957c0c9ee0d4563e8672d836125e83f83d297a2aca57a6cedcd13"
       },
       {
-        "path": "crates/lumen/src/jit_native_operations_tests.rs",
+        "path": "crates/trust-js/src/jit_native_operations_tests.rs",
         "sha256": "c3721f99f2294c099ce4b84a806cda6e0457bdf53447fd051e33f2e715fd1ea7"
       },
       {
-        "path": "crates/lumen/src/value.rs",
+        "path": "crates/trust-js/src/value.rs",
         "sha256": "613ea035ff3f6b3d52aa70b63ce48cc060e83b9a0cf296b03bd556c7f6035b49"
       },
       {
-        "path": "crates/lumen/src/jit_operations.rs",
+        "path": "crates/trust-js/src/jit_operations.rs",
         "sha256": "53b3f8ba0523f1db8cf9dc96d0aad7d639177524ae4cad85dec013ebb40dbb04"
       },
       {
-        "path": "crates/lumen/src/jit_ir.rs",
+        "path": "crates/trust-js/src/jit_ir.rs",
         "sha256": "a9099c56740a0114986f2ffab951a7abb649b0d2607432ee8fe88d3784441d4e"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing_effects.rs",
+        "path": "crates/trust-js/src/jit_optimizing_effects.rs",
         "sha256": "eda855e5a06da4f72dc3c9a0514eb4efd9461293321455e69e8d3a7db1368a6a"
       },
       {
-        "path": "crates/lumen/src/jit_optimizing_values.rs",
+        "path": "crates/trust-js/src/jit_optimizing_values.rs",
         "sha256": "052fb8120fc3a5ae4f76537988324b011d95bbbdf25ace9c3a73615d5b00ee00"
       },
       {
-        "path": "crates/lumen/src/code_point_intrinsic_tests.rs",
+        "path": "crates/trust-js/src/code_point_intrinsic_tests.rs",
         "sha256": "b8c52e50b3580a73900ff5c0dfc2694f6681d7f86ac27baee0b3059cefc55c85"
       },
       {
-        "path": "crates/lumen/src/record_enumeration_tests.rs",
+        "path": "crates/trust-js/src/record_enumeration_tests.rs",
         "sha256": "5f4dcf633878819e4de32c1f01314243a15514414be9ea5db87e218a580d361c"
       },
       {
-        "path": "crates/lumen/src/property_read.rs",
+        "path": "crates/trust-js/src/property_read.rs",
         "sha256": "d6b96d205718a12b3986e797ca5122dfc4e4648214e7f348b36ab33e8141abe0"
       },
       {
-        "path": "crates/lumen/src/property_read_tests.rs",
+        "path": "crates/trust-js/src/property_read_tests.rs",
         "sha256": "73e0805e996aeffcca8e37a46b2fcefc50894b4075c2355d94099c38dbe1590a"
       }
     ],
@@ -302,12 +302,12 @@
   },
   "binaries": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle18-20260930/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle18-20260930/trust-js-baseline",
       "sha256": "9f53ed184bf4f62c6523c7eaf72976956bb36e817d894d89a16561e96b43a0ce",
       "bytes": 25109592
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle18-20260930/lumen-candidate",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle18-20260930/trust-js-candidate",
       "sha256": "3ea7f67ecd934d13fce51500c35c8829fb7a5ab9af08f3fd62fe714d3c18b30f",
       "bytes": 25109848
     },
@@ -319,19 +319,19 @@
   },
   "workloads": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle18-20260930/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle18-20260930/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle18-20260930/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle18-20260930/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle18-20260930/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle18-20260930/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },

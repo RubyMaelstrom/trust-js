@@ -6,7 +6,7 @@
     "tier": "jit",
     "optimizing_jit": false,
     "affinity_cpu": 5,
-    "controls": "LUMEN_*, TRUST_* and LD_PRELOAD removed",
+    "controls": "TRUST_JS_*, TRUST_* and LD_PRELOAD removed",
     "background": "Desktop applications active; no owned build/test/profile overlapped comparisons."
   },
   "scope": "Native ARM64 template JIT: prove ASCII within prepared Unicode-root slices and select the existing byte matcher.",
@@ -15,79 +15,79 @@
     "head": "d3dd5112ac335ec206a621bbef364287e02671ad",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "59eb0bc2bd4c4039f1aa3d484989de4e8eb93678cf1468848e1ea1cce1e11582"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "1d4b7a51118b358e964d2df3d172d3f33086f19c00469114afc92e35204df587"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "ae88a105dd918f3e4b9183287e0efb940c7b043f4bc1c0246e05a6693b161364"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "1e5a9583fb321aadca91d9c7d11721a41cc7693e6998b503c8a5a366fb5f6c7d"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "c1f65c68fa0ab5981c0bc069f46debf5d8631d1b4be1c12b5730af1007b49124"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82e96a284dff5e24d77058d2249e14619b8268224d9aa756885eb6381433198f"
       },
       {
-        "path": "crates/lumen/src/lstr.rs",
+        "path": "crates/trust-js/src/lstr.rs",
         "sha256": "5e08bbb09b59c079bb9449fecbd8aa4747b802b592eb359374a4e502a3cb0b10"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "7775fbd6d1325cac38a68e0ab241976aaf0801d54a45c95a66484ee865ef6613"
       },
       {
-        "path": "crates/lumen/src/regex.rs",
+        "path": "crates/trust-js/src/regex.rs",
         "sha256": "fc7294d2f7ff9695521ed80aaf3929bbf78ddfed826a5d9816ba687c7ad0638f"
       },
       {
-        "path": "crates/lumen/src/builtins/regexp.rs",
+        "path": "crates/trust-js/src/builtins/regexp.rs",
         "sha256": "86ccaaa438dce839e8d9627d033c486b5558826ddc1123646f9717256984a12b"
       },
       {
-        "path": "crates/lumen/src/execution_storage.rs",
+        "path": "crates/trust-js/src/execution_storage.rs",
         "sha256": "78b94946afcebca3c1ec9566db0089e430330558bdbaecfa0cd678af52a45546"
       },
       {
-        "path": "crates/lumen/src/bytecode_activation.rs",
+        "path": "crates/trust-js/src/bytecode_activation.rs",
         "sha256": "acff393803d85fd4c0e2ad914d88be23912418f8a3ce8b0504e6410d326e7071"
       },
       {
-        "path": "crates/lumen/src/jit.rs",
+        "path": "crates/trust-js/src/jit.rs",
         "sha256": "10986fcf0809aede049260826b3b0e25d98ff347b82521b36d07d7626df3207c"
       },
       {
-        "path": "crates/lumen/src/eval.rs",
+        "path": "crates/trust-js/src/eval.rs",
         "sha256": "f875dc77b98fcf86dd0a7ae183448242e69a252bfcc143c3be307b23bb447d3b"
       },
       {
-        "path": "crates/lumen/src/eval_prepared_reference.rs",
+        "path": "crates/trust-js/src/eval_prepared_reference.rs",
         "sha256": "ea764c789f2aa5590a8ee708ba4a25dff695beded3c6fca976e8290a2fc747d3"
       },
       {
-        "path": "crates/lumen/src/gc_diagnostics.rs",
+        "path": "crates/trust-js/src/gc_diagnostics.rs",
         "sha256": "42c9e2e48b55a99f89cd37429bd09a19b9cb48dcf2c17297dbf60e7a823ff456"
       },
       {
-        "path": "crates/lumen/src/gc_generational.rs",
+        "path": "crates/trust-js/src/gc_generational.rs",
         "sha256": "1991c524afc14a3efad2be8ae1c57c381cdba3fecd839160951314f887d4b194"
       },
       {
-        "path": "crates/lumen/src/modules.rs",
+        "path": "crates/trust-js/src/modules.rs",
         "sha256": "b2797f5210825cc86fb4c36ddc23cc3c6ad679a6c4a1e546ed96da1fa2179e2b"
       },
       {
-        "path": "crates/lumen/src/prepared_reference_tests.rs",
+        "path": "crates/trust-js/src/prepared_reference_tests.rs",
         "sha256": "38cb7598672108cd246894fd3878a73e1425cfc672855f1a36076faf1349fdf4"
       }
     ],
@@ -99,79 +99,79 @@
     "head": "d3dd5112ac335ec206a621bbef364287e02671ad",
     "files": [
       {
-        "path": "crates/lumen/src/builtins/mod.rs",
+        "path": "crates/trust-js/src/builtins/mod.rs",
         "sha256": "59eb0bc2bd4c4039f1aa3d484989de4e8eb93678cf1468848e1ea1cce1e11582"
       },
       {
-        "path": "crates/lumen/src/interpreter.rs",
+        "path": "crates/trust-js/src/interpreter.rs",
         "sha256": "1d4b7a51118b358e964d2df3d172d3f33086f19c00469114afc92e35204df587"
       },
       {
-        "path": "crates/lumen/src/jstr.rs",
+        "path": "crates/trust-js/src/jstr.rs",
         "sha256": "ae88a105dd918f3e4b9183287e0efb940c7b043f4bc1c0246e05a6693b161364"
       },
       {
-        "path": "crates/lumen/src/lib.rs",
+        "path": "crates/trust-js/src/lib.rs",
         "sha256": "1e5a9583fb321aadca91d9c7d11721a41cc7693e6998b503c8a5a366fb5f6c7d"
       },
       {
-        "path": "crates/lumen/src/memory.rs",
+        "path": "crates/trust-js/src/memory.rs",
         "sha256": "c1f65c68fa0ab5981c0bc069f46debf5d8631d1b4be1c12b5730af1007b49124"
       },
       {
-        "path": "crates/lumen/src/string_slice_tests.rs",
+        "path": "crates/trust-js/src/string_slice_tests.rs",
         "sha256": "82e96a284dff5e24d77058d2249e14619b8268224d9aa756885eb6381433198f"
       },
       {
-        "path": "crates/lumen/src/lstr.rs",
+        "path": "crates/trust-js/src/lstr.rs",
         "sha256": "5e08bbb09b59c079bb9449fecbd8aa4747b802b592eb359374a4e502a3cb0b10"
       },
       {
-        "path": "crates/lumen/src/bytecode.rs",
+        "path": "crates/trust-js/src/bytecode.rs",
         "sha256": "7775fbd6d1325cac38a68e0ab241976aaf0801d54a45c95a66484ee865ef6613"
       },
       {
-        "path": "crates/lumen/src/regex.rs",
+        "path": "crates/trust-js/src/regex.rs",
         "sha256": "dafd81ef95ab9da44ee4d3220a2e279251817c972336f843dddb2a1ce4646ad9"
       },
       {
-        "path": "crates/lumen/src/builtins/regexp.rs",
+        "path": "crates/trust-js/src/builtins/regexp.rs",
         "sha256": "86ccaaa438dce839e8d9627d033c486b5558826ddc1123646f9717256984a12b"
       },
       {
-        "path": "crates/lumen/src/execution_storage.rs",
+        "path": "crates/trust-js/src/execution_storage.rs",
         "sha256": "78b94946afcebca3c1ec9566db0089e430330558bdbaecfa0cd678af52a45546"
       },
       {
-        "path": "crates/lumen/src/bytecode_activation.rs",
+        "path": "crates/trust-js/src/bytecode_activation.rs",
         "sha256": "acff393803d85fd4c0e2ad914d88be23912418f8a3ce8b0504e6410d326e7071"
       },
       {
-        "path": "crates/lumen/src/jit.rs",
+        "path": "crates/trust-js/src/jit.rs",
         "sha256": "10986fcf0809aede049260826b3b0e25d98ff347b82521b36d07d7626df3207c"
       },
       {
-        "path": "crates/lumen/src/eval.rs",
+        "path": "crates/trust-js/src/eval.rs",
         "sha256": "f875dc77b98fcf86dd0a7ae183448242e69a252bfcc143c3be307b23bb447d3b"
       },
       {
-        "path": "crates/lumen/src/eval_prepared_reference.rs",
+        "path": "crates/trust-js/src/eval_prepared_reference.rs",
         "sha256": "ea764c789f2aa5590a8ee708ba4a25dff695beded3c6fca976e8290a2fc747d3"
       },
       {
-        "path": "crates/lumen/src/gc_diagnostics.rs",
+        "path": "crates/trust-js/src/gc_diagnostics.rs",
         "sha256": "42c9e2e48b55a99f89cd37429bd09a19b9cb48dcf2c17297dbf60e7a823ff456"
       },
       {
-        "path": "crates/lumen/src/gc_generational.rs",
+        "path": "crates/trust-js/src/gc_generational.rs",
         "sha256": "1991c524afc14a3efad2be8ae1c57c381cdba3fecd839160951314f887d4b194"
       },
       {
-        "path": "crates/lumen/src/modules.rs",
+        "path": "crates/trust-js/src/modules.rs",
         "sha256": "b2797f5210825cc86fb4c36ddc23cc3c6ad679a6c4a1e546ed96da1fa2179e2b"
       },
       {
-        "path": "crates/lumen/src/prepared_reference_tests.rs",
+        "path": "crates/trust-js/src/prepared_reference_tests.rs",
         "sha256": "38cb7598672108cd246894fd3878a73e1425cfc672855f1a36076faf1349fdf4"
       }
     ],
@@ -187,30 +187,30 @@
   },
   "sources": {
     "react": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle7-20260930/react.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle7-20260930/react.js",
       "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
     },
     "djot": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle7-20260930/djot.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle7-20260930/djot.js",
       "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
     },
     "ejs": {
-      "file": "/big/Code/Lumen/examples/ejs/code.js",
+      "file": "/big/Code/trust-js/examples/ejs/code.js",
       "sha256": "837d966ceb1c9d06a6be6a50fc08146ccbd3411977585aa9a19231e17e16715c"
     },
     "vue": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle7-20260930/vue.js",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle7-20260930/vue.js",
       "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
     }
   },
   "artifacts": {
     "baseline": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle7-20260930/lumen-baseline",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle7-20260930/trust-js-baseline",
       "sha256": "1794f1f92462650c1313018b82840067593a18a5ec4a6e5470abd9899d67da64",
       "bytes": 25083608
     },
     "candidate": {
-      "file": "/big/Code/Lumen/benchmark-results/engine-cycle7-20260930/lumen-candidate",
+      "file": "/big/Code/trust-js/benchmark-results/engine-cycle7-20260930/trust-js-candidate",
       "sha256": "f86822532c39b77f75bba94cfe1d5134d793498a5e951d208aad5a18eab29cce",
       "bytes": 25083640
     },
@@ -1419,7 +1419,7 @@
   },
   "validation": {
     "focused": "40 regexp tests, 24 regex tests and nine string-slice tests passed.",
-    "clippy": "cargo clippy -p lumen --all-targets -- -D warnings passed",
+    "clippy": "cargo clippy -p trust-js --all-targets -- -D warnings passed",
     "specification": "Local ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202, spec.html:40110 and :38095.",
     "scope": "No new full library/workspace, x64 execution, wasm build or Test262 claim."
   },

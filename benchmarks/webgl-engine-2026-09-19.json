@@ -127,7 +127,7 @@
     }
   },
   "validation": {
-    "lumen_unit_tests": {"passed": 1085},
+    "trust_js_unit_tests": {"passed": 1085},
     "trust_library_tests": {"passed": 1757, "ignored": 25},
     "hardware_webgl_tests": {"passed": 6},
     "test262": {
@@ -198,49 +198,49 @@
     "cpu_affinity": [5, 6, 7, 8, 9, 15, 16, 17, 18, 19],
     "gpu": "NVIDIA GB10, 610.57.04",
     "trust_base": "ef9a0a8efad6c5b2c2487325abed3b0ebabaff7d",
-    "baseline_lumen_revision": "3c0bf3e837982d7aefdb876b7e7400c82a2992b2",
-    "updated_lumen_parent": "f37febe094cb780525035194c20f91d6f308fe19",
-    "updated_lumen_patch_sha256": "7b71fcfb2287dce8f717b20cf71910b870435fdb6a5933e2897a42979e9b9e87",
+    "baseline_trust_js_revision": "3c0bf3e837982d7aefdb876b7e7400c82a2992b2",
+    "updated_trust_js_parent": "f37febe094cb780525035194c20f91d6f308fe19",
+    "updated_trust_js_patch_sha256": "7b71fcfb2287dce8f717b20cf71910b870435fdb6a5933e2897a42979e9b9e87",
     "url": "http://localhost:8000",
     "viewport": [960, 640],
     "timeout_seconds": 45,
     "warmup_milliseconds": 25000,
     "tier": "default JIT",
     "build": "cargo build --release (default features)",
-    "flags": ["TRUST_LUMEN_TASK_TRACE=1", "--settle 90", "--js-diagnostics"],
-    "method": "Six sequential runs, three of each binary in ABBAAB order. Both have identical TRust/WebGL sources; only the Lumen engine differs. Completed rAF tasks beginning at or after 25s. Callback time excludes task checkpoint, presentation, and scheduling; start-to-start intervals include them. Headless controller uses real WebGL, excludes native desktop window presentation.",
+    "flags": ["TRUST_JS_TASK_TRACE=1", "--settle 90", "--js-diagnostics"],
+    "method": "Six sequential runs, three of each binary in ABBAAB order. Both have identical TRust/WebGL sources; only the TRust JS engine differs. Completed rAF tasks beginning at or after 25s. Callback time excludes task checkpoint, presentation, and scheduling; start-to-start intervals include them. Headless controller uses real WebGL, excludes native desktop window presentation.",
     "binaries": {
-      "baseline": {"path": "/tmp/lumen-scene-perf/trust-headless-before", "sha256": "dfdfd5bcfd73b4381e2c04036f0242c2a126cdee5330bc7b10faf226ffed8369"},
-      "updated": {"path": "/tmp/lumen-scene-perf/trust-headless-release-final", "sha256": "6a9f98ea08f0b9ef792ed32e870424c5094e4bd2d75df757e2895bffea3b0b37"}
+      "baseline": {"path": "/tmp/trust-js-scene-perf/trust-headless-before", "sha256": "dfdfd5bcfd73b4381e2c04036f0242c2a126cdee5330bc7b10faf226ffed8369"},
+      "updated": {"path": "/tmp/trust-js-scene-perf/trust-headless-release-final", "sha256": "6a9f98ea08f0b9ef792ed32e870424c5094e4bd2d75df757e2895bffea3b0b37"}
     },
     "site_revision": "f641d9a0c16472372a149182985e38f6adfa765f",
     "site_status": "",
     "modified_source_files": {
       "TRust": {},
-      "Lumen": {
+      "TRust JS": {
         "benchmarks/README.md": "b6c8610212a3f5e81eaafb6b15ab7f220b6e21c11c98f43fb74b1d3e9f4be592",
         "benchmarks/webgl-engine-kernels.js": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
-        "crates/lumen/src/builtins/typedarray.rs": "da4f7728089233c4e533bd797e73b5de1bdefedef6ccc96cfc2c3fe432fe8725",
-        "crates/lumen/src/bytecode.rs": "dc2326ac112e9b84c625755a3ba5cf97a31fe770f603750a9c27680fe9b38ae4",
-        "crates/lumen/src/eval.rs": "8c267c1c7c496d3e49381b574a61eb0cce8915d447235ab6123525de32b18bad",
-        "crates/lumen/src/interpreter.rs": "6688c1118744a566d2c3c8954dd881d59e3f36f882c29d87ac04c8458b30140a",
-        "crates/lumen/src/jit.rs": "1c70d6a12374eac269cc30b518339df27894826f6f7522bfb82f82ce484e48c9",
-        "crates/lumen/src/memory.rs": "74830859f296e4b163b74ee3c71787b9a71b4a41307a2b37fee899df9edb6f9e",
-        "crates/lumen/src/tests.rs": "95e8772509f8f6aed9a78d3c88d313bb8e2e164c9ab4f98a953b1f9df8a0b2e7",
-        "crates/lumen/src/value.rs": "c6e16eb1bd5e6eb4796569396b801c35fe8f6a9e90962fdf1d537ce6f205937c"
+        "crates/trust-js/src/builtins/typedarray.rs": "da4f7728089233c4e533bd797e73b5de1bdefedef6ccc96cfc2c3fe432fe8725",
+        "crates/trust-js/src/bytecode.rs": "dc2326ac112e9b84c625755a3ba5cf97a31fe770f603750a9c27680fe9b38ae4",
+        "crates/trust-js/src/eval.rs": "8c267c1c7c496d3e49381b574a61eb0cce8915d447235ab6123525de32b18bad",
+        "crates/trust-js/src/interpreter.rs": "6688c1118744a566d2c3c8954dd881d59e3f36f882c29d87ac04c8458b30140a",
+        "crates/trust-js/src/jit.rs": "1c70d6a12374eac269cc30b518339df27894826f6f7522bfb82f82ce484e48c9",
+        "crates/trust-js/src/memory.rs": "74830859f296e4b163b74ee3c71787b9a71b4a41307a2b37fee899df9edb6f9e",
+        "crates/trust-js/src/tests.rs": "95e8772509f8f6aed9a78d3c88d313bb8e2e164c9ab4f98a953b1f9df8a0b2e7",
+        "crates/trust-js/src/value.rs": "c6e16eb1bd5e6eb4796569396b801c35fe8f6a9e90962fdf1d537ce6f205937c"
       }
     }
   },
   "kernel_manifest": {
     "started_utc": "2026-09-19T13:27:06.270207+00:00",
-    "fixture": "/big/Code/Lumen/benchmarks/webgl-engine-kernels.js",
+    "fixture": "/big/Code/trust-js/benchmarks/webgl-engine-kernels.js",
     "fixture_sha256": "bffe0386b15230ee8226190ef26dd3076ad013ea79e9b2478fa280531c6843dc",
     "binaries": {
       "baseline": {
-        "path": "/tmp/lumen-scene-perf/base-source/target/release/lumen",
+        "path": "/tmp/trust-js-scene-perf/base-source/target/release/trust-js",
         "sha256": "00cabc52aa6e25c9d5fcf66016f08c9aa225bb736a35bc4f609b7ce51e083e27"
       },
-      "updated": {"path": "/tmp/lumen-scene-perf/lumen-release-final", "sha256": "12d0f6664186b330e8f7e4414fc7bd5bba4814693ecba6f52a8dbaf27fa18dee"}
+      "updated": {"path": "/tmp/trust-js-scene-perf/trust-js-release-final", "sha256": "12d0f6664186b330e8f7e4414fc7bd5bba4814693ecba6f52a8dbaf27fa18dee"}
     },
     "tier": "jit",
     "cpu_affinity": [19],
@@ -613,10 +613,10 @@
       }
     ]
   },
-  "raw_artifacts_directory": "/tmp/lumen-scene-perf",
+  "raw_artifacts_directory": "/tmp/trust-js-scene-perf",
   "schema_version": 1,
   "diagnosis": [
-    "The measured page uses native ARM64 JIT code and NVIDIA EGL/GLES. CPU profiles show repeated Lumen runtime calls; they do not show software rasterization as the cause of the remaining gap.",
+    "The measured page uses native ARM64 JIT code and NVIDIA EGL/GLES. CPU profiles show repeated TRust JS runtime calls; they do not show software rasterization as the cause of the remaining gap.",
     "Numeric array templates did not cover both current packed element representations. A missing optional numeric mirror could replay the rest of an arithmetic chain through generic opcode helpers.",
     "Numeric loop conditions using strict inequality could enter a helper sequence on every iteration. Same-type Number comparisons now stay native, preserving NaN and signed-zero semantics.",
     "Computed reads discarded per-operation scratch IC state and repeatedly resolved/copied property keys. Ordinary for-in loops repeatedly rebuilt the same key lists. The changes reuse bounded, guarded caches.",
@@ -679,7 +679,7 @@
     {
       "run": 1,
       "label": "baseline",
-      "log": "/tmp/lumen-scene-perf/comparison-1-baseline.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-1-baseline.log",
       "exit_code": 3,
       "wall_seconds": 45.16497114498634,
       "user_seconds": 42.619688,
@@ -843,7 +843,7 @@
     {
       "run": 2,
       "label": "updated",
-      "log": "/tmp/lumen-scene-perf/comparison-2-updated.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-2-updated.log",
       "exit_code": 3,
       "wall_seconds": 45.21325769700343,
       "user_seconds": 42.153508,
@@ -1059,7 +1059,7 @@
     {
       "run": 3,
       "label": "updated",
-      "log": "/tmp/lumen-scene-perf/comparison-3-updated.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-3-updated.log",
       "exit_code": 3,
       "wall_seconds": 45.19983324900386,
       "user_seconds": 42.204545,
@@ -1272,7 +1272,7 @@
     {
       "run": 4,
       "label": "baseline",
-      "log": "/tmp/lumen-scene-perf/comparison-4-baseline.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-4-baseline.log",
       "exit_code": 3,
       "wall_seconds": 45.17793192298268,
       "user_seconds": 42.698175,
@@ -1433,7 +1433,7 @@
     {
       "run": 5,
       "label": "baseline",
-      "log": "/tmp/lumen-scene-perf/comparison-5-baseline.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-5-baseline.log",
       "exit_code": 3,
       "wall_seconds": 45.17448504199274,
       "user_seconds": 42.686754,
@@ -1595,7 +1595,7 @@
     {
       "run": 6,
       "label": "updated",
-      "log": "/tmp/lumen-scene-perf/comparison-6-updated.log",
+      "log": "/tmp/trust-js-scene-perf/comparison-6-updated.log",
       "exit_code": 3,
       "wall_seconds": 45.161558882013196,
       "user_seconds": 42.266328,
@@ -1803,7 +1803,7 @@
     }
   ],
   "resource_diagnostics": {
-    "note": "Separate diagnostic runs with LUMEN_PERF_METRICS=1; not mixed into normal timing distributions. Managed memory is a post-GC lower bound where labeled.",
+    "note": "Separate diagnostic runs with TRUST_JS_PERF_METRICS=1; not mixed into normal timing distributions. Managed memory is a post-GC lower bound where labeled.",
     "runs": [
       {
         "label": "baseline",
@@ -2103,7 +2103,7 @@
     {
       "label": "baseline",
       "rss_kib": {
-        "/tmp/lumen-scene-perf/base-source/target/release/lumen": 14828,
+        "/tmp/trust-js-scene-perf/base-source/target/release/trust-js": 14828,
         "[anon]": 204,
         "[heap]": 3092,
         "/usr/lib/libc.so.6": 1108,
@@ -2120,7 +2120,7 @@
     {
       "label": "updated",
       "rss_kib": {
-        "/tmp/lumen-scene-perf/lumen-release-final": 17216,
+        "/tmp/trust-js-scene-perf/trust-js-release-final": 17216,
         "[anon]": 216,
         "[heap]": 3140,
         "/usr/lib/libc.so.6": 1108,
@@ -2153,13 +2153,13 @@
     }
   },
   "verification_logs": {
-    "lumen-final-suite.log": {"path": "/tmp/lumen-scene-perf/lumen-final-suite.log", "sha256": "9556190cb32123c965879fc9bcf74c7194ec537e7861077634f51d93cb1c4d64"},
-    "trust-final-suite.log": {"path": "/tmp/lumen-scene-perf/trust-final-suite.log", "sha256": "7c81cadf07f8dd66882db1ce6d49c15b509841adefc46509597ff96353bbab46"},
-    "trust-final-webgl.log": {"path": "/tmp/lumen-scene-perf/trust-final-webgl.log", "sha256": "bdfa576ab9925770022a667c3df337d828a7c26bf63e40918f03d486168b97bf"},
-    "test262-final.log": {"path": "/tmp/lumen-scene-perf/test262-final.log", "sha256": "afd81c1e58da5dc0b8b6bc9a54a4b444d0e7ded023b3edf3a5a5494ed2070ec9"},
-    "difftest-final.log": {"path": "/tmp/lumen-scene-perf/difftest-final.log", "sha256": "14d6e3b0953b27ba1daa0bc7ce9ddc750964eefc403bd71df9cda9b6b5b10850"},
-    "clippy-final.log": {"path": "/tmp/lumen-scene-perf/clippy-final.log", "sha256": "c1e74e6075fc559418f6a4eb30539f6fa1da74e415aee29da7364b675298811a"},
-    "build-final-engine.log": {"path": "/tmp/lumen-scene-perf/build-final-engine.log", "sha256": "04c3683f45e175f99366a235fe5ea6ee2e872d7200215256ad13a5bd3e344e85"},
-    "build-final-trust.log": {"path": "/tmp/lumen-scene-perf/build-final-trust.log", "sha256": "9c4c991997c4371c3e356f2854247e4d23ff2c0c5a559751bb3ff6f04452b69e"}
+    "trust-js-final-suite.log": {"path": "/tmp/trust-js-scene-perf/trust-js-final-suite.log", "sha256": "9556190cb32123c965879fc9bcf74c7194ec537e7861077634f51d93cb1c4d64"},
+    "trust-final-suite.log": {"path": "/tmp/trust-js-scene-perf/trust-final-suite.log", "sha256": "7c81cadf07f8dd66882db1ce6d49c15b509841adefc46509597ff96353bbab46"},
+    "trust-final-webgl.log": {"path": "/tmp/trust-js-scene-perf/trust-final-webgl.log", "sha256": "bdfa576ab9925770022a667c3df337d828a7c26bf63e40918f03d486168b97bf"},
+    "test262-final.log": {"path": "/tmp/trust-js-scene-perf/test262-final.log", "sha256": "afd81c1e58da5dc0b8b6bc9a54a4b444d0e7ded023b3edf3a5a5494ed2070ec9"},
+    "difftest-final.log": {"path": "/tmp/trust-js-scene-perf/difftest-final.log", "sha256": "14d6e3b0953b27ba1daa0bc7ce9ddc750964eefc403bd71df9cda9b6b5b10850"},
+    "clippy-final.log": {"path": "/tmp/trust-js-scene-perf/clippy-final.log", "sha256": "c1e74e6075fc559418f6a4eb30539f6fa1da74e415aee29da7364b675298811a"},
+    "build-final-engine.log": {"path": "/tmp/trust-js-scene-perf/build-final-engine.log", "sha256": "04c3683f45e175f99366a235fe5ea6ee2e872d7200215256ad13a5bd3e344e85"},
+    "build-final-trust.log": {"path": "/tmp/trust-js-scene-perf/build-final-trust.log", "sha256": "9c4c991997c4371c3e356f2854247e4d23ff2c0c5a559751bb3ff6f04452b69e"}
   }
 }

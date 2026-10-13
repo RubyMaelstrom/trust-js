@@ -19,7 +19,7 @@ import urllib.request
 
 VERSION = "17.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/unicode_segment.rs"
+OUTPUT = ROOT / "crates/trust-js/src/unicode_segment.rs"
 UCD = f"https://www.unicode.org/Public/{VERSION}/ucd"
 
 SOURCES = {
@@ -36,7 +36,7 @@ PROPERTY_RE = re.compile(
 
 
 def download(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "Lumen Unicode table generator"})
+    request = urllib.request.Request(url, headers={"User-Agent": "TRust JS Unicode table generator"})
     with urllib.request.urlopen(request) as response:
         return response.read().decode("utf-8")
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate DateTimeFormat patterns and field names for every advertised Lumen locale.
+"""Generate DateTimeFormat patterns and field names for every advertised TRust JS locale.
 
 The source is CLDR 48 (cldr-json, which resolves UTS #35 inheritance, including each
 non-Gregorian calendar's aliases to the generic or Chinese calendar). cldr-json does not publish
@@ -36,11 +36,11 @@ import cldr_locales  # noqa: E402
 
 TAG = "48.0.0"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUTPUT = ROOT / "crates/lumen/src/cldr_datetime_patterns.rs"
+OUTPUT = ROOT / "crates/trust-js/src/cldr_datetime_patterns.rs"
 CLDR_JSON = f"https://raw.githubusercontent.com/unicode-org/cldr-json/{TAG}/cldr-json"
 CLDR_XML = "https://raw.githubusercontent.com/unicode-org/cldr/release-48"
 LOCALES = list(cldr_locales.locales())
-# (Lumen calendar id, cldr-json package, calendar key)
+# (TRust JS calendar id, cldr-json package, calendar key)
 CALENDARS = [
     ("gregory", "cldr-dates-full", "gregorian"),
     ("iso8601", None, "iso8601"),
@@ -76,7 +76,7 @@ def load(package: str, locale: str, calendar: str) -> dict:
     else:
         request = urllib.request.Request(
             f"{CLDR_JSON}/{relative}",
-            headers={"User-Agent": "Lumen CLDR DateTimeFormat generator"},
+            headers={"User-Agent": "TRust JS CLDR DateTimeFormat generator"},
         )
         with urllib.request.urlopen(request) as response:
             data = json.load(response)
@@ -84,7 +84,7 @@ def load(package: str, locale: str, calendar: str) -> dict:
 
 
 def fetch_text(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "Lumen CLDR DateTimeFormat generator"})
+    request = urllib.request.Request(url, headers={"User-Agent": "TRust JS CLDR DateTimeFormat generator"})
     with urllib.request.urlopen(request) as response:
         return response.read().decode("utf-8")
 
