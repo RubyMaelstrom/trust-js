@@ -19321,6 +19321,64 @@ fn failed_module_graph_load_does_not_poison_a_retry() {
     }
 }
 
+/// A module evaluation promise is internal: a dependency's evaluation error reaches the author
+/// through the import() promise (or the static graph's own throw), and HostPromiseRejectionTracker
+/// never reports the per-module promise. Node prints nothing for a caught `import()` whose
+/// dependency throws.
+#[test]
+fn module_evaluation_errors_report_no_internal_rejection() {
+    use crate::bytecode::Tier;
+    let files = [
+        (
+            "main",
+            "globalThis.out = [];
+             import('mid').then(() => out.push('loaded'), e => out.push('caught ' + e.message));
+             try { await import('late'); } catch (e) { out.push('awaited ' + e.message); }",
+        ),
+        ("mid", "import 'dep'; export const x = 1;"),
+        ("dep", "throw new TypeError('boom');"),
+        ("late", "import 'slow'; export const y = 2;"),
+        ("slow", "await 0; throw new RangeError('late');"),
+        ("static", "import 'dep';"),
+    ];
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let loader = move |spec: &str, _: &str| {
+            files
+                .iter()
+                .find(|(key, _)| *key == spec)
+                .map(|(key, source)| (key.to_string(), source.to_string()))
+        };
+        let completion = engine
+            .eval_module(files[0].1, "main", loader)
+            .expect("parse");
+        assert!(matches!(completion, Completion::Value(_)), "tier {tier:?}");
+        assert_eq!(
+            run_in(&mut engine, "out.join()"),
+            "caught boom,awaited late",
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.unhandled_rejections.is_empty(),
+            "tier {tier:?}"
+        );
+        // A static graph whose dependency throws reports the error once, as its completion.
+        let completion = engine
+            .eval_module(files[5].1, "static", loader)
+            .expect("parse");
+        assert!(
+            matches!(completion, Completion::Throw { ref name, .. } if name == "TypeError"),
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.unhandled_rejections.is_empty(),
+            "tier {tier:?}"
+        );
+    }
+}
+
 #[test]
 fn failed_module_link_remains_retryable() {
     let mut engine = Engine::new();

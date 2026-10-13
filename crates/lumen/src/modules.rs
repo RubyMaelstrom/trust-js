@@ -305,6 +305,21 @@ enum Resolution {
 }
 
 impl Interp {
+    /// A new module evaluation promise: a [[TopLevelCapability]], or the promise this engine keeps
+    /// for every module of an evaluating graph. Its rejection reaches authors only through the
+    /// import() promise chained to it or the host's module script error report (HTML "run a
+    /// module script" reacts to its rejection), so it is marked handled: HostPromiseRejectionTracker
+    /// must not report the internal promise as an unhandled rejection.
+    fn new_evaluation_promise(&mut self) -> Value {
+        let promise = self.new_promise();
+        if let Value::Obj(object) = &promise {
+            if let Some(state) = self.promises.get_mut(&(Rc::as_ptr(object) as usize)) {
+                state.handled = true;
+            }
+        }
+        promise
+    }
+
     /// The evaluation promise for `key`, redirected to its cycle root once evaluation has begun.
     /// Browser embedders use this to delay a module script's completion steps through top-level
     /// await instead of treating the initial suspension as successful evaluation.
@@ -340,7 +355,7 @@ impl Interp {
         self.collect_eager_graph(&key, &mut graph);
         for m in &graph {
             if !self.module_recs[m].evaluated && self.module_recs[m].top_promise.is_none() {
-                let p = self.new_promise();
+                let p = self.new_evaluation_promise();
                 self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
             }
         }
@@ -1426,7 +1441,7 @@ impl Interp {
                 continue;
             }
             if !self.module_recs[&m].evaluated && self.module_recs[&m].top_promise.is_none() {
-                let p = self.new_promise();
+                let p = self.new_evaluation_promise();
                 self.module_recs.get_mut(&m).unwrap().top_promise = Some(p);
             }
             self.inner_module_evaluation_async(&m, stack, index);
@@ -1501,7 +1516,7 @@ impl Interp {
             let module_key = key.to_string();
             let top = match top {
                 Some(t) => t,
-                None => self.new_promise(),
+                None => self.new_evaluation_promise(),
             };
             // ExecuteModule receives the environment created during linking. Imports remain free
             // name operations so their live redirects are followed; all other own bindings map
@@ -1662,7 +1677,7 @@ impl Interp {
             self.collect_eager_graph(key, &mut graph);
             for m in &graph {
                 if !self.module_recs[m].evaluated && self.module_recs[m].top_promise.is_none() {
-                    let p = self.new_promise();
+                    let p = self.new_evaluation_promise();
                     self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
                 }
             }
@@ -1895,12 +1910,12 @@ impl Interp {
             return top;
         }
         if let Some(err) = err {
-            let p = self.new_promise();
+            let p = self.new_evaluation_promise();
             self.reject_promise(&p, err);
             return p;
         }
         if settled {
-            let p = self.new_promise();
+            let p = self.new_evaluation_promise();
             self.resolve_promise(&p, Value::Undefined);
             return p;
         }
@@ -1910,7 +1925,7 @@ impl Interp {
         self.collect_eager_graph(key, &mut graph);
         for m in &graph {
             if !self.module_recs[m].evaluated && self.module_recs[m].top_promise.is_none() {
-                let p = self.new_promise();
+                let p = self.new_evaluation_promise();
                 self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
             }
         }
@@ -1919,7 +1934,7 @@ impl Interp {
             .top_promise
             .clone()
             .unwrap_or_else(|| {
-                let p = self.new_promise();
+                let p = self.new_evaluation_promise();
                 match self.module_recs[key].eval_error.clone() {
                     Some(e) => self.reject_promise(&p, e),
                     None => self.resolve_promise(&p, Value::Undefined),
