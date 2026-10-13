@@ -18845,7 +18845,7 @@ fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
         Waiter,
     };
     use std::time::Duration;
-    let id = alloc_shared_mem(8);
+    let id = alloc_shared_mem(8).expect("an 8-byte shared block");
     let taken = BlockedAgent::default();
     with_waiter_list(id, 0, |list| list.push(Waiter::Blocked(taken.clone())));
     // A notify's removal, before it sets the waiter's flag.
