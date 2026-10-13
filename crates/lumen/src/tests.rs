@@ -29128,6 +29128,34 @@ r.join("|")"#;
 }
 
 #[test]
+fn stack_positions_of_spliced_callees() {
+    // Hot callers splice their callees, which then run without frames of their own: a captured
+    // or engine-created error still reports every callee at its own position (nested splices
+    // included), like the tree-walker.
+    let source = r#"function getY(o) { return o.p.y; }
+function viaGet(o) { return getY(o); }
+function leaf() { return new Error("x"); }
+function mid() { return leaf(); }
+function outer() { return mid(); }
+var r = [], e;
+for (var i = 0; i < 1000; i++) { viaGet({p: {y: 1}}); e = outer(); }
+r.push(e.stack.replace(/^.*\n/, ""));
+try { viaGet({}); } catch (x) { r.push(x.stack.replace(/^.*\n/, "")); }
+r.join("|")"#;
+    assert_eq!(
+        stack_on_every_tier(source),
+        frames(&[
+            "at leaf (https://example.com/a.js:3:26)",
+            "at mid (https://example.com/a.js:4:25)",
+            "at outer (https://example.com/a.js:5:27)",
+            "at https://example.com/a.js:7:59|    at getY (https://example.com/a.js:1:31)",
+            "at viaGet (https://example.com/a.js:2:29)",
+            "at https://example.com/a.js:9:7",
+        ])
+    );
+}
+
+#[test]
 fn module_frames_report_the_module_key() {
     let mut engine = Engine::new();
     let source = "export const s = new Error('m').stack; globalThis.moduleStack = s;";

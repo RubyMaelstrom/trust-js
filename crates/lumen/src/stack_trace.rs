@@ -35,6 +35,153 @@ use std::rc::Rc;
 /// The position of an operation that has none (see the module documentation).
 pub(crate) const NO_POSITION: u32 = u32::MAX;
 
+/// Marks a position that names an [`InlineSite`] instead of a byte offset: the operation runs
+/// in a callee the bytecode compiler spliced into its caller, which has no frame of its own.
+/// Capturing a stack, placing a thrown error and the legacy `caller` reflection expand it into
+/// the callee's frame (or frames, for nested splices). Byte offsets stay below this bit: a
+/// script's text is far smaller than 2 GiB.
+const INLINE_POSITION: u32 = 1 << 31;
+
+/// Whether `position` names an inline site rather than a byte offset.
+#[inline]
+pub(crate) fn is_inline_position(position: u32) -> bool {
+    position != NO_POSITION && position & INLINE_POSITION != 0
+}
+
+/// An operation of a spliced callee: the function, the operation's byte offset in the
+/// callee's own source, and the position of the splice in its caller (itself an inline position
+/// when the caller is spliced too).
+#[derive(Clone)]
+pub(crate) struct InlineSite {
+    pub(crate) callee: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pub(crate) inner: u32,
+    pub(crate) outer: u32,
+}
+
+/// The thread's registered inline sites. Compiled chunks are thread-bound (an Agent runs on
+/// one thread), and each owns the sites it registered through [`InlineSites`].
+#[derive(Default)]
+struct InlineSiteTable {
+    sites: Vec<Option<InlineSite>>,
+    free: Vec<u32>,
+}
+
+thread_local! {
+    static INLINE_SITES: std::cell::RefCell<InlineSiteTable> = Default::default();
+}
+
+/// The inline sites one chunk registered, released when the chunk is dropped. A chunk's inline
+/// positions are only read while it runs (as the call position of a frame above it or of an
+/// error it raises), and captured frames keep resolved byte offsets, so none outlives it.
+#[derive(Default)]
+pub(crate) struct InlineSites(Box<[u32]>);
+
+impl InlineSites {
+    /// Register `sites` in order and return the inline position of each. An `outer` that is an
+    /// inline position must name an earlier site of the same list (by its index, tagged).
+    pub(crate) fn register(sites: Vec<InlineSite>) -> (InlineSites, Vec<u32>) {
+        if sites.is_empty() {
+            return (InlineSites::default(), Vec::new());
+        }
+        INLINE_SITES.with(|table| {
+            let mut table = table.borrow_mut();
+            let mut positions: Vec<u32> = Vec::with_capacity(sites.len());
+            for mut site in sites {
+                if is_inline_position(site.outer) {
+                    site.outer = positions[(site.outer & !INLINE_POSITION) as usize];
+                }
+                let index = match table.free.pop() {
+                    Some(index) => {
+                        table.sites[index as usize] = Some(site);
+                        index
+                    }
+                    None => {
+                        let index = table.sites.len() as u32;
+                        assert!(
+                            index < !INLINE_POSITION,
+                            "inline site table exhausted its position space"
+                        );
+                        table.sites.push(Some(site));
+                        index
+                    }
+                };
+                positions.push(index | INLINE_POSITION);
+            }
+            let ids = positions.iter().map(|&p| p & !INLINE_POSITION).collect();
+            (InlineSites(ids), positions)
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.0.len() * std::mem::size_of::<u32>()
+    }
+}
+
+impl Drop for InlineSites {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        // During thread teardown the table may already be gone; nothing can read it then.
+        let _ = INLINE_SITES.try_with(|table| {
+            let mut table = table.borrow_mut();
+            for &index in self.0.iter() {
+                table.sites[index as usize] = None;
+                table.free.push(index);
+            }
+        });
+    }
+}
+
+/// The inline position of a compiler's local site list entry `index` (see
+/// [`InlineSites::register`]).
+#[inline]
+pub(crate) fn inline_position(index: u32) -> u32 {
+    debug_assert!(index < !INLINE_POSITION);
+    index | INLINE_POSITION
+}
+
+/// The list index an inline position carries.
+#[inline]
+pub(crate) fn inline_index(position: u32) -> usize {
+    (position & !INLINE_POSITION) as usize
+}
+
+/// The site an inline position names (None for a byte offset, or a site already released).
+pub(crate) fn inline_site(position: u32) -> Option<InlineSite> {
+    if !is_inline_position(position) {
+        return None;
+    }
+    INLINE_SITES.with(|table| {
+        table
+            .borrow()
+            .sites
+            .get((position & !INLINE_POSITION) as usize)
+            .cloned()
+            .flatten()
+    })
+}
+
+/// The innermost-first chain of spliced activations an inline `position` runs in, as
+/// (callee, its byte offset), and the byte offset in the context that holds the splices.
+pub(crate) fn inline_chain(mut position: u32) -> (Vec<(crate::value::Gc, u32)>, u32) {
+    let mut chain = Vec::new();
+    while let Some(site) = inline_site(position) {
+        if let Some(callee) = site.callee.upgrade() {
+            chain.push((crate::value::Gc::from(callee), site.inner));
+        }
+        position = site.outer;
+    }
+    // A released site (never expected while its chunk runs) reports no position.
+    if is_inline_position(position) {
+        position = NO_POSITION;
+    }
+    (chain, position)
+}
+
+/// The depth of a frame no operation places any more (see [`Frame::depth`]).
+const PLACED_DEPTH: u32 = u32::MAX;
+
 /// The location V8 prints for code without a URL and for built-in frames.
 const ANONYMOUS: &str = "<anonymous>";
 
@@ -611,6 +758,25 @@ impl Interp {
         let mut code = self.code_frames.len();
         while frames.len() < limit && (function > 0 || code > 0) {
             let depth = (function + code) as u32;
+            // Callees spliced into this context run above it without frames of their own.
+            if is_inline_position(position) {
+                let (chain, outer) = inline_chain(position);
+                for (callee, inner) in chain {
+                    if let Skip::UntilSeen(target) = skip {
+                        if skipping {
+                            skipping = Rc::as_ptr(&callee) as usize != target;
+                            continue;
+                        }
+                    }
+                    if frames.len() < limit {
+                        frames.extend(function_frame(&callee, false, inner, PLACED_DEPTH));
+                    }
+                }
+                position = outer;
+                if frames.len() >= limit {
+                    break;
+                }
+            }
             // A code frame entered at depth d runs above function frames [0, d).
             let frame = if code > 0 && self.code_frames[code - 1].depth as usize >= function {
                 code -= 1;
@@ -668,7 +834,20 @@ impl Interp {
             return;
         };
         if let Some((mut trace, index)) = self.pending_frame(thrown) {
-            trace.frames[index].position = position;
+            if is_inline_position(position) {
+                // The operation belongs to spliced callees: their frames come first.
+                let (chain, outer) = inline_chain(position);
+                trace.frames[index].position = outer;
+                let inline = chain.iter().filter_map(|(callee, inner)| {
+                    function_frame(callee, false, *inner, PLACED_DEPTH)
+                });
+                trace.frames.splice(index..index, inline);
+                if let Some(limit) = self.stack_trace_limit() {
+                    trace.frames.truncate(limit);
+                }
+            } else {
+                trace.frames[index].position = position;
+            }
             trace.lines = None;
         }
     }
@@ -681,7 +860,7 @@ impl Interp {
     pub(crate) fn settle_caught(&mut self, caught: &Value) {
         self.call_site = NO_POSITION;
         if let Some((mut trace, index)) = self.pending_frame(caught) {
-            trace.frames[index].depth = u32::MAX;
+            trace.frames[index].depth = PLACED_DEPTH;
         }
     }
 

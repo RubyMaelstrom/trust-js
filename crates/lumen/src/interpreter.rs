@@ -983,6 +983,63 @@ impl Default for FrameExtra {
     }
 }
 
+/// The youngest activation of a function, for the legacy `caller` / `arguments` reflection.
+#[derive(Clone, Copy)]
+enum LegacyActivation {
+    /// Function frame `k`.
+    Frame(usize),
+    /// Entry `j` of the spliced callees (innermost first) that function frame `k` was called
+    /// from: they run in the context below frame `k` (see `crate::stack_trace::inline_chain`).
+    Inline(usize, usize),
+}
+
+impl Interp {
+    /// The youngest activation of the function with `Rc::as_ptr` identity `function`. Callees
+    /// the compiler spliced into their caller have no frame; those that made the call to a
+    /// frame above them are named by that frame's call position.
+    fn legacy_activation(&self, function: usize) -> Option<LegacyActivation> {
+        for k in (0..self.fn_frames.len()).rev() {
+            if self.fn_frames[k].fn_ptr == function {
+                return Some(LegacyActivation::Frame(k));
+            }
+            let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site);
+            if let Some(j) = chain
+                .iter()
+                .position(|(callee, _)| Rc::as_ptr(callee) as usize == function)
+            {
+                return Some(LegacyActivation::Inline(k, j));
+            }
+        }
+        None
+    }
+
+    /// The legacy `caller` of `activation`: the function whose code made its call (null for
+    /// none, or for a strict caller).
+    fn legacy_caller(&self, activation: LegacyActivation) -> Value {
+        let (k, next) = match activation {
+            LegacyActivation::Frame(k) => (k, 0),
+            LegacyActivation::Inline(k, j) => (k, j + 1),
+        };
+        let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site);
+        if let Some((callee, _)) = chain.into_iter().nth(next) {
+            let strict = match &callee.borrow().call {
+                Callable::User(user) => user.func.is_strict,
+                _ => false,
+            };
+            return if strict {
+                Value::Null
+            } else {
+                Value::Obj(callee)
+            };
+        }
+        match self.fn_frames[..k].last() {
+            None => Value::Null,
+            Some(fr) if fr.strict => Value::Null,
+            Some(fr) => Value::Obj(fr.callee()),
+        }
+    }
+}
+
 impl FnFrame {
     /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
     pub fn callee(&self) -> Gc {
@@ -8925,9 +8982,17 @@ impl Interp {
                             // strict caller is censored to null). Eval runs inline, so eval
                             // frames are naturally skipped.
                             let rptr = Rc::as_ptr(r) as usize;
-                            let top = self.fn_frames.iter().rposition(|fr| fr.fn_ptr == rptr);
+                            let activation = self.legacy_activation(rptr);
+                            let top = match activation {
+                                Some(LegacyActivation::Frame(k)) => Some(k),
+                                _ => None,
+                            };
                             trace_legacy_reflection(key, top.map(|k| &self.fn_frames[k]));
+                            if let Some(activation) = activation.filter(|_| key == "caller") {
+                                return Ok(self.legacy_caller(activation));
+                            }
                             return Ok(match (key, top) {
+                                // A spliced activation keeps no arguments object.
                                 (_, None) => Value::Null,
                                 ("arguments", Some(k)) => {
                                     // The activation skipped building its arguments object
@@ -8950,11 +9015,7 @@ impl Interp {
                                         None => Value::Null,
                                     }
                                 }
-                                (_, Some(k)) => match self.fn_frames[..k].last() {
-                                    None => Value::Null,
-                                    Some(fr) if fr.strict => Value::Null,
-                                    Some(fr) => Value::Obj(fr.callee()),
-                                },
+                                (_, Some(_)) => unreachable!("caller is answered above"),
                             });
                         }
                     }

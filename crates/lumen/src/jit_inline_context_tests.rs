@@ -463,3 +463,72 @@ fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
         }
     }
 }
+
+#[test]
+fn spliced_callee_outlives_dropping_its_last_reference() {
+    // The splice reads the callee's captured bindings from its [[Environment]], which lives as
+    // long as the function: the body dropping every other reference to the function must leave
+    // it alive until the splice completes (warm machine-code reads and the cold helper alike).
+    let source = r#"
+        function makeWarm(){ var secret = {v: 42}; var other = [1,2,3];
+            return function target(holder){ if (holder.drop) holder.fn = null;
+                return secret.v + other.length; }; }
+        function makeCold(){ var rare = 'cold'; var hot = 1;
+            return function target(holder){ if (holder.drop) { holder.fn = null; return rare; }
+                return hot; }; }
+        function invoke(holder){ return holder.fn(holder); }
+        function drive(make){
+            var holder = { fn: make(), drop: false }, last;
+            for (var i = 0; i < 3000; i++) last = invoke(holder);
+            holder.drop = true;
+            return last + '->' + invoke(holder);
+        }
+        drive(makeWarm) + '|' + drive(makeCold);
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            evaluate(&mut engine, source),
+            "45->45|1->cold",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            require_hot_native(&mut engine, "invoke", true);
+        }
+    }
+}
+
+#[test]
+fn legacy_caller_finds_spliced_activations() {
+    // `f.caller` of a frame called from a spliced callee names that callee, and a function that
+    // reads its own `caller` keeps its frame (nested splices included).
+    let source = r#"
+        function inspect() { return inspect.caller; }
+        function leaf(x) { return inspect() === leaf ? x : -1; }
+        function mid(x) { return leaf(x); }
+        function invoke(x) { return mid(x); }
+        function self(x) { return self.caller === viaSelf ? x : -1; }
+        function viaSelf(x) { return self(x); }
+        function strictLeaf(x) { 'use strict'; return probe(x); }
+        function probe(x) { return probe.caller === null ? x : -1; }
+        function viaStrict(x) { return strictLeaf(x); }
+        var bad = 0;
+        for (var n = 0; n < 2000; n++) {
+            if (invoke(n) !== n) bad++;
+            if (viaSelf(n) !== n) bad++;
+            if (viaStrict(n) !== n) bad++;
+        }
+        String(bad);
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(evaluate(&mut engine, source), "0", "{tier:?}");
+        if tier == Tier::Jit {
+            require_hot_native(&mut engine, "invoke", true);
+        }
+    }
+}

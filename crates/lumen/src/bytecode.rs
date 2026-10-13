@@ -2370,6 +2370,8 @@ pub struct Chunk {
     call_pins: std::cell::RefCell<
         crate::fasthash::FastMap<usize, std::rc::Weak<std::cell::RefCell<crate::value::Object>>>,
     >,
+    /// The inline sites this chunk's positions name (`crate::stack_trace::InlineSite`).
+    inline_sites: crate::stack_trace::InlineSites,
     /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
     inline_targets: Vec<InlineTarget>,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
@@ -2620,6 +2622,7 @@ impl Chunk {
                 .map_or(0, CallNames::retained_bytes),
         );
         bytes = bytes.saturating_add(self.positions.retained_bytes());
+        bytes = bytes.saturating_add(self.inline_sites.retained_bytes());
         bytes = bytes.saturating_add(
             (self.call_positions.len() + self.construct_positions.len())
                 * std::mem::size_of::<u32>(),
@@ -7025,6 +7028,7 @@ fn finish_chunk(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
+    let inline_sites = register_inline_sites(&mut c);
     c.positions.runs.shrink_to_fit();
     let mut call_positions = vec![NO_POSITION; c.call_caches.len()].into_boxed_slice();
     let mut construct_positions = vec![NO_POSITION; c.construct_caches.len()].into_boxed_slice();
@@ -7174,6 +7178,7 @@ fn finish_chunk(
         positions: c.positions,
         call_positions,
         construct_positions,
+        inline_sites,
         construct_caches: c.construct_caches,
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),
@@ -7232,6 +7237,53 @@ pub(crate) fn direct_shared_context_enabled() -> bool {
 /// reproduce (handlers, closures). Its free-name reads resolve from its own [[Environment]]. The plan keys are the sites' `CallIc`
 /// indices, which equal the second compile's caller-level site ordinals (same AST, same
 /// emission order).
+/// Register the inline sites a finished compile's positions name, and rewrite those positions
+/// from the compiler's local site list to the registered ones. Sites of discarded or unused
+/// splices are left out.
+fn register_inline_sites(c: &mut Compiler) -> crate::stack_trace::InlineSites {
+    use crate::stack_trace::{inline_index, inline_position, is_inline_position, InlineSite};
+    let count = c.inline_sites.len();
+    if count == 0 {
+        return Default::default();
+    }
+    let mut used = vec![false; count];
+    for &(_, position) in &c.positions.runs {
+        if is_inline_position(position) {
+            used[inline_index(position)] = true;
+        }
+    }
+    // A site's caller position names an earlier site (a splice exists before its body's).
+    for index in (0..count).rev() {
+        let outer = c.inline_sites[index].2;
+        if used[index] && is_inline_position(outer) {
+            used[inline_index(outer)] = true;
+        }
+    }
+    let mut listed = vec![u32::MAX; count];
+    let mut sites = Vec::new();
+    for index in (0..count).filter(|&index| used[index]) {
+        let (target, inner, outer) = c.inline_sites[index];
+        let outer = if is_inline_position(outer) {
+            inline_position(listed[inline_index(outer)])
+        } else {
+            outer
+        };
+        listed[index] = sites.len() as u32;
+        sites.push(InlineSite {
+            callee: c.inline_targets[target as usize].pin.clone(),
+            inner,
+            outer,
+        });
+    }
+    let (owned, registered) = crate::stack_trace::InlineSites::register(sites);
+    for run in &mut c.positions.runs {
+        if is_inline_position(run.1) {
+            run.1 = registered[listed[inline_index(run.1)] as usize];
+        }
+    }
+    owned
+}
+
 pub(crate) fn plan_inlines(
     chunk: &Chunk,
     caller: &Function,
@@ -7575,6 +7627,16 @@ fn plan_inlines_at(
             {
                 skip!(idx, "typeof of a free name");
             }
+            // Legacy `f.caller` / `f.arguments` read an activation's frame, and a splice runs
+            // without one: a callee that names either property keeps its frame (the reflection
+            // still finds splices that call out through their call positions).
+            if callee_chunk
+                .names
+                .iter()
+                .any(|name| matches!(&**name, "caller" | "arguments"))
+            {
+                skip!(idx, "legacy caller/arguments reflection");
+            }
             let mut free_names: Vec<Rc<str>> = Vec::new();
             for op in callee_chunk.ops.iter() {
                 if let InlineCapability::ClosureRead(n) = inline_capability(op) {
@@ -7855,6 +7917,14 @@ struct Compiler {
     positions: SourcePositions,
     /// The position recorded for operations emitted now (see [`Compiler::at_position`]).
     position: CompilePosition,
+    /// Spliced callees' operation positions, as (inline target, byte offset in the callee's
+    /// source, position of the splice in its caller); [`Compiler::inline_position`] names them
+    /// with local inline positions that the chunk registers when it is built
+    /// (`crate::stack_trace::InlineSite`). Rolled back with `inline_targets`.
+    inline_sites: Vec<(u32, u32, u32)>,
+    inline_site_index: crate::fasthash::FastMap<(u32, u32, u32), u32>,
+    /// The splices being compiled, innermost last: (inline target, position in its caller).
+    inline_frames: Vec<(u32, u32)>,
     /// The target name [`Compiler::finish_call`] records for the call it emits.
     pending_call_name: Option<String>,
     construct_caches: Vec<std::cell::Cell<ConstructSite>>,
@@ -8335,17 +8405,38 @@ impl Compiler {
     }
 
     /// Compile with the operations attributed to the AST node at source `position`, as the
-    /// tree-walker attributes an error raised while it evaluates that node. A spliced callee
-    /// keeps its call site's position: its own positions index another function's source.
+    /// tree-walker attributes an error raised while it evaluates that node. A spliced callee's
+    /// positions index its own source, so they are recorded as inline positions that also name
+    /// the callee and the splice's position in its caller (see [`Compiler::inline_position`]).
     fn at_position<T>(&mut self, position: u32, compile: impl FnOnce(&mut Self) -> T) -> T {
-        if self.inline_depth > 0 || position == NO_POSITION {
+        if position == NO_POSITION {
             return compile(self);
         }
+        let position = match self.inline_frames.last() {
+            Some(&(target, outer)) => self.inline_position(target, position, outer),
+            None => position,
+        };
         let saved = std::mem::replace(&mut self.position.0, position);
         let result = compile(self);
         self.position.0 = saved;
         result
     }
+    /// The local inline position of an operation at byte `inner` of the callee spliced through
+    /// inline target `target`, whose splice sits at `outer` in its caller.
+    fn inline_position(&mut self, target: u32, inner: u32, outer: u32) -> u32 {
+        let key = (target, inner, outer);
+        let index = match self.inline_site_index.get(&key) {
+            Some(&index) => index,
+            None => {
+                let index = self.inline_sites.len() as u32;
+                self.inline_sites.push(key);
+                self.inline_site_index.insert(key, index);
+                index
+            }
+        };
+        crate::stack_trace::inline_position(index)
+    }
+
     /// Inside a splice, the callee's free-name reads resolve from its own [[Environment]], not
     /// the caller's running one. Anything else that observes the running environment has no
     /// remapping and makes the splice bail.
@@ -8518,8 +8609,13 @@ impl Compiler {
             self.class_plans.len(),
             self.assignment_targets.len(),
             self.private_sites,
+            self.inline_sites.len(),
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
+            let sites = snap.14;
+            self.inline_sites.truncate(sites);
+            self.inline_site_index
+                .retain(|_, index| (*index as usize) < sites);
             self.ops.truncate(snap.0);
             self.call_names.truncate(snap.0);
             self.positions.truncate(snap.0);
@@ -8647,7 +8743,11 @@ impl Compiler {
         for &s in param_slots.iter().rev() {
             self.emit(Op::StoreLocal(s));
         }
-        self.emit(Op::Pop); // the method (identity proven; the value itself is dead)
+        // The method (identity proven) stays owned by a hidden slot until the way's exit: its
+        // [[Environment]], which the body's `LoadNameIn` reads, lives exactly as long as the
+        // function, and the body may drop every other reference to it (`holder.f = null`).
+        let callee_slot = self.fresh_slot("(inline callee)");
+        self.emit(Op::StoreLocal(callee_slot));
         let this_slot = if !has_this {
             None // a plain Call site: nothing beneath the callee
         } else if w.uses_this {
@@ -8708,7 +8808,15 @@ impl Compiler {
             self.scope_bind(name, param_slots[k], false);
         }
         self.inline_env_targets.push(t);
+        // The body's operations report the callee's frame: at their own nodes, or at the
+        // callee's start for operations outside every positioned node.
+        let outer = self.position.0;
+        let body_position = self.inline_position(t, NO_POSITION, outer);
+        self.inline_frames.push((t, outer));
+        let saved_position = std::mem::replace(&mut self.position.0, body_position);
         let r = self.inline_body(f);
+        self.position.0 = saved_position;
+        self.inline_frames.pop();
         self.inline_env_targets.pop();
         self.call_seed_stack.pop();
         self.name_seed_stack.pop();
@@ -8730,8 +8838,12 @@ impl Compiler {
         self.scopes = saved_scopes;
         r?;
 
+        // Every completion of the body (its end and each `return`) releases the callee here.
+        for j in returns {
+            self.patch(j);
+        }
+        self.emit(Op::ResetSlots(callee_slot, 1));
         end_jumps.push(self.emit(Op::Jump(0)));
-        end_jumps.extend(returns);
         Ok(guard)
     }
 
