@@ -16704,6 +16704,135 @@ fn json_stringify_space_and_replacer_tostring() {
     );
 }
 
+/// JSON.stringify writes one buffer and reads own data properties and toJSON along ordinary
+/// prototype chains directly; every observable step (getters, Proxy traps, toJSON and replacer
+/// calls with their receivers and keys, holes reading the prototype, mapped arguments, wrapper
+/// coercions, cycle checks past the linearly scanned depth, gap formatting) must still happen
+/// exactly as specified. Expected output is node's.
+#[test]
+fn json_stringify_fast_paths_preserve_observable_steps() {
+    let source = r#"
+        var results = [];
+        function add(v) { results.push(String(v)); }
+        // toJSON found on the prototype chain, and a toJSON getter called with the value as receiver.
+        function P(x) { this.x = x; }
+        P.prototype.toJSON = function (key) { return "P" + this.x + "@" + key; };
+        add(JSON.stringify({ a: new P(1), b: [new P(2)] }));
+        var receivers = [];
+        Object.defineProperty(Array.prototype, "toJSON", { configurable: true, get() { receivers.push(this.length); return undefined; } });
+        add(JSON.stringify([[1], [1, 2]]) + " " + receivers.join(","));
+        delete Array.prototype.toJSON;
+        // A getter that deletes a later key (the prototype's value shows through) and installs toJSON.
+        var proto = { later: "from-proto" };
+        var o = Object.create(proto);
+        Object.defineProperty(o, "first", { enumerable: true, get() { delete o.later; Object.prototype.toJSON = function () { return "late"; }; return 1; } });
+        o.later = "own";
+        o.nested = { z: 1 };
+        add(JSON.stringify(o));
+        delete Object.prototype.toJSON;
+        // Holes read through the prototype; undefined, functions and symbols.
+        Array.prototype[1] = "proto-element";
+        add(JSON.stringify([0, , 2]));
+        delete Array.prototype[1];
+        add(JSON.stringify([undefined, function () {}, Symbol("s")]) + JSON.stringify({ u: undefined, f() {}, s: Symbol("s"), k: 1 }));
+        // Mapped arguments reflect parameter writes.
+        add((function (a, b) { a = "changed"; return JSON.stringify(arguments); })(1, 2));
+        // Proxies: trap order.
+        var log = [];
+        var proxy = new Proxy({ a: 1, b: { c: 2 } }, {
+          ownKeys(t) { log.push("ownKeys"); return Reflect.ownKeys(t); },
+          getOwnPropertyDescriptor(t, k) { log.push("gopd:" + k); return Reflect.getOwnPropertyDescriptor(t, k); },
+          get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); },
+        });
+        add(JSON.stringify(proxy) + " " + log.join(","));
+        // Replacer function and PropertyList (duplicates, numbers, wrappers).
+        add(JSON.stringify({ a: 1, b: [1, 2], c: { a: 3 } }, function (k, v) { return typeof v === "number" ? v * 10 : v; }));
+        add(JSON.stringify({ 1: "one", a: "A", b: "B", c: { a: 1, b: 2, 1: 3 } }, ["a", 1, new String("b"), "a", new Number(1)]));
+        // Indentation, empty containers.
+        add(JSON.stringify({ a: [], b: {}, c: [1, { d: 2, e: [] }], f: "x" }, null, 2));
+        add(JSON.stringify([[], {}, [[]]], null, "--"));
+        add(JSON.stringify({ a: { b: undefined } }, null, 4));
+        // Numbers.
+        add(JSON.stringify([0, -0, 1.5, -2, 1e21, 123456789012345, 1e15, 2 ** 53, NaN, Infinity, -Infinity, 5e-7]));
+        // Wrappers and rawJSON; BigInt.
+        var n = new Number(3); n.valueOf = function () { return 42; };
+        var str = new String("s"); str.toString = function () { return "T"; };
+        add(JSON.stringify([n, str, new Boolean(false), JSON.rawJSON("1e1000")]));
+        try { JSON.stringify({ big: 1n }); } catch (e) { add(e.name); }
+        BigInt.prototype.toJSON = function () { return this.toString() + "n"; };
+        add(JSON.stringify({ big: 10n }));
+        delete BigInt.prototype.toJSON;
+        // Cycles, shallow and past the linear-scan depth; shared (acyclic) references are fine.
+        var shared = { s: 1 };
+        add(JSON.stringify([shared, shared, { x: shared }]));
+        var cyc = { a: {} }; cyc.a.b = cyc;
+        try { JSON.stringify(cyc); } catch (e) { add(e.name); }
+        var deep = {}; var cur = deep; for (var k = 0; k < 100; k++) { cur.next = {}; cur = cur.next; } cur.back = deep.next.next;
+        try { JSON.stringify(deep); } catch (e) { add(e.name); }
+        var wide = [], leaf = { leaf: 1 }; for (var k = 0; k < 40; k++) wide = [wide, leaf, leaf];
+        add(JSON.stringify(wide).length);
+        // Top-level values, toJSON with keys and the replacer receiver.
+        add(JSON.stringify(undefined) + " " + JSON.stringify({ toJSON() { return undefined; } }) + " " + JSON.stringify("\u0007\ud800\"\\\n"));
+        var holders = [];
+        JSON.stringify({ a: [7] }, function (k, v) { holders.push(Array.isArray(this) ? "array" : Object.keys(this).join("+") + ":" + k); return v; });
+        add(holders.join(","));
+        add(JSON.stringify({ d: new Date(0), r: /x/g, m: new Map([[1, 2]]), e: new Error("x") }));
+        results.join("\n");
+    "#;
+    let expected = r#"{"a":"P1@a","b":["P2@0"]}
+[[1],[1,2]] 2,1,2
+{"first":1,"later":"from-proto","nested":"late"}
+[0,"proto-element",2]
+[null,null,null]{"k":1}
+{"0":"changed","1":2}
+{"a":1,"b":{"c":2}} get:toJSON,ownKeys,gopd:a,gopd:b,get:a,get:b
+{"a":10,"b":[10,20],"c":{"a":30}}
+{"a":"A","1":"one","b":"B"}
+{
+  "a": [],
+  "b": {},
+  "c": [
+    1,
+    {
+      "d": 2,
+      "e": []
+    }
+  ],
+  "f": "x"
+}
+[
+--[],
+--{},
+--[
+----[]
+--]
+]
+{
+    "a": {}
+}
+[0,0,1.5,-2,1e+21,123456789012345,1000000000000000,9007199254740992,null,null,null,5e-7]
+[42,"T",false,1e1000]
+TypeError
+{"big":"10n"}
+[{"s":1},{"s":1},{"x":{"s":1}}]
+TypeError
+TypeError
+962
+undefined undefined "\u0007\ud800\"\\\n"
+:,a:a,array
+{"d":"1970-01-01T00:00:00.000Z","r":{},"m":{},"e":{}}"#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "{tier:?}");
+    }
+}
+
 #[test]
 fn json_parse_reviver() {
     // The reviver transforms values bottom-up; returning undefined deletes the key.
