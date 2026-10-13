@@ -157,6 +157,8 @@ mod token;
 #[cfg(test)]
 mod typedarray_allocation_tests;
 #[cfg(test)]
+mod typedarray_conversion_tests;
+#[cfg(test)]
 mod typedarray_search_tests;
 mod tz;
 mod weak_metadata;

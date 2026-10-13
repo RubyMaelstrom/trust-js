@@ -13,18 +13,19 @@ fn dv_info(i: &mut Interp, this: &Value) -> Result<(usize, usize, usize, bool), 
 
 /// The DataView's current byte length, or `None` when its buffer is detached or (over a resizable
 /// buffer) the view is now out of bounds.
-/// Read `n` raw bytes of a (possibly shared) buffer.
-fn dv_bytes(i: &Interp, buf: usize, start: usize, n: usize) -> Option<Vec<u8>> {
+/// Read `n` (at most 8) raw bytes of a (possibly shared) buffer into the front of an array.
+fn dv_bytes(i: &Interp, buf: usize, start: usize, n: usize) -> Option<[u8; 8]> {
+    let mut bytes = [0; 8];
+    let mut copy = |source: &[u8]| {
+        bytes[..n].copy_from_slice(source.get(start..start.checked_add(n)?)?);
+        Some(bytes)
+    };
     if let Some(&id) = i.shared_buffers.get(&buf) {
-        return crate::interpreter::shared_mem_get(id).and_then(|m| {
-            let g = m.lock().unwrap();
-            (start + n <= g.len()).then(|| g[start..start + n].to_vec())
-        });
+        return crate::interpreter::shared_mem_get(id).and_then(|m| copy(&m.lock().unwrap()));
     }
-    i.array_buffers.get(&buf).and_then(|storage| {
-        let b = storage.borrow();
-        (start + n <= b.len()).then(|| b[start..start + n].to_vec())
-    })
+    i.array_buffers
+        .get(&buf)
+        .and_then(|storage| copy(&storage.borrow()))
 }
 
 /// Write raw bytes into a (possibly shared) buffer (bounds-checked, silently dropped otherwise).
@@ -113,9 +114,9 @@ fn dv_get(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     };
     // `kind.read` is little-endian; DataView defaults to big-endian, so reverse unless little.
     if !little {
-        b.reverse();
+        b[..es].reverse();
     }
-    Ok(Value::Num(kind.read(&b)))
+    Ok(Value::Num(kind.read(&b[..es])))
 }
 
 fn dv_set(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<Value, Value> {
@@ -142,12 +143,14 @@ fn dv_set(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     if byte_off.checked_add(es).is_none_or(|e| e > vlen) {
         return Err(i.make_error("RangeError", "Offset is outside the bounds of the DataView"));
     }
-    let mut bytes = kind.write(value);
+    let mut bytes = [0; 8];
+    let bytes = &mut bytes[..es];
+    kind.write_into(value, bytes);
     if !little {
         bytes.reverse();
     }
     let start = off + byte_off;
-    dv_put(i, buf, start, &bytes);
+    dv_put(i, buf, start, bytes);
     Ok(Value::Undefined)
 }
 
@@ -176,7 +179,7 @@ fn dv_get_big(i: &mut Interp, this: &Value, args: &[Value], signed: bool) -> Res
     if !little {
         b.reverse();
     }
-    let raw = u64::from_le_bytes(b.try_into().unwrap());
+    let raw = u64::from_le_bytes(b);
     Ok(Value::BigInt(if signed {
         crate::bigint::JsBigInt::from_i128(raw as i64 as i128)
     } else {
@@ -205,7 +208,7 @@ fn dv_set_big(i: &mut Interp, this: &Value, args: &[Value]) -> Result<Value, Val
     if byte_off.checked_add(8).is_none_or(|e| e > vlen) {
         return Err(i.make_error("RangeError", "Offset is outside the bounds of the DataView"));
     }
-    let mut bytes = (value.to_i128_wrapping() as u64).to_le_bytes().to_vec();
+    let mut bytes = (value.to_i128_wrapping() as u64).to_le_bytes();
     if !little {
         bytes.reverse();
     }

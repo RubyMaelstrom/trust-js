@@ -3964,6 +3964,12 @@ fn emit_effect(
         }
         Op::GetMethodElem => emit_op_helper(a, H_GET_METHOD_ELEM, pc_u32, unwind),
         Op::GetElem | Op::GetElemLocal(_) => emit_op_helper(a, H_GET_ELEM, pc_u32, unwind),
+        Op::DestructureArr(_)
+        | Op::TryArrayBinding(..)
+        | Op::ArrayBindingStep(..)
+        | Op::IterStepL(..) => {
+            emit_op_helper(a, H_ITERATION, pc_u32, unwind);
+        }
         _ => emit_exec(a, pc_u32, unwind),
     }
 }

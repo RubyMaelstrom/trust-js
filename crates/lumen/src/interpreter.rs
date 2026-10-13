@@ -3110,6 +3110,10 @@ pub struct Interp {
     pub(crate) species_protector: std::cell::Cell<(u32, u32)>,
     /// The TypedArray accessor protector (see `Interp::ta_accessor_reached`).
     pub(crate) ta_accessor_protector: RefCell<TaAccessorProof>,
+    /// The intrinsic Array iteration protector (see [`crate::builtins::ArrayIterationProof`]):
+    /// proves without running author code that GetIterator on an ordinary Array, its steps and
+    /// IteratorClose follow the built-in algorithms.
+    pub(crate) array_iteration_protector: RefCell<crate::builtins::ArrayIterationProof>,
     /// Per-CONSTRUCTOR construct cache (`new F(...)` — keyed by callee identity, since a
     /// constructor's derived state doesn't vary per site): the same raw pointers a [`CallIc`]
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
@@ -3533,6 +3537,7 @@ interp_memory_inventory! {
     elems_protector => "non_owning",
     species_protector => "non_owning",
     ta_accessor_protector => "non_owning",
+    array_iteration_protector => "non_owning",
     construct_ics => "measured",
     call_overflow => "measured",
     native_callback_cache => "measured",
@@ -3660,7 +3665,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 165);
+    assert_eq!(names.len(), 166);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4216,6 +4221,7 @@ impl Interp {
         // live, so the next use re-verifies against the restored ones.
         self.elems_protector.set((0, false));
         self.species_protector.set((0, u32::MAX));
+        *self.array_iteration_protector.borrow_mut() = Default::default();
     }
 
     /// Select the global lexical state associated with an embedder settings
@@ -4811,6 +4817,7 @@ impl Interp {
             elems_protector: std::cell::Cell::new((0, false)),
             species_protector: std::cell::Cell::new((0, u32::MAX)),
             ta_accessor_protector: RefCell::default(),
+            array_iteration_protector: Default::default(),
             construct_ics: Default::default(),
             call_overflow: Default::default(),
             native_callback_cache: None,
@@ -5207,19 +5214,18 @@ impl Interp {
             if start + es > buf.len() {
                 return None;
             }
-            let bytes = &buf[start..start + es];
+            let bytes = &mut buf[start..start + es];
             let old = if info.kind.is_bigint() {
                 info.kind.read_bigint(bytes)
             } else {
                 info.kind.read(bytes) as i128
             };
             if let Some(new) = f(old) {
-                let nb = if info.kind.is_bigint() {
-                    info.kind.write_bigint(new)
+                if info.kind.is_bigint() {
+                    bytes.copy_from_slice(&(new as u64).to_le_bytes());
                 } else {
-                    info.kind.write(new as f64)
-                };
-                buf[start..start + es].copy_from_slice(&nb);
+                    info.kind.write_into(new as f64, bytes);
+                }
             }
             Some(old)
         };
@@ -5271,7 +5277,8 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        let bytes = info.kind.write_bigint(n);
+        // Element encoding of a BigInt: wrapped modulo 2^64, little-endian.
+        let bytes = (n as u64).to_le_bytes();
         if let Some(&id) = self.shared_buffers.get(&info.buffer) {
             if let Some(mem) = shared_mem_get(id) {
                 let mut buf = mem.lock().unwrap();
@@ -5302,11 +5309,10 @@ impl Interp {
                 return;
             }
             let start = info.offset + idx * es;
-            let bytes = info.kind.write(n);
             if let Some(mem) = shared_mem_get(id) {
                 let mut buf = mem.lock().unwrap();
                 if start + es <= buf.len() {
-                    buf[start..start + es].copy_from_slice(&bytes);
+                    info.kind.write_into(n, &mut buf[start..start + es]);
                 }
             }
             return;
@@ -7617,14 +7623,25 @@ impl Interp {
         if !o.borrow().ic_plain.get() {
             if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(o) as usize)).copied() {
                 // TypedArraySetElement converts the value before checking current bounds. Only
-                // an already-numeric value on a Number-content view can bypass that observable
-                // step; coercions, BigInt content and immutable-buffer errors retain the
-                // general path.
-                if let Value::Num(value) = v {
-                    if !info.kind.is_bigint() && !self.immutable_buffers.contains(&info.buffer) {
-                        self.ta_write(&info, n as usize, value);
+                // a value already of the view's content type (a Number, or a BigInt for BigInt
+                // content) can bypass that observable step; coercions, mismatched content and
+                // immutable-buffer errors retain the general path.
+                match &v {
+                    Value::Num(value)
+                        if !info.kind.is_bigint()
+                            && !self.immutable_buffers.contains(&info.buffer) =>
+                    {
+                        self.ta_write(&info, n as usize, *value);
                         return Ok(());
                     }
+                    Value::BigInt(value)
+                        if info.kind.is_bigint()
+                            && !self.immutable_buffers.contains(&info.buffer) =>
+                    {
+                        self.ta_write_bigint(&info, n as usize, value.to_i128_wrapping());
+                        return Ok(());
+                    }
+                    _ => {}
                 }
                 return Err(v);
             }
@@ -11966,16 +11983,28 @@ impl Interp {
             return None;
         }
         let object = next.as_obj()?;
-        if self.proxies.contains_key(&(Rc::as_ptr(object) as usize))
-            || (self.multi_realm() && self.callee_realm_global(object).is_some())
-        {
-            return None;
-        }
         let native = match object.borrow().call {
             Callable::Native(native) => native,
             _ => return None,
         };
         let step = crate::builtins::intrinsic_iterator_step(native)?;
+        // `ic_plain` excludes a Proxy without a table lookup.
+        if !self.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+            || (self.multi_realm() && self.callee_realm_global(object).is_some())
+        {
+            return None;
+        }
+        // A step that executes no ECMAScript code needs no activation of its own. It keeps the
+        // amortized safepoints of the call it replaces: a drain loop may consist of nothing else.
+        if let Err(error) = self
+            .interrupt_poll()
+            .and_then(|()| self.gc_check_amortized())
+        {
+            return Some(Err(error));
+        }
+        if let Some(value) = crate::builtins::inert_iterator_step(self, native, iterator) {
+            return Some(Ok(value));
+        }
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;

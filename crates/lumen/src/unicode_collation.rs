@@ -309,6 +309,34 @@ pub(crate) fn append_mapping(input: &[u32], at: usize, output: &mut Vec<Element>
     append_from(CLDR_ROOT, input, at, output)
 }
 
+/// [`append_mapping`]'s elements for an ASCII code point followed by the end of the input or
+/// by another ASCII code point, when no such context forms a contraction with it. The table is
+/// derived from [`append_mapping`] itself, checking every ASCII successor, so it can only skip
+/// the table searches, never change a result.
+pub(crate) fn ascii_mapping(code_point: u32) -> Option<&'static [Element]> {
+    static TABLE: std::sync::OnceLock<Vec<Option<Vec<Element>>>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            (0..0x80)
+                .map(|first| {
+                    let mut alone = Vec::new();
+                    if append_mapping(&[first], 0, &mut alone) != 1 {
+                        return None;
+                    }
+                    let mut pair = Vec::new();
+                    (0..0x80)
+                        .all(|next| {
+                            pair.clear();
+                            append_mapping(&[first, next], 0, &mut pair) == 1 && pair == alone
+                        })
+                        .then_some(alone)
+                })
+                .collect()
+        })
+        .get(code_point as usize)?
+        .as_deref()
+}
+
 #[cfg(test)]
 pub(crate) fn append_ducet_mapping(input: &[u32], at: usize, output: &mut Vec<Element>) -> usize {
     append_from(DUCET, input, at, output)

@@ -1863,6 +1863,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_make_closure as *const () as usize,
         crate::bytecode::jit_object_literal as *const () as usize,
         crate::bytecode::jit_abstract_operation as *const () as usize,
+        crate::bytecode::jit_iteration as *const () as usize,
     ]
 }
 
@@ -1943,7 +1944,9 @@ pub const H_MAKE_CLOSURE: usize = 29;
 pub const H_OBJECT_LITERAL: usize = 30;
 /// Self-hosted built-ins' abstract operations (see `bytecode::jit_abstract_operation`).
 pub const H_ABSTRACT: usize = 31;
-pub const N_HELPERS: usize = 32;
+/// Iterator-protocol operations (see `bytecode::jit_iteration`).
+pub const H_ITERATION: usize = 32;
+pub const N_HELPERS: usize = 33;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -1981,6 +1984,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "make_closure",
     "object_literal",
     "abstract_operation",
+    "iteration",
 ];
 
 #[inline]

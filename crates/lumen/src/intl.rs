@@ -24,6 +24,7 @@ mod service;
 mod tags;
 mod tz_names;
 
+pub(crate) use collator::locale_compare;
 pub use tags::{canonicalize_language_tag, is_structurally_valid_tag};
 
 /// The English (CLDR `en`) specific non-location long name of a time zone at an instant, such

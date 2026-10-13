@@ -3006,6 +3006,16 @@ impl Property {
     pub(crate) fn clone_value_packed(&self) -> PackedValue {
         self.packed.clone()
     }
+    /// Whether this data property holds exactly the object at `expected`, compared without
+    /// creating an owner. A deferred prototype has no address yet and never matches.
+    #[inline]
+    pub(crate) fn holds_object(&self, expected: *const RefCell<Object>) -> bool {
+        !self.accessor()
+            && self
+                .packed
+                .with_object(|object| std::ptr::eq(Rc::as_ptr(object), expected))
+                .unwrap_or(false)
+    }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
     /// Callers must still prove ordinary internal methods and fall back for every other case.
     #[inline]
@@ -3043,6 +3053,12 @@ impl Property {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.packed.tag() == PACK_EMPTY
+    }
+    /// A present element as Array methods create it: a writable, enumerable and configurable
+    /// data property (no accessor, no hole).
+    #[inline]
+    pub(crate) fn is_plain_element(&self) -> bool {
+        self.meta == PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE && !self.is_empty()
     }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
@@ -5143,6 +5159,31 @@ impl Props {
             }
         }
         Some(p.into_value())
+    }
+
+    /// The packed elements of an Array whose `length` is the writable data value `len` and
+    /// whose every index below it holds a plain element ([`Property::is_plain_element`]), for
+    /// an edit that leaves them plain and contiguous. The caller proves ordinary Array internal
+    /// methods and that the Array.prototype algorithm being batched only gets, sets and deletes
+    /// such elements (plus appends, for which it proves extensibility and prototypes without
+    /// indexed properties): its effect is then exactly the edited list. The numeric mirror is
+    /// dropped and rebuilt on demand. The caller records the new length with
+    /// [`Self::set_array_length_value`]. `None` changes nothing.
+    pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut Vec<Property>> {
+        if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
+            return None;
+        }
+        let length = self.length_property()?;
+        if length.accessor() || !length.writable() || length.number_value() != Some(len as f64) {
+            return None;
+        }
+        let packed = self.elems.packed_ref()?;
+        if packed.len() != len || !packed.iter().all(Property::is_plain_element) {
+            return None;
+        }
+        self.note_structural();
+        self.mirror_invalidate();
+        self.elems.packed_mut()
     }
 
     /// ECMA-262 Array.prototype.shift / OrdinarySetWithOwnDescriptor (e28783d5,

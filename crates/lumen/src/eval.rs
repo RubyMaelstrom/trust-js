@@ -219,6 +219,32 @@ impl Interp {
                 Ok(())
             }
             Pattern::Array(elems) => {
+                // Fresh lexical names bound from Array elements that execute no code: the
+                // interleaving of steps and initializations is unobservable.
+                if matches!(mode, BindMode::Lexical(_))
+                    && elems.iter().all(|element| {
+                        matches!(
+                            element,
+                            ArrayPatElem::Hole
+                                | ArrayPatElem::Elem {
+                                    pattern: Pattern::Ident(_),
+                                    default: None,
+                                }
+                        )
+                    })
+                {
+                    let mut values = Vec::with_capacity(elems.len());
+                    if let Some(Ok(())) =
+                        self.inert_array_prefix(&value, elems.len(), |value| values.push(value))
+                    {
+                        for (element, value) in elems.iter().zip(values) {
+                            if let ArrayPatElem::Elem { pattern, .. } = element {
+                                self.bind_pattern(pattern, value, env, mode)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 // Iterate lazily, pulling only what the pattern needs and closing the iterator when
                 // we stop early (or on an abrupt completion).
                 let (iter, next) = self.get_iterator(&value)?;
@@ -1851,6 +1877,14 @@ impl Interp {
 
     /// GetIterator: returns (iterator, next-method).
     pub(crate) fn get_iterator(&mut self, v: &Value) -> Result<(Value, Value), Abrupt> {
+        // Under the intrinsic Array protocol, reading @@iterator, calling
+        // %Array.prototype.values% and reading `next` execute no ECMAScript code.
+        if let Some(next) = crate::builtins::intrinsic_array_iteration_next(self, v) {
+            return Ok((
+                crate::builtins::array_values_iterator(self, v.clone(), 0),
+                next,
+            ));
+        }
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(Value, Value), Abrupt> = (|| {
             // The key formatted once when @@iterator was minted, not a new string per GetIterator.
@@ -1907,6 +1941,9 @@ impl Interp {
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
     pub(crate) fn iterator_close(&mut self, iter: &Value) {
+        if crate::builtins::array_iterator_close_is_inert(self, iter) {
+            return;
+        }
         let perf_started = crate::jit::perf_stage_start();
         if let Ok(ret) = self.get_member(iter, "return") {
             if ret.is_callable() {
@@ -1919,6 +1956,9 @@ impl Interp {
     /// IteratorClose for a *normal* completion: errors from reading or calling `return` propagate
     /// (unlike the throw-completion `iterator_close`, which swallows them).
     pub(crate) fn iterator_close_normal(&mut self, iter: &Value) -> Result<(), Abrupt> {
+        if crate::builtins::array_iterator_close_is_inert(self, iter) {
+            return Ok(());
+        }
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(), Abrupt> = (|| {
             let ret = self.get_member(iter, "return")?;

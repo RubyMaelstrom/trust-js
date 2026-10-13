@@ -1669,7 +1669,7 @@ pub enum Op {
     /// source/next in the two hidden slots without allocating an iterator. Only emitted
     /// for fresh, flat lexical bindings; false leaves the entire protocol untouched.
     TryArrayBinding(u16, u16, u16),
-    /// A checked intrinsic native-call boundary and own indexed read in an admitted prefix.
+    /// The own indexed read of one step in an admitted prefix (no code runs and no call is made).
     /// The source stays owned by the hidden iterator slot for the ordinary frame lifetime.
     ArrayBindingStep(u16, u16, u16),
     /// Destructuring-assignment loop head: pop one iteration value and run the retained
@@ -15558,6 +15558,12 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::DestructureArr(n) => {
                 let v = pop!();
+                if let Some(result) =
+                    i.destructure_array_prefix(&v, n as usize, |value| stack.push(value))
+                {
+                    result?;
+                    continue;
+                }
                 let (it, nx) = i.get_iterator(&v)?;
                 let mut done = false;
                 for _ in 0..n {
@@ -15578,21 +15584,12 @@ fn run_vm_inner<S: StoredValue>(
             }
             Op::TryArrayBinding(iterator, next, count) => {
                 let source = stack.last().expect("binding source").clone();
-                let old_source = slots.read_value(iterator as usize);
-                let old_next = slots.read_value(next as usize);
-                let captured =
-                    i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
-                let matched = captured.is_some();
-                if let Some(captured) = captured {
-                    slots.write_value(next as usize, captured);
-                    slots.write_value(iterator as usize, source);
-                }
+                let matched = open_array_binding(i, slots, source, iterator, next, count)?;
                 stack.push(Value::Bool(matched));
             }
-            Op::ArrayBindingStep(iterator, next, index) => {
+            Op::ArrayBindingStep(iterator, _, index) => {
                 let source = slots.read_value(iterator as usize);
-                let next = slots.read_value(next as usize);
-                stack.push(i.array_binding_step(&source, &next, index as usize)?);
+                stack.push(i.array_binding_step(&source, index as usize)?);
             }
             Op::AssignTarget(target) => {
                 let value = pop!();
@@ -22127,6 +22124,96 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     }
 }
 
+/// `Op::TryArrayBinding`: retain the source and its `next` method in the two hidden slots when
+/// the closed Array prefix applies.
+fn open_array_binding<S: StoredValue>(
+    i: &mut Interp,
+    slots: &mut [S],
+    source: Value,
+    iterator: u16,
+    next: u16,
+    count: u16,
+) -> Result<bool, Abrupt> {
+    let old_source = slots.read_value(iterator as usize);
+    let old_next = slots.read_value(next as usize);
+    let captured = i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
+    let matched = captured.is_some();
+    if let Some(captured) = captured {
+        slots.write_value(next as usize, captured);
+        slots.write_value(iterator as usize, source);
+    }
+    Ok(matched)
+}
+
+/// Dedicated iterator-protocol entry for array destructuring and `for…of` steps: the same
+/// operations as `jit_exec`, without the generic decoder in front of their intrinsic
+/// Array/Map/Set fast paths.
+pub(crate) unsafe extern "C" fn jit_iteration(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    mut sp: *mut PackedValue,
+) -> crate::jit::SpFlag {
+    let ctx = unsafe { &mut *ctx };
+    jit_opstat(ctx, pc);
+    let chunk = unsafe { &*ctx.chunk };
+    let i = unsafe { &mut *ctx.interp };
+    let push = |sp: &mut *mut PackedValue, value: Value| unsafe {
+        sp.write(PackedValue::pack(value));
+        *sp = sp.add(1);
+    };
+    let result = match chunk.ops[pc as usize] {
+        Op::DestructureArr(count) => {
+            sp = unsafe { sp.sub(1) };
+            let source = unsafe { sp.read() }.into_value();
+            match i.destructure_array_prefix(&source, count as usize, |value| push(&mut sp, value))
+            {
+                Some(result) => result,
+                None => {
+                    // The proof failed before any effect: the generic operation runs instead.
+                    push(&mut sp, source);
+                    return unsafe { jit_exec(ctx, pc, sp) };
+                }
+            }
+        }
+        Op::TryArrayBinding(iterator, next, count) => {
+            let slots = unsafe { std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots) };
+            let source = unsafe { &*sp.sub(1) }.clone_value();
+            open_array_binding(i, slots, source, iterator, next, count).map(|matched| {
+                #[cfg(test)]
+                if matched {
+                    crate::array_binding::TEST_JIT_ARRAY_BINDING_OPENS
+                        .with(|count| count.set(count.get() + 1));
+                }
+                push(&mut sp, Value::Bool(matched));
+            })
+        }
+        Op::ArrayBindingStep(iterator, _, index) => {
+            let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
+            let source = slots.read_value(iterator as usize);
+            i.array_binding_step(&source, index as usize)
+                .map(|value| push(&mut sp, value))
+        }
+        Op::IterStepL(iterator, next) => {
+            let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
+            let iterator = slots.read_value(iterator as usize);
+            let next = slots.read_value(next as usize);
+            i.iterator_step(&iterator, &next).map(|step| {
+                let more = step.is_some();
+                push(&mut sp, step.unwrap_or(Value::Undefined));
+                push(&mut sp, Value::Bool(more));
+            })
+        }
+        _ => return unsafe { jit_exec(ctx, pc, sp) },
+    };
+    match result {
+        Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+        Err(error) => {
+            unsafe { ctx.throw_at(pc, error) };
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_JIT_LOCAL_RESET_HELPERS: std::cell::Cell<usize> = const {
@@ -23916,6 +24003,9 @@ unsafe fn jit_exec_inner(
         }
         Op::DestructureArr(n) => {
             let v = pop!();
+            if let Some(result) = i.destructure_array_prefix(&v, n as usize, |value| push!(value)) {
+                return result;
+            }
             let (it, nx) = i.get_iterator(&v)?;
             let mut done = false;
             for _ in 0..n {
@@ -23936,23 +24026,17 @@ unsafe fn jit_exec_inner(
         }
         Op::TryArrayBinding(iterator, next, count) => {
             let source = (*sp.sub(1)).unpack();
-            let old_source = slots.read_value(iterator as usize);
-            let old_next = slots.read_value(next as usize);
-            let captured = i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
-            let matched = captured.is_some();
-            if let Some(captured) = captured {
-                #[cfg(test)]
+            let matched = open_array_binding(i, slots, source, iterator, next, count)?;
+            #[cfg(test)]
+            if matched {
                 crate::array_binding::TEST_JIT_ARRAY_BINDING_OPENS
                     .with(|count| count.set(count.get() + 1));
-                slots.write_value(next as usize, captured);
-                slots.write_value(iterator as usize, source);
             }
             push!(Value::Bool(matched));
         }
-        Op::ArrayBindingStep(iterator, next, index) => {
+        Op::ArrayBindingStep(iterator, _, index) => {
             let source = slots.read_value(iterator as usize);
-            let next = slots.read_value(next as usize);
-            push!(i.array_binding_step(&source, &next, index as usize)?);
+            push!(i.array_binding_step(&source, index as usize)?);
         }
         Op::AssignTarget(target) => {
             let value = pop!();
