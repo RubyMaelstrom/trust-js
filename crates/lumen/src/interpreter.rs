@@ -649,6 +649,51 @@ fn function_profile_dump() {
 /// Block as required by the WebAssembly JavaScript Interface, without copying at call boundaries.
 pub type ArrayBufferBytes = Rc<RefCell<Vec<u8>>>;
 
+/// The Data Block behind an ArrayBuffer or SharedArrayBuffer object (its [[ArrayBufferData]]
+/// slot): the values of `Interp::array_buffers`. A detached ArrayBuffer has no entry, and a
+/// SharedArrayBuffer is never detached.
+#[derive(Clone)]
+pub(crate) enum BufferData {
+    /// An ArrayBuffer's own bytes, which an embedder resource such as wasm memory may share.
+    Local(ArrayBufferBytes),
+    /// A SharedArrayBuffer's Shared Data Block: its id in the process-wide registry
+    /// (`shared_mem_get`), which holds the bytes and the current length that every agent
+    /// sharing the block observes.
+    Shared(u64),
+}
+
+impl BufferData {
+    /// The block's current byte length, or `None` for a Shared Data Block missing from the
+    /// registry.
+    pub(crate) fn byte_len(&self) -> Option<usize> {
+        match self {
+            BufferData::Local(bytes) => Some(bytes.borrow().len()),
+            BufferData::Shared(id) => shared_mem_get(*id).map(|block| block.lock().unwrap().len()),
+        }
+    }
+
+    /// Run `f` over the block's bytes: borrowed for an ArrayBuffer's, under the block's lock for
+    /// a Shared Data Block. `None` (without calling `f`) for a shared block missing from the
+    /// registry.
+    pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match self {
+            BufferData::Local(bytes) => Some(f(&bytes.borrow())),
+            BufferData::Shared(id) => shared_mem_get(*id).map(|block| f(&block.lock().unwrap())),
+        }
+    }
+
+    /// [`Self::with_bytes`] with the bytes writable. Writes through it are not recorded as
+    /// ArrayBuffer mutations; callers mark them (`Interp::mark_array_buffer_dirty_range`).
+    pub(crate) fn with_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        match self {
+            BufferData::Local(bytes) => Some(f(&mut bytes.borrow_mut())),
+            BufferData::Shared(id) => {
+                shared_mem_get(*id).map(|block| f(&mut block.lock().unwrap()))
+            }
+        }
+    }
+}
+
 /// An embedder-held weak reference to a JavaScript object. Native resource graphs use this for
 /// callbacks whose strong lifetime is represented by a reachable JavaScript wrapper; retaining a
 /// strong `Value` in both graphs would turn otherwise collectable cross-boundary cycles immortal.
@@ -3232,9 +3277,11 @@ pub struct Interp {
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: IntrinsicMap,
-    /// ArrayBuffer byte storage, keyed by the ArrayBuffer object's pointer. The indirection lets an
-    /// embedder identify the same Data Block with an external resource such as wasm linear memory.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, ArrayBufferBytes>,
+    /// The Data Block of every attached ArrayBuffer and every SharedArrayBuffer, keyed by the
+    /// buffer object's pointer: an ArrayBuffer's own bytes, whose indirection lets an embedder
+    /// identify them with an external resource such as wasm linear memory, or a
+    /// SharedArrayBuffer's Shared Data Block id. Detaching an ArrayBuffer removes its entry.
+    pub(crate) array_buffers: crate::fasthash::FastMap<usize, BufferData>,
     pub(crate) native_buffers:
         crate::fasthash::FastMap<usize, Rc<crate::native_typed_array::NativeBuffer>>,
     /// Monotonic mutation generations for ArrayBuffer byte storage. Host embedders use these
@@ -3242,10 +3289,6 @@ pub struct Interp {
     pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
     /// Bounded, conservative byte ranges covering writes since the last host synchronization.
     pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
-    /// SharedArrayBuffer pointers → their global shared-memory id. The bytes and the current
-    /// length live in the registry's Shared Data Block (see `array_buffer_byte_length`);
-    /// `array_buffers` keeps an empty entry so a SharedArrayBuffer counts as attached.
-    pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
     /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
     /// bytes can be read but never written, resized, detached, or transferred.
     pub(crate) immutable_buffers: std::collections::HashSet<usize>,
@@ -3596,7 +3639,6 @@ interp_memory_inventory! {
     native_buffers => "measured",
     array_buffer_versions => "measured",
     array_buffer_dirty_ranges => "measured",
-    shared_buffers => "measured",
     immutable_buffers => "measured",
     host_keyed_buffers => "measured",
     can_block => "non_owning",
@@ -3696,7 +3738,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 168);
+    assert_eq!(names.len(), 167);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4215,6 +4257,31 @@ impl Default for BufferPressure {
             since_gc: 0,
             trigger: BUFFER_GC_TRIGGER,
         }
+    }
+}
+
+/// The trigger grows with the buffer data that survives a collection, whether an ArrayBuffer's
+/// own bytes or a SharedArrayBuffer's Shared Data Block. Four 40 MiB buffers are kept: the
+/// second allocation collects (one block retained, below the floor) and the fourth collects
+/// with three retained. Shared blocks used to count as empty, leaving the trigger at its floor,
+/// so programs holding large SharedArrayBuffers collected after every 64 MiB of new buffers.
+#[cfg(test)]
+#[test]
+fn buffer_gc_trigger_grows_with_retained_shared_data_blocks() {
+    for constructor in ["ArrayBuffer", "SharedArrayBuffer"] {
+        let mut engine = crate::Engine::new();
+        let source = format!(
+            "globalThis.kept = []; for (let k = 0; k < 4; k++) kept.push(new {constructor}(40 << 20)); kept.length"
+        );
+        assert!(matches!(
+            engine.eval(&source, false).expect("source parses"),
+            crate::Completion::Value(ref value) if value == "4"
+        ));
+        assert_eq!(
+            engine.interp.buffer_gc.trigger,
+            120 << 20,
+            "{constructor} survivors must raise the trigger"
+        );
     }
 }
 
@@ -5067,7 +5134,6 @@ impl Interp {
             native_buffers: Default::default(),
             array_buffer_versions: Default::default(),
             array_buffer_dirty_ranges: Default::default(),
-            shared_buffers: Default::default(),
             immutable_buffers: std::collections::HashSet::new(),
             host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
@@ -5303,20 +5369,18 @@ impl Interp {
                 Value::Undefined
             }
         };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            // Keep the shared length witness and synchronized data read. Ordinary buffers
-            // instead validate and decode under one borrow, with just one backing-store lookup.
-            if idx >= self.ta_len(info).unwrap_or(0) {
-                return Value::Undefined;
-            }
-            if let Some(mem) = shared_mem_get(id) {
-                return decode(&mem.lock().unwrap());
-            }
-            return Value::Undefined;
-        }
         match self.array_buffers.get(&info.buffer) {
-            Some(buf) => decode(&buf.borrow()),
-            _ => Value::Undefined,
+            // Ordinary buffers validate and decode under one borrow, with just one backing-store
+            // lookup.
+            Some(BufferData::Local(buf)) => decode(&buf.borrow()),
+            // Keep the shared length witness and synchronized data read.
+            Some(&BufferData::Shared(id)) => {
+                if idx >= self.ta_len(info).unwrap_or(0) {
+                    return Value::Undefined;
+                }
+                shared_mem_get(id).map_or(Value::Undefined, |mem| decode(&mem.lock().unwrap()))
+            }
+            None => Value::Undefined,
         }
     }
 
@@ -5338,12 +5402,7 @@ impl Interp {
                 None
             }
         };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            return shared_mem_get(id).and_then(|mem| take(&mem.lock().unwrap()));
-        }
-        self.array_buffers
-            .get(&info.buffer)
-            .and_then(|b| take(&b.borrow()))
+        self.array_buffers.get(&info.buffer)?.with_bytes(take)?
     }
 
     /// Write raw bytes at element `elem_start` (bounds-checked; silently drops what doesn't fit).
@@ -5354,23 +5413,25 @@ impl Interp {
                 buf[start..start + bytes.len()].copy_from_slice(bytes);
             }
         };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                put(&mut mem.lock().unwrap());
-                self.mark_array_buffer_dirty(info.buffer);
+        match self.array_buffers.get(&info.buffer) {
+            Some(BufferData::Local(storage)) => {
+                let mut b = storage.borrow_mut();
+                if start
+                    .checked_add(bytes.len())
+                    .is_some_and(|end| end <= b.len())
+                {
+                    put(&mut b);
+                    drop(b);
+                    self.mark_array_buffer_dirty_range(info.buffer, start, bytes.len());
+                }
             }
-            return;
-        }
-        if let Some(storage) = self.array_buffers.get(&info.buffer).cloned() {
-            let mut b = storage.borrow_mut();
-            if start
-                .checked_add(bytes.len())
-                .is_some_and(|end| end <= b.len())
-            {
-                put(&mut b);
-                drop(b);
-                self.mark_array_buffer_dirty_range(info.buffer, start, bytes.len());
+            // A Shared Data Block has no mutation generation or dirty ranges.
+            Some(&BufferData::Shared(id)) => {
+                if let Some(mem) = shared_mem_get(id) {
+                    put(&mut mem.lock().unwrap());
+                }
             }
+            None => {}
         }
     }
 
@@ -5410,17 +5471,9 @@ impl Interp {
             }
             Some(old)
         };
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                return apply(&mut buf);
-            }
-            return None;
-        }
-        match self.array_buffers.get(&info.buffer) {
-            Some(buf) => apply(&mut buf.borrow_mut()),
-            None => None,
-        }
+        self.array_buffers
+            .get(&info.buffer)?
+            .with_bytes_mut(apply)?
     }
 
     /// Store a JS value into a TypedArray element, coercing per the element type. BigInt arrays
@@ -5460,23 +5513,27 @@ impl Interp {
         let start = info.offset + idx * es;
         // Element encoding of a BigInt: wrapped modulo 2^64, little-endian.
         let bytes = (n as u64).to_le_bytes();
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
+        let wrote = match self.array_buffers.get(&info.buffer) {
+            Some(BufferData::Local(storage)) => {
+                let mut buf = storage.borrow_mut();
+                let fits = start + es <= buf.len();
+                if fits {
                     buf[start..start + es].copy_from_slice(&bytes);
                 }
+                fits
             }
-            return;
-        }
-        let mut wrote = false;
-        if let Some(storage) = self.array_buffers.get(&info.buffer) {
-            let mut buf = storage.borrow_mut();
-            if start + es <= buf.len() {
-                buf[start..start + es].copy_from_slice(&bytes);
-                wrote = true;
+            // A Shared Data Block has no mutation generation or dirty ranges.
+            Some(&BufferData::Shared(id)) => {
+                if let Some(mem) = shared_mem_get(id) {
+                    let mut buf = mem.lock().unwrap();
+                    if start + es <= buf.len() {
+                        buf[start..start + es].copy_from_slice(&bytes);
+                    }
+                }
+                false
             }
-        }
+            None => false,
+        };
         if wrote {
             self.mark_array_buffer_dirty_range(info.buffer, start, es);
         }
@@ -5485,28 +5542,32 @@ impl Interp {
     /// Write Number `n` into element `idx` of a TypedArray (out-of-range writes are ignored).
     pub(crate) fn ta_write(&mut self, info: &TaInfo, idx: usize, n: f64) {
         let es = info.kind.elsize();
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            if idx >= self.ta_len(info).unwrap_or(0) {
-                return;
-            }
-            let start = info.offset + idx * es;
-            if let Some(mem) = shared_mem_get(id) {
-                let mut buf = mem.lock().unwrap();
-                if start + es <= buf.len() {
+        let wrote = match self.array_buffers.get(&info.buffer) {
+            Some(BufferData::Local(storage)) => {
+                let mut buf = storage.borrow_mut();
+                let in_bounds = idx < info.length_for_buffer(buf.len()).unwrap_or(0);
+                if in_bounds {
+                    let start = info.offset + idx * es;
                     info.kind.write_into(n, &mut buf[start..start + es]);
                 }
+                in_bounds
             }
-            return;
-        }
-        let mut wrote = false;
-        if let Some(storage) = self.array_buffers.get(&info.buffer) {
-            let mut buf = storage.borrow_mut();
-            if idx < info.length_for_buffer(buf.len()).unwrap_or(0) {
+            // A Shared Data Block has no mutation generation or dirty ranges.
+            Some(&BufferData::Shared(id)) => {
+                if idx >= self.ta_len(info).unwrap_or(0) {
+                    return;
+                }
                 let start = info.offset + idx * es;
-                info.kind.write_into(n, &mut buf[start..start + es]);
-                wrote = true;
+                if let Some(mem) = shared_mem_get(id) {
+                    let mut buf = mem.lock().unwrap();
+                    if start + es <= buf.len() {
+                        info.kind.write_into(n, &mut buf[start..start + es]);
+                    }
+                }
+                false
             }
-        }
+            None => false,
+        };
         if wrote {
             self.mark_array_buffer_dirty_range(info.buffer, info.offset + idx * es, es);
         }
@@ -5524,7 +5585,7 @@ impl Interp {
         len: usize,
     ) -> bool {
         if info.kind.is_bigint()
-            || self.shared_buffers.contains_key(&info.buffer)
+            || self.is_shared_buffer(info.buffer)
             || self.immutable_buffers.contains(&info.buffer)
             || !self.ordinary_get_ptr(Rc::as_ptr(source) as usize)
         {
@@ -5541,7 +5602,7 @@ impl Interp {
         {
             return false;
         }
-        let Some(storage) = self.array_buffers.get(&info.buffer) else {
+        let Some(storage) = self.local_buffer(info.buffer) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -5692,7 +5753,7 @@ impl Interp {
                     || self.module_ns.contains_key(&ptr)
                     || self.deferred_ns.contains_key(&ptr)
                     || self.data_views.contains_key(&ptr)
-                    || self.array_buffers.contains_key(&ptr)
+                    || self.buffer_attached(ptr)
                     || self.host_indexed.contains_key(&ptr)
                 {
                     return ElementReceiverKind::Exotic;
@@ -6461,17 +6522,20 @@ impl Interp {
             crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
         };
         let byte_len = len * elem;
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+        let ptr = match self.array_buffers.get(&info.buffer)? {
+            BufferData::Local(storage) => {
+                let ptr = storage.borrow_mut().as_mut_ptr();
+                // N-API receives a live mutable pointer and may write through it after this call
+                // returns.
+                self.mark_array_buffer_dirty(info.buffer);
+                ptr
+            }
             // The registry keeps a Shared Data Block alive; only a grow moves its bytes.
-            let block = shared_mem_get(id)?;
-            let ptr = unsafe { block.lock().unwrap().as_mut_ptr().add(info.offset) };
-            return Some((code, byte_len, ptr));
-        }
-        // N-API receives a live mutable pointer and may write through it after this call returns.
-        self.mark_array_buffer_dirty(info.buffer);
-        let storage = self.array_buffers.get(&info.buffer)?;
-        let ptr = unsafe { storage.borrow_mut().as_mut_ptr().add(info.offset) };
-        Some((code, byte_len, ptr))
+            BufferData::Shared(id) => shared_mem_get(*id)?.lock().unwrap().as_mut_ptr(),
+        };
+        // SAFETY: `ta_len` placed the view's `byte_len` bytes from `info.offset` inside the
+        // block, so the offset stays within (or one past the end of) its allocation.
+        Some((code, byte_len, unsafe { ptr.add(info.offset) }))
     }
 
     pub fn make_array(&self, items: Vec<Value>) -> Value {
@@ -7081,14 +7145,9 @@ impl Interp {
         let len = self.ta_len(&info)?;
         let es = info.kind.elsize();
         let (start, end) = (info.offset, info.offset + len * es);
-        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
-            let mem = shared_mem_get(id)?;
-            let buf = mem.lock().unwrap();
-            return (end <= buf.len()).then(|| f(&buf[start..end]));
-        }
-        let storage = self.array_buffers.get(&info.buffer)?;
-        let buf = storage.borrow();
-        (end <= buf.len()).then(|| f(&buf[start..end]))
+        self.array_buffers
+            .get(&info.buffer)?
+            .with_bytes(|buf| (end <= buf.len()).then(|| f(&buf[start..end])))?
     }
 
     /// Snapshot a matching TypedArray over fixed backing storage for Web IDL unions.
@@ -7103,9 +7162,7 @@ impl Interp {
     ) -> Option<Vec<u8>> {
         let ptr = self.object_addr(value)?;
         let info = self.typed_arrays.get(&ptr)?;
-        if info.kind.name() != name
-            || (!allow_shared && self.shared_buffers.contains_key(&info.buffer))
-        {
+        if info.kind.name() != name || (!allow_shared && self.is_shared_buffer(info.buffer)) {
             return None;
         }
         let buffer = self.ta_buffer.get(&ptr)?.as_obj()?.borrow();
@@ -7131,7 +7188,7 @@ impl Interp {
         let ptr = Rc::as_ptr(obj) as usize;
 
         if let Some(info) = self.typed_arrays.get(&ptr).copied() {
-            if !allow_shared && self.shared_buffers.contains_key(&info.buffer) {
+            if !allow_shared && self.is_shared_buffer(info.buffer) {
                 return None;
             }
             let len = self.ta_len(&info)?;
@@ -7141,8 +7198,8 @@ impl Interp {
         if let Some((buffer, offset, fixed_len, length_tracking)) =
             self.data_views.get(&ptr).copied()
         {
-            let shared = self.shared_buffers.get(&buffer).copied();
-            if shared.is_some() && !allow_shared {
+            let data = self.array_buffers.get(&buffer)?;
+            if matches!(data, BufferData::Shared(_)) && !allow_shared {
                 return None;
             }
             // Copy only the view's bytes, not the whole backing store.
@@ -7155,21 +7212,13 @@ impl Interp {
                 };
                 Some(bytes[offset..offset + len].to_vec())
             };
-            return match shared {
-                Some(id) => view(&shared_mem_get(id)?.lock().unwrap()),
-                None => view(&self.array_buffers.get(&buffer)?.borrow()),
-            };
+            return data.with_bytes(view)?;
         }
 
-        if let Some(&id) = self.shared_buffers.get(&ptr) {
-            if !allow_shared {
-                return None;
-            }
-            return shared_mem_get(id).map(|bytes| bytes.lock().unwrap().clone());
+        match self.array_buffers.get(&ptr)? {
+            BufferData::Shared(_) if !allow_shared => None,
+            data => data.with_bytes(<[u8]>::to_vec),
         }
-        self.array_buffers
-            .get(&ptr)
-            .map(|buffer| buffer.borrow().clone())
     }
 
     /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, with the realm's intrinsic
@@ -7214,7 +7263,7 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -7231,13 +7280,14 @@ impl Interp {
 
     /// Replace a range of an ordinary, attached `ArrayBuffer` without changing its identity or
     /// JavaScript mutation generation. This is the range-aware counterpart to
-    /// [`Self::array_buffer_set_bytes`] for embedders mirroring a host-owned data block.
+    /// [`Self::array_buffer_set_bytes`] for embedders mirroring a host-owned data block. Returns
+    /// `false` for another value, a shared/detached buffer, or a range outside the buffer.
     pub fn array_buffer_set_range(&mut self, v: &Value, start: usize, bytes: &[u8]) -> bool {
         let Some(obj) = v.as_obj() else {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -7252,6 +7302,7 @@ impl Interp {
     }
 
     /// Copies a range from an ordinary, attached `ArrayBuffer` into an embedder-owned buffer.
+    /// Returns `false` for another value, a shared/detached buffer, or a range outside either.
     pub fn array_buffer_copy_range(
         &self,
         v: &Value,
@@ -7263,7 +7314,7 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        let Some(storage) = self.array_buffers.get(&ptr) else {
+        let Some(storage) = self.local_buffer(ptr) else {
             return false;
         };
         let buffer = storage.borrow();
@@ -7280,11 +7331,12 @@ impl Interp {
     /// Takes coalesced byte ranges covering JavaScript writes since the previous call. Highly
     /// fragmented writes collapse to the whole buffer, so ranges may include unchanged bytes.
     /// As with a full-buffer copy, the embedder must synchronize host writes before allowing JS
-    /// to modify the mirror. Taking the ranges does not change the mutation generation.
+    /// to modify the mirror. Taking the ranges does not change the mutation generation. `None`
+    /// for another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
         self.flush_native_buffer_writes(ptr);
-        self.array_buffers.contains_key(&ptr).then(|| {
+        self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_dirty_ranges
                 .remove(&ptr)
                 .unwrap_or_default()
@@ -7293,10 +7345,12 @@ impl Interp {
 
     /// Returns the mutation generation of an attached ordinary ArrayBuffer. The generation is
     /// intended for embedders that mirror an ArrayBuffer into another storage; it is not an
-    /// observable JavaScript value and may wrap after `u64::MAX` mutations.
+    /// observable JavaScript value and may wrap after `u64::MAX` mutations. `None` for another
+    /// value, a detached buffer or a SharedArrayBuffer: other agents write a Shared Data Block
+    /// without any generation this agent could observe.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
         let ptr = v.as_obj().map(|obj| Rc::as_ptr(obj) as usize)?;
-        self.array_buffers.contains_key(&ptr).then(|| {
+        self.local_buffer(ptr).is_some().then(|| {
             self.array_buffer_versions
                 .get(&ptr)
                 .copied()
@@ -7314,19 +7368,16 @@ impl Interp {
     /// mirror check but never allowing a stale external view to remain visible.
     pub(crate) fn mark_array_buffer_dirty(&mut self, ptr: usize) {
         let len = self
-            .array_buffers
-            .get(&ptr)
+            .local_buffer(ptr)
             .map_or(0, |buffer| buffer.borrow().len());
         self.mark_array_buffer_dirty_range(ptr, 0, len);
     }
 
-    /// Marks a byte range as changed by an engine-owned view or host pointer.
+    /// Marks a byte range as changed by an engine-owned view or host pointer. Only an
+    /// ArrayBuffer's own bytes are tracked: a Shared Data Block, which other agents write too,
+    /// has no mutation generation or dirty ranges.
     pub(crate) fn mark_array_buffer_dirty_range(&mut self, ptr: usize, start: usize, len: usize) {
-        let Some(buffer_len) = self
-            .array_buffers
-            .get(&ptr)
-            .map(|buffer| buffer.borrow().len())
-        else {
+        let Some(buffer_len) = self.local_buffer(ptr).map(|buffer| buffer.borrow().len()) else {
             return;
         };
         let Some(end) = start.checked_add(len) else {
@@ -7348,7 +7399,8 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
-        if self.shared_buffers.contains_key(&ptr) {
+        // A Shared Data Block cannot be detached.
+        if self.is_shared_buffer(ptr) {
             return false;
         }
         self.host_keyed_buffers.remove(&ptr);
@@ -7597,8 +7649,11 @@ impl Interp {
             if let Value::Obj(object) = base {
                 let id = Rc::as_ptr(object) as usize;
                 let object = object.borrow();
-                let kind = if self.array_buffers.contains_key(&id) {
-                    "ArrayBuffer"
+                let kind = if let Some(data) = self.buffer_data(id) {
+                    match data {
+                        BufferData::Local(_) => "ArrayBuffer",
+                        BufferData::Shared(_) => "SharedArrayBuffer",
+                    }
                 } else if self.typed_arrays.contains_key(&id) {
                     "TypedArray"
                 } else {
@@ -10216,14 +10271,44 @@ impl Interp {
 
     /// ArrayBufferByteLength (ECMA-262 #sec-arraybufferbytelength) of the buffer object at `ptr`,
     /// or `None` when it is detached. A SharedArrayBuffer's length is that of its Shared Data
-    /// Block, which any agent sharing it may grow; its `array_buffers` entry holds no bytes.
+    /// Block, which any agent sharing it may grow.
     pub(crate) fn array_buffer_byte_length(&self, ptr: usize) -> Option<usize> {
-        if !self.shared_buffers.is_empty() {
-            if let Some(&id) = self.shared_buffers.get(&ptr) {
-                return shared_mem_get(id).map(|block| block.lock().unwrap().len());
-            }
+        self.array_buffers.get(&ptr)?.byte_len()
+    }
+
+    /// The Data Block of the ArrayBuffer or SharedArrayBuffer object at `ptr`; `None` for a
+    /// detached ArrayBuffer or any other object.
+    pub(crate) fn buffer_data(&self, ptr: usize) -> Option<&BufferData> {
+        self.array_buffers.get(&ptr)
+    }
+
+    /// Whether `ptr` is a buffer object with a Data Block: an attached ArrayBuffer or a
+    /// SharedArrayBuffer (`!IsDetachedBuffer`).
+    pub(crate) fn buffer_attached(&self, ptr: usize) -> bool {
+        self.array_buffers.contains_key(&ptr)
+    }
+
+    /// The Shared Data Block id of the SharedArrayBuffer at `ptr`; `None` for an ArrayBuffer,
+    /// attached or detached, and any other object.
+    pub(crate) fn shared_block_id(&self, ptr: usize) -> Option<u64> {
+        match self.array_buffers.get(&ptr)? {
+            BufferData::Shared(id) => Some(*id),
+            BufferData::Local(_) => None,
         }
-        Some(self.array_buffers.get(&ptr)?.borrow().len())
+    }
+
+    /// IsSharedArrayBuffer (ECMA-262 #sec-issharedarraybuffer) for the buffer object at `ptr`.
+    pub(crate) fn is_shared_buffer(&self, ptr: usize) -> bool {
+        self.shared_block_id(ptr).is_some()
+    }
+
+    /// The bytes of the attached ArrayBuffer at `ptr`; `None` for a SharedArrayBuffer, whose
+    /// bytes are its Shared Data Block's, a detached ArrayBuffer or any other object.
+    pub(crate) fn local_buffer(&self, ptr: usize) -> Option<&ArrayBufferBytes> {
+        match self.array_buffers.get(&ptr)? {
+            BufferData::Local(bytes) => Some(bytes),
+            BufferData::Shared(_) => None,
+        }
     }
 
     /// The intrinsic %TypedArray.prototype% getter that OrdinaryGet of `key` on the TypedArray
@@ -11142,7 +11227,6 @@ impl Interp {
         crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, garbage_objects);
         crate::gc_sweep::map(&mut self.ta_buffer, garbage_objects);
         crate::gc_sweep::map(&mut self.shadow_realms, garbage_objects);
-        crate::gc_sweep::map(&mut self.shared_buffers, garbage_objects);
         crate::gc_sweep::set(&mut self.immutable_buffers, garbage_objects);
         crate::gc_sweep::set(&mut self.host_keyed_buffers, garbage_objects);
         crate::gc_sweep::map(&mut self.generators, garbage_objects);
@@ -11170,12 +11254,26 @@ impl Interp {
             return;
         }
         self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
-        let retained: usize = self
-            .array_buffers
-            .values()
-            .map(|block| block.try_borrow().map_or(0, |bytes| bytes.len()))
+        let mut local = 0usize;
+        let mut blocks = crate::fasthash::FastSet::default();
+        for data in self.array_buffers.values() {
+            match data {
+                BufferData::Local(bytes) => {
+                    local += bytes.try_borrow().map_or(0, |bytes| bytes.len());
+                }
+                // A surviving SharedArrayBuffer retains its Shared Data Block. Count each block
+                // once, however many buffers alias it.
+                BufferData::Shared(id) => {
+                    blocks.insert(*id);
+                }
+            }
+        }
+        let shared: usize = blocks
+            .into_iter()
+            .filter_map(shared_mem_get)
+            .map(|block| block.lock().unwrap().len())
             .sum();
-        self.buffer_gc.trigger = retained.max(BUFFER_GC_TRIGGER);
+        self.buffer_gc.trigger = local.saturating_add(shared).max(BUFFER_GC_TRIGGER);
     }
 
     /// A data block could not be allocated: collect everything unreachable (discarded buffers

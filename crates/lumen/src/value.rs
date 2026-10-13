@@ -2801,7 +2801,8 @@ impl TaKind {
 /// `[[ArrayLength]]`/`[[TypedArrayName]]`). Stored in an `Interp` side table keyed by object ptr.
 #[derive(Clone, Copy)]
 pub struct TaInfo {
-    /// Pointer of the backing ArrayBuffer object (key into `Interp::array_buffers`).
+    /// Pointer of the backing ArrayBuffer or SharedArrayBuffer object (key into
+    /// `Interp::array_buffers`).
     pub buffer: usize,
     pub offset: usize,
     pub len: usize,

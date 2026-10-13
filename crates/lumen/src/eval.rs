@@ -6943,6 +6943,7 @@ impl Interp {
                         if let Some(v) = self.data_views.remove(&sp) {
                             self.data_views.insert(dp, v);
                         }
+                        // An ArrayBuffer's bytes or a SharedArrayBuffer's Shared Data Block.
                         if let Some(v) = self.array_buffers.remove(&sp) {
                             self.array_buffers.insert(dp, v);
                         }

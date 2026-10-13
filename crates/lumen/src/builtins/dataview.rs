@@ -15,37 +15,36 @@ fn dv_info(i: &mut Interp, this: &Value) -> Result<(usize, usize, usize, bool), 
 /// buffer) the view is now out of bounds.
 /// Read `n` (at most 8) raw bytes of a (possibly shared) buffer into the front of an array.
 fn dv_bytes(i: &Interp, buf: usize, start: usize, n: usize) -> Option<[u8; 8]> {
-    let mut bytes = [0; 8];
-    let mut copy = |source: &[u8]| {
+    let copy = |source: &[u8]| {
+        let mut bytes = [0; 8];
         bytes[..n].copy_from_slice(source.get(start..start.checked_add(n)?)?);
         Some(bytes)
     };
-    if let Some(&id) = i.shared_buffers.get(&buf) {
-        return crate::interpreter::shared_mem_get(id).and_then(|m| copy(&m.lock().unwrap()));
-    }
-    i.array_buffers
-        .get(&buf)
-        .and_then(|storage| copy(&storage.borrow()))
+    i.buffer_data(buf)?.with_bytes(copy)?
 }
 
 /// Write raw bytes into a (possibly shared) buffer (bounds-checked, silently dropped otherwise).
 fn dv_put(i: &mut Interp, buf: usize, start: usize, bytes: &[u8]) {
-    if let Some(&id) = i.shared_buffers.get(&buf) {
-        if let Some(m) = crate::interpreter::shared_mem_get(id) {
-            let mut g = m.lock().unwrap();
-            if start + bytes.len() <= g.len() {
-                g[start..start + bytes.len()].copy_from_slice(bytes);
-            }
-        }
-        return;
-    }
-    if let Some(storage) = i.array_buffers.get(&buf).cloned() {
-        let mut b = storage.borrow_mut();
-        if start + bytes.len() <= b.len() {
+    let put = |b: &mut [u8]| {
+        let fits = start + bytes.len() <= b.len();
+        if fits {
             b[start..start + bytes.len()].copy_from_slice(bytes);
-            drop(b);
-            i.mark_array_buffer_dirty_range(buf, start, bytes.len());
         }
+        fits
+    };
+    let wrote = match i.buffer_data(buf) {
+        Some(BufferData::Local(storage)) => put(&mut storage.borrow_mut()),
+        // A Shared Data Block has no mutation generation or dirty ranges.
+        Some(BufferData::Shared(id)) => {
+            if let Some(m) = crate::interpreter::shared_mem_get(*id) {
+                put(&mut m.lock().unwrap());
+            }
+            false
+        }
+        None => false,
+    };
+    if wrote {
+        i.mark_array_buffer_dirty_range(buf, start, bytes.len());
     }
 }
 

@@ -2169,7 +2169,7 @@ fn scan_realm(
         interp
             .array_buffers
             .len()
-            .saturating_mul(size_of::<(usize, crate::interpreter::ArrayBufferBytes)>())
+            .saturating_mul(size_of::<(usize, crate::interpreter::BufferData)>())
             .saturating_add(
                 interp
                     .array_buffer_versions
@@ -2181,12 +2181,6 @@ fn scan_realm(
                     .array_buffer_dirty_ranges
                     .len()
                     .saturating_mul(size_of::<(usize, Vec<std::ops::Range<usize>>)>()),
-            )
-            .saturating_add(
-                interp
-                    .shared_buffers
-                    .len()
-                    .saturating_mul(size_of::<(usize, u64)>()),
             )
             .saturating_add(
                 interp
@@ -2243,7 +2237,6 @@ fn scan_realm(
     if !interp.array_buffers.is_empty()
         || !interp.array_buffer_versions.is_empty()
         || !interp.array_buffer_dirty_ranges.is_empty()
-        || !interp.shared_buffers.is_empty()
         || !interp.immutable_buffers.is_empty()
         || !interp.host_keyed_buffers.is_empty()
         || !interp.typed_arrays.is_empty()
@@ -2254,11 +2247,11 @@ fn scan_realm(
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
     }
-    for buffer in interp.array_buffers.values() {
-        visitor.array_buffer(buffer);
-    }
-    for id in interp.shared_buffers.values() {
-        visitor.shared_array_buffer(*id);
+    for data in interp.array_buffers.values() {
+        match data {
+            crate::interpreter::BufferData::Local(bytes) => visitor.array_buffer(bytes),
+            crate::interpreter::BufferData::Shared(id) => visitor.shared_array_buffer(*id),
+        }
     }
 
     totals.interpreter_side_tables.add(
@@ -2784,7 +2777,9 @@ mod tests {
     fn wasm_backing_alias_is_not_credited_again_as_an_array_buffer() {
         let mut interp = Interp::new();
         let storage = Rc::new(RefCell::new(Vec::with_capacity(79)));
-        interp.array_buffers.insert(1, storage.clone());
+        interp
+            .array_buffers
+            .insert(1, crate::interpreter::BufferData::Local(storage.clone()));
         interp
             .host_state
             .put_external_memory(ExternalWasmState(storage.clone()));
@@ -3067,14 +3062,21 @@ mod tests {
 
     #[test]
     fn agent_snapshot_aggregates_shadow_heaps_with_global_deduplication() {
+        use crate::interpreter::BufferData;
         let mut root = Interp::new();
         let mut shadow = Interp::new_with_symbol_agent(root.symbol_agent.clone());
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
-        root.array_buffers.insert(1, shared_buffer.clone());
-        shadow.array_buffers.insert(2, shared_buffer);
+        root.array_buffers
+            .insert(1, BufferData::Local(shared_buffer.clone()));
+        shadow
+            .array_buffers
+            .insert(2, BufferData::Local(shared_buffer));
         let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
-        root.shared_buffers.insert(3, shared_data_block);
-        shadow.shared_buffers.insert(4, shared_data_block);
+        root.array_buffers
+            .insert(3, BufferData::Shared(shared_data_block));
+        shadow
+            .array_buffers
+            .insert(4, BufferData::Shared(shared_data_block));
 
         let root_objects = crate::value::heap_gc_snapshot(&root.gc_heap);
         let root_scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
@@ -3123,7 +3125,9 @@ mod tests {
     fn absent_shared_backing_identity_is_unavailable_not_zero() {
         let mut interp = Interp::new();
         let absent_id = crate::interpreter::next_shared_id();
-        interp.shared_buffers.insert(1, absent_id);
+        interp
+            .array_buffers
+            .insert(1, crate::interpreter::BufferData::Shared(absent_id));
 
         let snapshot = measure(&interp, &[], &[]);
         assert_eq!(snapshot.shared_array_buffer_backing.unavailable_ids, 1);

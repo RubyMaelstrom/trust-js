@@ -203,9 +203,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             return Err(err());
         }
         // A detached buffer (regular buffer removed from the store) has no [[ArrayBufferData]].
-        if !i.array_buffers.contains_key(&info.buffer)
-            && !i.shared_buffers.contains_key(&info.buffer)
-        {
+        if !i.buffer_attached(info.buffer) {
             return Err(i.make_error("TypeError", "Atomics.wait/notify: buffer is detached"));
         }
         Ok(info)
@@ -213,8 +211,8 @@ pub(super) fn install_atomics(it: &mut Interp) {
     it.def_method(&atomics, "wait", 4, |i, _t, a| {
         let winfo = require_waitable(i, &arg(a, 0))?;
         // Atomics.wait needs a *shared* buffer — checked before ValidateAtomicAccess (index coercion).
-        let id = match i.shared_buffers.get(&winfo.buffer) {
-            Some(&id) => id,
+        let id = match i.shared_block_id(winfo.buffer) {
+            Some(id) => id,
             None => {
                 return Err(i.make_error(
                     "TypeError",
@@ -270,8 +268,8 @@ pub(super) fn install_atomics(it: &mut Interp) {
             }
         };
         // notify is a no-op (returns 0) on a non-shared buffer.
-        match i.shared_buffers.get(&info.buffer) {
-            Some(&id) => {
+        match i.shared_block_id(info.buffer) {
+            Some(id) => {
                 let byte_index = info.offset + idx * info.kind.elsize();
                 let own = i.async_wait_inbox.clone();
                 let (woken, own_tokens) =
@@ -288,8 +286,8 @@ pub(super) fn install_atomics(it: &mut Interp) {
     it.def_method(&atomics, "waitAsync", 4, |i, _t, a| {
         // ValidateIntegerTypedArray(waitable) runs before any index/value coercion.
         let winfo = require_waitable(i, &arg(a, 0))?;
-        let id = match i.shared_buffers.get(&winfo.buffer) {
-            Some(&id) => id,
+        let id = match i.shared_block_id(winfo.buffer) {
+            Some(id) => id,
             None => {
                 return Err(i.make_error(
                     "TypeError",

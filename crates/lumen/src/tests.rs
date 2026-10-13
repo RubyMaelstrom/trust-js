@@ -411,6 +411,49 @@ fn fragmented_array_buffer_writes_preserve_host_synchronization() {
     );
 }
 
+/// The embedder mirror API (mutation generations, dirty ranges, range reads and writes) covers
+/// ordinary ArrayBuffers only. A SharedArrayBuffer is rejected like a detached buffer: it used
+/// to report a generation that never changed and no dirty ranges however JavaScript wrote it,
+/// and accepted empty reads and writes as if it were an empty ordinary buffer.
+#[test]
+fn array_buffer_mirror_api_rejects_shared_array_buffers() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var sab = new SharedArrayBuffer(8), empty = new SharedArrayBuffer(0);
+         var ordinary = new ArrayBuffer(8); new Uint8Array(sab)[3] = 9",
+    );
+    let read = |engine: &mut Engine, name: &str| {
+        let global = engine.interp.global.borrow();
+        global.props.get(name).expect("global binding").value()
+    };
+    let (sab, empty, ordinary) = (
+        read(&mut engine, "sab"),
+        read(&mut engine, "empty"),
+        read(&mut engine, "ordinary"),
+    );
+    for buffer in [&sab, &empty] {
+        assert_eq!(engine.interp.array_buffer_version(buffer), None);
+        assert_eq!(engine.interp.take_array_buffer_dirty_ranges(buffer), None);
+        assert!(!engine.interp.array_buffer_set_bytes(buffer, &[]));
+        assert!(!engine.interp.array_buffer_set_range(buffer, 0, &[]));
+        assert!(!engine.interp.array_buffer_copy_range(buffer, 0, 0, &mut []));
+    }
+    assert!(!engine.interp.array_buffer_set_bytes(&sab, &[1; 8]));
+    assert_eq!(
+        engine.interp.buffer_source_bytes(&sab, true),
+        Some(vec![0, 0, 0, 9, 0, 0, 0, 0])
+    );
+    assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(0));
+    assert!(engine.interp.array_buffer_set_bytes(&ordinary, &[1; 8]));
+    run_in(&mut engine, "new Uint8Array(ordinary)[2] = 5");
+    assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(1));
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&ordinary),
+        Some(vec![2..3])
+    );
+}
+
 #[test]
 fn global_declaration_property_order_follows_instantiation_order() {
     // ECMA-262 GlobalDeclarationInstantiation: Annex B-only bindings first,
@@ -2547,7 +2590,7 @@ fn discarded_array_buffer_data_triggers_collection() {
             .interp
             .array_buffers
             .values()
-            .map(|bytes| bytes.borrow().len())
+            .map(|data| data.byte_len().unwrap_or(0))
             .sum();
         assert!(
             retained <= 72 * 1024 * 1024,
@@ -14806,6 +14849,30 @@ fn detached_typedarray() {
         "9,9,9"
     );
 }
+/// DetachArrayBuffer asserts its argument is not a SharedArrayBuffer, and a Shared Data Block
+/// cannot be detached. `$262.detachArrayBuffer` refuses one with a TypeError and leaves the
+/// buffer and its existing views intact; it used to zero the views while the buffer, new views
+/// and DataViews kept reporting the shared bytes.
+#[test]
+fn test262_detach_refuses_shared_array_buffers() {
+    use crate::bytecode::Tier;
+    let source = "var sab = new SharedArrayBuffer(8), view = new Int32Array(sab), out = [];
+view[1] = 7;
+try { $262.detachArrayBuffer(sab); out.push('detached'); } catch (e) { out.push(e.name); }
+out.push(sab.byteLength, view.length, view[1], Atomics.load(view, 1),
+         new Int32Array(sab).length, new DataView(sab).getInt32(4, true));
+out.join(',')";
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "TypeError,8,2,7,7,2,7",
+            "tier {tier:?}"
+        );
+    }
+}
 #[test]
 fn ta_index_properties() {
     assert_eq!(
@@ -18758,7 +18825,10 @@ out.join(',')"#;
             .interp
             .array_buffers
             .values()
-            .map(|bytes| bytes.borrow().capacity())
+            .filter_map(|data| match data {
+                crate::interpreter::BufferData::Local(bytes) => Some(bytes.borrow().capacity()),
+                crate::interpreter::BufferData::Shared(_) => None,
+            })
             .sum();
         assert!(local_bytes < 1 << 20, "tier {tier:?}: {local_bytes}");
     }

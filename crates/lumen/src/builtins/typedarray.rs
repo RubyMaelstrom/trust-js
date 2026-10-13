@@ -8,9 +8,9 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     Rc::make_mut(&mut it.extra_protos).insert("SharedArrayBuffer", proto.clone());
     // byteLength/maxByteLength/growable accessor getters on the prototype.
     // SharedArrayBuffer.prototype accessors require a shared buffer: reject a plain ArrayBuffer
-    // `this` with a TypeError (the shared side table is the discriminator).
+    // `this` with a TypeError (the kind of its Data Block is the discriminator).
     fn require_shared_buffer(i: &Interp, this: &Value) -> Result<(), Value> {
-        let shared = matches!(this, Value::Obj(o) if i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)));
+        let shared = matches!(this, Value::Obj(o) if i.is_shared_buffer(Rc::as_ptr(o) as usize));
         if !shared {
             return Err(i.make_error("TypeError", "requires a SharedArrayBuffer"));
         }
@@ -56,14 +56,14 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let max = resizable_max_byte_length(&this)
             .ok_or_else(|| i.make_error("TypeError", "SharedArrayBuffer is not growable"))?;
         let ptr = this.as_obj().map(|o| Rc::as_ptr(o) as usize).unwrap_or(0);
-        if !i.shared_buffers.contains_key(&ptr) {
+        let Some(id) = i.shared_block_id(ptr) else {
             return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
-        }
+        };
         let new_len = to_index(i, &arg(a, 0))?;
         // The length is the Shared Data Block's, which every agent sharing the buffer sees.
         // Holding its lock across the check and the resize orders racing grows, as the spec's
         // compare-exchange loop on [[ArrayBufferByteLengthData]] does.
-        let Some(block) = crate::interpreter::shared_mem_get(i.shared_buffers[&ptr]) else {
+        let Some(block) = crate::interpreter::shared_mem_get(id) else {
             return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
         };
         let mut bytes = block.lock().unwrap();
@@ -87,7 +87,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         // RequireInternalSlot + IsSharedArrayBuffer(O).
         let o = this
             .as_obj()
-            .filter(|o| i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)))
+            .filter(|o| i.is_shared_buffer(Rc::as_ptr(o) as usize))
             .ok_or_else(|| {
                 i.make_error(
                     "TypeError",
@@ -114,7 +114,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         let ctor = species_constructor(i, &this, &sab_ctor)?;
         let new_buf = ab(i.construct(ctor, &[Value::Num(new_len as f64)]))?;
         let nptr = match &new_buf {
-            Value::Obj(no) if i.shared_buffers.contains_key(&(Rc::as_ptr(no) as usize)) => {
+            Value::Obj(no) if i.is_shared_buffer(Rc::as_ptr(no) as usize) => {
                 Rc::as_ptr(no) as usize
             }
             _ => {
@@ -135,7 +135,10 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
         // Both buffers' bytes live in their process-global Shared Data Blocks.
-        let block = |i: &Interp, p: usize| crate::interpreter::shared_mem_get(i.shared_buffers[&p]);
+        let block = |i: &Interp, p: usize| {
+            i.shared_block_id(p)
+                .and_then(crate::interpreter::shared_mem_get)
+        };
         if let (true, Some(src), Some(dst)) = (begin < end, block(i, ptr), block(i, nptr)) {
             let slice = src
                 .lock()
@@ -190,11 +193,9 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         };
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        // The bytes live in the Shared Data Block allocated above; this entry holds none.
-        i.array_buffers.insert(bp, Default::default());
+        i.array_buffers.insert(bp, BufferData::Shared(id));
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
-        i.shared_buffers.insert(bp, id);
         set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
         Ok(Value::Obj(obj))
     });
@@ -228,7 +229,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         .cloned()
         .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
     let ptr = Rc::as_ptr(&o) as usize;
-    if i.shared_buffers.contains_key(&ptr) {
+    if i.is_shared_buffer(ptr) {
         return Err(i.make_error("TypeError", "transfer requires a non-shared ArrayBuffer"));
     }
     // The newLength argument is read (observably) before detachability is verified.
@@ -249,23 +250,23 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     if i.host_keyed_buffers.contains(&ptr) {
         return Err(i.make_error("TypeError", "ArrayBuffer detach key does not match"));
     }
-    if !i.array_buffers.contains_key(&ptr) {
+    // A SharedArrayBuffer was rejected above: an ArrayBuffer without its own bytes is detached.
+    let Some(len) = i.local_buffer(ptr).map(|bytes| bytes.borrow().len()) else {
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-    }
-    let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].borrow().len());
+    };
+    let new_len = new_len.unwrap_or(len);
     // ArrayBufferCopyAndDetach: transfer() preserves the source's resizability (its
     // [[ArrayBufferMaxByteLength]] slot); transferToFixedLength() is always fixed.
     let src_max = resizable_max_byte_length(&this);
     // Transfer ownership of the Vec rather than cloning it. This is the engine primitive behind
     // HTML structured transfer; same-length transfers must remain O(1) in backing-store bytes.
     i.invalidate_native_buffer(ptr);
-    let bytes = i
-        .array_buffers
-        .remove(&ptr)
-        .expect("the detached check above established a backing store");
+    let Some(BufferData::Local(bytes)) = i.array_buffers.remove(&ptr) else {
+        unreachable!("the detached check above established the buffer's own bytes");
+    };
     bytes.borrow_mut().resize(new_len, 0);
     let (bv, bp) = make_array_buffer(i, new_len)?;
-    i.array_buffers.insert(bp, bytes);
+    i.array_buffers.insert(bp, BufferData::Local(bytes));
     if let (false, Some(src_max)) = (fixed, src_max) {
         if let Value::Obj(nb) = &bv {
             set_internal(nb, "#\u{0}abMaxByteLength", Value::Num(src_max as f64));
@@ -338,7 +339,7 @@ pub(crate) fn array_buffer_with_storage(
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, storage);
+    i.array_buffers.insert(p, BufferData::Local(storage));
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind the `__ab*` prefix and surfaced through prototype accessor getters.
     set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(byte_len as f64));
@@ -355,7 +356,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     // `this` with a TypeError (both buffer kinds carry `__abMaxByteLength`, so brand alone isn't enough).
     fn reject_shared_buffer(i: &Interp, this: &Value) -> Result<(), Value> {
         if let Value::Obj(o) = this {
-            if i.shared_buffers.contains_key(&(Rc::as_ptr(o) as usize)) {
+            if i.is_shared_buffer(Rc::as_ptr(o) as usize) {
                 return Err(i.make_error("TypeError", "requires a non-shared ArrayBuffer"));
             }
         }
@@ -376,12 +377,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         // Detached (absent from the side table) → 0.
-        Ok(Value::Num(
-            i.array_buffers
-                .get(&p)
-                .map(|b| b.borrow().len())
-                .unwrap_or(0) as f64,
-        ))
+        Ok(Value::Num(i.array_buffer_byte_length(p).unwrap_or(0) as f64))
     });
     ab_getter(it, &proto, "maxByteLength", |i, this, _| {
         reject_shared_buffer(i, &this)?;
@@ -395,7 +391,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
                 // A detached buffer reports 0.
                 let detached = this
                     .as_obj()
-                    .map(|o| !i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize)))
+                    .map(|o| !i.buffer_attached(Rc::as_ptr(o) as usize))
                     .unwrap_or(true);
                 Ok(if detached { Value::Num(0.0) } else { v })
             }
@@ -420,9 +416,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .as_obj()
             .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        Ok(Value::Bool(
-            !i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize)),
-        ))
+        Ok(Value::Bool(!i.buffer_attached(Rc::as_ptr(o) as usize)))
     });
     ab_getter(it, &proto, "immutable", |i, this, _| {
         reject_shared_buffer(i, &this)?;
@@ -447,10 +441,10 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
                 )
             })?;
         let ptr = Rc::as_ptr(o) as usize;
-        if !i.array_buffers.contains_key(&ptr) {
+        // A SharedArrayBuffer was rejected above: an ArrayBuffer without its own bytes is detached.
+        let Some(len) = i.local_buffer(ptr).map(|bytes| bytes.borrow().len() as i64) else {
             return Err(i.make_error("TypeError", "Cannot slice a detached ArrayBuffer"));
-        }
-        let len = i.array_buffers[&ptr].borrow().len() as i64;
+        };
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -475,35 +469,34 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
                 return Err(i.make_error("TypeError", "slice species did not create an ArrayBuffer"))
             }
         };
-        if i.shared_buffers.contains_key(&nptr) {
-            return Err(i.make_error("TypeError", "slice species returned a SharedArrayBuffer"));
-        }
-        if !i.array_buffers.contains_key(&nptr) {
-            return Err(i.make_error("TypeError", "slice species returned a detached ArrayBuffer"));
-        }
+        let dst = match i.buffer_data(nptr) {
+            Some(BufferData::Local(bytes)) => bytes.clone(),
+            Some(BufferData::Shared(_)) => {
+                return Err(i.make_error("TypeError", "slice species returned a SharedArrayBuffer"))
+            }
+            None => {
+                return Err(
+                    i.make_error("TypeError", "slice species returned a detached ArrayBuffer")
+                )
+            }
+        };
         if nptr == ptr {
             return Err(i.make_error("TypeError", "slice species returned the same ArrayBuffer"));
         }
         if i.immutable_buffers.contains(&nptr) {
             return Err(i.make_error("TypeError", "slice species returned an immutable buffer"));
         }
-        if i.array_buffers[&nptr].borrow().len() < new_len {
+        if dst.borrow().len() < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
         // The species constructor may have detached or shrunk the source.
-        if !i.array_buffers.contains_key(&ptr) {
+        let Some(src) = i.local_buffer(ptr).cloned() else {
             return Err(i.make_error("TypeError", "source ArrayBuffer was detached during slice"));
-        }
+        };
         // CopyDataBlockBytes(toBuf, 0, fromBuf, first, min(newLength, currentLength - first)):
         // copy just that range. Two buffer objects can share one host Data Block (the embedder
         // API identifies storage), so a shared block copies within itself instead of borrowing
         // it twice.
-        let (Some(src), Some(dst)) = (
-            i.array_buffers.get(&ptr).cloned(),
-            i.array_buffers.get(&nptr).cloned(),
-        ) else {
-            return Ok(new_buf);
-        };
         if Rc::ptr_eq(&src, &dst) {
             let mut bytes = src.borrow_mut();
             let len = bytes.len() as i64;
@@ -532,21 +525,19 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let ptr = Rc::as_ptr(&o) as usize;
         let max = resizable_max_byte_length(&this)
             .ok_or_else(|| i.make_error("TypeError", "ArrayBuffer is not resizable"))?;
-        if i.shared_buffers.contains_key(&ptr) {
+        if i.is_shared_buffer(ptr) {
             return Err(i.make_error("TypeError", "resize requires a non-shared ArrayBuffer"));
         }
         let new_len = to_index(i, &arg(a, 0))?;
         // ToIndex may have detached the buffer: a TypeError, before the max-length RangeError.
-        if !i.array_buffers.contains_key(&ptr) {
+        let Some(buf) = i.local_buffer(ptr) else {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-        }
+        };
         if new_len > max {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
-        if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.borrow_mut().resize(new_len, 0);
-            i.mark_array_buffer_dirty(ptr);
-        }
+        buf.borrow_mut().resize(new_len, 0);
+        i.mark_array_buffer_dirty(ptr);
         // byteLength derives from the backing store length, which the resize above updated.
         Ok(Value::Undefined)
     });
@@ -568,10 +559,10 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        if !i.array_buffers.contains_key(&ptr) {
+        // A SharedArrayBuffer was rejected above: an ArrayBuffer without its own bytes is detached.
+        let Some(len) = i.local_buffer(ptr).map(|bytes| bytes.borrow().len() as i64) else {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-        }
-        let len = i.array_buffers[&ptr].borrow().len() as i64;
+        };
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -580,8 +571,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         // Coercing start/end may have detached or shrunk the source buffer: detachment is a
         // TypeError, and a resolved range past the current length is a RangeError.
         let storage = i
-            .array_buffers
-            .get(&ptr)
+            .local_buffer(ptr)
             .cloned()
             .ok_or_else(|| i.make_error("TypeError", "ArrayBuffer is detached"))?;
         let bytes = storage.borrow();
@@ -598,7 +588,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             Vec::new()
         };
         let (bv, bp) = make_array_buffer(i, slice.len())?;
-        if let Some(buf) = i.array_buffers.get(&bp) {
+        if let Some(buf) = i.local_buffer(bp) {
             buf.borrow_mut().copy_from_slice(&slice);
         }
         i.immutable_buffers.insert(bp);
@@ -644,7 +634,8 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let block = create_byte_data_block(i, n as usize)?;
         let p = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, Rc::new(RefCell::new(block)));
+        i.array_buffers
+            .insert(p, BufferData::Local(Rc::new(RefCell::new(block))));
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
@@ -710,7 +701,7 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         let actual = actual as usize;
         // `with` uses TypedArrayCreateSameType — it ignores `@@species`.
         let (new_ta, new_info) = ta_create_same(i, info.kind, len)?;
-        if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+        if !i.is_shared_buffer(info.buffer) && i.ta_len(&info) == Some(len) {
             if let Some(mut bytes) = i.ta_read_bytes(&info, 0, len) {
                 // TypedArrayCreateSameType gives the result a distinct ordinary buffer. Once the
                 // required coercions and index check have completed, copy the source encoding and
@@ -760,7 +751,7 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         let len = ab(i.to_number(&len))? as usize;
         let new_ta = ta_species_create(i, this, info.kind, &[Value::Num(len as f64)], true)?;
         // SpeciesConstructor access can run user code that detaches the source — re-validate.
-        if !i.array_buffers.contains_key(&info.buffer) {
+        if !i.buffer_attached(info.buffer) {
             return Err(i.make_error(
                 "TypeError",
                 "Cannot perform operation on a detached ArrayBuffer",
@@ -1238,7 +1229,7 @@ fn ta_native(
                 .ok_or_else(|| i.make_error("TypeError", "TypedArray is out of bounds"))?;
             let start = start.min(curlen);
             let end = end.min(curlen);
-            if !i.shared_buffers.contains_key(&info.buffer) {
+            if !i.is_shared_buffer(info.buffer) {
                 // After the required coercions and bounds recheck, ordinary-buffer fill has no
                 // user-observable operation between element writes. Encode the value once and
                 // write the repeated bytes in one range, avoiding a boxed conversion and dirty
@@ -1343,7 +1334,7 @@ fn ta_native(
                 // writes. Keep the source as bytes until sorting, then encode the sorted values
                 // into one output range; shared-buffer races retain the conservative path below
                 // (ECMA-262 §23.2.3.29).
-                if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+                if !i.is_shared_buffer(info.buffer) && i.ta_len(&info) == Some(len) {
                     if let Some(raw) = i.ta_read_bytes(&info, 0, len) {
                         let es = info.kind.elsize();
                         let mut nums: Vec<f64> = raw
@@ -1460,7 +1451,7 @@ fn ta_native(
             if i.immutable_buffers.contains(&info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
-            if !i.shared_buffers.contains_key(&info.buffer) && i.ta_len(&info) == Some(len) {
+            if !i.is_shared_buffer(info.buffer) && i.ta_len(&info) == Some(len) {
                 if let Some(source) = i.ta_read_bytes(&info, 0, len) {
                     // Ordinary TypedArray element swaps cannot invoke JavaScript. Snapshot and
                     // rewrite the complete fixed-length byte range, preserving NaN payloads while
@@ -1746,7 +1737,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // by the [[ArrayBufferData]] marker for a detached buffer (still an ArrayBuffer, so it can't
         // fall through to the array-like path — using a detached buffer is a TypeError).
         Some(Value::Obj(o))
-            if i.array_buffers.contains_key(&(Rc::as_ptr(o) as usize))
+            if i.buffer_attached(Rc::as_ptr(o) as usize)
                 || o.borrow().props.contains("#\u{0}abMaxByteLength") =>
         {
             let bp = Rc::as_ptr(o) as usize;
@@ -1935,14 +1926,10 @@ fn ta_convert_into(
     to: usize,
     count: usize,
 ) -> bool {
-    if i.shared_buffers.contains_key(&source.buffer)
-        || i.shared_buffers.contains_key(&target.buffer)
-    {
-        return false;
-    }
+    // Only ArrayBuffers' own bytes: shared buffers keep the per-element operations.
     let (Some(source_storage), Some(target_storage)) = (
-        i.array_buffers.get(&source.buffer).cloned(),
-        i.array_buffers.get(&target.buffer).cloned(),
+        i.local_buffer(source.buffer).cloned(),
+        i.local_buffer(target.buffer).cloned(),
     ) else {
         return false;
     };

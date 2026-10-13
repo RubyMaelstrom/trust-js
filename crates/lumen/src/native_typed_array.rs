@@ -4,7 +4,7 @@
 //! snapshot e28783d5fc9d. Shared, immutable writes, coercing and unsupported element types
 //! continue through the checked interpreter operations.
 
-use crate::interpreter::{ArrayBufferBytes, Interp};
+use crate::interpreter::{ArrayBufferBytes, BufferData, Interp};
 use crate::value::{Gc, TaInfo, TaKind};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -47,10 +47,9 @@ impl Interp {
             TaKind::U8Clamped => 8,
             _ => return,
         };
-        if self.shared_buffers.contains_key(&info.buffer) {
-            return;
-        }
-        let Some(storage) = self.array_buffers.get(&info.buffer) else {
+        // Only an ArrayBuffer's own bytes: SharedArrayBuffer elements stay on the checked
+        // operations, which lock the Shared Data Block.
+        let Some(BufferData::Local(storage)) = self.array_buffers.get(&info.buffer) else {
             return;
         };
         let size = info.kind.elsize();
@@ -287,7 +286,7 @@ mod tests {
             &mut engine,
             "function beforeThrow() {heap[2] = 91; throw 17;} try {beforeThrow();} catch(e) {} ",
         );
-        assert_eq!(engine.interp.array_buffers[&ptr].borrow()[6], 91);
+        assert_eq!(engine.interp.local_buffer(ptr).unwrap().borrow()[6], 91);
         assert_eq!(
             engine.interp.array_buffer_version(&buffer),
             Some(version + 1)
@@ -298,7 +297,7 @@ mod tests {
             .unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], 6..7);
-        let storage = engine.interp.array_buffers[&ptr].clone();
+        let storage = engine.interp.local_buffer(ptr).unwrap().clone();
         assert!(engine.interp.detach_array_buffer(&buffer));
         eval(
             &mut engine,
@@ -367,7 +366,7 @@ mod tests {
             .unwrap()
             .unwrap_or_else(|_| panic!("read buffer"));
         let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
-        let storage = Rc::downgrade(&engine.interp.array_buffers[&ptr]);
+        let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
         drop(buffer);
         eval(&mut engine, "a = null; buffer = null;");
         engine.interp.gc_collect();
@@ -416,7 +415,7 @@ mod tests {
             .unwrap()
             .unwrap_or_else(|_| panic!("read buffer"));
         let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
-        let storage = Rc::downgrade(&engine.interp.array_buffers[&ptr]);
+        let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
         assert!(engine.interp.detach_array_buffer(&buffer));
         assert!(
             storage.upgrade().is_none(),
