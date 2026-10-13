@@ -13557,6 +13557,59 @@ fn annexb_block_functions_use_vm_continuations_and_keep_distinct_bindings() {
     }
 }
 
+/// FunctionDeclarationInstantiation's Annex B step (ECMA-262 §10.2.11, web-compat insertion
+/// point) is blocked only by formal parameter names and creates no var binding named
+/// `arguments`: evaluating a block function of that name sets the VariableEnvironment's
+/// `arguments` (the arguments object's binding) or creates one there. Expected values are
+/// node's, except the arrow, where V8 still creates an undefined var binding up front.
+#[test]
+fn annexb_block_function_named_arguments_replaces_the_arguments_object_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        t(function () { { function arguments() {} } return typeof arguments; });
+        t(function (x) { { function arguments() {} } return x + typeof arguments; });
+        t(function (..._) { { function arguments() {} } return typeof arguments; });
+        t(function (arguments) { { function arguments() {} } return typeof arguments; });
+        t(function () { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; });
+        t(function () { { var b = typeof arguments; function arguments() {} } return b; });
+        t(function () { if (true) function arguments() { return 7; } return arguments(); });
+        t(function () { if (false) { function arguments() {} } return typeof arguments; });
+        t(function () { switch (1) { case 1: function arguments() {} } return typeof arguments; });
+        t(function () { return (function (x) { arguments[0] = 9; { function arguments() {} } return x; })(1); });
+        t(function () { function arguments() {} { function arguments() { return 2; } } return arguments(); });
+        t(function () { let r = typeof arguments; { let arguments; { function arguments() {} } } return r + typeof arguments; });
+        t(function () { eval('{ function arguments() {} }'); return typeof arguments; });
+        t(function () { return (() => { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; })(); });
+        t(function () { function g(a = () => arguments) { { function arguments() {} } return typeof a() + typeof arguments; } return g(); });
+        t(function () { function* gen() { var b = typeof arguments; { function arguments() {} } yield b + typeof arguments; } return gen().next().value; });
+        var asyncResult;
+        (async function () { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; })()
+            .then(function (v) { asyncResult = v; });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "function,undefinedfunction,function,undefined,objectfunction,function,7,object,\
+             function,9,2,objectobject,function,objectfunction,objectfunction,objectfunction",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "asyncResult"),
+            "objectfunction",
+            "{tier:?}"
+        );
+    }
+}
+
 #[test]
 fn jit_iterator_abort_unwinds_only_live_operands() {
     let mut engine = Engine::new();

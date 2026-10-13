@@ -14888,12 +14888,9 @@ impl Interp {
         }
 
         // Hoist `var`/function declarations into the function scope before executing the body.
-        // ("arguments" joins the blocked names: an Annex B block function of that name would
-        // clash with the arguments object, so it is not var-hoisted.)
-        let mut param_names = param_bound_names(&func.params);
-        if !func.is_arrow {
-            param_names.push("arguments".to_string());
-        }
+        // Only the formal parameter names block Annex B promotions (see `hoist_fn_body` for a
+        // block function named `arguments`).
+        let param_names = param_bound_names(&func.params);
         self.hoist_fn_body(func, &body, &param_names);
         if let Some(ps) = &param_seed {
             self.seed_param_vars(ps, &body);
@@ -15997,7 +15994,7 @@ impl Interp {
         self.global_var_names
             .borrow_mut()
             .extend(new_vars.iter().map(|(name, _)| (*name).to_owned()));
-        self.apply_hoist_ops(&hoist_ops, &self.global_env.clone());
+        self.apply_hoist_ops(&hoist_ops, &self.global_env.clone(), false);
         // The global Environment Record is object-backed: this script's `var`/`function` bindings
         // (which `hoist` just placed in `global_env`) become properties of the global object, so
         // they are visible as `globalThis.<name>` and writes stay in sync. Only the plan-computed
@@ -16104,7 +16101,7 @@ impl Interp {
     /// same-named block functions (eval and global code pass none; B.3.3.2/3 have no such clause).
     pub(crate) fn hoist(&mut self, stmts: &[Stmt], scope: &Env, param_blocked: &[String]) {
         let ops = collect_hoist_ops(stmts, self.strict, param_blocked);
-        self.apply_hoist_ops(&ops, scope);
+        self.apply_hoist_ops(&ops, scope, false);
     }
 
     /// [`Self::hoist`] for a function body, with the hoisting plan cached on the [`Function`]
@@ -16124,17 +16121,21 @@ impl Interp {
         });
         if cached.0 == strict {
             let ops = cached.1.clone();
-            self.apply_hoist_ops(&ops, scope);
+            self.apply_hoist_ops(&ops, scope, true);
         } else {
             // Strictness differs from the cached computation (shouldn't happen — a function's
             // strictness is fixed at parse) — fall back to an uncached walk.
             let ops = collect_hoist_ops(&func.body, strict, param_blocked);
-            self.apply_hoist_ops(&ops, scope);
+            self.apply_hoist_ops(&ops, scope, true);
         }
     }
 
     /// Replay a hoisting plan against `scope` (see [`HoistOp`] for the op semantics).
-    pub(crate) fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env) {
+    /// `function_code` selects FunctionDeclarationInstantiation's Annex B rule (ECMA-262
+    /// §10.2.11, web-compat insertion point): a block function named `arguments` gets no var
+    /// binding there. Evaluating its declaration sets the VariableEnvironment's `arguments`
+    /// binding (the arguments object's, when there is one) or creates it.
+    pub(crate) fn apply_hoist_ops(&mut self, ops: &[HoistOp], scope: &Env, function_code: bool) {
         for op in ops {
             match op {
                 HoistOp::Var(name) => {
@@ -16164,7 +16165,9 @@ impl Interp {
                     );
                 }
                 HoistOp::AnnexB(name, func) => {
-                    if !scope.borrow().vars.contains_key(name.as_str()) {
+                    if !(function_code && name == "arguments")
+                        && !scope.borrow().vars.contains_key(name.as_str())
+                    {
                         scope
                             .borrow_mut()
                             .vars

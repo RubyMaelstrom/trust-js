@@ -2695,7 +2695,9 @@ impl Interp {
                     return;
                 }
                 // The binding can be missing here only if a deletable (eval-created) one was
-                // deleted; B.3.3.3 re-creates it, still deletable.
+                // deleted, or for a function's `arguments`, which FunctionDeclarationInstantiation
+                // does not create (no arguments object, or one in a separate parameter scope).
+                // SetMutableBinding then creates it, deletable, as B.3.3.3 re-creates the former.
                 if !Rc::ptr_eq(&s, &self.global_env) {
                     let mut b = Binding::data(val, true, true);
                     b.deletable = true;
@@ -5318,7 +5320,7 @@ impl Interp {
         let saved_strict = self.strict;
         self.strict = strict;
         let hoist_ops = collect_hoist_ops(body, strict, &[]);
-        self.apply_hoist_ops(&hoist_ops, &probe);
+        self.apply_hoist_ops(&hoist_ops, &probe, false);
         self.strict = saved_strict;
         let var_bindings = ordered_global_hoist_bindings(&hoist_ops);
         let is_global = Rc::ptr_eq(var_env, &self.global_env);
