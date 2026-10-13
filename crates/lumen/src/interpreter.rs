@@ -5,6 +5,7 @@
 //! `Throw`, while statements additionally produce `Return`/`Break`/`Continue` completions.
 
 use crate::ast::*;
+use crate::builtins::TaAccessor;
 use crate::execution_storage::StoredValue;
 use crate::value::*;
 use std::cell::RefCell;
@@ -2977,6 +2978,8 @@ pub struct Interp {
     /// change to either bumps the epoch; an assignment can still replace the constructor's
     /// value, which each use re-reads.
     pub(crate) species_protector: std::cell::Cell<(u32, u32)>,
+    /// The TypedArray accessor protector (see `Interp::ta_accessor_reached`).
+    pub(crate) ta_accessor_protector: RefCell<TaAccessorProof>,
     /// Per-CONSTRUCTOR construct cache (`new F(...)` — keyed by callee identity, since a
     /// constructor's derived state doesn't vary per site): the same raw pointers a [`CallIc`]
     /// caches, validated by the same epoch. The `Weak` pins the callee's address against
@@ -3395,6 +3398,7 @@ interp_memory_inventory! {
     native_function_realms => "measured",
     elems_protector => "non_owning",
     species_protector => "non_owning",
+    ta_accessor_protector => "non_owning",
     construct_ics => "measured",
     call_overflow => "measured",
     native_callback_cache => "measured",
@@ -3521,7 +3525,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 162);
+    assert_eq!(names.len(), 163);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3955,6 +3959,21 @@ pub(crate) struct SharedSnapshot {
     pub(crate) address: usize,
     pub(crate) len: usize,
     pub(crate) body: Rc<Vec<Stmt>>,
+}
+
+/// The proof behind [`Interp::ta_accessor_protector`]. While `epoch` matches the live
+/// [`crate::value::proto_epoch`], `holder` (normally a Realm's %TypedArray.prototype%) is an
+/// ordinary object whose own `length`, `byteLength`, `byteOffset` and `buffer` are the matching
+/// intrinsic accessors, and each set `concrete` entry an ordinary object without those keys whose
+/// [[Prototype]] is `holder` (a concrete TypedArray prototype). All are marked prototypes, so a
+/// new or deleted key, a redefinition or a [[SetPrototypeOf]] moves the epoch on; the weak
+/// references keep their addresses from reuse.
+#[derive(Default)]
+pub(crate) struct TaAccessorProof {
+    epoch: u32,
+    holder: std::rc::Weak<RefCell<Object>>,
+    concrete: [std::rc::Weak<RefCell<Object>>; 4],
+    next_concrete: usize,
 }
 
 /// A realm's intrinsics: the global object, its environment, and the per-realm prototypes/constructors
@@ -4552,6 +4571,54 @@ fn function_realm_key(callback: &Value) -> Option<usize> {
     }
 }
 
+/// The intrinsic %TypedArray.prototype% getter that OrdinaryGet of `key` finds starting at
+/// `start`, and the object holding it, when every object it consults is an ordinary one whose
+/// properties all live in its property map (no Proxy, TypedArray, namespace, host or wrapper
+/// exotic).
+fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
+    let mut cur = Some(start.clone());
+    while let Some(object) = cur {
+        let next = {
+            let b = object.borrow();
+            if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+                return None;
+            }
+            if let Some(property) = b.props.get(key) {
+                let found = property
+                    .getter()
+                    .filter(|_| property.accessor())
+                    .and_then(crate::builtins::ta_accessor_of)?;
+                drop(b);
+                return Some((found, object));
+            }
+            b.proto.clone()
+        };
+        cur = next;
+    }
+    None
+}
+
+/// Whether `holder` is an ordinary object whose own `length`, `byteLength`, `byteOffset` and
+/// `buffer` are each the matching intrinsic %TypedArray.prototype% accessor.
+fn ta_accessor_holder_is_pristine(holder: &Gc) -> bool {
+    let holder = holder.borrow();
+    holder.ic_plain.get()
+        && matches!(holder.exotic, Exotic::None)
+        && [
+            TaAccessor::Length,
+            TaAccessor::ByteLength,
+            TaAccessor::ByteOffset,
+            TaAccessor::Buffer,
+        ]
+        .into_iter()
+        .all(|accessor| {
+            holder.props.get(accessor.name()).is_some_and(|property| {
+                property.accessor()
+                    && property.getter().and_then(crate::builtins::ta_accessor_of) == Some(accessor)
+            })
+        })
+}
+
 impl Interp {
     pub(crate) fn new() -> Interp {
         Self::new_with_symbol_agent(crate::value::new_symbol_agent())
@@ -4605,6 +4672,7 @@ impl Interp {
             native_function_realms: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
             species_protector: std::cell::Cell::new((0, u32::MAX)),
+            ta_accessor_protector: RefCell::default(),
             construct_ics: Default::default(),
             call_overflow: Default::default(),
             native_callback_cache: None,
@@ -8672,16 +8740,16 @@ impl Interp {
                         }
                         TaIndex::Ordinary => {}
                     }
-                    // The meta keys live on %TypedArray.prototype% as accessors; an own property
-                    // (defineProperty on the instance) shadows them.
-                    let cur = self.ta_len(&info);
-                    if o.borrow().props.contains(key) {
-                        return self.get_from_chain(&o, key, &receiver, trace);
-                    }
-                    if matches!(
-                        key,
-                        "length" | "byteLength" | "byteOffset" | "BYTES_PER_ELEMENT" | "buffer"
-                    ) {
+                    // `length`, `byteLength`, `byteOffset` and `buffer` are accessors of
+                    // %TypedArray.prototype%. When OrdinaryGet with this receiver would call one
+                    // of those intrinsic getters, compute its result instead; anything else on
+                    // the way (an own property, a subclass or replaced accessor, a Proxy, a null
+                    // prototype) takes the ordinary lookup below.
+                    let accessor = match &receiver {
+                        Value::Obj(r) if Rc::ptr_eq(r, &o) => self.ta_accessor_reached(&o, key),
+                        _ => None,
+                    };
+                    if let Some(accessor) = accessor {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
                                 crate::feedback::PropertyOutcome::Exotic,
@@ -8690,30 +8758,23 @@ impl Interp {
                                 None,
                             );
                         }
-                    }
-                    match key {
-                        "length" => {
-                            return Ok(Value::Num(cur.unwrap_or(0) as f64));
-                        }
-                        "byteLength" => {
-                            return Ok(Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64))
-                        }
-                        "byteOffset" => {
-                            return Ok(Value::Num(if cur.is_none() {
+                        let cur = self.ta_len(&info);
+                        return Ok(match accessor {
+                            TaAccessor::Length => Value::Num(cur.unwrap_or(0) as f64),
+                            TaAccessor::ByteLength => {
+                                Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64)
+                            }
+                            TaAccessor::ByteOffset => Value::Num(if cur.is_none() {
                                 0.0
                             } else {
                                 info.offset as f64
-                            }))
-                        }
-                        "BYTES_PER_ELEMENT" => return Ok(Value::Num(info.kind.elsize() as f64)),
-                        "buffer" => {
-                            return Ok(self
+                            }),
+                            TaAccessor::Buffer => self
                                 .ta_buffer
                                 .get(&ptr)
                                 .cloned()
-                                .unwrap_or(Value::Undefined))
-                        }
-                        _ => {}
+                                .unwrap_or(Value::Undefined),
+                        });
                     }
                 }
                 // Web IDL legacy platform object [[GetOwnProperty]]: a supported indexed
@@ -9804,6 +9865,76 @@ impl Interp {
         info.length_for_buffer(buflen)
     }
 
+    /// The intrinsic %TypedArray.prototype% getter that OrdinaryGet of `key` on the TypedArray
+    /// `o` (ECMA-262 §10.4.5.5 [[Get]] for a non-numeric key, then §10.1.8.1) would call, when
+    /// `o` has no own `key` and every prototype up to that accessor is an ordinary object whose
+    /// properties all live in its property map. None for any other outcome.
+    fn ta_accessor_reached(&self, o: &Gc, key: &str) -> Option<TaAccessor> {
+        let accessor = match key {
+            "length" => TaAccessor::Length,
+            "byteLength" => TaAccessor::ByteLength,
+            "byteOffset" => TaAccessor::ByteOffset,
+            "buffer" => TaAccessor::Buffer,
+            _ => return None,
+        };
+        let proto = {
+            let o = o.borrow();
+            if o.props.contains(key) {
+                return None;
+            }
+            o.proto.clone()?
+        };
+        // The usual chain is a concrete prototype without such a key, then the holder of all
+        // four intrinsic accessors: both proven once per epoch (see `TaAccessorProof`).
+        let epoch = crate::value::proto_epoch();
+        {
+            let proof = self.ta_accessor_protector.borrow();
+            let proto = Rc::as_ptr(&proto);
+            if proof.epoch == epoch
+                && epoch != u32::MAX
+                && (std::ptr::eq(proof.holder.as_ptr(), proto)
+                    || proof
+                        .concrete
+                        .iter()
+                        .any(|c| std::ptr::eq(c.as_ptr(), proto)))
+            {
+                return Some(accessor);
+            }
+        }
+        let (found, holder) = ta_accessor_on_chain(&proto, key)?;
+        let mut proof = self.ta_accessor_protector.borrow_mut();
+        if proof.epoch != epoch || !std::ptr::eq(proof.holder.as_ptr(), Rc::as_ptr(&holder)) {
+            if !ta_accessor_holder_is_pristine(&holder) {
+                return Some(found);
+            }
+            holder.borrow().props.mark_proto();
+            *proof = TaAccessorProof {
+                epoch,
+                holder: Rc::downgrade(&holder),
+                ..Default::default()
+            };
+        }
+        let concrete = {
+            let concrete = proto.borrow();
+            concrete.ic_plain.get()
+                && matches!(concrete.exotic, Exotic::None)
+                && concrete
+                    .proto
+                    .as_ref()
+                    .is_some_and(|p| Rc::ptr_eq(p, &holder))
+                && ["length", "byteLength", "byteOffset", "buffer"]
+                    .iter()
+                    .all(|key| !concrete.props.contains(key))
+        };
+        if concrete {
+            proto.borrow().props.mark_proto();
+            let slot = proof.next_concrete;
+            proof.concrete[slot] = Rc::downgrade(&proto);
+            proof.next_concrete = (slot + 1) % proof.concrete.len();
+        }
+        Some(found)
+    }
+
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid
     /// in-range element index, a *canonical numeric* key that isn't one (e.g. "1.5", "-0", "-1",
     /// out of range — these are inert: never stored, never reach the prototype), or an ordinary key.
@@ -9827,6 +9958,14 @@ impl Interp {
     /// CanonicalNumericIndexString: the numeric value when `key` is the canonical string form of a
     /// Number ("0", "1.5", "-0", "Infinity", "NaN"…), else None.
     pub(crate) fn canonical_numeric_index(&self, key: &str) -> Option<f64> {
+        // Number::toString output starts with a digit, `-`, `Infinity` or `NaN`: any other key
+        // (every method or accessor name) is rejected before a float parse.
+        if !matches!(
+            key.as_bytes().first(),
+            Some(b'0'..=b'9' | b'-' | b'I' | b'N')
+        ) {
+            return None;
+        }
         if key == "-0" {
             return Some(-0.0);
         }

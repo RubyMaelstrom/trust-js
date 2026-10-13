@@ -711,13 +711,57 @@ fn ta_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
     ))
 }
 
-const TA_META_KEYS: [&str; 5] = [
-    "length",
-    "byteLength",
-    "byteOffset",
-    "buffer",
-    "BYTES_PER_ELEMENT",
-];
+/// One of the accessor properties of %TypedArray.prototype% whose getter a property read may
+/// answer without calling it (see `Interp::ta_accessor_reached`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TaAccessor {
+    Length,
+    ByteLength,
+    ByteOffset,
+    Buffer,
+}
+
+impl TaAccessor {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            TaAccessor::Length => "length",
+            TaAccessor::ByteLength => "byteLength",
+            TaAccessor::ByteOffset => "byteOffset",
+            TaAccessor::Buffer => "buffer",
+        }
+    }
+}
+
+/// The intrinsic getters of those accessors, as the very function pointers their function
+/// objects hold: separately coerced copies of one function need not share an address, so a
+/// getter is recognized only against the value that was installed.
+pub(crate) fn ta_accessor_getters() -> &'static [(TaAccessor, NativeFn); 4] {
+    static GETTERS: std::sync::OnceLock<[(TaAccessor, NativeFn); 4]> = std::sync::OnceLock::new();
+    GETTERS.get_or_init(|| {
+        [
+            (TaAccessor::Length, ta_length_get as NativeFn),
+            (TaAccessor::ByteLength, ta_bytelength_get),
+            (TaAccessor::ByteOffset, ta_byteoffset_get),
+            (TaAccessor::Buffer, ta_buffer_get),
+        ]
+    })
+}
+
+/// Which intrinsic %TypedArray.prototype% getter (of any Realm) `getter` is. Each computes its
+/// answer from a TypedArray receiver alone, so calling it on one is unobservable.
+pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
+    let Value::Obj(getter) = getter else {
+        return None;
+    };
+    let f = match getter.borrow().call {
+        Callable::Native(f) => f,
+        _ => return None,
+    };
+    ta_accessor_getters()
+        .iter()
+        .find(|(_, installed)| std::ptr::fn_addr_eq(*installed, f))
+        .map(|(accessor, _)| *accessor)
+}
 
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
@@ -1323,6 +1367,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
         }
     } else if let Some(info) = o.as_obj().and_then(|obj| ta_info(i, obj)) {
         // A TypedArray's enumerable own properties are its integer indices (plus any expandos).
+        // Its elements never live in the property map, and `length` etc. are inherited
+        // accessors, so every string key the map holds is an ordinary own property.
         let n = i.ta_len(&info).unwrap_or(0);
         for idx in 0..n {
             let v = i.ta_read(&info, idx);
@@ -1339,11 +1385,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                     .props
                     .ordered_keys()
                     .into_iter()
-                    .filter(|k| {
-                        !Interp::is_sym_key(k)
-                            && k.parse::<usize>().is_err()
-                            && !TA_META_KEYS.contains(&&**k)
-                    })
+                    .filter(|k| !Interp::is_sym_key(k))
                     .collect()
             })
             .unwrap_or_default();
@@ -4430,11 +4472,11 @@ fn install_object(it: &mut Interp) {
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
-            for k in ordered_enum_keys(&o) {
-                if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
-                    keys.push(Value::Str(k.into()));
-                }
-            }
+            keys.extend(
+                ordered_enum_keys(&o)
+                    .into_iter()
+                    .map(|k| Value::Str(k.into())),
+            );
             return Ok(i.make_array(keys));
         }
         let names = ordered_enum_keys(&o);
@@ -4462,16 +4504,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(strs));
         }
-        // A TypedArray's own keys are its integer indices, then any string expandos (the
-        // length/buffer/... metadata are inherited, not own).
+        // A TypedArray's own keys are its integer indices, then any string expandos in insertion
+        // order (the length/buffer/... metadata are inherited, not own).
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
-            for k in o.borrow().props.keys() {
-                if !Interp::is_sym_key(&k)
-                    && k.parse::<usize>().is_err()
-                    && !TA_META_KEYS.contains(&&*k)
-                {
+            for k in o.borrow().props.ordered_keys() {
+                if !Interp::is_sym_key(&k) && !Interp::is_private_key(&k) {
                     keys.push(Value::Str(k.into()));
                 }
             }

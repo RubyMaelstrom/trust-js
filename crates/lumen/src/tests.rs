@@ -269,6 +269,86 @@ fn numeric_typed_array_access_preserves_exotic_semantics_in_all_tiers() {
     }
 }
 
+/// `length`, `byteLength`, `byteOffset` and `buffer` are %TypedArray.prototype% accessors and
+/// BYTES_PER_ELEMENT a prototype data property: a TypedArray's [[Get]] answers them directly only
+/// where OrdinaryGet would reach those intrinsics, and own properties of those names are
+/// ordinary own properties. Expected values are node's.
+#[test]
+fn typed_array_accessor_reads_follow_the_prototype_chain_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        class V extends Float32Array {
+            get length() { return 99; } get byteLength() { return 98; }
+            get byteOffset() { return 97; } get buffer() { return 'buf'; } }
+        var v = new V(4);
+        t(function () { return [v.length, v.byteLength, v.byteOffset, v.buffer, v.BYTES_PER_ELEMENT]; });
+        var orphan = Object.setPrototypeOf(new Int16Array(2), null);
+        t(function () { return [orphan.length, orphan.byteLength, orphan.buffer, orphan.BYTES_PER_ELEMENT]; });
+        var u = new Uint8Array(3), f = new Float64Array(3);
+        t(function () { return [u.length, u.byteLength, u.byteOffset, u.buffer instanceof ArrayBuffer]; });
+        t(function () { return Reflect.get(u, 'length', f) + '/' + Reflect.get(u, 'byteLength', f); });
+        t(function () { return Reflect.get(u, 'length', {}); });
+        t(function () { return Object.create(u).length; });
+        var TAP = Object.getPrototypeOf(Uint8Array.prototype);
+        var lengthGet = Object.getOwnPropertyDescriptor(TAP, 'length');
+        var byteLengthGet = Object.getOwnPropertyDescriptor(TAP, 'byteLength').get;
+        Object.defineProperty(TAP, 'length', {
+            get() { return 'patched:' + lengthGet.get.call(this); }, configurable: true });
+        t(function () { return u.length + '/' + new Float64Array(2).length; });
+        Object.defineProperty(TAP, 'length', lengthGet);
+        class S extends Int16Array {}
+        Object.defineProperty(S.prototype, 'length', { get: byteLengthGet });
+        Object.defineProperty(S.prototype, 'BYTES_PER_ELEMENT', { value: 's' });
+        t(function () { return new S(5).length + '/' + new S(1).BYTES_PER_ELEMENT; });
+        Object.defineProperty(Uint16Array.prototype, 'byteLength', { value: 'own-data' });
+        t(function () { return new Uint16Array(4).byteLength; });
+        var proxied = Object.setPrototypeOf(new Int8Array(5),
+            new Proxy({}, { get(target, key) { return 'proxy:' + String(key); } }));
+        t(function () { return proxied.length + '/' + proxied.byteOffset; });
+        var z = new Int8Array(2);
+        Object.defineProperty(z, 'length', { value: 9, enumerable: true, configurable: true });
+        Object.defineProperty(z, 'buffer', { value: 8, enumerable: false, configurable: true });
+        z.extra = 1;
+        t(function () { return [z.length, z.buffer, Object.keys(z).join('/'),
+            Object.getOwnPropertyNames(z).join('/'), JSON.stringify(Object.entries(z))].join(' '); });
+        function hot(a) { var s = 0; for (var i = 0; i < 300; i++) s += a.length + a.byteLength; return s; }
+        t(function () { return [hot(new Uint8Array(2)), hot(v), hot(orphan)].join('/'); });
+        // Changes after warm reads: a concrete prototype's own accessor, its [[Prototype]], and
+        // the intrinsic holder's keys.
+        function last(a, key) { var r; for (var i = 0; i < 300; i++) r = a[key]; return r; }
+        var w = new Int32Array(2);
+        hot(w);
+        Object.defineProperty(Int32Array.prototype, 'length', {
+            get() { return 'concrete'; }, configurable: true });
+        t(function () { return w.length + '/' + last(w, 'length'); });
+        delete Int32Array.prototype.length;
+        Object.setPrototypeOf(Int32Array.prototype, null);
+        t(function () { return w.length + '/' + last(w, 'buffer'); });
+        Object.setPrototypeOf(Int32Array.prototype, TAP);
+        var byteOffsetDesc = Object.getOwnPropertyDescriptor(TAP, 'byteOffset');
+        delete TAP.byteOffset;
+        t(function () { return w.byteOffset + '/' + last(w, 'length'); });
+        Object.defineProperty(TAP, 'byteOffset', byteOffsetDesc);
+        t(function () { return last(w, 'byteOffset') + '/' + hot(w); });
+        out.join(';')
+    "#;
+    let expected = "99,98,97,buf,4;,,,;3,3,0,true;3/24;TypeError;TypeError;patched:3/patched:2;\
+        10/s;own-data;proxy:length/proxy:byteOffset;\
+        9 8 0/1/length/extra 0/1/length/buffer/extra [[\"0\",0],[\"1\",0],[\"length\",9],[\"extra\",1]];\
+        1200/59100/NaN;concrete/concrete;undefined/undefined;undefined/2;0/3000";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "tier {tier:?}");
+    }
+}
+
 #[cfg(feature = "embed")]
 #[test]
 fn fragmented_array_buffer_writes_preserve_host_synchronization() {
@@ -2048,7 +2128,10 @@ fn promise_then_with_the_intrinsic_species_allocates_only_its_result() {
         "var pending = new Promise(function () {}); function f() {} pending.then(f);",
     );
     let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
-    run_in(&mut engine, "for (var i = 0; i < 4000; i++) pending.then(f);");
+    run_in(
+        &mut engine,
+        "for (var i = 0; i < 4000; i++) pending.then(f);",
+    );
     let per_then =
         (crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before) as f64 / 4000.0;
     assert!(per_then < 1.5, "{per_then} objects allocated per then");
