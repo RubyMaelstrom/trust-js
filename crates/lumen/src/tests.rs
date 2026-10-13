@@ -13490,6 +13490,47 @@ fn for_head_no_in_function_boundaries_execute() {
 }
 
 #[test]
+fn loop_free_functions_earn_native_code_through_vm_runs() {
+    // A loop-free body runs `jit_admit_runs` times on the bytecode VM before it is compiled to
+    // native code; a body with a loop is compiled on its first run.
+    let mut engine = Engine::new();
+    engine.set_tier(crate::bytecode::Tier::Jit);
+    engine.set_tier_threshold(1);
+    engine.interp.jit_admit_runs = 3;
+    let chunk_of = |engine: &mut Engine, name: &str| {
+        let env = engine.interp.global_env.clone();
+        let Ok(value) = engine.interp.get_var(name, &env) else {
+            panic!("missing fixture function {name}")
+        };
+        let object = value.as_obj().expect("function object").borrow();
+        let crate::value::Callable::User(user) = &object.call else {
+            panic!("user function")
+        };
+        user.func.code.get().cloned().flatten()
+    };
+    run_in(
+        &mut engine,
+        "function flat(x){return x+1} function looped(n){var s=0;for(var k=0;k<n;k++)s+=k;return s}",
+    );
+    let native_supported = cfg!(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ));
+    // Call 1 runs on the tree-walker, call 2 compiles bytecode, calls 2-4 run on the VM.
+    for call in 1..=4 {
+        assert_eq!(run_in(&mut engine, "flat(1) + looped(4)"), "8", "call {call}");
+    }
+    let flat = chunk_of(&mut engine, "flat").expect("flat compiled to bytecode");
+    assert_eq!(flat.vm_runs.get(), 3);
+    assert!(flat.jit.untried(), "flat still waits for native admission");
+    let looped = chunk_of(&mut engine, "looped").expect("looped compiled on its first call");
+    assert_eq!(looped.jit.untried(), !native_supported);
+    assert_eq!(run_in(&mut engine, "flat(1) + looped(4)"), "8");
+    assert_eq!(flat.jit.untried(), !native_supported);
+    assert_eq!(flat.jit.get().flatten().is_some(), native_supported);
+}
+
+#[test]
 fn non_decimal_number_literals_are_not_machine_word_bounded() {
     // ECMA-262 §12.9.3 computes the mathematical value without a u64-sized
     // ceiling, then rounds it to Number. Steam ships the first literal below.

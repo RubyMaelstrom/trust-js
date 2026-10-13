@@ -149,6 +149,11 @@ impl NativeCodeSlot {
         retired.finish();
     }
 
+    /// No compile was ever attempted for this slot (nothing resident, pending or reclaimed).
+    pub(crate) fn untried(&self) -> bool {
+        self.state.get().is_none()
+    }
+
     /// Bounded re-use evidence avoids immediate re-emission after each eviction.
     /// This is separate from initial function/OSR hotness and does not change it.
     pub(crate) fn ready_to_compile(&self) -> bool {

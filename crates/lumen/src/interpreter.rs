@@ -2823,6 +2823,11 @@ pub struct Interp {
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
     pub(crate) tier_threshold: u32,
+    /// Bytecode VM runs a loop-free function makes before it is compiled to native code (env
+    /// `LUMEN_JIT_ADMIT_RUNS`). A body with a loop is compiled on its first run: one call can
+    /// spend its whole time in the loop. A loop-free body costs about as much to compile as
+    /// a few hundred runs on the VM gain, and most functions of a page run only a few times.
+    pub(crate) jit_admit_runs: u32,
     /// Opt-in tagged execution slices (env `LUMEN_TAGGED_ARITHMETIC`). The flag is captured
     /// once per Agent so hot bytecode operators do not repeatedly consult process synchronization
     /// state; unset keeps the established numeric fast paths unchanged. Covers the binary
@@ -3358,6 +3363,7 @@ interp_memory_inventory! {
     strict => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
+    jit_admit_runs => "non_owning",
     tagged_arithmetic => "non_owning",
     vm_pool => "measured",
     native_arg_pool => "measured",
@@ -3943,6 +3949,9 @@ pub(crate) struct HostSettingsState {
 /// running it on the tree-walker costs each later Realm of the Agent a few milliseconds.
 /// Smaller run-once bodies still compile on their first call (and stay on the VM): interpreting
 /// them too would save less memory for a similar cost in every later Realm.
+/// See [`Interp::jit_admit_runs`].
+pub(crate) const DEFAULT_JIT_ADMIT_RUNS: u32 = 0;
+
 pub(crate) const RUN_ONCE_INTERPRETED_STATEMENTS: usize = 1000;
 
 /// One decoded static host snapshot (see `Interp::shared_snapshots`). Every evaluation runs a
@@ -4673,6 +4682,10 @@ impl Interp {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            jit_admit_runs: std::env::var("LUMEN_JIT_ADMIT_RUNS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_JIT_ADMIT_RUNS),
             tagged_arithmetic: std::env::var_os("LUMEN_TAGGED_ARITHMETIC").is_some(),
             vm_pool: Vec::new(),
             native_arg_pool: Vec::new(),
@@ -12572,6 +12585,24 @@ impl Interp {
         }
     }
 
+    /// Whether `chunk` may run (or be compiled to) native code on this run. A loop-free body
+    /// first runs `jit_admit_runs` times on the bytecode VM (see [`Interp::jit_admit_runs`]);
+    /// a forced tier (`tier_threshold` 0) admits at once.
+    fn native_admitted(&self, func: &Function, chunk: &crate::bytecode::Chunk) -> bool {
+        if !chunk.jit.untried()
+            || self.tier_threshold == 0
+            || func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0
+        {
+            return true;
+        }
+        let runs = chunk.vm_runs.get();
+        if runs >= self.jit_admit_runs {
+            return true;
+        }
+        chunk.vm_runs.set(runs + 1);
+        false
+    }
+
     /// Run an already-compiled chunk (JIT or bytecode VM), saving/restoring the per-body engine
     /// flags (`strict`, `tco_ok`, field-init / async-gen-body markers). Shared by the lean
     /// [`call_user_inner`] path and the [`call_compiled_fast`] shortcut so they can't diverge.
@@ -12600,7 +12631,10 @@ impl Interp {
         // A static snapshot's run-once bootstrap function (`Function::run_once`) runs once per
         // Realm: the bytecode VM runs it about as fast as native code would, without making
         // every Agent keep its executable code.
-        if matches!(self.tier, crate::bytecode::Tier::Jit) && !func.run_once {
+        if matches!(self.tier, crate::bytecode::Tier::Jit)
+            && !func.run_once
+            && self.native_admitted(func, chunk)
+        {
             let permit = if chunk.jit.ready_to_compile()
                 && crate::jit::ensure_executable_capacity(chunk.jit_budget_wait_bytes.get())
             {
@@ -12618,6 +12652,15 @@ impl Interp {
                 }
                 match crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get()) {
                     crate::jit::JitCompileOutcome::Compiled(code) => {
+                        if env_flag!("LUMEN_TIER_LOG") {
+                            eprintln!(
+                                "[tier] native: {} ops, {} code bytes, loop {}, after {} VM runs",
+                                chunk.jit_ops().len(),
+                                code.code_bytes(),
+                                func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0,
+                                chunk.vm_runs.get()
+                            );
+                        }
                         chunk.jit_budget_wait_bytes.set(0);
                         permit.commit(Some(std::rc::Rc::new(code)));
                     }

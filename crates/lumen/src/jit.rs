@@ -1660,6 +1660,11 @@ impl JitCode {
 
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches
     /// to it through the swapped ctx).
+    /// Size of the generated machine code in bytes.
+    pub(crate) fn code_bytes(&self) -> usize {
+        self.len
+    }
+
     pub(crate) fn mem_ptr(&self) -> *const u8 {
         assert_eq!(
             self.entry_kind,

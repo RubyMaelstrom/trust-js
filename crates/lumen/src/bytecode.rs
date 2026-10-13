@@ -2376,6 +2376,9 @@ pub struct Chunk {
     inline_targets: Vec<InlineTarget>,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
+    /// Bytecode VM runs that a loop-free body made while it waited for native admission
+    /// (see `Interp::jit_admit_runs`).
+    pub(crate) vm_runs: std::cell::Cell<u32>,
     /// Whether an inline recompile has been considered (also enables the direct-call entry).
     pub(crate) inline_attempted: std::cell::Cell<bool>,
     /// Next adaptive feedback checkpoint, or zero after success/exhaustion/disablement.
@@ -7184,6 +7187,7 @@ fn finish_chunk(
         call_pins: std::cell::RefCell::new(c.call_pins),
         inline_targets: c.inline_targets,
         jit_runs: std::cell::Cell::new(0),
+        vm_runs: std::cell::Cell::new(0),
         // Hot optimization is another possible second-stage result, not a reservation
         // of that slot. Unadmitted functions retain the established inlining policy.
         // Both publishers check code2; an inlined body keeps its original-call fallback
