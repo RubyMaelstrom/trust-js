@@ -10159,6 +10159,11 @@ impl Interp {
             );
         }
         if live > self.live_object_limit {
+            // Leave the handler that catches this error room to allocate (its error object,
+            // messages, cleanup) before the next safepoint collects again. Without re-arming,
+            // the very first allocation in the `catch` block would rerun the full collection
+            // and throw again, so the error could never be handled in practice.
+            self.gc_next = live.saturating_add(GC_TRIGGER);
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
         // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit].

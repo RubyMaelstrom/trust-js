@@ -2058,6 +2058,35 @@ fn live_object_limit_is_configurable_and_enforced() {
     assert_eq!(retain(150_000, 250_000), "range:allocation limit exceeded");
 }
 
+/// The handler that catches the live-object RangeError must be able to allocate while the
+/// retained graph is still reachable: the throwing safepoint re-arms the next collection
+/// instead of leaving it due, which made the first allocation in `catch` collect and throw again.
+#[test]
+fn live_object_limit_error_handler_can_allocate() {
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.set_live_object_limit(150_000);
+        let source = "var kept = [], outcome = 'ok';
+            function fill() { for (var i = 0; i < 250000; i++) kept.push({ i: i }); }
+            try { fill(); } catch (e) {
+                var notes = [];
+                for (var j = 0; j < 2000; j++) notes.push({ j: j, name: e.name });
+                outcome = e.name + ':' + e.message + ':' + notes.length + ':' + notes[1999].j;
+            }
+            kept = null; outcome";
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "RangeError:allocation limit exceeded:2000:1999",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
 /// Releasing the last reference to a long object chain must not recurse once per link. Each case
 /// runs on a deliberately small native stack, where per-link recursion overflowed at a few
 /// thousand links; the chains here are two orders of magnitude longer.
