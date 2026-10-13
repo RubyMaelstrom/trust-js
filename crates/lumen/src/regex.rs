@@ -4980,6 +4980,10 @@ struct Matcher<'a, I: ReInput> {
     prof: bool,
 }
 
+/// Failed string-set states one match records in its failure memo. The memo only saves repeated
+/// work, so further failures past this many go unrecorded rather than growing it without bound.
+const MAX_STRING_FAILURES: usize = 1 << 20;
+
 /// How far ahead [`Matcher::continuation_viable`] may look before giving up on a proof.
 const VIABILITY_BUDGET: usize = 16;
 
@@ -5335,11 +5339,14 @@ impl<'a, I: ReInput> Matcher<'a, I> {
             if !self.tick() {
                 return None;
             }
-            // Beyond `min`, an unbounded repetition's state no longer depends on the count.
-            let memo_count = match max {
-                None if count >= min => min,
-                _ => count,
-            };
+            // Beyond `min` every further iteration must consume an element, so once `max` is
+            // out of reach of the remaining input the state no longer depends on the count.
+            let memo_count =
+                if count >= min && max.is_none_or(|limit| limit - count >= self.room(pos)) {
+                    min
+                } else {
+                    count
+                };
             let key = self.memo_key(prog, pc, pos, memo_count);
             if self.memo_failed(&key) {
                 return None;
@@ -6096,7 +6103,11 @@ impl<'a, I: ReInput> Matcher<'a, I> {
                             unreachable!("string-set failure without its count");
                         };
                         let key = self.memo_key(prog, p as usize, q, count);
-                        if let Some(failures) = &mut self.string_failures {
+                        if let Some(failures) = self
+                            .string_failures
+                            .as_mut()
+                            .filter(|failures| failures.len() < MAX_STRING_FAILURES)
+                        {
                             failures.insert(key);
                         }
                         continue;
@@ -6783,6 +6794,21 @@ mod internal_engine_diagnostics {
                 .unwrap()[0],
             Some((1, 7))
         );
+    }
+
+    #[test]
+    fn bounded_string_set_repetition_memoizes_by_position() {
+        // Each `a` can end a one- or two-element string, so the failing repetition can reach
+        // every position with many different counts. Once `max` is out of reach of the rest of
+        // the subject the count is irrelevant, and the failure memo stays linear in the subject
+        // instead of growing with position × count.
+        let re = super::Regex::new(r"^[\q{aa|a}]{0,100000}$", "v").unwrap();
+        let input = crate::lstr::LStr::from("a".repeat(20_000) + "b");
+        let text = super::ReText::new_rc(true, &input);
+        let start = std::time::Instant::now();
+        let found = re.exec_text_shared(&text, 0, &crate::RuntimeInterrupt::default());
+        assert!(matches!(found, Ok(None)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
     }
 
     #[test]
