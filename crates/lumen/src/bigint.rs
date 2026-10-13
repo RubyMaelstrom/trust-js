@@ -381,10 +381,7 @@ impl JsBigInt {
     pub(crate) fn mul_bounded(&self, o: &Self, poll: &mut Poll) -> Result<Self, Stop> {
         // A product has `a + b - 1` or `a + b` bits; reject before computing when even the
         // smaller is over the limit.
-        if !self.is_zero()
-            && !o.is_zero()
-            && self.bit_len() + o.bit_len() - 1 > MAX_BITS
-        {
+        if !self.is_zero() && !o.is_zero() && self.bit_len() + o.bit_len() - 1 > MAX_BITS {
             return Err(Stop::TooLarge);
         }
         self.mul_with(o, poll)?.within_limit()

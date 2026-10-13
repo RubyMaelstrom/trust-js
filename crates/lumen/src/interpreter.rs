@@ -3960,6 +3960,7 @@ pub const MAX_ARRAY_OP_LEN: usize = 1 << 27; // ~134M elements
 /// is copied into the callee's frame and `arguments`; V8 runs out of stack near 120,000 of them
 /// and SpiderMonkey stops at 500,000.
 pub const MAX_ARGUMENTS_LEN: usize = 1 << 20; // ~1M arguments
+
 // A string splits or spreads into at most one piece per byte (plus one), so string operations
 // never reach the array limit.
 const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN);
@@ -3970,6 +3971,7 @@ pub const MAX_BUFFER_BYTES: usize = 1 << 28; // 256 MiB
                                              // Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
                                              // string growth still dies as a RangeError rather than an OOM.
 pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
+
 // Builders check MAX_STR_LEN as they accumulate. A few (escaping, case mapping, normalization)
 // only bound their result by a fixed expansion of an input that is within the limit (at most
 // 12x, for NFKD); keep that headroom below what an engine string can represent.

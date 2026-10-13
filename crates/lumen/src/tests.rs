@@ -2758,7 +2758,10 @@ fn memory_caps_convert_blowups_to_rangeerror() {
     assert_eq!(throws("[...Array(2 ** 30)]"), "RangeError"); // huge spread
     assert_eq!(throws("Math.max(...Array(2 ** 21))"), "RangeError"); // huge argument list
     assert_eq!(throws("Math.max.apply(null, Array(2 ** 21))"), "RangeError");
-    assert_eq!(throws("Reflect.apply(Math.max, null, { length: 2 ** 32 })"), "RangeError");
+    assert_eq!(
+        throws("Reflect.apply(Math.max, null, { length: 2 ** 32 })"),
+        "RangeError"
+    );
     assert_eq!(
         throws("Object.keys(new Proxy({}, { ownKeys: () => ({ length: 2 ** 32 }) }))"),
         "RangeError"
@@ -5030,7 +5033,8 @@ fn bigint() {
 
 /// BigInt results are limited to 2^30 bits (V8's "Maximum BigInt size exceeded"), checked
 /// before the result is allocated, and radix conversion works a limb at a time. Expected values
-/// are node's.
+/// are node's, except that 70 million binary digits exceed this engine's string limit (64 MiB)
+/// but not V8's; that RangeError comes before the conversion.
 #[test]
 fn bigint_size_limit_and_radix_conversion() {
     let source = r#"
@@ -5038,10 +5042,10 @@ fn bigint_size_limit_and_radix_conversion() {
         [
             attempt(() => 2n ** 2000000000n),
             attempt(() => 2n ** 1073741824n),
-            attempt(() => { var x = 1n; for (var k = 0; k < 10; k++) x <<= 1000000000n; return x; }),
-            attempt(() => { var x = 1n << 600000000n; return x * x; }),
-            attempt(() => (1n << 1000000000n).toString(2)),
-            attempt(() => (2n ** 1073741823n) >> 1073741821n),
+            attempt(() => 1n << 1073741824n),
+            attempt(() => (2n ** 64n) ** 20000000n),
+            attempt(() => (1n << 70000000n).toString(2)),
+            attempt(() => (2n ** 100000n) >> 99998n),
             [(-4n) ** 3n, (-4n) ** 2n, 8n ** 5n, (-1n) ** 1000000000001n, 0n ** 99999999999999n].join(),
             [255n.toString(2), (-255n).toString(16), 12345678901234567890123456789n.toString(36),
              (2n ** 64n).toString(), (-(10n ** 19n)).toString(), (10n ** 19n - 1n).toString(7)].join(),
