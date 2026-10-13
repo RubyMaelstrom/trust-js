@@ -17696,6 +17696,60 @@ fn shared_array_buffer_aliasing() {
     );
 }
 
+/// A growable SharedArrayBuffer's length is that of its Shared Data Block (ECMA-262
+/// ArrayBufferByteLength, SharedArrayBuffer.prototype.grow): after `grow`, length-tracking
+/// TypedArrays and DataViews see and write the new bytes, and a DataView's tracking is decided
+/// by the [[ArrayBufferMaxByteLength]] slot, not a `growable` accessor. Expected values are
+/// Node's. The engine keeps no second copy of the bytes beside the shared block.
+#[test]
+fn growable_shared_array_buffer_grows_its_shared_block() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var sab = new SharedArrayBuffer(4, {maxByteLength: 16});
+var tracking = new Uint8Array(sab);
+var fixed = new Uint8Array(sab, 0, 4);
+var dv = new DataView(sab);
+var dvFixed = new DataView(sab, 0, 4);
+fixed[1] = 7;
+sab.grow(8);
+tracking[6] = 5;
+out.push(tracking[6], tracking.length, fixed.length, sab.byteLength, dv.byteLength,
+         dvFixed.byteLength);
+out.push(dv.getUint8(6), new Uint8Array(sab)[6], tracking[1]);
+dv.setUint8(7, 9);
+out.push(tracking[7], Atomics.add(tracking, 7, 1), Atomics.load(tracking, 7));
+var late = new Uint8Array(sab, 4);
+out.push(late.length, late[2]);
+try { sab.grow(6); out.push('no'); } catch (e) { out.push(e.name); }
+try { sab.grow(17); out.push('no'); } catch (e) { out.push(e.name); }
+sab.grow(8);
+out.push(sab.byteLength, sab.slice(5, 8).byteLength, new Uint8Array(sab.slice(5, 8)).join('|'));
+Object.defineProperty(SharedArrayBuffer.prototype, 'growable', {get() { return false; }});
+var dv2 = new DataView(sab);
+sab.grow(12);
+out.push(dv2.byteLength, dv.byteLength, tracking.length);
+var big = new SharedArrayBuffer(1 << 20);
+out.push(new DataView(big).byteLength);
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "5,8,4,8,8,4,5,5,7,9,9,10,4,5,RangeError,RangeError,8,3,0|5|10,12,12,12,1048576",
+            "tier {tier:?}"
+        );
+        let local_bytes: usize = engine
+            .interp
+            .array_buffers
+            .values()
+            .map(|bytes| bytes.borrow().capacity())
+            .sum();
+        assert!(local_bytes < 1 << 20, "tier {tier:?}: {local_bytes}");
+    }
+}
+
 #[test]
 fn atomics_wait_async() {
     // A value mismatch resolves synchronously (not async).

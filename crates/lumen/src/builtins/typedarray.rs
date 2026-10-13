@@ -30,12 +30,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
-        Ok(Value::Num(
-            i.array_buffers
-                .get(&p)
-                .map(|b| b.borrow().len())
-                .unwrap_or(0) as f64,
-        ))
+        Ok(Value::Num(i.array_buffer_byte_length(p).unwrap_or(0) as f64))
     });
     sab_getter(it, &proto, "maxByteLength", |i, this, _| {
         require_shared_buffer(i, &this)?;
@@ -65,21 +60,21 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
         }
         let new_len = to_index(i, &arg(a, 0))?;
-        let cur = i
-            .array_buffers
-            .get(&ptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0);
+        // The length is the Shared Data Block's, which every agent sharing the buffer sees.
+        // Holding its lock across the check and the resize orders racing grows, as the spec's
+        // compare-exchange loop on [[ArrayBufferByteLengthData]] does.
+        let Some(block) = crate::interpreter::shared_mem_get(i.shared_buffers[&ptr]) else {
+            return Err(i.make_error("TypeError", "grow requires a SharedArrayBuffer"));
+        };
+        let mut bytes = block.lock().unwrap();
+        let cur = bytes.len();
         if new_len == cur {
             return Ok(Value::Undefined);
         }
-        if new_len < cur || new_len > max {
+        if new_len < cur || new_len > max || bytes.try_reserve_exact(new_len - cur).is_err() {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.borrow_mut().resize(new_len, 0);
-            i.mark_array_buffer_dirty(ptr);
-        }
+        bytes.resize(new_len, 0);
         Ok(Value::Undefined)
     });
     if let Some(key) = well_known_key(it, "toStringTag") {
@@ -100,11 +95,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
                 )
             })?;
         let ptr = Rc::as_ptr(o) as usize;
-        let len = i
-            .array_buffers
-            .get(&ptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0) as i64;
+        let len = i.array_buffer_byte_length(ptr).unwrap_or(0) as i64;
         let begin = norm_index(ab(i.to_number(&arg(a, 0)))?, len);
         let end = match arg(a, 1) {
             Value::Undefined => len,
@@ -140,30 +131,21 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             ));
         }
         // The new buffer must be at least `new_len` bytes.
-        let dst_byte_len = i
-            .array_buffers
-            .get(&nptr)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0);
-        if dst_byte_len < new_len {
+        if i.array_buffer_byte_length(nptr).unwrap_or(0) < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
-        // A SharedArrayBuffer's bytes live in the process-global shared block keyed by `__sab_id`.
-        let src_id = match i.get_member(&this, "#\u{0}sab_id") {
-            Ok(Value::Num(n)) => n as u64,
-            _ => return Err(i.make_error("TypeError", "not a SharedArrayBuffer")),
-        };
-        let src = crate::interpreter::shared_mem_get(src_id)
-            .map(|m| m.lock().unwrap().clone())
-            .unwrap_or_default();
-        if begin < end && (end as usize) <= src.len() {
-            let slice = src[begin as usize..end as usize].to_vec();
-            if let Ok(Value::Num(dst_id)) = i.get_member(&new_buf, "#\u{0}sab_id") {
-                if let Some(m) = crate::interpreter::shared_mem_get(dst_id as u64) {
-                    let mut buf = m.lock().unwrap();
-                    let n = slice.len().min(buf.len());
-                    buf[..n].copy_from_slice(&slice[..n]);
-                }
+        // Both buffers' bytes live in their process-global Shared Data Blocks.
+        let block = |i: &Interp, p: usize| crate::interpreter::shared_mem_get(i.shared_buffers[&p]);
+        if let (true, Some(src), Some(dst)) = (begin < end, block(i, ptr), block(i, nptr)) {
+            let slice = src
+                .lock()
+                .unwrap()
+                .get(begin as usize..end as usize)
+                .map(<[u8]>::to_vec);
+            if let Some(slice) = slice {
+                let mut buf = dst.lock().unwrap();
+                let n = slice.len().min(buf.len());
+                buf[..n].copy_from_slice(&slice[..n]);
             }
         }
         Ok(new_buf)
@@ -202,8 +184,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers
-            .insert(bp, Rc::new(RefCell::new(vec![0u8; len])));
+        // The bytes live in the Shared Data Block allocated below; this entry holds none.
+        i.array_buffers.insert(bp, Default::default());
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
@@ -1747,10 +1729,9 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 _ => None,
             };
             // Coercing byteOffset/length above may have detached the buffer.
-            if !i.array_buffers.contains_key(&bp) {
+            let Some(buflen) = i.array_buffer_byte_length(bp) else {
                 return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-            }
-            let buflen = i.array_buffers[&bp].borrow().len();
+            };
             // A resizable ArrayBuffer or a growable SharedArrayBuffer makes an auto-length view
             // length-tracking.
             let resizable = matches!(

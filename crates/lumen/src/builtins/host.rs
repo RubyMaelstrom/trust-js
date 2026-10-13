@@ -141,8 +141,8 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers
-        .insert(p, Rc::new(RefCell::new(vec![0u8; len]))); // length placeholder
+    // The block holds the bytes and the length; this entry only marks the buffer attached.
+    i.array_buffers.insert(p, Default::default());
     set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(len as f64));
     set_internal(&obj, "#\u{0}abResizable", Value::Bool(false));
     set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
@@ -194,11 +194,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
             .shared_buffers
             .get(&p)
             .ok_or_else(|| i.make_error("TypeError", "broadcast requires a SharedArrayBuffer"))?;
-        let len = i
-            .array_buffers
-            .get(&p)
-            .map(|b| b.borrow().len())
-            .unwrap_or(0);
+        let len = i.array_buffer_byte_length(p).unwrap_or(0);
         if let Some(ag) = &i.agent {
             for tx in &ag.agent_broadcast_txs {
                 let _ = tx.send((id, len));

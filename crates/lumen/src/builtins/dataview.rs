@@ -49,7 +49,7 @@ fn dv_put(i: &mut Interp, buf: usize, start: usize, bytes: &[u8]) {
 }
 
 fn dv_view_len(i: &Interp, buf: usize, off: usize, len: usize, track: bool) -> Option<usize> {
-    let blen = i.array_buffers.get(&buf)?.borrow().len();
+    let blen = i.array_buffer_byte_length(buf)?;
     if track {
         if off > blen {
             None
@@ -288,15 +288,19 @@ pub(super) fn install_dataview(it: &mut Interp) {
             None
         };
         // Re-read the (possibly mutated) buffer state after all coercions.
-        if !i.array_buffers.contains_key(&bp) {
+        let Some(buflen) = i.array_buffer_byte_length(bp) else {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-        }
-        let buflen = i.array_buffers[&bp].borrow().len();
+        };
         if offset > buflen {
             return Err(i.make_error("RangeError", "DataView byteOffset is out of bounds"));
         }
-        let rv = ab(i.get_member(&bv, "resizable"))?;
-        let resizable = i.to_boolean(&rv);
+        // IsFixedLengthArrayBuffer: a resizable ArrayBuffer or growable SharedArrayBuffer has an
+        // [[ArrayBufferMaxByteLength]] slot. Read the slot, not the author-visible accessors.
+        let resizable = matches!(
+            bv.as_obj()
+                .and_then(|o| o.borrow().props.get("#\u{0}abResizable").map(|p| p.value())),
+            Some(Value::Bool(true))
+        );
         if let Some(l) = len_arg {
             if offset + l > buflen {
                 return Err(i.make_error("RangeError", "DataView byteLength is out of bounds"));
@@ -305,10 +309,9 @@ pub(super) fn install_dataview(it: &mut Interp) {
         // OrdinaryCreateFromConstructor does Get(newTarget, "prototype"), which can run a custom
         // proto getter that detaches or resizes the buffer — re-validate everything afterwards.
         let obj = new_from_ctor(i, "DataView")?;
-        if !i.array_buffers.contains_key(&bp) {
+        let Some(buflen) = i.array_buffer_byte_length(bp) else {
             return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-        }
-        let buflen = i.array_buffers[&bp].borrow().len();
+        };
         if offset > buflen {
             return Err(i.make_error("RangeError", "DataView byteOffset is out of bounds"));
         }

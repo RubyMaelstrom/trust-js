@@ -3079,8 +3079,9 @@ pub struct Interp {
     pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
     /// Bounded, conservative byte ranges covering writes since the last host synchronization.
     pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
-    /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
-    /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
+    /// SharedArrayBuffer pointers → their global shared-memory id. The bytes and the current
+    /// length live in the registry's Shared Data Block (see `array_buffer_byte_length`);
+    /// `array_buffers` keeps an empty entry so a SharedArrayBuffer counts as attached.
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
     /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
     /// bytes can be read but never written, resized, detached, or transferred.
@@ -6103,6 +6104,12 @@ impl Interp {
             crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
         };
         let byte_len = len * elem;
+        if let Some(&id) = self.shared_buffers.get(&info.buffer) {
+            // The registry keeps a Shared Data Block alive; only a grow moves its bytes.
+            let block = shared_mem_get(id)?;
+            let ptr = unsafe { block.lock().unwrap().as_mut_ptr().add(info.offset) };
+            return Some((code, byte_len, ptr));
+        }
         // N-API receives a live mutable pointer and may write through it after this call returns.
         self.mark_array_buffer_dirty(info.buffer);
         let storage = self.array_buffers.get(&info.buffer)?;
@@ -6984,6 +6991,9 @@ impl Interp {
             return false;
         };
         let ptr = Rc::as_ptr(obj) as usize;
+        if self.shared_buffers.contains_key(&ptr) {
+            return false;
+        }
         self.host_keyed_buffers.remove(&ptr);
         self.invalidate_native_buffer(ptr);
         let removed = self.array_buffers.remove(&ptr).is_some();
@@ -9840,8 +9850,19 @@ impl Interp {
     /// whose resizable buffer shrank below its range) or its buffer is detached. A length-tracking
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
-        let buflen = self.array_buffers.get(&info.buffer)?.borrow().len();
-        info.length_for_buffer(buflen)
+        info.length_for_buffer(self.array_buffer_byte_length(info.buffer)?)
+    }
+
+    /// ArrayBufferByteLength (ECMA-262 #sec-arraybufferbytelength) of the buffer object at `ptr`,
+    /// or `None` when it is detached. A SharedArrayBuffer's length is that of its Shared Data
+    /// Block, which any agent sharing it may grow; its `array_buffers` entry holds no bytes.
+    pub(crate) fn array_buffer_byte_length(&self, ptr: usize) -> Option<usize> {
+        if !self.shared_buffers.is_empty() {
+            if let Some(&id) = self.shared_buffers.get(&ptr) {
+                return shared_mem_get(id).map(|block| block.lock().unwrap().len());
+            }
+        }
+        Some(self.array_buffers.get(&ptr)?.borrow().len())
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid
