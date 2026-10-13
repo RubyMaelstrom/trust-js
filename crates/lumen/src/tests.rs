@@ -16023,7 +16023,8 @@ fn string_padding_ascii_fast_path_preserves_unit_truncation() {
 
 /// Builders whose result length author code controls throw V8's RangeError instead of
 /// materializing a string an engine string cannot hold (a Rust panic, which aborts the page).
-/// Every case also exceeds V8's own limit, so node throws the same RangeError.
+/// Every case also exceeds V8's own limit, so node throws the same RangeError; the engine stops
+/// each one before its result passes the 64 MiB string limit.
 #[test]
 fn oversized_string_builders_throw_range_errors() {
     let cases = [
@@ -16031,14 +16032,14 @@ fn oversized_string_builders_throw_range_errors() {
         "''.padStart(2 ** 32 + 5)",
         "'x'.padStart(2 ** 30, '\\ud83d')",
         "'\\u00e9'.padEnd(2 ** 31, '\\u00e9')",
-        "Array(17).fill('x'.repeat(2 ** 25)).join('')",
+        "Array(600).fill('x'.repeat(2 ** 20)).join('')",
         "new Array(2 ** 20).join('x'.repeat(2 ** 10))",
-        "String(Array(17).fill('x'.repeat(2 ** 25)))",
+        "String(Array(600).fill('x'.repeat(2 ** 20)))",
         "'x'.repeat(2 ** 20).replaceAll('x', 'y'.repeat(2 ** 10))",
         "'x'.repeat(2 ** 16).replaceAll('x', () => 'y'.repeat(2 ** 14))",
         "'\\u00e9'.repeat(2 ** 16).replaceAll('\\u00e9', 'y'.repeat(2 ** 14))",
         "('a'.repeat(2 ** 20) + 'z').replace('z', '$`'.repeat(600))",
-        "String.raw({ raw: Array(17).fill('x'.repeat(2 ** 25)) })",
+        "String.raw({ raw: Array(600).fill('x'.repeat(2 ** 20)) })",
         "new Uint8Array(2 ** 20).join('x'.repeat(2 ** 10))",
     ];
     for tier in [
@@ -16063,13 +16064,13 @@ fn oversized_string_builders_throw_range_errors() {
     }
     // Quoting is per byte, so the JSON case runs once rather than per tier.
     assert_eq!(
-        throws("JSON.stringify(Array(17).fill('x'.repeat(2 ** 25)))"),
+        throws("JSON.stringify(Array(600).fill('x'.repeat(2 ** 20)))"),
         "RangeError"
     );
     // A formatted list contains every element. (V8 reports an ICU error here instead.)
     #[cfg(feature = "intl")]
     assert_eq!(
-        throws("new Intl.ListFormat().format(Array(17).fill('x'.repeat(2 ** 25)))"),
+        throws("new Intl.ListFormat().format(Array(600).fill('x'.repeat(2 ** 20)))"),
         "RangeError"
     );
 }

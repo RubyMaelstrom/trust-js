@@ -82,6 +82,14 @@ pub(crate) fn check_string_length(i: &mut Interp, len: usize) -> Result<(), Valu
     Ok(())
 }
 
+/// Append `piece` to a string result under construction, checking the new length first so the
+/// buffer never grows past [`MAX_STR_LEN`].
+pub(crate) fn push_str_checked(i: &mut Interp, out: &mut String, piece: &str) -> Result<(), Value> {
+    check_string_length(i, out.len().saturating_add(piece.len()))?;
+    out.push_str(piece);
+    Ok(())
+}
+
 /// Map an `Abrupt` (which, from inside a native function, can only be a `Throw`) to its value so it
 /// fits the native `Result<_, Value>` contract.
 fn ab<T>(r: Result<T, Abrupt>) -> Result<T, Value> {
@@ -6134,13 +6142,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut out = String::new();
         for k in 0..len {
             if k > 0 {
-                out.push_str(&sep);
+                push_str_checked(i, &mut out, &sep)?;
             }
             let v = array_get_index(i, &o, &ov, k)?;
             if !matches!(v, Value::Undefined | Value::Null) {
-                out.push_str(&ab(i.to_string(&v))?);
+                let piece = ab(i.to_string(&v))?;
+                push_str_checked(i, &mut out, &piece)?;
             }
-            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
@@ -6272,9 +6280,9 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                     return Err(i.make_error("TypeError", "toLocaleString is not a function"));
                 }
                 let s = ab(i.call(tls, el, &[arg(args, 0), arg(args, 1)]))?;
-                out.push_str(&ab(i.to_string(&s))?);
+                let piece = ab(i.to_string(&s))?;
+                push_str_checked(i, &mut out, &piece)?;
             }
-            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });
@@ -8650,21 +8658,25 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
     let mut result = String::new();
     let mut first = true;
     while let Some(value) = step_iter_with(i, &this, &next)? {
-        if first {
-            first = false;
+        let piece = if matches!(value, Value::Undefined | Value::Null) {
+            crate::lstr::LStr::from("")
         } else {
-            result.push_str(&separator);
-        }
-        if !matches!(value, Value::Undefined | Value::Null) {
             match i.to_string(&value) {
-                Ok(s) => result.push_str(&s),
+                Ok(s) => s,
                 Err(e) => {
                     i.iterator_close(&this);
                     return Err(crate::interpreter::abrupt_value(e));
                 }
             }
-        }
-        if let Err(error) = check_string_length(i, result.len()) {
+        };
+        let appended = if first {
+            first = false;
+            push_str_checked(i, &mut result, &piece)
+        } else {
+            push_str_checked(i, &mut result, &separator)
+                .and_then(|()| push_str_checked(i, &mut result, &piece))
+        };
+        if let Err(error) = appended {
             i.iterator_close(&this);
             return Err(error);
         }
@@ -11461,12 +11473,13 @@ fn install_string(it: &mut Interp) {
                 let mut out = String::new();
                 let mut byte = 0usize;
                 for ch in s.chars() {
-                    out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+                    let piece = string_replacement(i, &repl, "", &s, byte)?;
+                    push_str_checked(i, &mut out, &piece)?;
                     out.push(ch);
                     byte += ch.len_utf8();
-                    check_string_length(i, out.len())?;
                 }
-                out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+                let piece = string_replacement(i, &repl, "", &s, byte)?;
+                push_str_checked(i, &mut out, &piece)?;
                 return Ok(Value::lstr(out));
             }
             let units = i.units_full(&s);
@@ -11483,13 +11496,11 @@ fn install_string(it: &mut Interp) {
                 } else {
                     String::new()
                 };
-                out.push_str(&string_replacement_parts(
-                    i, &repl, "", &s, pos, &before, &after,
-                )?);
+                let piece = string_replacement_parts(i, &repl, "", &s, pos, &before, &after)?;
+                push_str_checked(i, &mut out, &piece)?;
                 if let Some(&unit) = units.get(pos) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
-                check_string_length(i, out.len())?;
             }
             return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
         }
@@ -11509,19 +11520,18 @@ fn install_string(it: &mut Interp) {
             }
             let mut out = String::with_capacity(s.len());
             out.push_str(&s[..first]);
-            out.push_str(&string_replacement(i, &repl, pat.as_ref(), &s, first)?);
+            let rep = string_replacement(i, &repl, pat.as_ref(), &s, first)?;
+            push_str_checked(i, &mut out, &rep)?;
             let mut rest = &s[first + pat.len()..];
             let mut base = first + pat.len();
             while let Some(pos) = rest.find(pat.as_ref()) {
-                check_string_length(i, out.len())?;
-                out.push_str(&rest[..pos]);
+                push_str_checked(i, &mut out, &rest[..pos])?;
                 let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
-                out.push_str(&rep);
+                push_str_checked(i, &mut out, &rep)?;
                 rest = &rest[pos + pat.len()..];
                 base += pos + pat.len();
             }
-            check_string_length(i, out.len() + rest.len())?;
-            out.push_str(rest);
+            push_str_checked(i, &mut out, rest)?;
             return Ok(Value::lstr(out));
         }
         // A pure-ASCII receiver cannot contain a non-ASCII search string. Avoid allocating a
@@ -11543,7 +11553,11 @@ fn install_string(it: &mut Interp) {
         let mut cursor = 0usize;
         let mut pos = first;
         loop {
-            out.push_str(&crate::jstr::from_units(&source_units[cursor..pos]));
+            push_str_checked(
+                i,
+                &mut out,
+                &crate::jstr::from_units(&source_units[cursor..pos]),
+            )?;
             let matched = crate::jstr::from_units(&source_units[pos..pos + pattern_len]);
             let before = if needs_context {
                 crate::jstr::from_units(&source_units[..pos])
@@ -11555,10 +11569,8 @@ fn install_string(it: &mut Interp) {
             } else {
                 String::new()
             };
-            out.push_str(&string_replacement_parts(
-                i, &repl, &matched, &s, pos, &before, &after,
-            )?);
-            check_string_length(i, out.len())?;
+            let piece = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
+            push_str_checked(i, &mut out, &piece)?;
             cursor = pos + pattern_len;
             let Some(next) = source_units[cursor..]
                 .windows(pattern_len)
@@ -11568,8 +11580,11 @@ fn install_string(it: &mut Interp) {
             };
             pos = cursor + next;
         }
-        out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
-        check_string_length(i, out.len())?;
+        push_str_checked(
+            i,
+            &mut out,
+            &crate::jstr::from_units(&source_units[cursor..]),
+        )?;
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
 
@@ -11603,13 +11618,14 @@ fn install_string(it: &mut Interp) {
         let mut out = String::new();
         for k in 0..len {
             let seg = ab(i.get_member(&raw, &k.to_string()))?;
-            out.push_str(&ab(i.to_string(&seg))?);
+            let piece = ab(i.to_string(&seg))?;
+            push_str_checked(i, &mut out, &piece)?;
             if k + 1 < len {
                 if let Some(sub) = args.get(k + 1) {
-                    out.push_str(&ab(i.to_string(sub))?);
+                    let piece = ab(i.to_string(sub))?;
+                    push_str_checked(i, &mut out, &piece)?;
                 }
             }
-            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });
@@ -11948,21 +11964,18 @@ fn string_replacement_parts(
                         continue;
                     }
                     '&' => {
-                        out.push_str(matched);
+                        push_str_checked(i, &mut out, matched)?;
                         chars.next();
-                        check_string_length(i, out.len())?;
                         continue;
                     }
                     '`' => {
-                        out.push_str(before);
+                        push_str_checked(i, &mut out, before)?;
                         chars.next();
-                        check_string_length(i, out.len())?;
                         continue;
                     }
                     '\'' => {
-                        out.push_str(after);
+                        push_str_checked(i, &mut out, after)?;
                         chars.next();
-                        check_string_length(i, out.len())?;
                         continue;
                     }
                     _ => {}

@@ -1546,7 +1546,7 @@ fn ta_native(
             let mut out = String::new();
             for k in 0..len {
                 if k > 0 {
-                    out.push_str(&sep);
+                    push_str_checked(i, &mut out, &sep)?;
                 }
                 let v = i.ta_read(&info, k);
                 if !matches!(v, Value::Undefined | Value::Null) {
