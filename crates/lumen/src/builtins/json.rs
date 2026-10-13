@@ -77,7 +77,11 @@ pub(super) fn install_json(it: &mut Interp) {
         set_data(&wrapper, "", value);
         let mut seen = Vec::new();
         match json_str(i, &Value::Obj(wrapper), "", &opts, &gap, "", &mut seen)? {
-            Some(s) => Ok(Value::lstr(s)),
+            Some(s) => {
+                // Escaping can expand a single top-level string up to sixfold.
+                check_string_length(i, s.len())?;
+                Ok(Value::lstr(s))
+            }
             None => Ok(Value::Undefined),
         }
     });
@@ -428,14 +432,18 @@ fn json_str(
                 } else {
                     i.array_length(o)
                 };
-                let mut items = Vec::with_capacity(len);
+                // Every element serializes to at least "null", so the running length check
+                // stops a huge sparse `length` long before it could be materialized.
+                let mut items = Vec::with_capacity(len.min(1024));
+                let mut total = 0usize;
                 for k in 0..len {
-                    items.push(
-                        json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)?
-                            .unwrap_or_else(|| "null".to_string()),
-                    );
+                    let item = json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)?
+                        .unwrap_or_else(|| "null".to_string());
+                    total += item.len() + 1;
+                    check_string_length(i, total)?;
+                    items.push(item);
                 }
-                join_json("[", "]", items, gap, &new_indent, indent)
+                join_json(i, "[", "]", items, gap, &new_indent, indent)?
             } else {
                 // An array replacer restricts the keys (in its order); else all enumerable keys.
                 let keys: Vec<String> = match &opts.keys {
@@ -470,16 +478,19 @@ fn json_str(
                     }
                 };
                 let mut parts = Vec::new();
+                let mut total = 0usize;
                 for k in &keys {
                     if let Some(vs) = json_str(i, &value, k, opts, gap, &new_indent, seen)? {
                         let colon = if gap.is_empty() { ":" } else { ": " };
                         let mut member = json_quote(k);
                         member.push_str(colon);
                         member.push_str(&vs);
+                        total += member.len() + 1;
+                        check_string_length(i, total)?;
                         parts.push(member);
                     }
                 }
-                join_json("{", "}", parts, gap, &new_indent, indent)
+                join_json(i, "{", "}", parts, gap, &new_indent, indent)?
             };
             seen.pop();
             Ok(Some(result))
@@ -488,31 +499,38 @@ fn json_str(
 }
 
 fn join_json(
+    i: &mut Interp,
     open: &str,
     close: &str,
     parts: Vec<String>,
     gap: &str,
     inner: &str,
     outer: &str,
-) -> String {
+) -> Result<String, Value> {
     // JSON.stringify's array/object assembly is a deterministic concatenation (ECMA-262
     // §25.5.2.5). Stream the already-serialized members into one buffer instead of joining them
     // into a temporary string and formatting a second copy.
     let separators = if gap.is_empty() {
         parts.len().saturating_sub(1)
     } else {
-        parts.len().saturating_sub(1) * (2 + inner.len()) + 2 + inner.len() + outer.len()
+        parts
+            .len()
+            .saturating_sub(1)
+            .saturating_mul(2 + inner.len())
+            .saturating_add(2 + inner.len() + outer.len())
     };
     let capacity = open
         .len()
         .saturating_add(close.len())
         .saturating_add(parts.iter().map(String::len).sum::<usize>())
         .saturating_add(separators);
+    // Indentation repeats on every line, so a gap can multiply the members' own length.
+    check_string_length(i, capacity)?;
     let mut out = String::with_capacity(capacity);
     out.push_str(open);
     if parts.is_empty() {
         out.push_str(close);
-        return out;
+        return Ok(out);
     }
     if gap.is_empty() {
         for (index, part) in parts.iter().enumerate() {
@@ -535,7 +553,7 @@ fn join_json(
         out.push_str(outer);
     }
     out.push_str(close);
-    out
+    Ok(out)
 }
 
 #[derive(Clone, Copy)]

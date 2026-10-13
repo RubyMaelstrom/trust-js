@@ -3929,6 +3929,10 @@ pub const MAX_BUFFER_BYTES: usize = 1 << 28; // 256 MiB
                                              // Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
                                              // string growth still dies as a RangeError rather than an OOM.
 pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
+// Builders check MAX_STR_LEN as they accumulate. A few (escaping, case mapping, normalization)
+// only bound their result by a fixed expansion of an input that is within the limit (at most
+// 12x, for NFKD); keep that headroom below what an engine string can represent.
+const _: () = assert!(MAX_STR_LEN * 16 <= crate::lstr::MAX_LEN);
 
 #[derive(Clone)]
 pub(crate) struct HostSettingsState {

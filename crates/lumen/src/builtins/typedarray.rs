@@ -1536,6 +1536,7 @@ fn ta_native(
                 if !matches!(v, Value::Undefined | Value::Null) {
                     out.push_str(&ab(i.to_string(&v))?);
                 }
+                check_string_length(i, out.len())?;
             }
             Ok(Value::lstr(out))
         })()),
@@ -2113,6 +2114,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
             }
             let s = ab(i.call(tls, v, &[arg(a, 0), arg(a, 1)]))?;
             out.push_str(&ab(i.to_string(&s))?);
+            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });

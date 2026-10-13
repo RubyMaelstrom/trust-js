@@ -15859,6 +15859,59 @@ fn string_padding_ascii_fast_path_preserves_unit_truncation() {
     assert_eq!(run("'😀'.padStart(3, 'x')"), "x😀");
 }
 
+/// Builders whose result length author code controls throw V8's RangeError instead of
+/// materializing a string an engine string cannot hold (a Rust panic, which aborts the page).
+/// Every case also exceeds V8's own limit, so node throws the same RangeError.
+#[test]
+fn oversized_string_builders_throw_range_errors() {
+    let cases = [
+        "''.padEnd(2 ** 31, 'ab')",
+        "''.padStart(2 ** 32 + 5)",
+        "'x'.padStart(2 ** 30, '\\ud83d')",
+        "'\\u00e9'.padEnd(2 ** 31, '\\u00e9')",
+        "Array(17).fill('x'.repeat(2 ** 25)).join('')",
+        "new Array(2 ** 20).join('x'.repeat(2 ** 10))",
+        "String(Array(17).fill('x'.repeat(2 ** 25)))",
+        "'x'.repeat(2 ** 20).replaceAll('x', 'y'.repeat(2 ** 10))",
+        "'x'.repeat(2 ** 16).replaceAll('x', () => 'y'.repeat(2 ** 14))",
+        "'\\u00e9'.repeat(2 ** 16).replaceAll('\\u00e9', 'y'.repeat(2 ** 14))",
+        "('a'.repeat(2 ** 20) + 'z').replace('z', '$`'.repeat(600))",
+        "String.raw({ raw: Array(17).fill('x'.repeat(2 ** 25)) })",
+        "new Uint8Array(2 ** 20).join('x'.repeat(2 ** 10))",
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        for case in cases {
+            let source = format!(
+                "(function () {{ try {{ return 'ok ' + ({case}).length; }} \
+                 catch (e) {{ return e.name + ': ' + e.message; }} }})()"
+            );
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "RangeError: Invalid string length",
+                "{tier:?}: {case}"
+            );
+        }
+    }
+    // Quoting is per byte, so the JSON case runs once rather than per tier.
+    assert_eq!(
+        throws("JSON.stringify(Array(17).fill('x'.repeat(2 ** 25)))"),
+        "RangeError"
+    );
+    // A formatted list contains every element. (V8 reports an ICU error here instead.)
+    #[cfg(feature = "intl")]
+    assert_eq!(
+        throws("new Intl.ListFormat().format(Array(17).fill('x'.repeat(2 ** 25)))"),
+        "RangeError"
+    );
+}
+
 #[test]
 fn string_replace_substitution() {
     assert_eq!(run("'abc'.replace('b', '[$`]')"), "a[a]c");

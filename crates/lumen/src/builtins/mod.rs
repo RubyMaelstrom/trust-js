@@ -70,6 +70,16 @@ fn arg_to_number(i: &mut Interp, args: &[Value], idx: usize) -> Result<f64, Valu
     }
 }
 
+/// The RangeError for a string result longer than the engine's [`MAX_STR_LEN`] bytes (V8's
+/// message). Builders check while they accumulate, so an oversized result is never materialized:
+/// an engine string cannot hold 2 GiB, and building one first would exhaust memory.
+pub(crate) fn check_string_length(i: &mut Interp, len: usize) -> Result<(), Value> {
+    if len > MAX_STR_LEN {
+        return Err(i.make_error("RangeError", "Invalid string length"));
+    }
+    Ok(())
+}
+
 /// Map an `Abrupt` (which, from inside a native function, can only be a `Throw`) to its value so it
 /// fits the native `Result<_, Value>` contract.
 fn ab<T>(r: Result<T, Abrupt>) -> Result<T, Value> {
@@ -6114,6 +6124,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if !matches!(v, Value::Undefined | Value::Null) {
                 out.push_str(&ab(i.to_string(&v))?);
             }
+            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
@@ -6247,6 +6258,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 let s = ab(i.call(tls, el, &[arg(args, 0), arg(args, 1)]))?;
                 out.push_str(&ab(i.to_string(&s))?);
             }
+            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });
@@ -8636,6 +8648,10 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
                 }
             }
         }
+        if let Err(error) = check_string_length(i, result.len()) {
+            i.iterator_close(&this);
+            return Err(error);
+        }
     }
     Ok(Value::lstr(
         crate::jstr::canonicalize(&result).unwrap_or(result),
@@ -10488,6 +10504,7 @@ pub(crate) fn nf_string_replace(
         };
         let matched = &s[pos..pos + pat.len()];
         let rep = string_replacement(i, &repl, matched, &s, pos)?;
+        check_string_length(i, s.len() - pat.len() + rep.len())?;
         return Ok(Value::lstr(format!(
             "{}{}{}",
             &s[..pos],
@@ -10516,6 +10533,7 @@ pub(crate) fn nf_string_replace(
     let matched = crate::jstr::from_units(&source_units[pos..end]);
     let after = crate::jstr::from_units(&source_units[end..]);
     let rep = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
+    check_string_length(i, before.len() + rep.len() + after.len())?;
     let joined = crate::jstr::concat(&crate::jstr::concat(&before, &rep), &after);
     Ok(Value::lstr(
         crate::jstr::canonicalize(&joined).unwrap_or(joined),
@@ -11433,6 +11451,7 @@ fn install_string(it: &mut Interp) {
                     out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
                     out.push(ch);
                     byte += ch.len_utf8();
+                    check_string_length(i, out.len())?;
                 }
                 out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
                 return Ok(Value::lstr(out));
@@ -11457,6 +11476,7 @@ fn install_string(it: &mut Interp) {
                 if let Some(&unit) = units.get(pos) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
+                check_string_length(i, out.len())?;
             }
             return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
         }
@@ -11468,9 +11488,10 @@ fn install_string(it: &mut Interp) {
             };
             if let Repl::Text(template) = &repl {
                 if !template.as_bytes().contains(&b'$') {
-                    return Ok(Value::lstr(replace_all_ascii_literal(
-                        &s, &pat, template, first,
-                    )));
+                    let Some(out) = replace_all_ascii_literal(&s, &pat, template, first) else {
+                        return Err(i.make_error("RangeError", "Invalid string length"));
+                    };
+                    return Ok(Value::lstr(out));
                 }
             }
             let mut out = String::with_capacity(s.len());
@@ -11479,12 +11500,14 @@ fn install_string(it: &mut Interp) {
             let mut rest = &s[first + pat.len()..];
             let mut base = first + pat.len();
             while let Some(pos) = rest.find(pat.as_ref()) {
+                check_string_length(i, out.len())?;
                 out.push_str(&rest[..pos]);
                 let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
                 out.push_str(&rep);
                 rest = &rest[pos + pat.len()..];
                 base += pos + pat.len();
             }
+            check_string_length(i, out.len() + rest.len())?;
             out.push_str(rest);
             return Ok(Value::lstr(out));
         }
@@ -11522,6 +11545,7 @@ fn install_string(it: &mut Interp) {
             out.push_str(&string_replacement_parts(
                 i, &repl, &matched, &s, pos, &before, &after,
             )?);
+            check_string_length(i, out.len())?;
             cursor = pos + pattern_len;
             let Some(next) = source_units[cursor..]
                 .windows(pattern_len)
@@ -11532,6 +11556,7 @@ fn install_string(it: &mut Interp) {
             pos = cursor + next;
         }
         out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
+        check_string_length(i, out.len())?;
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
 
@@ -11571,6 +11596,7 @@ fn install_string(it: &mut Interp) {
                     out.push_str(&ab(i.to_string(sub))?);
                 }
             }
+            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });
@@ -11745,6 +11771,9 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     if pad.is_empty() {
         return Ok(Value::Str(s));
     }
+    // The result has `target` UTF-16 units, so at least that many bytes: reject an oversized
+    // padding before building any of it.
+    check_string_length(i, target)?;
     let s = s.as_str();
     let need = target - cur;
     if s.is_ascii() && pad.is_ascii() {
@@ -11759,6 +11788,7 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
     let fill = crate::jstr::from_units(&fill_units);
+    check_string_length(i, s.len() + fill.len())?;
     Ok(Value::lstr(if at_start {
         format!("{fill}{s}")
     } else {
@@ -11809,23 +11839,27 @@ fn replacement_needs_context(repl: &Repl) -> bool {
 /// Fast literal replacement for an ASCII `replaceAll`. With no `$` marker, GetSubstitution is
 /// exactly the replacement text, so avoid reparsing the template and constructing a temporary
 /// `String` for every match (ECMA-262 §22.1.3.20.15.3–4).
+/// `None` when the result would exceed [`MAX_STR_LEN`].
 fn replace_all_ascii_literal(
     source: &crate::lstr::LStr,
     pattern: &crate::lstr::LStr,
     replacement: &str,
     first: usize,
-) -> String {
+) -> Option<String> {
     let mut out = String::with_capacity(source.len());
     out.push_str(&source[..first]);
     out.push_str(replacement);
     let mut rest = &source[first + pattern.len()..];
     while let Some(pos) = rest.find(pattern.as_ref()) {
+        if out.len() > MAX_STR_LEN {
+            return None;
+        }
         out.push_str(&rest[..pos]);
         out.push_str(replacement);
         rest = &rest[pos + pattern.len()..];
     }
     out.push_str(rest);
-    out
+    (out.len() <= MAX_STR_LEN).then_some(out)
 }
 
 #[inline(always)]
@@ -11903,16 +11937,19 @@ fn string_replacement_parts(
                     '&' => {
                         out.push_str(matched);
                         chars.next();
+                        check_string_length(i, out.len())?;
                         continue;
                     }
                     '`' => {
                         out.push_str(before);
                         chars.next();
+                        check_string_length(i, out.len())?;
                         continue;
                     }
                     '\'' => {
                         out.push_str(after);
                         chars.next();
+                        check_string_length(i, out.len())?;
                         continue;
                     }
                     _ => {}
