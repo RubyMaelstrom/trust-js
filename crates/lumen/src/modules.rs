@@ -362,7 +362,8 @@ impl Interp {
         let top = self.module_recs[&key].top_promise.clone().unwrap();
         let mut stack = Vec::new();
         self.inner_module_evaluation_async(&key, &mut stack, &mut 0);
-        self.run_agent_event_loop().map_err(Abrupt::Interrupt)?;
+        self.drain_microtasks_interruptible()
+            .map_err(Abrupt::Interrupt)?;
         if let Value::Obj(o) = &top {
             if let Some(ps) = self.promises.get(&(Rc::as_ptr(o) as usize)) {
                 if ps.status == 2 {

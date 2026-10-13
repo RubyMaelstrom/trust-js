@@ -17827,22 +17827,20 @@ out.join(',')"#;
 #[test]
 fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
     use crate::interpreter::{
-        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, Waiter,
+        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, BlockedAgent, Waiter,
     };
     use std::time::Duration;
     let id = alloc_shared_mem(8);
-    let taken = Waiter::default();
-    with_waiter_list(id, 0, |list| list.push(taken.clone()));
+    let taken = BlockedAgent::default();
+    with_waiter_list(id, 0, |list| list.push(Waiter::Blocked(taken.clone())));
     // A notify's removal, before it sets the waiter's flag.
-    with_waiter_list(id, 0, |list| {
-        list.retain(|waiter| !std::sync::Arc::ptr_eq(waiter, &taken))
-    });
+    with_waiter_list(id, 0, |list| list.clear());
     assert!(futex_block(&taken, id, 0, Some(Duration::ZERO)));
-    let listed = Waiter::default();
-    with_waiter_list(id, 4, |list| list.push(listed.clone()));
+    let listed = BlockedAgent::default();
+    with_waiter_list(id, 4, |list| list.push(Waiter::Blocked(listed.clone())));
     assert!(!futex_block(&listed, id, 4, Some(Duration::ZERO)));
     // It left its list, so a later notify finds no waiter there.
-    assert_eq!(futex_notify(id, 4, -1), 0);
+    assert_eq!(futex_notify(id, 4, -1, None).0, 0);
 }
 
 #[test]
@@ -26143,6 +26141,78 @@ fn atomics_waitasync_sees_same_job_notify() {
         crate::Completion::Value(v) => assert_eq!(v, "v:ok"),
         crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
     }
+}
+
+/// An `Atomics.waitAsync` promise settles through the agent's job queue (ECMA-262
+/// EnqueueAtomicsWaitAsyncTimeoutJob, NotifyWaiter): evaluation never blocks for a pending wait
+/// (each script with one used to take four seconds), a timeout resolves at a job checkpoint
+/// after it passes, even one a microtask loop keeps running, and a later script's notify still
+/// resolves an earlier script's promise, which used to be dropped.
+#[test]
+fn atomics_wait_async_settles_through_the_job_queue() {
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let started = std::time::Instant::now();
+        run_in(
+            &mut engine,
+            "var out = [];
+             var i32 = new Int32Array(new SharedArrayBuffer(16));
+             Atomics.waitAsync(i32, 0, 0).value.then(v => out.push('later:' + v));
+             Atomics.waitAsync(i32, 1, 0, 60000).value.then(v => out.push('long:' + v));
+             var spun = 0;
+             Atomics.waitAsync(i32, 2, 0, 0.5).value.then(v => out.push('short:' + v));
+             (function spin() { if (out.length === 0) { spun++; Promise.resolve().then(spin); } })();",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "tier {tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "out.join() + ',' + (spun > 0)"),
+            "short:timed-out,true",
+            "tier {tier:?}"
+        );
+        run_in(
+            &mut engine,
+            "Atomics.notify(i32, 0); Atomics.notify(i32, 1);",
+        );
+        assert_eq!(
+            run_in(&mut engine, "out.join()"),
+            "short:timed-out,later:ok,long:ok",
+            "tier {tier:?}"
+        );
+        assert!(
+            engine.interp.pending_async_waits.is_empty(),
+            "tier {tier:?}"
+        );
+    }
+}
+
+/// A notification from another agent reaches a waitAsync waiter through its agent's inbox
+/// (EnqueueResolveInAgentJob), which the host's event loop blocks on.
+#[test]
+fn atomics_wait_async_receives_another_agents_notify() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var out = 'pending';
+         var i32 = new Int32Array(new SharedArrayBuffer(8));
+         Atomics.waitAsync(i32, 0, 0).value.then(v => { out = v; });
+         $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {
+             var a = new Int32Array(sab);
+             $262.agent.report(Atomics.notify(a, 0));
+             $262.agent.leaving();
+         })`);
+         $262.agent.broadcast(i32.buffer);",
+    );
+    engine.run_agent_event_loop().expect("not interrupted");
+    assert_eq!(
+        run_in(&mut engine, "out + ',' + $262.agent.getReport()"),
+        "ok,1"
+    );
 }
 
 #[test]

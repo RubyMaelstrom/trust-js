@@ -2061,7 +2061,13 @@ fn scan_realm(
         interp
             .pending_async_waits
             .capacity()
-            .saturating_mul(size_of::<(Value, std::sync::mpsc::Receiver<&'static str>)>())
+            .saturating_mul(size_of::<crate::interpreter::AsyncWait>())
+            .saturating_add(
+                interp
+                    .async_wait_inbox
+                    .as_ref()
+                    .map_or(0, |_| size_of::<crate::interpreter::AsyncWaitInbox>()),
+            )
             .saturating_add(
                 interp
                     .pending_timers
@@ -2069,8 +2075,8 @@ fn scan_realm(
                     .saturating_mul(size_of::<(Value, std::time::Instant)>()),
             ),
     );
-    for (promise, _) in &interp.pending_async_waits {
-        visitor.value(promise);
+    for wait in &interp.pending_async_waits {
+        visitor.value(&wait.promise);
     }
     for (callback, _) in &interp.pending_timers {
         visitor.value(callback);
@@ -2085,7 +2091,7 @@ fn scan_realm(
             ),
         );
     }
-    if !interp.pending_async_waits.is_empty() || interp.agent.is_some() {
+    if interp.async_wait_inbox.is_some() || interp.agent.is_some() {
         totals.interpreter_side_tables.make_lower_bound(
             "standard-library channel backing and queued message storage are opaque",
         );
@@ -3630,12 +3636,18 @@ mod tests {
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
 
-        let (_wait_tx, wait_rx) = std::sync::mpsc::channel();
         engine.interp.pending_async_waits.reserve(3);
         engine
             .interp
             .pending_async_waits
-            .push((Value::lstr("wait promise payload"), wait_rx));
+            .push(crate::interpreter::AsyncWait {
+                promise: Value::lstr("wait promise payload"),
+                token: 0,
+                id: 0,
+                index: 0,
+                deadline: None,
+            });
+        engine.interp.async_wait_inbox = Some(Default::default());
         engine.interp.pending_timers.reserve(4);
         engine.interp.pending_timers.push((
             Value::lstr("timer callback payload"),

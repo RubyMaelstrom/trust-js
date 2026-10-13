@@ -1281,7 +1281,11 @@ fn caught_module_evaluation_error_reports_no_rejection() {
         "#,
     )
     .unwrap();
-    fs::write(root.join("mid.mjs"), "import './dep.mjs'; export const x = 1;").unwrap();
+    fs::write(
+        root.join("mid.mjs"),
+        "import './dep.mjs'; export const x = 1;",
+    )
+    .unwrap();
     fs::write(root.join("dep.mjs"), "throw new TypeError('boom');").unwrap();
     let (mut rt, out, err) = test_runtime();
     rt.run_module(&root.join("main.mjs").to_string_lossy())

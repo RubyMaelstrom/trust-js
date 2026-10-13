@@ -854,6 +854,8 @@ fn check_async(preamble: &str, src: &str, strict: bool, fm: &Frontmatter, path: 
         }
         Ok(Completion::Value(_)) => {}
     }
+    // As the agent's host, run its jobs until no Atomics.waitAsync or $262.agent timer is left.
+    let _ = engine.run_agent_event_loop();
     let console = engine.take_console();
     if console.iter().any(|l| l == "Test262:AsyncTestComplete") {
         Outcome::Pass
@@ -933,6 +935,7 @@ fn run_module(path: &Path, src: &str, harness: &Harness, fm: &Frontmatter) -> Ou
             }
             Ok(Completion::Value(_)) => {}
         }
+        let _ = engine.run_agent_event_loop();
         let console = engine.take_console();
         if console.iter().any(|l| l == "Test262:AsyncTestComplete") {
             return Outcome::Pass;

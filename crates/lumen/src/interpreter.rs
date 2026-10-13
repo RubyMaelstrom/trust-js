@@ -794,7 +794,6 @@ pub fn monotonic_now_ms() -> f64 {
 /// EnterCriticalSection): DoWait compares the element and adds its waiter inside it, and notify
 /// removes waiters inside it, so a notify can never fall between the comparison and the enqueue.
 /// Each waiter has its own wake handle so `notify` can wake an exact count.
-pub type Waiter = Arc<(Mutex<bool>, Condvar)>;
 fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
@@ -809,16 +808,92 @@ pub fn with_waiter_list<R>(id: u64, index: usize, f: impl FnOnce(&mut Vec<Waiter
     }
     result
 }
-/// Block on a waiter in the list of `(id, index)` until a notify wakes it or `timeout` elapses;
-/// `true` when notified. A timed-out waiter leaves its list in the critical section, unless a
-/// notify removed it first: that notify counted it as woken, so the wait reports "ok" too.
+/// A Waiter Record of a WaiterList.
+#[derive(Clone)]
+pub enum Waiter {
+    /// An agent suspended in `Atomics.wait`.
+    Blocked(BlockedAgent),
+    /// An `Atomics.waitAsync` promise: the token names it among the pending waits of the agent
+    /// that receives its notification from other agents through the inbox.
+    Async(Arc<AsyncWaitInbox>, u64),
+}
+/// The wake handle of an agent suspended in `Atomics.wait`: whether a notify woke it.
+pub type BlockedAgent = Arc<(Mutex<bool>, Condvar)>;
+
+/// The notifications of an agent's `Atomics.waitAsync` waiters that other agents delivered
+/// (ECMA-262 EnqueueResolveInAgentJob), kept until that agent's next job checkpoint resolves
+/// their promises.
+#[derive(Default)]
+pub struct AsyncWaitInbox {
+    notified: Mutex<Vec<u64>>,
+    arrived: Condvar,
+}
+
+impl AsyncWaitInbox {
+    fn deliver(&self, token: u64) {
+        self.notified.lock().unwrap().push(token);
+        self.arrived.notify_all();
+    }
+    /// The tokens delivered since the last call.
+    pub(crate) fn take(&self) -> Vec<u64> {
+        std::mem::take(&mut self.notified.lock().unwrap())
+    }
+    #[cfg(feature = "embed")]
+    pub(crate) fn has_notifications(&self) -> bool {
+        !self.notified.lock().unwrap().is_empty()
+    }
+    /// Block until a notification arrives or `deadline` passes.
+    pub(crate) fn wait_until(&self, deadline: std::time::Instant) {
+        let notified = self.notified.lock().unwrap();
+        let now = std::time::Instant::now();
+        if notified.is_empty() && deadline > now {
+            drop(self.arrived.wait_timeout(notified, deadline - now).unwrap());
+        }
+    }
+}
+
+/// An `Atomics.waitAsync` that went async (ECMA-262 DoWait): its promise, and the Waiter Record
+/// it keeps in the list of `(id, index)` until a notify or its timeout.
+pub(crate) struct AsyncWait {
+    pub(crate) promise: Value,
+    pub(crate) token: u64,
+    pub(crate) id: u64,
+    pub(crate) index: usize,
+    /// When its timeout job runs (EnqueueAtomicsWaitAsyncTimeoutJob); `None` never times out.
+    pub(crate) deadline: Option<std::time::Instant>,
+}
+
+/// A token for a new `Atomics.waitAsync` waiter, unique in the process.
+pub(crate) fn next_async_wait_token() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Take async waiter `token` from the list of `(id, index)` for its timeout; `false` when a
+/// notify already took it.
+pub(crate) fn futex_remove_async(id: u64, index: usize, token: u64) -> bool {
+    with_waiter_list(id, index, |list| {
+        let Some(at) = list
+            .iter()
+            .position(|w| matches!(w, Waiter::Async(_, t) if *t == token))
+        else {
+            return false;
+        };
+        list.remove(at);
+        true
+    })
+}
+
+/// Block an agent waiting in the list of `(id, index)` until a notify wakes it or `timeout`
+/// elapses; `true` when notified. A timed-out waiter leaves its list in the critical section,
+/// unless a notify removed it first: that notify counted it as woken, so it reports "ok" too.
 pub fn futex_block(
-    waiter: &Waiter,
+    agent: &BlockedAgent,
     id: u64,
     index: usize,
     timeout: Option<std::time::Duration>,
 ) -> bool {
-    let (lock, cvar) = &**waiter;
+    let (lock, cvar) = &**agent;
     // A timeout too far away to represent never elapses.
     let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
     let mut woken = lock.lock().unwrap();
@@ -839,16 +914,27 @@ pub fn futex_block(
     }
     drop(woken);
     with_waiter_list(id, index, |list| {
-        let Some(at) = list.iter().position(|w| Arc::ptr_eq(w, waiter)) else {
+        let Some(at) = list
+            .iter()
+            .position(|w| matches!(w, Waiter::Blocked(b) if Arc::ptr_eq(b, agent)))
+        else {
             return true;
         };
         list.remove(at);
         false
     })
 }
-/// Wake up to `max` (`<0` ⇒ all) waiters on `(id, index)` in list order, returning how many.
-pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
-    let to_wake: Vec<Waiter> = with_waiter_list(id, index, |list| {
+/// Atomics.notify: take up to `max` (`<0` ⇒ all) waiters of `(id, index)` in list order and
+/// notify each (ECMA-262 NotifyWaiter): wake a blocked agent, or deliver an async waiter's token
+/// to its agent's inbox — except the calling agent's own (inbox `own`), whose tokens are
+/// returned for the caller to resolve at once. Returns the count and those tokens.
+pub fn futex_notify(
+    id: u64,
+    index: usize,
+    max: i64,
+    own: Option<&Arc<AsyncWaitInbox>>,
+) -> (u64, Vec<u64>) {
+    let taken: Vec<Waiter> = with_waiter_list(id, index, |list| {
         let n = if max < 0 {
             list.len()
         } else {
@@ -856,13 +942,21 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
         };
         list.drain(..n).collect()
     });
-    let count = to_wake.len() as u64;
-    for w in to_wake {
-        let (lock, cvar) = &*w;
-        *lock.lock().unwrap() = true;
-        cvar.notify_all();
+    let mut own_tokens = Vec::new();
+    for waiter in &taken {
+        match waiter {
+            Waiter::Blocked(agent) => {
+                let (lock, cvar) = &**agent;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
+            Waiter::Async(inbox, token) if own.is_some_and(|own| Arc::ptr_eq(own, inbox)) => {
+                own_tokens.push(*token);
+            }
+            Waiter::Async(inbox, token) => inbox.deliver(*token),
+        }
     }
-    count
+    (taken.len() as u64, own_tokens)
 }
 
 pub type Env = Rc<RefCell<Scope>>;
@@ -3075,9 +3169,11 @@ pub struct Interp {
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
-    /// Pending `Atomics.waitAsync` operations: each carries the result promise and a channel that a
-    /// waiter thread sends "ok"/"timed-out" on. The event loop resolves them as they complete.
-    pub(crate) pending_async_waits: Vec<(Value, std::sync::mpsc::Receiver<&'static str>)>,
+    /// This agent's `Atomics.waitAsync` waiters still in a WaiterList, oldest first. Job
+    /// checkpoints resolve their promises once notified or timed out (`settle_async_waits`).
+    pub(crate) pending_async_waits: Vec<AsyncWait>,
+    /// Where other agents deliver notifications of those waiters (made on first use).
+    pub(crate) async_wait_inbox: Option<Arc<AsyncWaitInbox>>,
     /// Host timers from `$262.agent.setTimeout`: (callback, deadline).
     pub(crate) pending_timers: Vec<(Value, std::time::Instant)>,
     /// Agent-harness wiring (present only in spawned agents / a main with agents).
@@ -3411,6 +3507,7 @@ interp_memory_inventory! {
     host_keyed_buffers => "measured",
     can_block => "non_owning",
     pending_async_waits => "measured",
+    async_wait_inbox => "measured",
     pending_timers => "measured",
     agent => "measured",
     typed_arrays => "measured",
@@ -3504,7 +3601,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 162);
+    assert_eq!(names.len(), 163);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4698,6 +4795,7 @@ impl Interp {
             host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
             pending_async_waits: Vec::new(),
+            async_wait_inbox: None,
             pending_timers: Vec::new(),
             agent: None,
             typed_arrays: Default::default(),

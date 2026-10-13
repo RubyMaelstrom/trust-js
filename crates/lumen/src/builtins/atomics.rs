@@ -1,9 +1,11 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use crate::interpreter::{AsyncWait, BlockedAgent, Waiter};
+use std::time::Duration;
 
-/// `Atomics` over integer TypedArrays. lumen is single-threaded, so the read-modify-write ops are
-/// plain operations; `wait`/`notify` are no-ops.
+/// `Atomics` over integer TypedArrays. A shared buffer's read-modify-write operations hold its
+/// Shared Data Block's lock; `wait`/`waitAsync`/`notify` use the process-wide WaiterLists.
 pub(super) fn install_atomics(it: &mut Interp) {
     let atomics = Object::new(Some(it.object_proto.clone()));
 
@@ -82,27 +84,32 @@ pub(super) fn install_atomics(it: &mut Interp) {
     }
     /// DoWait from EnterCriticalSection through AddWaiter (ECMA-262 #sec-dowait): inside the
     /// critical section of the element's WaiterList, read the element and, when it equals
-    /// `expected`, add a new waiter. Otherwise the synchronous result: "not-equal", or
-    /// "timed-out" for a `waitAsync` whose timeout is zero (`timeout_now`), which adds none.
+    /// `expected`, add `waiter`. Otherwise the synchronous result: "not-equal", or "timed-out"
+    /// for a `waitAsync` whose timeout is zero, which adds no waiter (`None`).
     fn enqueue_waiter(
         info: &TaInfo,
-        idx: usize,
+        byte_index: usize,
         id: u64,
         expected: i128,
-        timeout_now: bool,
-    ) -> Result<(usize, crate::interpreter::Waiter), &'static str> {
-        let byte_index = info.offset + idx * info.kind.elsize();
+        waiter: Option<Waiter>,
+    ) -> Result<(), &'static str> {
         let block = crate::interpreter::shared_mem_get(id).ok_or("not-equal")?;
         crate::interpreter::with_waiter_list(id, byte_index, |list| {
             if element_value(info.kind, &block.lock().unwrap(), byte_index) != Some(expected) {
                 return Err("not-equal");
             }
-            if timeout_now {
-                return Err("timed-out");
-            }
-            let waiter = crate::interpreter::Waiter::default();
-            list.push(waiter.clone());
-            Ok((byte_index, waiter))
+            list.push(waiter.ok_or("timed-out")?);
+            Ok(())
+        })
+    }
+    /// DoWait's realTimeout from ToNumber(timeout): NaN is +∞, and a negative value 0. `None`
+    /// is +∞, as is a finite timeout too long to represent.
+    fn wait_timeout(i: &mut Interp, timeout: &Value) -> Result<Option<Duration>, Value> {
+        let q = ab(i.to_number(timeout))?;
+        Ok(if q.is_nan() {
+            None
+        } else {
+            Duration::try_from_secs_f64(q.max(0.0) / 1000.0).ok()
         })
     }
     fn write_i128(i: &mut Interp, info: &TaInfo, idx: usize, n: i128) {
@@ -217,13 +224,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         };
         let (info, idx) = target(i, a)?;
         let expected = wait_operand(i, &info, &arg(a, 2))?;
-        // timeout: ToNumber (NaN → +Infinity), clamped at 0.
-        let q = ab(i.to_number(&arg(a, 3)))?;
-        let timeout = if q.is_nan() || q == f64::INFINITY {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(q.max(0.0) as u64))
-        };
+        let timeout = wait_timeout(i, &arg(a, 3))?;
         // Only an agent with [[CanBlock]] may suspend (the main agent cannot).
         if !i.can_block {
             return Err(i.make_error(
@@ -231,11 +232,13 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 "Atomics.wait: the calling agent cannot be suspended",
             ));
         }
-        let (byte_index, waiter) = match enqueue_waiter(&info, idx, id, expected, false) {
-            Ok(enqueued) => enqueued,
-            Err(result) => return Ok(Value::lstr(result)),
-        };
-        let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
+        let byte_index = info.offset + idx * info.kind.elsize();
+        let agent = BlockedAgent::default();
+        let waiter = Waiter::Blocked(agent.clone());
+        if let Err(result) = enqueue_waiter(&info, byte_index, id, expected, Some(waiter)) {
+            return Ok(Value::lstr(result));
+        }
+        let woken = crate::interpreter::futex_block(&agent, id, byte_index, timeout);
         Ok(Value::lstr(if woken { "ok" } else { "timed-out" }))
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
@@ -259,9 +262,14 @@ pub(super) fn install_atomics(it: &mut Interp) {
         match i.shared_buffers.get(&info.buffer) {
             Some(&id) => {
                 let byte_index = info.offset + idx * info.kind.elsize();
-                Ok(Value::Num(
-                    crate::interpreter::futex_notify(id, byte_index, count) as f64,
-                ))
+                let own = i.async_wait_inbox.clone();
+                let (woken, own_tokens) =
+                    crate::interpreter::futex_notify(id, byte_index, count, own.as_ref());
+                // NotifyWaiter resolves this agent's own waitAsync promises at once.
+                for token in own_tokens {
+                    i.resolve_async_wait(token, "ok");
+                }
+                Ok(Value::Num(woken as f64))
             }
             None => Ok(Value::Num(0.0)),
         }
@@ -280,34 +288,33 @@ pub(super) fn install_atomics(it: &mut Interp) {
         };
         let (info, idx) = target(i, a)?;
         let expected = wait_operand(i, &info, &arg(a, 2))?;
-        // timeout: ToNumber (NaN → +Infinity); None means "no timeout".
-        let q = ab(i.to_number(&arg(a, 3)))?;
-        let timeout = if q.is_nan() || q == f64::INFINITY {
-            None
-        } else {
-            Some(std::time::Duration::from_millis(q.max(0.0) as u64))
-        };
+        let timeout = wait_timeout(i, &arg(a, 3))?;
         let result = i.new_object();
         // A value that already differs, or a zero timeout, resolves synchronously (not async).
-        let zero = matches!(timeout, Some(d) if d.is_zero());
-        let (byte_index, waiter) = match enqueue_waiter(&info, idx, id, expected, zero) {
-            Ok(enqueued) => enqueued,
-            Err(value) => {
-                set_data(&result, "async", Value::Bool(false));
-                set_data(&result, "value", Value::lstr(value));
-                return Ok(Value::Obj(result));
-            }
-        };
-        // Otherwise wait asynchronously: a waiter thread reports the outcome, which the event loop
-        // uses to resolve the returned promise. The waiter joined the list synchronously, so a
-        // notify later in this same job sees it.
-        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
-        std::thread::spawn(move || {
-            let woken = crate::interpreter::futex_block(&waiter, id, byte_index, timeout);
-            let _ = tx.send(if woken { "ok" } else { "timed-out" });
-        });
+        let byte_index = info.offset + idx * info.kind.elsize();
+        let token = crate::interpreter::next_async_wait_token();
+        let inbox = i
+            .async_wait_inbox
+            .get_or_insert_with(Default::default)
+            .clone();
+        let waiter = (timeout != Some(Duration::ZERO)).then(|| Waiter::Async(inbox, token));
+        if let Err(value) = enqueue_waiter(&info, byte_index, id, expected, waiter) {
+            set_data(&result, "async", Value::Bool(false));
+            set_data(&result, "value", Value::lstr(value));
+            return Ok(Value::Obj(result));
+        }
+        // The waiter joined its list synchronously, so a notify later in this same job sees it.
+        // A notify resolves the promise (this agent's at once, another agent's through this
+        // agent's inbox), or this agent's job checkpoints time it out (settle_async_waits).
         let promise = i.new_promise();
-        i.pending_async_waits.push((promise.clone(), rx));
+        i.pending_async_waits.push(AsyncWait {
+            promise: promise.clone(),
+            token,
+            id,
+            index: byte_index,
+            // A timeout too far away to represent never elapses.
+            deadline: timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout)),
+        });
         set_data(&result, "async", Value::Bool(true));
         set_data(&result, "value", promise);
         Ok(Value::Obj(result))
