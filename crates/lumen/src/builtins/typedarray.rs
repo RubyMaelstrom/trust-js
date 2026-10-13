@@ -2437,23 +2437,15 @@ fn hex_decode_spec(s: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
     (index, out, false)
 }
 
-/// Read a Uint8Array receiver's bytes; errors if `this` isn't a (non-detached) Uint8Array.
+/// ValidateUint8Array, then GetUint8ArrayBytes: the bytes the view covers now (a length-tracking
+/// view follows its buffer; a SharedArrayBuffer is read from its shared Data Block). A detached
+/// buffer or a view out of bounds of a shrunk resizable buffer is a TypeError
+/// (ValidateTypedArrayBounds).
 fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
-    let ptr = map_ptr(this).ok_or_else(|| i.make_error("TypeError", "not a Uint8Array"))?;
-    let info = *i
-        .typed_arrays
-        .get(&ptr)
-        .ok_or_else(|| i.make_error("TypeError", "not a Uint8Array"))?;
-    if !matches!(info.kind, TaKind::U8) {
-        return Err(i.make_error("TypeError", "method requires a Uint8Array"));
-    }
-    let storage = i
-        .array_buffers
-        .get(&info.buffer)
-        .cloned()
-        .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
-    let buf = storage.borrow();
-    Ok(buf[info.offset..info.offset + info.len].to_vec())
+    let info = u8_validate(i, this)?;
+    i.ta_len(&info)
+        .and_then(|len| i.ta_read_bytes(&info, 0, len))
+        .ok_or_else(|| i.make_error("TypeError", "Uint8Array is detached or out of bounds"))
 }
 /// The new Uint8Array of `Uint8Array.fromBase64`/`fromHex`: AllocateTypedArray("Uint8Array",
 /// %Uint8Array%, %Uint8Array.prototype%, length) and its bytes (proposal-arraybuffer-base64).
@@ -2625,10 +2617,8 @@ fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Res
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get(&info.buffer) {
-        buf.borrow_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
-        i.mark_array_buffer_dirty_range(info.buffer, info.offset, bytes.len());
-    }
+    // The caller decoded at most the view's current length, and decoding runs no author code.
+    i.ta_write_bytes(info, 0, bytes);
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));
     set_data(&result, "written", Value::Num(bytes.len() as f64));

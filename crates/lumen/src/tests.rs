@@ -13948,6 +13948,49 @@ fn uint8_setfrom() {
         "72,105,0"
     );
 }
+
+/// GetUint8ArrayBytes and SetUint8ArrayBytes (ECMA-262 §23.2.8) read and write the viewed
+/// buffer's Data Block: a SharedArrayBuffer's shared block, a length-tracking view's current
+/// length, and ValidateTypedArrayBounds' TypeError for a view out of bounds of a shrunk
+/// resizable buffer (which used to panic). toHex/toBase64 values are Node's.
+#[test]
+fn uint8_base64_hex_use_the_live_view() {
+    use crate::bytecode::Tier;
+    let source = r#"var out = [];
+var shared = new Uint8Array(new SharedArrayBuffer(4));
+shared[0] = 1; shared[3] = 255;
+out.push(shared.toHex(), shared.toBase64());
+var r = shared.setFromHex('0a0b');
+out.push(r.read + ':' + r.written, new Uint8Array(shared.buffer).join('|'));
+r = shared.setFromBase64('AQID');
+out.push(r.read + ':' + r.written, shared.join('|'));
+var rab = new ArrayBuffer(8, {maxByteLength: 16});
+var fixed = new Uint8Array(rab, 0, 8);
+var tracking = new Uint8Array(rab, 2);
+rab.resize(4);
+for (var f of [() => fixed.toHex(), () => fixed.toBase64(), () => fixed.setFromHex('ab'),
+               () => fixed.setFromBase64('AA==')]) {
+  try { f(); out.push('no'); } catch (e) { out.push(e.name); }
+}
+new Uint8Array(rab).set([1, 2, 3, 4]);
+out.push(tracking.toHex(), tracking.toBase64());
+r = tracking.setFromHex('ffeeddcc');
+out.push(r.read + ':' + r.written, new Uint8Array(rab).join('|'));
+rab.resize(1);
+try { tracking.toHex(); out.push('no'); } catch (e) { out.push(e.name); }
+out.join(',')"#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "010000ff,AQAA/w==,4:2,10|11|0|255,4:3,1|2|3|255,TypeError,TypeError,TypeError,\
+             TypeError,0304,AwQ=,4:2,1|2|255|238,TypeError",
+            "tier {tier:?}"
+        );
+    }
+}
 #[test]
 fn float16_array() {
     // f16 round-trip correctness against known values.
