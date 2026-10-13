@@ -4218,6 +4218,31 @@ impl Default for BufferPressure {
     }
 }
 
+/// The trigger grows with the buffer data that survives a collection, whether an ArrayBuffer's
+/// own bytes or a SharedArrayBuffer's Shared Data Block. Four 40 MiB buffers are kept: the
+/// second allocation collects (one block retained, below the floor) and the fourth collects
+/// with three retained. Shared blocks used to count as empty, leaving the trigger at its floor,
+/// so programs holding large SharedArrayBuffers collected after every 64 MiB of new buffers.
+#[cfg(test)]
+#[test]
+fn buffer_gc_trigger_grows_with_retained_shared_data_blocks() {
+    for constructor in ["ArrayBuffer", "SharedArrayBuffer"] {
+        let mut engine = crate::Engine::new();
+        let source = format!(
+            "globalThis.kept = []; for (let k = 0; k < 4; k++) kept.push(new {constructor}(40 << 20)); kept.length"
+        );
+        assert!(matches!(
+            engine.eval(&source, false).expect("source parses"),
+            crate::Completion::Value(ref value) if value == "4"
+        ));
+        assert_eq!(
+            engine.interp.buffer_gc.trigger,
+            120 << 20,
+            "{constructor} survivors must raise the trigger"
+        );
+    }
+}
+
 /// Minimum pressure that triggers an end-of-task cycle collection. Larger retained heaps scale
 /// this floor, so short-lived allocation churn alone does not force a full scan every frame.
 const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
@@ -11185,12 +11210,20 @@ impl Interp {
             return;
         }
         self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
-        let retained: usize = self
+        let local: usize = self
             .array_buffers
             .values()
             .map(|block| block.try_borrow().map_or(0, |bytes| bytes.len()))
             .sum();
-        self.buffer_gc.trigger = retained.max(BUFFER_GC_TRIGGER);
+        // A surviving SharedArrayBuffer retains its Shared Data Block (its `array_buffers`
+        // entry holds no bytes). Count each block once, however many buffers alias it.
+        let blocks: crate::fasthash::FastSet<u64> = self.shared_buffers.values().copied().collect();
+        let shared: usize = blocks
+            .into_iter()
+            .filter_map(shared_mem_get)
+            .map(|block| block.lock().unwrap().len())
+            .sum();
+        self.buffer_gc.trigger = local.saturating_add(shared).max(BUFFER_GC_TRIGGER);
     }
 
     /// A data block could not be allocated: collect everything unreachable (discarded buffers
