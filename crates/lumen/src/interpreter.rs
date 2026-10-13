@@ -2820,6 +2820,9 @@ pub struct Interp {
     /// Hot-loop poll divider. Execution tiers increment this cheaply and consult the shared
     /// atomics/deadline only once per bounded batch.
     pub(crate) interrupt_poll_tick: u32,
+    /// The tree-walking evaluator's stack-gateway divider: it queries the native stack once per
+    /// eight evaluations, so at least once every eight levels of nesting (see `Interp::eval`).
+    pub(crate) ast_tick: u32,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
     /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
@@ -3362,6 +3365,7 @@ interp_memory_inventory! {
     wall_clock => "external",
     runtime_interrupt => "external",
     interrupt_poll_tick => "non_owning",
+    ast_tick => "non_owning",
     strict => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
@@ -3529,7 +3533,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 163);
+    assert_eq!(names.len(), 164);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3879,6 +3883,115 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
         }
     }
     f()
+}
+
+/// Walks over parsed source (the parser, the tree-walking evaluator, the bytecode compiler and
+/// the other AST passes) recurse once per nesting level, and the parser bounds that depth
+/// (`MAX_PARSE_DEPTH`) rather than the native stack. Each recursive gateway first checks
+/// [`ast_stack_low`] and, when it is, re-enters itself through [`with_ast_stack`], so a deep tree
+/// continues on fresh heap-allocated segments instead of overflowing whatever stack the walk
+/// started on:
+///
+/// ```ignore
+/// if crate::interpreter::ast_stack_low() {
+///     return crate::interpreter::with_ast_stack(|| self.walk(node));
+/// }
+/// ```
+///
+/// The red zone covers one level's frames (large in debug builds) plus error construction;
+/// segments are released when the level returns. The parser bounds how deep these walks go, so
+/// their segments are not counted against the execution budget (see [`with_data_stack`] for
+/// recursion over author data).
+#[cfg(not(target_arch = "wasm32"))]
+const AST_STACK_RED_ZONE: usize = 512 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const AST_STACK_SEGMENT: usize = 2 * 1024 * 1024;
+
+/// Whether an AST walk should move to a fresh stack segment before its next level.
+#[inline]
+pub(crate) fn ast_stack_low() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return stacker::remaining_stack().is_none_or(|remaining| remaining < AST_STACK_RED_ZONE);
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
+/// Run one level of an AST walk, on a fresh segment when the native stack is low.
+#[inline]
+pub(crate) fn with_ast_stack<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
+    if ast_stack_low() {
+        return stacker::grow(AST_STACK_SEGMENT, f);
+    }
+    f()
+}
+
+/// The native stack dropping a whole parsed tree may need: drop glue recurses through every
+/// nesting level without a gateway, under 100 bytes a level in release builds, up to
+/// `MAX_PARSE_DEPTH` levels. (Debug frames are larger; test threads run on large stacks.)
+#[cfg(not(target_arch = "wasm32"))]
+const AST_DROP_STACK: usize = 512 * 1024;
+
+/// Drop a parsed tree (a function body's statements) where its deepest nesting fits.
+pub(crate) fn drop_ast<T>(tree: T) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if stacker::remaining_stack().is_none_or(|remaining| remaining < AST_DROP_STACK) {
+        return stacker::grow(AST_STACK_SEGMENT, move || drop(tree));
+    }
+    drop(tree)
+}
+
+/// The deepest nesting of a native recursion over author data that wasm32, which cannot switch
+/// stacks, attempts before throwing.
+#[cfg(target_arch = "wasm32")]
+const WASM_DATA_DEPTH_GUARD: u32 = 1000;
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static DATA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run one level of a native recursion whose depth author data controls (JSON.parse and
+/// stringify, `flat`): on a fresh segment when the stack runs low, sharing the execution
+/// budget of [`with_execution_stack`], so the recursion either completes or reports exhaustion.
+/// `None` means the budget is spent and the caller throws the RangeError a JavaScript recursion
+/// would ("Maximum call stack size exceeded").
+#[inline]
+pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if stacker::remaining_stack().is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE) {
+            if EXECUTION_STACK_SEGMENTS.with(|segments| segments.get())
+                >= MAX_EXECUTION_STACK_SEGMENTS
+            {
+                return None;
+            }
+            struct SegmentGuard;
+            impl Drop for SegmentGuard {
+                fn drop(&mut self) {
+                    EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() - 1));
+                }
+            }
+            EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() + 1));
+            let _guard = SegmentGuard;
+            return Some(stacker::grow(EXECUTION_STACK_SEGMENT, f));
+        }
+        Some(f())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                DATA_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            }
+        }
+        if DATA_DEPTH.with(|depth| depth.get()) >= WASM_DATA_DEPTH_GUARD {
+            return None;
+        }
+        DATA_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _guard = DepthGuard;
+        Some(f())
+    }
 }
 
 /// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
@@ -4682,6 +4795,7 @@ impl Interp {
             wall_clock: None,
             runtime_interrupt: Default::default(),
             interrupt_poll_tick: 0,
+            ast_tick: 0,
             strict: false,
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
@@ -16263,6 +16377,9 @@ pub(crate) fn ordered_global_hoist_bindings(ops: &[HoistOp]) -> Vec<(&str, bool)
 /// var binding only when the name is not already a parameter/var binding; a `for` head does not
 /// get different instantiation semantics.
 fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| collect_hoist_stmt(stmt, out));
+    }
     match stmt {
         Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => collect_hoist_stmt(inner, out),
         Stmt::VarDecl {
@@ -16356,6 +16473,11 @@ fn collect_annexb_funcs(
     blocked: &mut Vec<String>,
     out: &mut Vec<HoistOp>,
 ) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| {
+            collect_annexb_funcs(stmt, in_block, blocked, out)
+        });
+    }
     match stmt {
         Stmt::FuncDecl(func) if in_block => {
             // Annex B.3.3 promotes only *plain* function declarations; a block-scoped

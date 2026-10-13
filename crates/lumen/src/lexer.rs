@@ -54,6 +54,9 @@ struct Lexer<'a> {
     last_close_control: bool,
     /// A postfix update ends an expression; a prefix update still expects an operand.
     last_update_postfix: bool,
+    /// Nesting of template literals inside the substitutions being copied: each level recurses
+    /// (see [`Lexer::copy_template_tail`]), so it is bounded like the parser's nesting.
+    template_depth: u32,
 }
 
 /// Tokenize `src`. A lex error is reported as a SyntaxError by the caller.
@@ -110,6 +113,7 @@ fn lex(src: &str, html_comments: bool) -> Result<Vec<Token>, LexError> {
         control_paren_stack: Vec::new(),
         last_close_control: false,
         last_update_postfix: false,
+        template_depth: 0,
     };
     let result = lx.run();
     crate::jit::perf_lex_end(perf_started, result.is_ok());
@@ -808,7 +812,14 @@ impl Lexer<'_> {
                 }
                 Some('`') => {
                     src.push('`');
-                    self.copy_template_tail(&mut src)?;
+                    if self.template_depth >= crate::parser::MAX_PARSE_DEPTH {
+                        return Err(self.err("template literals nested too deeply"));
+                    }
+                    self.template_depth += 1;
+                    let copied =
+                        crate::interpreter::with_ast_stack(|| self.copy_template_tail(&mut src));
+                    self.template_depth -= 1;
+                    copied?;
                     last_sig = Some(')');
                     newline = false;
                 }

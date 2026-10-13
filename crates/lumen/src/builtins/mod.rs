@@ -6934,16 +6934,8 @@ fn flatten_into(
                 if depth > 0 && json_is_array(i, &element)? {
                     let len_val = ab(i.get_member(&element, "length"))?;
                     let el_len = to_length_val(i, &len_val)?;
-                    target_index = flatten_into(
-                        i,
-                        target,
-                        &element,
-                        el_len,
-                        target_index,
-                        depth - 1,
-                        None,
-                        &Value::Undefined,
-                    )?;
+                    target_index =
+                        flatten_nested(i, target, &element, el_len, target_index, depth)?;
                 } else {
                     if target_index as u64 >= 9_007_199_254_740_991 {
                         return Err(
@@ -6977,16 +6969,7 @@ fn flatten_into(
         if depth > 0 && json_is_array(i, &element)? {
             let len_val = ab(i.get_member(&element, "length"))?;
             let el_len = to_length_val(i, &len_val)?;
-            target_index = flatten_into(
-                i,
-                target,
-                &element,
-                el_len,
-                target_index,
-                depth - 1,
-                None,
-                &Value::Undefined,
-            )?;
+            target_index = flatten_nested(i, target, &element, el_len, target_index, depth)?;
         } else {
             // Compared as u64: usize is 32-bit on wasm32, where 2^53 - 1 overflows the type.
             if target_index as u64 >= 9_007_199_254_740_991 {
@@ -6997,6 +6980,35 @@ fn flatten_into(
         }
     }
     Ok(target_index)
+}
+
+/// FlattenIntoArray's recursion into a nested array (one level shallower, without a mapper). An
+/// array nested deeper than the native stack budget allows (`flat(Infinity)` of a long chain of
+/// one-element arrays) throws the RangeError a deep JavaScript recursion would.
+fn flatten_nested(
+    i: &mut Interp,
+    target: &Value,
+    element: &Value,
+    element_len: usize,
+    start: usize,
+    depth: i64,
+) -> Result<usize, Value> {
+    let flattened = crate::interpreter::with_data_stack(|| {
+        flatten_into(
+            &mut *i,
+            target,
+            element,
+            element_len,
+            start,
+            depth - 1,
+            None,
+            &Value::Undefined,
+        )
+    });
+    match flattened {
+        Some(result) => result,
+        None => Err(i.make_error("RangeError", "Maximum call stack size exceeded")),
+    }
 }
 
 fn flatten_dense_target_safe(i: &Interp, target: &Value, source: &Value) -> bool {

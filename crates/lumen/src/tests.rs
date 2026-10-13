@@ -2087,6 +2087,121 @@ fn live_object_limit_error_handler_can_allocate() {
     }
 }
 
+/// Deeply nested source either runs or is a catchable SyntaxError, on every tier and on a 1 MiB
+/// thread stack: the parser bounds the nesting of statements, expressions, patterns and chains
+/// (`MAX_PARSE_DEPTH`), and the parser, the AST passes, the compiler and the tree-walking
+/// evaluator continue on fresh stack segments when theirs runs low. Before, a few thousand
+/// chained calls, nested blocks or `else if`s overflowed the native stack and aborted. Values
+/// are node's (given `--stack-size` large enough to parse them).
+#[test]
+fn deeply_nested_source_runs_or_throws_syntax_error() {
+    // (description, JavaScript building the source for `n` levels, expected completion)
+    let cases: &[(&str, &str, &str)] = &[
+        ("additions", "Array(n).fill('1').join('+')", "4000"),
+        ("member chain", "'a' + '.b'.repeat(n) + ' === a'", "true"),
+        ("call chain", "'g' + '()'.repeat(n) + ' === g'", "true"),
+        ("optional chain", "'a' + '?.b'.repeat(n) + ' === a'", "true"),
+        ("new chain", "'new '.repeat(n) + 'G === G'", "true"),
+        ("exponents", "Array(n).fill('1').join('**')", "1"),
+        ("assignments", "'x = '.repeat(n) + '3'", "3"),
+        ("conditionals", "'1 ? '.repeat(n) + '5' + ' : 0'.repeat(n)", "5"),
+        ("blocks", "'{'.repeat(n) + 'x = 1;' + '}'.repeat(n)", "1"),
+        (
+            "else if",
+            "'if (x === -1) 0; ' + 'else if (x === -1) 0; '.repeat(n) + 'else 7;'",
+            "7",
+        ),
+        ("labels", "Array.from({ length: n }, (_, k) => 'l' + k + ': ').join('') + '8;'", "8"),
+        ("parentheses", "'('.repeat(n / 2) + '1' + ')'.repeat(n / 2)", "1"),
+        ("arrays", "'['.repeat(n / 2) + ']'.repeat(n / 2) + '.length'", "1"),
+        ("arrows", "'typeof ' + '(() => '.repeat(n / 4) + '1' + ')'.repeat(n / 4)", "function"),
+        (
+            "patterns",
+            "'var ' + '['.repeat(n / 2) + 'y' + ']'.repeat(n / 2) + ' = ' + '['.repeat(n / 2) + '5' + ']'.repeat(n / 2) + '; y'",
+            "5",
+        ),
+        (
+            "functions",
+            "'(function () { return '.repeat(n / 8) + '9' + '; })()'.repeat(n / 8)",
+            "9",
+        ),
+        ("templates", "'`${'.repeat(n / 8) + '4' + '}`'.repeat(n / 8)", "4"),
+    ];
+    let mut script = String::from(
+        "var a = {}; a.b = a; function g() { return g; } function G() { return G; } var x = 0;
+         function run(build, n) {
+             var source = build(n);
+             try { return String((0, eval)(source)); } catch (e) { return e.name; }
+         }
+         var results = [];",
+    );
+    for (_, build, _) in cases {
+        script.push_str(&format!(
+            "results.push(run(function (n) {{ return {build}; }}, 4000));
+             results.push(run(function (n) {{ return {build}; }}, 12000));"
+        ));
+    }
+    script.push_str("results.join('|')");
+    let expected = cases
+        .iter()
+        .map(|(_, _, value)| format!("{value}|SyntaxError"))
+        .collect::<Vec<_>>()
+        .join("|");
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let script = script.clone();
+        let expected = expected.clone();
+        let outcome = std::thread::Builder::new()
+            .name(format!("deep-source-{tier:?}"))
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(run_in(&mut engine, &script), expected, "{tier:?}");
+            })
+            .expect("spawn")
+            .join();
+        assert!(outcome.is_ok(), "{tier:?} failed");
+    }
+}
+
+/// JSON.parse, its reviver walk, JSON.stringify and `flat(Infinity)` recurse once per level of
+/// nesting and now continue on fresh native stack segments (a release build parses the million
+/// levels node does); all of them aborted the process with a native stack overflow at a few tens
+/// of thousands of levels. Debug frames are larger, so this runs 10,000 levels.
+#[test]
+fn deeply_nested_json_and_flat_complete() {
+    let outcome = std::thread::Builder::new()
+        .name("deep-json".to_string())
+        .stack_size(1 << 20)
+        .spawn(|| {
+            let mut engine = Engine::new();
+            run_in(
+                &mut engine,
+                "function depth(v) { var d = 0; while (Array.isArray(v)) { v = v[0]; d++; } return d; }
+                 var n = 10000;
+                 var text = '['.repeat(n) + '1' + ']'.repeat(n);
+                 var nested = [1]; for (var k = 1; k < n; k++) nested = [nested];
+                 var objects = '{\"a\":'.repeat(n) + '1' + '}'.repeat(n);
+                 [
+                     depth(JSON.parse(text)),
+                     depth(JSON.parse(text, function (key, value) { return value; })),
+                     JSON.parse(objects) !== null,
+                     JSON.stringify(nested).length,
+                     nested.flat(Infinity).length
+                 ].join(':')",
+            )
+        })
+        .expect("spawn")
+        .join()
+        .expect("deep JSON panicked");
+    assert_eq!(outcome, "10000:10000:true:20001:1");
+}
+
 /// A discarded ArrayBuffer keeps its data until the collector finds it, and a buffer is a single
 /// object, so buffer data drives collection too: allocating 96 MiB of typed arrays that are
 /// never kept must not retain them all (a 16 MiB-per-iteration loop used to reach 16 GB).

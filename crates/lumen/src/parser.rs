@@ -405,6 +405,9 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 /// `finally`, `switch` cases, labelled statements and `with`, but never inside a function or
 /// class. A module's `for (var a = …, b = …; …)` binds `b` for `export { b }`.
 fn var_declared_names(stmt: &Stmt, out: &mut Vec<String>) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| var_declared_names(stmt, out));
+    }
     match stmt {
         Stmt::VarDecl {
             kind: DeclKind::Var,
@@ -469,9 +472,19 @@ fn var_declared_names(stmt: &Stmt, out: &mut Vec<String>) {
     }
 }
 
-/// Recursion-depth ceiling for the parser. Beyond this we bail with a SyntaxError rather than
-/// overflow the native stack on pathologically nested input (test262 has deeply-nested fixtures).
-const MAX_PARSE_DEPTH: u32 = 1200;
+/// The deepest nesting of statements, expressions, patterns and left-nested chains (`a.b.c`,
+/// `f()()`, `a + b + c`) a parse may produce; deeper source is a SyntaxError. Every later walk
+/// over the tree (early errors, scope analysis, the compiler, the tree-walking evaluator,
+/// snapshots) recurses once per level, so this bound, together with the stack growth at their
+/// recursive gateways, is what keeps pathological source from overflowing the native stack.
+/// Engines differ here: V8 runs out of stack near 2,000 parentheses, 4,000 blocks or 7,000
+/// chained calls, but accepts a million `+` operands.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_PARSE_DEPTH: u32 = 5000;
+/// wasm32 cannot switch stacks, so its walks must fit the module's own stack: keep the former
+/// bound of 1,200 nested operands (two levels each in this count).
+#[cfg(target_arch = "wasm32")]
+pub(crate) const MAX_PARSE_DEPTH: u32 = 2400;
 
 struct Parser {
     toks: Vec<Token>,
@@ -855,6 +868,42 @@ impl Parser {
         }
     }
 
+    /// Parse one more level of nesting: bounded by [`MAX_PARSE_DEPTH`], and continued on a fresh
+    /// native stack segment when this one runs low.
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return self.err("nesting too deep");
+        }
+        self.depth += 1;
+        let result = self.on_grown_stack(parse);
+        self.depth -= 1;
+        result
+    }
+
+    /// Run one recursive parse step, moving to a fresh native stack segment when this one runs
+    /// low. (A level can be many large frames: a template substitution parses with a parser of
+    /// its own.)
+    fn on_grown_stack<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        crate::interpreter::with_ast_stack(|| parse(self))
+    }
+
+    /// Count one more link of a left-nested chain built in a loop (`a.b.c`, `f()()`, `a + b`, a
+    /// template's concatenation): parsing it does not recurse, but each link nests the tree one
+    /// level deeper for every later walk. The function building the chain restores `depth`.
+    fn deepen(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return self.err("nesting too deep");
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn parse_stmts_until_eof(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let mut out = Vec::new();
         while !self.at_eof() {
@@ -872,6 +921,10 @@ impl Parser {
     // ----- statements -------------------------------------------------------------------------
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.nested(Self::parse_stmt_inner)
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, ParseError> {
         if matches!(self.cur(), Tok::Keyword(_)) && self.cur_escaped() {
             return self.err("keywords must not contain escape sequences");
         }
@@ -1077,6 +1130,12 @@ impl Parser {
                     self.labels.push(n.clone());
                     chain.push(n);
                 }
+                // Each label nests the statement one level deeper (see `Self::deepen`).
+                let depth = self.depth;
+                if self.depth as usize + chain.len() > MAX_PARSE_DEPTH as usize {
+                    return self.err("nesting too deep");
+                }
+                self.depth += chain.len() as u32;
                 // `continue label` may only target a label whose statement is (a label chain
                 // over) an iteration statement.
                 let iter_ahead = matches!(
@@ -1112,6 +1171,7 @@ impl Parser {
                         self.iter_labels.pop();
                     }
                 }
+                self.depth = depth;
                 let mut stmt = body?;
                 for label in chain.into_iter().rev() {
                     stmt = Stmt::Labeled {
@@ -1278,8 +1338,8 @@ impl Parser {
     /// A binding target: a plain identifier, or an array/object destructuring pattern.
     fn parse_binding_pattern(&mut self) -> Result<Pattern, ParseError> {
         match self.cur() {
-            Tok::Punct("[") => self.parse_array_pattern(),
-            Tok::Punct("{") => self.parse_object_pattern(),
+            Tok::Punct("[") => self.nested(Self::parse_array_pattern),
+            Tok::Punct("{") => self.nested(Self::parse_object_pattern),
             _ => self.parse_binding_ident(),
         }
     }
@@ -2284,6 +2344,10 @@ impl Parser {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, ParseError> {
+        self.nested(Self::parse_assign_inner)
+    }
+
+    fn parse_assign_inner(&mut self) -> Result<Expr, ParseError> {
         // `yield` / `yield*` (only a keyword inside a generator body).
         if self.in_generator && self.is_ident_word("yield") {
             return self.parse_yield();
@@ -2406,6 +2470,13 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        let depth = self.depth;
+        let result = self.parse_binary_chain(min_prec);
+        self.depth = depth;
+        result
+    }
+
+    fn parse_binary_chain(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
         let mut left_paren = self.last_paren;
         while let Some((op, prec, right_assoc, logical)) = self.binary_op() {
@@ -2426,8 +2497,11 @@ impl Parser {
                 return self.err("cannot mix '??' with '&&' or '||' without parentheses");
             }
             self.advance();
+            // This operator nests the tree one level, whichever side recurses: `a + b + c`
+            // builds the left side in this loop, `a ** b ** c` the right side by recursion.
+            self.deepen()?;
             let next_min = if right_assoc { prec } else { prec + 1 };
-            let right = self.parse_binary(next_min)?;
+            let right = self.on_grown_stack(|parser| parser.parse_binary(next_min))?;
             if op == "??"
                 && !self.last_paren
                 && matches!(
@@ -2507,18 +2581,9 @@ impl Parser {
         Some((op, prec, right, logical))
     }
 
-    /// Depth-guarded entry point. Every expression flows through `parse_unary` (each operand of a
-    /// binary op, each parenthesised/array/object nesting level), so bracketing it here bounds all
-    /// expression recursion with a single choke point.
+    /// Depth-guarded entry point for every operand (unary operators nest through it).
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
-            self.depth -= 1;
-            return self.err("expression nesting too deep");
-        }
-        let r = self.parse_unary_inner();
-        self.depth -= 1;
-        r
+        self.nested(Self::parse_unary_inner)
     }
 
     fn parse_unary_inner(&mut self) -> Result<Expr, ParseError> {
@@ -2621,9 +2686,24 @@ impl Parser {
     }
 
     fn parse_lhs(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_member_expr()?;
+        let depth = self.depth;
+        let result = self.parse_lhs_chain();
+        self.depth = depth;
+        result
+    }
+
+    /// A member/call chain; every link nests the tree one level deeper (see [`Self::deepen`]),
+    /// counting on from the member links of [`Self::parse_member_chain`].
+    fn parse_lhs_chain(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.parse_member_chain()?;
         let mut had_optional = false;
         loop {
+            if matches!(
+                self.cur(),
+                Tok::Punct("(" | "." | "[" | "?.") | Tok::Template(_)
+            ) {
+                self.deepen()?;
+            }
             if self.is_punct("(") {
                 let pos = self.call_pos();
                 let args = self.parse_args()?;
@@ -2709,6 +2789,14 @@ impl Parser {
 
     /// MemberExpression without trailing calls — handles `new` and `.`/`[]` member tails.
     fn parse_member_expr(&mut self) -> Result<Expr, ParseError> {
+        let depth = self.depth;
+        let result = self.parse_member_chain();
+        self.depth = depth;
+        result
+    }
+
+    /// [`Self::parse_member_expr`], leaving its links counted in `depth` for the caller.
+    fn parse_member_chain(&mut self) -> Result<Expr, ParseError> {
         let mut base = if self.is_kw("new") {
             let new_pos = self.cur_pos();
             let new_escaped = self.cur_escaped();
@@ -2735,7 +2823,7 @@ impl Parser {
                 if self.in_async && self.is_ident_word("await") && !self.cur_escaped() {
                     return self.err("'await' expression cannot be the operand of 'new'");
                 }
-                let callee = self.parse_member_expr()?;
+                let callee = self.nested(Self::parse_member_expr)?;
                 // `new import(...)` is a SyntaxError — an ImportCall (`import()`) is a
                 // CallExpression, so it can't be the MemberExpression base of `new` — but a
                 // parenthesized `new (import(...))` covers it into a valid PrimaryExpression.
@@ -2767,6 +2855,9 @@ impl Parser {
             self.parse_primary()?
         };
         loop {
+            if matches!(self.cur(), Tok::Punct("." | "[") | Tok::Template(_)) {
+                self.deepen()?;
+            }
             if self.eat_punct(".") {
                 let pos = self.cur_pos();
                 let name = self.parse_property_name_ident()?;
@@ -3090,8 +3181,17 @@ impl Parser {
     /// literals, `${...}` holes are sub-parsed as expressions. Starting from a string literal makes
     /// every `+` a string concatenation (which ToString-coerces each substitution).
     fn build_template(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
+        let depth = self.depth;
+        let result = self.build_template_chain(parts);
+        self.depth = depth;
+        result
+    }
+
+    /// The template's left-nested concatenation; every part deepens it (see [`Self::deepen`]).
+    fn build_template_chain(&mut self, parts: Vec<TplPart>) -> Result<Expr, ParseError> {
         let mut expr: Option<Expr> = None;
         for part in parts {
+            self.deepen()?;
             let piece = match part {
                 TplPart::Str { cooked, .. } => match cooked {
                     Some(c) => Expr::Str(Rc::from(c.as_str())),
@@ -3574,7 +3674,9 @@ impl Parser {
         // parameter. This includes method defaults/bodies, fields and static blocks
         // nested in a for initializer (ECMA-262 §15.7, Class Definitions).
         let saved_no_in = std::mem::replace(&mut self.no_in, false);
-        let result = self.parse_class_inner();
+        // A heritage clause can itself be a class expression, recursing without passing
+        // through another nested level.
+        let result = self.nested(Self::parse_class_inner);
         self.no_in = saved_no_in;
         result
     }
@@ -4241,6 +4343,9 @@ fn is_valid_assign_target(e: &Expr) -> bool {
 /// `LeftHandSideExpression` (e.g. a member expression) — never a nested pattern — and
 /// element/property targets may be member expressions too.
 fn valid_assignment_pattern(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| valid_assignment_pattern(e));
+    }
     fn simple(e: &Expr) -> bool {
         matches!(
             e,
@@ -4293,6 +4398,9 @@ fn valid_assignment_pattern(e: &Expr) -> bool {
 /// Whether a destructuring assignment pattern targets `eval`/`arguments` (a strict-mode
 /// SyntaxError). Walks target positions only, not keys or defaults.
 fn pattern_strict_banned(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pattern_strict_banned(e));
+    }
     let banned = |n: &str| n == "eval" || n == "arguments";
     match e {
         Expr::Ident(n, _) => banned(n),
@@ -4333,6 +4441,9 @@ fn pattern_strict_banned(e: &Expr) -> bool {
 /// *non-pattern* position (e.g. the member base in `[{a = 0}.x] = []`) — a SyntaxError the
 /// blanket cover-forgiveness must not absorb.
 fn pattern_has_stray_cover(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pattern_has_stray_cover(e));
+    }
     // Generic-expression positions: any object literal with a Cover prop (at any depth) is bad.
     fn generic(e: &Expr) -> bool {
         crate::eval::expr_contains(e, |x| {
@@ -4394,6 +4505,9 @@ fn pattern_has_stray_cover(e: &Expr) -> bool {
 }
 
 fn is_valid_assign_pattern(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| is_valid_assign_pattern(e));
+    }
     match e {
         Expr::Ident(_, _) => true,
         Expr::Member {
@@ -4556,6 +4670,9 @@ fn pn_declared(st: &[Vec<String>], name: &str) -> bool {
 }
 
 fn pn_class(class: &Class, st: &mut Vec<Vec<String>>) -> Result<(), String> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pn_class(class, st));
+    }
     if let Some(s) = &class.superclass {
         pn_expr(s, st)?;
     }
@@ -4595,6 +4712,9 @@ fn pn_params(params: &[Param], st: &mut Vec<Vec<String>>) -> Result<(), String> 
 }
 
 fn pn_pattern(pat: &Pattern, st: &mut Vec<Vec<String>>) -> Result<(), String> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pn_pattern(pat, st));
+    }
     match pat {
         Pattern::Array(elems) => {
             for e in elems {
@@ -4632,6 +4752,9 @@ fn pn_stmts(stmts: &[Stmt], st: &mut Vec<Vec<String>>) -> Result<(), String> {
 }
 
 fn pn_stmt(stmt: &Stmt, st: &mut Vec<Vec<String>>) -> Result<(), String> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pn_stmt(stmt, st));
+    }
     match stmt {
         Stmt::Expr(e) | Stmt::Throw(e) => pn_expr(e, st)?,
         Stmt::VarDecl { decls, .. } => {
@@ -4742,6 +4865,9 @@ fn pn_args(args: &[ArrayElem], st: &mut Vec<Vec<String>>) -> Result<(), String> 
 }
 
 fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| pn_expr(expr, st));
+    }
     match expr {
         // A bare private name is only grammatical as `#x in obj` (parsed as PrivateIn); anywhere
         // else — `#x`, `!#x`, `1 + #x` — it is a SyntaxError.
@@ -4844,6 +4970,9 @@ fn pn_expr(expr: &Expr, st: &mut Vec<Vec<String>>) -> Result<(), String> {
 /// Whether `new`'s callee chain bottoms out in an `import(...)` call (peeling member/index access),
 /// which makes it a CallExpression and thus an invalid `new` operand.
 fn callee_has_import_call(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| callee_has_import_call(e));
+    }
     match e {
         Expr::ImportCall { .. } => true,
         Expr::Member { obj, .. } | Expr::Index { obj, .. } => callee_has_import_call(obj),
@@ -4952,6 +5081,9 @@ fn is_strict_reserved_binding(name: &str) -> bool {
 }
 
 fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| expr_to_pattern(e));
+    }
     match e {
         // A bare private name is never an assignment target.
         Expr::Ident(name, _) if name.starts_with('#') => None,

@@ -209,6 +209,9 @@ impl Interp {
         env: &Env,
         mode: BindMode,
     ) -> Result<(), Abrupt> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.bind_pattern(pat, value, env, mode));
+        }
         match pat {
             Pattern::Ident(name) => {
                 match mode {
@@ -749,7 +752,27 @@ impl Interp {
         }
     }
 
+    /// [`Self::exec_stmt`] continued on a fresh native stack segment (see `with_ast_stack`); kept
+    /// out of line so the gateway adds no frame state to the hot statement dispatch.
+    #[cold]
+    #[inline(never)]
+    fn exec_stmt_on_fresh_stack(&mut self, stmt: &Stmt, env: &Env) -> Completion {
+        crate::interpreter::with_ast_stack(|| self.exec_stmt(stmt, env))
+    }
+
+    /// [`Self::eval`] continued on a fresh native stack segment, out of line like
+    /// [`Self::exec_stmt_on_fresh_stack`].
+    #[cold]
+    #[inline(never)]
+    fn eval_on_fresh_stack(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        crate::interpreter::with_ast_stack(|| self.eval(expr, env))
+    }
+
     pub(crate) fn exec_stmt(&mut self, stmt: &Stmt, env: &Env) -> Completion {
+        self.ast_tick = self.ast_tick.wrapping_add(1);
+        if self.ast_tick & 7 == 0 && crate::interpreter::ast_stack_low() {
+            return self.exec_stmt_on_fresh_stack(stmt, env);
+        }
         match stmt {
             Stmt::Empty | Stmt::Debugger => Ok(Value::Empty),
             Stmt::FuncDecl(func) => {
@@ -3130,6 +3153,13 @@ impl Interp {
     }
 
     pub(crate) fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        // Querying the native stack on every evaluation would cost the tree-walker several
+        // percent; every eighth (each level of nesting is at least one evaluation) suffices
+        // for the gateway's red zone.
+        self.ast_tick = self.ast_tick.wrapping_add(1);
+        if self.ast_tick & 7 == 0 && crate::interpreter::ast_stack_low() {
+            return self.eval_on_fresh_stack(expr, env);
+        }
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::BigInt(n) => Ok(Value::BigInt(n.clone())),
@@ -7570,6 +7600,11 @@ impl Interp {
         value: Value,
         env: &Env,
     ) -> Result<(), Abrupt> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| {
+                self.assign_to_target(target, value, env)
+            });
+        }
         match target {
             Expr::Ident(name, _) => self.assign_var(name, value, env),
             Expr::Member { obj, prop, .. } => {
@@ -8466,7 +8501,9 @@ impl Interp {
             Value::Null => Ok(crate::lstr::LStr::from("null")),
             Value::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
             Value::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
-            Value::BigInt(n) => Ok(crate::lstr::LStr::from(self.bigint_to_string(n, 10)?.as_str())),
+            Value::BigInt(n) => Ok(crate::lstr::LStr::from(
+                self.bigint_to_string(n, 10)?.as_str(),
+            )),
             Value::Str(s) => Ok(s.clone()),
             Value::Sym(_) => {
                 Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
@@ -8755,6 +8792,9 @@ enum LoopStep {
 /// resolution, which the parser already folds), declares nothing and creates no closure:
 /// primitive literals, and array/object literals built only from them.
 fn env_free_initializer(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| env_free_initializer(e));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -8908,6 +8948,9 @@ fn stmts_contain(stmts: &[Stmt], pred: fn(&Expr) -> bool) -> bool {
 }
 
 fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| stmt_contains(s, pred));
+    }
     let e = |x: &Expr| expr_contains(x, pred);
     match s {
         Stmt::Expr(x) | Stmt::Throw(x) => e(x),
@@ -8977,6 +9020,9 @@ pub(crate) fn expr_has_own_suspension(x: &Expr) -> bool {
 }
 
 fn expr_contains_impl(x: &Expr, pred: fn(&Expr) -> bool, descend_arrows: bool) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| expr_contains_impl(x, pred, descend_arrows));
+    }
     if pred(x) {
         return true;
     }
@@ -9091,6 +9137,9 @@ pub(crate) fn method_super_call_error_full(func: &crate::ast::Function) -> Optio
 
 /// `args` also flags `arguments` (a field-initializer rule); methods omit it since they may use it.
 fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| fi_expr(e, args));
+    }
     match e {
         Expr::Ident(n, _) if args && n == "arguments" => {
             Some("'arguments' is not allowed in a class field initializer")
@@ -9170,6 +9219,9 @@ fn fi_stmts(stmts: &[Stmt], args: bool) -> Option<&'static str> {
 }
 
 fn fi_stmt(s: &Stmt, args: bool) -> Option<&'static str> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| fi_stmt(s, args));
+    }
     match s {
         Stmt::Expr(e) | Stmt::Throw(e) => fi_expr(e, args),
         Stmt::Return(e) => e.as_ref().and_then(|e| fi_expr(e, args)),

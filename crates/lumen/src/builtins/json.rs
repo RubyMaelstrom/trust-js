@@ -75,7 +75,7 @@ pub(super) fn install_json(it: &mut Interp) {
         // SerializeJSONProperty starts from a wrapper holder `{ "": value }`.
         let wrapper = i.new_object();
         set_data(&wrapper, "", value);
-        let mut seen = Vec::new();
+        let mut seen = crate::fasthash::FastSet::default();
         match json_str(i, &Value::Obj(wrapper), "", &opts, &gap, "", &mut seen)? {
             Some(s) => {
                 // Escaping can expand a single top-level string up to sixfold.
@@ -300,7 +300,9 @@ fn internalize_json_property(
                     Some(JsonRecord::Arr(elems)) => elems.get(idx),
                     _ => None,
                 };
-                let new_el = internalize_json_property(i, &val, &k, reviver, child)?;
+                let new_el = nested(i, |i| {
+                    internalize_json_property(i, &val, &k, reviver, child)
+                })?;
                 if matches!(new_el, Value::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
@@ -333,7 +335,9 @@ fn internalize_json_property(
                     }
                     _ => None,
                 };
-                let new_el = internalize_json_property(i, &val, &k, reviver, child)?;
+                let new_el = nested(i, |i| {
+                    internalize_json_property(i, &val, &k, reviver, child)
+                })?;
                 if matches!(new_el, Value::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
@@ -357,6 +361,20 @@ fn internalize_json_property(
     ))
 }
 
+/// One nested level of JSON.parse, its reviver walk or JSON.stringify, which recurse once per
+/// level of the text or value: on a fresh native stack segment when this one runs low, so deep
+/// nesting either completes (node parses a million levels) or throws the RangeError a deep
+/// JavaScript recursion would, instead of overflowing the stack.
+fn nested<T>(
+    i: &mut Interp,
+    level: impl FnOnce(&mut Interp) -> Result<T, Value>,
+) -> Result<T, Value> {
+    match crate::interpreter::with_data_stack(|| level(&mut *i)) {
+        Some(result) => result,
+        None => Err(i.make_error("RangeError", "Maximum call stack size exceeded")),
+    }
+}
+
 fn json_str(
     i: &mut Interp,
     holder: &Value,
@@ -364,7 +382,7 @@ fn json_str(
     opts: &JsonOpts,
     gap: &str,
     indent: &str,
-    seen: &mut Vec<usize>,
+    seen: &mut crate::fasthash::FastSet<usize>,
 ) -> Result<Option<String>, Value> {
     // SerializeJSONProperty: fetch the value, then apply toJSON, then the function replacer.
     let mut value = ab(i.get_member(holder, key))?;
@@ -418,10 +436,10 @@ fn json_str(
                 return Ok(None); // functions are omitted
             }
             let ptr = Rc::as_ptr(o) as usize;
-            if seen.contains(&ptr) {
+            // The objects being serialized, for SerializeJSONObject/Array's cycle check.
+            if !seen.insert(ptr) {
                 return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
             }
-            seen.push(ptr);
             let new_indent = format!("{indent}{gap}");
             // IsArray sees through proxies; key enumeration / length use proxy-aware operations.
             let is_array = json_is_array(i, &value)?;
@@ -437,8 +455,10 @@ fn json_str(
                 let mut items = Vec::with_capacity(len.min(1024));
                 let mut total = 0usize;
                 for k in 0..len {
-                    let item = json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)?
-                        .unwrap_or_else(|| "null".to_string());
+                    let item = nested(i, |i| {
+                        json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)
+                    })?
+                    .unwrap_or_else(|| "null".to_string());
                     total += item.len() + 1;
                     check_string_length(i, total)?;
                     items.push(item);
@@ -480,7 +500,9 @@ fn json_str(
                 let mut parts = Vec::new();
                 let mut total = 0usize;
                 for k in &keys {
-                    if let Some(vs) = json_str(i, &value, k, opts, gap, &new_indent, seen)? {
+                    if let Some(vs) =
+                        nested(i, |i| json_str(i, &value, k, opts, gap, &new_indent, seen))?
+                    {
                         let colon = if gap.is_empty() { ":" } else { ": " };
                         let mut member = json_quote(k);
                         member.push_str(colon);
@@ -492,7 +514,7 @@ fn json_str(
                 }
                 join_json(i, "{", "}", parts, gap, &new_indent, indent)?
             };
-            seen.pop();
+            seen.remove(&ptr);
             Ok(Some(result))
         }
     }
@@ -638,7 +660,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let v = json_parse_value(i, input, pos)?;
+                let v = nested(i, |i| json_parse_value(i, input, pos))?;
                 set_data(&obj, &key, v);
                 json_skip_ws(input, pos);
                 match input.get(*pos) {
@@ -667,7 +689,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                 return Ok(i.make_array(items));
             }
             loop {
-                items.push(json_parse_value(i, input, pos)?);
+                items.push(nested(i, |i| json_parse_value(i, input, pos))?);
                 json_skip_ws(input, pos);
                 match input.get(*pos) {
                     Some(',') => {
@@ -746,6 +768,28 @@ enum JsonRecord {
     Obj(Vec<(String, JsonRecord)>),
 }
 
+impl JsonRecord {
+    fn take_children(&mut self, out: &mut Vec<JsonRecord>) {
+        match self {
+            JsonRecord::Prim(..) => {}
+            JsonRecord::Arr(items) => out.append(items),
+            JsonRecord::Obj(entries) => out.extend(entries.drain(..).map(|(_, record)| record)),
+        }
+    }
+}
+
+impl Drop for JsonRecord {
+    /// Records nest as deeply as the text (a million levels parse), so release them from an
+    /// explicit worklist rather than one native frame per level.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.take_children(&mut pending);
+        while let Some(mut record) = pending.pop() {
+            record.take_children(&mut pending);
+        }
+    }
+}
+
 /// Mirror of `json_parse_value` that also returns a `JsonRecord`. Containers are framed inline;
 /// primitive leaves delegate to `json_parse_value` and capture their exact source span.
 fn json_parse_recorded(
@@ -778,7 +822,7 @@ fn json_parse_recorded(
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let (v, vr) = json_parse_recorded(i, input, pos)?;
+                let (v, vr) = nested(i, |i| json_parse_recorded(i, input, pos))?;
                 set_data(&obj, &key, v);
                 rec.retain(|(k, _)| k != &key);
                 rec.push((key, vr));
@@ -808,7 +852,7 @@ fn json_parse_recorded(
                 return Ok((i.make_array(items), JsonRecord::Arr(rec)));
             }
             loop {
-                let (v, vr) = json_parse_recorded(i, input, pos)?;
+                let (v, vr) = nested(i, |i| json_parse_recorded(i, input, pos))?;
                 items.push(v);
                 rec.push(vr);
                 json_skip_ws(input, pos);

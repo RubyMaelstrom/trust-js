@@ -4080,6 +4080,9 @@ impl CaptureScan {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.stmt(s));
+        }
         self.spend_watch_budget()?;
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
@@ -4392,6 +4395,9 @@ impl CaptureScan {
     }
 
     fn expr(&mut self, e: &Expr) -> Option<()> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.expr(e));
+        }
         self.spend_watch_budget()?;
         match e {
             Expr::Num(_)
@@ -8004,6 +8010,9 @@ struct Compiler {
 /// selected conditional arm, the final sequence element, and the right logical operand inherit
 /// tail position.
 fn has_tail_call(expr: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| has_tail_call(expr));
+    }
     match expr {
         Expr::Call { .. } | Expr::TaggedTemplate { .. } => true,
         Expr::Cond { cons, alt, .. } => has_tail_call(cons) || has_tail_call(alt),
@@ -8288,6 +8297,9 @@ fn pattern_exprs_safe(pattern: &Pattern, banned: &crate::fasthash::FastSet<&str>
 }
 
 fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| default_expr_safe(e, banned));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -8341,6 +8353,9 @@ fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool 
 /// local is unobservable outside its function (that is what makes slot storage sound), so only a
 /// syntactic assignment/update in this very expression could touch it.
 fn no_assign_to(e: &Expr, name: &str) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| no_assign_to(e, name));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -9632,6 +9647,9 @@ impl Compiler {
     /// Does this expression continue an open optional chain? An OptionalChain wrapper closes
     /// its own chain; optional links in arguments/keys are separate expressions as well.
     fn has_open_optional_chain(e: &Expr) -> bool {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| Self::has_open_optional_chain(e));
+        }
         match e {
             Expr::Member { obj, optional, .. } | Expr::Index { obj, optional, .. } => {
                 *optional || Self::has_open_optional_chain(obj)
@@ -9657,6 +9675,9 @@ impl Compiler {
     }
 
     fn opt_chain_link(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.opt_chain_link(e, shorts));
+        }
         if !Self::has_open_optional_chain(e) {
             // Preserve ordinary expression specializations (GetPropThis/GetPropLocal,
             // element fusions, etc.) before the first optional link. Besides avoiding extra
@@ -10263,6 +10284,9 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.stmt(s));
+        }
         if self.fragment_root.is_none()
             && matches!(
                 s,
@@ -13103,6 +13127,9 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.expr(e));
+        }
         match e.position() {
             Some(position) if !self.cannot_fail(e) => {
                 self.at_position(position, |c| c.expr_node(e))
@@ -14906,6 +14933,9 @@ fn eval_expr_with_slots<S: StoredValue>(
 /// any binding. Field initializers are scanned too although they run as methods; that only
 /// over-approximates. The match is exhaustive so a new expression form must decide here.
 fn retained_expr_names(e: &Expr, out: &mut crate::fasthash::FastSet<String>) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| retained_expr_names(e, out));
+    }
     fn elems(items: &[crate::ast::ArrayElem], out: &mut crate::fasthash::FastSet<String>) -> bool {
         items.iter().all(|item| match item {
             crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {

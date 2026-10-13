@@ -2055,6 +2055,9 @@ pub(crate) fn typed_module_source(text: String, attr_type: Option<&str>) -> Stri
 /// Await expression outside any function/class body) — the async-module test for `import defer`.
 pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
     fn stmt(s: &Stmt) -> bool {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| stmt(s));
+        }
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => expr(e),
             Stmt::Return(v) => v.as_ref().map(expr).unwrap_or(false),
@@ -2125,6 +2128,9 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
         }
     }
     fn expr(e: &Expr) -> bool {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| expr(e));
+        }
         match e {
             Expr::Await(_) => true,
             Expr::ToStr(x) | Expr::OptionalChain(x) => expr(x),
