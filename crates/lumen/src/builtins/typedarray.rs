@@ -324,16 +324,13 @@ fn to_index(i: &mut Interp, value: &Value) -> Result<usize, Value> {
 /// abort the process.
 pub(crate) fn create_byte_data_block(i: &mut Interp, len: usize) -> Result<Vec<u8>, Value> {
     i.note_buffer_allocation(len);
-    let mut block = Vec::new();
-    if block.try_reserve_exact(len).is_err() {
-        // Unreachable buffers still hold their data until a collection finds them.
-        i.collect_for_failed_allocation();
-        if block.try_reserve_exact(len).is_err() {
-            return Err(i.make_error("RangeError", "Array buffer allocation failed"));
-        }
+    if let Some(block) = crate::interpreter::try_zeroed_bytes(len) {
+        return Ok(block);
     }
-    block.resize(len, 0);
-    Ok(block)
+    // Unreachable buffers still hold their data until a collection finds them.
+    i.collect_for_failed_allocation();
+    crate::interpreter::try_zeroed_bytes(len)
+        .ok_or_else(|| i.make_error("RangeError", "Array buffer allocation failed"))
 }
 
 fn make_array_buffer(i: &mut Interp, byte_len: usize) -> Result<(Value, usize), Value> {

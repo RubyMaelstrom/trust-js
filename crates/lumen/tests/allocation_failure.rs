@@ -49,3 +49,44 @@ fn exhausted_memory_throws_range_error_for_array_buffers() {
         );
     }
 }
+
+/// A new ArrayBuffer's data comes from the allocator already zeroed, so a large one is fresh
+/// pages that become resident only when written (asm.js and emscripten heaps of hundreds of MiB
+/// are allocated up front). Filling the block with zeros made all of it resident at once.
+#[test]
+fn large_array_buffers_stay_lazily_zeroed() {
+    const SCRIPT: &[u8] = br#"
+        var buffer = new ArrayBuffer(256 * 1024 * 1024);
+        new Uint8Array(buffer)[12345678] = 1;
+        var until = Date.now() + 1500;
+        while (Date.now() < until) {}
+    "#;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(SCRIPT).unwrap();
+    // The peak resident set (VmHWM) only grows, so any reading while the script spins after
+    // the allocation shows whether the block became resident.
+    let status = format!("/proc/{}/status", child.id());
+    let mut peak_kib = 0u64;
+    while child.try_wait().unwrap().is_none() {
+        let hwm = std::fs::read_to_string(&status).ok().and_then(|text| {
+            let line = text.lines().find(|line| line.starts_with("VmHWM:"))?;
+            line.split_whitespace().nth(1)?.parse::<u64>().ok()
+        });
+        peak_kib = peak_kib.max(hwm.unwrap_or(0));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(peak_kib > 0, "no reading of the child's memory");
+    assert!(peak_kib < 128 * 1024, "peak resident set {peak_kib} KiB");
+}

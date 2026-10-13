@@ -770,12 +770,30 @@ pub fn next_shared_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, AtomicOrdering::SeqCst)
 }
+/// `len` zero bytes, or `None` when the allocator cannot provide them. The block comes from the
+/// allocator already zeroed, so a large one is fresh pages that cost neither time nor resident
+/// memory until they are written (emscripten and asm.js heaps of hundreds of MiB are allocated
+/// up front), where filling a reserved Vec would touch every page.
+pub(crate) fn try_zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has a non-zero size.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a live allocation from the global allocator with exactly the layout a
+    // `Vec<u8>` of capacity `len` uses (`len` bytes, alignment 1), and all `len` bytes are
+    // initialized (to zero); the Vec takes ownership and frees it with that layout.
+    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
+}
+
 /// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id, or `None`
 /// when the memory is not available.
 pub fn alloc_shared_mem(len: usize) -> Option<u64> {
-    let mut block = Vec::new();
-    block.try_reserve_exact(len).ok()?;
-    block.resize(len, 0);
+    let block = try_zeroed_bytes(len)?;
     let id = next_shared_id();
     shared_mem_registry()
         .lock()
