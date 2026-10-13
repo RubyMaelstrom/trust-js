@@ -3656,7 +3656,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 163);
+    assert_eq!(names.len(), 164);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
