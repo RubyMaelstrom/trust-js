@@ -1789,7 +1789,6 @@ fn regex_ident_part(c: char) -> bool {
 // AST
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone)]
 enum Node {
     Empty,
     Char(u32),
@@ -1821,6 +1820,34 @@ enum Node {
     },
 }
 
+/// Dropping a tree through the derived glue recurses once per level. Detach nested children into a
+/// worklist instead, so dropping a deeply nested pattern uses constant native stack.
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.detach_children(&mut pending);
+        while let Some(mut node) = pending.pop() {
+            node.detach_children(&mut pending);
+        }
+    }
+}
+
+impl Node {
+    fn detach_children(&mut self, out: &mut Vec<Node>) {
+        match self {
+            Node::Concat(nodes) | Node::Alt(nodes) => out.append(nodes),
+            Node::Group(_, inner)
+            | Node::Repeat(inner, ..)
+            | Node::Look(_, inner)
+            | Node::LookBehind(_, inner)
+            | Node::Modifier { inner, .. } => {
+                out.push(std::mem::replace(&mut **inner, Node::Empty))
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Parser {
     chars: Vec<char>,
     /// Total capturing groups in the whole pattern (prescanned): Annex B decides decimal escapes
@@ -1838,6 +1865,50 @@ struct Parser {
     named_mode: bool,
     /// `\k<name>` references collected during parsing, validated against `names` afterwards.
     name_refs: Vec<String>,
+    /// Groups and nested classes open at the current position (see [`MAX_PATTERN_NESTING`]).
+    depth: usize,
+    /// Lookarounds open at the current position (see [`MAX_LOOKAROUND_NESTING`]).
+    look_depth: usize,
+}
+
+/// How deeply groups and UnicodeSets classes may nest; a deeper pattern is a SyntaxError, as V8
+/// reports an oversized pattern. The parser, the compiler and the other passes over the pattern
+/// tree recurse once per level, growing the native stack on demand (see [`with_pattern_stack`]),
+/// so this bounds the memory they can claim. Real patterns, including generated ones such as word
+/// tries, nest a few dozen levels.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PATTERN_NESTING: usize = 1000;
+/// wasm32 cannot switch to a fresh stack segment, so there the bound alone must keep the
+/// recursion within the default 1 MiB stack.
+#[cfg(target_arch = "wasm32")]
+const MAX_PATTERN_NESTING: usize = 250;
+
+/// How deeply lookarounds may nest. Each compiles to a sub-program that dropping, memory
+/// accounting and analysis of the compiled matcher walk recursively, so they are bounded more
+/// tightly than groups; real patterns nest lookarounds two or three levels.
+const MAX_LOOKAROUND_NESTING: usize = 128;
+
+/// Headroom one recursion level over a pattern may use before checking again (a debug build's
+/// parser takes about 10 KiB per nesting level, an optimized one about 1.5 KiB), and the size of
+/// each stack segment added when it runs out.
+#[cfg(not(target_arch = "wasm32"))]
+const PATTERN_STACK_RED_ZONE: usize = 128 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATTERN_STACK_SEGMENT: usize = 1024 * 1024;
+
+/// Run one level of a recursive pass over a pattern, on a fresh stack segment when the current
+/// one is nearly exhausted: a pattern compiled deep in a script's recursion, or nested
+/// [`MAX_PATTERN_NESTING`] levels deep, must not overflow the native stack.
+#[inline]
+fn with_pattern_stack<R>(pass: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stacker::maybe_grow(PATTERN_STACK_RED_ZONE, PATTERN_STACK_SEGMENT, pass)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        pass()
+    }
 }
 
 /// The element sequence regular expressions operate over. In unicode (`u`/`v`) mode an element
@@ -2298,6 +2369,8 @@ impl Regex {
             unicode_sets,
             named_mode,
             name_refs: Vec::new(),
+            depth: 0,
+            look_depth: 0,
         };
         let mut ast = p.parse_alt()?;
         if p.pos != p.chars.len() {
@@ -2325,7 +2398,7 @@ impl Regex {
         // Wrap the whole match in group-0 saves.
         let mut prog = vec![Inst::Save(0)];
         let mut nmarks = 0usize;
-        compile(&ast, &mut prog, &mut nmarks)?;
+        compile(&ast, &mut prog, &mut nmarks, false)?;
         prog.push(Inst::Save(1));
         prog.push(Inst::Match);
         // The `flags` accessor returns flags in canonical order.
@@ -3043,6 +3116,31 @@ impl Parser {
         c
     }
 
+    /// Parse a group or nested class body one nesting level deeper.
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.depth == MAX_PATTERN_NESTING {
+            return Err("regular expression is nested too deeply".into());
+        }
+        self.depth += 1;
+        let result = with_pattern_stack(|| parse(self));
+        self.depth -= 1;
+        result
+    }
+
+    /// Parse a lookaround body (see [`MAX_LOOKAROUND_NESTING`]).
+    fn parse_lookaround_body(&mut self) -> Result<Node, String> {
+        if self.look_depth == MAX_LOOKAROUND_NESTING {
+            return Err("regular expression is nested too deeply".into());
+        }
+        self.look_depth += 1;
+        let body = self.parse_alt();
+        self.look_depth -= 1;
+        body
+    }
+
     fn parse_alt(&mut self) -> Result<Node, String> {
         let mut branches = vec![self.parse_concat()?];
         while self.peek() == Some('|') {
@@ -3177,7 +3275,7 @@ impl Parser {
             Some('.') => Ok(Node::Any),
             Some('^') => Ok(Node::Start),
             Some('$') => Ok(Node::End),
-            Some('(') => self.parse_group(),
+            Some('(') => self.nested(Self::parse_group),
             Some('[') => self.parse_class(),
             Some('\\') => self.parse_escape(),
             // In Unicode mode a PatternCharacter excludes the remaining SyntaxCharacters.
@@ -3201,13 +3299,13 @@ impl Parser {
                 }
                 Some('=') => {
                     self.bump();
-                    let inner = self.parse_alt()?;
+                    let inner = self.parse_lookaround_body()?;
                     self.expect(')')?;
                     Ok(Node::Look(false, Box::new(inner)))
                 }
                 Some('!') => {
                     self.bump();
-                    let inner = self.parse_alt()?;
+                    let inner = self.parse_lookaround_body()?;
                     self.expect(')')?;
                     Ok(Node::Look(true, Box::new(inner)))
                 }
@@ -3218,7 +3316,7 @@ impl Parser {
                     match self.peek() {
                         Some(c @ ('=' | '!')) => {
                             self.bump();
-                            let inner = self.parse_alt()?;
+                            let inner = self.parse_lookaround_body()?;
                             self.expect(')')?;
                             Ok(Node::LookBehind(c == '!', Box::new(inner)))
                         }
@@ -3400,7 +3498,7 @@ impl Parser {
                 } else {
                     false
                 };
-                let mut set = self.parse_class_set_expression()?;
+                let mut set = self.nested(Self::parse_class_set_expression)?;
                 self.expect(']')?;
                 if negate {
                     set = set.complement()?;
@@ -3538,7 +3636,7 @@ impl Parser {
 
     fn parse_class(&mut self) -> Result<Node, String> {
         if self.unicode_sets {
-            return self.parse_class_set();
+            return self.nested(Self::parse_class_set);
         }
         let mut cc = CharClass::default();
         if self.peek() == Some('^') {
@@ -4079,7 +4177,24 @@ fn push_class_atom(cc: &mut CharClass, a: ClassAtom) {
 // Compiler
 // ---------------------------------------------------------------------------------------------
 
-fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), String> {
+/// Lower `node` onto `prog`. A `backward` node belongs to a lookbehind body, which runs
+/// right-to-left: its concatenations are emitted in reverse, while alternative order, greed and
+/// nested lookarounds (which set their own direction) are unchanged.
+fn compile(
+    node: &Node,
+    prog: &mut Vec<Inst>,
+    nmarks: &mut usize,
+    backward: bool,
+) -> Result<(), String> {
+    with_pattern_stack(|| compile_node(node, prog, nmarks, backward))
+}
+
+fn compile_node(
+    node: &Node,
+    prog: &mut Vec<Inst>,
+    nmarks: &mut usize,
+    backward: bool,
+) -> Result<(), String> {
     match node {
         Node::Empty => {}
         Node::Char(c) => prog.push(Inst::Char(*c)),
@@ -4108,12 +4223,18 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
                 opt(add.1, remove.1),
                 opt(add.2, remove.2),
             ));
-            compile(inner, prog, nmarks)?;
+            compile(inner, prog, nmarks, backward)?;
             prog.push(Inst::PopFlags);
         }
         Node::Concat(v) => {
-            for n in v {
-                compile(n, prog, nmarks)?;
+            if backward {
+                for n in v.iter().rev() {
+                    compile(n, prog, nmarks, backward)?;
+                }
+            } else {
+                for n in v {
+                    compile(n, prog, nmarks, backward)?;
+                }
             }
         }
         Node::Alt(v) => {
@@ -4123,13 +4244,13 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
                     let sp = prog.len();
                     prog.push(Inst::Split(0, 0));
                     let a_start = prog.len();
-                    compile(alt, prog, nmarks)?;
+                    compile(alt, prog, nmarks, backward)?;
                     jmp_ends.push(prog.len());
                     prog.push(Inst::Jmp(0));
                     let next = prog.len();
                     prog[sp] = Inst::Split(a_start, next);
                 } else {
-                    compile(alt, prog, nmarks)?;
+                    compile(alt, prog, nmarks, backward)?;
                 }
             }
             let end = prog.len();
@@ -4141,14 +4262,15 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
             if let Some(i) = idx {
                 prog.push(Inst::Save(2 * i));
             }
-            compile(inner, prog, nmarks)?;
+            compile(inner, prog, nmarks, backward)?;
             if let Some(i) = idx {
                 prog.push(Inst::Save(2 * i + 1));
             }
         }
         Node::Look(negate, inner) => {
+            // A lookahead body always matches forward, even inside a lookbehind.
             let mut sub = Vec::new();
-            compile(inner, &mut sub, nmarks)?;
+            compile(inner, &mut sub, nmarks, false)?;
             sub.push(Inst::Match);
             prog.push(Inst::Look {
                 negate: *negate,
@@ -4156,9 +4278,9 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
             });
         }
         Node::LookBehind(negate, inner) => {
-            // The body is compiled from the REVERSED AST and executed right-to-left.
+            // The body is compiled backward and executed right-to-left.
             let mut sub = Vec::new();
-            compile(&reverse_node(inner), &mut sub, nmarks)?;
+            compile(inner, &mut sub, nmarks, true)?;
             sub.push(Inst::Match);
             prog.push(Inst::LookBehind {
                 negate: *negate,
@@ -4166,7 +4288,7 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, nmarks: &mut usize) -> Result<(), 
             });
         }
         Node::Repeat(inner, min, max, greedy) => {
-            compile_repeat(inner, *min, *max, *greedy, prog, nmarks)?
+            compile_repeat(inner, *min, *max, *greedy, prog, nmarks, backward)?
         }
     }
     Ok(())
@@ -4192,6 +4314,7 @@ fn compile_counted_repeat(
     greedy: bool,
     prog: &mut Vec<Inst>,
     nmarks: &mut usize,
+    backward: bool,
 ) -> Result<(), String> {
     let span = cap_span(inner);
     let counter = *nmarks;
@@ -4201,7 +4324,7 @@ fn compile_counted_repeat(
         if let Some((lo, hi)) = span {
             prog.push(Inst::ClearCaps(lo, hi));
         }
-        compile(inner, prog, nmarks)
+        compile(inner, prog, nmarks, backward)
     };
     prog.push(Inst::CounterReset(counter));
     let head = prog.len();
@@ -4235,6 +4358,7 @@ fn compile_repeat(
     greedy: bool,
     prog: &mut Vec<Inst>,
     nmarks: &mut usize,
+    backward: bool,
 ) -> Result<(), String> {
     // A variable-length UnicodeSets atom needs explicit heap state: compiling it through the
     // general Split/SetMark loop recurses once per matched string and exhausts the native matcher
@@ -4263,7 +4387,7 @@ fn compile_repeat(
     // keeps short counted loops straight-line. ECMA-262 places no bound on the counts, so larger
     // ones run as a counted loop whose program size doesn't depend on them.
     if min > MAX_REPEAT || max.is_some_and(|m| m > MAX_REPEAT) {
-        return compile_counted_repeat(inner, min, max, greedy, prog, nmarks);
+        return compile_counted_repeat(inner, min, max, greedy, prog, nmarks, backward);
     }
     // RepeatMatcher clears the captures inside the atom at the start of every iteration.
     let span = cap_span(inner);
@@ -4271,7 +4395,7 @@ fn compile_repeat(
         if let Some((lo, hi)) = span {
             prog.push(Inst::ClearCaps(lo, hi));
         }
-        compile(inner, prog, nmarks)
+        compile(inner, prog, nmarks, backward)
     };
     for _ in 0..min {
         body_with_clear(prog, nmarks)?;
@@ -4329,33 +4453,13 @@ fn compile_repeat(
     Ok(())
 }
 
-/// The AST with every concatenation reversed, so a forward compile of the result consumed
-/// right-to-left implements backwards matching. Alternative ORDER is preserved; nested
-/// lookarounds keep their own orientation (their compile handles direction independently).
-fn reverse_node(node: &Node) -> Node {
-    match node {
-        Node::Concat(v) => Node::Concat(v.iter().rev().map(reverse_node).collect()),
-        Node::Alt(v) => Node::Alt(v.iter().map(reverse_node).collect()),
-        Node::Group(idx, inner) => Node::Group(*idx, Box::new(reverse_node(inner))),
-        Node::Repeat(inner, min, max, greedy) => {
-            Node::Repeat(Box::new(reverse_node(inner)), *min, *max, *greedy)
-        }
-        Node::Modifier { add, remove, inner } => Node::Modifier {
-            add: *add,
-            remove: *remove,
-            inner: Box::new(reverse_node(inner)),
-        },
-        other => other.clone(),
-    }
-}
-
 /// The min/max capture-group indices inside `node`, if any (for per-iteration capture resets).
 fn cap_span(node: &Node) -> Option<(usize, usize)> {
     let merge = |a: Option<(usize, usize)>, b: Option<(usize, usize)>| match (a, b) {
         (Some((l1, h1)), Some((l2, h2))) => Some((l1.min(l2), h1.max(h2))),
         (x, None) | (None, x) => x,
     };
-    match node {
+    with_pattern_stack(|| match node {
         Node::Group(idx, inner) => merge(idx.map(|i| (i, i)), cap_span(inner)),
         Node::Concat(v) | Node::Alt(v) => v.iter().fold(None, |acc, n| merge(acc, cap_span(n))),
         Node::Repeat(inner, ..)
@@ -4363,12 +4467,12 @@ fn cap_span(node: &Node) -> Option<(usize, usize)> {
         | Node::LookBehind(_, inner)
         | Node::Modifier { inner, .. } => cap_span(inner),
         _ => None,
-    }
+    })
 }
 
 /// The largest numeric back reference in the pattern (0 when there are none).
 fn max_backref(node: &Node, out: &mut usize) {
-    match node {
+    with_pattern_stack(|| match node {
         Node::Backref(n) => *out = (*out).max(*n),
         Node::Concat(items) | Node::Alt(items) => {
             for n in items {
@@ -4381,7 +4485,7 @@ fn max_backref(node: &Node, out: &mut usize) {
         | Node::LookBehind(_, inner)
         | Node::Modifier { inner, .. } => max_backref(inner, out),
         _ => {}
-    }
+    })
 }
 
 /// Replace each `\k<name>` (`Node::NamedBackref`) with the numeric `Backref` of its group. Names are
@@ -4398,7 +4502,7 @@ fn collect_group_names(
     names: &[(String, usize)],
 ) -> Result<std::collections::HashSet<String>, String> {
     use std::collections::HashSet;
-    match node {
+    with_pattern_stack(|| match node {
         Node::Group(idx, inner) => {
             let mut s = collect_group_names(inner, names)?;
             if let Some(idx) = idx {
@@ -4433,11 +4537,11 @@ fn collect_group_names(
             Ok(union)
         }
         _ => Ok(std::collections::HashSet::new()),
-    }
+    })
 }
 
 fn resolve_named_backrefs(node: &mut Node, names: &[(String, usize)]) {
-    match node {
+    with_pattern_stack(|| match node {
         Node::NamedBackref(name) => {
             let idxs: Vec<usize> = names
                 .iter()
@@ -4459,7 +4563,7 @@ fn resolve_named_backrefs(node: &mut Node, names: &[(String, usize)]) {
         | Node::LookBehind(_, inner)
         | Node::Modifier { inner, .. } => resolve_named_backrefs(inner, names),
         _ => {}
-    }
+    })
 }
 
 /// If `node` matches exactly one code point, return it as a `Rep` (for the `Inst::Many` fast path).
@@ -6449,6 +6553,70 @@ mod internal_engine_diagnostics {
                 .map(|captures| captures.to_vec());
             assert_eq!(found, Some(expected), "/{pattern}/{flags}");
         }
+    }
+
+    #[test]
+    fn deeply_nested_patterns_compile_on_a_small_stack_or_fail_cleanly() {
+        // The parser, the compiler and the other passes over the pattern tree recurse once per
+        // nesting level. At the nesting limits every form compiles and matches on a small native
+        // stack, which they grow on demand; one level deeper is a SyntaxError, never a stack
+        // overflow.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let control = crate::RuntimeInterrupt::default();
+                let depth = super::MAX_PATTERN_NESTING;
+                let looks = super::MAX_LOOKAROUND_NESTING;
+                let named: String = (0..depth).map(|i| format!("(?<g{i}>")).collect();
+                let cases = [
+                    ("(".repeat(depth) + "a" + &")".repeat(depth), "", "(", ")"),
+                    (
+                        "(?:".repeat(depth) + "a" + &")*".repeat(depth),
+                        "",
+                        "(?:",
+                        ")",
+                    ),
+                    (
+                        "(?i:".repeat(depth) + "a" + &")".repeat(depth),
+                        "",
+                        "(?:",
+                        ")",
+                    ),
+                    (named + "a" + &")".repeat(depth), "", "(?:", ")"),
+                    ("[".repeat(depth) + "a" + &"]".repeat(depth), "v", "[", "]"),
+                    (
+                        "(?=".repeat(looks) + "a" + &")".repeat(looks),
+                        "",
+                        "(?!",
+                        ")",
+                    ),
+                    (
+                        "(?<=".repeat(looks) + "a" + &")".repeat(looks) + "b",
+                        "",
+                        "(?<!",
+                        ")",
+                    ),
+                ];
+                for (pattern, flags, open, close) in cases {
+                    let re = super::Regex::new(&pattern, flags)
+                        .unwrap_or_else(|error| panic!("{flags}: {error}"));
+                    let input = crate::lstr::LStr::from("ab");
+                    let text = super::ReText::new_rc(flags.contains('v'), &input);
+                    assert!(
+                        matches!(re.exec_text_shared(&text, 0, &control), Ok(Some(_))),
+                        "{flags} {open}"
+                    );
+                    let deeper = format!("{open}{pattern}{close}");
+                    assert_eq!(
+                        super::Regex::new(&deeper, flags).err().as_deref(),
+                        Some("regular expression is nested too deeply"),
+                        "{flags} {open}"
+                    );
+                }
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("nested patterns on a small stack");
     }
 
     #[test]

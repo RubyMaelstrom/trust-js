@@ -52,3 +52,36 @@ fn backtracking_restores_lookaround_and_iteration_captures() {
         r#"[["a",null],["a",null],["ab",null,"b"],["ab",null]]"#,
     );
 }
+
+/// Deeply nested patterns are an implementation limit: past it, a SyntaxError rather than a
+/// native stack overflow. Patterns at the limit compile and match (node gives the same results
+/// for them).
+#[test]
+fn deeply_nested_patterns_are_syntax_errors_not_crashes() {
+    check(
+        r#"
+        function attempt(source, flags, subject) {
+            try {
+                var match = new RegExp(source, flags).exec(subject);
+                return match ? match.length + ':' + match.index : 'null';
+            } catch (error) {
+                return error.name;
+            }
+        }
+        function nest(open, body, close, depth) {
+            return open.repeat(depth) + body + close.repeat(depth);
+        }
+        [
+            attempt(nest('(', 'a', ')', 1000), '', 'a'),
+            attempt(nest('(?:', 'a', ')*', 1000), '', 'aa'),
+            attempt(nest('[', 'a', ']', 1000), 'v', 'a'),
+            attempt(nest('(?<=', 'a', ')', 128) + 'b', '', 'ab'),
+            attempt(nest('(', 'a', ')', 100000), '', 'a'),
+            attempt(nest('(?:', 'a', ')*', 100000), '', 'a'),
+            attempt(nest('[', 'a', ']', 100000), 'v', 'a'),
+            attempt(nest('(?=', 'a', ')', 100000), '', 'a'),
+        ].join()
+        "#,
+        "1001:0,1:0,1:0,1:1,SyntaxError,SyntaxError,SyntaxError,SyntaxError",
+    );
+}
