@@ -14806,6 +14806,30 @@ fn detached_typedarray() {
         "9,9,9"
     );
 }
+/// DetachArrayBuffer asserts its argument is not a SharedArrayBuffer, and a Shared Data Block
+/// cannot be detached. `$262.detachArrayBuffer` refuses one with a TypeError and leaves the
+/// buffer and its existing views intact; it used to zero the views while the buffer, new views
+/// and DataViews kept reporting the shared bytes.
+#[test]
+fn test262_detach_refuses_shared_array_buffers() {
+    use crate::bytecode::Tier;
+    let source = "var sab = new SharedArrayBuffer(8), view = new Int32Array(sab), out = [];
+view[1] = 7;
+try { $262.detachArrayBuffer(sab); out.push('detached'); } catch (e) { out.push(e.name); }
+out.push(sab.byteLength, view.length, view[1], Atomics.load(view, 1),
+         new Int32Array(sab).length, new DataView(sab).getInt32(4, true));
+out.join(',')";
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "TypeError,8,2,7,7,2,7",
+            "tier {tier:?}"
+        );
+    }
+}
 #[test]
 fn ta_index_properties() {
     assert_eq!(

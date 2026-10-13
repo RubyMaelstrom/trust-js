@@ -70,6 +70,11 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
         if let Value::Obj(o) = arg(args, 0) {
             let p = Rc::as_ptr(&o) as usize;
+            // DetachArrayBuffer asserts IsSharedArrayBuffer is false: a Shared Data Block cannot be
+            // detached, so refuse instead of leaving the buffer half detached.
+            if i.shared_buffers.contains_key(&p) {
+                return Err(i.make_error("TypeError", "Cannot detach a SharedArrayBuffer"));
+            }
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
             i.invalidate_native_buffer(p);
             i.array_buffers.remove(&p);
