@@ -269,6 +269,86 @@ fn numeric_typed_array_access_preserves_exotic_semantics_in_all_tiers() {
     }
 }
 
+/// `length`, `byteLength`, `byteOffset` and `buffer` are %TypedArray.prototype% accessors and
+/// BYTES_PER_ELEMENT a prototype data property: a TypedArray's [[Get]] answers them directly only
+/// where OrdinaryGet would reach those intrinsics, and own properties of those names are
+/// ordinary own properties. Expected values are node's.
+#[test]
+fn typed_array_accessor_reads_follow_the_prototype_chain_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        class V extends Float32Array {
+            get length() { return 99; } get byteLength() { return 98; }
+            get byteOffset() { return 97; } get buffer() { return 'buf'; } }
+        var v = new V(4);
+        t(function () { return [v.length, v.byteLength, v.byteOffset, v.buffer, v.BYTES_PER_ELEMENT]; });
+        var orphan = Object.setPrototypeOf(new Int16Array(2), null);
+        t(function () { return [orphan.length, orphan.byteLength, orphan.buffer, orphan.BYTES_PER_ELEMENT]; });
+        var u = new Uint8Array(3), f = new Float64Array(3);
+        t(function () { return [u.length, u.byteLength, u.byteOffset, u.buffer instanceof ArrayBuffer]; });
+        t(function () { return Reflect.get(u, 'length', f) + '/' + Reflect.get(u, 'byteLength', f); });
+        t(function () { return Reflect.get(u, 'length', {}); });
+        t(function () { return Object.create(u).length; });
+        var TAP = Object.getPrototypeOf(Uint8Array.prototype);
+        var lengthGet = Object.getOwnPropertyDescriptor(TAP, 'length');
+        var byteLengthGet = Object.getOwnPropertyDescriptor(TAP, 'byteLength').get;
+        Object.defineProperty(TAP, 'length', {
+            get() { return 'patched:' + lengthGet.get.call(this); }, configurable: true });
+        t(function () { return u.length + '/' + new Float64Array(2).length; });
+        Object.defineProperty(TAP, 'length', lengthGet);
+        class S extends Int16Array {}
+        Object.defineProperty(S.prototype, 'length', { get: byteLengthGet });
+        Object.defineProperty(S.prototype, 'BYTES_PER_ELEMENT', { value: 's' });
+        t(function () { return new S(5).length + '/' + new S(1).BYTES_PER_ELEMENT; });
+        Object.defineProperty(Uint16Array.prototype, 'byteLength', { value: 'own-data' });
+        t(function () { return new Uint16Array(4).byteLength; });
+        var proxied = Object.setPrototypeOf(new Int8Array(5),
+            new Proxy({}, { get(target, key) { return 'proxy:' + String(key); } }));
+        t(function () { return proxied.length + '/' + proxied.byteOffset; });
+        var z = new Int8Array(2);
+        Object.defineProperty(z, 'length', { value: 9, enumerable: true, configurable: true });
+        Object.defineProperty(z, 'buffer', { value: 8, enumerable: false, configurable: true });
+        z.extra = 1;
+        t(function () { return [z.length, z.buffer, Object.keys(z).join('/'),
+            Object.getOwnPropertyNames(z).join('/'), JSON.stringify(Object.entries(z))].join(' '); });
+        function hot(a) { var s = 0; for (var i = 0; i < 300; i++) s += a.length + a.byteLength; return s; }
+        t(function () { return [hot(new Uint8Array(2)), hot(v), hot(orphan)].join('/'); });
+        // Changes after warm reads: a concrete prototype's own accessor, its [[Prototype]], and
+        // the intrinsic holder's keys.
+        function last(a, key) { var r; for (var i = 0; i < 300; i++) r = a[key]; return r; }
+        var w = new Int32Array(2);
+        hot(w);
+        Object.defineProperty(Int32Array.prototype, 'length', {
+            get() { return 'concrete'; }, configurable: true });
+        t(function () { return w.length + '/' + last(w, 'length'); });
+        delete Int32Array.prototype.length;
+        Object.setPrototypeOf(Int32Array.prototype, null);
+        t(function () { return w.length + '/' + last(w, 'buffer'); });
+        Object.setPrototypeOf(Int32Array.prototype, TAP);
+        var byteOffsetDesc = Object.getOwnPropertyDescriptor(TAP, 'byteOffset');
+        delete TAP.byteOffset;
+        t(function () { return w.byteOffset + '/' + last(w, 'length'); });
+        Object.defineProperty(TAP, 'byteOffset', byteOffsetDesc);
+        t(function () { return last(w, 'byteOffset') + '/' + hot(w); });
+        out.join(';')
+    "#;
+    let expected = "99,98,97,buf,4;,,,;3,3,0,true;3/24;TypeError;TypeError;patched:3/patched:2;\
+        10/s;own-data;proxy:length/proxy:byteOffset;\
+        9 8 0/1/length/extra 0/1/length/buffer/extra [[\"0\",0],[\"1\",0],[\"length\",9],[\"extra\",1]];\
+        1200/59100/NaN;concrete/concrete;undefined/undefined;undefined/2;0/3000";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "tier {tier:?}");
+    }
+}
+
 #[cfg(feature = "embed")]
 #[test]
 fn fragmented_array_buffer_writes_preserve_host_synchronization() {
@@ -2034,6 +2114,163 @@ fn await_allocates_no_reaction_functions_or_result_promise() {
     let per_await =
         (crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before) as f64 / 4000.0;
     assert!(per_await < 1.5, "{per_await} objects allocated per await");
+}
+
+/// Promise.prototype.then whose SpeciesConstructor is provably %Promise% skips the generic
+/// NewPromiseCapability (an executor, resolving functions and a capability record): only the
+/// result promise is allocated. Every author-visible step of the generic path (an own or
+/// inherited accessor `constructor`, a replaced or deleted @@species, a subclass) still runs.
+#[test]
+fn promise_then_with_the_intrinsic_species_allocates_only_its_result() {
+    let mut engine = Engine::new();
+    run_in(
+        &mut engine,
+        "var pending = new Promise(function () {}); function f() {} pending.then(f);",
+    );
+    let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
+    run_in(
+        &mut engine,
+        "for (var i = 0; i < 4000; i++) pending.then(f);",
+    );
+    let per_then =
+        (crate::value::heap_allocated_objects(&engine.interp.gc_heap) - before) as f64 / 4000.0;
+    assert!(per_then < 1.5, "{per_then} objects allocated per then");
+
+    // Expected values are node's.
+    let source = r#"
+        var log = [];
+        function note(s) { log.push(s); }
+        var P = Promise, PP = Promise.prototype;
+        var species = Object.getOwnPropertyDescriptor(P, Symbol.species);
+        var r = P.resolve(1).then(function (v) { note('a' + v); return v + 1; });
+        note(Object.getPrototypeOf(r) === PP);
+        r.then(function (v) { note('b' + v); });
+        var p1 = P.resolve(2);
+        Object.defineProperty(p1, 'constructor', { get() { note('own'); return P; } });
+        p1.then(function (v) { note('c' + v); });
+        class Sub extends P {}
+        PP.constructor = Sub;
+        note(P.resolve(3).then(function (v) { note('d' + v); }) instanceof Sub);
+        PP.constructor = P;
+        Object.defineProperty(PP, 'constructor', {
+            get() { note('proto'); return P; }, configurable: true });
+        P.resolve(4).then(function () {});
+        Object.defineProperty(PP, 'constructor', {
+            value: P, writable: true, enumerable: false, configurable: true });
+        Object.defineProperty(P, Symbol.species, {
+            get() { note('species'); return undefined; }, configurable: true });
+        note(Object.getPrototypeOf(P.resolve(5).then(function (v) { note('e' + v); })) === PP);
+        delete P[Symbol.species];
+        Object.defineProperty(Function.prototype, Symbol.species, {
+            get() { note('inherited'); return Sub; }, configurable: true });
+        note(P.resolve(6).then(function () {}) instanceof Sub);
+        delete Function.prototype[Symbol.species];
+        Object.defineProperty(P, Symbol.species, species);
+        var p5 = P.resolve(7);
+        Object.setPrototypeOf(p5, Sub.prototype);
+        note(p5.then(function (v) { note('f' + v); }) instanceof Sub);
+        note(Sub.resolve(8).then(function (v) { note('g' + v); }) instanceof Sub);
+        P.reject(9).then(null, function (e) { note('h' + e); return 'x'; })
+            .then(function (v) { note('i' + v); });
+        P.resolve(10).then(function () { return { then(res) { note('thenable'); res(11); } }; })
+            .then(function (v) { note('j' + v); });
+        log.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "true,own,true,proto,species,true,inherited,true,true,true",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "log.join()"),
+            "true,own,true,proto,species,true,inherited,true,true,true,\
+             a1,c2,d3,e5,f7,g8,h9,b2,ix,thenable,j11",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Well-known Symbols are the Agent's (ECMA-262 §6.1.5.1) and %Promise%/%AggregateError% are
+/// intrinsics: replacing or watching the global `Symbol`, `Promise`, `AggregateError` and `Intl`
+/// bindings changes neither ToPrimitive, Object.prototype.toString, the iterator protocol, a
+/// later Realm's or module namespace's symbols, nor Promise.prototype.then/finally/Promise.any.
+#[test]
+fn engine_reaches_well_known_symbols_and_intrinsics_without_global_bindings() {
+    let source = r#"
+        var out = [];
+        var S = Symbol, iter = Symbol.iterator, tag = Symbol.toStringTag;
+        class Tagged { get [Symbol.toStringTag]() { return 'Tagged'; } }
+        var prim = { [Symbol.toPrimitive](hint) { return hint === 'number' ? 42 : hint; } };
+        var P = Promise, AE = AggregateError, settled = "", hits = 0;
+        function note() { for (var i = 0; i < arguments.length; i++) settled += arguments[i] + ","; }
+        globalThis.Symbol = function () { throw new Error('global Symbol read'); };
+        Object.defineProperty(globalThis, 'Promise', {
+            get() { hits++; return P; }, configurable: true });
+        globalThis.AggregateError = function () { throw new Error('global AggregateError read'); };
+        globalThis.Intl = undefined;
+        out.push(prim + 1, `${prim}`, +prim);
+        out.push([new Map, P.resolve(), new Tagged, new Set, function* () {}()]
+            .map(function (o) { return Object.prototype.toString.call(o); }).join());
+        out.push([...new Set([1, 2])].join(), Array.from(new Map([[3, 4]])).join());
+        var [a, b] = 'xy';
+        out.push(a + b, (1234.5).toLocaleString('en-US'));
+        var other = $262.createRealm().global;
+        out.push(other.Symbol.iterator === iter, other.Symbol.toStringTag === tag);
+        P.resolve(1).then(function (v) { note('then' + v); });
+        P.resolve(2).finally(function () { note('finally'); });
+        P.reject(3).catch(function (v) { note('catch' + v); });
+        Object.defineProperty(Array.prototype, '0', {
+            set(v) { throw new Error('errors used Set'); }, configurable: true });
+        // "A newly created AggregateError object" has no own `message` (V8 adds one).
+        P.any([P.reject(4), P.reject(5)]).catch(function (e) {
+            note(e instanceof AE, e.constructor === AE, Object.hasOwn(e, 'message'),
+                e.errors.join('+'), Object.getOwnPropertyDescriptor(e, 'errors').enumerable);
+        });
+        P.any([]).catch(function (e) { note(e instanceof AE, e.errors.length); });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "default1,string,42,[object Map],[object Promise],[object Tagged],[object Set],\
+             [object Generator],1,2,3,4,xy,1,234.5,true,true",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "delete Array.prototype[0]; settled + ';' + hits"
+            ),
+            "then1,finally,catch3,true,0,true,true,false,4+5,false,;0",
+            "{tier:?}"
+        );
+    }
+    // A module namespace created after `Symbol` is replaced still gets its @@toStringTag.
+    let mut engine = Engine::new();
+    run_in(&mut engine, "globalThis.Symbol = undefined;");
+    engine
+        .eval_module(
+            "import * as ns from '/dep.js'; globalThis.nsTag = Object.prototype.toString.call(ns);",
+            "/main.js",
+            |spec, _| (spec == "/dep.js").then(|| (spec.to_string(), "export var x;".to_string())),
+        )
+        .unwrap();
+    assert_eq!(run_in(&mut engine, "nsTag"), "[object Module]");
 }
 
 /// The live-object ceiling is an engine setting: retention below it succeeds, retention above it
@@ -13320,6 +13557,59 @@ fn annexb_block_functions_use_vm_continuations_and_keep_distinct_bindings() {
     }
 }
 
+/// FunctionDeclarationInstantiation's Annex B step (ECMA-262 §10.2.11, web-compat insertion
+/// point) is blocked only by formal parameter names and creates no var binding named
+/// `arguments`: evaluating a block function of that name sets the VariableEnvironment's
+/// `arguments` (the arguments object's binding) or creates one there. Expected values are
+/// node's, except the arrow, where V8 still creates an undefined var binding up front.
+#[test]
+fn annexb_block_function_named_arguments_replaces_the_arguments_object_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        t(function () { { function arguments() {} } return typeof arguments; });
+        t(function (x) { { function arguments() {} } return x + typeof arguments; });
+        t(function (..._) { { function arguments() {} } return typeof arguments; });
+        t(function (arguments) { { function arguments() {} } return typeof arguments; });
+        t(function () { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; });
+        t(function () { { var b = typeof arguments; function arguments() {} } return b; });
+        t(function () { if (true) function arguments() { return 7; } return arguments(); });
+        t(function () { if (false) { function arguments() {} } return typeof arguments; });
+        t(function () { switch (1) { case 1: function arguments() {} } return typeof arguments; });
+        t(function () { return (function (x) { arguments[0] = 9; { function arguments() {} } return x; })(1); });
+        t(function () { function arguments() {} { function arguments() { return 2; } } return arguments(); });
+        t(function () { let r = typeof arguments; { let arguments; { function arguments() {} } } return r + typeof arguments; });
+        t(function () { eval('{ function arguments() {} }'); return typeof arguments; });
+        t(function () { return (() => { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; })(); });
+        t(function () { function g(a = () => arguments) { { function arguments() {} } return typeof a() + typeof arguments; } return g(); });
+        t(function () { function* gen() { var b = typeof arguments; { function arguments() {} } yield b + typeof arguments; } return gen().next().value; });
+        var asyncResult;
+        (async function () { var b = typeof arguments; { function arguments() {} } return b + typeof arguments; })()
+            .then(function (v) { asyncResult = v; });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "function,undefinedfunction,function,undefined,objectfunction,function,7,object,\
+             function,9,2,objectobject,function,objectfunction,objectfunction,objectfunction",
+            "{tier:?}"
+        );
+        assert_eq!(
+            run_in(&mut engine, "asyncResult"),
+            "objectfunction",
+            "{tier:?}"
+        );
+    }
+}
+
 #[test]
 fn jit_iterator_abort_unwinds_only_live_operands() {
     let mut engine = Engine::new();
@@ -15026,6 +15316,43 @@ fn number_tostring_spec() {
         assert_eq!(run(&format!("({src})+''")), want, "({src})+''");
     }
 }
+/// When two shortest digit strings round-trip, Number::toString prints the one closest to the
+/// value, an even one on a tie (ECMA-262 §6.1.6.1.20 NOTE 2), as V8 does: String, JSON,
+/// property keys and toExponential() agree. Expected values are node's.
+#[test]
+fn number_to_string_picks_the_closest_shortest_digits_in_all_tiers() {
+    let source = r#"
+        var xs = [29275894.1650390625, 2 ** -25, 9.425454303262663e13, -9.006362915039062,
+            0.6435928344726562, -10.831863403320312, 0.1 + 0.2, 5e-324, 1.7976931348623157e308,
+            123456789012345680000, 1e21, 1.5e-7];
+        [xs.map(function (x) { return String(x); }).join(), JSON.stringify(xs),
+         xs.map(function (x) { return x.toExponential(); }).join(),
+         Object.keys({ [xs[0]]: 1 })[0]].join('|')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "29275894.165039062,2.9802322387695312e-8,94254543032626.62,-9.006362915039062,\
+             0.6435928344726562,-10.831863403320312,0.30000000000000004,5e-324,\
+             1.7976931348623157e+308,123456789012345680000,1e+21,1.5e-7|\
+             [29275894.165039062,2.9802322387695312e-8,94254543032626.62,-9.006362915039062,\
+             0.6435928344726562,-10.831863403320312,0.30000000000000004,5e-324,\
+             1.7976931348623157e+308,123456789012345680000,1e+21,1.5e-7]|\
+             2.9275894165039062e+7,2.9802322387695312e-8,9.425454303262662e+13,\
+             -9.006362915039062e+0,6.435928344726562e-1,-1.0831863403320312e+1,\
+             3.0000000000000004e-1,5e-324,1.7976931348623157e+308,1.2345678901234568e+20,1e+21,\
+             1.5e-7|29275894.165039062",
+            "{tier:?}"
+        );
+    }
+}
 #[test]
 fn number_methods_fixed() {
     let cases = [
@@ -15066,6 +15393,77 @@ fn number_methods_fixed() {
     ];
     for (src, want) in cases {
         assert_eq!(run(src), want, "{src}");
+    }
+}
+/// toPrecision and toExponential pick the larger n on an exact tie of the binary value
+/// (ECMA-262 §21.1.3.5 step 10.b, §21.1.3.2 step 10.b), not core's ties-to-even. Expected
+/// values are node's.
+#[test]
+fn number_precision_and_exponential_round_exact_ties_up_in_all_tiers() {
+    let source = "[(2.5).toPrecision(1), (0.125).toPrecision(2), (-2.5).toPrecision(1), \
+         (9.5).toPrecision(1), (99.95).toPrecision(3), (1.45).toPrecision(2), \
+         (5e-324).toPrecision(3), (1.7976931348623157e308).toPrecision(1), \
+         (0.000001).toPrecision(2), (20612.890625).toPrecision(10), (2 ** -25).toPrecision(17), \
+         (123.456).toPrecision(21), (1.25).toExponential(1), (1.35).toExponential(1), \
+         (0.5).toExponential(0), (9.95).toExponential(1), (5e-324).toExponential(2), \
+         (-1.5).toExponential(0)].join()";
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "3,0.13,-3,1e+1,100,1.4,4.94e-324,2e+308,0.0000010,20612.89063,\
+             2.9802322387695313e-8,123.456000000000003070,1.3e+0,1.4e+0,5e-1,9.9e+0,4.94e-324,\
+             -2e+0",
+            "{tier:?}"
+        );
+    }
+}
+/// toPrecision, toFixed and toExponential range-check ToIntegerOrInfinity of their argument, in
+/// the specification's step order relative to a non-finite receiver (ECMA-262 §21.1.3.5,
+/// §21.1.3.3, §21.1.3.2). Expected values are node's.
+#[test]
+fn number_formatting_arguments_are_integers_before_their_range_checks_in_all_tiers() {
+    let source = r#"
+        var out = [];
+        function t(f) { try { out.push(String(f())); } catch (e) { out.push(e.constructor.name); } }
+        t(function () { return (1).toPrecision(100.5).length; });
+        t(function () { return (1).toPrecision(0.5); });
+        t(function () { return (1).toPrecision(-0.5); });
+        t(function () { return (1).toPrecision(1.9); });
+        t(function () { return (NaN).toPrecision(0); });
+        t(function () { return (-Infinity).toPrecision(1000); });
+        t(function () { return (1).toPrecision(NaN); });
+        t(function () { return (1).toPrecision({ valueOf() { out.push('valueOf'); return 2; } }); });
+        t(function () { return (1).toFixed(100.9).length; });
+        t(function () { return (NaN).toFixed(101); });
+        t(function () { return (Infinity).toFixed(-1); });
+        t(function () { return (1).toExponential(100.9).length; });
+        t(function () { return (NaN).toExponential(101); });
+        t(function () { return (Infinity).toExponential(-1); });
+        t(function () { return (1).toExponential(-0.5); });
+        t(function () { return (1).toFixed(-0.5); });
+        out.join()
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "101,RangeError,RangeError,1,NaN,-Infinity,RangeError,valueOf,1.0,102,RangeError,\
+             RangeError,105,NaN,Infinity,1e+0,1",
+            "{tier:?}"
+        );
     }
 }
 #[test]

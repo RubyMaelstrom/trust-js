@@ -2120,15 +2120,8 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
     });
     // length / byteLength / byteOffset / buffer are accessor getters on %TypedArray.prototype% that
     // brand-check the receiver (calling one on a non-TypedArray is a TypeError).
-    for (name, getter) in [
-        (
-            "length",
-            ta_length_get as fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>,
-        ),
-        ("byteLength", ta_bytelength_get),
-        ("byteOffset", ta_byteoffset_get),
-        ("buffer", ta_buffer_get),
-    ] {
+    for &(accessor, getter) in ta_accessor_getters() {
+        let name = accessor.name();
         let g = it.make_native(&format!("get {name}"), 0, getter);
         ta_proto.borrow_mut().props.insert(
             name,

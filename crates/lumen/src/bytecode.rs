@@ -3862,14 +3862,14 @@ impl CaptureScan {
         // ECMA-262 Annex B.3.2 extends FunctionDeclarationInstantiation with a mutable
         // function-scope binding for each qualifying sloppy block FunctionDeclaration. Reuse the
         // interpreter's shared hoist plan so capture analysis observes exactly the same early-error
-        // and parameter/`arguments` blockers as execution.
-        let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
-        if !func.is_arrow {
-            annexb_blocked.push("arguments".to_string());
-        }
+        // and parameter blockers as execution. A block function named `arguments` gets no such
+        // binding: until it is evaluated, an arrow's `arguments` still names the enclosing one.
+        let annexb_blocked = crate::interpreter::param_bound_names(&func.params);
         for op in crate::interpreter::collect_hoist_ops(body, func.is_strict, &annexb_blocked) {
             if let HoistOp::AnnexB(name, _) = op {
-                names.insert(name);
+                if name != "arguments" {
+                    names.insert(name);
+                }
             }
         }
         self.declare_lexicals(body, &mut names);
@@ -6846,13 +6846,37 @@ fn compile_inner(
             // or its parents for an arrow, so direct reads and nested arrows observe one object.
         }
         // Function-scoped `var`s and hoisted function declarations from the shared hoist plan.
-        let mut annexb_blocked = crate::interpreter::param_bound_names(&func.params);
-        if !func.is_arrow {
-            annexb_blocked.push("arguments".to_string());
-        }
+        let annexb_blocked = crate::interpreter::param_bound_names(&func.params);
         for op in crate::interpreter::collect_hoist_ops(&func.body, func.is_strict, &annexb_blocked)
         {
             match op {
+                HoistOp::AnnexB(name, function) if name == "arguments" => {
+                    // ECMA-262 §10.2.11 (web-compat insertion point) gives a block function named
+                    // `arguments` no var binding: evaluating it sets the VariableEnvironment's
+                    // `arguments` (normally the arguments object's) or creates that binding then,
+                    // which slots cannot express in advance. The tree-walker runs such functions.
+                    // A coroutine's activation already holds the arguments object when the body
+                    // names it and has no parameter expressions, so the chunk resolves `arguments`
+                    // there; other coroutines keep the function block-scoped.
+                    if !is_coroutine {
+                        log_bail("annexb-arguments", "block function named arguments");
+                        return None;
+                    }
+                    if !func.is_arrow
+                        && uses_arguments
+                        && !crate::interpreter::params_have_expr(&func.params)
+                    {
+                        let target = match c.home(&name) {
+                            Some(home) => home,
+                            None => {
+                                c.env_bind(&name, false);
+                                Home::Env(false)
+                            }
+                        };
+                        c.annexb_targets
+                            .insert(Rc::as_ptr(&function) as usize, target);
+                    }
+                }
                 HoistOp::Var(name) => {
                     if prepared_entry {
                         c.env_bind(&name, false);

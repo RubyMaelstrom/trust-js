@@ -327,6 +327,15 @@ pub(crate) fn intl_delegate(
     }
 }
 
+/// The current Realm's %Intl.<service>% constructor, cached when Intl is installed: an
+/// intrinsic, never a read of the global `Intl` binding, which author code may replace.
+pub(crate) fn intl_service(i: &Interp, service: &str) -> Result<Value, Value> {
+    i.extra_protos
+        .get(format!("%Intl.{service}%").as_str())
+        .map(|c| Value::Obj(c.clone()))
+        .ok_or_else(|| i.make_error("TypeError", format!("Intl.{service} is unavailable")))
+}
+
 /// Construct `Intl.<service>(locales, options)` and invoke `method(args…)` on it. Used to route the
 /// `toLocale*`/`localeCompare` methods through the Intl services now that they exist.
 #[cfg(feature = "intl")]
@@ -338,14 +347,7 @@ pub(crate) fn intl_delegate(
     method: &str,
     call_args: &[Value],
 ) -> Result<Value, Value> {
-    // Use the cached intrinsic (immune to tainted Intl globals), falling back to the global.
-    let ctor = match i.extra_protos.get(format!("%Intl.{service}%").as_str()) {
-        Some(c) => Value::Obj(c.clone()),
-        None => {
-            let intl = ab(i.get_member(&Value::Obj(i.global.clone()), "Intl"))?;
-            ab(i.get_member(&intl, service))?
-        }
-    };
+    let ctor = intl_service(i, service)?;
     let inst = ab(i.construct(ctor, &[locales, options]))?;
     let f = ab(i.get_member(&inst, method))?;
     ab(i.call(f, inst, call_args))
@@ -712,13 +714,57 @@ fn ta_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
     ))
 }
 
-const TA_META_KEYS: [&str; 5] = [
-    "length",
-    "byteLength",
-    "byteOffset",
-    "buffer",
-    "BYTES_PER_ELEMENT",
-];
+/// One of the accessor properties of %TypedArray.prototype% whose getter a property read may
+/// answer without calling it (see `Interp::ta_accessor_reached`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TaAccessor {
+    Length,
+    ByteLength,
+    ByteOffset,
+    Buffer,
+}
+
+impl TaAccessor {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            TaAccessor::Length => "length",
+            TaAccessor::ByteLength => "byteLength",
+            TaAccessor::ByteOffset => "byteOffset",
+            TaAccessor::Buffer => "buffer",
+        }
+    }
+}
+
+/// The intrinsic getters of those accessors, as the very function pointers their function
+/// objects hold: separately coerced copies of one function need not share an address, so a
+/// getter is recognized only against the value that was installed.
+pub(crate) fn ta_accessor_getters() -> &'static [(TaAccessor, NativeFn); 4] {
+    static GETTERS: std::sync::OnceLock<[(TaAccessor, NativeFn); 4]> = std::sync::OnceLock::new();
+    GETTERS.get_or_init(|| {
+        [
+            (TaAccessor::Length, ta_length_get as NativeFn),
+            (TaAccessor::ByteLength, ta_bytelength_get),
+            (TaAccessor::ByteOffset, ta_byteoffset_get),
+            (TaAccessor::Buffer, ta_buffer_get),
+        ]
+    })
+}
+
+/// Which intrinsic %TypedArray.prototype% getter (of any Realm) `getter` is. Each computes its
+/// answer from a TypedArray receiver alone, so calling it on one is unobservable.
+pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
+    let Value::Obj(getter) = getter else {
+        return None;
+    };
+    let f = match getter.borrow().call {
+        Callable::Native(f) => f,
+        _ => return None,
+    };
+    ta_accessor_getters()
+        .iter()
+        .find(|(_, installed)| std::ptr::fn_addr_eq(*installed, f))
+        .map(|(accessor, _)| *accessor)
+}
 
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
@@ -1324,6 +1370,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
         }
     } else if let Some(info) = o.as_obj().and_then(|obj| ta_info(i, obj)) {
         // A TypedArray's enumerable own properties are its integer indices (plus any expandos).
+        // Its elements never live in the property map, and `length` etc. are inherited
+        // accessors, so every string key the map holds is an ordinary own property.
         let n = i.ta_len(&info).unwrap_or(0);
         for idx in 0..n {
             let v = i.ta_read(&info, idx);
@@ -1340,11 +1388,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                     .props
                     .ordered_keys()
                     .into_iter()
-                    .filter(|k| {
-                        !Interp::is_sym_key(k)
-                            && k.parse::<usize>().is_err()
-                            && !TA_META_KEYS.contains(&&**k)
-                    })
+                    .filter(|k| !Interp::is_sym_key(k))
                     .collect()
             })
             .unwrap_or_default();
@@ -1711,9 +1755,19 @@ fn set_internal_obj(target: &Value, key: &str, v: Value) {
     }
 }
 
-fn make_aggregate_error(i: &mut Interp, errors: Value) -> Result<Value, Value> {
-    let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "AggregateError"))?;
-    ab(i.construct(ctor, &[errors]))
+/// Promise.any's rejection value (ECMA-262 §27.2.4.3.1 PerformPromiseAny and §27.2.4.3.2
+/// Promise.any Reject Element Functions): "a newly created AggregateError object" of the current
+/// Realm, with no `message`, whose own `errors` is CreateArrayFromList(errors). Nothing here may
+/// consult the global `AggregateError` binding or iterate: `errors` is the combinator's own
+/// fully populated Array, which nothing else can reach.
+fn make_aggregate_error(i: &Interp, errors: Value) -> Value {
+    let error = i.make_error("AggregateError", "");
+    if let Value::Obj(o) = &error {
+        o.borrow_mut()
+            .props
+            .insert("errors", Property::data(errors, true, false, true));
+    }
+    error
 }
 
 /// `Promise.resolve(x)` as a value helper (returns existing promises unchanged).
@@ -3129,17 +3183,10 @@ fn ordered_enum_keys(o: &Gc) -> Vec<Rc<str>> {
         .collect()
 }
 
-/// The property key for `@@toStringTag` (`Symbol.toStringTag`), if Symbol is installed.
-pub(crate) fn to_string_tag_key(i: &Interp) -> Option<String> {
-    let sym = i.global.borrow().props.get("Symbol").map(|p| p.value())?;
-    if let Value::Obj(o) = sym {
-        if let Some(p) = o.borrow().props.get("toStringTag") {
-            if let Value::Sym(d) = p.value() {
-                return Some(Interp::sym_key(&d));
-            }
-        }
-    }
-    None
+/// The property key for `@@toStringTag`, once the well-known Symbols exist. Like every
+/// well-known Symbol it is the Agent's own, never whatever the global `Symbol` now holds.
+pub(crate) fn to_string_tag_key(i: &Interp) -> Option<Rc<str>> {
+    well_known_key(i, "toStringTag")
 }
 
 /// Install a non-enumerable, configurable `@@toStringTag` data property.
@@ -3818,12 +3865,16 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
     let errors = ab(i.get_member(&state, "#\u{0}errors"))?;
-    ab(i.set_member(&errors, &idx.to_string(), reason))?;
+    // Step 9 replaces an element of the errors List: an own data property of the internal
+    // Array, so an inherited Array.prototype index setter never runs.
+    if let Value::Obj(o) = &errors {
+        crate::value::set_data(o, &idx.to_string(), reason);
+    }
     let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
     ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
-        let agg = make_aggregate_error(i, errors)?;
+        let agg = make_aggregate_error(i, errors);
         ab(i.call(reject_fn, Value::Undefined, &[agg]))?;
     }
     Ok(Value::Undefined)
@@ -4209,11 +4260,11 @@ fn install_object(it: &mut Interp) {
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
-            for k in ordered_enum_keys(&o) {
-                if k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&*k) {
-                    keys.push(Value::Str(k.into()));
-                }
-            }
+            keys.extend(
+                ordered_enum_keys(&o)
+                    .into_iter()
+                    .map(|k| Value::Str(k.into())),
+            );
             return Ok(i.make_array(keys));
         }
         let names = ordered_enum_keys(&o);
@@ -4241,16 +4292,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(strs));
         }
-        // A TypedArray's own keys are its integer indices, then any string expandos (the
-        // length/buffer/... metadata are inherited, not own).
+        // A TypedArray's own keys are its integer indices, then any string expandos in insertion
+        // order (the length/buffer/... metadata are inherited, not own).
         if let Some(info) = ta_info(i, &o) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
-            for k in o.borrow().props.keys() {
-                if !Interp::is_sym_key(&k)
-                    && k.parse::<usize>().is_err()
-                    && !TA_META_KEYS.contains(&&*k)
-                {
+            for k in o.borrow().props.ordered_keys() {
+                if !Interp::is_sym_key(&k) && !Interp::is_private_key(&k) {
                     keys.push(Value::Str(k.into()));
                 }
             }
@@ -4818,11 +4866,9 @@ fn to_precision(n: f64, p: usize) -> String {
         };
     }
     let neg = n < 0.0;
-    // `p` significant digits via scientific notation (`d.ddde±E`, the mantissa has exactly `p` digits).
-    let sci = format!("{:.*e}", p - 1, n.abs());
-    let (mantissa, exp_str) = sci.split_once('e').unwrap();
-    let e: i32 = exp_str.parse().unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // `p` significant digits with the spec's tie-breaking, and the exponent of the first.
+    let (digits, e) = exact_significant_digits(n.abs(), p);
+    let digits: String = digits.iter().map(|d| (d + b'0') as char).collect();
     let body = if e < -6 || e >= p as i32 {
         let sign = if e >= 0 { "+" } else { "-" };
         if p == 1 {
@@ -11731,18 +11777,71 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     }
 }
 
-/// Number.prototype.toExponential's digit selection: the exact decimal expansion of the binary
-/// value, rounded to `f` fraction digits with ties away from zero (the spec's "larger n").
-/// `shortest` (fractionDigits undefined) picks the minimal digits that round-trip.
+/// The first `n` (at least one) significant decimal digits of the finite, positive `x`, rounded
+/// from its exact binary value with ties away from zero, and the decimal exponent of the first
+/// digit: `x` is about d₀.d₁…dₙ₋₁ × 10^e. This is the choice of n and e in
+/// Number.prototype.toExponential and toPrecision (ECMA-262 §21.1.3.2 step 10.b, §21.1.3.5
+/// step 10.b): "if there are two such sets of e and n, pick the e and n for which n × 10^(e–f)
+/// is larger". Core's `{:.*e}` rounds such exact ties to even instead.
+fn exact_significant_digits(x: f64, n: usize) -> (Vec<u8>, i32) {
+    debug_assert!(x > 0.0 && x.is_finite() && n >= 1);
+    // A double is an odd integer times 2^e2; with e2 < 0 its decimal expansion ends exactly -e2
+    // places after the point. Asking for every significant digit (one more than the decimal
+    // logarithm promises, which may be one short) formats it without rounding, so the digit
+    // after the cut decides: below 5 rounds down, and anything from 5 on (a tie is a 5 followed
+    // only by zeros) rounds up.
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let significand = match biased {
+        0 => bits & 0xf_ffff_ffff_ffff,
+        _ => bits & 0xf_ffff_ffff_ffff | 1 << 52,
+    };
+    let e2 = if biased == 0 { -1074 } else { biased - 1075 } + significand.trailing_zeros() as i32;
+    let fraction_digits = (-e2).max(0);
+    let exact = (x.log10().floor() as i32 + 1 + fraction_digits).max(0) as usize;
+    let formatted = format!("{x:.*e}", exact.max(n - 1));
+    let (mantissa, exponent) = formatted.split_once('e').unwrap();
+    let mut e: i32 = exponent.parse().unwrap();
+    let mut digits: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    let round_up = digits.get(n).is_some_and(|&d| d >= 5);
+    digits.resize(n, 0);
+    if round_up {
+        match digits.iter().rposition(|&d| d != 9) {
+            Some(k) => {
+                digits[k] += 1;
+                digits[k + 1..].fill(0);
+            }
+            None => {
+                // 9.99… rounds up to 10.0…: one digit more in front, one exponent higher.
+                digits.fill(0);
+                digits[0] = 1;
+                e += 1;
+            }
+        }
+    }
+    (digits, e)
+}
+
+/// Number.prototype.toExponential's digit selection: `f` fraction digits by
+/// [`exact_significant_digits`], or with `shortest` (fractionDigits undefined) the minimal
+/// digits that round-trip.
 fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
     // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
     let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
     let fmt_exp = |exp: i32| format!("e{}{}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    if shortest {
-        let s = format!("{x:e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let exp: i32 = e.parse().unwrap();
-        return format!("{sign}{m}{}", fmt_exp(exp));
+    if shortest && x != 0.0 {
+        // §21.1.3.2 step 10.a leaves the last of the fewest round-trip digits open; take
+        // Number::toString's choice, as V8 does, laid out as d.ddd.
+        let (digits, n) = crate::eval::shortest_digits(x);
+        let m = match digits.as_str().split_at(1) {
+            (first, "") => first.to_string(),
+            (first, rest) => format!("{first}.{rest}"),
+        };
+        return format!("{sign}{m}{}", fmt_exp(n - 1));
     }
     if x == 0.0 {
         let m = if f == 0 {
@@ -11752,37 +11851,7 @@ fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
         };
         return format!("{sign}{m}e+0");
     }
-    // 780 fraction digits is past the longest exact decimal expansion of any f64 mantissa, so the
-    // digits (including everything after the rounding point) are exact.
-    let s = format!("{x:.780e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let mut exp: i32 = e.parse().unwrap();
-    let mut digits: Vec<u8> = m
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    if digits.len() > f + 1 && digits[f + 1] >= 5 {
-        let mut k = f + 1;
-        loop {
-            if k == 0 {
-                digits.insert(0, 1);
-                exp += 1;
-                break;
-            }
-            k -= 1;
-            if digits[k] == 9 {
-                digits[k] = 0;
-            } else {
-                digits[k] += 1;
-                break;
-            }
-        }
-    }
-    digits.truncate(f + 1);
-    while digits.len() < f + 1 {
-        digits.push(0);
-    }
+    let (digits, exp) = exact_significant_digits(x, f + 1);
     let ds: String = digits.iter().map(|d| (d + b'0') as char).collect();
     let m = if f == 0 {
         ds

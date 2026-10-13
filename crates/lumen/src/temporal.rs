@@ -2592,10 +2592,7 @@ pub fn install(it: &mut Interp) {
                         ));
                     }
                 }
-                let intl = i
-                    .get_member(&Value::Obj(i.global.clone()), "Intl")
-                    .map_err(unab)?;
-                let ctor = i.get_member(&intl, "DateTimeFormat").map_err(unab)?;
+                let ctor = crate::builtins::intl_service(i, "DateTimeFormat")?;
                 let dtf = i.construct(ctor, &[locales, options]).map_err(unab)?;
                 let fmt = i.get_member(&dtf, "format").map_err(unab)?;
                 i.call(fmt, dtf, &[this]).map_err(unab)
@@ -2709,10 +2706,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
         .unwrap_or_else(|| tz.to_string());
     set_data(&opts, "timeZone", Value::lstr(tz_canon));
 
-    let intl = i
-        .get_member(&Value::Obj(i.global.clone()), "Intl")
-        .map_err(unab)?;
-    let ctor = i.get_member(&intl, "DateTimeFormat").map_err(unab)?;
+    let ctor = crate::builtins::intl_service(i, "DateTimeFormat")?;
     let dtf = i
         .construct(ctor, &[locales, Value::Obj(opts)])
         .map_err(unab)?;

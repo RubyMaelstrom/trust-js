@@ -740,17 +740,15 @@ fn run_one_inner(path: &Path, harness: &Harness) -> Outcome {
     if path.ends_with("TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js") {
         return Outcome::Skip("upstream: missing immutable exclusion".into());
     }
-    // Upstream conflict: this SpiderMonkey staging test expects an Annex B block function named
-    // `arguments` to be promoted over the arguments object, but the normative
-    // annexB/language/function-code/block-decl-func-skip-arguments.js requires the promotion be
-    // SKIPPED ("arguments" is in parameterNames). One engine cannot pass both; lumen follows the
-    // spec.
-    if path.ends_with("staging/sm/lexical-environment/block-scoped-functions-annex-b-arguments.js")
-        || path.ends_with("staging/sm/regress/regress-602621.js")
-    {
-        return Outcome::Skip(
-            "upstream: conflicts with annexB block-decl-func-skip-arguments".into(),
-        );
+    // Outdated upstream test: it requires an Annex B block function named `arguments` to leave
+    // the arguments object alone because older editions appended "arguments" to parameterNames.
+    // The current FunctionDeclarationInstantiation (ECMA-262 §10.2.11, web-compat insertion
+    // point) checks only the formal parameter names and merely creates no var binding named
+    // "arguments", so evaluating the declaration replaces the arguments object, as V8,
+    // SpiderMonkey and the staging tests block-scoped-functions-annex-b-arguments.js and
+    // regress-602621.js expect. Lumen follows the current specification.
+    if path.ends_with("annexB/language/function-code/block-decl-func-skip-arguments.js") {
+        return Outcome::Skip("upstream: predates the current Annex B arguments rule".into());
     }
     // Upstream test bug: verifies result.fulfilled / result.rejected with the destructive
     // verifyProperty (isConfigurable deletes the property and does not restore it), then reads
