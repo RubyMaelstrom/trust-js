@@ -1363,20 +1363,21 @@ fn errors_have_names() {
 #[test]
 fn regexp_resource_exhaustion_throws_instead_of_becoming_no_match() {
     // RegExpBuiltinExec returns null only for the matcher's failure result. An implementation
-    // limit (here the matcher's native recursion bound) is an abrupt completion, not permission
-    // to silently select the no-match branch.
-    assert_eq!(
-        run(r#"
-            const re = /(?:ab)*c/y;
-            try {
-                re.test("ab".repeat(4000));
-                "returned";
-            } catch (error) {
-                error.name + ":" + re.lastIndex;
-            }
-        "#),
-        "RangeError:0"
-    );
+    // limit (here a lowered ceiling on the matcher's backtracking state) is an abrupt completion,
+    // not permission to silently select the no-match branch.
+    let source = r#"
+        const re = /(?:a|b)*(?=c)/y;
+        try {
+            re.test("ab".repeat(20000)) + ":" + re.lastIndex;
+        } catch (error) {
+            error.name + ":" + re.lastIndex;
+        }
+    "#;
+    crate::regex::set_backtrack_state_limit(1 << 12);
+    let limited = Engine::new().eval(source, false);
+    crate::regex::set_backtrack_state_limit(crate::regex::MAX_BACKTRACK_STATE);
+    assert!(matches!(limited, Ok(Completion::Value(ref value)) if value == "RangeError:0"));
+    assert_eq!(run(source), "false:0");
 }
 
 #[test]

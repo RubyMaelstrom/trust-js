@@ -130,6 +130,8 @@ mod record_enumeration_tests;
 mod regex;
 mod regex_emoji;
 mod regex_fold;
+#[cfg(test)]
+mod regexp_tests;
 #[cfg(all(test, feature = "embed"))]
 mod script_caller_tests;
 #[cfg(test)]
