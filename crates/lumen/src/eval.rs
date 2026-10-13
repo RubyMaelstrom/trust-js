@@ -4908,7 +4908,8 @@ impl Interp {
                 .async_wait_inbox
                 .get_or_insert_with(Default::default)
                 .clone();
-            inbox.wait_until(wake);
+            // A host interruption wakes it too; the poll above then reports it.
+            inbox.wait_until(wake, &self.runtime_interrupt);
         }
         Ok(())
     }

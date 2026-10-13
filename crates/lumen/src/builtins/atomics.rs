@@ -1,7 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
-use crate::interpreter::{AsyncWait, BlockedAgent, Waiter};
+use crate::interpreter::{AsyncWait, BlockedAgent, WaitOutcome, Waiter};
 use std::time::Duration;
 
 /// `Atomics` over integer TypedArrays. A shared buffer's read-modify-write operations hold its
@@ -238,8 +238,19 @@ pub(super) fn install_atomics(it: &mut Interp) {
         if let Err(result) = enqueue_waiter(&info, byte_index, id, expected, Some(waiter)) {
             return Ok(Value::lstr(result));
         }
-        let woken = crate::interpreter::futex_block(&agent, id, byte_index, timeout);
-        Ok(Value::lstr(if woken { "ok" } else { "timed-out" }))
+        let interrupt = i.runtime_interrupt.clone();
+        match crate::interpreter::futex_block(&agent, id, byte_index, timeout, &interrupt) {
+            WaitOutcome::Woken => Ok(Value::lstr("ok")),
+            WaitOutcome::TimedOut => Ok(Value::lstr("timed-out")),
+            // Native dispatch polls the host's control again when this returns and replaces this
+            // placeholder with the non-catchable interruption.
+            WaitOutcome::Interrupted => Err(i.make_error(
+                "Error",
+                interrupt
+                    .current_reason()
+                    .map_or("Atomics.wait was interrupted", |reason| reason.message()),
+            )),
+        }
     });
     it.def_method(&atomics, "notify", 3, |i, _t, a| {
         require_waitable(i, &arg(a, 0))?;

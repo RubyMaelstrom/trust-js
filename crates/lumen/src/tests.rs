@@ -17827,7 +17827,8 @@ out.join(',')"#;
 #[test]
 fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
     use crate::interpreter::{
-        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, BlockedAgent, Waiter,
+        alloc_shared_mem, futex_block, futex_notify, with_waiter_list, BlockedAgent, WaitOutcome,
+        Waiter,
     };
     use std::time::Duration;
     let id = alloc_shared_mem(8);
@@ -17835,10 +17836,13 @@ fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
     with_waiter_list(id, 0, |list| list.push(Waiter::Blocked(taken.clone())));
     // A notify's removal, before it sets the waiter's flag.
     with_waiter_list(id, 0, |list| list.clear());
-    assert!(futex_block(&taken, id, 0, Some(Duration::ZERO)));
+    let interrupt = crate::RuntimeInterrupt::default();
+    let woken = futex_block(&taken, id, 0, Some(Duration::ZERO), &interrupt);
+    assert!(matches!(woken, WaitOutcome::Woken));
     let listed = BlockedAgent::default();
     with_waiter_list(id, 4, |list| list.push(Waiter::Blocked(listed.clone())));
-    assert!(!futex_block(&listed, id, 4, Some(Duration::ZERO)));
+    let timed_out = futex_block(&listed, id, 4, Some(Duration::ZERO), &interrupt);
+    assert!(matches!(timed_out, WaitOutcome::TimedOut));
     // It left its list, so a later notify finds no waiter there.
     assert_eq!(futex_notify(id, 4, -1, None).0, 0);
 }
@@ -26213,6 +26217,81 @@ fn atomics_wait_async_receives_another_agents_notify() {
         run_in(&mut engine, "out + ',' + $262.agent.getReport()"),
         "ok,1"
     );
+}
+
+/// A host interruption stops an agent suspended in Atomics.wait, which cannot poll: a
+/// cancellation wakes it at once (TRust cancels a page thread, then joins it), an armed deadline
+/// when it passes. The script ends interrupted, not with a catchable error, and the waiter leaves
+/// its WaiterList. A host blocked in the agent event loop is woken the same way.
+#[test]
+fn host_interruption_wakes_a_blocked_atomics_wait() {
+    use crate::bytecode::Tier;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    let cancel_soon = |control: &Arc<crate::RuntimeInterrupt>| {
+        let control = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.cancel();
+        })
+    };
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let control = Arc::new(crate::RuntimeInterrupt::default());
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.set_interrupt_handle(control.clone());
+        let canceller = cancel_soon(&control);
+        let started = Instant::now();
+        let outcome = engine
+            .eval_interruptible(
+                "var i32 = new Int32Array(new SharedArrayBuffer(8));
+                 try { Atomics.wait(i32, 0, 0); } catch (e) { 'caught' }",
+                false,
+            )
+            .expect("script parses");
+        canceller.join().expect("canceller thread");
+        assert!(
+            matches!(
+                outcome,
+                ExecutionOutcome::Interrupted {
+                    reason: InterruptReason::Cancelled
+                }
+            ),
+            "tier {tier:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "tier {tier:?}");
+    }
+
+    let control = Arc::new(crate::RuntimeInterrupt::default());
+    let mut engine = Engine::new();
+    engine.set_interrupt_handle(control.clone());
+    run_in(
+        &mut engine,
+        "var i32 = new Int32Array(new SharedArrayBuffer(8));",
+    );
+    control.set_deadline(Some(Instant::now() + Duration::from_millis(100)));
+    let outcome = engine
+        .eval_interruptible("Atomics.wait(i32, 0, 0)", false)
+        .expect("script parses");
+    assert!(matches!(
+        outcome,
+        ExecutionOutcome::Interrupted {
+            reason: InterruptReason::DeadlineExceeded
+        }
+    ));
+    control.set_deadline(None);
+    assert_eq!(run_in(&mut engine, "Atomics.notify(i32, 0)"), "0");
+
+    run_in(&mut engine, "Atomics.waitAsync(i32, 0, 0);");
+    let canceller = cancel_soon(&control);
+    let started = Instant::now();
+    assert_eq!(
+        engine.run_agent_event_loop(),
+        Err(InterruptReason::Cancelled)
+    );
+    canceller.join().expect("canceller thread");
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]

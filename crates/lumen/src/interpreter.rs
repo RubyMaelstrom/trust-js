@@ -842,14 +842,41 @@ impl AsyncWaitInbox {
     pub(crate) fn has_notifications(&self) -> bool {
         !self.notified.lock().unwrap().is_empty()
     }
-    /// Block until a notification arrives or `deadline` passes.
-    pub(crate) fn wait_until(&self, deadline: std::time::Instant) {
-        let notified = self.notified.lock().unwrap();
-        let now = std::time::Instant::now();
-        if notified.is_empty() && deadline > now {
-            drop(self.arrived.wait_timeout(notified, deadline - now).unwrap());
-        }
+    /// Block until a notification arrives, `deadline` passes or the host interrupts the agent.
+    pub(crate) fn wait_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+        interrupt: &crate::RuntimeInterrupt,
+    ) {
+        let inbox = self.clone();
+        let wake = crate::interrupt::BlockedWake(Arc::new(move || {
+            let _held = inbox.notified.lock().unwrap();
+            inbox.arrived.notify_all();
+        }));
+        interrupt.while_blocked(wake, || {
+            let notified = self.notified.lock().unwrap();
+            if !notified.is_empty() || interrupt.current_reason().is_some() {
+                return;
+            }
+            let wake_at = interrupt
+                .armed_deadline()
+                .map_or(deadline, |armed| armed.min(deadline));
+            let now = std::time::Instant::now();
+            if wake_at > now {
+                drop(self.arrived.wait_timeout(notified, wake_at - now).unwrap());
+            }
+        });
     }
+}
+
+/// How an agent suspended in `Atomics.wait` resumed.
+pub enum WaitOutcome {
+    /// A notify woke it ("ok").
+    Woken,
+    /// Its timeout elapsed ("timed-out").
+    TimedOut,
+    /// The host interrupted the agent (see [`crate::RuntimeInterrupt`]).
+    Interrupted,
 }
 
 /// An `Atomics.waitAsync` that went async (ECMA-262 DoWait): its promise, and the Waiter Record
@@ -884,44 +911,66 @@ pub(crate) fn futex_remove_async(id: u64, index: usize, token: u64) -> bool {
     })
 }
 
-/// Block an agent waiting in the list of `(id, index)` until a notify wakes it or `timeout`
-/// elapses; `true` when notified. A timed-out waiter leaves its list in the critical section,
-/// unless a notify removed it first: that notify counted it as woken, so it reports "ok" too.
+/// Block an agent waiting in the list of `(id, index)` until a notify wakes it, `timeout`
+/// elapses, or the host interrupts it: a cancellation or navigation request wakes it at once,
+/// and an armed deadline when it passes. A waiter that stops for a timeout or an interruption
+/// leaves its list in the critical section, unless a notify removed it first: that notify
+/// counted it as woken, so it reports "ok".
 pub fn futex_block(
     agent: &BlockedAgent,
     id: u64,
     index: usize,
     timeout: Option<std::time::Duration>,
-) -> bool {
+    interrupt: &crate::RuntimeInterrupt,
+) -> WaitOutcome {
     let (lock, cvar) = &**agent;
     // A timeout too far away to represent never elapses.
     let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
-    let mut woken = lock.lock().unwrap();
-    while !*woken {
-        match deadline {
-            None => woken = cvar.wait(woken).unwrap(),
-            Some(deadline) => {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                woken = cvar.wait_timeout(woken, deadline - now).unwrap().0;
+    let wake = {
+        let agent = agent.clone();
+        crate::interrupt::BlockedWake(Arc::new(move || {
+            let _held = agent.0.lock().unwrap();
+            agent.1.notify_all();
+        }))
+    };
+    let stopped = interrupt.while_blocked(wake, || {
+        let mut woken = lock.lock().unwrap();
+        loop {
+            if *woken {
+                return None;
             }
+            if interrupt.current_reason().is_some() {
+                return Some(WaitOutcome::Interrupted);
+            }
+            let now = std::time::Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Some(WaitOutcome::TimedOut);
+            }
+            woken = match [deadline, interrupt.armed_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+            {
+                Some(wake_at) => {
+                    let wait = wake_at.saturating_duration_since(now);
+                    cvar.wait_timeout(woken, wait).unwrap().0
+                }
+                None => cvar.wait(woken).unwrap(),
+            };
         }
-    }
-    if *woken {
-        return true;
-    }
-    drop(woken);
+    });
+    let Some(outcome) = stopped else {
+        return WaitOutcome::Woken;
+    };
     with_waiter_list(id, index, |list| {
         let Some(at) = list
             .iter()
             .position(|w| matches!(w, Waiter::Blocked(b) if Arc::ptr_eq(b, agent)))
         else {
-            return true;
+            return WaitOutcome::Woken;
         };
         list.remove(at);
-        false
+        outcome
     })
 }
 /// Atomics.notify: take up to `max` (`<0` ⇒ all) waiters of `(id, index)` in list order and
