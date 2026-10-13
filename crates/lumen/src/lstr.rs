@@ -62,6 +62,8 @@ pub(crate) const ASCII_HINT: u32 = 1 << 31;
 // never ASCII-hinted even when its bytes are ASCII. The optimizing tier's decimal-key reader
 // also rejects it by its <=10-byte length guard before accessing inline bytes.
 const VIEW_CAP: u32 = ASCII_HINT - 1;
+/// The longest content, in bytes, an engine string can hold; constructing a longer one panics.
+pub(crate) const MAX_LEN: usize = VIEW_CAP as usize - 1;
 const MIN_VIEW_BYTES: usize = 256;
 /// A view may keep an owner of at most this size alive regardless of the slice's length; larger
 /// owners are pinned only by slices covering at least half of them. Copying every short slice

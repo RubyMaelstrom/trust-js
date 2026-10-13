@@ -182,13 +182,18 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         {
             return Err(i.make_error("RangeError", "SharedArrayBuffer allocation too large"));
         }
+        // The Shared Data Block holds the bytes (zeroed, allocated fallibly); it counts toward
+        // the collector's buffer pressure like an ArrayBuffer's block.
+        i.note_buffer_allocation(len);
+        let Some(id) = crate::interpreter::alloc_shared_mem(len) else {
+            return Err(i.make_error("RangeError", "Array buffer allocation failed"));
+        };
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        // The bytes live in the Shared Data Block allocated below; this entry holds none.
+        // The bytes live in the Shared Data Block allocated above; this entry holds none.
         i.array_buffers.insert(bp, Default::default());
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
-        let id = crate::interpreter::alloc_shared_mem(len);
         i.shared_buffers.insert(bp, id);
         set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
         Ok(Value::Obj(obj))
@@ -259,7 +264,7 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
         .remove(&ptr)
         .expect("the detached check above established a backing store");
     bytes.borrow_mut().resize(new_len, 0);
-    let (bv, bp) = make_array_buffer(i, new_len);
+    let (bv, bp) = make_array_buffer(i, new_len)?;
     i.array_buffers.insert(bp, bytes);
     if let (false, Some(src_max)) = (fixed, src_max) {
         if let Value::Obj(nb) = &bv {
@@ -299,8 +304,23 @@ fn to_index(i: &mut Interp, value: &Value) -> Result<usize, Value> {
     Ok(n as usize)
 }
 
-fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
-    make_array_buffer_from_bytes(i, vec![0u8; byte_len])
+/// CreateByteDataBlock (ECMA-262 §6.2.9.1): `len` zero bytes, or the RangeError the
+/// specification requires when they cannot be allocated, where an infallible allocation would
+/// abort the process.
+pub(crate) fn create_byte_data_block(i: &mut Interp, len: usize) -> Result<Vec<u8>, Value> {
+    i.note_buffer_allocation(len);
+    if let Some(block) = crate::interpreter::try_zeroed_bytes(len) {
+        return Ok(block);
+    }
+    // Unreachable buffers still hold their data until a collection finds them.
+    i.collect_for_failed_allocation();
+    crate::interpreter::try_zeroed_bytes(len)
+        .ok_or_else(|| i.make_error("RangeError", "Array buffer allocation failed"))
+}
+
+fn make_array_buffer(i: &mut Interp, byte_len: usize) -> Result<(Value, usize), Value> {
+    let block = create_byte_data_block(i, byte_len)?;
+    Ok(make_array_buffer_from_bytes(i, block))
 }
 
 fn make_array_buffer_from_bytes(i: &mut Interp, bytes: Vec<u8>) -> (Value, usize) {
@@ -577,7 +597,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         } else {
             Vec::new()
         };
-        let (bv, bp) = make_array_buffer(i, slice.len());
+        let (bv, bp) = make_array_buffer(i, slice.len())?;
         if let Some(buf) = i.array_buffers.get(&bp) {
             buf.borrow_mut().copy_from_slice(&slice);
         }
@@ -621,11 +641,10 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if n as usize > MAX_BUFFER_BYTES || max.is_some_and(|m| m as usize > MAX_BUFFER_BYTES) {
             return Err(i.make_error("RangeError", "ArrayBuffer allocation too large"));
         }
-        let len = n as usize;
+        let block = create_byte_data_block(i, n as usize)?;
         let p = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers
-            .insert(p, Rc::new(RefCell::new(vec![0u8; len])));
+        i.array_buffers.insert(p, Rc::new(RefCell::new(block)));
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
@@ -767,11 +786,8 @@ fn ta_create_same(i: &mut Interp, kind: TaKind, len: usize) -> Result<(Value, Ta
             "TypedArray backing buffer exceeds allocation limit",
         ));
     }
-    Ok(typed_array_from_bytes(
-        i,
-        kind,
-        vec![0; len * kind.elsize()],
-    ))
+    let block = create_byte_data_block(i, len * kind.elsize())?;
+    Ok(typed_array_from_bytes(i, kind, block))
 }
 
 /// AllocateTypedArray (ECMA-262 #sec-allocatetypedarray) with the current Realm's intrinsic
@@ -1533,12 +1549,13 @@ fn ta_native(
             let mut out = String::new();
             for k in 0..len {
                 if k > 0 {
-                    out.push_str(&sep);
+                    push_str_checked(i, &mut out, &sep)?;
                 }
                 let v = i.ta_read(&info, k);
                 if !matches!(v, Value::Undefined | Value::Null) {
                     out.push_str(&ab(i.to_string(&v))?);
                 }
+                check_string_length(i, out.len())?;
             }
             Ok(Value::lstr(out))
         })()),
@@ -1682,7 +1699,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
     };
     let (buf_val, buf_ptr, offset, len, track) = match args.first() {
         None => {
-            let (bv, bp) = make_array_buffer(i, 0);
+            let (bv, bp) = make_array_buffer(i, 0)?;
             (bv, bp, 0, 0, false)
         }
         Some(source) if map_ptr(source).is_some_and(|p| i.typed_arrays.contains_key(&p)) => {
@@ -1708,7 +1725,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                         "TypedArray content types (BigInt vs Number) differ",
                     ));
                 }
-                let (bv, bp) = make_array_buffer(i, bytes);
+                let (bv, bp) = make_array_buffer(i, bytes)?;
                 let target_info = TaInfo {
                     buffer: bp,
                     offset: 0,
@@ -1790,7 +1807,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         Some(v) if !matches!(v, Value::Obj(_)) => {
             let len = numeric_length.expect("primitive ToIndex already performed");
             let bytes = checked_bytes(i, len)?;
-            let (bv, bp) = make_array_buffer(i, bytes);
+            let (bv, bp) = make_array_buffer(i, bytes)?;
             (bv, bp, 0, len, false)
         }
         Some(other) => {
@@ -1823,7 +1840,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                 };
                 let len = items.len();
                 let bytes = checked_bytes(i, len)?;
-                let (bv, bp) = make_array_buffer(i, bytes);
+                let (bv, bp) = make_array_buffer(i, bytes)?;
                 let info = TaInfo {
                     buffer: bp,
                     offset: 0,
@@ -1838,7 +1855,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             } else {
                 let n = ab(i.to_length(other.as_obj().unwrap()))?;
                 let bytes = checked_bytes(i, n)?;
-                let (bv, bp) = make_array_buffer(i, bytes);
+                let (bv, bp) = make_array_buffer(i, bytes)?;
                 let info = TaInfo {
                     buffer: bp,
                     offset: 0,
@@ -2174,6 +2191,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
             }
             let s = ab(i.call(tls, v, &[arg(a, 0), arg(a, 1)]))?;
             out.push_str(&ab(i.to_string(&s))?);
+            check_string_length(i, out.len())?;
         }
         Ok(Value::lstr(out))
     });

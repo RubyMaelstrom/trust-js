@@ -417,6 +417,83 @@ pub enum Expr {
     NewTarget,
 }
 
+impl Expr {
+    /// The call below `self` when `self` continues a call chain: a non-optional call of the
+    /// value of another plain call (`f()()`), or a method call on it (`f().m()`, `f()[k]()`).
+    /// The compiler and the tree-walker run such chains in a loop rather than one native frame
+    /// per link.
+    pub(crate) fn call_chain_link(&self) -> Option<&Expr> {
+        let Expr::Call {
+            callee,
+            optional: false,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let below = match &**callee {
+            below @ Expr::Call { .. } => below,
+            Expr::Member {
+                obj,
+                optional: false,
+                ..
+            }
+            | Expr::Index {
+                obj,
+                optional: false,
+                ..
+            } => obj,
+            _ => return None,
+        };
+        match below {
+            Expr::Call {
+                callee,
+                optional: false,
+                ..
+            } if !matches!(&**callee, Expr::Super)
+                && !matches!(&**callee, Expr::Ident(name, _) if name == "eval") =>
+            {
+                Some(below)
+            }
+            _ => None,
+        }
+    }
+
+    /// Detach the operand a left-nested chain continues through (`a + b` → `a`, `a.b` → `a`,
+    /// `f()` → `f`, …), leaving a leaf in its place.
+    fn take_chain_link(&mut self) -> Option<Expr> {
+        let link = match self {
+            Expr::Binary { left, .. } | Expr::Logical { left, .. } => left,
+            Expr::Member { obj, .. } | Expr::Index { obj, .. } => obj,
+            Expr::Call { callee, .. } | Expr::New { callee, .. } => callee,
+            Expr::TaggedTemplate { tag, .. } => tag,
+            Expr::OptionalChain(inner) | Expr::Paren(inner) | Expr::ToStr(inner) => inner,
+            _ => return None,
+        };
+        match **link {
+            Expr::Null => None,
+            _ => Some(std::mem::replace(&mut **link, Expr::Null)),
+        }
+    }
+}
+
+impl Drop for Expr {
+    /// A chain is as deep as it is long, and chains are not bounded by `MAX_PARSE_DEPTH` (see
+    /// `parser::MAX_CHAIN_LINKS`): release it link by link instead of one native frame per link.
+    /// Other children drop recursively, through nesting the parser bounds, on a fresh stack
+    /// segment when this one runs low (an AST can be dropped wherever its last owner goes).
+    fn drop(&mut self) {
+        if crate::interpreter::ast_stack_low() {
+            let node = std::mem::replace(self, Expr::Null);
+            return crate::interpreter::with_ast_stack(move || drop(node));
+        }
+        let mut next = self.take_chain_link();
+        while let Some(mut link) = next {
+            next = link.take_chain_link();
+        }
+    }
+}
+
 /// The phase of a dynamic `import()` call: plain evaluation, `import.source(...)` (source-phase),
 /// or `import.defer(...)` (deferred-evaluation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +592,16 @@ pub struct FunctionBody {
     stmts: std::cell::OnceCell<Vec<Stmt>>,
     /// The statements' snapshot encoding, while they may still be unmaterialized.
     encoded: Option<&'static [u8]>,
+}
+
+impl Drop for FunctionBody {
+    /// Dropping a body recurses through its nesting, including the functions nested in it, so
+    /// it runs where the deepest tree the parser accepts fits (see `interpreter::drop_ast`).
+    fn drop(&mut self) {
+        if let Some(stmts) = self.stmts.take() {
+            crate::interpreter::drop_ast(stmts);
+        }
+    }
 }
 
 impl FunctionBody {
@@ -627,6 +714,18 @@ impl std::ops::DerefMut for FunctionBody {
 impl std::fmt::Debug for FunctionBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.with(|stmts| stmts.fmt(f))
+    }
+}
+
+impl Drop for Function {
+    /// Like a body (see `FunctionBody`'s drop), parameters can nest further functions in their
+    /// defaults; release both where the deepest tree the parser accepts fits.
+    fn drop(&mut self) {
+        let params = std::mem::take(&mut self.params);
+        let stmts = self.body.stmts.take();
+        if !params.is_empty() || stmts.is_some() {
+            crate::interpreter::drop_ast((params, stmts));
+        }
     }
 }
 
@@ -766,6 +865,9 @@ impl RetainedAst<'_> {
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.stmt(stmt));
+        }
         if let Some(body) = stmt.loop_body() {
             self.add(std::mem::size_of::<LoopBody>() - std::mem::size_of::<Stmt>());
             if let Some(token) = body.site.retained_token() {
@@ -954,6 +1056,9 @@ impl RetainedAst<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.expr(expr));
+        }
         match expr {
             Expr::Paren(inner)
             | Expr::ToStr(inner)
@@ -1423,6 +1528,9 @@ fn scan_stmts(body: &[Stmt], flags: &mut u8) {
 }
 
 fn scan_stmt(s: &Stmt, flags: &mut u8) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| scan_stmt(s, flags));
+    }
     match s {
         Stmt::Expr(e) | Stmt::Throw(e) => scan_expr(e, flags),
         Stmt::VarDecl { kind: _, decls } => {
@@ -1541,6 +1649,9 @@ pub(crate) fn expr_scan_flags(e: &Expr) -> u8 {
 }
 
 fn scan_expr(e: &Expr, flags: &mut u8) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| scan_expr(e, flags));
+    }
     match e {
         Expr::Ident(n, _) => {
             if n == "arguments" {

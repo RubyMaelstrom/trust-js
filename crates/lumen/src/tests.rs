@@ -2296,6 +2296,266 @@ fn live_object_limit_is_configurable_and_enforced() {
     assert_eq!(retain(150_000, 250_000), "range:allocation limit exceeded");
 }
 
+/// The handler that catches the live-object RangeError must be able to allocate while the
+/// retained graph is still reachable: the throwing safepoint re-arms the next collection
+/// instead of leaving it due, which made the first allocation in `catch` collect and throw again.
+#[test]
+fn live_object_limit_error_handler_can_allocate() {
+    use crate::bytecode::Tier;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        engine.set_live_object_limit(150_000);
+        let source = "var kept = [], outcome = 'ok';
+            function fill() { for (var i = 0; i < 250000; i++) kept.push({ i: i }); }
+            try { fill(); } catch (e) {
+                var notes = [];
+                for (var j = 0; j < 2000; j++) notes.push({ j: j, name: e.name });
+                outcome = e.name + ':' + e.message + ':' + notes.length + ':' + notes[1999].j;
+            }
+            kept = null; outcome";
+        match engine.eval(source, false).expect("parse") {
+            Completion::Value(value) => assert_eq!(
+                value, "RangeError:allocation limit exceeded:2000:1999",
+                "{tier:?}"
+            ),
+            Completion::Throw { name, message } => panic!("{tier:?} threw {name}: {message}"),
+        }
+    }
+}
+
+/// Deeply nested source either runs or is a catchable SyntaxError, on every tier and on a 1 MiB
+/// thread stack: the parser bounds the nesting of statements, expressions and patterns
+/// (`MAX_PARSE_DEPTH`), and the parser, the AST passes, the compiler and the tree-walking
+/// evaluator continue on fresh stack segments when theirs runs low. Before, a few thousand
+/// nested blocks or `else if`s overflowed the native stack and aborted. Values are node's
+/// (given `--stack-size` large enough to parse them).
+#[test]
+fn deeply_nested_source_runs_or_throws_syntax_error() {
+    // (description, JavaScript building the source for `n` levels, expected completion)
+    let cases: &[(&str, &str, &str)] = &[
+        ("new chain", "'new '.repeat(n) + 'G === G'", "true"),
+        ("exponents", "Array(n).fill('1').join('**')", "1"),
+        ("assignments", "'x = '.repeat(n) + '3'", "3"),
+        ("conditionals", "'1 ? '.repeat(n) + '5' + ' : 0'.repeat(n)", "5"),
+        ("blocks", "'{'.repeat(n) + 'x = 1;' + '}'.repeat(n)", "1"),
+        (
+            "else if",
+            "'if (x === -1) 0; ' + 'else if (x === -1) 0; '.repeat(n) + 'else 7;'",
+            "7",
+        ),
+        ("labels", "Array.from({ length: n }, (_, k) => 'l' + k + ': ').join('') + '8;'", "8"),
+        ("parentheses", "'('.repeat(n / 2) + '1' + ')'.repeat(n / 2)", "1"),
+        ("arrays", "'['.repeat(n / 2) + ']'.repeat(n / 2) + '.length'", "1"),
+        ("arrows", "'typeof ' + '(() => '.repeat(n / 4) + '1' + ')'.repeat(n / 4)", "function"),
+        (
+            "patterns",
+            "'var ' + '['.repeat(n / 2) + 'y' + ']'.repeat(n / 2) + ' = ' + '['.repeat(n / 2) + '5' + ']'.repeat(n / 2) + '; y'",
+            "5",
+        ),
+        (
+            "functions",
+            "'(function () { return '.repeat(n / 8) + '9' + '; })()'.repeat(n / 8)",
+            "9",
+        ),
+        ("templates", "'`${'.repeat(n / 4) + '4' + '}`'.repeat(n / 4)", "4"),
+    ];
+    let mut script = String::from(
+        "var a = {}; a.b = a; function g() { return g; } function G() { return G; } var x = 0;
+         function run(build, n) {
+             var source = build(n);
+             try { return String((0, eval)(source)); } catch (e) { return e.name; }
+         }
+         var results = [];",
+    );
+    for (_, build, _) in cases {
+        script.push_str(&format!(
+            "results.push(run(function (n) {{ return {build}; }}, 4000));
+             results.push(run(function (n) {{ return {build}; }}, 12000));"
+        ));
+    }
+    script.push_str("results.join('|')");
+    let expected = cases
+        .iter()
+        .map(|(_, _, value)| format!("{value}|SyntaxError"))
+        .collect::<Vec<_>>()
+        .join("|");
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let script = script.clone();
+        let expected = expected.clone();
+        let outcome = std::thread::Builder::new()
+            .name(format!("deep-source-{tier:?}"))
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(run_in(&mut engine, &script), expected, "{tier:?}");
+            })
+            .expect("spawn")
+            .join();
+        assert!(outcome.is_ok(), "{tier:?} failed");
+    }
+}
+
+/// Left-nested chains are as deep as they are long, but generated and obfuscated code builds
+/// them with hundreds of thousands of links (node runs a million `+` operands), so they are not
+/// bounded by the nesting limit: these 30,000-link chains, six times that limit, run on every
+/// tier on a 1 MiB thread stack, at the top level and in a function that compiles. Operator,
+/// property and call chains are compiled and evaluated in a loop; the other walks grow their
+/// stack. Values are node's where node has the stack for them (it runs out on long property,
+/// call and tagged-template chains).
+#[test]
+fn long_expression_chains_run() {
+    // (description, JavaScript building an expression of `n` links, expected value)
+    let cases: &[(&str, &str, &str)] = &[
+        ("additions", "Array(n).fill('1').join('+')", "30000"),
+        (
+            "concatenation",
+            "'(' + Array(n).fill(\"'x'\").join('+') + ').length'",
+            "30000",
+        ),
+        (
+            "logical",
+            "Array(n).fill('one').join(' && ') + ' || 2'",
+            "1",
+        ),
+        (
+            "coalescing",
+            "Array(n).fill('none').join(' ?? ') + ' ?? 3'",
+            "3",
+        ),
+        ("bitwise", "Array(n).fill('one').join(' | ')", "1"),
+        ("comma", "'(' + Array(n).fill('one').join(', ') + ')'", "1"),
+        ("template", "'`' + '${one}'.repeat(n) + '`.length'", "30000"),
+        ("member chain", "'a' + '.b'.repeat(n) + ' === a'", "true"),
+        (
+            "index chain",
+            "'a' + '[\"b\"]'.repeat(n) + ' === a'",
+            "true",
+        ),
+        ("optional chain", "'a' + '?.b'.repeat(n) + ' === a'", "true"),
+        ("call chain", "'g' + '()'.repeat(n) + ' === g'", "true"),
+        ("method chain", "'a' + '.m()'.repeat(n) + ' === a'", "true"),
+        (
+            "tagged templates",
+            "'g' + '`x`'.repeat(n) + ' === g'",
+            "true",
+        ),
+    ];
+    let mut script = String::from(
+        "var one = 1, none = null, a = { m() { return a; } }; a.b = a;
+         function g() { return g; }
+         var results = [];",
+    );
+    for (_, build, _) in cases {
+        script.push_str(&format!(
+            "results.push(String((0, eval)((function (n) {{ return {build}; }})(30000))));
+             var inner = Function('return ' + (function (n) {{ return {build}; }})(30000));
+             results.push(String(inner()) + ':' + String(inner()));"
+        ));
+    }
+    script.push_str("results.join('|')");
+    let expected = cases
+        .iter()
+        .map(|(_, _, value)| format!("{value}|{value}:{value}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let script = script.clone();
+        let expected = expected.clone();
+        let outcome = std::thread::Builder::new()
+            .name(format!("long-chains-{tier:?}"))
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                assert_eq!(run_in(&mut engine, &script), expected, "{tier:?}");
+            })
+            .expect("spawn")
+            .join();
+        assert!(outcome.is_ok(), "{tier:?} failed");
+    }
+}
+
+/// JSON.parse, its reviver walk, JSON.stringify and `flat(Infinity)` recurse once per level of
+/// nesting and now continue on fresh native stack segments (a release build parses the million
+/// levels node does); all of them aborted the process with a native stack overflow at a few tens
+/// of thousands of levels. Debug frames are larger, so this runs 10,000 levels.
+#[test]
+fn deeply_nested_json_and_flat_complete() {
+    let outcome = std::thread::Builder::new()
+        .name("deep-json".to_string())
+        .stack_size(1 << 20)
+        .spawn(|| {
+            let mut engine = Engine::new();
+            run_in(
+                &mut engine,
+                "function depth(v) { var d = 0; while (Array.isArray(v)) { v = v[0]; d++; } return d; }
+                 var n = 10000;
+                 var text = '['.repeat(n) + '1' + ']'.repeat(n);
+                 var nested = [1]; for (var k = 1; k < n; k++) nested = [nested];
+                 var objects = '{\"a\":'.repeat(n) + '1' + '}'.repeat(n);
+                 [
+                     depth(JSON.parse(text)),
+                     depth(JSON.parse(text, function (key, value) { return value; })),
+                     JSON.parse(objects) !== null,
+                     JSON.stringify(nested).length,
+                     nested.flat(Infinity).length
+                 ].join(':')",
+            )
+        })
+        .expect("spawn")
+        .join()
+        .expect("deep JSON panicked");
+    assert_eq!(outcome, "10000:10000:true:20001:1");
+}
+
+/// A discarded ArrayBuffer keeps its data until the collector finds it, and a buffer is a single
+/// object, so buffer data drives collection too: allocating 96 MiB of typed arrays that are
+/// never kept must not retain them all (a 16 MiB-per-iteration loop used to reach 16 GB).
+#[test]
+fn discarded_array_buffer_data_triggers_collection() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "var total = 0;
+                 for (var k = 0; k < 96; k++) total += new Uint8Array(1024 * 1024).length;
+                 total"
+            ),
+            "100663296"
+        );
+        let retained: usize = engine
+            .interp
+            .array_buffers
+            .values()
+            .map(|bytes| bytes.borrow().len())
+            .sum();
+        assert!(
+            retained <= 72 * 1024 * 1024,
+            "{tier:?} retains {retained} bytes of discarded buffers"
+        );
+    }
+}
+
 /// Releasing the last reference to a long object chain must not recurse once per link. Each case
 /// runs on a deliberately small native stack, where per-link recursion overflowed at a few
 /// thousand links; the chains here are two orders of magnitude longer.
@@ -2928,8 +3188,18 @@ fn memory_caps_convert_blowups_to_rangeerror() {
     assert_eq!(throws("new Array(4294967296)"), "RangeError"); // invalid uint32 length
     assert_eq!(throws("[].length = 4294967296"), "RangeError");
     assert_eq!(throws("'x'.repeat(1e9)"), "RangeError");
-    assert_eq!(throws("Array(100000000).join(',')"), "RangeError"); // huge length op
-    assert_eq!(throws("[...Array(100000000)]"), "RangeError"); // huge spread
+    assert_eq!(throws("Array(2 ** 30).join(',')"), "RangeError"); // huge length op
+    assert_eq!(throws("[...Array(2 ** 30)]"), "RangeError"); // huge spread
+    assert_eq!(throws("Math.max(...Array(2 ** 21))"), "RangeError"); // huge argument list
+    assert_eq!(throws("Math.max.apply(null, Array(2 ** 21))"), "RangeError");
+    assert_eq!(
+        throws("Reflect.apply(Math.max, null, { length: 2 ** 32 })"),
+        "RangeError"
+    );
+    assert_eq!(
+        throws("Object.keys(new Proxy({}, { ownKeys: () => ({ length: 2 ** 32 }) }))"),
+        "RangeError"
+    );
     assert_eq!(throws("(123).toFixed(1e9)"), "RangeError");
     assert_eq!(throws("let s='x'; for(;;){ s += s; }"), "RangeError"); // doubling string
                                                                        // Truncating a huge sparse length must not loop over the whole range (would hang).
@@ -2937,6 +3207,44 @@ fn memory_caps_convert_blowups_to_rangeerror() {
         run("var a=[1,2,3]; a.length = 1e9; a.length = 1; a.length"),
         "1"
     );
+}
+
+/// Arrays just past the former 2^20-element engine cap (a few million rows of real data) work
+/// like in other engines; only absurd lengths throw (see above). Spreading is compiled per tier;
+/// the built-ins are tier-independent, so they run once (a million elements is slow in debug).
+#[test]
+fn million_element_array_operations_succeed() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "(function (a) { return [...a].length; })(new Array(1048577).fill(7))"
+            ),
+            "1048577",
+            "{tier:?}"
+        );
+    }
+    let source = "var n = 1048577, a = new Array(n).fill(1);
+        a[n - 1] = 7;
+        var sparse = []; sparse[n - 1] = 1; sparse[0] = 2;
+        [
+            a.join('').length,
+            'x,'.repeat(n).split(',').length,
+            ('abc,def\\n'.repeat(n) + 'z').split('\\n').length,
+            a.toReversed()[0],
+            a.with(0, 9)[0],
+            Float64Array.from(a).length,
+            sparse.sort()[1],
+            Array.prototype.at.call({ length: 2 ** 53 - 1 }, -1)
+        ].join(':')";
+    assert_eq!(run(source), "1048577:1048578:1048578:7:9:1048577:2:");
 }
 
 #[test]
@@ -5155,6 +5463,89 @@ fn bigint() {
     assert_eq!(throws("+1n"), "TypeError"); // unary plus on BigInt
     assert_eq!(run("Number(123n)"), "123"); // explicit conversion ok
     assert_eq!(run("String(99n)"), "99");
+}
+
+/// BigInt results are limited to 2^30 bits (V8's "Maximum BigInt size exceeded"), checked
+/// before the result is allocated, and radix conversion works a limb at a time. Expected values
+/// are node's, except that 70 million binary digits exceed this engine's string limit (64 MiB)
+/// but not V8's; that RangeError comes before the conversion.
+#[test]
+fn bigint_size_limit_and_radix_conversion() {
+    let source = r#"
+        function attempt(f) { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }
+        [
+            attempt(() => 2n ** 2000000000n),
+            attempt(() => 2n ** 1073741824n),
+            attempt(() => 1n << 1073741824n),
+            attempt(() => (2n ** 64n) ** 20000000n),
+            attempt(() => (1n << 70000000n).toString(2)),
+            attempt(() => (2n ** 100000n) >> 99998n),
+            [(-4n) ** 3n, (-4n) ** 2n, 8n ** 5n, (-1n) ** 1000000000001n, 0n ** 99999999999999n].join(),
+            [255n.toString(2), (-255n).toString(16), 12345678901234567890123456789n.toString(36),
+             (2n ** 64n).toString(), (-(10n ** 19n)).toString(), (10n ** 19n - 1n).toString(7)].join(),
+            [BigInt('0x' + 'f'.repeat(40)), BigInt('0o777'), BigInt(' -12345678901234567890123456789 '),
+             BigInt('+42'), BigInt('0'.repeat(60) + '1'), attempt(() => BigInt('-0x10'))].join(),
+            [(10n ** 50n + 12345n) / (10n ** 25n + 7n), (10n ** 50n + 12345n) % (10n ** 25n + 7n)].join(),
+            BigInt((3n ** 20000n).toString()) === 3n ** 20000n
+        ].join('|')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "RangeError: Maximum BigInt size exceeded|RangeError: Maximum BigInt size exceeded|\
+             RangeError: Maximum BigInt size exceeded|RangeError: Maximum BigInt size exceeded|\
+             RangeError: Invalid string length|4|-64,16,32768,-1,0|\
+             11111111,-ff,17384dv0z83qk7482z9,18446744073709551616,-10000000000000000000,\
+             23621642325042620603532|1461501637330902918203684832716283019655932542975,511,\
+             -12345678901234567890123456789,42,1,SyntaxError: Cannot convert string to a BigInt|\
+             9999999999999999999999993,12394|true",
+            "{tier:?}"
+        );
+    }
+}
+
+/// The quadratic BigInt digit loops poll the host interrupt: a deadline stops a multiplication,
+/// division, radix conversion or parse of huge values instead of letting it run for minutes.
+#[test]
+fn long_bigint_operations_honor_the_deadline() {
+    for operation in [
+        "var x = (1n << 4000000n) - 1n; x * (x + 2n)",
+        "((1n << 20000000n) - 1n) / ((1n << 10000000n) + 12345n)",
+        "((1n << 20000000n) - 1n).toString()",
+        "BigInt('9'.repeat(5000000))",
+        "3n ** 3000000n",
+    ] {
+        let mut engine = Engine::new();
+        let interrupt = engine.interrupt_handle();
+        interrupt.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        ));
+        let started = std::time::Instant::now();
+        match engine
+            .eval_interruptible(operation, false)
+            .expect("script parses")
+        {
+            ExecutionOutcome::Interrupted {
+                reason: InterruptReason::DeadlineExceeded,
+            } => {}
+            ExecutionOutcome::Interrupted { reason } => panic!("{operation}: {reason:?}"),
+            ExecutionOutcome::Value(value) => panic!("{operation} completed: {value}"),
+            ExecutionOutcome::Throw { name, message } => {
+                panic!("{operation} threw {name}: {message}")
+            }
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{operation} did not honor the deadline promptly"
+        );
+    }
 }
 
 #[test]
@@ -16313,6 +16704,60 @@ fn string_padding_ascii_fast_path_preserves_unit_truncation() {
     assert_eq!(run("'😀'.padStart(3, 'x')"), "x😀");
 }
 
+/// Builders whose result length author code controls throw V8's RangeError instead of
+/// materializing a string an engine string cannot hold (a Rust panic, which aborts the page).
+/// Every case also exceeds V8's own limit, so node throws the same RangeError; the engine stops
+/// each one before its result passes the 64 MiB string limit.
+#[test]
+fn oversized_string_builders_throw_range_errors() {
+    let cases = [
+        "''.padEnd(2 ** 31, 'ab')",
+        "''.padStart(2 ** 32 + 5)",
+        "'x'.padStart(2 ** 30, '\\ud83d')",
+        "'\\u00e9'.padEnd(2 ** 31, '\\u00e9')",
+        "Array(600).fill('x'.repeat(2 ** 20)).join('')",
+        "new Array(2 ** 20).join('x'.repeat(2 ** 10))",
+        "String(Array(600).fill('x'.repeat(2 ** 20)))",
+        "'x'.repeat(2 ** 20).replaceAll('x', 'y'.repeat(2 ** 10))",
+        "'x'.repeat(2 ** 16).replaceAll('x', () => 'y'.repeat(2 ** 14))",
+        "'\\u00e9'.repeat(2 ** 16).replaceAll('\\u00e9', 'y'.repeat(2 ** 14))",
+        "('a'.repeat(2 ** 20) + 'z').replace('z', '$`'.repeat(600))",
+        "String.raw({ raw: Array(600).fill('x'.repeat(2 ** 20)) })",
+        "new Uint8Array(2 ** 20).join('x'.repeat(2 ** 10))",
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        for case in cases {
+            let source = format!(
+                "(function () {{ try {{ return 'ok ' + ({case}).length; }} \
+                 catch (e) {{ return e.name + ': ' + e.message; }} }})()"
+            );
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "RangeError: Invalid string length",
+                "{tier:?}: {case}"
+            );
+        }
+    }
+    // Quoting is per byte, so the JSON case runs once rather than per tier.
+    assert_eq!(
+        throws("JSON.stringify(Array(600).fill('x'.repeat(2 ** 20)))"),
+        "RangeError"
+    );
+    // A formatted list contains every element. (V8 reports an ICU error here instead.)
+    #[cfg(feature = "intl")]
+    assert_eq!(
+        throws("new Intl.ListFormat().format(Array(600).fill('x'.repeat(2 ** 20)))"),
+        "RangeError"
+    );
+}
+
 #[test]
 fn string_replace_substitution() {
     assert_eq!(run("'abc'.replace('b', '[$`]')"), "a[a]c");
@@ -16821,6 +17266,135 @@ fn json_stringify_space_and_replacer_tostring() {
         ),
         r#""big""#
     );
+}
+
+/// JSON.stringify writes one buffer and reads own data properties and toJSON along ordinary
+/// prototype chains directly; every observable step (getters, Proxy traps, toJSON and replacer
+/// calls with their receivers and keys, holes reading the prototype, mapped arguments, wrapper
+/// coercions, cycle checks past the linearly scanned depth, gap formatting) must still happen
+/// exactly as specified. Expected output is node's.
+#[test]
+fn json_stringify_fast_paths_preserve_observable_steps() {
+    let source = r#"
+        var results = [];
+        function add(v) { results.push(String(v)); }
+        // toJSON found on the prototype chain, and a toJSON getter called with the value as receiver.
+        function P(x) { this.x = x; }
+        P.prototype.toJSON = function (key) { return "P" + this.x + "@" + key; };
+        add(JSON.stringify({ a: new P(1), b: [new P(2)] }));
+        var receivers = [];
+        Object.defineProperty(Array.prototype, "toJSON", { configurable: true, get() { receivers.push(this.length); return undefined; } });
+        add(JSON.stringify([[1], [1, 2]]) + " " + receivers.join(","));
+        delete Array.prototype.toJSON;
+        // A getter that deletes a later key (the prototype's value shows through) and installs toJSON.
+        var proto = { later: "from-proto" };
+        var o = Object.create(proto);
+        Object.defineProperty(o, "first", { enumerable: true, get() { delete o.later; Object.prototype.toJSON = function () { return "late"; }; return 1; } });
+        o.later = "own";
+        o.nested = { z: 1 };
+        add(JSON.stringify(o));
+        delete Object.prototype.toJSON;
+        // Holes read through the prototype; undefined, functions and symbols.
+        Array.prototype[1] = "proto-element";
+        add(JSON.stringify([0, , 2]));
+        delete Array.prototype[1];
+        add(JSON.stringify([undefined, function () {}, Symbol("s")]) + JSON.stringify({ u: undefined, f() {}, s: Symbol("s"), k: 1 }));
+        // Mapped arguments reflect parameter writes.
+        add((function (a, b) { a = "changed"; return JSON.stringify(arguments); })(1, 2));
+        // Proxies: trap order.
+        var log = [];
+        var proxy = new Proxy({ a: 1, b: { c: 2 } }, {
+          ownKeys(t) { log.push("ownKeys"); return Reflect.ownKeys(t); },
+          getOwnPropertyDescriptor(t, k) { log.push("gopd:" + k); return Reflect.getOwnPropertyDescriptor(t, k); },
+          get(t, k, r) { log.push("get:" + String(k)); return Reflect.get(t, k, r); },
+        });
+        add(JSON.stringify(proxy) + " " + log.join(","));
+        // Replacer function and PropertyList (duplicates, numbers, wrappers).
+        add(JSON.stringify({ a: 1, b: [1, 2], c: { a: 3 } }, function (k, v) { return typeof v === "number" ? v * 10 : v; }));
+        add(JSON.stringify({ 1: "one", a: "A", b: "B", c: { a: 1, b: 2, 1: 3 } }, ["a", 1, new String("b"), "a", new Number(1)]));
+        // Indentation, empty containers.
+        add(JSON.stringify({ a: [], b: {}, c: [1, { d: 2, e: [] }], f: "x" }, null, 2));
+        add(JSON.stringify([[], {}, [[]]], null, "--"));
+        add(JSON.stringify({ a: { b: undefined } }, null, 4));
+        // Numbers.
+        add(JSON.stringify([0, -0, 1.5, -2, 1e21, 123456789012345, 1e15, 2 ** 53, NaN, Infinity, -Infinity, 5e-7]));
+        // Wrappers and rawJSON; BigInt.
+        var n = new Number(3); n.valueOf = function () { return 42; };
+        var str = new String("s"); str.toString = function () { return "T"; };
+        add(JSON.stringify([n, str, new Boolean(false), JSON.rawJSON("1e1000")]));
+        try { JSON.stringify({ big: 1n }); } catch (e) { add(e.name); }
+        BigInt.prototype.toJSON = function () { return this.toString() + "n"; };
+        add(JSON.stringify({ big: 10n }));
+        delete BigInt.prototype.toJSON;
+        // Cycles, shallow and past the linear-scan depth; shared (acyclic) references are fine.
+        var shared = { s: 1 };
+        add(JSON.stringify([shared, shared, { x: shared }]));
+        var cyc = { a: {} }; cyc.a.b = cyc;
+        try { JSON.stringify(cyc); } catch (e) { add(e.name); }
+        var deep = {}; var cur = deep; for (var k = 0; k < 100; k++) { cur.next = {}; cur = cur.next; } cur.back = deep.next.next;
+        try { JSON.stringify(deep); } catch (e) { add(e.name); }
+        var wide = [], leaf = { leaf: 1 }; for (var k = 0; k < 40; k++) wide = [wide, leaf, leaf];
+        add(JSON.stringify(wide).length);
+        // Top-level values, toJSON with keys and the replacer receiver.
+        add(JSON.stringify(undefined) + " " + JSON.stringify({ toJSON() { return undefined; } }) + " " + JSON.stringify("\u0007\ud800\"\\\n"));
+        var holders = [];
+        JSON.stringify({ a: [7] }, function (k, v) { holders.push(Array.isArray(this) ? "array" : Object.keys(this).join("+") + ":" + k); return v; });
+        add(holders.join(","));
+        add(JSON.stringify({ d: new Date(0), r: /x/g, m: new Map([[1, 2]]), e: new Error("x") }));
+        results.join("\n");
+    "#;
+    let expected = r#"{"a":"P1@a","b":["P2@0"]}
+[[1],[1,2]] 2,1,2
+{"first":1,"later":"from-proto","nested":"late"}
+[0,"proto-element",2]
+[null,null,null]{"k":1}
+{"0":"changed","1":2}
+{"a":1,"b":{"c":2}} get:toJSON,ownKeys,gopd:a,gopd:b,get:a,get:b
+{"a":10,"b":[10,20],"c":{"a":30}}
+{"a":"A","1":"one","b":"B"}
+{
+  "a": [],
+  "b": {},
+  "c": [
+    1,
+    {
+      "d": 2,
+      "e": []
+    }
+  ],
+  "f": "x"
+}
+[
+--[],
+--{},
+--[
+----[]
+--]
+]
+{
+    "a": {}
+}
+[0,0,1.5,-2,1e+21,123456789012345,1000000000000000,9007199254740992,null,null,null,5e-7]
+[42,"T",false,1e1000]
+TypeError
+{"big":"10n"}
+[{"s":1},{"s":1},{"x":{"s":1}}]
+TypeError
+TypeError
+962
+undefined undefined "\u0007\ud800\"\\\n"
+:,a:a,array
+{"d":"1970-01-01T00:00:00.000Z","r":{},"m":{},"e":{}}"#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(run_in(&mut engine, source), expected, "{tier:?}");
+    }
 }
 
 #[test]

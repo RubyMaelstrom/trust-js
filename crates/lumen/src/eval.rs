@@ -210,6 +210,9 @@ impl Interp {
         env: &Env,
         mode: BindMode,
     ) -> Result<(), Abrupt> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.bind_pattern(pat, value, env, mode));
+        }
         match pat {
             Pattern::Ident(name) => {
                 match mode {
@@ -776,7 +779,79 @@ impl Interp {
         }
     }
 
+    /// The right operand of a logical operator whose left operand evaluated to `left`.
+    fn eval_logical_right(
+        &mut self,
+        op: &str,
+        left: Value,
+        right: &Expr,
+        env: &Env,
+    ) -> Result<Value, Abrupt> {
+        let take_right = match op {
+            "&&" => self.to_boolean(&left),
+            "||" => !self.to_boolean(&left),
+            "??" => matches!(left, Value::Undefined | Value::Null),
+            _ => unreachable!(),
+        };
+        if take_right {
+            self.eval(right, env)
+        } else {
+            Ok(left)
+        }
+    }
+
+    /// A left-nested chain of binary and logical operators (`a + b + c`, `a && b || c`),
+    /// evaluated left to right in a loop rather than recursing once per link: generated and
+    /// obfuscated code chains hundreds of thousands of operands.
+    fn eval_operator_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        loop {
+            node = match node {
+                Expr::Binary { op, left, right } => {
+                    links.push((true, *op, &**right));
+                    left
+                }
+                Expr::Logical { op, left, right } => {
+                    links.push((false, *op, &**right));
+                    left
+                }
+                _ => break,
+            };
+        }
+        let mut value = self.eval(node, env)?;
+        for (binary, op, right) in links.into_iter().rev() {
+            value = if binary {
+                let right = self.eval(right, env)?;
+                self.binary(op, value, right)?
+            } else {
+                self.eval_logical_right(op, value, right, env)?
+            };
+        }
+        Ok(value)
+    }
+
+    /// [`Self::exec_stmt`] continued on a fresh native stack segment (see `with_ast_stack`); kept
+    /// out of line so the gateway adds no frame state to the hot statement dispatch.
+    #[cold]
+    #[inline(never)]
+    fn exec_stmt_on_fresh_stack(&mut self, stmt: &Stmt, env: &Env) -> Completion {
+        crate::interpreter::with_ast_stack(|| self.exec_stmt(stmt, env))
+    }
+
+    /// [`Self::eval`] continued on a fresh native stack segment, out of line like
+    /// [`Self::exec_stmt_on_fresh_stack`].
+    #[cold]
+    #[inline(never)]
+    fn eval_on_fresh_stack(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        crate::interpreter::with_ast_stack(|| self.eval(expr, env))
+    }
+
     pub(crate) fn exec_stmt(&mut self, stmt: &Stmt, env: &Env) -> Completion {
+        self.ast_tick = self.ast_tick.wrapping_add(1);
+        if self.ast_tick & 7 == 0 && crate::interpreter::ast_stack_low() {
+            return self.exec_stmt_on_fresh_stack(stmt, env);
+        }
         match stmt {
             Stmt::Empty | Stmt::Debugger => Ok(Value::Empty),
             Stmt::FuncDecl(func) => {
@@ -2918,6 +2993,10 @@ impl Interp {
         } else {
             len as usize
         };
+        // A trap's array-like `length` is author data: bound the list before reading it.
+        if len > crate::interpreter::MAX_ARRAY_OP_LEN {
+            return Err(self.throw("RangeError", "array length exceeds engine limit"));
+        }
         let mut out = Vec::with_capacity(len.min(1024));
         for k in 0..len {
             out.push(self.get_member(obj, &k.to_string())?);
@@ -3168,6 +3247,13 @@ impl Interp {
     }
 
     pub(crate) fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        // Querying the native stack on every evaluation would cost the tree-walker several
+        // percent; every eighth (each level of nesting is at least one evaluation) suffices
+        // for the gateway's red zone.
+        self.ast_tick = self.ast_tick.wrapping_add(1);
+        if self.ast_tick & 7 == 0 && crate::interpreter::ast_stack_low() {
+            return self.eval_on_fresh_stack(expr, env);
+        }
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::BigInt(n) => Ok(Value::BigInt(n.clone())),
@@ -3238,32 +3324,14 @@ impl Interp {
                     self.eval(alt, env)
                 }
             }
+            Expr::Binary { left, .. } | Expr::Logical { left, .. }
+                if matches!(**left, Expr::Binary { .. } | Expr::Logical { .. }) =>
+            {
+                self.eval_operator_chain(expr, env)
+            }
             Expr::Logical { op, left, right } => {
                 let l = self.eval(left, env)?;
-                match *op {
-                    "&&" => {
-                        if self.to_boolean(&l) {
-                            self.eval(right, env)
-                        } else {
-                            Ok(l)
-                        }
-                    }
-                    "||" => {
-                        if self.to_boolean(&l) {
-                            Ok(l)
-                        } else {
-                            self.eval(right, env)
-                        }
-                    }
-                    "??" => {
-                        if matches!(l, Value::Undefined | Value::Null) {
-                            self.eval(right, env)
-                        } else {
-                            Ok(l)
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                self.eval_logical_right(op, l, right, env)
             }
             Expr::Unary { op, arg } => self.eval_unary(op, arg, env),
             Expr::Update { op, prefix, arg } => self.eval_update(op, *prefix, arg, env),
@@ -3311,6 +3379,12 @@ impl Interp {
                     v
                 }
             }
+            Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                if matches!(&**obj, Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                    if !matches!(**obj, Expr::Super)) =>
+            {
+                self.eval_member_chain(expr, env)
+            }
             Expr::Member {
                 obj,
                 prop,
@@ -3323,6 +3397,14 @@ impl Interp {
                 optional,
                 pos,
             } => self.eval_index(obj, index, *optional, *pos, env),
+            Expr::Call { .. }
+                if expr
+                    .call_chain_link()
+                    .and_then(Expr::call_chain_link)
+                    .is_some() =>
+            {
+                self.eval_call_chain(expr, env)
+            }
             Expr::Call {
                 callee,
                 args,
@@ -3405,6 +3487,151 @@ impl Interp {
         }
         self.get_member(&base, prop)
             .map_err(|error| self.placed_error(error, position))
+    }
+
+    /// A chain of property reads (`a.b.c`, `a[0]?.b`), evaluated from its base outwards in a
+    /// loop rather than recursing once per link: generated code chains hundreds of thousands.
+    /// Each link performs the steps of [`Self::eval_member`] / [`Self::eval_index`] on the value
+    /// below it, and an error is placed at the link that raised it and then at each enclosing
+    /// link, as the recursion would.
+    fn eval_member_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        loop {
+            match node {
+                Expr::Member { obj, .. } | Expr::Index { obj, .. }
+                    if !matches!(**obj, Expr::Super) =>
+                {
+                    links.push(node);
+                    node = obj;
+                }
+                _ => break,
+            }
+        }
+        let mut value = match self.eval(node, env) {
+            Ok(value) => value,
+            Err(error) => return Err(self.placed_chain_error(error, &links)),
+        };
+        for index in (0..links.len()).rev() {
+            value = match self.member_link(links[index], value, env) {
+                Ok(value) => value,
+                Err(error) => return Err(self.placed_chain_error(error, &links[..=index])),
+            };
+        }
+        Ok(value)
+    }
+
+    /// One link of [`Self::eval_member_chain`]: the read of `link` from the already evaluated
+    /// `base`.
+    fn member_link(&mut self, link: &Expr, base: Value, env: &Env) -> Result<Value, Abrupt> {
+        if self.short_circuit {
+            return Ok(Value::Undefined); // an earlier `?.` link short-circuited
+        }
+        let optional = matches!(
+            link,
+            Expr::Member { optional: true, .. } | Expr::Index { optional: true, .. }
+        );
+        if optional && matches!(base, Value::Undefined | Value::Null) {
+            self.short_circuit = true;
+            return Ok(Value::Undefined);
+        }
+        match link {
+            Expr::Member { prop, .. } if prop.starts_with('#') => {
+                let k = self.resolve_private(prop, env);
+                self.get_private_member(&base, &k)
+            }
+            Expr::Member { prop, .. } => self.get_member(&base, prop),
+            Expr::Index { index, .. } => {
+                let idx = self.eval(index, env)?;
+                // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
+                if matches!(base, Value::Undefined | Value::Null) {
+                    trace_nullish_property("eval-index", &idx);
+                    return Err(
+                        self.throw("TypeError", "cannot read property of null or undefined")
+                    );
+                }
+                if let (Value::Obj(o), Value::Num(n)) = (&base, &idx) {
+                    if let Some(v) = self.fast_get_elem(o, *n) {
+                        return Ok(v);
+                    }
+                }
+                let key = self.to_property_key(&idx)?;
+                self.get_member(&base, &key)
+            }
+            _ => unreachable!("member chain links are property reads"),
+        }
+    }
+
+    /// A chain of calls (`f()()()`, `f().m().n()`; see [`Expr::call_chain_link`]), evaluated
+    /// from its innermost call outwards in a loop rather than recursing once per link. Each link
+    /// performs the steps of [`Self::eval_call`] and [`Self::eval_callee_reference`] on the value
+    /// of the call below it.
+    fn eval_call_chain(&mut self, expr: &Expr, env: &Env) -> Result<Value, Abrupt> {
+        let mut links = Vec::new();
+        let mut node = expr;
+        while let Some(below) = node.call_chain_link() {
+            links.push(node);
+            node = below;
+        }
+        let mut value = match self.eval(node, env) {
+            Ok(value) => value,
+            Err(error) => return Err(self.placed_chain_error(error, &links)),
+        };
+        for index in (0..links.len()).rev() {
+            value = match self.call_link(links[index], value, env) {
+                Ok(value) => value,
+                Err(error) => return Err(self.placed_chain_error(error, &links[..=index])),
+            };
+        }
+        Ok(value)
+    }
+
+    /// One link of [`Self::eval_call_chain`]: the call `link` whose callee is, or is a method
+    /// of, the value `below`.
+    fn call_link(&mut self, link: &Expr, below: Value, env: &Env) -> Result<Value, Abrupt> {
+        let Expr::Call {
+            callee, args, pos, ..
+        } = link
+        else {
+            unreachable!("call chain links are calls");
+        };
+        if self.short_circuit {
+            return Ok(Value::Undefined);
+        }
+        let (func, this) = match &**callee {
+            Expr::Member { prop, .. } if prop.starts_with('#') => {
+                let k = self.resolve_private(prop, env);
+                (self.get_private_member(&below, &k)?, below)
+            }
+            Expr::Member { prop, .. } => (self.get_member(&below, prop)?, below),
+            Expr::Index { index, .. } => {
+                let idx = self.eval(index, env)?;
+                let key = self.ref_prop_key(&below, &mut RefKey::Raw(idx))?;
+                (self.get_member(&below, &key)?, below)
+            }
+            _ => (below, Value::Undefined),
+        };
+        let argv = self.eval_args(args, env)?;
+        if !func.is_callable() {
+            return Err(self.throw(
+                "TypeError",
+                crate::callee_name::not_callable_message(callee, false),
+            ));
+        }
+        self.call_at(*pos, func, this, &argv)
+    }
+
+    /// `error`, raised inside the innermost of `links` (outermost first), placed at each of
+    /// them from the inside out.
+    #[cold]
+    #[inline(never)]
+    fn placed_chain_error(&self, error: Abrupt, links: &[&Expr]) -> Abrupt {
+        for link in links.iter().rev() {
+            if let Some(position) = link.position() {
+                self.place_thrown(&error, position);
+            }
+        }
+        error
     }
 
     /// `super.prop`.
@@ -7689,6 +7916,11 @@ impl Interp {
         value: Value,
         env: &Env,
     ) -> Result<(), Abrupt> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| {
+                self.assign_to_target(target, value, env)
+            });
+        }
         match target {
             Expr::Ident(name, _) => self.assign_var(name, value, env),
             Expr::Member { obj, prop, .. } => {
@@ -8144,19 +8376,21 @@ impl Interp {
         y: &crate::bigint::JsBigInt,
     ) -> Result<Value, Abrupt> {
         use crate::bigint::JsBigInt;
+        let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+        let stop = |stop| self.bigint_stop(stop);
         let v = match op {
-            "+" => x.add(y),
-            "-" => x.sub(y),
-            "*" => x.mul(y),
-            "/" => x
-                .div(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "%" => x
-                .rem(y)
-                .ok_or_else(|| self.throw("RangeError", "Division by zero"))?,
-            "**" => x
-                .pow(y)
-                .ok_or_else(|| self.throw("RangeError", "Exponent must be non-negative"))?,
+            "+" => x.add_bounded(y).map_err(stop)?,
+            "-" => x.sub_bounded(y).map_err(stop)?,
+            "*" => x.mul_bounded(y, &mut poll).map_err(stop)?,
+            "/" | "%" if y.is_zero() => {
+                return Err(self.throw("RangeError", "Division by zero"));
+            }
+            "/" => x.div_bounded(y, &mut poll).map_err(stop)?,
+            "%" => x.rem_bounded(y, &mut poll).map_err(stop)?,
+            "**" if y.is_negative() => {
+                return Err(self.throw("RangeError", "Exponent must be non-negative"));
+            }
+            "**" => x.pow_bounded(y, &mut poll).map_err(stop)?,
             "&" => x.bitand(y),
             "|" => x.bitor(y),
             "^" => x.bitxor(y),
@@ -8166,13 +8400,7 @@ impl Interp {
                 let leftward = (op == "<<") != y.is_negative();
                 let count = y.to_i128().map(|v| v.unsigned_abs()).unwrap_or(u128::MAX);
                 if leftward {
-                    if x.is_zero() {
-                        JsBigInt::zero()
-                    } else if count > (1 << 30) {
-                        return Err(self.throw("RangeError", "BigInt is too large to allocate"));
-                    } else {
-                        x.shl(count as u64)
-                    }
+                    x.shl_bounded(count).map_err(stop)?
                 } else if count >= (1 << 30) {
                     // Every bit shifted out: floor(x / 2^count) is 0 or -1 by sign.
                     if x.is_negative() {
@@ -8189,6 +8417,36 @@ impl Interp {
         Ok(Value::BigInt(v))
     }
 
+    /// The completion for a BigInt operation that stopped: V8's RangeError for a result over
+    /// the size limit, or the host's interrupt.
+    pub(crate) fn bigint_stop(&self, stop: crate::bigint::Stop) -> Abrupt {
+        match stop {
+            crate::bigint::Stop::TooLarge => {
+                self.throw("RangeError", "Maximum BigInt size exceeded")
+            }
+            crate::bigint::Stop::Interrupted(reason) => Abrupt::Interrupt(reason),
+        }
+    }
+
+    /// The digits of a BigInt in `radix` (Number::toString for BigInts, ECMA-262 §6.1.6.2.23).
+    /// A result longer than the engine's string limit throws before the quadratic conversion
+    /// runs, and a long conversion polls the host interrupt.
+    pub(crate) fn bigint_to_string(
+        &self,
+        n: &crate::bigint::JsBigInt,
+        radix: u32,
+    ) -> Result<String, Abrupt> {
+        // |n| >= 2^(bits - 1), so it has at least floor((bits - 1) * log_radix 2) + 1 digits.
+        let bits = n.bit_len().saturating_sub(1) as f64;
+        let digits = (bits * std::f64::consts::LN_2 / (radix as f64).ln()).floor();
+        if digits >= MAX_STR_LEN as f64 {
+            return Err(self.throw("RangeError", "Invalid string length"));
+        }
+        let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+        n.to_string_radix_bounded(radix, &mut poll)
+            .map_err(|stop| self.bigint_stop(stop))
+    }
+
     /// ToBigInt: BigInt stays; Boolean → 0n/1n; String parses (SyntaxError if malformed); Number /
     /// undefined / null / Symbol throw TypeError.
     pub(crate) fn to_bigint(&mut self, v: &Value) -> Result<crate::bigint::JsBigInt, Abrupt> {
@@ -8196,8 +8454,12 @@ impl Interp {
         match p {
             Value::BigInt(n) => Ok(n),
             Value::Bool(b) => Ok(crate::bigint::JsBigInt::from_u64(b as u64)),
-            Value::Str(s) => string_to_bigint(&s)
-                .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt")),
+            Value::Str(s) => {
+                let mut poll = crate::bigint::Poll::new(&self.runtime_interrupt);
+                string_to_bigint_bounded(&s, &mut poll)
+                    .map_err(|stop| self.bigint_stop(stop))?
+                    .ok_or_else(|| self.throw("SyntaxError", "Cannot convert string to a BigInt"))
+            }
             Value::Num(_) => Err(self.throw("TypeError", "Cannot convert a Number to a BigInt")),
             _ => Err(self.throw("TypeError", "Cannot convert value to a BigInt")),
         }
@@ -8555,7 +8817,9 @@ impl Interp {
             Value::Null => Ok(crate::lstr::LStr::from("null")),
             Value::Bool(b) => Ok(crate::lstr::LStr::from(if *b { "true" } else { "false" })),
             Value::Num(n) => Ok(crate::lstr::LStr::from(self.num_to_str(*n).as_str())),
-            Value::BigInt(n) => Ok(crate::lstr::LStr::from(n.to_string().as_str())),
+            Value::BigInt(n) => Ok(crate::lstr::LStr::from(
+                self.bigint_to_string(n, 10)?.as_str(),
+            )),
             Value::Str(s) => Ok(s.clone()),
             Value::Sym(_) => {
                 Err(self.throw("TypeError", "Cannot convert a Symbol value to a string"))
@@ -8826,6 +9090,9 @@ enum LoopStep {
 /// resolution, which the parser already folds), declares nothing and creates no closure:
 /// primitive literals, and array/object literals built only from them.
 fn env_free_initializer(e: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| env_free_initializer(e));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -8979,6 +9246,9 @@ fn stmts_contain(stmts: &[Stmt], pred: fn(&Expr) -> bool) -> bool {
 }
 
 fn stmt_contains(s: &Stmt, pred: fn(&Expr) -> bool) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| stmt_contains(s, pred));
+    }
     let e = |x: &Expr| expr_contains(x, pred);
     match s {
         Stmt::Expr(x) | Stmt::Throw(x) => e(x),
@@ -9048,6 +9318,9 @@ pub(crate) fn expr_has_own_suspension(x: &Expr) -> bool {
 }
 
 fn expr_contains_impl(x: &Expr, pred: fn(&Expr) -> bool, descend_arrows: bool) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| expr_contains_impl(x, pred, descend_arrows));
+    }
     if pred(x) {
         return true;
     }
@@ -9162,6 +9435,9 @@ pub(crate) fn method_super_call_error_full(func: &crate::ast::Function) -> Optio
 
 /// `args` also flags `arguments` (a field-initializer rule); methods omit it since they may use it.
 fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| fi_expr(e, args));
+    }
     match e {
         Expr::Ident(n, _) if args && n == "arguments" => {
             Some("'arguments' is not allowed in a class field initializer")
@@ -9241,6 +9517,9 @@ fn fi_stmts(stmts: &[Stmt], args: bool) -> Option<&'static str> {
 }
 
 fn fi_stmt(s: &Stmt, args: bool) -> Option<&'static str> {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| fi_stmt(s, args));
+    }
     match s {
         Stmt::Expr(e) | Stmt::Throw(e) => fi_expr(e, args),
         Stmt::Return(e) => e.as_ref().and_then(|e| fi_expr(e, args)),
@@ -9753,27 +10032,36 @@ pub(crate) fn private_display(key: &str) -> &str {
 }
 
 /// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable.
+/// StringToBigInt for comparisons with a string operand (unpolled).
 fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
+    string_to_bigint_bounded(s, &mut crate::bigint::Poll::never())
+        .ok()
+        .flatten()
+}
+
+/// StringToBigInt (ECMA-262 §7.1.14): `Ok(None)` when the string is not a valid integer.
+fn string_to_bigint_bounded(
+    s: &str,
+    poll: &mut crate::bigint::Poll,
+) -> Result<Option<crate::bigint::JsBigInt>, crate::bigint::Stop> {
     use crate::bigint::JsBigInt;
     let t = s.trim_matches(crate::regex::js_whitespace);
     if t.is_empty() {
-        return Some(JsBigInt::zero());
+        return Ok(Some(JsBigInt::zero()));
     }
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return JsBigInt::parse_radix(h, 16);
-    }
-    if let Some(o) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return JsBigInt::parse_radix(o, 8);
-    }
-    if let Some(b) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return JsBigInt::parse_radix(b, 2);
+    for (prefixes, radix) in [(["0x", "0X"], 16), (["0o", "0O"], 8), (["0b", "0B"], 2)] {
+        if let Some(digits) = prefixes.iter().find_map(|prefix| t.strip_prefix(prefix)) {
+            return JsBigInt::parse_radix_bounded(digits, radix, poll);
+        }
     }
     let (neg, digits) = match t.strip_prefix('-') {
         Some(d) => (true, d),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let v = JsBigInt::parse_dec(digits)?;
-    Some(if neg { v.neg() } else { v })
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    Ok(JsBigInt::parse_radix_bounded(digits, 10, poll)?.map(|v| if neg { v.neg() } else { v }))
 }
 
 /// The outcome of evaluating a `return` operand: a pending proper tail call, or a plain value.

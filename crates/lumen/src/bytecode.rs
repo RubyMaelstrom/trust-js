@@ -4083,6 +4083,9 @@ impl CaptureScan {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Option<()> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.stmt(s));
+        }
         self.spend_watch_budget()?;
         match s {
             Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
@@ -4395,6 +4398,9 @@ impl CaptureScan {
     }
 
     fn expr(&mut self, e: &Expr) -> Option<()> {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.expr(e));
+        }
         self.spend_watch_budget()?;
         match e {
             Expr::Num(_)
@@ -8032,6 +8038,9 @@ struct Compiler {
 /// selected conditional arm, the final sequence element, and the right logical operand inherit
 /// tail position.
 fn has_tail_call(expr: &Expr) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| has_tail_call(expr));
+    }
     match expr {
         Expr::Call { .. } | Expr::TaggedTemplate { .. } => true,
         Expr::Cond { cons, alt, .. } => has_tail_call(cons) || has_tail_call(alt),
@@ -8316,6 +8325,9 @@ fn pattern_exprs_safe(pattern: &Pattern, banned: &crate::fasthash::FastSet<&str>
 }
 
 fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| default_expr_safe(e, banned));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -8369,6 +8381,9 @@ fn default_expr_safe(e: &Expr, banned: &crate::fasthash::FastSet<&str>) -> bool 
 /// local is unobservable outside its function (that is what makes slot storage sound), so only a
 /// syntactic assignment/update in this very expression could touch it.
 fn no_assign_to(e: &Expr, name: &str) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| no_assign_to(e, name));
+    }
     match e {
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -9660,6 +9675,9 @@ impl Compiler {
     /// Does this expression continue an open optional chain? An OptionalChain wrapper closes
     /// its own chain; optional links in arguments/keys are separate expressions as well.
     fn has_open_optional_chain(e: &Expr) -> bool {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| Self::has_open_optional_chain(e));
+        }
         match e {
             Expr::Member { obj, optional, .. } | Expr::Index { obj, optional, .. } => {
                 *optional || Self::has_open_optional_chain(obj)
@@ -9685,6 +9703,9 @@ impl Compiler {
     }
 
     fn opt_chain_link(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.opt_chain_link(e, shorts));
+        }
         if !Self::has_open_optional_chain(e) {
             // Preserve ordinary expression specializations (GetPropThis/GetPropLocal,
             // element fusions, etc.) before the first optional link. Besides avoiding extra
@@ -10291,6 +10312,9 @@ impl Compiler {
     }
 
     fn stmt(&mut self, s: &Stmt) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.stmt(s));
+        }
         if self.fragment_root.is_none()
             && matches!(
                 s,
@@ -13131,6 +13155,9 @@ impl Compiler {
     }
 
     fn expr(&mut self, e: &Expr) -> CResult {
+        if crate::interpreter::ast_stack_low() {
+            return crate::interpreter::with_ast_stack(|| self.expr(e));
+        }
         match e.position() {
             Some(position) if !self.cannot_fail(e) => {
                 self.at_position(position, |c| c.expr_node(e))
@@ -13146,8 +13173,220 @@ impl Compiler {
             if matches!(self.home(name), Some(Home::Slot(slot, _)) if !self.tdz_slots.contains(&slot)))
     }
 
+    /// The operator of a binary expression.
+    fn binary_operator(&mut self, op: &'static str) -> Op {
+        match op {
+            "+" => Op::Add,
+            "-" => Op::Sub,
+            "*" => Op::Mul,
+            "/" => Op::Div,
+            "%" => Op::Mod,
+            "&" => Op::BitAnd,
+            "|" => Op::BitOr,
+            "^" => Op::BitXor,
+            "<<" => Op::Shl,
+            ">>" => Op::Shr,
+            ">>>" => Op::UShr,
+            "<" => Op::Lt,
+            ">" => Op::Gt,
+            "<=" => Op::Le,
+            ">=" => Op::Ge,
+            "==" => Op::EqEq,
+            "!=" => Op::NotEq,
+            "===" => Op::StrictEq,
+            "!==" => Op::StrictNotEq,
+            "instanceof" => Op::InstanceOf(self.new_single_cache()),
+            "in" => Op::In,
+            other => {
+                let i = self.name_idx(other);
+                Op::GenBin(i)
+            }
+        }
+    }
+
+    /// `typeof x === "literal"` (either way round), compiled to one TypeofIs test.
+    fn typeof_comparison<'e>(
+        op: &str,
+        left: &'e Expr,
+        right: &'e Expr,
+    ) -> Option<(&'e Expr, &'e Rc<str>)> {
+        if !matches!(op, "==" | "!=" | "===" | "!==") {
+            return None;
+        }
+        match (left, right) {
+            (Expr::Unary { op: "typeof", arg }, Expr::Str(literal))
+            | (Expr::Str(literal), Expr::Unary { op: "typeof", arg }) => Some((arg, literal)),
+            _ => None,
+        }
+    }
+
+    /// A left-nested chain of binary and logical operators (`a + b + c`, `a && b || c`),
+    /// compiled left to right in a loop rather than recursing once per link: generated and
+    /// obfuscated code chains hundreds of thousands of operands. Each link emits exactly what
+    /// the recursive lowering below does (none of these nodes carries a source position).
+    fn operator_chain(&mut self, e: &Expr) -> CResult {
+        let mut links = Vec::new();
+        let mut node = e;
+        loop {
+            match node {
+                Expr::Binary { op, left, right }
+                    if Self::typeof_comparison(op, left, right).is_none() =>
+                {
+                    links.push((true, *op, &**right));
+                    node = left;
+                }
+                Expr::Logical { op, left, right } => {
+                    links.push((false, *op, &**right));
+                    node = left;
+                }
+                _ => break,
+            }
+        }
+        self.expr(node)?;
+        for (binary, op, right) in links.into_iter().rev() {
+            if binary {
+                self.expr(right)?;
+                let op = self.binary_operator(op);
+                self.emit(op);
+            } else {
+                let jump = match op {
+                    "&&" => self.emit(Op::JumpIfFalsePeek(0)),
+                    "||" => self.emit(Op::JumpIfTruePeek(0)),
+                    "??" => self.emit(Op::JumpIfNotNullishPeek(0)),
+                    _ => return Err(Bail),
+                };
+                self.emit(Op::Pop);
+                self.expr(right)?;
+                self.patch(jump);
+            }
+        }
+        Ok(())
+    }
+
+    /// A non-optional public property read `o.p` or `o[k]` on an ordinary base: one link of a
+    /// member chain that [`Self::member_chain`] compiles in a loop.
+    fn plain_member_link(e: &Expr) -> Option<&Expr> {
+        match e {
+            Expr::Member {
+                obj,
+                prop,
+                optional: false,
+                ..
+            } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => Some(obj),
+            Expr::Index {
+                obj,
+                optional: false,
+                ..
+            } if !matches!(**obj, Expr::Super) => Some(obj),
+            _ => None,
+        }
+    }
+
+    /// A chain of property reads (`a.b.c`, `a[0][1]`), compiled from its innermost read
+    /// outwards in a loop rather than recursing once per link. The innermost read keeps its
+    /// receiver-direct and fused forms; every outer read is a plain GetProp/GetElem on the
+    /// value below it, at its own source position, exactly as the recursive lowering emits.
+    fn member_chain(&mut self, e: &Expr) -> CResult {
+        let mut links = Vec::new();
+        let mut node = e;
+        while let Some(obj) = Self::plain_member_link(node) {
+            if Self::plain_member_link(obj).is_none() {
+                break;
+            }
+            links.push(node);
+            node = obj;
+        }
+        self.expr(node)?;
+        for link in links.into_iter().rev() {
+            let position = link.position().unwrap_or(NO_POSITION);
+            self.at_position(position, |c| {
+                match link {
+                    Expr::Member { prop, .. } => {
+                        let i = c.name_idx(prop);
+                        let cache = c.new_cache(i);
+                        c.emit(Op::GetProp(i, cache));
+                    }
+                    Expr::Index { index, .. } => {
+                        c.expr(index)?;
+                        c.emit(Op::GetElem);
+                    }
+                    _ => unreachable!("plain member links are reads"),
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A chain of calls (`f()()()`, `f().m().n()`), compiled from its innermost call outwards
+    /// in a loop rather than recursing once per link. Each outer link calls the value the link
+    /// below left on the stack, as a plain callee or through GetMethod/GetMethodElem, and
+    /// emits exactly the call sequence of the recursive lowering at its own position.
+    fn call_chain(&mut self, e: &Expr) -> CResult {
+        let mut links = Vec::new();
+        let mut node = e;
+        while let Some(below) = node.call_chain_link() {
+            links.push(node);
+            node = below;
+        }
+        // Only the outermost call can be in tail position (see the Call lowering below).
+        let tail = self.tail_call_node == e as *const Expr as usize;
+        if tail {
+            self.tail_call_node = 0;
+        }
+        self.expr(node)?;
+        for link in links.into_iter().rev() {
+            let Expr::Call {
+                callee, args, pos, ..
+            } = link
+            else {
+                unreachable!("call chain links are calls");
+            };
+            let outermost = std::ptr::eq(link, e);
+            self.at_position(*pos, |c| {
+                let (with_this, allow_inline) = match &**callee {
+                    Expr::Member { prop, .. } => {
+                        let name = c.name_idx(prop);
+                        if prop.starts_with('#') {
+                            let site = c.new_private_site();
+                            c.emit(Op::GetPrivateMethod(name, site));
+                            (true, false)
+                        } else {
+                            let cache = c.new_cache(name);
+                            c.emit(Op::GetMethod(name, cache));
+                            (true, true)
+                        }
+                    }
+                    Expr::Index { index, .. } => {
+                        c.expr(index)?;
+                        c.emit(Op::GetMethodElem);
+                        (true, true)
+                    }
+                    _ => (false, true),
+                };
+                c.tail_finish = tail && outermost;
+                c.pending_call_name = Some(crate::callee_name::callee_name(callee));
+                c.finish_call(args, with_this, allow_inline)
+            })?;
+        }
+        Ok(())
+    }
+
     fn expr_node(&mut self, e: &Expr) -> CResult {
         match e {
+            _ if e
+                .call_chain_link()
+                .and_then(Expr::call_chain_link)
+                .is_some() =>
+            {
+                self.call_chain(e)
+            }
+            _ if Self::plain_member_link(e)
+                .and_then(Self::plain_member_link)
+                .is_some() =>
+            {
+                self.member_chain(e)
+            }
             Expr::Func(f) => self.emit_closure(f, None),
             Expr::Class(class) if crate::eval::expr_has_own_suspension(e) => {
                 self.staged_class(class, None)
@@ -13327,58 +13566,27 @@ impl Compiler {
                 self.emit(Op::SuperGet);
                 Ok(())
             }
+            Expr::Binary { left, .. } | Expr::Logical { left, .. }
+                if matches!(**left, Expr::Binary { .. } | Expr::Logical { .. }) =>
+            {
+                self.operator_chain(e)
+            }
             Expr::Binary { op, left, right } => {
-                if matches!(*op, "==" | "!=" | "===" | "!==") {
-                    let pair = match (&**left, &**right) {
-                        (Expr::Unary { op: "typeof", arg }, Expr::Str(literal))
-                        | (Expr::Str(literal), Expr::Unary { op: "typeof", arg }) => {
-                            Some((arg, literal))
-                        }
-                        _ => None,
-                    };
-                    if let Some((argument, literal)) = pair {
-                        // An unknown identifier needs typeof's unresolvable-reference
-                        // exception. Its existing TypeofName operation remains authoritative.
-                        if !matches!(&**argument, Expr::Ident(name, _) if self.home(name).is_none())
-                        {
-                            self.expr(argument)?;
-                            self.emit(Op::TypeofIs(
-                                crate::value::TypeofTest::from_literal(literal),
-                                matches!(*op, "!=" | "!=="),
-                            ));
-                            return Ok(());
-                        }
+                if let Some((argument, literal)) = Self::typeof_comparison(op, left, right) {
+                    // An unknown identifier needs typeof's unresolvable-reference
+                    // exception. Its existing TypeofName operation remains authoritative.
+                    if !matches!(argument, Expr::Ident(name, _) if self.home(name).is_none()) {
+                        self.expr(argument)?;
+                        self.emit(Op::TypeofIs(
+                            crate::value::TypeofTest::from_literal(literal),
+                            matches!(*op, "!=" | "!=="),
+                        ));
+                        return Ok(());
                     }
                 }
                 self.expr(left)?;
                 self.expr(right)?;
-                let bop = match *op {
-                    "+" => Op::Add,
-                    "-" => Op::Sub,
-                    "*" => Op::Mul,
-                    "/" => Op::Div,
-                    "%" => Op::Mod,
-                    "&" => Op::BitAnd,
-                    "|" => Op::BitOr,
-                    "^" => Op::BitXor,
-                    "<<" => Op::Shl,
-                    ">>" => Op::Shr,
-                    ">>>" => Op::UShr,
-                    "<" => Op::Lt,
-                    ">" => Op::Gt,
-                    "<=" => Op::Le,
-                    ">=" => Op::Ge,
-                    "==" => Op::EqEq,
-                    "!=" => Op::NotEq,
-                    "===" => Op::StrictEq,
-                    "!==" => Op::StrictNotEq,
-                    "instanceof" => Op::InstanceOf(self.new_single_cache()),
-                    "in" => Op::In,
-                    other => {
-                        let i = self.name_idx(other);
-                        Op::GenBin(i)
-                    }
-                };
+                let bop = self.binary_operator(op);
                 self.emit(bop);
                 Ok(())
             }
@@ -14934,6 +15142,9 @@ fn eval_expr_with_slots<S: StoredValue>(
 /// any binding. Field initializers are scanned too although they run as methods; that only
 /// over-approximates. The match is exhaustive so a new expression form must decide here.
 fn retained_expr_names(e: &Expr, out: &mut crate::fasthash::FastSet<String>) -> bool {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| retained_expr_names(e, out));
+    }
     fn elems(items: &[crate::ast::ArrayElem], out: &mut crate::fasthash::FastSet<String>) -> bool {
         items.iter().all(|item| match item {
             crate::ast::ArrayElem::Item(e) | crate::ast::ArrayElem::Spread(e) => {
@@ -21291,7 +21502,7 @@ unsafe fn jit_intrinsic_inner(
                                             if n >= 0.0
                                                 && n.is_finite()
                                                 && n.fract() == 0.0
-                                                && n <= crate::interpreter::MAX_ARRAY_OP_LEN
+                                                && n <= crate::interpreter::MAX_ARGUMENTS_LEN
                                                     as f64 =>
                                         {
                                             Some(n as usize)

@@ -70,10 +70,19 @@ fn string_list(i: &mut Interp, list: &Value) -> Result<Vec<String>, Value> {
     // eagerly draining the iterable first.
     let (iter, next) = ab(i.get_iterator(list))?;
     let mut out = Vec::new();
+    // The formatted list contains every element, so their total bounds its length.
+    let mut total = 0usize;
     loop {
         match ab(i.iterator_step(&iter, &next))? {
             None => break,
-            Some(Value::Str(s)) => out.push(s.to_string()),
+            Some(Value::Str(s)) => {
+                total = total.saturating_add(s.len());
+                if let Err(err) = crate::builtins::check_string_length(i, total) {
+                    i.iterator_close(&iter);
+                    return Err(err);
+                }
+                out.push(s.to_string())
+            }
             Some(_) => {
                 let err =
                     i.make_error("TypeError", "Intl.ListFormat list elements must be strings");

@@ -79,7 +79,10 @@ impl SelfHostedSource {
             .into_iter()
             .rev()
             .find_map(|statement| match statement {
-                Stmt::Expr(Expr::Paren(inner)) => Some(*inner),
+                Stmt::Expr(mut expr @ Expr::Paren(_)) => match &mut expr {
+                    Expr::Paren(inner) => Some(std::mem::replace(&mut **inner, Expr::Null)),
+                    _ => None,
+                },
                 Stmt::Expr(expr @ Expr::Object(_)) => Some(expr),
                 _ => None,
             })

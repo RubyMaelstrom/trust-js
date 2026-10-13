@@ -19,7 +19,7 @@ pub(super) fn install_json(it: &mut Interp) {
                 Value::Obj(o) => ab(i.to_length(o))?,
                 _ => 0,
             };
-            let mut list: Vec<String> = Vec::new();
+            let mut list: Vec<Rc<str>> = Vec::new();
             // JSON.stringify's PropertyList keeps the first occurrence of each String while
             // preserving input order (ECMA-262 §25.5.4.1). Hash the already-coerced keys so a
             // large replacer array does not repeatedly rescan the prefix of `list`.
@@ -39,7 +39,7 @@ pub(super) fn install_json(it: &mut Interp) {
                 };
                 if let Some(key) = key {
                     if list_seen.insert(key.clone()) {
-                        list.push(key);
+                        list.push(Rc::from(key));
                     }
                 }
             }
@@ -72,13 +72,27 @@ pub(super) fn install_json(it: &mut Interp) {
             Value::Str(s) => s.chars().take(10).collect(),
             _ => String::new(),
         };
-        // SerializeJSONProperty starts from a wrapper holder `{ "": value }`.
-        let wrapper = i.new_object();
-        set_data(&wrapper, "", value);
-        let mut seen = Vec::new();
-        match json_str(i, &Value::Obj(wrapper), "", &opts, &gap, "", &mut seen)? {
-            Some(s) => Ok(Value::lstr(s)),
-            None => Ok(Value::Undefined),
+        // SerializeJSONProperty starts from a wrapper holder `{ "": value }`; only a replacer
+        // function can observe it (as its receiver).
+        let holder = if opts.func.is_some() {
+            let wrapper = i.new_object();
+            set_data(&wrapper, "", value.clone());
+            Value::Obj(wrapper)
+        } else {
+            Value::Undefined
+        };
+        let mut serializer = Serializer {
+            opts: &opts,
+            gap: &gap,
+            indent: String::new(),
+            stack: Vec::new(),
+            deep_stack: crate::fasthash::FastSet::default(),
+            out: String::with_capacity(64),
+        };
+        if json_serialize_property(i, &mut serializer, &holder, JsonKey::Name(""), value)? {
+            Ok(Value::lstr(serializer.out))
+        } else {
+            Ok(Value::Undefined)
         }
     });
     it.def_method(&j, "parse", 2, |i, _t, args| {
@@ -152,12 +166,13 @@ pub(super) fn install_json(it: &mut Interp) {
     set_builtin(&it.global, "JSON", Value::Obj(j));
 }
 
-fn json_quote(s: &str) -> String {
+/// Append QuoteJSONString(s) (ECMA-262 §25.5.2.3) to `out`.
+fn json_quote_into(out: &mut String, s: &str) {
     // QuoteJSONString (ECMA-262 §25.5.4.3) operates on UTF-16 code points. ASCII has no
     // surrogate or multi-unit cases, so keep this common path byte-based and avoid the Unicode
     // iterator/peek state entirely.
+    out.reserve(s.len() + 2);
     if s.is_ascii() {
-        let mut out = String::with_capacity(s.len() + 2);
         out.push('"');
         for &b in s.as_bytes() {
             match b {
@@ -168,15 +183,14 @@ fn json_quote(s: &str) -> String {
                 b'\t' => out.push_str("\\t"),
                 0x08 => out.push_str("\\b"),
                 0x0c => out.push_str("\\f"),
-                b if b < 0x20 => push_json_unicode_escape(&mut out, b as u16),
+                b if b < 0x20 => push_json_unicode_escape(out, b as u16),
                 b => out.push(b as char),
             }
         }
         out.push('"');
-        return out;
+        return;
     }
 
-    let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     let mut chars = s.chars().peekable();
     while let Some(mut c) = chars.next() {
@@ -200,16 +214,15 @@ fn json_quote(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{0008}' => out.push_str("\\b"),
             '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => push_json_unicode_escape(&mut out, c as u16),
+            c if (c as u32) < 0x20 => push_json_unicode_escape(out, c as u16),
             c => match crate::jstr::smuggled(c) {
                 // Well-formed JSON.stringify: a lone surrogate is written as its \u escape.
-                Some(u) => push_json_unicode_escape(&mut out, u),
+                Some(u) => push_json_unicode_escape(out, u),
                 None => out.push(c),
             },
         }
     }
     out.push('"');
-    out
 }
 
 #[inline]
@@ -225,7 +238,7 @@ fn push_json_unicode_escape(out: &mut String, unit: u16) {
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.
 struct JsonOpts {
     func: Option<Value>,
-    keys: Option<Vec<String>>,
+    keys: Option<Vec<Rc<str>>>,
 }
 
 /// [[Delete]] for the JSON reviver: trap-aware, discarding the boolean status (per `Perform ?`).
@@ -296,7 +309,9 @@ fn internalize_json_property(
                     Some(JsonRecord::Arr(elems)) => elems.get(idx),
                     _ => None,
                 };
-                let new_el = internalize_json_property(i, &val, &k, reviver, child)?;
+                let new_el = nested(i, |i| {
+                    internalize_json_property(i, &val, &k, reviver, child)
+                })?;
                 if matches!(new_el, Value::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
@@ -329,7 +344,9 @@ fn internalize_json_property(
                     }
                     _ => None,
                 };
-                let new_el = internalize_json_property(i, &val, &k, reviver, child)?;
+                let new_el = nested(i, |i| {
+                    internalize_json_property(i, &val, &k, reviver, child)
+                })?;
                 if matches!(new_el, Value::Undefined) {
                     json_delete_prop(i, &val, &k)?;
                 } else {
@@ -353,189 +370,363 @@ fn internalize_json_property(
     ))
 }
 
-fn json_str(
+/// One nested level of JSON.parse, its reviver walk or JSON.stringify, which recurse once per
+/// level of the text or value: on a fresh native stack segment when this one runs low, so deep
+/// nesting either completes (node parses a million levels) or throws the RangeError a deep
+/// JavaScript recursion would, instead of overflowing the stack.
+fn nested<T>(
     i: &mut Interp,
-    holder: &Value,
-    key: &str,
-    opts: &JsonOpts,
-    gap: &str,
-    indent: &str,
-    seen: &mut Vec<usize>,
-) -> Result<Option<String>, Value> {
-    // SerializeJSONProperty: fetch the value, then apply toJSON, then the function replacer.
-    let mut value = ab(i.get_member(holder, key))?;
-    if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
-        let tojson = ab(i.get_member(&value, "toJSON"))?;
-        if tojson.is_callable() {
-            value = ab(i.call(tojson, value.clone(), &[Value::lstr(key.to_string())]))?;
-        }
+    level: impl FnOnce(&mut Interp) -> Result<T, Value>,
+) -> Result<T, Value> {
+    match crate::interpreter::with_data_stack(|| level(&mut *i)) {
+        Some(result) => result,
+        None => Err(i.make_error("RangeError", "Maximum call stack size exceeded")),
     }
-    if let Some(func) = &opts.func {
-        value = ab(i.call(
-            func.clone(),
-            holder.clone(),
-            &[Value::lstr(key.to_string()), value],
-        ))?;
-    }
-    // A JSON.rawJSON object serializes as its stored raw text, verbatim.
-    if let Value::Obj(o) = &value {
-        if let Some(Value::Str(raw)) = o.borrow().props.get("\u{0}raw_json").map(|p| p.value()) {
-            return Ok(Some(raw.to_string()));
-        }
-    }
-    // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
-    // valueOf/toString is observed); booleans read the wrapped datum directly.
-    if let Value::Obj(o) = &value {
-        let exotic = o.borrow().exotic.clone();
-        match exotic {
-            Exotic::NumWrap(_) => value = Value::Num(ab(i.to_number(&value))?),
-            Exotic::StrWrap(_) => value = Value::Str(ab(i.to_string(&value))?),
-            Exotic::BoolWrap(b) => value = Value::Bool(b),
-            Exotic::BigIntWrap(_) => {
-                return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
-            }
-            _ => {}
-        }
-    }
-    match &value {
-        Value::Undefined | Value::Empty | Value::Sym(_) => Ok(None),
-        Value::Null => Ok(Some("null".to_string())),
-        Value::Bool(b) => Ok(Some(if *b { "true" } else { "false" }.to_string())),
-        Value::Num(n) => Ok(Some(if n.is_finite() {
-            i.num_to_str(*n)
-        } else {
-            "null".to_string()
-        })),
-        // JSON.stringify of a BigInt throws (matches the spec).
-        Value::BigInt(_) => Err(i.make_error("TypeError", "Do not know how to serialize a BigInt")),
-        Value::Str(s) => Ok(Some(json_quote(s))),
-        Value::Obj(o) => {
-            if !matches!(o.borrow().call, Callable::None) {
-                return Ok(None); // functions are omitted
-            }
-            let ptr = Rc::as_ptr(o) as usize;
-            if seen.contains(&ptr) {
-                return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
-            }
-            seen.push(ptr);
-            let new_indent = format!("{indent}{gap}");
-            // IsArray sees through proxies; key enumeration / length use proxy-aware operations.
-            let is_array = json_is_array(i, &value)?;
-            let is_proxy = proxy_pair(i, &value).is_some();
-            let result = if is_array {
-                let len = if is_proxy {
-                    ab(i.to_length(o))?
-                } else {
-                    i.array_length(o)
-                };
-                let mut items = Vec::with_capacity(len);
-                for k in 0..len {
-                    items.push(
-                        json_str(i, &value, &k.to_string(), opts, gap, &new_indent, seen)?
-                            .unwrap_or_else(|| "null".to_string()),
-                    );
-                }
-                join_json("[", "]", items, gap, &new_indent, indent)
-            } else {
-                // An array replacer restricts the keys (in its order); else all enumerable keys.
-                let keys: Vec<String> = match &opts.keys {
-                    Some(list) => list.clone(),
-                    None if is_proxy => proxy_enum_string_keys(i, &value)?
-                        .iter()
-                        .filter_map(|k| match k {
-                            Value::Str(s) => Some(s.to_string()),
-                            _ => None,
-                        })
-                        .collect(),
-                    None => {
-                        let mut keys = Vec::new();
-                        let own_keys = ordinary_own_keys_ordered(i, o)?;
-                        for key in own_keys
-                            .into_iter()
-                            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-                        {
-                            let enumerable = if ab(i.host_indexed_own_value(o, &key))?.is_some() {
-                                crate::value::canonical_index(&key).is_some()
-                            } else {
-                                o.borrow()
-                                    .props
-                                    .get(&key)
-                                    .is_some_and(|property| property.enumerable())
-                            };
-                            if enumerable {
-                                keys.push(key);
-                            }
-                        }
-                        keys
-                    }
-                };
-                let mut parts = Vec::new();
-                for k in &keys {
-                    if let Some(vs) = json_str(i, &value, k, opts, gap, &new_indent, seen)? {
-                        let colon = if gap.is_empty() { ":" } else { ": " };
-                        let mut member = json_quote(k);
-                        member.push_str(colon);
-                        member.push_str(&vs);
-                        parts.push(member);
-                    }
-                }
-                join_json("{", "}", parts, gap, &new_indent, indent)
-            };
-            seen.pop();
-            Ok(Some(result))
+}
+
+/// JSON.stringify's state (ECMA-262 §25.5.2.1): the options, the indentation, the objects being
+/// serialized (for the cycle check) and the one buffer the whole result is written to.
+struct Serializer<'a> {
+    opts: &'a JsonOpts,
+    gap: &'a str,
+    indent: String,
+    /// The objects being serialized, outermost first. The cycle check scans the first
+    /// [`JSON_STACK_SCAN`] of them and looks the rest up in `deep_stack`.
+    stack: Vec<usize>,
+    deep_stack: crate::fasthash::FastSet<usize>,
+    out: String,
+}
+
+/// Nesting levels whose cycle check is a linear scan: shallow values (almost all of them) skip
+/// hashing, while deep nesting stays linear overall.
+const JSON_STACK_SCAN: usize = 32;
+
+/// A property key for SerializeJSONProperty, made into a String only when toJSON or a replacer
+/// function observes it.
+#[derive(Clone, Copy)]
+enum JsonKey<'k> {
+    Name(&'k str),
+    Index(usize),
+}
+
+impl JsonKey<'_> {
+    fn value(self) -> Value {
+        match self {
+            JsonKey::Name(name) => Value::lstr(name.to_string()),
+            JsonKey::Index(index) => Value::lstr(index.to_string()),
         }
     }
 }
 
-fn join_json(
-    open: &str,
-    close: &str,
-    parts: Vec<String>,
-    gap: &str,
-    inner: &str,
-    outer: &str,
-) -> String {
-    // JSON.stringify's array/object assembly is a deterministic concatenation (ECMA-262
-    // §25.5.2.5). Stream the already-serialized members into one buffer instead of joining them
-    // into a temporary string and formatting a second copy.
-    let separators = if gap.is_empty() {
-        parts.len().saturating_sub(1)
-    } else {
-        parts.len().saturating_sub(1) * (2 + inner.len()) + 2 + inner.len() + outer.len()
+/// Whether Get on `object` for a string key has no side effects to observe when it finds an own
+/// data property: an ordinary object (no Proxy, exotic host or namespace methods; `ic_plain`) that
+/// is not a mapped arguments object.
+fn json_plain_get(i: &Interp, object: &Gc) -> bool {
+    object.borrow().ic_plain.get()
+        && (i.mapped_arguments.is_empty()
+            || !i
+                .mapped_arguments
+                .contains_key(&(Rc::as_ptr(object) as usize)))
+}
+
+/// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
+/// directly; anything else (accessors, absent keys, exotic objects) runs the full [[Get]].
+fn json_get(i: &mut Interp, holder: &Value, object: &Gc, key: &str) -> Result<Value, Value> {
+    if json_plain_get(i, object) {
+        if let Some(property) = object.borrow().props.get(key) {
+            if !property.accessor() {
+                return Ok(property.value());
+            }
+        }
+    }
+    ab(i.get_member(holder, key))
+}
+
+/// [`json_get`] for an array element.
+fn json_get_index(
+    i: &mut Interp,
+    holder: &Value,
+    object: &Gc,
+    index: usize,
+) -> Result<Value, Value> {
+    if let (true, Ok(slot)) = (json_plain_get(i, object), u32::try_from(index)) {
+        if let Some(property) = object.borrow().props.get_index(slot) {
+            if !property.accessor() {
+                return Ok(property.value());
+            }
+        }
+    }
+    ab(i.get_member(holder, &index.to_string()))
+}
+
+/// GetV(value, "toJSON") for SerializeJSONProperty step 2. Most values have no toJSON anywhere
+/// on an ordinary prototype chain; walk such a chain directly, and leave accessors and exotic
+/// objects to the full [[Get]] (whose result is the same, including getter calls).
+fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
+    if let Value::Obj(start) = value {
+        let mut current = start.clone();
+        loop {
+            let next = {
+                let object = current.borrow();
+                if !object.ic_plain.get() {
+                    break;
+                }
+                match object.props.get("toJSON") {
+                    Some(property) if !property.accessor() => return Ok(property.value()),
+                    Some(_) => break,
+                    None => object.proto.clone(),
+                }
+            };
+            match next {
+                Some(proto) => current = proto,
+                None => return Ok(Value::Undefined),
+            }
+        }
+    }
+    ab(i.get_member(value, "toJSON"))
+}
+
+/// SerializeJSONProperty (ECMA-262 §25.5.2.2) for a `value` already read from `holder[key]`,
+/// appended to the serializer's buffer. Returns false, appending nothing, when the property
+/// serializes to undefined.
+fn json_serialize_property(
+    i: &mut Interp,
+    s: &mut Serializer,
+    holder: &Value,
+    key: JsonKey,
+    mut value: Value,
+) -> Result<bool, Value> {
+    if matches!(value, Value::Obj(_) | Value::BigInt(_)) {
+        let to_json = json_to_json_method(i, &value)?;
+        if to_json.is_callable() {
+            value = ab(i.call(to_json, value.clone(), &[key.value()]))?;
+        }
+    }
+    if let Some(func) = &s.opts.func {
+        value = ab(i.call(func.clone(), holder.clone(), &[key.value(), value]))?;
+    }
+    if let Value::Obj(o) = &value {
+        // A JSON.rawJSON object (always created with a null prototype) serializes as its stored
+        // raw text, verbatim.
+        let raw = {
+            let object = o.borrow();
+            match object.proto {
+                None => object
+                    .props
+                    .get("\u{0}raw_json")
+                    .map(|property| property.value()),
+                Some(_) => None,
+            }
+        };
+        if let Some(Value::Str(raw)) = raw {
+            s.out.push_str(&raw);
+            return Ok(true);
+        }
+        // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
+        // valueOf/toString is observed); booleans read the wrapped datum directly.
+        let wrapped = match o.borrow().exotic {
+            Exotic::NumWrap(_) => Some(0),
+            Exotic::StrWrap(_) => Some(1),
+            Exotic::BoolWrap(b) => Some(2 + b as u8),
+            Exotic::BigIntWrap(_) => {
+                return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
+            }
+            _ => None,
+        };
+        match wrapped {
+            Some(0) => value = Value::Num(ab(i.to_number(&value))?),
+            Some(1) => value = Value::Str(ab(i.to_string(&value))?),
+            Some(b) => value = Value::Bool(b == 3),
+            None => {}
+        }
+    }
+    match &value {
+        Value::Undefined | Value::Empty | Value::Sym(_) => return Ok(false),
+        Value::Null => s.out.push_str("null"),
+        Value::Bool(b) => s.out.push_str(if *b { "true" } else { "false" }),
+        Value::Num(n) if !n.is_finite() => s.out.push_str("null"),
+        Value::Num(n) if n.fract() == 0.0 && n.abs() < 1e15 => {
+            // Integral and below 10^21, so Number::toString prints its digits (-0 prints "0").
+            use std::fmt::Write;
+            let _ = write!(s.out, "{}", *n as i64);
+        }
+        Value::Num(n) => s.out.push_str(&i.num_to_str(*n)),
+        // JSON.stringify of a BigInt throws (matches the spec).
+        Value::BigInt(_) => {
+            return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
+        }
+        Value::Str(text) => {
+            // Escaping only lengthens the text.
+            check_string_length(i, s.out.len().saturating_add(text.len()))?;
+            json_quote_into(&mut s.out, text);
+        }
+        Value::Obj(o) => {
+            if !matches!(o.borrow().call, Callable::None) {
+                return Ok(false); // functions are omitted
+            }
+            let o = o.clone();
+            if json_is_array(i, &value)? {
+                nested(i, |i| json_serialize_array(i, s, &value, &o))?;
+            } else {
+                nested(i, |i| json_serialize_object(i, s, &value, &o))?;
+            }
+        }
+    }
+    check_string_length(i, s.out.len())?;
+    Ok(true)
+}
+
+/// The start of SerializeJSONObject/Array: the cycle check and the deeper indentation.
+fn json_enter(i: &mut Interp, s: &mut Serializer, object: &Gc) -> Result<usize, Value> {
+    let ptr = Rc::as_ptr(object) as usize;
+    let shallow = &s.stack[..s.stack.len().min(JSON_STACK_SCAN)];
+    if shallow.contains(&ptr) || s.deep_stack.contains(&ptr) {
+        return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
+    }
+    if s.stack.len() >= JSON_STACK_SCAN {
+        s.deep_stack.insert(ptr);
+    }
+    s.stack.push(ptr);
+    let stepback = s.indent.len();
+    s.indent.push_str(s.gap);
+    Ok(stepback)
+}
+
+/// The end of SerializeJSONObject/Array: the closing bracket, on its own line when the gap
+/// indents a non-empty body.
+fn json_leave(s: &mut Serializer, object: &Gc, stepback: usize, any: bool, close: char) {
+    s.indent.truncate(stepback);
+    if any && !s.gap.is_empty() {
+        s.out.push('\n');
+        s.out.push_str(&s.indent);
+    }
+    s.out.push(close);
+    let ptr = s.stack.pop();
+    debug_assert_eq!(ptr, Some(Rc::as_ptr(object) as usize));
+    if s.stack.len() >= JSON_STACK_SCAN {
+        s.deep_stack.remove(&(Rc::as_ptr(object) as usize));
+    }
+}
+
+/// The separator before a member or element: a comma after the first, and with a gap a newline
+/// and the current indentation.
+fn json_separator(s: &mut Serializer, first: bool) {
+    if !first {
+        s.out.push(',');
+    }
+    if !s.gap.is_empty() {
+        s.out.push('\n');
+        s.out.push_str(&s.indent);
+    }
+}
+
+/// SerializeJSONObject (ECMA-262 §25.5.2.5).
+fn json_serialize_object(
+    i: &mut Interp,
+    s: &mut Serializer,
+    value: &Value,
+    object: &Gc,
+) -> Result<(), Value> {
+    let stepback = json_enter(i, s, object)?;
+    // K: the replacer's PropertyList, or EnumerableOwnProperties(value, key).
+    let keys: Vec<Rc<str>> = match &s.opts.keys {
+        Some(list) => list.clone(),
+        None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
+            .iter()
+            .filter_map(|key| match key {
+                Value::Str(key) => Some(Rc::from(key.as_str())),
+                _ => None,
+            })
+            .collect(),
+        None if object.borrow().ic_plain.get() => {
+            // An ordinary object's [[OwnPropertyKeys]] is its own key order; enumerability is
+            // its stored attribute. A record of enumerable named data properties needs no
+            // filtering.
+            let object = object.borrow();
+            if let Some(keys) = object.props.named_data_keys() {
+                keys.to_vec()
+            } else {
+                let mut keys = object.props.ordered_keys();
+                keys.retain(|key| {
+                    !Interp::is_sym_key(key)
+                        && !Interp::is_private_key(key)
+                        && object
+                            .props
+                            .get(key)
+                            .is_some_and(|property| property.enumerable())
+                });
+                keys
+            }
+        }
+        None => {
+            let mut keys = Vec::new();
+            let own_keys = ordinary_own_keys_ordered(i, object)?;
+            for key in own_keys
+                .into_iter()
+                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+            {
+                let enumerable = if ab(i.host_indexed_own_value(object, &key))?.is_some() {
+                    crate::value::canonical_index(&key).is_some()
+                } else {
+                    object
+                        .borrow()
+                        .props
+                        .get(&key)
+                        .is_some_and(|property| property.enumerable())
+                };
+                if enumerable {
+                    keys.push(Rc::from(key.as_str()));
+                }
+            }
+            keys
+        }
     };
-    let capacity = open
-        .len()
-        .saturating_add(close.len())
-        .saturating_add(parts.iter().map(String::len).sum::<usize>())
-        .saturating_add(separators);
-    let mut out = String::with_capacity(capacity);
-    out.push_str(open);
-    if parts.is_empty() {
-        out.push_str(close);
-        return out;
-    }
-    if gap.is_empty() {
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                out.push(',');
-            }
-            out.push_str(part);
+    s.out.push('{');
+    let mut any = false;
+    for key in &keys {
+        let member_start = s.out.len();
+        json_separator(s, !any);
+        json_quote_into(&mut s.out, key);
+        s.out.push(':');
+        if !s.gap.is_empty() {
+            s.out.push(' ');
         }
+        let member = json_get(i, value, object, key)?;
+        if json_serialize_property(i, s, value, JsonKey::Name(key), member)? {
+            any = true;
+        } else {
+            s.out.truncate(member_start);
+        }
+    }
+    json_leave(s, object, stepback, any, '}');
+    Ok(())
+}
+
+/// SerializeJSONArray (ECMA-262 §25.5.2.6).
+fn json_serialize_array(
+    i: &mut Interp,
+    s: &mut Serializer,
+    value: &Value,
+    object: &Gc,
+) -> Result<(), Value> {
+    let stepback = json_enter(i, s, object)?;
+    let len = if proxy_pair(i, value).is_some() {
+        ab(i.to_length(object))?
     } else {
-        out.push('\n');
-        out.push_str(inner);
-        for (index, part) in parts.iter().enumerate() {
-            if index != 0 {
-                out.push_str(",\n");
-                out.push_str(inner);
-            }
-            out.push_str(part);
+        i.array_length(object)
+    };
+    s.out.push('[');
+    for index in 0..len {
+        json_separator(s, index == 0);
+        let element = json_get_index(i, value, object, index)?;
+        if !json_serialize_property(i, s, value, JsonKey::Index(index), element)? {
+            s.out.push_str("null");
         }
-        out.push('\n');
-        out.push_str(outer);
+        // Every element adds at least "null", so a huge sparse length stops here.
+        check_string_length(i, s.out.len())?;
     }
-    out.push_str(close);
-    out
+    json_leave(s, object, stepback, len > 0, ']');
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -638,7 +829,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let v = json_parse_value(i, input, pos)?;
+                let v = nested(i, |i| json_parse_value(i, input, pos))?;
                 set_data(&obj, &key, v);
                 json_skip_ws(input, pos);
                 match input.get(*pos) {
@@ -667,7 +858,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                 return Ok(i.make_array(items));
             }
             loop {
-                items.push(json_parse_value(i, input, pos)?);
+                items.push(nested(i, |i| json_parse_value(i, input, pos))?);
                 json_skip_ws(input, pos);
                 match input.get(*pos) {
                     Some(',') => {
@@ -746,6 +937,28 @@ enum JsonRecord {
     Obj(Vec<(String, JsonRecord)>),
 }
 
+impl JsonRecord {
+    fn take_children(&mut self, out: &mut Vec<JsonRecord>) {
+        match self {
+            JsonRecord::Prim(..) => {}
+            JsonRecord::Arr(items) => out.append(items),
+            JsonRecord::Obj(entries) => out.extend(entries.drain(..).map(|(_, record)| record)),
+        }
+    }
+}
+
+impl Drop for JsonRecord {
+    /// Records nest as deeply as the text (a million levels parse), so release them from an
+    /// explicit worklist rather than one native frame per level.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.take_children(&mut pending);
+        while let Some(mut record) = pending.pop() {
+            record.take_children(&mut pending);
+        }
+    }
+}
+
 /// Mirror of `json_parse_value` that also returns a `JsonRecord`. Containers are framed inline;
 /// primitive leaves delegate to `json_parse_value` and capture their exact source span.
 fn json_parse_recorded(
@@ -778,7 +991,7 @@ fn json_parse_recorded(
                     return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
                 }
                 *pos += 1;
-                let (v, vr) = json_parse_recorded(i, input, pos)?;
+                let (v, vr) = nested(i, |i| json_parse_recorded(i, input, pos))?;
                 set_data(&obj, &key, v);
                 rec.retain(|(k, _)| k != &key);
                 rec.push((key, vr));
@@ -808,7 +1021,7 @@ fn json_parse_recorded(
                 return Ok((i.make_array(items), JsonRecord::Arr(rec)));
             }
             loop {
-                let (v, vr) = json_parse_recorded(i, input, pos)?;
+                let (v, vr) = nested(i, |i| json_parse_recorded(i, input, pos))?;
                 items.push(v);
                 rec.push(vr);
                 json_skip_ws(input, pos);

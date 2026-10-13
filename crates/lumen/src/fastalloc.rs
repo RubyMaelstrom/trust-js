@@ -174,6 +174,20 @@ unsafe impl GlobalAlloc for ClassAlloc {
         System.dealloc(ptr, layout)
     }
 
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // Blocks too large for a class (ArrayBuffer data) come from the system already zeroed:
+        // calloc maps fresh pages, which cost nothing until written. Cached class blocks are
+        // reused dirty, so they are cleared here.
+        if class_of(layout.size(), layout.align()).is_none() {
+            return unsafe { System.alloc_zeroed(layout) };
+        }
+        let ptr = unsafe { self.alloc(layout) };
+        if !ptr.is_null() {
+            unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
+        }
+        ptr
+    }
+
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // Within one size class a grow/shrink is free; otherwise allocate-copy-free through
         // the same class discipline.

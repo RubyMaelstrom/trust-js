@@ -2,7 +2,9 @@
 //! calls [`install`] to populate `globalThis`, the standard constructors/prototypes, `Math`, and
 //! the global functions. test262 exercises this realm as the primary conformance oracle.
 
-use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
+use crate::interpreter::{
+    Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN,
+};
 use crate::lstr::LStr;
 use crate::value::*;
 use std::cell::RefCell;
@@ -77,6 +79,24 @@ fn arg_to_number(i: &mut Interp, args: &[Value], idx: usize) -> Result<f64, Valu
     }
 }
 
+/// The RangeError for a string result longer than the engine's [`MAX_STR_LEN`] bytes (V8's
+/// message). Builders check while they accumulate, so an oversized result is never materialized:
+/// an engine string cannot hold 2 GiB, and building one first would exhaust memory.
+pub(crate) fn check_string_length(i: &mut Interp, len: usize) -> Result<(), Value> {
+    if len > MAX_STR_LEN {
+        return Err(i.make_error("RangeError", "Invalid string length"));
+    }
+    Ok(())
+}
+
+/// Append `piece` to a string result under construction, checking the new length first so the
+/// buffer never grows past [`MAX_STR_LEN`].
+pub(crate) fn push_str_checked(i: &mut Interp, out: &mut String, piece: &str) -> Result<(), Value> {
+    check_string_length(i, out.len().saturating_add(piece.len()))?;
+    out.push_str(piece);
+    Ok(())
+}
+
 /// Map an `Abrupt` (which, from inside a native function, can only be a `Throw`) to its value so it
 /// fits the native `Result<_, Value>` contract.
 fn ab<T>(r: Result<T, Abrupt>) -> Result<T, Value> {
@@ -109,7 +129,8 @@ pub(crate) fn nf_function_apply(
     let list = match arg(args, 1) {
         Value::Undefined | Value::Null => i.take_native_arg_buf(0),
         Value::Obj(o) => {
-            let len = ab(i.checked_array_len(&o))?;
+            let len = ab(i.to_length(&o))?;
+            check_argument_count(i, len)?;
             let direct_dense = i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
                 && !i.mapped_arguments.contains_key(&(Rc::as_ptr(&o) as usize));
             let mut v = i.take_native_arg_buf(len);
@@ -2065,11 +2086,24 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
         }
     };
     let len = ab(i.to_length(&o))?;
+    check_argument_count(i, len)?;
     let mut out = Vec::with_capacity(len.min(1024));
     for k in 0..len {
         out.push(array_get_index(i, &o, v, k)?);
     }
     Ok(out)
+}
+
+/// The RangeError for an argument list longer than [`MAX_ARGUMENTS_LEN`], raised before any
+/// element is read, as for a spread argument list.
+fn check_argument_count(i: &mut Interp, len: usize) -> Result<(), Value> {
+    if len > MAX_ARGUMENTS_LEN {
+        return Err(i.make_error(
+            "RangeError",
+            "argument list exceeds engine allocation limit",
+        ));
+    }
+    Ok(())
 }
 
 /// GetFunctionRealm-style lookup: when `new.target`'s `prototype` isn't an object, the instance's
@@ -6205,11 +6239,12 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut out = String::new();
         for k in 0..len {
             if k > 0 {
-                out.push_str(&sep);
+                push_str_checked(i, &mut out, &sep)?;
             }
             let v = array_get_index(i, &o, &ov, k)?;
             if !matches!(v, Value::Undefined | Value::Null) {
-                out.push_str(&ab(i.to_string(&v))?);
+                let piece = ab(i.to_string(&v))?;
+                push_str_checked(i, &mut out, &piece)?;
             }
         }
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
@@ -6358,14 +6393,15 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                     return Err(i.make_error("TypeError", "toLocaleString is not a function"));
                 }
                 let s = ab(i.call(tls, el, &[arg(args, 0), arg(args, 1)]))?;
-                out.push_str(&ab(i.to_string(&s))?);
+                let piece = ab(i.to_string(&s))?;
+                push_str_checked(i, &mut out, &piece)?;
             }
         }
         Ok(Value::lstr(out))
     });
     it.def_method(&ap, "at", 1, |i, this, args| {
         let o = arr_to_object(i, &this)?;
-        let len = ab(i.checked_array_len(&o))? as i64;
+        let len = ab(i.to_length(&o))? as i64;
         let mut idx = ab(i.to_number(&arg(args, 0)))? as i64;
         if idx < 0 {
             idx += len;
@@ -7056,16 +7092,8 @@ fn flatten_into(
                 if depth > 0 && json_is_array(i, &element)? {
                     let len_val = ab(i.get_member(&element, "length"))?;
                     let el_len = to_length_val(i, &len_val)?;
-                    target_index = flatten_into(
-                        i,
-                        target,
-                        &element,
-                        el_len,
-                        target_index,
-                        depth - 1,
-                        None,
-                        &Value::Undefined,
-                    )?;
+                    target_index =
+                        flatten_nested(i, target, &element, el_len, target_index, depth)?;
                 } else {
                     if target_index as u64 >= 9_007_199_254_740_991 {
                         return Err(
@@ -7099,16 +7127,7 @@ fn flatten_into(
         if depth > 0 && json_is_array(i, &element)? {
             let len_val = ab(i.get_member(&element, "length"))?;
             let el_len = to_length_val(i, &len_val)?;
-            target_index = flatten_into(
-                i,
-                target,
-                &element,
-                el_len,
-                target_index,
-                depth - 1,
-                None,
-                &Value::Undefined,
-            )?;
+            target_index = flatten_nested(i, target, &element, el_len, target_index, depth)?;
         } else {
             // Compared as u64: usize is 32-bit on wasm32, where 2^53 - 1 overflows the type.
             if target_index as u64 >= 9_007_199_254_740_991 {
@@ -7119,6 +7138,35 @@ fn flatten_into(
         }
     }
     Ok(target_index)
+}
+
+/// FlattenIntoArray's recursion into a nested array (one level shallower, without a mapper). An
+/// array nested deeper than the native stack budget allows (`flat(Infinity)` of a long chain of
+/// one-element arrays) throws the RangeError a deep JavaScript recursion would.
+fn flatten_nested(
+    i: &mut Interp,
+    target: &Value,
+    element: &Value,
+    element_len: usize,
+    start: usize,
+    depth: i64,
+) -> Result<usize, Value> {
+    let flattened = crate::interpreter::with_data_stack(|| {
+        flatten_into(
+            &mut *i,
+            target,
+            element,
+            element_len,
+            start,
+            depth - 1,
+            None,
+            &Value::Undefined,
+        )
+    });
+    match flattened {
+        Some(result) => result,
+        None => Err(i.make_error("RangeError", "Maximum call stack size exceeded")),
+    }
 }
 
 fn flatten_dense_target_safe(i: &Interp, target: &Value, source: &Value) -> bool {
@@ -8796,19 +8844,27 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
     let mut result = String::new();
     let mut first = true;
     while let Some(value) = step_iter_with(i, &this, &next)? {
-        if first {
-            first = false;
+        let piece = if matches!(value, Value::Undefined | Value::Null) {
+            crate::lstr::LStr::from("")
         } else {
-            result.push_str(&separator);
-        }
-        if !matches!(value, Value::Undefined | Value::Null) {
             match i.to_string(&value) {
-                Ok(s) => result.push_str(&s),
+                Ok(s) => s,
                 Err(e) => {
                     i.iterator_close(&this);
                     return Err(crate::interpreter::abrupt_value(e));
                 }
             }
+        };
+        let appended = if first {
+            first = false;
+            push_str_checked(i, &mut result, &piece)
+        } else {
+            push_str_checked(i, &mut result, &separator)
+                .and_then(|()| push_str_checked(i, &mut result, &piece))
+        };
+        if let Err(error) = appended {
+            i.iterator_close(&this);
+            return Err(error);
         }
     }
     Ok(Value::lstr(
@@ -10662,6 +10718,7 @@ pub(crate) fn nf_string_replace(
         };
         let matched = &s[pos..pos + pat.len()];
         let rep = string_replacement(i, &repl, matched, &s, pos)?;
+        check_string_length(i, s.len() - pat.len() + rep.len())?;
         return Ok(Value::lstr(format!(
             "{}{}{}",
             &s[..pos],
@@ -10690,6 +10747,7 @@ pub(crate) fn nf_string_replace(
     let matched = crate::jstr::from_units(&source_units[pos..end]);
     let after = crate::jstr::from_units(&source_units[end..]);
     let rep = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
+    check_string_length(i, before.len() + rep.len() + after.len())?;
     let joined = crate::jstr::concat(&crate::jstr::concat(&before, &rep), &after);
     Ok(Value::lstr(
         crate::jstr::canonicalize(&joined).unwrap_or(joined),
@@ -10750,9 +10808,6 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
         }
     }
     let s = this_string(i, &this)?;
-    if s.len() > MAX_ARRAY_OP_LEN {
-        return Err(i.make_error("RangeError", "string too large to split in this engine"));
-    }
     // `limit` (ToUint32, modulo 2^32) caps the number of pieces; 0 → empty result — but
     // ToString of the separator is observable BEFORE the zero-limit shortcut.
     let limit = match arg(args, 1) {
@@ -11604,11 +11659,13 @@ fn install_string(it: &mut Interp) {
                 let mut out = String::new();
                 let mut byte = 0usize;
                 for ch in s.chars() {
-                    out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+                    let piece = string_replacement(i, &repl, "", &s, byte)?;
+                    push_str_checked(i, &mut out, &piece)?;
                     out.push(ch);
                     byte += ch.len_utf8();
                 }
-                out.push_str(&string_replacement(i, &repl, "", &s, byte)?);
+                let piece = string_replacement(i, &repl, "", &s, byte)?;
+                push_str_checked(i, &mut out, &piece)?;
                 return Ok(Value::lstr(out));
             }
             let units = i.units_full(&s);
@@ -11625,9 +11682,8 @@ fn install_string(it: &mut Interp) {
                 } else {
                     String::new()
                 };
-                out.push_str(&string_replacement_parts(
-                    i, &repl, "", &s, pos, &before, &after,
-                )?);
+                let piece = string_replacement_parts(i, &repl, "", &s, pos, &before, &after)?;
+                push_str_checked(i, &mut out, &piece)?;
                 if let Some(&unit) = units.get(pos) {
                     out.push_str(&crate::jstr::unit_str(unit));
                 }
@@ -11642,24 +11698,26 @@ fn install_string(it: &mut Interp) {
             };
             if let Repl::Text(template) = &repl {
                 if !template.as_bytes().contains(&b'$') {
-                    return Ok(Value::lstr(replace_all_ascii_literal(
-                        &s, &pat, template, first,
-                    )));
+                    let Some(out) = replace_all_ascii_literal(&s, &pat, template, first) else {
+                        return Err(i.make_error("RangeError", "Invalid string length"));
+                    };
+                    return Ok(Value::lstr(out));
                 }
             }
             let mut out = String::with_capacity(s.len());
             out.push_str(&s[..first]);
-            out.push_str(&string_replacement(i, &repl, pat.as_ref(), &s, first)?);
+            let rep = string_replacement(i, &repl, pat.as_ref(), &s, first)?;
+            push_str_checked(i, &mut out, &rep)?;
             let mut rest = &s[first + pat.len()..];
             let mut base = first + pat.len();
             while let Some(pos) = rest.find(pat.as_ref()) {
-                out.push_str(&rest[..pos]);
+                push_str_checked(i, &mut out, &rest[..pos])?;
                 let rep = string_replacement(i, &repl, pat.as_ref(), &s, base + pos)?;
-                out.push_str(&rep);
+                push_str_checked(i, &mut out, &rep)?;
                 rest = &rest[pos + pat.len()..];
                 base += pos + pat.len();
             }
-            out.push_str(rest);
+            push_str_checked(i, &mut out, rest)?;
             return Ok(Value::lstr(out));
         }
         // A pure-ASCII receiver cannot contain a non-ASCII search string. Avoid allocating a
@@ -11681,7 +11739,11 @@ fn install_string(it: &mut Interp) {
         let mut cursor = 0usize;
         let mut pos = first;
         loop {
-            out.push_str(&crate::jstr::from_units(&source_units[cursor..pos]));
+            push_str_checked(
+                i,
+                &mut out,
+                &crate::jstr::from_units(&source_units[cursor..pos]),
+            )?;
             let matched = crate::jstr::from_units(&source_units[pos..pos + pattern_len]);
             let before = if needs_context {
                 crate::jstr::from_units(&source_units[..pos])
@@ -11693,9 +11755,8 @@ fn install_string(it: &mut Interp) {
             } else {
                 String::new()
             };
-            out.push_str(&string_replacement_parts(
-                i, &repl, &matched, &s, pos, &before, &after,
-            )?);
+            let piece = string_replacement_parts(i, &repl, &matched, &s, pos, &before, &after)?;
+            push_str_checked(i, &mut out, &piece)?;
             cursor = pos + pattern_len;
             let Some(next) = source_units[cursor..]
                 .windows(pattern_len)
@@ -11705,7 +11766,11 @@ fn install_string(it: &mut Interp) {
             };
             pos = cursor + next;
         }
-        out.push_str(&crate::jstr::from_units(&source_units[cursor..]));
+        push_str_checked(
+            i,
+            &mut out,
+            &crate::jstr::from_units(&source_units[cursor..]),
+        )?;
         Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)))
     });
 
@@ -11739,10 +11804,12 @@ fn install_string(it: &mut Interp) {
         let mut out = String::new();
         for k in 0..len {
             let seg = ab(i.get_member(&raw, &k.to_string()))?;
-            out.push_str(&ab(i.to_string(&seg))?);
+            let piece = ab(i.to_string(&seg))?;
+            push_str_checked(i, &mut out, &piece)?;
             if k + 1 < len {
                 if let Some(sub) = args.get(k + 1) {
-                    out.push_str(&ab(i.to_string(sub))?);
+                    let piece = ab(i.to_string(sub))?;
+                    push_str_checked(i, &mut out, &piece)?;
                 }
             }
         }
@@ -11919,6 +11986,9 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     if pad.is_empty() {
         return Ok(Value::Str(s));
     }
+    // The result has `target` UTF-16 units, so at least that many bytes: reject an oversized
+    // padding before building any of it.
+    check_string_length(i, target)?;
     let s = s.as_str();
     let need = target - cur;
     if s.is_ascii() && pad.is_ascii() {
@@ -11933,6 +12003,7 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
     let pad_units = crate::jstr::units(&pad);
     let fill_units: Vec<u16> = pad_units.iter().copied().cycle().take(need).collect();
     let fill = crate::jstr::from_units(&fill_units);
+    check_string_length(i, s.len() + fill.len())?;
     Ok(Value::lstr(if at_start {
         format!("{fill}{s}")
     } else {
@@ -11983,23 +12054,27 @@ fn replacement_needs_context(repl: &Repl) -> bool {
 /// Fast literal replacement for an ASCII `replaceAll`. With no `$` marker, GetSubstitution is
 /// exactly the replacement text, so avoid reparsing the template and constructing a temporary
 /// `String` for every match (ECMA-262 §22.1.3.20.15.3–4).
+/// `None` when the result would exceed [`MAX_STR_LEN`].
 fn replace_all_ascii_literal(
     source: &crate::lstr::LStr,
     pattern: &crate::lstr::LStr,
     replacement: &str,
     first: usize,
-) -> String {
+) -> Option<String> {
     let mut out = String::with_capacity(source.len());
     out.push_str(&source[..first]);
     out.push_str(replacement);
     let mut rest = &source[first + pattern.len()..];
     while let Some(pos) = rest.find(pattern.as_ref()) {
+        if out.len() > MAX_STR_LEN {
+            return None;
+        }
         out.push_str(&rest[..pos]);
         out.push_str(replacement);
         rest = &rest[pos + pattern.len()..];
     }
     out.push_str(rest);
-    out
+    (out.len() <= MAX_STR_LEN).then_some(out)
 }
 
 #[inline(always)]
@@ -12075,17 +12150,17 @@ fn string_replacement_parts(
                         continue;
                     }
                     '&' => {
-                        out.push_str(matched);
+                        push_str_checked(i, &mut out, matched)?;
                         chars.next();
                         continue;
                     }
                     '`' => {
-                        out.push_str(before);
+                        push_str_checked(i, &mut out, before)?;
                         chars.next();
                         continue;
                     }
                     '\'' => {
-                        out.push_str(after);
+                        push_str_checked(i, &mut out, after)?;
                         chars.next();
                         continue;
                     }

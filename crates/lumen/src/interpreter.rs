@@ -771,14 +771,36 @@ pub fn next_shared_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, AtomicOrdering::SeqCst)
 }
-/// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id.
-pub fn alloc_shared_mem(len: usize) -> u64 {
+/// `len` zero bytes, or `None` when the allocator cannot provide them. The block comes from the
+/// allocator already zeroed, so a large one is fresh pages that cost neither time nor resident
+/// memory until they are written (emscripten and asm.js heaps of hundreds of MiB are allocated
+/// up front), where filling a reserved Vec would touch every page.
+pub(crate) fn try_zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has a non-zero size.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a live allocation from the global allocator with exactly the layout a
+    // `Vec<u8>` of capacity `len` uses (`len` bytes, alignment 1), and all `len` bytes are
+    // initialized (to zero); the Vec takes ownership and frees it with that layout.
+    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
+}
+
+/// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id, or `None`
+/// when the memory is not available.
+pub fn alloc_shared_mem(len: usize) -> Option<u64> {
+    let block = try_zeroed_bytes(len)?;
     let id = next_shared_id();
     shared_mem_registry()
         .lock()
         .unwrap()
-        .insert(id, Arc::new(Mutex::new(vec![0u8; len])));
-    id
+        .insert(id, Arc::new(Mutex::new(block)));
+    Some(id)
 }
 pub fn shared_mem_get(id: u64) -> Option<SharedMem> {
     shared_mem_registry().lock().unwrap().get(&id).cloned()
@@ -2942,6 +2964,9 @@ pub struct Interp {
     /// Hot-loop poll divider. Execution tiers increment this cheaply and consult the shared
     /// atomics/deadline only once per bounded batch.
     pub(crate) interrupt_poll_tick: u32,
+    /// The tree-walking evaluator's stack-gateway divider: it queries the native stack once per
+    /// eight evaluations, so at least once every eight levels of nesting (see `Interp::eval`).
+    pub(crate) ast_tick: u32,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
     /// Execution tier (env `LUMEN_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
@@ -3363,6 +3388,9 @@ pub struct Interp {
     /// graph. Collection is deferred until the operation returns so active
     /// evaluation state remains a complete root set.
     pub(crate) gc_suppressed: u32,
+    /// ArrayBuffer data allocated since the last collection, and the amount that triggers the
+    /// next one (see [`Interp::note_buffer_allocation`]).
+    pub(crate) buffer_gc: BufferPressure,
     /// Call counter for [`Interp::gc_check_amortized`]. Layered calls poll every 256 calls; direct
     /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
     /// registry maintenance.
@@ -3496,6 +3524,7 @@ interp_memory_inventory! {
     wall_clock => "external",
     runtime_interrupt => "external",
     interrupt_poll_tick => "non_owning",
+    ast_tick => "non_owning",
     strict => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
@@ -3612,6 +3641,7 @@ interp_memory_inventory! {
     gc_next => "non_owning",
     live_object_limit => "non_owning",
     gc_suppressed => "non_owning",
+    buffer_gc => "non_owning",
     gc_tick => "non_owning",
     gc_task_allocated => "non_owning",
     gc_task_live => "non_owning",
@@ -3666,7 +3696,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 166);
+    assert_eq!(names.len(), 168);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4018,6 +4048,115 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Walks over parsed source (the parser, the tree-walking evaluator, the bytecode compiler and
+/// the other AST passes) recurse once per nesting level, and the parser bounds that depth
+/// (`MAX_PARSE_DEPTH`) rather than the native stack. Each recursive gateway first checks
+/// [`ast_stack_low`] and, when it is, re-enters itself through [`with_ast_stack`], so a deep tree
+/// continues on fresh heap-allocated segments instead of overflowing whatever stack the walk
+/// started on:
+///
+/// ```ignore
+/// if crate::interpreter::ast_stack_low() {
+///     return crate::interpreter::with_ast_stack(|| self.walk(node));
+/// }
+/// ```
+///
+/// The red zone covers one level's frames (large in debug builds) plus error construction;
+/// segments are released when the level returns. The parser bounds how deep these walks go, so
+/// their segments are not counted against the execution budget (see [`with_data_stack`] for
+/// recursion over author data).
+#[cfg(not(target_arch = "wasm32"))]
+const AST_STACK_RED_ZONE: usize = 512 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const AST_STACK_SEGMENT: usize = 2 * 1024 * 1024;
+
+/// Whether an AST walk should move to a fresh stack segment before its next level.
+#[inline]
+pub(crate) fn ast_stack_low() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return stacker::remaining_stack().is_none_or(|remaining| remaining < AST_STACK_RED_ZONE);
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
+/// Run one level of an AST walk, on a fresh segment when the native stack is low.
+#[inline]
+pub(crate) fn with_ast_stack<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
+    if ast_stack_low() {
+        return stacker::grow(AST_STACK_SEGMENT, f);
+    }
+    f()
+}
+
+/// The native stack dropping a whole parsed tree may need: drop glue recurses through every
+/// nesting level without a gateway, under 100 bytes a level in release builds, up to
+/// `MAX_PARSE_DEPTH` levels. (Debug frames are larger; test threads run on large stacks.)
+#[cfg(not(target_arch = "wasm32"))]
+const AST_DROP_STACK: usize = 512 * 1024;
+
+/// Drop a parsed tree (a function body's statements) where its deepest nesting fits.
+pub(crate) fn drop_ast<T>(tree: T) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if stacker::remaining_stack().is_none_or(|remaining| remaining < AST_DROP_STACK) {
+        return stacker::grow(AST_STACK_SEGMENT, move || drop(tree));
+    }
+    drop(tree)
+}
+
+/// The deepest nesting of a native recursion over author data that wasm32, which cannot switch
+/// stacks, attempts before throwing.
+#[cfg(target_arch = "wasm32")]
+const WASM_DATA_DEPTH_GUARD: u32 = 1000;
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static DATA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run one level of a native recursion whose depth author data controls (JSON.parse and
+/// stringify, `flat`): on a fresh segment when the stack runs low, sharing the execution
+/// budget of [`with_execution_stack`], so the recursion either completes or reports exhaustion.
+/// `None` means the budget is spent and the caller throws the RangeError a JavaScript recursion
+/// would ("Maximum call stack size exceeded").
+#[inline]
+pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if stacker::remaining_stack().is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE) {
+            if EXECUTION_STACK_SEGMENTS.with(|segments| segments.get())
+                >= MAX_EXECUTION_STACK_SEGMENTS
+            {
+                return None;
+            }
+            struct SegmentGuard;
+            impl Drop for SegmentGuard {
+                fn drop(&mut self) {
+                    EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() - 1));
+                }
+            }
+            EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() + 1));
+            let _guard = SegmentGuard;
+            return Some(stacker::grow(EXECUTION_STACK_SEGMENT, f));
+        }
+        Some(f())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                DATA_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            }
+        }
+        if DATA_DEPTH.with(|depth| depth.get()) >= WASM_DATA_DEPTH_GUARD {
+            return None;
+        }
+        DATA_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _guard = DepthGuard;
+        Some(f())
+    }
+}
+
 /// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
 /// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), the
 /// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
@@ -4057,6 +4196,28 @@ pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
 
+/// ArrayBuffer data allocated since the last collection that triggers another, at least. A
+/// backing store is freed only when the collector finds its buffer unreachable, and a buffer is
+/// one object however many bytes it holds, so object pressure alone let discarded buffers pile
+/// up (a loop allocating 16 MiB arrays and keeping none reached 16 GB). Like V8's external
+/// memory limit, the trigger grows with the buffer data that survives a collection.
+const BUFFER_GC_TRIGGER: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufferPressure {
+    since_gc: usize,
+    trigger: usize,
+}
+
+impl Default for BufferPressure {
+    fn default() -> Self {
+        BufferPressure {
+            since_gc: 0,
+            trigger: BUFFER_GC_TRIGGER,
+        }
+    }
+}
+
 /// Minimum pressure that triggers an end-of-task cycle collection. Larger retained heaps scale
 /// this floor, so short-lived allocation churn alone does not force a full scan every frame.
 const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
@@ -4064,9 +4225,21 @@ const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
 /// Memory safety valves. Several built-ins iterate/allocate in proportion to a user-controlled
 /// `length`, so without these a single adversarial test (e.g. `Array(4e9).join()` or `s += s`
 /// doubling a string) can exhaust all RAM. Operations that would materialize more than these
-/// bounds raise a RangeError instead. They are generous relative to real test262 tests but small
-/// enough that one runaway test stays bounded.
-pub const MAX_ARRAY_OP_LEN: usize = 1 << 20; // ~1M elements
+/// bounds raise a RangeError instead.
+///
+/// The most elements one operation materializes (`[...a]`, `join`, `sort`, `fill`, `split`,
+/// iteration into a list). It matches V8's largest elements backing store (2^27 slots), so the
+/// arrays real programs build (CSV rows, large datasets) fit, while an absurd array-like
+/// `length` still throws before anything is allocated.
+pub const MAX_ARRAY_OP_LEN: usize = 1 << 27; // ~134M elements
+/// The most arguments one call receives from a spread or an `apply`/`Reflect.apply` list. Each
+/// is copied into the callee's frame and `arguments`; V8 runs out of stack near 120,000 of them
+/// and SpiderMonkey stops at 500,000.
+pub const MAX_ARGUMENTS_LEN: usize = 1 << 20; // ~1M arguments
+
+// A string splits or spreads into at most one piece per byte (plus one), so string operations
+// never reach the array limit.
+const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN);
 
 /// Byte ceiling for a single ArrayBuffer/SharedArrayBuffer allocation (real programs allocate
 /// tens of MB; runaway growth is still stopped well below the process heap cap).
@@ -4074,6 +4247,11 @@ pub const MAX_BUFFER_BYTES: usize = 1 << 28; // 256 MiB
                                              // Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
                                              // string growth still dies as a RangeError rather than an OOM.
 pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
+
+// Builders check MAX_STR_LEN as they accumulate. A few (escaping, case mapping, normalization)
+// only bound their result by a fixed expansion of an input that is within the limit (at most
+// 12x, for NFKD); keep that headroom below what an engine string can represent.
+const _: () = assert!(MAX_STR_LEN * 16 <= crate::lstr::MAX_LEN);
 
 #[derive(Clone)]
 pub(crate) struct HostSettingsState {
@@ -4807,6 +4985,7 @@ impl Interp {
             wall_clock: None,
             runtime_interrupt: Default::default(),
             interrupt_poll_tick: 0,
+            ast_tick: 0,
             strict: false,
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
@@ -4933,6 +5112,7 @@ impl Interp {
             gc_next: GC_TRIGGER,
             live_object_limit: default_live_object_limit(),
             gc_suppressed: 0,
+            buffer_gc: BufferPressure::default(),
             gc_tick: 0,
             gc_task_allocated: crate::value::heap_allocated_objects(&gc_heap),
             gc_task_live: crate::value::heap_live_objects(&gc_heap),
@@ -10439,6 +10619,11 @@ impl Interp {
             );
         }
         if live > self.live_object_limit {
+            // Leave the handler that catches this error room to allocate (its error object,
+            // messages, cleanup) before the next safepoint collects again. Without re-arming,
+            // the very first allocation in the `catch` block would rerun the full collection
+            // and throw again, so the error could never be handled in practice.
+            self.gc_next = live.saturating_add(GC_TRIGGER);
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
         // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit].
@@ -10975,7 +11160,34 @@ impl Interp {
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
     }
 
+    /// Account for `len` bytes of new ArrayBuffer data, first collecting once enough has been
+    /// allocated since the last collection that discarded buffers may be holding as much again.
+    /// Called before the data block is allocated, where a collection is a safepoint like any
+    /// allocation of the buffer object itself.
+    pub(crate) fn note_buffer_allocation(&mut self, len: usize) {
+        self.buffer_gc.since_gc = self.buffer_gc.since_gc.saturating_add(len);
+        if self.buffer_gc.since_gc <= self.buffer_gc.trigger || self.gc_suppressed != 0 {
+            return;
+        }
+        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
+        let retained: usize = self
+            .array_buffers
+            .values()
+            .map(|block| block.try_borrow().map_or(0, |bytes| bytes.len()))
+            .sum();
+        self.buffer_gc.trigger = retained.max(BUFFER_GC_TRIGGER);
+    }
+
+    /// A data block could not be allocated: collect everything unreachable (discarded buffers
+    /// included) before the caller retries once.
+    pub(crate) fn collect_for_failed_allocation(&mut self) {
+        if self.gc_suppressed == 0 {
+            self.gc_collect();
+        }
+    }
+
     fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
+        self.buffer_gc.since_gc = 0;
         // Allocation and task-boundary pressure usually visit only newly allocated objects,
         // with bounded major-collection debt: a retained page heap is not rescanned for each
         // 1/8 of growth. Explicit/idle collections and released documents revisit everything.
@@ -16508,6 +16720,9 @@ pub(crate) fn ordered_global_hoist_bindings(ops: &[HoistOp]) -> Vec<(&str, bool)
 /// var binding only when the name is not already a parameter/var binding; a `for` head does not
 /// get different instantiation semantics.
 fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| collect_hoist_stmt(stmt, out));
+    }
     match stmt {
         Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => collect_hoist_stmt(inner, out),
         Stmt::VarDecl {
@@ -16601,6 +16816,11 @@ fn collect_annexb_funcs(
     blocked: &mut Vec<String>,
     out: &mut Vec<HoistOp>,
 ) {
+    if crate::interpreter::ast_stack_low() {
+        return crate::interpreter::with_ast_stack(|| {
+            collect_annexb_funcs(stmt, in_block, blocked, out)
+        });
+    }
     match stmt {
         Stmt::FuncDecl(func) if in_block => {
             // Annex B.3.3 promotes only *plain* function declarations; a block-scoped
