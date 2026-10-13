@@ -3,7 +3,7 @@
 //! the global functions. test262 exercises this realm as the primary conformance oracle.
 
 use crate::interpreter::{
-    Abrupt, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN,
+    Abrupt, BufferData, Interp, MAX_ARGUMENTS_LEN, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN,
 };
 use crate::lstr::LStr;
 use crate::value::*;
@@ -660,7 +660,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                         Some(Value::Bool(true))
                     )
                 });
-            let shared = i.shared_buffers.contains_key(&info.buffer);
+            let shared = i.is_shared_buffer(info.buffer);
             if info.track || (resizable && !shared) {
                 return Ok(false);
             }
@@ -1245,7 +1245,7 @@ fn ta_receiver(i: &mut Interp, this: &Value) -> Result<(crate::value::TaInfo, bo
     match ptr {
         Some(p) => {
             let info = i.typed_arrays[&p];
-            Ok((info, !i.array_buffers.contains_key(&info.buffer)))
+            Ok((info, !i.buffer_attached(info.buffer)))
         }
         None => Err(i.make_error(
             "TypeError",
@@ -1891,7 +1891,7 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// ArrayBuffer + TypedArrays. Backing bytes live in `Interp::array_buffers`; each view's state in
+// ArrayBuffer + TypedArrays. Data Blocks live in `Interp::array_buffers`; each view's state in
 // `Interp::typed_arrays`. Integer-index get/set is wired in `get_member`/`set_member`; the named
 // metadata (length/byteLength/byteOffset/buffer/BYTES_PER_ELEMENT) is stored as real own props.
 // ---------------------------------------------------------------------------------------------

@@ -2590,7 +2590,7 @@ fn discarded_array_buffer_data_triggers_collection() {
             .interp
             .array_buffers
             .values()
-            .map(|bytes| bytes.borrow().len())
+            .map(|data| data.byte_len().unwrap_or(0))
             .sum();
         assert!(
             retained <= 72 * 1024 * 1024,
@@ -18825,7 +18825,10 @@ out.join(',')"#;
             .interp
             .array_buffers
             .values()
-            .map(|bytes| bytes.borrow().capacity())
+            .filter_map(|data| match data {
+                crate::interpreter::BufferData::Local(bytes) => Some(bytes.borrow().capacity()),
+                crate::interpreter::BufferData::Shared(_) => None,
+            })
             .sum();
         assert!(local_bytes < 1 << 20, "tier {tier:?}: {local_bytes}");
     }

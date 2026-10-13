@@ -72,7 +72,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             let p = Rc::as_ptr(&o) as usize;
             // DetachArrayBuffer asserts IsSharedArrayBuffer is false: a Shared Data Block cannot be
             // detached, so refuse instead of leaving the buffer half detached.
-            if i.shared_buffers.contains_key(&p) {
+            if i.is_shared_buffer(p) {
                 return Err(i.make_error("TypeError", "Cannot detach a SharedArrayBuffer"));
             }
             // Truly detach: drop the backing store (so views see it as detached) and zero the views.
@@ -146,12 +146,10 @@ fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    // The block holds the bytes and the length; this entry only marks the buffer attached.
-    i.array_buffers.insert(p, Default::default());
+    i.array_buffers.insert(p, BufferData::Shared(id));
     set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(len as f64));
     set_internal(&obj, "#\u{0}abResizable", Value::Bool(false));
     set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
-    i.shared_buffers.insert(p, id);
     Value::Obj(obj)
 }
 
@@ -185,7 +183,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         let p = match sab.as_obj() {
             Some(o) => {
                 let p = Rc::as_ptr(o) as usize;
-                if i.shared_buffers.contains_key(&p) {
+                if i.is_shared_buffer(p) {
                     p
                 } else if let Some(info) = i.typed_arrays.get(&p) {
                     info.buffer
@@ -195,9 +193,8 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
             }
             None => return Err(i.make_error("TypeError", "broadcast requires a SharedArrayBuffer")),
         };
-        let id = *i
-            .shared_buffers
-            .get(&p)
+        let id = i
+            .shared_block_id(p)
             .ok_or_else(|| i.make_error("TypeError", "broadcast requires a SharedArrayBuffer"))?;
         let len = i.array_buffer_byte_length(p).unwrap_or(0);
         if let Some(ag) = &i.agent {
