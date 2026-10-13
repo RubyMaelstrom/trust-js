@@ -5,6 +5,7 @@ use crate::ast::*;
 use crate::interpreter::*;
 use crate::stack_trace::NO_POSITION;
 use crate::value::*;
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 /// Complete ordinary-chain proof: key-layout allocation, live prefix and enumerable flags.
@@ -8542,42 +8543,42 @@ impl Interp {
                 "-Infinity".to_string()
             };
         }
-        let neg = n < 0.0;
-        // Rust's `{:e}` yields the shortest round-tripping mantissa + exponent (`d[.ddd]e±E`).
-        let sci = format!("{:e}", n.abs());
-        let (mantissa, exp_str) = sci.split_once('e').unwrap();
-        let exp: i32 = exp_str.parse().unwrap();
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
+        // The spec's `n`: value = digits × 10^(n-k).
+        let (digits, np) = shortest_digits(n.abs());
+        let digits = digits.as_str();
         let k = digits.len() as i32;
-        let np = exp + 1; // the spec's `n`: value = digits × 10^(n-k)
-        let body = if k <= np && np <= 21 {
-            format!("{}{}", digits, "0".repeat((np - k) as usize))
-        } else if 0 < np && np <= 21 {
-            format!("{}.{}", &digits[..np as usize], &digits[np as usize..])
-        } else if -6 < np && np <= 0 {
-            format!("0.{}{}", "0".repeat((-np) as usize), digits)
-        } else {
-            let exp_part = np - 1;
-            let sign = if exp_part >= 0 { "+" } else { "-" };
-            if k == 1 {
-                format!("{}e{}{}", digits, sign, exp_part.abs())
-            } else {
-                format!(
-                    "{}.{}e{}{}",
-                    &digits[..1],
-                    &digits[1..],
-                    sign,
-                    exp_part.abs()
-                )
-            }
-        };
-        if neg {
-            format!("-{body}")
-        } else {
-            body
+        let mut out = String::with_capacity(digits.len() + 8);
+        if n < 0.0 {
+            out.push('-');
         }
+        if k <= np && np <= 21 {
+            out.push_str(digits);
+            out.extend(std::iter::repeat_n('0', (np - k) as usize));
+        } else if 0 < np && np <= 21 {
+            let (int, fraction) = digits.split_at(np as usize);
+            out.push_str(int);
+            out.push('.');
+            out.push_str(fraction);
+        } else if -6 < np && np <= 0 {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-np) as usize));
+            out.push_str(digits);
+        } else {
+            let (first, rest) = digits.split_at(1);
+            out.push_str(first);
+            if !rest.is_empty() {
+                out.push('.');
+                out.push_str(rest);
+            }
+            let exponent = np - 1;
+            let _ = write!(
+                out,
+                "e{}{}",
+                if exponent >= 0 { '+' } else { '-' },
+                exponent.unsigned_abs()
+            );
+        }
+        out
     }
 
     pub(crate) fn strict_equals(&self, a: &Value, b: &Value) -> bool {
@@ -9250,6 +9251,92 @@ pub(crate) fn js_mod(a: f64, b: f64) -> f64 {
         return a;
     }
     a % b
+}
+
+/// The digits of Number::toString's shortest form of the finite, positive `x` and its `n`:
+/// `x` is 0.d₁…dₖ × 10ⁿ (ECMA-262 §6.1.6.1.20 step 5). Among the shortest digit strings that
+/// read back as `x`, NOTE 2 recommends the one closest to `x`, an even one on a tie, which V8
+/// and SpiderMonkey print. Core's shortest formatting returns some shortest string: below 16
+/// digits it is the only one (the decimal spacing exceeds the rounding interval), but at 16
+/// or 17 digits a second can lie in the interval, so the correctly rounded string of that
+/// length (ties to even) wins whenever it differs and also reads back as `x`.
+pub(crate) fn shortest_digits(x: f64) -> (Digits, i32) {
+    let (digits, n) = Digits::scientific(format_args!("{x:e}"));
+    if digits.len < 16 {
+        return (digits, n);
+    }
+    let (rounded, rounded_n) = Digits::scientific(format_args!("{x:.*e}", digits.len - 1));
+    if (rounded.as_str(), rounded_n) == (digits.as_str(), n) || rounded.len > digits.len {
+        return (digits, n);
+    }
+    let mut text = FloatText::default();
+    let _ = write!(
+        text,
+        "{}e{}",
+        rounded.as_str(),
+        rounded_n - rounded.len as i32
+    );
+    if text.as_str().parse::<f64>() == Ok(x) {
+        (rounded, rounded_n)
+    } else {
+        (digits, n)
+    }
+}
+
+/// At most 17 significant decimal digits of a double, without trailing zeros.
+pub(crate) struct Digits {
+    bytes: [u8; 17],
+    len: usize,
+}
+
+impl Digits {
+    /// The digits and `n` (one more than the exponent) of core's scientific form of a double.
+    fn scientific(args: std::fmt::Arguments<'_>) -> (Digits, i32) {
+        let mut text = FloatText::default();
+        let _ = text.write_fmt(args);
+        let (mantissa, exponent) = text.as_str().split_once('e').unwrap_or(("0", "0"));
+        let mut digits = Digits {
+            bytes: [b'0'; 17],
+            len: 0,
+        };
+        for digit in mantissa.bytes().filter(u8::is_ascii_digit).take(17) {
+            digits.bytes[digits.len] = digit;
+            digits.len += 1;
+        }
+        while digits.len > 1 && digits.bytes[digits.len - 1] == b'0' {
+            digits.len -= 1;
+        }
+        (digits, exponent.parse::<i32>().unwrap_or(0) + 1)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("0")
+    }
+}
+
+/// A stack buffer for one double's scientific text (at most 17 digits, a point and `e-324`).
+#[derive(Default)]
+struct FloatText {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl FloatText {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Write for FloatText {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(std::fmt::Error)?
+            .copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 pub(crate) fn to_int32(n: f64) -> i32 {

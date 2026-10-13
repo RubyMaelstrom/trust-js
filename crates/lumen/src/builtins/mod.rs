@@ -12045,11 +12045,15 @@ fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
     // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
     let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
     let fmt_exp = |exp: i32| format!("e{}{}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    if shortest {
-        let s = format!("{x:e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let exp: i32 = e.parse().unwrap();
-        return format!("{sign}{m}{}", fmt_exp(exp));
+    if shortest && x != 0.0 {
+        // §21.1.3.2 step 10.a leaves the last of the fewest round-trip digits open; take
+        // Number::toString's choice, as V8 does, laid out as d.ddd.
+        let (digits, n) = crate::eval::shortest_digits(x);
+        let m = match digits.as_str().split_at(1) {
+            (first, "") => first.to_string(),
+            (first, rest) => format!("{first}.{rest}"),
+        };
+        return format!("{sign}{m}{}", fmt_exp(n - 1));
     }
     if x == 0.0 {
         let m = if f == 0 {

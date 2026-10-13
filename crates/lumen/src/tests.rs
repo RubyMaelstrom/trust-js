@@ -15179,6 +15179,43 @@ fn number_tostring_spec() {
         assert_eq!(run(&format!("({src})+''")), want, "({src})+''");
     }
 }
+/// When two shortest digit strings round-trip, Number::toString prints the one closest to the
+/// value, an even one on a tie (ECMA-262 §6.1.6.1.20 NOTE 2), as V8 does: String, JSON,
+/// property keys and toExponential() agree. Expected values are node's.
+#[test]
+fn number_to_string_picks_the_closest_shortest_digits_in_all_tiers() {
+    let source = r#"
+        var xs = [29275894.1650390625, 2 ** -25, 9.425454303262663e13, -9.006362915039062,
+            0.6435928344726562, -10.831863403320312, 0.1 + 0.2, 5e-324, 1.7976931348623157e308,
+            123456789012345680000, 1e21, 1.5e-7];
+        [xs.map(function (x) { return String(x); }).join(), JSON.stringify(xs),
+         xs.map(function (x) { return x.toExponential(); }).join(),
+         Object.keys({ [xs[0]]: 1 })[0]].join('|')
+    "#;
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(&mut engine, source),
+            "29275894.165039062,2.9802322387695312e-8,94254543032626.62,-9.006362915039062,\
+             0.6435928344726562,-10.831863403320312,0.30000000000000004,5e-324,\
+             1.7976931348623157e+308,123456789012345680000,1e+21,1.5e-7|\
+             [29275894.165039062,2.9802322387695312e-8,94254543032626.62,-9.006362915039062,\
+             0.6435928344726562,-10.831863403320312,0.30000000000000004,5e-324,\
+             1.7976931348623157e+308,123456789012345680000,1e+21,1.5e-7]|\
+             2.9275894165039062e+7,2.9802322387695312e-8,9.425454303262662e+13,\
+             -9.006362915039062e+0,6.435928344726562e-1,-1.0831863403320312e+1,\
+             3.0000000000000004e-1,5e-324,1.7976931348623157e+308,1.2345678901234568e+20,1e+21,\
+             1.5e-7|29275894.165039062",
+            "{tier:?}"
+        );
+    }
+}
 #[test]
 fn number_methods_fixed() {
     let cases = [
