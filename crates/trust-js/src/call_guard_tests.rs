@@ -62,6 +62,291 @@ fn check(source: &str, expected: &str) {
 
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() {
+    // PrepareForOrdinaryCall uses [[Realm]], not the parent of [[Environment]].
+    // Self-hosted methods deliberately bind their intrinsics in a parentless record.
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            var foreign = $262.createRealm().global;
+            var mappingMethod = Array.prototype.map;
+            function callback(x) { return x + 1; }
+            function mapDrive(values, fn) { return values.map(fn).join(','); }
+            var result;
+            for (var n=0; n<12; n++) result = mapDrive([1,,3], callback);
+            result
+        "#
+            ),
+            "2,,4",
+            "{tier:?}"
+        );
+        let method = object(&mut engine, "mappingMethod");
+        let method_record = method.borrow();
+        let Callable::User(user) = &method_record.call else {
+            panic!("self-hosted map")
+        };
+        assert!(user.func.self_hosted);
+        assert!(user.env.borrow().parent.is_none());
+        drop(method_record);
+        if tier == Tier::Jit {
+            let driver = chunk(&mut engine, "mapDrive");
+            let entry = driver
+                .cached_call_for(Rc::as_ptr(&method) as usize)
+                .expect("private self-hosted method fills the native call cache");
+            assert_eq!(entry.native, 0);
+            assert_eq!(entry.realm, Rc::as_ptr(&engine.interp.global) as usize);
+            assert_eq!(
+                entry.global_env,
+                Rc::as_ptr(&engine.interp.global_env) as usize
+            );
+            assert!(!entry.code.is_null());
+            assert!(driver.jit_runs.get() > 0);
+        }
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            var calls = 0;
+            try {
+                mapDrive([1,2,3], function (x) { calls++; if (x === 2) throw x; return x; });
+            } catch (error) { result = error + ':' + calls; }
+            var foreignResult = foreign.Array.prototype.map.call([4], callback);
+            result + ':' + (Object.getPrototypeOf(foreignResult) === foreign.Array.prototype)
+                + ':' + (Object.getPrototypeOf(mapDrive([5], callback)) === String.prototype)
+        "#
+            ),
+            "2:2:true:true",
+            "{tier:?}"
+        );
+        assert!(engine.interp.fn_frames.is_empty());
+        engine.interp.gc_collect();
+    }
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn checked_calls_use_creation_realm_after_host_environment_replacement() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    engine.interp.switch_host_job_context(101);
+    assert_eq!(
+        eval(
+            &mut engine,
+            r#"
+        var foreign = $262.createRealm().global;
+        function realmLeaf(x) { return x + 3; }
+        function realmDrive(fn, x) { return fn(x); }
+        for (var n=0; n<12; n++) realmDrive(realmLeaf, n);
+        'ready'
+    "#
+        ),
+        "ready"
+    );
+    let leaf = object(&mut engine, "realmLeaf");
+    let driver = chunk(&mut engine, "realmDrive");
+    let old_environment = engine.interp.global_env.clone();
+    let previous = driver
+        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .expect("initial same-Realm cache fill");
+    assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);
+    engine.interp.switch_host_job_context(102);
+    assert!(!Rc::ptr_eq(&old_environment, &engine.interp.global_env));
+    assert_eq!(
+        eval(
+            &mut engine,
+            r#"
+        Object.setPrototypeOf(realmLeaf, foreign.Function.prototype);
+        realmDrive(realmLeaf, 5)
+    "#
+        ),
+        "8"
+    );
+    let current = driver
+        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .expect("creation Realm remains cacheable with a replaced global environment");
+    assert_ne!(current.global_env, previous.global_env);
+    assert_eq!(
+        current.global_env,
+        Rc::as_ptr(&engine.interp.global_env) as usize
+    );
+    assert_eq!(current.realm, Rc::as_ptr(&engine.interp.global) as usize);
+    assert_eq!(
+        eval(
+            &mut engine,
+            r#"
+        var proxyCalls = 0;
+        var proxy = new Proxy(realmLeaf, {apply(f,t,a) { proxyCalls++; return Reflect.apply(f,t,a); }});
+        class ClassOnly {}
+        var checks = realmDrive(proxy, 6) === 9 && proxyCalls === 1
+            && realmDrive(realmLeaf.bind(null), 7) === 10;
+        try { realmDrive(ClassOnly, 0); checks = false; }
+        catch (error) { checks = checks && error instanceof TypeError; }
+        foreign.eval('globalThis.foreignLeaf = function(x) { return [x+4, new TypeError()]; };');
+        var foreignAnswer = realmDrive(foreign.foreignLeaf, 5);
+        checks = checks && foreignAnswer[0] === 9
+            && foreignAnswer[1] instanceof foreign.TypeError
+            && !(foreignAnswer[1] instanceof TypeError);
+        var scoped, scope = {marker: 11};
+        with (scope) { scoped = function() { return marker; }; }
+        checks = checks && realmDrive(scoped, 0) === 11;
+        scope.marker = 12;
+        checks && realmDrive(scoped, 0) === 12
+    "#
+        ),
+        "true"
+    );
+    for name in ["proxy", "ClassOnly", "scoped"] {
+        let target = object(&mut engine, name);
+        assert!(
+            driver
+                .cached_call_for(Rc::as_ptr(&target) as usize)
+                .is_none(),
+            "{name} retains checked generic dispatch"
+        );
+    }
+    assert!(engine.interp.fn_frames.is_empty());
+    assert!(engine.interp.pending_tail.is_none());
+    engine.interp.gc_collect();
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
+    for mode in [1, 2] {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            var foreign = $262.createRealm().global;
+            var token = {number: 17};
+            function make(token) {
+                return function (x) {
+                    var home = x;
+                    function capture() { return home; }
+                    var number = token.number;
+                    if (x) {
+                        victim.prototype = null;
+                        victim = null;
+                        $262.gc();
+                        if (x === 2) throw 'owned throw';
+                    }
+                    return number + capture();
+                };
+            }
+            var victim = make(token);
+            function checkedDrive(f, x) { return f((f=null,x)); }
+            for (var n=0; n<12; n++) checkedDrive(victim, 0);
+        "#,
+        );
+        let victim = object(&mut engine, "victim");
+        let token = object(&mut engine, "token");
+        let victim_weak = Rc::downgrade(&victim);
+        let token_weak = Rc::downgrade(&token);
+        let driver = chunk(&mut engine, "checkedDrive");
+        let entry = driver
+            .cached_call_for(Rc::as_ptr(&victim) as usize)
+            .expect("capturing callee is cached");
+        assert_ne!(
+            entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
+            0,
+            "activation-homed callee forces the checked helper rather than direct machine call"
+        );
+        drop((victim, token));
+        eval(&mut engine, "token = null");
+        let result = eval(
+            &mut engine,
+            &format!("try {{ checkedDrive(victim,{mode}) }} catch(error) {{ error }}"),
+        );
+        assert_eq!(result, if mode == 1 { "18" } else { "owned throw" });
+        engine.interp.gc_collect();
+        assert_eq!(
+            victim_weak.strong_count(),
+            0,
+            "callee destructor after mode {mode}"
+        );
+        assert_eq!(
+            token_weak.strong_count(),
+            0,
+            "captured payload destructor after mode {mode}"
+        );
+        assert!(engine.interp.fn_frames.is_empty());
+    }
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments() {
+    let reads = (0..10)
+        .map(|n| format!("capture{n}"))
+        .collect::<Vec<_>>()
+        .join("+");
+    let mut expression = format!("function (x) {{ return {reads}+x; }}");
+    for n in (0..10).rev() {
+        expression = format!("(function () {{ let capture{n}={n}; return {expression}; }})()");
+    }
+    let source = format!(
+        r#"
+        var foreign = $262.createRealm().global;
+        var deep = {expression};
+        function deepDrive(f, x) {{ return f(x); }}
+        var answer;
+        for(var n=0;n<12;n++) answer = deepDrive(deep, n);
+        answer
+    "#
+    );
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(eval(&mut engine, &source), "56", "{tier:?}");
+        let deep = object(&mut engine, "deep");
+        let mut current = match &deep.borrow().call {
+            Callable::User(user) => user.env.clone(),
+            _ => panic!("deep user closure"),
+        };
+        let mut depth = 0;
+        while !Rc::ptr_eq(&current, &engine.interp.global_env) {
+            let next = current
+                .borrow()
+                .parent
+                .clone()
+                .expect("global root retained");
+            current = next;
+            depth += 1;
+        }
+        assert!(
+            depth > 8,
+            "fixture exercises the former bounded parent walk"
+        );
+        if tier == Tier::Jit {
+            let driver = chunk(&mut engine, "deepDrive");
+            let entry = driver
+                .cached_call_for(Rc::as_ptr(&deep) as usize)
+                .expect("deep same-Realm closure fills the native call cache");
+            assert_eq!(
+                entry.env,
+                match &deep.borrow().call {
+                    Callable::User(user) => Rc::as_ptr(&user.env),
+                    _ => unreachable!(),
+                }
+            );
+            assert!(driver.jit_runs.get() > 0);
+        }
+        assert_eq!(eval(&mut engine, "$262.gc(); deepDrive(deep, 20)"), "65");
+        assert!(engine.interp.fn_frames.is_empty());
+    }
+}
+
+#[test]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);

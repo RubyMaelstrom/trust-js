@@ -789,6 +789,11 @@ pub struct Function {
     /// `bytecode::plan_inlines`). Preferred over `code` wherever a chunk is fetched; `code`
     /// stays alive because filled call ICs hold raw pointers into it.
     pub code2: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
+    /// A separately published optimizing version of the selected canonical body, including
+    /// any guarded baseline inlines. The baseline tiers remain available after retirement;
+    /// active invocations and raw call-cache pointers keep their original immutable chunks.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) optimizing_code: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
     /// Lazily-built object-map templates for closures of this function (see
     /// `Interp::make_function`): the function object's `Props` (length/name and a `prototype`
     /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
@@ -1436,25 +1441,44 @@ impl Function {
     /// Select code for a new invocation; live activations retain their own chunk.
     /// ECMA-262 e28783d5, Execution Contexts / PrepareForOrdinaryCall: changing a
     /// later entry must not replace an existing invocation's evaluation state.
-    /// A failed specialization reuses the already warmed primary template. Its
-    /// immutable second-stage slot still prevents repeated speculative attempts.
+    /// A failed specialization reuses the already warmed baseline, including its guarded
+    /// inlines. Its immutable optimizing slot prevents repeated speculative attempts.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn execution_code(&self) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
-        let upgraded = self.code2.get();
         #[cfg(feature = "optimizing-jit")]
-        if let Some(Some(chunk)) = upgraded {
-            if chunk.optimizing_candidate
-                && chunk.optimizing_misses.get() >= crate::bytecode::SPECIALIZATION_MISS_LIMIT
-                && self.code.get().is_some_and(Option::is_some)
+        if let Some(Some(chunk)) = self.optimizing_code.get() {
+            if chunk.optimizing_misses.get() < crate::bytecode::SPECIALIZATION_MISS_LIMIT {
+                return self.optimizing_code.get();
+            }
+            // Retired code remains charged to the bounded executable cache until pressure
+            // or destruction reclaims it after all active frames and leases have finished.
+        }
+        self.code2.get().or_else(|| self.code.get())
+    }
+
+    /// Shared snapshot ASTs have one second-stage slot for every Realm. A body planned
+    /// exclusively for another Realm cannot win any inline guard, so a new invocation
+    /// retains its warmed primary body. Mixed/unrestricted chunks remain eligible.
+    /// Active frames and code leases keep their already selected immutable chunk.
+    #[inline]
+    pub(crate) fn execution_code_for(
+        &self,
+        genv: usize,
+    ) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
+        #[cfg(feature = "optimizing-jit")]
+        if let Some(Some(chunk)) = self.optimizing_code.get() {
+            if chunk.optimizing_misses.get() < crate::bytecode::SPECIALIZATION_MISS_LIMIT
+                && chunk.inline_realm_compatible(genv)
             {
-                // Dispatch selects the warmed primary without polling or dismantling the
-                // retired mapping. Its bytes remain charged to the bounded executable cache;
-                // pressure or destruction reclaims it after active frames and leases finish.
-                // This keeps native lifetime maintenance out of every later function call.
-                return self.code.get();
+                return self.optimizing_code.get();
             }
         }
-        upgraded.or_else(|| self.code.get())
+        match self.code2.get() {
+            Some(Some(chunk)) if !chunk.inline_realm_compatible(genv) => self.code.get(),
+            Some(_) => self.code2.get(),
+            None => self.code.get(),
+        }
     }
 
     /// What this function's own activation must provide: whether the body (or a nested arrow, or a

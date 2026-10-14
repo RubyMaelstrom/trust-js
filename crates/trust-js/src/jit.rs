@@ -115,6 +115,30 @@ mod inline_context_tests;
 
 #[cfg(all(
     test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "bytecode_inline_prepared_tests.rs"]
+mod inline_prepared_tests;
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "jit_inline_realm_selection_tests.rs"]
+mod inline_realm_selection_tests;
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[path = "call_global_env_pin_tests.rs"]
+mod call_global_env_pin_tests;
+
+#[cfg(all(
+    test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]

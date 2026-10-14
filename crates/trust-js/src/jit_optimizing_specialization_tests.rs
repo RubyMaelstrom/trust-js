@@ -129,7 +129,11 @@ fn retirement_reuses_primary_while_existing_native_frames_finish() {
     };
     let primary = function.code.get().and_then(Option::as_ref).unwrap();
     let original_native = primary.jit.get().flatten().unwrap();
-    let upgraded = function.code2.get().and_then(Option::as_ref).unwrap();
+    let upgraded = function
+        .optimizing_code
+        .get()
+        .and_then(Option::as_ref)
+        .unwrap();
     assert!(upgraded.optimizing_candidate);
     let old = Rc::downgrade(&upgraded.jit.get().flatten().unwrap());
     RETIRING_VERSION.with(|state| *state.borrow_mut() = Some(old.clone()));
@@ -384,7 +388,7 @@ fn install_warmed_fields(engine: &mut Engine) -> (Rc<Chunk>, Rc<JitCode>) {
         .begin_compile()
         .unwrap()
         .commit(Some(code.clone()));
-    assert!(function.code2.set(Some(chunk.clone())).is_ok());
+    assert!(function.optimizing_code.set(Some(chunk.clone())).is_ok());
     bytecode::invalidate_call_caches();
     engine.set_tier(Tier::Jit);
     (chunk, code)

@@ -20,6 +20,8 @@ mod bitwise;
 mod call_tests;
 #[path = "jit_optimizing_creation.rs"]
 mod creation;
+#[path = "jit_optimizing_codegen.rs"]
+mod codegen;
 #[cfg(test)]
 #[path = "jit_optimizing_creation_tests.rs"]
 mod creation_tests;
@@ -36,8 +38,28 @@ mod elements;
 #[path = "jit_optimizing_frame.rs"]
 mod frame;
 #[cfg(test)]
+#[path = "jit_optimizing_heap_proof_tests.rs"]
+mod heap_proof_tests;
+#[path = "jit_optimizing_heap_proofs.rs"]
+mod heap_proofs;
+#[cfg(test)]
 #[path = "jit_optimizing_heap_tests.rs"]
 mod heap_tests;
+#[path = "jit_optimizing_inline.rs"]
+mod inline;
+#[cfg(test)]
+#[path = "jit_optimizing_inline_tests.rs"]
+mod inline_tests;
+#[path = "jit_optimizing_integer_consumers.rs"]
+mod integer_consumers;
+#[cfg(test)]
+#[path = "jit_optimizing_integer_consumer_tests.rs"]
+mod integer_consumer_tests;
+#[cfg(test)]
+#[path = "jit_optimizing_integer_tests.rs"]
+mod integer_tests;
+#[path = "jit_optimizing_integers.rs"]
+mod integers;
 #[path = "jit_optimizing_names.rs"]
 mod names;
 #[cfg(test)]
@@ -53,6 +75,8 @@ mod property;
 #[cfg(test)]
 #[path = "jit_optimizing_property_tests.rs"]
 mod property_tests;
+#[path = "jit_optimizing_ranges.rs"]
+mod ranges;
 #[path = "jit_optimizing_specialization.rs"]
 mod specialization;
 #[cfg(test)]
@@ -67,6 +91,9 @@ mod stack_lowering;
 mod stack_tests;
 #[path = "jit_optimizing_stores.rs"]
 mod stores;
+#[cfg(test)]
+#[path = "jit_optimizing_store_tests.rs"]
+mod store_tests;
 #[path = "jit_optimizing_values.rs"]
 mod value_facts;
 
@@ -215,7 +242,7 @@ fn has_sampling_source(chunk: &Chunk) -> bool {
 }
 
 /// Called at bounded baseline entry checkpoints, before executing any bytecode.
-/// The current mapping remains resident/active and is NEVER overwritten. Function::code2
+/// The current mapping remains resident/active and is NEVER overwritten. Function::optimizing_code
 /// publishes a separate canonical chunk; epoch invalidation makes FUTURE callers re-resolve.
 /// ECMA-262 Execution Contexts / [[Call]]: identity comes from the live invocation, not a
 /// function-name lookup or a closure instance remembered by a compilation cache.
@@ -324,12 +351,11 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     };
     // Script/continuation entries do not manufacture a Function execution context. A foreign
     // or already upgraded frame cannot justify publishing this chunk as that function's tier.
-    if function.code2.get().is_some()
+    if function.optimizing_code.get().is_some()
         || function
-            .code
-            .get()
+            .execution_code_for(ctx.genv)
             .and_then(Option::as_ref)
-            .is_none_or(|primary| !std::ptr::eq(&**primary, chunk))
+            .is_none_or(|baseline| !std::ptr::eq(&**baseline, chunk))
     {
         return;
     }
@@ -358,7 +384,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         return;
     };
     permit.commit(Some(std::rc::Rc::new(code)));
-    if function.code2.set(Some(next)).is_ok() {
+    if function.optimizing_code.set(Some(next)).is_ok() {
         bytecode::invalidate_call_caches();
         if counted {
             HOT_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -433,7 +459,12 @@ fn isa() -> Option<&'static Arc<dyn TargetIsa>> {
         // deterministic-Wasm pass would canonicalize each operation a second time;
         // disabling that redundant pass does not enable fast-math reassociation.
         flags.set("enable_nan_canonicalization", "false").ok()?;
-        flags.set("enable_verifier", "true").ok()?;
+        flags
+            .set(
+                "enable_verifier",
+                if codegen::verify_every_pass() { "true" } else { "false" },
+            )
+            .ok()?;
         flags.set("preserve_frame_pointers", "true").ok()?;
         flags.set("is_pic", "false").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
@@ -623,8 +654,11 @@ struct Lowering<'a, 'b> {
     interp: Value,
     slots: Value,
     locals: Vec<Option<Variable>>,
+    local_integers: Vec<Option<Variable>>,
     frame_plan: &'b frame::FramePlan,
     value_plan: Option<&'b value_facts::ValuePlan>,
+    numeric_plan: Option<&'b ranges::NumericPlan>,
+    heap_metadata_plan: Option<&'b heap_proofs::MetadataPlan>,
     property_results: &'b [(u32, value_facts::Types)],
     loop_facts: Option<&'b loop_facts::Plan>,
     loop_field_addresses: Vec<Variable>,
@@ -643,6 +677,8 @@ struct Lowering<'a, 'b> {
     /// Non-owning Number representation paired with each canonical operand word.
     /// It is meaningful only after that word is proven/guarded to be a Number.
     stack_numbers: Vec<Variable>,
+    /// Sparse non-owning exact semantic safe integers, never raw unsigned I32 bits.
+    stack_integers: Vec<Option<Variable>>,
     stack_state: stack::StackState,
     pc: usize,
     sp: Variable,
@@ -687,6 +723,13 @@ impl Lowering<'_, '_> {
             .unwrap_or_default()
     }
 
+    fn input_ranges(&self) -> ranges::Inputs {
+        self.numeric_plan
+            .and_then(|plan| plan.at.get(self.pc))
+            .copied()
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     fn count_value_proof(kind: usize, count: usize) {
         TEST_VALUE_PROOFS.with(|counts| {
@@ -702,8 +745,13 @@ impl Lowering<'_, '_> {
     }
 
     fn set_local(&mut self, slot: u16, value: Value) {
+        self.set_local_integer(slot, value, None);
+    }
+
+    fn set_local_integer(&mut self, slot: u16, value: Value, integer: Option<Value>) {
         self.b
             .def_var(self.locals[slot as usize].expect("tracked local"), value);
+        self.define_local_integer(slot, value, integer, integers::Point::After);
     }
 
     fn publish_locals(&mut self) {
@@ -719,6 +767,10 @@ impl Lowering<'_, '_> {
     }
 
     fn reload_locals(&mut self, live: &[u16], writes: SlotWrites) {
+        self.reload_locals_at(live, writes, integers::Point::After);
+    }
+
+    fn reload_locals_at(&mut self, live: &[u16], writes: SlotWrites, point: integers::Point) {
         let live = if self.sparse_reloads {
             live
         } else {
@@ -751,6 +803,7 @@ impl Lowering<'_, '_> {
                 self.locals[usize::from(slot)].expect("live tracked local"),
                 value,
             );
+            self.define_local_integer(slot, value, None, point);
         }
     }
 
@@ -782,11 +835,21 @@ impl Lowering<'_, '_> {
     }
 
     fn push(&mut self, value: Value) {
+        self.push_integer(value, None);
+    }
+
+    fn push_integer(&mut self, value: Value, integer: Option<Value>) {
         self.b
             .def_var(self.stack_vars[self.stack_state.depth], value);
         let number = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
         self.b
             .def_var(self.stack_numbers[self.stack_state.depth], number);
+        self.define_stack_integer(
+            self.stack_state.depth,
+            value,
+            integer,
+            integers::Point::After,
+        );
         self.change_top(8);
     }
 
@@ -806,6 +869,7 @@ impl Lowering<'_, '_> {
             immediate,
             &self.frame_plan.live_after[self.pc],
             writes,
+            integers::Point::After,
         )
     }
 
@@ -815,11 +879,12 @@ impl Lowering<'_, '_> {
         immediate: u32,
         live: &[u16],
         writes: SlotWrites,
+        point: integers::Point,
     ) -> Value {
         self.publish_locals();
         self.publish_stack(self.stack_state.depth);
         let flag = self.canonical_helper(helper, immediate);
-        self.reload_locals(live, writes);
+        self.reload_locals_at(live, writes, point);
         flag
     }
 
@@ -1019,10 +1084,14 @@ impl Lowering<'_, '_> {
         let right = self.stack_read(1);
         let left = self.stack_read(2);
         let inputs = self.input_types();
-        let left_known = inputs.second.is_number();
-        let right_known = inputs.top.is_number();
+        let integer_inputs = self.input_ranges();
+        let left_known = inputs.second.is_number() || integer_inputs.second.is_some();
+        let right_known = inputs.top.is_number() || integer_inputs.top.is_some();
         #[cfg(test)]
-        Self::count_value_proof(0, usize::from(left_known) + usize::from(right_known));
+        Self::count_value_proof(
+            0,
+            usize::from(inputs.second.is_number()) + usize::from(inputs.top.is_number()),
+        );
         let slow = if left_known && right_known {
             None
         } else {
@@ -1046,6 +1115,7 @@ impl Lowering<'_, '_> {
         let left = self.stack_number(2);
         let right = self.stack_number(1);
         let mut numeric_result = None;
+        let mut integer_result = None;
         let result = match op {
             Op::Add | Op::Sub | Op::Mul | Op::Div => {
                 let number = match op {
@@ -1058,8 +1128,9 @@ impl Lowering<'_, '_> {
                 self.packed_number(number)
             }
             Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
-                let number = self.bitwise_number(op, left_word, right_word, left, right);
+                let (number, integer) = self.bitwise_number(op, left_word, right_word, left, right);
                 numeric_result = Some(number);
+                integer_result = integer;
                 self.b.ins().bitcast(types::I64, MemFlags::new(), number)
             }
             _ => {
@@ -1077,7 +1148,7 @@ impl Lowering<'_, '_> {
                 self.b.ins().bor_imm_s(bit, PACK_BOOL as i64)
             }
         };
-        self.stack_write(2, result);
+        self.stack_write_integer(2, result, integer_result);
         if let Some(number) = numeric_result {
             self.b
                 .def_var(self.stack_numbers[self.stack_state.depth - 2], number);
@@ -1119,11 +1190,12 @@ impl Lowering<'_, '_> {
             0,
             &self.frame_plan.live_at[self.pc],
             SlotWrites::None,
+            integers::Point::Before,
         );
         let normal = self.b.create_block();
         self.b.ins().brif(flag, self.unwind, &[], normal, &[]);
         self.b.switch_to_block(normal);
-        self.reload_stack(self.stack_plan.at[self.pc]);
+        self.reload_stack_at(self.stack_plan.at[self.pc], integers::Point::Before);
         if self.loop_facts.is_some_and(|plan| plan.contains(self.pc)) {
             self.validate_loop_fields(self.pc);
         }
@@ -1140,6 +1212,23 @@ impl Lowering<'_, '_> {
         };
         let yes = self.loop_exit(yes);
         let no = self.loop_exit(no);
+        if self.stack_state.known() > 0 {
+            if let Some(integer) = self.stack_integer(1) {
+                #[cfg(test)]
+                integer_consumers::record(2);
+                let truthy = if matches!(op, Op::JumpIfNotNullishPeek(_)) {
+                    self.b.ins().iconst(types::I8, 1)
+                } else {
+                    self.b.ins().icmp_imm_s(IntCC::NotEqual, integer, 0)
+                };
+                if matches!(op, Op::JumpIfFalse(_)) {
+                    self.change_top(-8);
+                }
+                self.finish_normal();
+                self.b.ins().brif(truthy, yes, &[], no, &[]);
+                return;
+            }
+        }
         let slow;
         if self.stack_state.known() > 0 {
             let value = self.stack_read(1);
@@ -1223,6 +1312,9 @@ impl Lowering<'_, '_> {
 
     fn lower(&mut self, pc: usize, op: &Op) {
         let next = self.pcs[pc + 1];
+        if self.integer_scalar(op, next) {
+            return;
+        }
         if self.loop_field_operation(pc, op, next) {
             return;
         }
@@ -1359,10 +1451,11 @@ impl Lowering<'_, '_> {
                     self.slow(pc, slow, next);
                 }
             }
-            Op::Jump(target) | Op::InlineGuard(_, target) => {
-                // Spliced baseline inlining has a complete original-call fallback. This
-                // backend takes that path until its own effect/frame-aware inliner lands.
+            Op::Jump(target) => {
                 self.jump_normal(self.pcs[*target as usize]);
+            }
+            Op::InlineGuard(target, fallback) => {
+                self.inline_guard(*target, self.pcs[*fallback as usize], next);
             }
             Op::JumpIfFalse(target)
             | Op::JumpIfFalsePeek(target)
@@ -1544,7 +1637,7 @@ fn compile_entry_with_limits(
     let cfg = Cfg::build(chunk).map_err(CompileError::ControlFlow)?;
     let entry_pc = continuation.map_or(0, |(pc, _, _)| pc);
     if continuation.is_some()
-        && (!bytecode::native_deopt::supported(chunk)
+        && (!bytecode::native_deopt::supported_loop_continuation(chunk)
             || cfg
                 .block_at(entry_pc)
                 .is_none_or(|block| cfg.blocks()[block.0 as usize].start != entry_pc)
@@ -1553,8 +1646,6 @@ fn compile_entry_with_limits(
         return Err(CompileError::Unsupported);
     }
     let local_effects = std::env::var("TRUST_JS_OPT_JIT_LOCAL_EFFECTS").as_deref() != Ok("0");
-    let frame =
-        frame::FramePlan::build(chunk, &cfg, local_effects).ok_or(CompileError::Unsupported)?;
     let stack_plan = stack::StackPlan::build(chunk, &cfg).ok_or(CompileError::Unsupported)?;
     // A failed/budget-exhausted value proof retains all dynamic guards, not a less
     // capable function or a different execution tier. The switch also skips analysis cost.
@@ -1597,6 +1688,50 @@ fn compile_entry_with_limits(
         .or_else(|| specialization.as_ref().map(|plan| &plan.values))
         .or(generic_values.as_ref())
         .or(continuation_values.as_ref());
+    // Entry samples are category guards only; this plan deliberately derives
+    // ranges from language operations instead of treating an Int32 sample as a
+    // runtime range proof. Borrowed loop entries need their own guarded roots.
+    let integer_demand = (continuation.is_none()
+        && std::env::var("TRUST_JS_OPT_JIT_INT_SSA").as_deref() != Ok("0")
+        && std::env::var("TRUST_JS_OPT_JIT_RANGES").as_deref() != Ok("0"))
+    .then(|| integers::Demand::build(chunk, &stack_plan))
+    .flatten();
+    let numeric_plan = (continuation.is_none()
+        && std::env::var("TRUST_JS_OPT_JIT_RANGES").as_deref() != Ok("0"))
+    .then(|| match integer_demand.as_ref() {
+        Some(demand) => ranges::NumericPlan::with_integer_demand(
+            chunk,
+            &cfg,
+            &stack_plan,
+            value_plan,
+            Some(demand),
+        ),
+        None => ranges::NumericPlan::build(chunk, &cfg, &stack_plan, value_plan),
+    })
+    .flatten();
+    let integer_scalar_sites = numeric_plan
+        .as_ref()
+        .and_then(|plan| plan.integers.as_ref())
+        .map(|facts| facts.scalar_sites(chunk, &stack_plan));
+    let frame = match integer_scalar_sites.as_deref() {
+        Some(sites) => frame::FramePlan::with_scalar_paths(chunk, &cfg, local_effects, sites),
+        None => frame::FramePlan::build(chunk, &cfg, local_effects),
+    }
+    .ok_or(CompileError::Unsupported)?;
+    let heap_metadata_plan = (continuation.is_none() && property::supported(values))
+        .then(|| {
+            heap_proofs::MetadataPlan::build(
+                chunk,
+                &cfg,
+                &frame,
+                &stack_plan,
+                value_plan,
+                specialization
+                    .as_ref()
+                    .map_or(&[], |plan| plan.properties.as_slice()),
+            )
+        })
+        .flatten();
     if chunk.optimizing_candidate && specialization.is_none() {
         return Err(CompileError::Unsupported);
     }
@@ -1719,6 +1854,7 @@ fn compile_entry_with_limits(
         b.ins()
             .store(MemFlags::trusted(), strict, interp, layout.strict as i32);
         let mut locals = vec![None; chunk.jit_frame().1];
+        let mut local_integers = vec![None; chunk.jit_frame().1];
         for &slot in &frame.tracked {
             let var = b.declare_var(types::I64);
             let value = b
@@ -1726,12 +1862,31 @@ fn compile_entry_with_limits(
                 .load(types::I64, MemFlags::trusted(), slots, i32::from(slot) * 8);
             b.def_var(var, value);
             locals[slot as usize] = Some(var);
+            if numeric_plan
+                .as_ref()
+                .and_then(|plan| plan.integers.as_ref())
+                .is_some_and(|facts| facts.locals[usize::from(slot)])
+            {
+                let integer = b.declare_var(types::I64);
+                let zero = b.ins().iconst(types::I64, 0);
+                b.def_var(integer, zero);
+                local_integers[usize::from(slot)] = Some(integer);
+            }
         }
         let stack_vars = (0..stack_plan.capacity)
             .map(|_| b.declare_var(types::I64))
             .collect();
         let stack_numbers = (0..stack_plan.capacity)
             .map(|_| b.declare_var(types::F64))
+            .collect();
+        let stack_integers = (0..stack_plan.capacity)
+            .map(|cell| {
+                numeric_plan
+                    .as_ref()
+                    .and_then(|plan| plan.integers.as_ref())
+                    .filter(|facts| facts.operands[cell])
+                    .map(|_| b.declare_var(types::I64))
+            })
             .collect();
         let mut lower = Lowering {
             b,
@@ -1742,8 +1897,11 @@ fn compile_entry_with_limits(
             interp,
             slots,
             locals,
+            local_integers,
             frame_plan: &frame,
             value_plan,
+            numeric_plan: numeric_plan.as_ref(),
+            heap_metadata_plan: heap_metadata_plan.as_ref(),
             property_results: specialization
                 .as_ref()
                 .map_or(&[], |plan| plan.properties.as_slice()),
@@ -1767,6 +1925,7 @@ fn compile_entry_with_limits(
             stack_plan: &stack_plan,
             stack_vars,
             stack_numbers,
+            stack_integers,
             stack_state: stack_plan.at[entry_pc],
             pc: entry_pc,
             sp,
@@ -1781,7 +1940,7 @@ fn compile_entry_with_limits(
             pcs,
         };
         if continuation.is_some() {
-            lower.reload_stack(stack_plan.at[entry_pc]);
+            lower.reload_stack_at(stack_plan.at[entry_pc], integers::Point::Before);
         }
         if let Some(plan) = &loop_facts {
             lower.loop_field_addresses = (0..plan.field_count())
@@ -1907,13 +2066,14 @@ fn compile_entry_with_limits(
         switch.emit(&mut lower.b, target, error);
         for (pc, landing) in destinations {
             lower.b.switch_to_block(landing);
+            lower.pc = pc;
             // Both throw routing and normal return/break/continue finalizers
             // can arrive here. Their canonical frame, not stale predecessor
             // SSA variables, supplies precisely the destination's register uses.
-            lower.reload_locals(&frame.live_at[pc], SlotWrites::All);
+            lower.reload_locals_at(&frame.live_at[pc], SlotWrites::All, integers::Point::Before);
             // Completion helpers returned the exact sp. Load only the proven suffix,
             // independent of whether the restored prefix is shorter than its CFG depth.
-            lower.reload_stack(stack_plan.at[pc]);
+            lower.reload_stack_at(stack_plan.at[pc], integers::Point::Before);
             lower.b.ins().jump(lower.pcs[pc], &[]);
         }
         for (block, success) in [(ok, 1), (error, 0)] {
@@ -1947,17 +2107,21 @@ fn compile_entry_with_limits(
         record.ir_instructions.set(context.func.dfg.num_insts());
         record.ir_blocks.set(context.func.dfg.num_blocks());
     }
+    #[cfg(test)]
+    stores::TEST_BODY_SIZE.with(|size| {
+        size.set((context.func.dfg.num_insts(), context.func.dfg.num_blocks()));
+    });
     if std::env::var_os("TRUST_JS_OPT_JIT_DUMP").is_some() {
         eprintln!("{}", context.func.display());
     }
     let passes = diagnostic.as_deref().map(diagnostics::passes::Scope::start);
     let codegen_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
-    let result = context.compile(&**isa, &mut Default::default());
+    let result = codegen::compile(&mut context, &**isa);
     if let (Some(record), Some(started)) = (&diagnostic, codegen_started) {
         record.codegen_ns.set(diagnostics::nanos(started));
     }
     drop(passes);
-    let code = result.map_err(|e| CompileError::Codegen(format!("{e:?}")))?;
+    let code = result.map_err(CompileError::Codegen)?;
     let finish_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
     // All runtime calls are explicit indirect calls. Refuse any unexpected libcall/relocation
     // before allocating executable memory; never publish an unlinked buffer.
@@ -2083,12 +2247,12 @@ mod tests {
             );
             if !expected {
                 assert!(hot_counter(primary).is_none(), "{name}");
-                assert!(function.code2.get().is_none(), "{name}");
+                assert!(function.optimizing_code.get().is_none(), "{name}");
                 assert!(!primary.jit.get().flatten().unwrap().pc_offsets.is_empty());
             } else {
                 assert!(
                     function
-                        .code2
+                        .optimizing_code
                         .get()
                         .and_then(Option::as_ref)
                         .is_some_and(|chunk| chunk.optimizing_candidate),
@@ -2171,6 +2335,36 @@ mod tests {
             "baseline native body remains selected"
         );
         assert_eq!(code.residency.active.get(), 0);
+        assert!(function.optimizing_code.get().is_none());
+        let result = engine
+            .eval(
+                "var warmedTotal=0;for(var k=0;k<10000;k++)warmedTotal+=subject(k);warmedTotal;",
+                false,
+            )
+            .unwrap();
+        assert!(matches!(result, Completion::Value(ref value) if value == "100050000"));
+        let optimized = function
+            .optimizing_code
+            .get()
+            .and_then(Option::as_ref)
+            .expect("hot admission must optimize the existing guarded inline body");
+        assert_eq!(optimized.jit_ops(), inlined.jit_ops());
+        assert!(!std::rc::Rc::ptr_eq(optimized, inlined));
+        assert!(optimized.optimizing_candidate);
+        let native = optimized
+            .jit
+            .get()
+            .flatten()
+            .expect("optimized inline native code");
+        assert!(
+            native.pc_offsets.is_empty(),
+            "actual whole-function execution"
+        );
+        assert_eq!(native.residency.active.get(), 0);
+        assert!(std::rc::Rc::ptr_eq(
+            function.execution_code().and_then(Option::as_ref).unwrap(),
+            optimized,
+        ));
         engine.interp.gc_collect();
         let result = engine
             .eval("leaf=function(x){return x+7;};subject(5)", false)
@@ -2178,6 +2372,21 @@ mod tests {
         assert!(
             matches!(result, Completion::Value(ref value) if value == "24"),
             "the inliner's original-call fallback preserves live callee replacement"
+        );
+        let result = engine
+            .eval(
+                "var conversions=0;var mixed={valueOf(){conversions++;return 5;}};var result;for(var k=0;k<8;k++)result=subject(mixed);[result,conversions].join('|');",
+                false,
+            )
+            .unwrap();
+        assert!(matches!(result, Completion::Value(ref value) if value == "24|8"));
+        assert_eq!(optimized.optimizing_misses.get(), SPECIALIZATION_MISS_LIMIT);
+        assert!(
+            std::rc::Rc::ptr_eq(
+                function.execution_code().and_then(Option::as_ref).unwrap(),
+                inlined,
+            ),
+            "retirement preserves the warmed baseline inline tier"
         );
     }
 
@@ -2262,7 +2471,7 @@ mod tests {
         };
         let cold = function(&mut engine, "cold");
         assert!(
-            cold.code2.get().is_none(),
+            cold.optimizing_code.get().is_none(),
             "one call must retain baseline code"
         );
         for name in [
@@ -2287,7 +2496,7 @@ mod tests {
                 "{name} reached hot admission"
             );
             let upgraded = function
-                .code2
+                .optimizing_code
                 .get()
                 .and_then(Option::as_ref)
                 .expect("upgraded chunk");
@@ -2315,12 +2524,12 @@ mod tests {
         }
         let method = function(&mut engine, "method");
         assert!(
-            method.code2.get().is_none(),
+            method.optimizing_code.get().is_none(),
             "prepared super-method parameters are environment-backed, not guarded private inputs"
         );
         let getter = function(&mut engine, "getterRead");
         assert!(
-            getter.code2.get().is_none(),
+            getter.optimizing_code.get().is_none(),
             "sampling never executes or treats a getter as own data"
         );
         engine.interp.gc_collect();

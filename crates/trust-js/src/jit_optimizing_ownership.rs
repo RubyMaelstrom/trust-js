@@ -234,6 +234,11 @@ impl Lowering<'_, '_> {
             Op::LoadLocal(_) | Op::StoreLocal(_) => inputs.local,
             _ => inputs.top,
         };
+        let integer = match op {
+            Op::LoadLocal(slot) => self.local_integer(*slot),
+            Op::Dup | Op::StoreLocal(_) => self.stack_integer(1),
+            _ => None,
+        };
         // A whole-function proof can remove the entire owner/slow-path graph. BigInt,
         // String and Symbol are NOT copyable here, even though ECMAScript calls them
         // primitive values. Empty is copyable storage but never a successful local read.
@@ -241,10 +246,10 @@ impl Lowering<'_, '_> {
             #[cfg(test)]
             Self::count_value_proof(2, 1);
             match op {
-                Op::LoadLocal(_) | Op::Dup => self.push(value),
+                Op::LoadLocal(_) | Op::Dup => self.push_integer(value, integer),
                 Op::StoreLocal(slot) => {
                     let incoming = self.stack_read(1);
-                    self.set_local(*slot, incoming);
+                    self.set_local_integer(*slot, incoming, integer);
                     self.change_top(-8);
                 }
                 Op::Pop => self.change_top(-8),
@@ -266,14 +271,14 @@ impl Lowering<'_, '_> {
         match op {
             Op::LoadLocal(_) | Op::Dup => {
                 self.retain_word(value, slow);
-                self.push(value);
+                self.push_integer(value, integer);
             }
             Op::StoreLocal(slot) => {
                 // The input stack already OWNS incoming. Self-assignment therefore has at
                 // least two references and cannot destroy the value while moving it home.
                 let incoming = self.stack_read(1);
                 self.release_word(value, slow);
-                self.set_local(*slot, incoming);
+                self.set_local_integer(*slot, incoming, integer);
                 self.change_top(-8);
             }
             Op::Pop => {

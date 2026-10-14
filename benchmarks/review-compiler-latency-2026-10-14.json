@@ -1,0 +1,639 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-14T10:34:36.144257+00:00",
+  "status": "Integrated implementation with focused correctness/static compiler evidence; application performance acceptance pending",
+  "performance_acceptance": false,
+  "scope": "Release finalized-CLIF verification policy and compact warmed monomorphic existing-own named-field store emission in the optional optimizing backend.",
+  "machine": {
+    "host": "crystal",
+    "system": "Linux",
+    "kernel": "7.2.10-crystal",
+    "architecture": "aarch64",
+    "rustc_from_test_cache": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+    "isolated_build_test_cpu_affinity": "0-3",
+    "isolated_cargo_jobs": 4,
+    "root_integrated_test_cpu_affinity": "15-18"
+  },
+  "source_identity": {
+    "isolated_base_revision": "e67ec560aa7f83363a61a635620e713c66c8642f",
+    "isolated_base_source_path": "/tmp/trust-js-compiler-candidate-20261014",
+    "isolated_base_inventory_sha256": "46be1682c846bedb384f2971dfec99a9a5175a1243c1fc8881ba652fd7769129",
+    "isolated_base_uncommitted_patch_sha256": "67d08449dd1893c233f102ebf8af59554441be5058b8e8d53e2b34704e4b5a62",
+    "isolated_final_source_path": "/tmp/trust-js-compile-latency-20261014",
+    "tested_exact_final_isolated_source": true,
+    "incremental_patches": {
+      "verifier": {
+        "path": "/big/Code/trust-js/target/compiler-latency-review-20261014/verifier.patch",
+        "sha256": "fea0eb147f1a7e6c7466656f864d9376c55546ab8ec3cabc59089ac8677889a8",
+        "files": {
+          "crates/trust-js/src/jit_optimizing.rs": {
+            "before_sha256": "340f022bf4b1759d7731a2e72c90d967c1059f1211152dc04fd6758068f611fe",
+            "after_sha256": "07cc8263fba0637b10f1769c7882186c30d9682b5986460c3c61091195dae13c"
+          },
+          "crates/trust-js/src/jit_optimizing_codegen.rs": {
+            "before_sha256": null,
+            "after_sha256": "ae24f6aa8f2fb0d814a06de366cadb07c6ab568ac5c849fd08e29368e534b841"
+          }
+        }
+      },
+      "compact-store": {
+        "path": "/big/Code/trust-js/target/compiler-latency-review-20261014/compact-store.patch",
+        "sha256": "696c1a93354d8ec46fd9053c1d20075e75dd422574f1a6867168e34941fcf0b6",
+        "files": {
+          "crates/trust-js/src/jit_optimizing.rs": {
+            "before_sha256": "07cc8263fba0637b10f1769c7882186c30d9682b5986460c3c61091195dae13c",
+            "after_sha256": "c59e89c9b3b6fc5b1a5a2ef948a87a19455bd28db043789ce0660725bc5ed553"
+          },
+          "crates/trust-js/src/jit_optimizing_stores.rs": {
+            "before_sha256": "631d45c4a6ffa8053ba41df920bf684aa1bae06830f6beb9dda32810896de83c",
+            "after_sha256": "2c753da0d78c723287880905c5cb7c12db9d1af8d7840ba65a19fb27a36ed793"
+          },
+          "crates/trust-js/src/jit_optimizing_store_tests.rs": {
+            "before_sha256": null,
+            "after_sha256": "060f9930f70a08fe23d1b45445e76e9c0fe73566b231e56ad878912ee9cc22b6"
+          }
+        }
+      }
+    },
+    "original_final_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-latency-review-20261014/manifest.json",
+      "sha256": "5128f7ecd6d97975ddc537b23885c63269f6b9f0b08fe79ee81ba075e035c1cd",
+      "bytes": 7458
+    },
+    "isolated_and_integrated_module_hashes": {
+      "crates/trust-js/src/jit_optimizing.rs": {
+        "isolated_final_sha256": "c59e89c9b3b6fc5b1a5a2ef948a87a19455bd28db043789ce0660725bc5ed553",
+        "integrated_main_observed_sha256": "62bc14c49ec9f8cba027e5bbe851af6fc9ab8deee440e358ffdd160265d51b62",
+        "identical": false
+      },
+      "crates/trust-js/src/jit_optimizing_codegen.rs": {
+        "isolated_final_sha256": "ae24f6aa8f2fb0d814a06de366cadb07c6ab568ac5c849fd08e29368e534b841",
+        "integrated_main_observed_sha256": "ae24f6aa8f2fb0d814a06de366cadb07c6ab568ac5c849fd08e29368e534b841",
+        "identical": true
+      },
+      "crates/trust-js/src/jit_optimizing_stores.rs": {
+        "isolated_final_sha256": "2c753da0d78c723287880905c5cb7c12db9d1af8d7840ba65a19fb27a36ed793",
+        "integrated_main_observed_sha256": "e81b0e6a63a14205c9564b984f1fd8d6a9df317d22e14e7ff241e658c49db3da",
+        "identical": false,
+        "integration_difference": "Main additionally preserves the integer mirror for an assignment-expression result via stack_integer(1)/stack_write_integer(2,incoming,integer). The compact-store guard and owner transaction delta is unchanged.",
+        "raw_diff": "--- /tmp/trust-js-compile-latency-20261014/crates/trust-js/src/jit_optimizing_stores.rs\n+++ /big/Code/trust-js/crates/trust-js/src/jit_optimizing_stores.rs\n@@ -190,7 +190,8 @@\n         let consumed_receiver = matches!(op, Op::SetProp(..) | Op::SetPropDrop(..));\n         let keep = matches!(op, Op::SetProp(..));\n         if keep {\n-            self.stack_write(2, incoming);\n+            let integer = self.stack_integer(1);\n+            self.stack_write_integer(2, incoming, integer);\n         }\n         let consumed = 1 + usize::from(consumed_receiver) - usize::from(keep);\n         self.change_top(-8 * consumed as i64);\n"
+      },
+      "crates/trust-js/src/jit_optimizing_store_tests.rs": {
+        "isolated_final_sha256": "060f9930f70a08fe23d1b45445e76e9c0fe73566b231e56ad878912ee9cc22b6",
+        "integrated_main_observed_sha256": "060f9930f70a08fe23d1b45445e76e9c0fe73566b231e56ad878912ee9cc22b6",
+        "identical": true
+      }
+    },
+    "integrated_context_files_observed_sha256": {
+      "Cargo.toml": "bfcea6964c4a4811a162e0d3dffbaf5961063dabbdb52902dfd56136ce26f2fa",
+      "Cargo.lock": "d3a26fd0cd4df4a536df4a685390bd1534b79b630afa6aef7d0908629bc87bce",
+      "crates/trust-js/Cargo.toml": "c61e7abfbc9811b935b06048d61d2bf0b1be4ce6ce17b280826e7eb2e3f8a5ce",
+      "crates/trust-js/src/interpreter.rs": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0",
+      "crates/trust-js/src/bytecode.rs": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580",
+      "crates/trust-js/src/jit_optimizing_integers.rs": "e04f018b59cff8759263a28e73ac2d06d802106405fe3371a0ceda2efcbe1d3f",
+      "crates/trust-js/src/jit_optimizing_integer_consumers.rs": "14e4dcf4a794b16c14394693e3d3739c2444ccfccc17040dfd4cadd47f2f2fad"
+    },
+    "integrated_hash_scope": "Current module/context hashes observed when this record was created, not a retrospective complete snapshot of the root test binary. Main includes integer/Realm changes absent from the isolated tree; parent lowering hash intentionally differs. Root integrated the exact small patches into that newer main.",
+    "earlier_integer_realm_record": "benchmarks/review-compiler-post-v1-validation-2026-10-14.json"
+  },
+  "implementation_contracts": {
+    "verifier": {
+      "release": "Validate finalized CLIF once with Context.verify before Context.compile when repeated internal checks are disabled. Invalid input returns an error before compiled code exists.",
+      "debug_test_or_explicit_diagnostic": "Keep strategic repeated verification for debug_assertions, cfg(test), or TRUST_JS_OPT_JIT_VERIFY=1. ISA flags are fixed on first initialization.",
+      "unchanged": "Bytecode validation, JS semantics, ownership/publication/type/heap/recovery guards, and normal compile/publication failure handling."
+    },
+    "compact_store": {
+      "eligibility": "Cacheable monomorphic preferred own-depth0 state at a non-index named store on an ordinary plain receiver.",
+      "frozen_scalars": [
+        "receiver shape",
+        "slot"
+      ],
+      "live_checks": [
+        "ordinary/plain/exotic receiver",
+        "receiver shape",
+        "slot bounds",
+        "current entries storage pointer",
+        "data+writable descriptor flags",
+        "existing alias-aware owner transfer transaction"
+      ],
+      "miss_boundary": "Every miss completes checked Set before partial store/owner effects. Heap metadata proofs are invalidated across the write.",
+      "unchanged_paths": [
+        "creation cache sites",
+        "polymorphic cache sites",
+        "indexed storage",
+        "unsupported or observable owners"
+      ],
+      "ablation": "TRUST_JS_OPT_JIT_COMPACT_STORES=0 retains original dynamic cache/creation emission.",
+      "tradeoff": "Later shape/descriptor mismatches use the checked helper rather than expanding more native ways in that version."
+    },
+    "admission": "No threshold, semantic-benefit requirement, retirement rule or production IR budget was loosened."
+  },
+  "source_authority": {
+    "cranelift_version": "0.136.2",
+    "settings": {
+      "path": "/home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-codegen-meta-0.136.2/src/shared/settings.rs",
+      "sha256": "c1e090b5157db5f6b514e1c35032dfc27d487242436c74fd7a799a7c6c13ce51",
+      "bytes": 14744,
+      "line": 71,
+      "evidence": "enable_verifier documents optional strategic development checks and compilation overhead."
+    },
+    "context": {
+      "path": "/home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-codegen-0.136.2/src/context.rs",
+      "sha256": "7ef0b642a4093a6dae0512d61e9ed77171123ce9bfadfdfe5956a58ecb3bdd9b",
+      "bytes": 13332,
+      "verify_if_lines": [
+        138,
+        185,
+        287,
+        336,
+        394
+      ],
+      "evidence": "Context invokes verification between passes; input verification checks types, CFG and dominance without mutating CLIF."
+    },
+    "ladybird": {
+      "repository": "https://github.com/LadybirdBrowser/ladybird",
+      "revision": "d8afe7ddba448c54ee9ded2c808c1a77d3791ca1",
+      "checkout": "/tmp/trust-js-ladybird-review-20261014",
+      "options_url": "https://github.com/LadybirdBrowser/ladybird/blob/d8afe7ddba448c54ee9ded2c808c1a77d3791ca1/Libraries/LibJS/JIT/Rust/src/options.rs#L114",
+      "passes_url": "https://github.com/LadybirdBrowser/ladybird/blob/d8afe7ddba448c54ee9ded2c808c1a77d3791ca1/Libraries/LibJS/JIT/Rust/src/passes/mod.rs#L135",
+      "evidence": "Internal IR checks default off in release and run for debug/tests/explicit verification. Source policy comparison, not measured Ladybird performance attribution."
+    },
+    "ecma262": {
+      "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+      "local_source": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+      "algorithm": "OrdinarySetWithOwnDescriptor",
+      "evidence": "Existing own writable data overwrites ignore inherited setters; accessor/nonwritable/deletion/proxy cases preserve specified observability. Key shapes do not prove attributes or backing allocation."
+    }
+  },
+  "prior_investigation_diagnostics": {
+    "excluded_from_acceptance_timings": true,
+    "scope": "Frozen v1 React browser diagnostic before these patches. HOT_AT=1 and compile-only observation; bootstrap/application totals include seven bootstrap publications. These measurements do not test the new implementation.",
+    "controls": {
+      "TRUST_JS_OPT_JIT_HOT_AT": "1",
+      "TRUST_JS_OPT_JIT_DIAGNOSTICS": "compile"
+    },
+    "requests_attempts": 102,
+    "successful_publications": 84,
+    "bootstrap_publications": 7,
+    "ir_budget_declines": 18,
+    "optimizing_compile_ns": 1814754151,
+    "default_hot_companion_publications": 0,
+    "successful_bodies": {
+      "source_operations": 5311,
+      "clif_instructions": 314330,
+      "clif_blocks": 71162,
+      "native_bytes": 1438932,
+      "helper_sites": 3392,
+      "publication_words": 8724,
+      "heap_guards": 32782
+    },
+    "successful_phase_totals_ms": {
+      "analysis": 14.467,
+      "lowering": 98.376,
+      "codegen": 1668.155,
+      "finish": 5.285
+    },
+    "cranelift_exclusive_pass_totals_ms": {
+      "regalloc": 595.976,
+      "verifier": 466.373,
+      "egraph": 221.731,
+      "vcode_lower": 85.189,
+      "flowgraph": 70.627,
+      "vcode_emit": 63.896,
+      "compile": 60.976,
+      "domtree": 58.369,
+      "remove_constant_phis": 36.605
+    },
+    "verifier_pass_calls": 420,
+    "raw_artifacts": {
+      "browser.log": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/browser.log",
+        "sha256": "f3d3b846f810a055273cf04a991e643231e09b544d7e073fc60a0c4af4790dbf",
+        "bytes": 317576
+      },
+      "parsed-engine-metrics.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/parsed-engine-metrics.json",
+        "sha256": "d6617b225800e1fc8c38162c615c65016629a77cc4dcb488c63fabb22a8acee2",
+        "bytes": 136041
+      },
+      "control.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/control.json",
+        "sha256": "6bb8ffd5385feffe207b3f0c010644179f41fad8cbc721d7bc4b2c20b4785bf8",
+        "bytes": 9342
+      },
+      "exit.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/exit.json",
+        "sha256": "a71c2d01fa023712f1fb64959911de7501fa7b37942a9ed906665b322187f848",
+        "bytes": 562
+      },
+      "summary.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/summary.json",
+        "sha256": "ff98ce88fdbe21f4c3ca3463bcbbbbb14436e5bf8d373b564c73d821f6fc61ee",
+        "bytes": 7060
+      }
+    },
+    "interpretation": "Repeated verifier work and expanded store graphs justify controlled experiments. These totals and the static fixture do not establish application repayment."
+  },
+  "isolated_final_validation": {
+    "build_command": [
+      "taskset",
+      "-c",
+      "0-3",
+      "env",
+      "CARGO_TARGET_DIR=/big/Code/trust-js/target/compiler-latency-debug-20261014",
+      "CARGO_BUILD_JOBS=4",
+      "cargo",
+      "test",
+      "-p",
+      "trust-js",
+      "--features",
+      "optimizing-jit",
+      "--lib",
+      "--no-run"
+    ],
+    "test_binary": "/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/trust_js-d06ff139c08843fd",
+    "profile": "debug unit tests with default Intl; verifier tests explicitly create verifier-off and verifier-on ISAs",
+    "verifier": {
+      "passed": 2,
+      "failed": 0,
+      "coverage": [
+        "malformed finalized CLIF rejected before native code exists",
+        "branch/phi CLIF emits byte-identical native bytes under input-only versus repeated validation; one versus more than one verifier passes"
+      ]
+    },
+    "default_store_filter": {
+      "passed": 10,
+      "failed": 0,
+      "new_tests": 5,
+      "existing_tests": 5
+    },
+    "coverage": [
+      "actual native subject entry",
+      "unchanged production hot IR budget",
+      "live descriptors, prototypes, deletion, proxy, array, nonextensible and throwing setters",
+      "local/stack/This aliases and tested scalar/reference categories",
+      "GC/frame/owner boundaries",
+      "correct fallback after shape/storage growth",
+      "safe same-shape independently allocated backing replacement"
+    ],
+    "ablations": [
+      {
+        "command": "taskset -c0-3 env TRUST_JS_OPT_JIT_HEAP_OPS=0 /big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/trust_js-d06ff139c08843fd store_tests --nocapture",
+        "result": "10 passed,0 failed",
+        "same_shape_native_entry": "asserted positive native entry; no compact emission",
+        "same_shape_checked_property_helpers": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "command": "taskset -c0-3 env TRUST_JS_OPT_JIT_COMPACT_STORES=0 /big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/trust_js-d06ff139c08843fd store_tests --nocapture",
+        "result": "10 passed,0 failed",
+        "same_shape_native_entry": "asserted positive native entry using original dynamic cache path; no compact emission",
+        "same_shape_checked_property_helpers": [
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "same_shape_default": {
+      "compact_emitted_sites": 1,
+      "native_entry": "asserted positive",
+      "checked_property_helpers": [
+        0,
+        0,
+        0
+      ],
+      "result": "18 then own x9"
+    },
+    "ablation_scope": "Both complete store filters pass 10 tests. All semantic/native cases still execute. The compact IR comparison alone returns early under either disabled-emission control, since no compact graph exists then; its production-budget proof is from the default run.",
+    "counter_evidence": "Same-shape tests assert positive native entry, zero active native frames after return, and checked-property helper vectors [0,0,0] default, [1,0,0] HEAP_OPS=0, [0,0,0] COMPACT_STORES=0. These assertions pass; they are not emitted timing observations."
+  },
+  "static_hot_fixture": {
+    "scope": "One actual hot candidate under unchanged 40-IR-instructions/source-operation production limit. Expanded old graph compiled only for static comparison with a generous test-only limit. Figures identify the isolated tree, not later integer/Realm main or browser applications.",
+    "compact": {
+      "ir_instructions": 223,
+      "ir_blocks": 40,
+      "native_bytes": 1156
+    },
+    "expanded": {
+      "ir_instructions": 367,
+      "ir_blocks": 74,
+      "native_bytes": 1700
+    },
+    "initial_run_native_bytes": 1152,
+    "latest_raw_log": "/big/Code/trust-js/target/compiler-latency-final-store-tests-20261014.log",
+    "byte_size_note": "Initial build1152bytes; final build1156bytes. Same223instructions/40blocks; embedded address encoding may vary. Both below expanded1700bytes, without production budget change."
+  },
+  "integrated_main_validation": {
+    "scope": "Root applied both exact incremental patches to its newer main, personally reviewed them, verified hashes, and ran focused checks with embed+optimizing-jit. These do not establish full conformance of all other main changes.",
+    "stores": {
+      "command": [
+        "taskset",
+        "-c",
+        "15-18",
+        "cargo",
+        "test",
+        "-j4",
+        "-p",
+        "trust-js",
+        "--lib",
+        "--features",
+        "embed,optimizing-jit",
+        "store_tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "passed": 10,
+      "failed": 0,
+      "log_key": "integrated_main_store_tests"
+    },
+    "codegen": {
+      "command": [
+        "taskset",
+        "-c",
+        "15-18",
+        "cargo",
+        "test",
+        "-j4",
+        "-p",
+        "trust-js",
+        "--lib",
+        "--features",
+        "embed,optimizing-jit",
+        "codegen::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "passed": 2,
+      "failed": 0,
+      "log_key": "integrated_main_verifier_tests"
+    }
+  },
+  "node_oracle": {
+    "recorded_utc": "2026-10-14T10:28:28.677429+00:00",
+    "scope": "New explicit oracle reproduction after integration, not the earlier unretained stdout",
+    "command": [
+      "taskset",
+      "-c",
+      "0",
+      "/usr/bin/node",
+      "/big/Code/trust-js/target/compiler-latency-node-fixtures-20261014.js"
+    ],
+    "exit_code": 0,
+    "stdout_matches_expected": true,
+    "stderr_empty": true,
+    "metadata": {
+      "version": "v24.21.0",
+      "versions": {
+        "node": "24.21.0",
+        "acorn": "8.18.0",
+        "ada": "4.0.0",
+        "amaro": "1.1.11",
+        "ares": "1.34.8",
+        "brotli": "1.2.0",
+        "cldr": "48.0",
+        "icu": "78.3",
+        "llhttp": "9.4.3",
+        "merve": "1.2.2",
+        "modules": "137",
+        "napi": "10",
+        "nbytes": "0.1.4",
+        "ncrypto": "0.0.1",
+        "nghttp2": "1.70.0",
+        "nghttp3": "",
+        "ngtcp2": "",
+        "openssl": "3.5.8",
+        "simdjson": "4.6.7",
+        "simdutf": "6.4.0",
+        "sqlite": "3.53.4",
+        "tz": "2026c",
+        "undici": "7.29.1",
+        "unicode": "17.0",
+        "uv": "1.52.1",
+        "uvwasi": "0.0.23",
+        "v8": "13.6.233.17-node.53",
+        "zlib": "1.3.2.1-motley-8002e91",
+        "zstd": "1.5.7"
+      },
+      "arch": "arm64",
+      "platform": "linux",
+      "execPath": "/usr/bin/node"
+    },
+    "node_executable_sha256": "f73c94d413747fc9f2ee5e667f8372851c85ad49670047552b9743efeb41c771",
+    "fixture_path": "/big/Code/trust-js/target/compiler-latency-node-fixtures-20261014.js",
+    "fixture_sha256": "424a90f3498172b4d9d42aa754b040b68e2e84dd344b3f6a75cab8f7a0976276",
+    "stdout_path": "/big/Code/trust-js/target/compiler-latency-review-20261014/node-oracle-reproduction.stdout.log",
+    "stderr_path": "/big/Code/trust-js/target/compiler-latency-review-20261014/node-oracle-reproduction.stderr.log",
+    "not_a_performance_timing": true,
+    "fixture_raw_source": "function subject(o,n){'use strict';o.x=n;return n+n;}var receiver={x:0};subject(receiver,1);subject(receiver,2);\n\n        var trace=[],results=[];\n        Object.setPrototypeOf(receiver,{set x(v){trace.push('proto:'+v);}});\n        results.push(subject(receiver,3));results.push(receiver.x);\n        Object.defineProperty(receiver,'x',{get:function(){return 11;},set:function(v){trace.push('own:'+v);},configurable:true});\n        results.push(subject(receiver,4));\n        Object.defineProperty(receiver,'x',{value:5,writable:false,configurable:true});\n        try{subject(receiver,6);}catch(e){results.push(e.name);}\n        delete receiver.x;\n        results.push(subject(receiver,7));results.push(Object.hasOwn(receiver,'x'));\n        Object.preventExtensions(receiver);results.push(subject(receiver,8));\n        receiver=new Proxy({x:0},{set:function(t,k,v,r){trace.push('proxy:'+v);return Reflect.set(t,k,v,r);}});\n        results.push(subject(receiver,9));results.push(receiver.x);\n        receiver=[];receiver.x=0;results.push(subject(receiver,10));results.push(receiver.x);\n        receiver={x:0};Object.defineProperty(receiver,'x',{set:function(v){trace.push('throw:'+v);throw 'stop';}});\n        try{subject(receiver,11);}catch(e){results.push(e);}\n        console.log(results.join('|')+'|'+trace.join(','));\n        \n\nfor (const body of ['return o.x=v','return (0,o).x=v','return this.x=v']) {\n for (const kind of ['self','undefined','null','false','-0','NaN','Infinity','string','symbol','bigint']) {\n  const receiver={x:0};\n  const values={self:receiver,undefined:undefined,null:null,false:false,'-0':-0,NaN:NaN,Infinity:Infinity,string:'shared',symbol:Symbol('x'),bigint:12345678901234567890n};\n  const held=values[kind];\n  const subject=Function('o','v', \"'use strict';\"+body);\n  const call=()=>body.includes('this.')?subject.call(receiver,receiver,held):subject(receiver,held);\n  call();call();const result=call();\n  if (!Object.is(result,held)||!Object.is(receiver.x,held))throw Error(body+' '+kind);\n }\n}\nconsole.log('30 alias/category fixtures passed');\n",
+    "expected_descriptor_trace": "6|3|8|TypeError|14|false|16|18|9|20|10|stop|own:4,proto:7,proto:8,proxy:9,throw:11",
+    "alias_category_cases": 30,
+    "earlier_observation": "Original run passed but stdout was not saved. This new explicit reproduction records exit0/stdout/executable identity and is not mislabeled as that original log."
+  },
+  "raw_logs": {
+    "initial_debug_build": {
+      "path": "/big/Code/trust-js/target/compiler-latency-debug-build-20261014.log",
+      "sha256": "c1aa9b7debf0bc0d7dc0b9abe07fa2c8fbb2767fe1eaaad78500bd57124fe911",
+      "bytes": 1667,
+      "raw_text": "   Compiling foldhash v0.2.0\n   Compiling cranelift-srcgen v0.136.2\n   Compiling libm v0.2.16\n   Compiling wasmtime-internal-core v49.0.2\n   Compiling object v0.39.1\n   Compiling hashbrown v0.17.1\n   Compiling cranelift-assembler-x64-meta v0.136.2\n   Compiling find-msvc-tools v0.1.14\n   Compiling cranelift-isle v0.136.2\n   Compiling shlex v2.0.1\n   Compiling cc v1.6.0\n   Compiling memchr v2.8.3\n   Compiling heck v0.5.0\n   Compiling cranelift-codegen-shared v0.136.2\n   Compiling cranelift-codegen-meta v0.136.2\n   Compiling cranelift-bitset v0.136.2\n   Compiling cranelift-assembler-x64 v0.136.2\n   Compiling allocator-api2 v0.2.21\n   Compiling target-lexicon v0.13.5\n   Compiling equivalent v1.0.2\n   Compiling indexmap v2.14.2\n   Compiling bumpalo v3.20.3\n   Compiling cranelift-entity v0.136.2\n   Compiling arbitrary v1.5.0\n   Compiling hashbrown v0.16.1\n   Compiling cranelift-codegen v0.136.2\n   Compiling smallvec v1.16.2\n   Compiling rustc-hash v2.1.3\n   Compiling log v0.4.34\n   Compiling fnv v1.0.7\n   Compiling gimli v0.33.0\n   Compiling regalloc2 v0.15.2\n   Compiling ar_archive_writer v0.5.3\n   Compiling psm v0.1.32\n   Compiling cranelift-control v0.136.2\n   Compiling cranelift-bforest v0.136.2\n   Compiling libc v0.2.190\n   Compiling stacker v0.1.25\n   Compiling cfg-if v1.0.5\n   Compiling cranelift-native v0.136.2\n   Compiling cranelift-frontend v0.136.2\n   Compiling trust-js v0.1.3 (/tmp/trust-js-compile-latency-20261014/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 7m 29s\n  Executable unittests src/lib.rs (/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/trust_js-d06ff139c08843fd)\n"
+    },
+    "initial_verifier_tests": {
+      "path": "/big/Code/trust-js/target/compiler-latency-verifier-tests-20261014.log",
+      "sha256": "168ff390b1245f01c41aba5b6dc3590bcce6e71f97a71601c0ac86c59d3f3af5",
+      "bytes": 334,
+      "raw_text": "\nrunning 2 tests\ntest jit::optimizing::codegen::tests::input_only_validation_rejects_malformed_ir_before_codegen ... ok\ntest jit::optimizing::codegen::tests::input_only_validation_emits_identical_code_with_fewer_verifier_passes ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2184 filtered out; finished in 0.01s\n\n"
+    },
+    "initial_store_tests_before_same_shape_fixture": {
+      "path": "/big/Code/trust-js/target/compiler-latency-store-tests-20261014.log",
+      "sha256": "744c45122395e7eda58fc8b5c3c9082618e80af0aa93a204a57af7617e01b5c3",
+      "bytes": 1222,
+      "raw_text": "\nrunning 9 tests\ncompact-store IR=223 blocks=40 bytes=1152; expanded IR=367 blocks=74 bytes=1700\ntest jit::optimizing::store_tests::warmed_own_store_reduces_ir_and_fits_the_unchanged_hot_budget ... ok\ntest jit::optimizing::store_tests::compact_own_stores_observe_descriptors_prototypes_deletion_exotics_and_throws ... ok\ntest jit::property_store_tests::assignment_results_retain_scalar_and_reference_owners_across_creation_and_gc ... ok\ntest jit::property_store_tests::assignment_store_misses_preserve_descriptor_side_effects_and_expression_values ... ok\ntest jit::property_store_tests::assignment_store_retains_new_host_owners_and_releases_final_old_owners ... ok\ntest jit::optimizing::store_tests::creation_and_polymorphic_store_sites_keep_the_existing_dynamic_paths ... ok\ntest jit::property_store_tests::warm_assignment_expressions_use_native_stores_without_losing_rhs_owners ... ok\ntest jit::property_store_tests::rejecting_proxy_assignments_check_strictness_without_changing_reflect_set ... ok\ntest jit::optimizing::store_tests::compact_own_stores_keep_aliases_every_value_category_and_live_storage_through_gc ... ok\n\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2177 filtered out; finished in 8.82s\n\n"
+    },
+    "final_exact_source_build": {
+      "path": "/big/Code/trust-js/target/compiler-latency-final-build-20261014.log",
+      "sha256": "1e1bbb3c3526514c3d90bba724e06d85d7a46161b67031a60623b740dac85341",
+      "bytes": 291,
+      "raw_text": "   Compiling trust-js v0.1.3 (/tmp/trust-js-compile-latency-20261014/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.13s\n  Executable unittests src/lib.rs (/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/trust_js-d06ff139c08843fd)\n"
+    },
+    "final_verifier_tests": {
+      "path": "/big/Code/trust-js/target/compiler-latency-final-verifier-tests-20261014.log",
+      "sha256": "c2652117afae10c7d6aa7cf321bdcddfb391576ffc41949c5b4713c3430a05f6",
+      "bytes": 334,
+      "raw_text": "\nrunning 2 tests\ntest jit::optimizing::codegen::tests::input_only_validation_rejects_malformed_ir_before_codegen ... ok\ntest jit::optimizing::codegen::tests::input_only_validation_emits_identical_code_with_fewer_verifier_passes ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2185 filtered out; finished in 0.01s\n\n"
+    },
+    "final_default_store_tests": {
+      "path": "/big/Code/trust-js/target/compiler-latency-final-store-tests-20261014.log",
+      "sha256": "9e5a9231bad1b57c92c6e3bd4c38979e565597517014fc3b21701ef083337acb",
+      "bytes": 1339,
+      "raw_text": "\nrunning 10 tests\ntest jit::optimizing::store_tests::compact_own_store_uses_replaced_storage_with_the_same_receiver_and_shape ... ok\ncompact-store IR=223 blocks=40 bytes=1156; expanded IR=367 blocks=74 bytes=1700\ntest jit::optimizing::store_tests::warmed_own_store_reduces_ir_and_fits_the_unchanged_hot_budget ... ok\ntest jit::optimizing::store_tests::compact_own_stores_observe_descriptors_prototypes_deletion_exotics_and_throws ... ok\ntest jit::property_store_tests::assignment_results_retain_scalar_and_reference_owners_across_creation_and_gc ... ok\ntest jit::property_store_tests::assignment_store_misses_preserve_descriptor_side_effects_and_expression_values ... ok\ntest jit::optimizing::store_tests::creation_and_polymorphic_store_sites_keep_the_existing_dynamic_paths ... ok\ntest jit::property_store_tests::warm_assignment_expressions_use_native_stores_without_losing_rhs_owners ... ok\ntest jit::property_store_tests::assignment_store_retains_new_host_owners_and_releases_final_old_owners ... ok\ntest jit::property_store_tests::rejecting_proxy_assignments_check_strictness_without_changing_reflect_set ... ok\ntest jit::optimizing::store_tests::compact_own_stores_keep_aliases_every_value_category_and_live_storage_through_gc ... ok\n\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2177 filtered out; finished in 8.87s\n\n"
+    },
+    "final_heap_off_store_tests": {
+      "path": "/big/Code/trust-js/target/compiler-latency-final-store-heap-off-tests-20261014.log",
+      "sha256": "172134e3ca7fcc262c51fbe2bb0acfda3bd58c187dc93bf4c7da85ebcffb8714",
+      "bytes": 1259,
+      "raw_text": "\nrunning 10 tests\ntest jit::optimizing::store_tests::compact_own_store_uses_replaced_storage_with_the_same_receiver_and_shape ... ok\ntest jit::optimizing::store_tests::warmed_own_store_reduces_ir_and_fits_the_unchanged_hot_budget ... ok\ntest jit::optimizing::store_tests::compact_own_stores_observe_descriptors_prototypes_deletion_exotics_and_throws ... ok\ntest jit::property_store_tests::assignment_results_retain_scalar_and_reference_owners_across_creation_and_gc ... ok\ntest jit::property_store_tests::assignment_store_retains_new_host_owners_and_releases_final_old_owners ... ok\ntest jit::property_store_tests::assignment_store_misses_preserve_descriptor_side_effects_and_expression_values ... ok\ntest jit::optimizing::store_tests::creation_and_polymorphic_store_sites_keep_the_existing_dynamic_paths ... ok\ntest jit::property_store_tests::warm_assignment_expressions_use_native_stores_without_losing_rhs_owners ... ok\ntest jit::property_store_tests::rejecting_proxy_assignments_check_strictness_without_changing_reflect_set ... ok\ntest jit::optimizing::store_tests::compact_own_stores_keep_aliases_every_value_category_and_live_storage_through_gc ... ok\n\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2177 filtered out; finished in 7.64s\n\n"
+    },
+    "final_compact_off_store_tests": {
+      "path": "/big/Code/trust-js/target/compiler-latency-final-store-compact-off-tests-20261014.log",
+      "sha256": "11037040e98b3218882720282460e65632c1b810288e52c8a03674fef81b789c",
+      "bytes": 1260,
+      "raw_text": "\nrunning 10 tests\ntest jit::optimizing::store_tests::compact_own_store_uses_replaced_storage_with_the_same_receiver_and_shape ... ok\ntest jit::optimizing::store_tests::warmed_own_store_reduces_ir_and_fits_the_unchanged_hot_budget ... ok\ntest jit::optimizing::store_tests::compact_own_stores_observe_descriptors_prototypes_deletion_exotics_and_throws ... ok\ntest jit::property_store_tests::assignment_results_retain_scalar_and_reference_owners_across_creation_and_gc ... ok\ntest jit::property_store_tests::assignment_store_retains_new_host_owners_and_releases_final_old_owners ... ok\ntest jit::property_store_tests::assignment_store_misses_preserve_descriptor_side_effects_and_expression_values ... ok\ntest jit::optimizing::store_tests::creation_and_polymorphic_store_sites_keep_the_existing_dynamic_paths ... ok\ntest jit::property_store_tests::warm_assignment_expressions_use_native_stores_without_losing_rhs_owners ... ok\ntest jit::property_store_tests::rejecting_proxy_assignments_check_strictness_without_changing_reflect_set ... ok\ntest jit::optimizing::store_tests::compact_own_stores_keep_aliases_every_value_category_and_live_storage_through_gc ... ok\n\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2177 filtered out; finished in 10.74s\n\n"
+    },
+    "prior_clippy_failure": {
+      "path": "/big/Code/trust-js/target/compiler-latency-clippy-20261014.log",
+      "sha256": "1814971a665d2171b0b54fabf22d08bbe11a7de23a6575e561aeeea59bd6dc82",
+      "bytes": 3445,
+      "raw_text": "    Checking foldhash v0.2.0\n    Checking libm v0.2.16\n   Compiling cranelift-codegen-shared v0.136.2\n    Checking allocator-api2 v0.2.21\n   Compiling cranelift-codegen-meta v0.136.2\n    Checking hashbrown v0.17.1\n    Checking equivalent v1.0.2\n    Checking bumpalo v3.20.3\n    Checking smallvec v1.16.2\n    Checking arbitrary v1.5.0\n    Checking indexmap v2.14.2\n    Checking wasmtime-internal-core v49.0.2\n    Checking cranelift-bitset v0.136.2\n    Checking hashbrown v0.16.1\n    Checking log v0.4.34\n    Checking cranelift-entity v0.136.2\n    Checking rustc-hash v2.1.3\n    Checking fnv v1.0.7\n    Checking regalloc2 v0.15.2\n    Checking cranelift-bforest v0.136.2\n    Checking cranelift-control v0.136.2\n    Checking gimli v0.33.0\n    Checking cranelift-assembler-x64 v0.136.2\n   Compiling cranelift-codegen v0.136.2\n    Checking target-lexicon v0.13.5\n    Checking psm v0.1.32\n    Checking libc v0.2.190\n    Checking cfg-if v1.0.5\n    Checking stacker v0.1.25\n    Checking cranelift-frontend v0.136.2\n    Checking cranelift-native v0.136.2\n    Checking trust-js v0.1.3 (/tmp/trust-js-compile-latency-20261014/crates/trust-js)\nerror: the borrowed expression implements the required traits\n    --> crates/trust-js/src/builtins/mod.rs:4124:46\n     |\n4124 |         return Err(i.make_error(\"TypeError\", &format!(\"{name} called on null or undefined\")));\n     |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!(\"{name} called on null or undefined\")`\n     |\n     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrows_for_generic_args\n     = note: `-D clippy::needless-borrows-for-generic-args` implied by `-D warnings`\n     = help: to override `-D warnings` add `#[allow(clippy::needless_borrows_for_generic_args)]`\n\nerror: the borrowed expression implements the required traits\n    --> crates/trust-js/src/builtins/mod.rs:4127:46\n     |\n4127 |         return Err(i.make_error(\"TypeError\", &format!(\"{name} callback is not callable\")));\n     |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!(\"{name} callback is not callable\")`\n     |\n     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrows_for_generic_args\n\nerror: unnecessary closure used with `bool::then`\n  --> crates/trust-js/src/jit_optimizing_ranges.rs:61:9\n   |\n61 | /         (number.is_finite()\n62 | |             && number.fract() == 0.0\n63 | |             && number.abs() <= SAFE_MAX as f64\n64 | |             && !(number == 0.0 && number.is_sign_negative()))\n...  |\n67 | |             max: number as i64,\n68 | |         })\n   | |__________^\n   |\n   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_lazy_evaluations\n   = note: `-D clippy::unnecessary-lazy-evaluations` implied by `-D warnings`\n   = help: to override `-D warnings` add `#[allow(clippy::unnecessary_lazy_evaluations)]`\nhelp: use `then_some` instead\n   |\n65 ~         .then_some(Self {\n66 +             min: number as i64,\n67 +             max: number as i64,\n68 +         })\n   |\n\nerror: could not compile `trust-js` (lib) due to 3 previous errors\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `trust-js` (lib test) due to 3 previous errors\n"
+    },
+    "integrated_main_store_tests": {
+      "path": "/tmp/trust-js-main-stores-v2-20261014.log",
+      "sha256": "a37b05dcc535312f29f5d96407052202c11ccb24fc18f1134488917efd31266b",
+      "bytes": 1479,
+      "raw_text": "   Compiling trust-js v0.1.3 (/big/Code/trust-js/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.94s\n     Running unittests src/lib.rs (target/debug/deps/trust_js-02b40a0fd73d0540)\n\nrunning 10 tests\ntest jit::optimizing::store_tests::compact_own_store_uses_replaced_storage_with_the_same_receiver_and_shape ... ok\ntest jit::optimizing::store_tests::warmed_own_store_reduces_ir_and_fits_the_unchanged_hot_budget ... ok\ntest jit::optimizing::store_tests::compact_own_stores_observe_descriptors_prototypes_deletion_exotics_and_throws ... ok\ntest jit::property_store_tests::assignment_store_misses_preserve_descriptor_side_effects_and_expression_values ... ok\ntest jit::property_store_tests::assignment_results_retain_scalar_and_reference_owners_across_creation_and_gc ... ok\ntest jit::property_store_tests::assignment_store_retains_new_host_owners_and_releases_final_old_owners ... ok\ntest jit::optimizing::store_tests::creation_and_polymorphic_store_sites_keep_the_existing_dynamic_paths ... ok\ntest jit::property_store_tests::rejecting_proxy_assignments_check_strictness_without_changing_reflect_set ... ok\ntest jit::property_store_tests::warm_assignment_expressions_use_native_stores_without_losing_rhs_owners ... ok\ntest jit::optimizing::store_tests::compact_own_stores_keep_aliases_every_value_category_and_live_storage_through_gc ... ok\n\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2275 filtered out; finished in 4.91s\n\n"
+    },
+    "integrated_main_verifier_tests": {
+      "path": "/tmp/trust-js-main-codegen-v2-20261014.log",
+      "sha256": "9ce17c39452d4b9bb0390ec63c2df59026c5235a3f5264b1441c3fe096b8bcb7",
+      "bytes": 487,
+      "raw_text": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s\n     Running unittests src/lib.rs (target/debug/deps/trust_js-02b40a0fd73d0540)\n\nrunning 2 tests\ntest jit::optimizing::codegen::tests::input_only_validation_rejects_malformed_ir_before_codegen ... ok\ntest jit::optimizing::codegen::tests::input_only_validation_emits_identical_code_with_fewer_verifier_passes ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2283 filtered out; finished in 0.00s\n\n"
+    },
+    "node_oracle_reproduction_stdout": {
+      "path": "/big/Code/trust-js/target/compiler-latency-review-20261014/node-oracle-reproduction.stdout.log",
+      "sha256": "f4773bcc09d4fe851295115e45bd8ee94691439b04de236182bc4fbc6860c0ee",
+      "bytes": 117,
+      "raw_text": "6|3|8|TypeError|14|false|16|18|9|20|10|stop|own:4,proto:7,proto:8,proxy:9,throw:11\n30 alias/category fixtures passed\n"
+    },
+    "node_oracle_reproduction_stderr": {
+      "path": "/big/Code/trust-js/target/compiler-latency-review-20261014/node-oracle-reproduction.stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "raw_text": ""
+    }
+  },
+  "prior_clippy_failure": {
+    "exit_code": 101,
+    "command": [
+      "taskset",
+      "-c",
+      "0-3",
+      "env",
+      "CARGO_TARGET_DIR=/big/Code/trust-js/target/compiler-latency-debug-20261014",
+      "CARGO_BUILD_JOBS=4",
+      "cargo",
+      "clippy",
+      "-p",
+      "trust-js",
+      "--features",
+      "optimizing-jit",
+      "--lib",
+      "--tests",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "scope": "Frozen isolated base before final fifth fixture. Three pre-existing lint errors; no reported verifier/store warning. This failed command is not relabeled a pass.",
+    "errors": [
+      {
+        "file": "crates/trust-js/src/builtins/mod.rs",
+        "lines": [
+          4124,
+          4127
+        ],
+        "lint": "needless_borrows_for_generic_args"
+      },
+      {
+        "file": "crates/trust-js/src/jit_optimizing_ranges.rs",
+        "lines": [
+          61
+        ],
+        "lint": "unnecessary_lazy_evaluations"
+      }
+    ],
+    "main_status": "Root reported those three fixed in main; later integration lint is outside this record."
+  },
+  "canceled_release_unit_build": {
+    "status": "aborted at root request, not a test failure",
+    "exit_code": 130,
+    "reason": "Whole-library opt3/fat-LTO/one-CGU release unit linking was unnecessary for bounded wrapper tests; explicit ISA modes were exercised using the debug cache.",
+    "metadata": {
+      "path": "/big/Code/trust-js/target/compiler-latency-release-aborted-20261014.json",
+      "sha256": "da7385abe406e376a7d3e12b4aeeb8e6335bcba03dcdecec6d7414aff1ea6ddb",
+      "bytes": 2150,
+      "raw_record": {
+        "status": "aborted_by_root_request",
+        "reason": "Full opt3/fatLTO whole-library release unit-test codegen unnecessary; focused tests will use debug cache with explicit ISA modes",
+        "jobs": [
+          {
+            "pid": 3252156,
+            "cwd": "/tmp/trust-js-compile-latency-20261014",
+            "signal": "SIGINT",
+            "command": "cargo test --release -p trust-js --features optimizing-jit --lib codegen::tests -- --nocapture "
+          },
+          {
+            "pid": 3254973,
+            "cwd": "/tmp/trust-js-compile-latency-20261014",
+            "signal": "SIGINT",
+            "command": "rustc --crate-name trust_js --edition=2021 crates/trust-js/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C opt-level=3 -C lto=fat -C codegen-units=1 --allow=clippy::type_complexity --allow=clippy::too_many_arguments --allow=clippy::needless_range_loop --allow=clippy::doc_lazy_continuation --test --cfg feature=\"default\" --cfg feature=\"intl\" --cfg feature=\"optimizing-jit\" --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values(\"architecture-diagnostics\", \"bench\", \"default\", \"embed\", \"heap-bridge\", \"intl\", \"optimizing-jit\")) -C metadata=d5c7a0be5340129c -C extra-filename=-6b52b0e51d8d3cae --out-dir /big/Code/trust-js/target/compiler-latency-build-20261014/release/deps -C strip=debuginfo -L dependency=/big/Code/trust-js/target/compiler-latency-build-20261014/release/deps --extern cranelift_codegen=/big/Code/trust-js/target/compiler-latency-build-20261014/release/deps/libcranelift_codegen-12666125e888a571.rlib --extern cranelift_frontend=/big/Code/trust-js/target/compiler-latency-build-20261014/release/deps/libcranelift_frontend-618735a59d5d123c.rlib --extern cranelift_native=/big/Code/trust-js/target/compiler-latency-build-20261014/release/deps/libcranelift_native-87348e62e5442262.rlib --extern stacker=/big/Code/trust-js/target/compiler-latency-build-20261014/release/deps/libstacker-de8d1dc933e05ee2.rlib -C link-arg=-fuse-ld=mold -L native=/big/Code/trust-js/target/compiler-latency-build-20261014/release/build/psm-c055e8ccd5f5b9d5/out "
+          }
+        ],
+        "time_epoch": 1791970361.7550519
+      }
+    },
+    "raw_stdout_limit": "Release stdout was observed through an exec session and was not saved as a standalone log. Cancellation metadata retains owned commands/signals; no release unit-test success is claimed."
+  },
+  "paused_initial_debug_build": {
+    "metadata": {
+      "path": "/big/Code/trust-js/target/compiler-latency-pause-20261014.json",
+      "sha256": "28f5a775fd2ced651a2bb274d10a36c5c88733d2ce00bc228c20ec5f90be0ffa",
+      "bytes": 2310,
+      "raw_record": {
+        "status": "resumed_after_profile_handoff",
+        "pause_observed_epoch": 1791971086.5582452,
+        "cargo_root": 3279263,
+        "worktree": "/tmp/trust-js-compile-latency-20261014",
+        "jobs": [
+          {
+            "pid": 3279263,
+            "start": "9016205",
+            "state": "T",
+            "ticks": 29,
+            "command": "cargo test -p trust-js --features optimizing-jit --lib --no-run ",
+            "cpu_tick_delta_250ms": 0,
+            "resume_signal": "SIGCONT"
+          },
+          {
+            "pid": 3281273,
+            "start": "9024291",
+            "state": "T",
+            "ticks": 19759,
+            "command": "rustc --crate-name trust_js --edition=2021 crates/trust-js/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --allow=clippy::type_complexity --allow=clippy::too_many_arguments --allow=clippy::needless_range_loop --allow=clippy::doc_lazy_continuation --test --cfg feature=\"default\" --cfg feature=\"intl\" --cfg feature=\"optimizing-jit\" --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values(\"architecture-diagnostics\", \"bench\", \"default\", \"embed\", \"heap-bridge\", \"intl\", \"optimizing-jit\")) -C metadata=8e2b9f84fc13b9be -C extra-filename=-d06ff139c08843fd --out-dir /big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps -C incremental=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/incremental -L dependency=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps --extern cranelift_codegen=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/libcranelift_codegen-52847250cd3d44d8.rlib --extern cranelift_frontend=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/libcranelift_frontend-1b13b76c4a6dd3d2.rlib --extern cranelift_native=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/libcranelift_native-0cd8063ee972d24d.rlib --extern stacker=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/deps/libstacker-3d765193098efee4.rlib -C link-arg=-fuse-ld=mold -L native=/big/Code/trust-js/target/compiler-latency-debug-20261014/debug/build/psm-83cd455ed16a6e1a/out ",
+            "cpu_tick_delta_250ms": 0,
+            "resume_signal": "SIGCONT"
+          }
+        ],
+        "resume_epoch": 1791971242.2196152,
+        "observed_pause_seconds": 155.6613700389862
+      }
+    },
+    "scope": "Owned compiler tree stopped/resumed around an authorized diagnostic profile. Initial Rust build duration includes dependencies and observed 155.66s pause; it is not JavaScript compilation latency."
+  },
+  "review": {
+    "independent_reviewer": "/root/range_review",
+    "outcome": "Production invariants and final same-shape test source clear; initial HEAP_OPS=0 expected-site defect corrected before final execution.",
+    "root": "Root personally read production/test changes, verified patch/log hashes, integrated and reran focused main checks."
+  },
+  "limitations": [
+    "No application acceptance or measured verifier/store compile-latency reduction in this record. Actual release browser ablations and repayment remain pending.",
+    "Optional optimizing backend remains off by default; no threshold or budget increase.",
+    "A single static hot fixture does not establish framework-wide performance, admission improvement or code-size reduction.",
+    "Debug/test retains strategic verification; explicit ISA false/true tests verify wrapper behavior but do not exercise production release configuration of every engine body.",
+    "Focused native aarch64 checks do not establish wasm32, other native targets or full Test262 conformance.",
+    "Prior lint failure and canceled release build are explicitly scoped, not treated as successful checks.",
+    "Integer/Realm main differs from the isolated candidate and frozen v1 browser artifacts. Root focused checks do not validate every other integrated change.",
+    "Local artifact paths are not guaranteed in a fresh clone. Small raw compiler/check/lint logs and Node source/stdout are embedded; large browser diagnostics are referenced by path/hash.",
+    "Ladybird policy is source comparison only; no Ladybird runtime performance result is recorded."
+  ]
+}

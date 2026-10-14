@@ -12,6 +12,15 @@ impl Lowering<'_, '_> {
     }
 
     pub(super) fn stack_write(&mut self, back: usize, value: Value) {
+        self.stack_write_integer(back, value, None);
+    }
+
+    pub(super) fn stack_write_integer(
+        &mut self,
+        back: usize,
+        value: Value,
+        integer: Option<Value>,
+    ) {
         assert!(
             back > 0 && back <= self.stack_state.known(),
             "proven live operand"
@@ -21,6 +30,12 @@ impl Lowering<'_, '_> {
         let number = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
         self.b
             .def_var(self.stack_numbers[self.stack_state.depth - back], number);
+        self.define_stack_integer(
+            self.stack_state.depth - back,
+            value,
+            integer,
+            integers::Point::After,
+        );
     }
 
     /// ECMA-262 e28783d5, Number Type and Number arithmetic: intermediate Number
@@ -52,6 +67,10 @@ impl Lowering<'_, '_> {
     }
 
     pub(super) fn reload_stack(&mut self, state: stack::StackState) {
+        self.reload_stack_at(state, integers::Point::After);
+    }
+
+    pub(super) fn reload_stack_at(&mut self, state: stack::StackState, point: integers::Point) {
         let sp = self.top();
         for slot in state.floor..state.depth {
             let offset = ((slot as i64 - state.depth as i64) * 8) as i32;
@@ -59,6 +78,7 @@ impl Lowering<'_, '_> {
             self.b.def_var(self.stack_vars[slot], value);
             let number = self.b.ins().bitcast(types::F64, MemFlags::new(), value);
             self.b.def_var(self.stack_numbers[slot], number);
+            self.define_stack_integer(slot, value, None, point);
         }
         self.stack_state = state;
     }

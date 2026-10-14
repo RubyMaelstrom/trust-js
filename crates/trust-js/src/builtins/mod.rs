@@ -4121,10 +4121,10 @@ fn group_by(
     mut add: impl FnMut(&mut Interp, Value, Value) -> Result<(), Value>,
 ) -> Result<(), Value> {
     if matches!(items, Value::Null | Value::Undefined) {
-        return Err(i.make_error("TypeError", &format!("{name} called on null or undefined")));
+        return Err(i.make_error("TypeError", format!("{name} called on null or undefined")));
     }
     if !callback.is_callable() {
-        return Err(i.make_error("TypeError", &format!("{name} callback is not callable")));
+        return Err(i.make_error("TypeError", format!("{name} callback is not callable")));
     }
     let (iterator, next) = ab(i.get_iterator(items))?;
     // These callees are fixed by GroupBy/GetIterator. Reuse the guarded callback entries

@@ -82,12 +82,12 @@ thread_local! {
     static INLINE_SITES: std::cell::RefCell<InlineSiteTable> = Default::default();
 }
 
-/// The inline sites one chunk registered, released when the chunk is dropped. A chunk's inline
+/// The inline sites a lowering registered, released when its final chunk is dropped. A chunk's inline
 /// positions are only read while it runs (as the call position of a frame above it or of an
 /// error it raises), and captured frames keep resolved byte offsets, so none outlives it.
 /// Only inlined chunks allocate metadata; ordinary chunks retain one nullable pointer.
-#[derive(Default)]
-pub(crate) struct InlineSites(Option<Box<InlineMetadata>>);
+#[derive(Clone, Default)]
+pub(crate) struct InlineSites(Option<Rc<InlineMetadata>>);
 
 /// Registered identities and the checked-operation lookup are distinct: only identities are
 /// unregistered on drop. Positions contain no JavaScript owners and serve every running Realm.
@@ -129,7 +129,7 @@ impl InlineSites {
             }
             let ids = positions.iter().map(|&p| p & INLINE_INDEX_MASK).collect();
             (
-                InlineSites(Some(Box::new(InlineMetadata {
+                InlineSites(Some(Rc::new(InlineMetadata {
                     ids,
                     implicit_positions: Box::default(),
                 }))),
@@ -146,6 +146,12 @@ impl InlineSites {
         })
     }
 
+    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
+        self.0.as_ref().map_or(0, |metadata| {
+            visitor.inline_sites_bytes(Rc::as_ptr(metadata) as usize, self.retained_bytes())
+        })
+    }
+
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_none()
@@ -153,7 +159,8 @@ impl InlineSites {
 
     /// Install the dense lookup after the compiler has remapped every final inline identity.
     pub(crate) fn set_implicit_positions(&mut self, positions: Box<[u32]>) {
-        let metadata = self.0.as_mut().expect("only inlined chunks own positions");
+        let metadata = Rc::get_mut(self.0.as_mut().expect("only inlined chunks own positions"))
+            .expect("inline metadata is finalized before sharing");
         debug_assert!(metadata.implicit_positions.is_empty());
         metadata.implicit_positions = positions;
     }
@@ -170,15 +177,12 @@ impl InlineSites {
     }
 }
 
-impl Drop for InlineSites {
+impl Drop for InlineMetadata {
     fn drop(&mut self) {
-        let Some(metadata) = &self.0 else {
-            return;
-        };
         // During thread teardown the table may already be gone; nothing can read it then.
         let _ = INLINE_SITES.try_with(|table| {
             let mut table = table.borrow_mut();
-            for &index in metadata.ids.iter() {
+            for &index in self.ids.iter() {
                 table.sites[index as usize] = None;
                 table.free.push(index);
             }
@@ -1032,6 +1036,51 @@ fn function_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_inline_sites_keep_positions_live_until_the_last_chunk() {
+        let engine = crate::Engine::new();
+        let callee = engine.interp.new_object();
+        let pin = Rc::downgrade(&callee);
+        let (mut sites, positions) = InlineSites::register(vec![
+            InlineSite {
+                callee: pin.clone(),
+                inner: 11,
+                outer: 37,
+            },
+            InlineSite {
+                callee: pin.clone(),
+                inner: 19,
+                outer: inline_position(0),
+            },
+        ]);
+        sites.set_implicit_positions(vec![NO_POSITION, positions[1]].into_boxed_slice());
+        let clone = sites.clone();
+        let mut visitor = crate::memory::Visitor::default();
+        assert!(sites.scan_retained_memory(&mut visitor) > 0);
+        assert_eq!(
+            clone.scan_retained_memory(&mut visitor),
+            0,
+            "charge shared metadata once"
+        );
+        drop(sites);
+        assert_eq!(clone.implicit_position(1), positions[1]);
+        let inner = inline_site(positions[1]).expect("the clone owns both registered identities");
+        assert_eq!(inner.outer, positions[0]);
+        assert_eq!(inline_site(inner.outer).unwrap().outer, 37);
+        drop(callee);
+        assert!(
+            pin.upgrade().is_none(),
+            "inline metadata must retain no JavaScript owner"
+        );
+        assert!(
+            inline_site(positions[1]).is_some(),
+            "a dead weak callee does not release IDs"
+        );
+        drop(clone);
+        assert!(inline_site(positions[0]).is_none());
+        assert!(inline_site(positions[1]).is_none());
+    }
 
     #[test]
     fn line_and_utf16_column() {

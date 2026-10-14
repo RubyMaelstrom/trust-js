@@ -1,0 +1,871 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-14T10:32:36.351117+00:00",
+  "status": "Focused checked-call correctness and intended native-cache-path evidence; integrated unchanged into frozen compiler candidate v2. Application performance acceptance remains separate.",
+  "summary": {
+    "candidate_test_executions_passed": 39,
+    "candidate_test_executions_failed": 0,
+    "distinct_rust_tests_per_selection": 13,
+    "candidate_selections": 3,
+    "new_rust_fixtures": 4,
+    "node_oracle_checks": 9,
+    "node_oracle_checks_passed": 9,
+    "expected_negative_control_passed": 1,
+    "expected_negative_control_failed": 3,
+    "expected_negative_control_exit_code": 101,
+    "candidate_source_restored_by_exact_hashes": true
+  },
+  "machine": {
+    "architecture": "aarch64",
+    "system": "Linux-7.2.10-crystal-aarch64-with-glibc2.44",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)",
+    "build_cpus": [
+      10,
+      11,
+      13,
+      14
+    ],
+    "build_jobs": 4,
+    "test_threads": 1,
+    "profile": "test; unoptimized + debuginfo; not acceptance timing"
+  },
+  "standards_basis": {
+    "specification": "ECMA-262 editor snapshot",
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "local_file": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+    "clauses": [
+      {
+        "name": "PrepareForOrdinaryCall",
+        "url": "https://tc39.es/ecma262/#sec-prepareforordinarycall",
+        "local_line": 13860,
+        "requirement": "The callee execution context uses the actual function and its immutable [[Realm]], independently of [[Environment]]."
+      },
+      {
+        "name": "OrdinaryFunctionCreate",
+        "url": "https://tc39.es/ecma262/#sec-ordinaryfunctioncreate",
+        "local_line": 14037,
+        "requirement": "Creation Realm and lexical environment are separate internal slots; mutable function prototypes do not establish Realm identity."
+      }
+    ]
+  },
+  "implementation": {
+    "changes": [
+      "call_jit_fast uses immutable UserCallable.realm equality instead of an eight-parent lexical-environment walk.",
+      "jit_call_hit_inner lends the existing packed callee owner through PackedValue::with_object for observer-free identity/environment inspection."
+    ],
+    "preserved_guards": [
+      "Active global-environment identity and Weak allocation pins on every call-cache fill/hit.",
+      "Call-cache epoch and executable-code lease.",
+      "under_with, class-constructor, prepared-entry and resumable-frame exclusions.",
+      "Normative Realm switching for foreign callees, proxy/bound dispatch and this binding.",
+      "GC safepoints, canonical operands, frame/exception cleanup and final owner destruction."
+    ],
+    "prerequisite": "Immutable UserCallable.realm identity/callee_realm_global main correctness fix; snapshots include current Realm-aware dispatch and Weak planning-global-env pins.",
+    "independent_review": "Root and review_changes independently reviewed the production proof and focused fixtures before unchanged v2 integration; no actionable issue found."
+  },
+  "source": {
+    "isolated_source": "/tmp/trust-js-checked-call-20261014",
+    "source_base_inventory": {
+      "created_at": "2026-10-14T09:59:10.033969+00:00",
+      "workspace_base_revision": "e67ec560aa7f83363a61a635620e713c66c8642f",
+      "isolated_source": "/tmp/trust-js-checked-call-20261014",
+      "main_source_modified": false,
+      "production_prerequisite": "Immutable UserCallable.realm identity/callee_realm_global main correctness fix; snapshots include current Realm-aware dispatch and Weak planning-global-env pins.",
+      "files": [
+        {
+          "path": "crates/trust-js/src/bytecode.rs",
+          "base_sha256": "56cbc48ff2efb9a684a488392ab5b671bb5172f000635ad7d5b5ef744eecf579",
+          "candidate_sha256": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580",
+          "base_mtime_ns": 1791970397081889108
+        },
+        {
+          "path": "crates/trust-js/src/interpreter.rs",
+          "base_sha256": "3691b47dfee3e5ade2254ee0bd9bdb5648672135b77d08af5646f5092f9798fd",
+          "candidate_sha256": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0",
+          "base_mtime_ns": 1791971449330477756
+        },
+        {
+          "path": "crates/trust-js/src/call_guard_tests.rs",
+          "base_sha256": "6528abe92a73309616c63a56c25ae7e3a4b734bfc7015f1cf1f2f3ef84cc14b9",
+          "candidate_sha256": "f6d65f87f7c5cb6f1ca1fb95cb7e230194757f0c4ee3d4cec887203f8df5493b",
+          "base_mtime_ns": 1791137938139677622
+        }
+      ]
+    },
+    "source_base_inventory_sha256": "dbf74cf1b91d1b4cc34bc94dfe035a6e54b8dafa232cbd91794c0f9e2cb0c6ed",
+    "exact_patch": {
+      "original_path": "/big/Code/trust-js/target/compiler-review-20261014/checked-call-source-v1.patch",
+      "bytes": 14042,
+      "sha256": "fdfa945f8c4795a9e8011074098cc5151d2bf140bf9a4b249d82b2ab52075927",
+      "text": "--- a/crates/trust-js/src/bytecode.rs\n+++ b/crates/trust-js/src/bytecode.rs\n@@ -22730,8 +22730,10 @@\n     // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with\n     // its identity and [[Environment]], never the filling closure's (a local copy; the way is\n     // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).\n-    if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {\n-        let key = Rc::as_ptr(&callee) as usize;\n+    // The callee's operand remains an owner through the whole committed call.\n+    // This observer-free inspection therefore needs no unpack/clone/drop round trip.\n+    let _ = (*sp.sub(argc + 1)).with_object(|callee| {\n+        let key = Rc::as_ptr(callee) as usize;\n         if key != ic.callee {\n             if let crate::value::Callable::User(user) = &callee.borrow().call {\n                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);\n@@ -22739,7 +22741,7 @@\n                 ic.env = Rc::as_ptr(&user.env);\n             }\n         }\n-    }\n+    });\n     // The emitted probe already validated this epoch. Acquire before inline\n     // recompilation, which may now reclaim other inactive native code.\n     let code = crate::jit::cache::lease_raw(ic.code);\n--- a/crates/trust-js/src/interpreter.rs\n+++ b/crates/trust-js/src/interpreter.rs\n@@ -15095,24 +15095,13 @@\n         if env.borrow().under_with {\n             return None;\n         }\n-        if self.multi_realm() {\n-            type ScopeCell = RefCell<Scope>;\n-            let mut cur: *const ScopeCell = Rc::as_ptr(&env);\n-            let root_is_active = 'walk: {\n-                for _ in 0..8 {\n-                    if cur == Rc::as_ptr(&self.global_env) {\n-                        break 'walk true;\n-                    }\n-                    match unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) } {\n-                        Some(p) => cur = p,\n-                        None => break 'walk false,\n-                    }\n-                }\n-                false\n-            };\n-            if !root_is_active {\n-                return None;\n-            }\n+        // PrepareForOrdinaryCall selects immutable [[Realm]], independently of\n+        // [[Environment]] and the function object's mutable prototype. Private\n+        // self-hosted environments have no global parent, and host settings may\n+        // replace a Realm's global environment while ordinary closures survive.\n+        // Cache fills still pin and guard the currently active global environment.\n+        if self.multi_realm() && realm != Rc::as_ptr(&self.global) as usize {\n+            return None;\n         }\n         if !self.class_info.is_empty() && self.class_info.contains_key(&(Rc::as_ptr(o) as usize)) {\n             return None;\n--- a/crates/trust-js/src/call_guard_tests.rs\n+++ b/crates/trust-js/src/call_guard_tests.rs\n@@ -57,6 +57,291 @@\n         assert!(engine.interp.fn_frames.is_empty());\n         engine.interp.gc_collect();\n         assert_eq!(eval(&mut engine, \"1+2\"), \"3\");\n+    }\n+}\n+\n+#[test]\n+#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\n+fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() {\n+    // PrepareForOrdinaryCall uses [[Realm]], not the parent of [[Environment]].\n+    // Self-hosted methods deliberately bind their intrinsics in a parentless record.\n+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n+        let mut engine = Engine::new();\n+        engine.set_tier(tier);\n+        engine.set_tier_threshold(0);\n+        assert_eq!(\n+            eval(\n+                &mut engine,\n+                r#\"\n+            var foreign = $262.createRealm().global;\n+            var mappingMethod = Array.prototype.map;\n+            function callback(x) { return x + 1; }\n+            function mapDrive(values, fn) { return values.map(fn).join(','); }\n+            var result;\n+            for (var n=0; n<12; n++) result = mapDrive([1,,3], callback);\n+            result\n+        \"#\n+            ),\n+            \"2,,4\",\n+            \"{tier:?}\"\n+        );\n+        let method = object(&mut engine, \"mappingMethod\");\n+        let method_record = method.borrow();\n+        let Callable::User(user) = &method_record.call else {\n+            panic!(\"self-hosted map\")\n+        };\n+        assert!(user.func.self_hosted);\n+        assert!(user.env.borrow().parent.is_none());\n+        drop(method_record);\n+        if tier == Tier::Jit {\n+            let driver = chunk(&mut engine, \"mapDrive\");\n+            let entry = driver\n+                .cached_call_for(Rc::as_ptr(&method) as usize)\n+                .expect(\"private self-hosted method fills the native call cache\");\n+            assert_eq!(entry.native, 0);\n+            assert_eq!(entry.realm, Rc::as_ptr(&engine.interp.global) as usize);\n+            assert_eq!(\n+                entry.global_env,\n+                Rc::as_ptr(&engine.interp.global_env) as usize\n+            );\n+            assert!(!entry.code.is_null());\n+            assert!(driver.jit_runs.get() > 0);\n+        }\n+        assert_eq!(\n+            eval(\n+                &mut engine,\n+                r#\"\n+            var calls = 0;\n+            try {\n+                mapDrive([1,2,3], function (x) { calls++; if (x === 2) throw x; return x; });\n+            } catch (error) { result = error + ':' + calls; }\n+            var foreignResult = foreign.Array.prototype.map.call([4], callback);\n+            result + ':' + (Object.getPrototypeOf(foreignResult) === foreign.Array.prototype)\n+                + ':' + (Object.getPrototypeOf(mapDrive([5], callback)) === String.prototype)\n+        \"#\n+            ),\n+            \"2:2:true:true\",\n+            \"{tier:?}\"\n+        );\n+        assert!(engine.interp.fn_frames.is_empty());\n+        engine.interp.gc_collect();\n+    }\n+}\n+\n+#[test]\n+#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\n+fn checked_calls_use_creation_realm_after_host_environment_replacement() {\n+    let mut engine = Engine::new();\n+    engine.set_tier(Tier::Jit);\n+    engine.set_tier_threshold(0);\n+    engine.interp.switch_host_job_context(101);\n+    assert_eq!(\n+        eval(\n+            &mut engine,\n+            r#\"\n+        var foreign = $262.createRealm().global;\n+        function realmLeaf(x) { return x + 3; }\n+        function realmDrive(fn, x) { return fn(x); }\n+        for (var n=0; n<12; n++) realmDrive(realmLeaf, n);\n+        'ready'\n+    \"#\n+        ),\n+        \"ready\"\n+    );\n+    let leaf = object(&mut engine, \"realmLeaf\");\n+    let driver = chunk(&mut engine, \"realmDrive\");\n+    let old_environment = engine.interp.global_env.clone();\n+    let previous = driver\n+        .cached_call_for(Rc::as_ptr(&leaf) as usize)\n+        .expect(\"initial same-Realm cache fill\");\n+    assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);\n+    engine.interp.switch_host_job_context(102);\n+    assert!(!Rc::ptr_eq(&old_environment, &engine.interp.global_env));\n+    assert_eq!(\n+        eval(\n+            &mut engine,\n+            r#\"\n+        Object.setPrototypeOf(realmLeaf, foreign.Function.prototype);\n+        realmDrive(realmLeaf, 5)\n+    \"#\n+        ),\n+        \"8\"\n+    );\n+    let current = driver\n+        .cached_call_for(Rc::as_ptr(&leaf) as usize)\n+        .expect(\"creation Realm remains cacheable with a replaced global environment\");\n+    assert_ne!(current.global_env, previous.global_env);\n+    assert_eq!(\n+        current.global_env,\n+        Rc::as_ptr(&engine.interp.global_env) as usize\n+    );\n+    assert_eq!(current.realm, Rc::as_ptr(&engine.interp.global) as usize);\n+    assert_eq!(\n+        eval(\n+            &mut engine,\n+            r#\"\n+        var proxyCalls = 0;\n+        var proxy = new Proxy(realmLeaf, {apply(f,t,a) { proxyCalls++; return Reflect.apply(f,t,a); }});\n+        class ClassOnly {}\n+        var checks = realmDrive(proxy, 6) === 9 && proxyCalls === 1\n+            && realmDrive(realmLeaf.bind(null), 7) === 10;\n+        try { realmDrive(ClassOnly, 0); checks = false; }\n+        catch (error) { checks = checks && error instanceof TypeError; }\n+        foreign.eval('globalThis.foreignLeaf = function(x) { return [x+4, new TypeError()]; };');\n+        var foreignAnswer = realmDrive(foreign.foreignLeaf, 5);\n+        checks = checks && foreignAnswer[0] === 9\n+            && foreignAnswer[1] instanceof foreign.TypeError\n+            && !(foreignAnswer[1] instanceof TypeError);\n+        var scoped, scope = {marker: 11};\n+        with (scope) { scoped = function() { return marker; }; }\n+        checks = checks && realmDrive(scoped, 0) === 11;\n+        scope.marker = 12;\n+        checks && realmDrive(scoped, 0) === 12\n+    \"#\n+        ),\n+        \"true\"\n+    );\n+    for name in [\"proxy\", \"ClassOnly\", \"scoped\"] {\n+        let target = object(&mut engine, name);\n+        assert!(\n+            driver\n+                .cached_call_for(Rc::as_ptr(&target) as usize)\n+                .is_none(),\n+            \"{name} retains checked generic dispatch\"\n+        );\n+    }\n+    assert!(engine.interp.fn_frames.is_empty());\n+    assert!(engine.interp.pending_tail.is_none());\n+    engine.interp.gc_collect();\n+}\n+\n+#[test]\n+#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\n+fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {\n+    for mode in [1, 2] {\n+        let mut engine = Engine::new();\n+        engine.set_tier(Tier::Jit);\n+        engine.set_tier_threshold(0);\n+        eval(\n+            &mut engine,\n+            r#\"\n+            var foreign = $262.createRealm().global;\n+            var token = {number: 17};\n+            function make(token) {\n+                return function (x) {\n+                    var home = x;\n+                    function capture() { return home; }\n+                    var number = token.number;\n+                    if (x) {\n+                        victim.prototype = null;\n+                        victim = null;\n+                        $262.gc();\n+                        if (x === 2) throw 'owned throw';\n+                    }\n+                    return number + capture();\n+                };\n+            }\n+            var victim = make(token);\n+            function checkedDrive(f, x) { return f((f=null,x)); }\n+            for (var n=0; n<12; n++) checkedDrive(victim, 0);\n+        \"#,\n+        );\n+        let victim = object(&mut engine, \"victim\");\n+        let token = object(&mut engine, \"token\");\n+        let victim_weak = Rc::downgrade(&victim);\n+        let token_weak = Rc::downgrade(&token);\n+        let driver = chunk(&mut engine, \"checkedDrive\");\n+        let entry = driver\n+            .cached_call_for(Rc::as_ptr(&victim) as usize)\n+            .expect(\"capturing callee is cached\");\n+        assert_ne!(\n+            entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,\n+            0,\n+            \"activation-homed callee forces the checked helper rather than direct machine call\"\n+        );\n+        drop((victim, token));\n+        eval(&mut engine, \"token = null\");\n+        let result = eval(\n+            &mut engine,\n+            &format!(\"try {{ checkedDrive(victim,{mode}) }} catch(error) {{ error }}\"),\n+        );\n+        assert_eq!(result, if mode == 1 { \"18\" } else { \"owned throw\" });\n+        engine.interp.gc_collect();\n+        assert_eq!(\n+            victim_weak.strong_count(),\n+            0,\n+            \"callee destructor after mode {mode}\"\n+        );\n+        assert_eq!(\n+            token_weak.strong_count(),\n+            0,\n+            \"captured payload destructor after mode {mode}\"\n+        );\n+        assert!(engine.interp.fn_frames.is_empty());\n+    }\n+}\n+\n+#[test]\n+#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\n+fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments() {\n+    let reads = (0..10)\n+        .map(|n| format!(\"capture{n}\"))\n+        .collect::<Vec<_>>()\n+        .join(\"+\");\n+    let mut expression = format!(\"function (x) {{ return {reads}+x; }}\");\n+    for n in (0..10).rev() {\n+        expression = format!(\"(function () {{ let capture{n}={n}; return {expression}; }})()\");\n+    }\n+    let source = format!(\n+        r#\"\n+        var foreign = $262.createRealm().global;\n+        var deep = {expression};\n+        function deepDrive(f, x) {{ return f(x); }}\n+        var answer;\n+        for(var n=0;n<12;n++) answer = deepDrive(deep, n);\n+        answer\n+    \"#\n+    );\n+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n+        let mut engine = Engine::new();\n+        engine.set_tier(tier);\n+        engine.set_tier_threshold(0);\n+        assert_eq!(eval(&mut engine, &source), \"56\", \"{tier:?}\");\n+        let deep = object(&mut engine, \"deep\");\n+        let mut current = match &deep.borrow().call {\n+            Callable::User(user) => user.env.clone(),\n+            _ => panic!(\"deep user closure\"),\n+        };\n+        let mut depth = 0;\n+        while !Rc::ptr_eq(&current, &engine.interp.global_env) {\n+            let next = current\n+                .borrow()\n+                .parent\n+                .clone()\n+                .expect(\"global root retained\");\n+            current = next;\n+            depth += 1;\n+        }\n+        assert!(\n+            depth > 8,\n+            \"fixture exercises the former bounded parent walk\"\n+        );\n+        if tier == Tier::Jit {\n+            let driver = chunk(&mut engine, \"deepDrive\");\n+            let entry = driver\n+                .cached_call_for(Rc::as_ptr(&deep) as usize)\n+                .expect(\"deep same-Realm closure fills the native call cache\");\n+            assert_eq!(\n+                entry.env,\n+                match &deep.borrow().call {\n+                    Callable::User(user) => Rc::as_ptr(&user.env),\n+                    _ => unreachable!(),\n+                }\n+            );\n+            assert!(driver.jit_runs.get() > 0);\n+        }\n+        assert_eq!(eval(&mut engine, \"$262.gc(); deepDrive(deep, 20)\"), \"65\");\n+        assert!(engine.interp.fn_frames.is_empty());\n     }\n }\n \n"
+    },
+    "exact_modified_functions": [
+      {
+        "path": "crates/trust-js/src/interpreter.rs",
+        "function": "pub(crate) unsafe fn call_jit_fast(",
+        "base_source": "    pub(crate) unsafe fn call_jit_fast(\n        &mut self,\n        callee: &Value,\n        this_slot: *const crate::value::PackedValue,\n        args: *mut crate::value::PackedValue,\n        argc: usize,\n        // The caller's per-site cache + pin map: filled once the full guard set passes, so\n        // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.\n        site: Option<(\n            &crate::bytecode::CallSite,\n            &RefCell<crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>>,\n        )>,\n    ) -> Option<Result<Value, Abrupt>> {\n        // Eligibility belongs to the callee, not to all objects in the Agent. Proxy\n        // [[Call]] must dispatch its traps, but a separate ordinary function still has the\n        // same [[Call]] after any number of unrelated proxies have been created/revoked.\n        // The immutable Callable and identity pin preserve this proof on cached hits.\n        let Value::Obj(o) = callee else { return None };\n        let object = o.borrow();\n        let (func, env, realm) = match &object.call {\n            Callable::User(user) if object.ic_plain.get() => {\n                (user.func.clone(), user.env.clone(), user.realm)\n            }\n            _ => return None,\n        };\n        drop(object);\n        // A closure under a `with` scope stays on the tree-walker (see `Scope::under_with`):\n        // the VM's free-name ops re-resolve at execution time, which is observably wrong when\n        // a with-object binding changes between the spec's reference resolution and its use.\n        if env.borrow().under_with {\n            return None;\n        }\n        if self.multi_realm() {\n            type ScopeCell = RefCell<Scope>;\n            let mut cur: *const ScopeCell = Rc::as_ptr(&env);\n            let root_is_active = 'walk: {\n                for _ in 0..8 {\n                    if cur == Rc::as_ptr(&self.global_env) {\n                        break 'walk true;\n                    }\n                    match unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) } {\n                        Some(p) => cur = p,\n                        None => break 'walk false,\n                    }\n                }\n                false\n            };\n            if !root_is_active {\n                return None;\n            }\n        }\n        if !self.class_info.is_empty() && self.class_info.contains_key(&(Rc::as_ptr(o) as usize)) {\n            return None;\n        }\n        // Not yet tiered / didn't compile / no machine code \u2192 generic (which counts calls up).\n        // Function's chunk handles remain set-once, but native residency is\n        // reclaimable. Hold the owned code lease through GC and the whole call.\n        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {\n            Some(Some(c)) => c,\n            _ => return None,\n        };\n        let code = match chunk.jit.get() {\n            Some(Some(c)) => c,\n            _ => return None,\n        };\n        // A prepared body must first run FunctionDeclarationInstantiation. Its environment is\n        // not the closure environment supplied by this moved-frame shortcut.\n        if chunk.prepared_entry || chunk.jit_is_resumable() {\n            return None;\n        }\n        // A callee that needs an activation env (captured locals / lexical this) is cacheable\n        // too: its committed path enters through `jit::run` (which builds the activation)\n        // instead of `run_moved`. IC entries carry direct bit 4; bits 0-3 stay clear, so the\n        // machine-code direct sequence's first gate routes them to the helper.\n        let needs_env = !chunk.jit_no_activation();\n        // Every guard passed: remember the callee at this site so the next call takes the\n        // one-compare cached path. The Weak pin makes the raw identity compare ABA-safe (the\n        // address can't be recycled while pinned); a megamorphic site stops refilling at the cap\n        // instead of growing the pin list without bound.\n        if let Some((cs, pins)) = site {\n            let key = Rc::as_ptr(o) as usize;\n            let mut p = pins.borrow_mut();\n            if p.len() < 4096 || p.contains_key(&key) {\n                p.entry(key).or_insert_with(|| Rc::downgrade(o));\n                // Pin the active global scope's address too: the cached same-realm proof\n                // compares it raw, so it must never be recycled while cached (realms already\n                // outlive their caches in practice; this makes it airtight). Fills are rare, so\n                // the linear dedup scan (bounded by realm count) doesn't matter.\n                if !self\n                    .global_env_pins\n                    .iter()\n                    .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))\n                {\n                    let genv = Rc::downgrade(&self.global_env);\n                    self.global_env_pins.push(genv);\n                }\n                let (n_params, n_slots) = chunk.jit_frame();\n                if n_params <= u16::MAX as usize && n_slots <= u16::MAX as usize {\n                    let evicted = cs.fill(\n                        crate::bytecode::CallIc {\n                            callee: key,\n                            env: Rc::as_ptr(&env),\n                            chunk: chunk as *const Rc<crate::bytecode::Chunk>,\n                            code: Rc::as_ptr(&code),\n                            global_env: Rc::as_ptr(&self.global_env) as usize,\n                            strict: func.is_strict,\n                            uses_this: chunk.needs_frame_this(),\n                            n_params: n_params as u16,\n                            n_slots: n_slots as u16,\n                            direct: (if needs_env {\n                                crate::bytecode::CALL_IC_NEEDS_ENV\n                            } else {\n                                chunk.jit_direct_flags(&code)\n                                    | (((chunk.inline_attempted.get() || func.code2.get().is_some())\n                                        as u8)\n                                        << 2)\n                            }) | if func.is_arrow {\n                                crate::bytecode::CALL_IC_LEXICAL_THIS\n                            } else {\n                                0\n                            },\n                            func: Rc::as_ptr(&func),\n                            epoch: crate::bytecode::CALL_IC_EPOCH\n                                .load(std::sync::atomic::Ordering::Relaxed),\n                            chunk_raw: Rc::as_ptr(chunk),\n                            code_mem: code.mem_ptr(),\n                            pc_offs_ptr: code.pc_offsets_ptr(),\n                            native: 0,\n                            intrinsic: 0,\n                            realm,\n                        },\n                        Some(&func),\n                    );\n                    if let Some(evicted) = evicted {\n                        let pin = p.get(&evicted.callee).expect(\"call entry has an ABA pin\");\n                        self.call_overflow.insert(evicted, pin.clone());\n                    }\n                }\n            }\n        }\n        // --- committed: from here the arguments and `*this_slot` are ours ---\n        self.depth += 1;\n        if execution_stack_exhausted(self.depth) {\n            self.depth -= 1;\n            // Ownership contract: consume the arguments and `this` even on the early throw.\n            unsafe {\n                for k in 0..argc {\n                    std::ptr::drop_in_place(args.add(k));\n                }\n                std::ptr::drop_in_place(this_slot.cast_mut());\n            }\n            return Some(Err(\n                self.throw(\"RangeError\", \"Maximum call stack size exceeded\")\n            ));\n        }\n        if let Err(e) = self.gc_check_amortized() {\n            self.depth -= 1;\n            unsafe {\n                for k in 0..argc {\n                    std::ptr::drop_in_place(args.add(k));\n                }\n                std::ptr::drop_in_place(this_slot.cast_mut());\n            }\n            return Some(Err(e));\n        }\n        let saved_ctor = std::mem::replace(&mut self.constructing, false);\n        let saved_nt = if func.is_arrow {\n            self.new_target.clone()\n        } else {\n            std::mem::replace(&mut self.new_target, Value::Undefined)\n        };\n        self.fn_frames.push(FnFrame {\n            fn_ptr: Rc::as_ptr(o) as usize,\n            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),\n            strict: func.is_strict,\n            construct: false,\n            extra: None,\n        });\n        let this_val = self.bind_compiled_this(\n            &func,\n            chunk,\n            unsafe { this_slot.read() }.into_value(),\n            false,\n        );\n        // A successful cache fill is a native entry just like the next cache hit. Its\n        // original code lease stays live even if the checkpoint invalidates the fresh IC.\n        self.note_native_entry(\n            Rc::as_ptr(&func),\n            chunk,\n            realm,\n            Rc::as_ptr(&self.global_env) as usize,\n        );\n        let mut r = with_execution_stack(self.depth, || {\n            if needs_env {\n                unsafe {\n                    crate::jit::run_moved_env(\n                        self,\n                        chunk,\n                        &code,\n                        &env as *const Env,\n                        this_val,\n                        args,\n                        argc,\n                        chunk.jit_frame(),\n                    )\n                }\n            } else {\n                unsafe {\n                    crate::jit::run_moved(\n                        self,\n                        chunk,\n                        &code,\n                        &env as *const Env,\n                        this_val,\n                        args,\n                        argc,\n                        chunk.jit_frame(),\n                    )\n                }\n            }\n            .map(PackedValue::into_value)\n        });\n        self.pop_fn_frame();\n        self.constructing = saved_ctor;\n        self.new_target = saved_nt;\n        // Proper-tail-call trampoline, exactly like `call`.\n        while r.is_ok() {\n            match self.pending_tail.take() {\n                Some(bx) => {\n                    let (f, t, a) = *bx;\n                    if let Err(e) = self.gc_check() {\n                        r = Err(e);\n                        break;\n                    }\n                    r = self.call_tail(f, t, &a);\n                }\n                None => break,\n            }\n        }\n        self.depth -= 1;\n        Some(r)\n    }\n",
+        "candidate_source": "    pub(crate) unsafe fn call_jit_fast(\n        &mut self,\n        callee: &Value,\n        this_slot: *const crate::value::PackedValue,\n        args: *mut crate::value::PackedValue,\n        argc: usize,\n        // The caller's per-site cache + pin map: filled once the full guard set passes, so\n        // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.\n        site: Option<(\n            &crate::bytecode::CallSite,\n            &RefCell<crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>>,\n        )>,\n    ) -> Option<Result<Value, Abrupt>> {\n        // Eligibility belongs to the callee, not to all objects in the Agent. Proxy\n        // [[Call]] must dispatch its traps, but a separate ordinary function still has the\n        // same [[Call]] after any number of unrelated proxies have been created/revoked.\n        // The immutable Callable and identity pin preserve this proof on cached hits.\n        let Value::Obj(o) = callee else { return None };\n        let object = o.borrow();\n        let (func, env, realm) = match &object.call {\n            Callable::User(user) if object.ic_plain.get() => {\n                (user.func.clone(), user.env.clone(), user.realm)\n            }\n            _ => return None,\n        };\n        drop(object);\n        // A closure under a `with` scope stays on the tree-walker (see `Scope::under_with`):\n        // the VM's free-name ops re-resolve at execution time, which is observably wrong when\n        // a with-object binding changes between the spec's reference resolution and its use.\n        if env.borrow().under_with {\n            return None;\n        }\n        // PrepareForOrdinaryCall selects immutable [[Realm]], independently of\n        // [[Environment]] and the function object's mutable prototype. Private\n        // self-hosted environments have no global parent, and host settings may\n        // replace a Realm's global environment while ordinary closures survive.\n        // Cache fills still pin and guard the currently active global environment.\n        if self.multi_realm() && realm != Rc::as_ptr(&self.global) as usize {\n            return None;\n        }\n        if !self.class_info.is_empty() && self.class_info.contains_key(&(Rc::as_ptr(o) as usize)) {\n            return None;\n        }\n        // Not yet tiered / didn't compile / no machine code \u2192 generic (which counts calls up).\n        // Function's chunk handles remain set-once, but native residency is\n        // reclaimable. Hold the owned code lease through GC and the whole call.\n        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {\n            Some(Some(c)) => c,\n            _ => return None,\n        };\n        let code = match chunk.jit.get() {\n            Some(Some(c)) => c,\n            _ => return None,\n        };\n        // A prepared body must first run FunctionDeclarationInstantiation. Its environment is\n        // not the closure environment supplied by this moved-frame shortcut.\n        if chunk.prepared_entry || chunk.jit_is_resumable() {\n            return None;\n        }\n        // A callee that needs an activation env (captured locals / lexical this) is cacheable\n        // too: its committed path enters through `jit::run` (which builds the activation)\n        // instead of `run_moved`. IC entries carry direct bit 4; bits 0-3 stay clear, so the\n        // machine-code direct sequence's first gate routes them to the helper.\n        let needs_env = !chunk.jit_no_activation();\n        // Every guard passed: remember the callee at this site so the next call takes the\n        // one-compare cached path. The Weak pin makes the raw identity compare ABA-safe (the\n        // address can't be recycled while pinned); a megamorphic site stops refilling at the cap\n        // instead of growing the pin list without bound.\n        if let Some((cs, pins)) = site {\n            let key = Rc::as_ptr(o) as usize;\n            let mut p = pins.borrow_mut();\n            if p.len() < 4096 || p.contains_key(&key) {\n                p.entry(key).or_insert_with(|| Rc::downgrade(o));\n                // Pin the active global scope's address too: the cached same-realm proof\n                // compares it raw, so it must never be recycled while cached (realms already\n                // outlive their caches in practice; this makes it airtight). Fills are rare, so\n                // the linear dedup scan (bounded by realm count) doesn't matter.\n                if !self\n                    .global_env_pins\n                    .iter()\n                    .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))\n                {\n                    let genv = Rc::downgrade(&self.global_env);\n                    self.global_env_pins.push(genv);\n                }\n                let (n_params, n_slots) = chunk.jit_frame();\n                if n_params <= u16::MAX as usize && n_slots <= u16::MAX as usize {\n                    let evicted = cs.fill(\n                        crate::bytecode::CallIc {\n                            callee: key,\n                            env: Rc::as_ptr(&env),\n                            chunk: chunk as *const Rc<crate::bytecode::Chunk>,\n                            code: Rc::as_ptr(&code),\n                            global_env: Rc::as_ptr(&self.global_env) as usize,\n                            strict: func.is_strict,\n                            uses_this: chunk.needs_frame_this(),\n                            n_params: n_params as u16,\n                            n_slots: n_slots as u16,\n                            direct: (if needs_env {\n                                crate::bytecode::CALL_IC_NEEDS_ENV\n                            } else {\n                                chunk.jit_direct_flags(&code)\n                                    | (((chunk.inline_attempted.get() || func.code2.get().is_some())\n                                        as u8)\n                                        << 2)\n                            }) | if func.is_arrow {\n                                crate::bytecode::CALL_IC_LEXICAL_THIS\n                            } else {\n                                0\n                            },\n                            func: Rc::as_ptr(&func),\n                            epoch: crate::bytecode::CALL_IC_EPOCH\n                                .load(std::sync::atomic::Ordering::Relaxed),\n                            chunk_raw: Rc::as_ptr(chunk),\n                            code_mem: code.mem_ptr(),\n                            pc_offs_ptr: code.pc_offsets_ptr(),\n                            native: 0,\n                            intrinsic: 0,\n                            realm,\n                        },\n                        Some(&func),\n                    );\n                    if let Some(evicted) = evicted {\n                        let pin = p.get(&evicted.callee).expect(\"call entry has an ABA pin\");\n                        self.call_overflow.insert(evicted, pin.clone());\n                    }\n                }\n            }\n        }\n        // --- committed: from here the arguments and `*this_slot` are ours ---\n        self.depth += 1;\n        if execution_stack_exhausted(self.depth) {\n            self.depth -= 1;\n            // Ownership contract: consume the arguments and `this` even on the early throw.\n            unsafe {\n                for k in 0..argc {\n                    std::ptr::drop_in_place(args.add(k));\n                }\n                std::ptr::drop_in_place(this_slot.cast_mut());\n            }\n            return Some(Err(\n                self.throw(\"RangeError\", \"Maximum call stack size exceeded\")\n            ));\n        }\n        if let Err(e) = self.gc_check_amortized() {\n            self.depth -= 1;\n            unsafe {\n                for k in 0..argc {\n                    std::ptr::drop_in_place(args.add(k));\n                }\n                std::ptr::drop_in_place(this_slot.cast_mut());\n            }\n            return Some(Err(e));\n        }\n        let saved_ctor = std::mem::replace(&mut self.constructing, false);\n        let saved_nt = if func.is_arrow {\n            self.new_target.clone()\n        } else {\n            std::mem::replace(&mut self.new_target, Value::Undefined)\n        };\n        self.fn_frames.push(FnFrame {\n            fn_ptr: Rc::as_ptr(o) as usize,\n            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),\n            strict: func.is_strict,\n            construct: false,\n            extra: None,\n        });\n        let this_val = self.bind_compiled_this(\n            &func,\n            chunk,\n            unsafe { this_slot.read() }.into_value(),\n            false,\n        );\n        // A successful cache fill is a native entry just like the next cache hit. Its\n        // original code lease stays live even if the checkpoint invalidates the fresh IC.\n        self.note_native_entry(\n            Rc::as_ptr(&func),\n            chunk,\n            realm,\n            Rc::as_ptr(&self.global_env) as usize,\n        );\n        let mut r = with_execution_stack(self.depth, || {\n            if needs_env {\n                unsafe {\n                    crate::jit::run_moved_env(\n                        self,\n                        chunk,\n                        &code,\n                        &env as *const Env,\n                        this_val,\n                        args,\n                        argc,\n                        chunk.jit_frame(),\n                    )\n                }\n            } else {\n                unsafe {\n                    crate::jit::run_moved(\n                        self,\n                        chunk,\n                        &code,\n                        &env as *const Env,\n                        this_val,\n                        args,\n                        argc,\n                        chunk.jit_frame(),\n                    )\n                }\n            }\n            .map(PackedValue::into_value)\n        });\n        self.pop_fn_frame();\n        self.constructing = saved_ctor;\n        self.new_target = saved_nt;\n        // Proper-tail-call trampoline, exactly like `call`.\n        while r.is_ok() {\n            match self.pending_tail.take() {\n                Some(bx) => {\n                    let (f, t, a) = *bx;\n                    if let Err(e) = self.gc_check() {\n                        r = Err(e);\n                        break;\n                    }\n                    r = self.call_tail(f, t, &a);\n                }\n                None => break,\n            }\n        }\n        self.depth -= 1;\n        Some(r)\n    }\n",
+        "candidate_excerpt_sha256": "16dac5b3762df9f12e9bde6faf0f76c4c821af2c460cff5423f740acc55d1349",
+        "integrated_main_excerpt_matches": true,
+        "isolated_full_file_sha256": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0",
+        "integrated_main_full_file_sha256": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0"
+      },
+      {
+        "path": "crates/trust-js/src/bytecode.rs",
+        "function": "unsafe fn jit_call_hit_inner(",
+        "base_source": "unsafe fn jit_call_hit_inner(\n    ctx: *mut crate::jit::JitCtx,\n    pc: u32,\n    mut sp: *mut PackedValue,\n) -> crate::jit::SpFlag {\n    let ctx = &mut *ctx;\n    let way = (pc >> 16) as usize & (CALL_IC_WAYS - 1);\n    let pc = pc & 0xFFFF;\n    jit_opstat(ctx, pc);\n    let i = &mut *ctx.interp;\n    let chunk = &*ctx.chunk;\n    // Detailed profiling disables the inline probe at compile time, but keep this helper\n    // semantically complete if a previously emitted chunk reaches it after instrumentation is\n    // enabled. The profiled path must observe before dispatch and must not consume moved slots.\n    if chunk.feedback.detailed_enabled() {\n        return match jit_call_inner(ctx, pc, &mut sp) {\n            Ok(()) => crate::jit::SpFlag { sp, flag: 0 },\n            Err(ab) => {\n                ctx.error = Some(ab);\n                crate::jit::SpFlag { sp, flag: 1 }\n            }\n        };\n    }\n    let (argc, c, with_this) = match chunk.ops[pc as usize] {\n        Op::CallWithThis(argc, c) => (argc as usize, c, true),\n        Op::Call(argc, c) => (argc as usize, c, false),\n        _ => unreachable!(\"jit_call_hit emitted only for call ops\"),\n    };\n    let entry = &chunk.call_caches[c as usize].entries[way];\n    // A native entry needs two words of the way: read them in place. Copying the whole entry\n    // first (a dozen words through vector stores) made every native call wait for the copy.\n    let (native, intrinsic) = {\n        // SAFETY: the Cell holds plain-old-data and nothing writes it during this read.\n        let entry = unsafe { &*entry.as_ptr() };\n        (entry.native, entry.intrinsic)\n    };\n    if native != 0 {\n        return jit_call_hit_native(ctx, sp, argc, with_this, native, intrinsic, entry);\n    }\n    let mut ic = entry.get();\n    // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this\n    // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with\n    // its identity and [[Environment]], never the filling closure's (a local copy; the way is\n    // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).\n    if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {\n        let key = Rc::as_ptr(&callee) as usize;\n        if key != ic.callee {\n            if let crate::value::Callable::User(user) = &callee.borrow().call {\n                debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);\n                ic.callee = key;\n                ic.env = Rc::as_ptr(&user.env);\n            }\n        }\n    }\n    // The emitted probe already validated this epoch. Acquire before inline\n    // recompilation, which may now reclaim other inactive native code.\n    let code = crate::jit::cache::lease_raw(ic.code);\n    jit_callstat(i, ctx, &ic, argc, with_this, sp);\n    let chunk_ref = &*ic.chunk;\n    let runs = chunk_ref.jit_runs.get().saturating_add(1);\n    chunk_ref.jit_runs.set(runs);\n    if chunk_ref.inline_retry_due(runs) {\n        i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);\n    }\n    let args_ptr = sp.sub(argc);\n    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));\n    let this_slot: *const PackedValue = if with_this {\n        sp.sub(argc + 2)\n    } else {\n        &raw mut *undef as *const PackedValue\n    };\n    let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);\n    // Arguments and `this` were moved; pop them virtually and drop only the callee slot\n    // (same ownership story as jit_call_inner's Some arm).\n    sp = args_ptr.sub(1);\n    match sp.read().into_value() {\n        Value::Obj(o) => {\n            if Rc::strong_count(&o) > 1 {\n                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };\n            } else {\n                drop(o);\n            }\n        }\n        other => drop(other),\n    }\n    if with_this {\n        sp = sp.sub(1); // `this` was consumed (moved) by the callee \u2014 skip, don't drop\n    }\n    match r {\n        Ok(v) => {\n            sp.write(PackedValue::pack(v));\n            crate::jit::SpFlag {\n                sp: sp.add(1),\n                flag: 0,\n            }\n        }\n        Err(ab) => {\n            ctx.error = Some(ab);\n            crate::jit::SpFlag { sp, flag: 1 }\n        }\n    }\n}\n",
+        "candidate_source": "unsafe fn jit_call_hit_inner(\n    ctx: *mut crate::jit::JitCtx,\n    pc: u32,\n    mut sp: *mut PackedValue,\n) -> crate::jit::SpFlag {\n    let ctx = &mut *ctx;\n    let way = (pc >> 16) as usize & (CALL_IC_WAYS - 1);\n    let pc = pc & 0xFFFF;\n    jit_opstat(ctx, pc);\n    let i = &mut *ctx.interp;\n    let chunk = &*ctx.chunk;\n    // Detailed profiling disables the inline probe at compile time, but keep this helper\n    // semantically complete if a previously emitted chunk reaches it after instrumentation is\n    // enabled. The profiled path must observe before dispatch and must not consume moved slots.\n    if chunk.feedback.detailed_enabled() {\n        return match jit_call_inner(ctx, pc, &mut sp) {\n            Ok(()) => crate::jit::SpFlag { sp, flag: 0 },\n            Err(ab) => {\n                ctx.error = Some(ab);\n                crate::jit::SpFlag { sp, flag: 1 }\n            }\n        };\n    }\n    let (argc, c, with_this) = match chunk.ops[pc as usize] {\n        Op::CallWithThis(argc, c) => (argc as usize, c, true),\n        Op::Call(argc, c) => (argc as usize, c, false),\n        _ => unreachable!(\"jit_call_hit emitted only for call ops\"),\n    };\n    let entry = &chunk.call_caches[c as usize].entries[way];\n    // A native entry needs two words of the way: read them in place. Copying the whole entry\n    // first (a dozen words through vector stores) made every native call wait for the copy.\n    let (native, intrinsic) = {\n        // SAFETY: the Cell holds plain-old-data and nothing writes it during this read.\n        let entry = unsafe { &*entry.as_ptr() };\n        (entry.native, entry.intrinsic)\n    };\n    if native != 0 {\n        return jit_call_hit_native(ctx, sp, argc, with_this, native, intrinsic, entry);\n    }\n    let mut ic = entry.get();\n    // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this\n    // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with\n    // its identity and [[Environment]], never the filling closure's (a local copy; the way is\n    // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).\n    // The callee's operand remains an owner through the whole committed call.\n    // This observer-free inspection therefore needs no unpack/clone/drop round trip.\n    let _ = (*sp.sub(argc + 1)).with_object(|callee| {\n        let key = Rc::as_ptr(callee) as usize;\n        if key != ic.callee {\n            if let crate::value::Callable::User(user) = &callee.borrow().call {\n                debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);\n                ic.callee = key;\n                ic.env = Rc::as_ptr(&user.env);\n            }\n        }\n    });\n    // The emitted probe already validated this epoch. Acquire before inline\n    // recompilation, which may now reclaim other inactive native code.\n    let code = crate::jit::cache::lease_raw(ic.code);\n    jit_callstat(i, ctx, &ic, argc, with_this, sp);\n    let chunk_ref = &*ic.chunk;\n    let runs = chunk_ref.jit_runs.get().saturating_add(1);\n    chunk_ref.jit_runs.set(runs);\n    if chunk_ref.inline_retry_due(runs) {\n        i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);\n    }\n    let args_ptr = sp.sub(argc);\n    let mut undef = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));\n    let this_slot: *const PackedValue = if with_this {\n        sp.sub(argc + 2)\n    } else {\n        &raw mut *undef as *const PackedValue\n    };\n    let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);\n    // Arguments and `this` were moved; pop them virtually and drop only the callee slot\n    // (same ownership story as jit_call_inner's Some arm).\n    sp = args_ptr.sub(1);\n    match sp.read().into_value() {\n        Value::Obj(o) => {\n            if Rc::strong_count(&o) > 1 {\n                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };\n            } else {\n                drop(o);\n            }\n        }\n        other => drop(other),\n    }\n    if with_this {\n        sp = sp.sub(1); // `this` was consumed (moved) by the callee \u2014 skip, don't drop\n    }\n    match r {\n        Ok(v) => {\n            sp.write(PackedValue::pack(v));\n            crate::jit::SpFlag {\n                sp: sp.add(1),\n                flag: 0,\n            }\n        }\n        Err(ab) => {\n            ctx.error = Some(ab);\n            crate::jit::SpFlag { sp, flag: 1 }\n        }\n    }\n}\n",
+        "candidate_excerpt_sha256": "da583971e13b29ef25169ccf1de36a36a9686bf0c14f76ef267a72795e2fe861",
+        "integrated_main_excerpt_matches": true,
+        "isolated_full_file_sha256": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580",
+        "integrated_main_full_file_sha256": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580"
+      }
+    ],
+    "exact_full_test_module": {
+      "original_path": "/tmp/trust-js-checked-call-20261014/crates/trust-js/src/call_guard_tests.rs",
+      "bytes": 23576,
+      "sha256": "f6d65f87f7c5cb6f1ca1fb95cb7e230194757f0c4ee3d4cec887203f8df5493b",
+      "text": "//! Callee-local fast paths in Agents containing proxies. ECMA-262 snapshot e28783d5:\n//! Proxy [[Call]] / [[Construct]] (spec.html:16541,16568), Object.hasOwn (31428).\n\nuse std::rc::Rc;\n\nuse crate::bytecode::{Chunk, Tier};\nuse crate::value::{Callable, Gc, Value};\nuse crate::{Completion, Engine};\n\nfn eval(engine: &mut Engine, source: &str) -> String {\n    match engine.eval(source, false).expect(\"guard fixture parses\") {\n        Completion::Value(value) => value,\n        Completion::Throw { name, message } => panic!(\"{name}: {message}\\n{source}\"),\n    }\n}\n\nfn object(engine: &mut Engine, name: &str) -> Gc {\n    let env = engine.interp.global_env.clone();\n    let Value::Obj(object) = engine\n        .interp\n        .get_var(name, &env)\n        .unwrap_or_else(|_| panic!(\"missing {name}\"))\n    else {\n        panic!(\"{name} is not an object\")\n    };\n    object\n}\n\nfn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {\n    let object = object(engine, name);\n    let object = object.borrow();\n    let Callable::User(user) = &object.call else {\n        panic!(\"{name} is not a user function\")\n    };\n    let chunk = user\n        .func\n        .code2\n        .get()\n        .or_else(|| user.func.code.get())\n        .and_then(Option::as_ref)\n        .expect(\"compiled caller\")\n        .clone();\n    assert!(\n        chunk.jit.get().is_some_and(|code| code.is_some()),\n        \"{name} was not native\"\n    );\n    chunk\n}\n\nfn check(source: &str, expected: &str) {\n    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n        let mut engine = Engine::new();\n        engine.set_tier(tier);\n        engine.set_tier_threshold(0);\n        assert_eq!(eval(&mut engine, source), expected, \"{tier:?}\");\n        assert!(engine.interp.pending_tail.is_none());\n        assert!(engine.interp.fn_frames.is_empty());\n        engine.interp.gc_collect();\n        assert_eq!(eval(&mut engine, \"1+2\"), \"3\");\n    }\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() {\n    // PrepareForOrdinaryCall uses [[Realm]], not the parent of [[Environment]].\n    // Self-hosted methods deliberately bind their intrinsics in a parentless record.\n    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n        let mut engine = Engine::new();\n        engine.set_tier(tier);\n        engine.set_tier_threshold(0);\n        assert_eq!(\n            eval(\n                &mut engine,\n                r#\"\n            var foreign = $262.createRealm().global;\n            var mappingMethod = Array.prototype.map;\n            function callback(x) { return x + 1; }\n            function mapDrive(values, fn) { return values.map(fn).join(','); }\n            var result;\n            for (var n=0; n<12; n++) result = mapDrive([1,,3], callback);\n            result\n        \"#\n            ),\n            \"2,,4\",\n            \"{tier:?}\"\n        );\n        let method = object(&mut engine, \"mappingMethod\");\n        let method_record = method.borrow();\n        let Callable::User(user) = &method_record.call else {\n            panic!(\"self-hosted map\")\n        };\n        assert!(user.func.self_hosted);\n        assert!(user.env.borrow().parent.is_none());\n        drop(method_record);\n        if tier == Tier::Jit {\n            let driver = chunk(&mut engine, \"mapDrive\");\n            let entry = driver\n                .cached_call_for(Rc::as_ptr(&method) as usize)\n                .expect(\"private self-hosted method fills the native call cache\");\n            assert_eq!(entry.native, 0);\n            assert_eq!(entry.realm, Rc::as_ptr(&engine.interp.global) as usize);\n            assert_eq!(\n                entry.global_env,\n                Rc::as_ptr(&engine.interp.global_env) as usize\n            );\n            assert!(!entry.code.is_null());\n            assert!(driver.jit_runs.get() > 0);\n        }\n        assert_eq!(\n            eval(\n                &mut engine,\n                r#\"\n            var calls = 0;\n            try {\n                mapDrive([1,2,3], function (x) { calls++; if (x === 2) throw x; return x; });\n            } catch (error) { result = error + ':' + calls; }\n            var foreignResult = foreign.Array.prototype.map.call([4], callback);\n            result + ':' + (Object.getPrototypeOf(foreignResult) === foreign.Array.prototype)\n                + ':' + (Object.getPrototypeOf(mapDrive([5], callback)) === String.prototype)\n        \"#\n            ),\n            \"2:2:true:true\",\n            \"{tier:?}\"\n        );\n        assert!(engine.interp.fn_frames.is_empty());\n        engine.interp.gc_collect();\n    }\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn checked_calls_use_creation_realm_after_host_environment_replacement() {\n    let mut engine = Engine::new();\n    engine.set_tier(Tier::Jit);\n    engine.set_tier_threshold(0);\n    engine.interp.switch_host_job_context(101);\n    assert_eq!(\n        eval(\n            &mut engine,\n            r#\"\n        var foreign = $262.createRealm().global;\n        function realmLeaf(x) { return x + 3; }\n        function realmDrive(fn, x) { return fn(x); }\n        for (var n=0; n<12; n++) realmDrive(realmLeaf, n);\n        'ready'\n    \"#\n        ),\n        \"ready\"\n    );\n    let leaf = object(&mut engine, \"realmLeaf\");\n    let driver = chunk(&mut engine, \"realmDrive\");\n    let old_environment = engine.interp.global_env.clone();\n    let previous = driver\n        .cached_call_for(Rc::as_ptr(&leaf) as usize)\n        .expect(\"initial same-Realm cache fill\");\n    assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);\n    engine.interp.switch_host_job_context(102);\n    assert!(!Rc::ptr_eq(&old_environment, &engine.interp.global_env));\n    assert_eq!(\n        eval(\n            &mut engine,\n            r#\"\n        Object.setPrototypeOf(realmLeaf, foreign.Function.prototype);\n        realmDrive(realmLeaf, 5)\n    \"#\n        ),\n        \"8\"\n    );\n    let current = driver\n        .cached_call_for(Rc::as_ptr(&leaf) as usize)\n        .expect(\"creation Realm remains cacheable with a replaced global environment\");\n    assert_ne!(current.global_env, previous.global_env);\n    assert_eq!(\n        current.global_env,\n        Rc::as_ptr(&engine.interp.global_env) as usize\n    );\n    assert_eq!(current.realm, Rc::as_ptr(&engine.interp.global) as usize);\n    assert_eq!(\n        eval(\n            &mut engine,\n            r#\"\n        var proxyCalls = 0;\n        var proxy = new Proxy(realmLeaf, {apply(f,t,a) { proxyCalls++; return Reflect.apply(f,t,a); }});\n        class ClassOnly {}\n        var checks = realmDrive(proxy, 6) === 9 && proxyCalls === 1\n            && realmDrive(realmLeaf.bind(null), 7) === 10;\n        try { realmDrive(ClassOnly, 0); checks = false; }\n        catch (error) { checks = checks && error instanceof TypeError; }\n        foreign.eval('globalThis.foreignLeaf = function(x) { return [x+4, new TypeError()]; };');\n        var foreignAnswer = realmDrive(foreign.foreignLeaf, 5);\n        checks = checks && foreignAnswer[0] === 9\n            && foreignAnswer[1] instanceof foreign.TypeError\n            && !(foreignAnswer[1] instanceof TypeError);\n        var scoped, scope = {marker: 11};\n        with (scope) { scoped = function() { return marker; }; }\n        checks = checks && realmDrive(scoped, 0) === 11;\n        scope.marker = 12;\n        checks && realmDrive(scoped, 0) === 12\n    \"#\n        ),\n        \"true\"\n    );\n    for name in [\"proxy\", \"ClassOnly\", \"scoped\"] {\n        let target = object(&mut engine, name);\n        assert!(\n            driver\n                .cached_call_for(Rc::as_ptr(&target) as usize)\n                .is_none(),\n            \"{name} retains checked generic dispatch\"\n        );\n    }\n    assert!(engine.interp.fn_frames.is_empty());\n    assert!(engine.interp.pending_tail.is_none());\n    engine.interp.gc_collect();\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {\n    for mode in [1, 2] {\n        let mut engine = Engine::new();\n        engine.set_tier(Tier::Jit);\n        engine.set_tier_threshold(0);\n        eval(\n            &mut engine,\n            r#\"\n            var foreign = $262.createRealm().global;\n            var token = {number: 17};\n            function make(token) {\n                return function (x) {\n                    var home = x;\n                    function capture() { return home; }\n                    var number = token.number;\n                    if (x) {\n                        victim.prototype = null;\n                        victim = null;\n                        $262.gc();\n                        if (x === 2) throw 'owned throw';\n                    }\n                    return number + capture();\n                };\n            }\n            var victim = make(token);\n            function checkedDrive(f, x) { return f((f=null,x)); }\n            for (var n=0; n<12; n++) checkedDrive(victim, 0);\n        \"#,\n        );\n        let victim = object(&mut engine, \"victim\");\n        let token = object(&mut engine, \"token\");\n        let victim_weak = Rc::downgrade(&victim);\n        let token_weak = Rc::downgrade(&token);\n        let driver = chunk(&mut engine, \"checkedDrive\");\n        let entry = driver\n            .cached_call_for(Rc::as_ptr(&victim) as usize)\n            .expect(\"capturing callee is cached\");\n        assert_ne!(\n            entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,\n            0,\n            \"activation-homed callee forces the checked helper rather than direct machine call\"\n        );\n        drop((victim, token));\n        eval(&mut engine, \"token = null\");\n        let result = eval(\n            &mut engine,\n            &format!(\"try {{ checkedDrive(victim,{mode}) }} catch(error) {{ error }}\"),\n        );\n        assert_eq!(result, if mode == 1 { \"18\" } else { \"owned throw\" });\n        engine.interp.gc_collect();\n        assert_eq!(\n            victim_weak.strong_count(),\n            0,\n            \"callee destructor after mode {mode}\"\n        );\n        assert_eq!(\n            token_weak.strong_count(),\n            0,\n            \"captured payload destructor after mode {mode}\"\n        );\n        assert!(engine.interp.fn_frames.is_empty());\n    }\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn checked_calls_cache_deep_same_realm_closures_without_flattening_environments() {\n    let reads = (0..10)\n        .map(|n| format!(\"capture{n}\"))\n        .collect::<Vec<_>>()\n        .join(\"+\");\n    let mut expression = format!(\"function (x) {{ return {reads}+x; }}\");\n    for n in (0..10).rev() {\n        expression = format!(\"(function () {{ let capture{n}={n}; return {expression}; }})()\");\n    }\n    let source = format!(\n        r#\"\n        var foreign = $262.createRealm().global;\n        var deep = {expression};\n        function deepDrive(f, x) {{ return f(x); }}\n        var answer;\n        for(var n=0;n<12;n++) answer = deepDrive(deep, n);\n        answer\n    \"#\n    );\n    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n        let mut engine = Engine::new();\n        engine.set_tier(tier);\n        engine.set_tier_threshold(0);\n        assert_eq!(eval(&mut engine, &source), \"56\", \"{tier:?}\");\n        let deep = object(&mut engine, \"deep\");\n        let mut current = match &deep.borrow().call {\n            Callable::User(user) => user.env.clone(),\n            _ => panic!(\"deep user closure\"),\n        };\n        let mut depth = 0;\n        while !Rc::ptr_eq(&current, &engine.interp.global_env) {\n            let next = current\n                .borrow()\n                .parent\n                .clone()\n                .expect(\"global root retained\");\n            current = next;\n            depth += 1;\n        }\n        assert!(\n            depth > 8,\n            \"fixture exercises the former bounded parent walk\"\n        );\n        if tier == Tier::Jit {\n            let driver = chunk(&mut engine, \"deepDrive\");\n            let entry = driver\n                .cached_call_for(Rc::as_ptr(&deep) as usize)\n                .expect(\"deep same-Realm closure fills the native call cache\");\n            assert_eq!(\n                entry.env,\n                match &deep.borrow().call {\n                    Callable::User(user) => Rc::as_ptr(&user.env),\n                    _ => unreachable!(),\n                }\n            );\n            assert!(driver.jit_runs.get() > 0);\n        }\n        assert_eq!(eval(&mut engine, \"$262.gc(); deepDrive(deep, 20)\"), \"65\");\n        assert!(engine.interp.fn_frames.is_empty());\n    }\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {\n    let mut engine = Engine::new();\n    engine.set_tier(Tier::Jit);\n    engine.set_tier_threshold(0);\n    assert_eq!(\n        eval(\n            &mut engine,\n            r#\"\n        var unrelated = new Proxy({}, {});\n        function leaf(x) { return x+1; }\n        function Box(x) { this.x=x; }\n        var native = Math.sqrt;\n        function driver(x) { return leaf(x)+native(4); }\n        function maker(x) { return new Box(x); }\n        function arrays() { return new Array(3).length; }\n        var out;\n        for(var n=0;n<80;n++) out=driver(n)+':'+maker(n).x+':'+arrays();\n        out\n    \"#\n        ),\n        \"82:79:3\"\n    );\n    let driver = chunk(&mut engine, \"driver\");\n    for name in [\"leaf\", \"native\"] {\n        let target = object(&mut engine, name);\n        let entry = driver\n            .cached_call_for(Rc::as_ptr(&target) as usize)\n            .unwrap_or_else(|| panic!(\"{name} did not fill its call cache with a live proxy\"));\n        assert_eq!(entry.native != 0, name == \"native\");\n    }\n    let maker = chunk(&mut engine, \"maker\");\n    let target = object(&mut engine, \"Box\");\n    assert!(\n        maker.cached_construct_for(Rc::as_ptr(&target) as usize),\n        \"ordinary construction remained uncached\"\n    );\n}\n\n#[test]\n#[cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\"))]\nfn fresh_closure_call_cache_uses_the_live_function_identity() {\n    // PrepareForOrdinaryCall sets the execution context's Function to the actual\n    // callee (ECMA-262 e28783d5, spec.html:13873). Sharing code does not share that\n    // identity. Error.stack is an implementation extension that reads this frame.\n    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {\n        let mut engine = Engine::new();\n        engine.set_tier(tier);\n        engine.set_tier_threshold(0);\n        eval(\n            &mut engine,\n            r#\"\n            function factory(label) {\n                var f = function (x) {\n                    var local = x;\n                    function capture() { return local; }\n                    if (x < 0) Reflect.apply(ArrayBuffer, null, [8]);\n                    return capture() + ':' + new Error('frame').stack;\n                };\n                Object.defineProperty(f, 'name', {value: label});\n                return f;\n            }\n            function drive(f, x) { return f(x); }\n            var original = factory('originalClosure');\n            for (var i = 0; i < 80; i++) drive(original, i);\n            var replacement = factory('replacementClosure');\n        \"#,\n        );\n        if matches!(tier, Tier::Jit) {\n            let driver = chunk(&mut engine, \"drive\");\n            let original = object(&mut engine, \"original\");\n            let entry = driver\n                .cached_call_for(Rc::as_ptr(&original) as usize)\n                .expect(\"original closure filled the call cache\");\n            assert_ne!(entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV, 0);\n        }\n        // Keep the old closure alive for a deterministic wrong-identity failure,\n        // instead of depending on a use-after-free to crash the test process.\n        assert_eq!(\n            eval(\n                &mut engine,\n                r#\"\n            var result = drive(replacement, 42);\n            result.startsWith('42:') && result.includes('replacementClosure') &&\n                !result.includes('originalClosure')\n        \"#\n            ),\n            \"true\",\n            \"{tier:?}\"\n        );\n        assert_eq!(\n            eval(\n                &mut engine,\n                r#\"\n            original = null;\n            var correct = true;\n            for (var i = 0; i < 32; i++) {\n                var label = 'freshClosure' + i;\n                var fresh = factory(label);\n                var churn = Array.from({length: 32}, function () {\n                    return {values: new Float64Array([1.5, 2.5, 3.5])};\n                });\n                var stack = drive(fresh, i);\n                correct = correct && stack.startsWith(i + ':') && stack.includes(label);\n                try { drive(fresh, -1); correct = false; }\n                catch (e) {\n                    correct = correct && e.name === 'TypeError' && e.stack.includes(label);\n                }\n            }\n            correct\n        \"#\n            ),\n            \"true\",\n            \"{tier:?}: discarded cached closure and native exception\"\n        );\n        assert!(engine.interp.fn_frames.is_empty());\n    }\n}\n\n#[test]\nfn cached_calls_still_dispatch_proxy_traps_and_revocation() {\n    check(\n        r#\"\n        var calls=0, log=[];\n        function leaf(x){return x+1}\n        function drive(f,x){return f(x)}\n        var rev=Proxy.revocable(leaf,{apply(t,receiver,a){calls++;return t(a[0])+10}});\n        var native=new Proxy(Math.sqrt,{apply(t,receiver,a){return 100+t(a[0])}});\n        for(var n=0;n<80;n++){drive(leaf,n);drive(rev.proxy,n)}\n        var result=[calls,drive(native,4)];\n        rev.revoke();\n        try{drive(rev.proxy,(log.push('arg'),1))}catch(e){result.push(e.name)}\n        result.push(drive(leaf,2),log.join(','));\n        result.join('|')\n    \"#,\n        \"80|102|TypeError|3|arg\",\n    );\n}\n\n#[test]\nfn cached_constructors_preserve_proxy_new_target_and_live_prototypes() {\n    check(\n        r#\"\n        var unrelated=new Proxy({},{}), hits=0;\n        function Box(x){this.x=x}\n        function make(C,x){return new C(x)}\n        for(var n=0;n<160;n++)make(Box,n);\n        var rev=Proxy.revocable(Box,{construct(t,a,nt){hits++;return {x:a[0]+10,nt:nt}}});\n        var p=make(rev.proxy,2), out=[p.x,p.nt===rev.proxy,hits];\n        Box.prototype={tag:8};out.push(make(Box,3).tag);\n        var seen=0;\n        Box.prototype=new Proxy({}, {set(t,k,v,r){seen++;return Reflect.set(t,k,v,r)}});\n        out.push(make(Box,4).x,seen);\n        var Native=new Proxy(Array,{construct(t,a,nt){return {length:a[0]+7}}});\n        out.push(make(Native,2).length,make(Array,2).length);\n        rev.revoke();try{make(rev.proxy,3)}catch(e){out.push(e.name)}\n        var bad=new Proxy(Box,{construct(){return 1}});\n        try{make(bad,1)}catch(e){out.push(e.name)}\n        function Target(){this.nt=new.target}\n        var wrapped=new Proxy(new Proxy(Target,{}),{});\n        out.push(make(wrapped,0).nt===wrapped);\n        out.join('|')\n    \"#,\n        \"12|true|1|8|4|1|9|2|TypeError|TypeError|true\",\n    );\n}\n\n#[test]\nfn enabled_native_intrinsics_preserve_exotic_receivers_and_lists() {\n    check(\n        r#\"\n        var unrelated=new Proxy({},{}), events=[];\n        function sum(a,b){return this.base+a+b}\n        function apply(f,t,a){return f.apply(t,a)}\n        function call(f,t,a){return f.call(t,a,2)}\n        function push(a,x){return a.push(x)}\n        var t={base:5}, a=[];\n        for(var n=0;n<160;n++){apply(sum,t,[1,2]);call(sum,t,1);push(a,n);a.pop()}\n        var fn=new Proxy(sum,{apply(target,receiver,args){events.push('apply');return 20+Reflect.apply(target,receiver,args)}});\n        var list=new Proxy({length:2,0:1,1:2},{get(t,k,r){events.push(k);return Reflect.get(t,k,r)}});\n        var out=[apply(fn,t,list),call(fn,t,1)];\n        var p=new Proxy([],{set(t,k,v,r){events.push('set:'+k);return Reflect.set(t,k,v,r)}});\n        out.push(push(p,7),p[0],events.join(','));\n        out.join('|')\n    \"#,\n        \"28|28|1|7|length,0,1,apply,apply,set:0,set:length\",\n    );\n}\n\n#[test]\nfn hasown_intrinsic_dispatches_getownproperty_after_warmup() {\n    check(r#\"\n        var unrelated=new Proxy({},{}), reads=0;\n        function own(o,k){return Object.hasOwn(o,k)}\n        for(var n=0;n<160;n++)own({x:1},'x');\n        var rev=Proxy.revocable({x:1},{getOwnPropertyDescriptor(t,k){reads++;return Reflect.getOwnPropertyDescriptor(t,k)}});\n        var out=[own(rev.proxy,'x'),own(rev.proxy,'missing'),reads];\n        var bytes=new Uint8Array(2);bytes['01']=3;\n        out.push(own(bytes,'0'),own(bytes,'2'),own(bytes,'-0'),own(bytes,'01'));\n        out.push(own('abc','1'),own('abc','length'),own(1,'x'),own(true,'x'),own(1n,'x'),own(Symbol(),'x'));\n        var holes=[1,,3];out.push(own(holes,'0'),own(holes,'1'));\n        rev.revoke();try{own(rev.proxy,'x')}catch(e){out.push(e.name)}\n        var sealed=Object.freeze({x:1}), liar=new Proxy(sealed,{getOwnPropertyDescriptor(){return undefined}});\n        try{own(liar,'x')}catch(e){out.push(e.name)}\n        out.join('|')\n    \"#,\"true|false|2|true|false|false|true|true|true|false|false|false|false|true|false|TypeError|TypeError\");\n}\n\n#[test]\nfn hasown_preserves_coercion_order_and_does_not_invoke_data_getters() {\n    check(\n        r#\"\n        var log=[], key={toString(){log.push('key');return 'x'}};\n        try{Object.hasOwn(null,key)}catch(e){log.push('static:'+e.name)}\n        try{Object.prototype.hasOwnProperty.call(null,key)}catch(e){log.push('proto:'+e.name)}\n        var o={get x(){throw 'must not read value'}};\n        log.push(Object.hasOwn(o,key));\n        var s=Symbol();o[s]=2;log.push(Object.hasOwn(o,s));\n        log.join('|')\n    \"#,\n        \"static:TypeError|key|proto:TypeError|key|true|true\",\n    );\n}\n\n#[test]\nfn proxies_do_not_weaken_realm_or_class_call_guards() {\n    check(\n        r#\"\n        var unrelated=new Proxy({},{});\n        var other=$262.createRealm().global;\n        var foreign=other.eval('(function f(){return this})');\n        function drive(f){return f()}\n        function local(){return this}\n        for(var n=0;n<160;n++){drive(local);drive(foreign)}\n        var out=[drive(local)===globalThis,drive(foreign)===other];\n        var foreignFail=other.eval('(function f(){throw new TypeError(\"other\")})');\n        try{drive(foreignFail)}catch(e){out.push(e instanceof other.TypeError,!(e instanceof TypeError))}\n        class C{};try{drive(C)}catch(e){out.push(e.name)}\n        out.push(drive(local)===globalThis);\n        out.join('|')\n    \"#,\n        \"true|true|true|true|TypeError|true\",\n    );\n}\n\n/// ECMA-262 ProxyCreate step 5 and Call step 2: a proxy of a non-callable target has no\n/// [[Call]], so calling it throws a TypeError without reading the handler's `apply` trap, on\n/// every tier and at plain, method and spread call sites.\n#[test]\nfn calling_a_proxy_of_a_non_callable_target_never_reads_its_trap() {\n    check(\n        r#\"\n        var reads=0, handler={get apply(){reads++;return function(){return 'trap'}}};\n        var p=new Proxy({}, handler), o={p:p}, out=[];\n        function plain(){return p()}\n        function method(){return o.p()}\n        function spread(){return p(...[1])}\n        for(var n=0;n<3;n++){\n            for(var f of [plain,method,spread]){\n                try{out.push(f())}catch(e){out.push(e instanceof TypeError)}\n            }\n        }\n        out.push(reads, typeof p, typeof new Proxy(function(){}, {}));\n        out.join('|')\n    \"#,\n        \"true|true|true|true|true|true|true|true|true|0|object|function\",\n    );\n}\n"
+    },
+    "candidate_file_hashes_restored_and_verified": [
+      {
+        "path": "crates/trust-js/src/bytecode.rs",
+        "sha256": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580"
+      },
+      {
+        "path": "crates/trust-js/src/interpreter.rs",
+        "sha256": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0"
+      },
+      {
+        "path": "crates/trust-js/src/call_guard_tests.rs",
+        "sha256": "f6d65f87f7c5cb6f1ca1fb95cb7e230194757f0c4ee3d4cec887203f8df5493b"
+      }
+    ],
+    "coverage_of_embedded_source": "Exact patch, complete modified production functions before/after, complete test module and full-file prerequisite/candidate hashes. Unchanged portions of the large production files are identified by hashes and tracked repository paths.",
+    "isolated_full_engine_source_inventory": {
+      "scope": "All files in the exact isolated trust-js crate used for compilation plus workspace Cargo.toml/Cargo.lock; includes all compiler modules, fixtures, self-hosted source and data. Restored candidate source, matching the passing runs.",
+      "files": {
+        "crates/trust-js/CHANGELOG.md": "4afb0b1760c90dba69886626989df250b742c87f3abfb22bee78e2a2d364675c",
+        "crates/trust-js/Cargo.toml": "c61e7abfbc9811b935b06048d61d2bf0b1be4ce6ce17b280826e7eb2e3f8a5ce",
+        "crates/trust-js/benches/engine.rs": "ccd3a83729d795f732afb6a505e5bd865d8c233cbd1bdd2c4fc4c08e8825749c",
+        "crates/trust-js/benches/internals.rs": "5017b51eb0dd23e9df870b8c5e17273b825102da47b2a978ab663373d9d88ccf",
+        "crates/trust-js/benches/support/harness.rs": "5f7bc3a518f0caf0ab18b08f5b5a43513645b9c3876bdcf3de3d03112552937e",
+        "crates/trust-js/src/allocation_diagnostics.rs": "62596312e9e40716fff1366bdc44e72d3d1ced892004b4a062a865ac877aab7e",
+        "crates/trust-js/src/array_binding.rs": "84bacea7e6afe645db06b2e7e1d91b9dac7e76fd264cfa178064c13dcf26330c",
+        "crates/trust-js/src/array_binding_tests.rs": "badd334e2759a865d47ea3f4729c3e09b62ea0c2e716ab77e6aaee2cdb822009",
+        "crates/trust-js/src/array_dense_edit_tests.rs": "65dd8aa5bfe060933f0234ba205e501e4b92c2a41206032375fb35c03a819256",
+        "crates/trust-js/src/array_length_tests.rs": "17f35dd88f9ad8cff5dcf7adb95ab4c0c6995369e944a10fbcd75e594cf20e59",
+        "crates/trust-js/src/array_shift_tests.rs": "b363b77f6a444cf71c26bee21f3ad144bd209806222e9475c533dcf21083803f",
+        "crates/trust-js/src/ast.rs": "f3d276c7f10c7c27e7642a54e3fecf715fcc5ee251b8c715e81761ba27d0e826",
+        "crates/trust-js/src/atomic_compat.rs": "a121d4a2bc2e0150e17d1651af99b4cc0e7dc4de13374dabe1235c216fed78c7",
+        "crates/trust-js/src/bigint.rs": "b5afeb3bd6aeac5167bbf79ce31ce4b4ede5f3e89e55200ee3255902a103b26d",
+        "crates/trust-js/src/bin/trust-js.rs": "b38f69e61c21229899876bc87a1e2bbef6cf384ee77fadd24e2a8b4608e5b392",
+        "crates/trust-js/src/binding_reference_tests.rs": "a3f84488cead5fa33749110cc149a4ac683c4cce5c601cff2bf32f1d4bd20a09",
+        "crates/trust-js/src/bootstrap_operation_tests.rs": "d93a21e8858182ddb6a47bc742fd68b4a7bbb0aa8e0db6f2d2b0cdb3c283994a",
+        "crates/trust-js/src/borrowed_parameters.rs": "97a5c46d2bbac2d3ff4e44e102fa1440e18205a9a3738493c79344c5179488ca",
+        "crates/trust-js/src/builtins/atomics.rs": "e9c9133afde48485592e485055b489de5c5513f313534c348ba83b85d91e7a0e",
+        "crates/trust-js/src/builtins/collections.rs": "b73ca912e74f46f8c5cecaaffdf50401a9e168c9d1ab5b9d558b6cbe5e1905e0",
+        "crates/trust-js/src/builtins/dataview.rs": "3ddc5c1c8b0ddf0d8acbcccc042547b10f5d26351838dd79b474a703d1650f61",
+        "crates/trust-js/src/builtins/date.rs": "fb30eafc37232c2292f339032ac671b8d0729d592d4f987680d398e868eaccfe",
+        "crates/trust-js/src/builtins/disposable.rs": "5998e61d160408b1bd755b2d81b7ce5d4b7df4dd79522defd852873f828250ce",
+        "crates/trust-js/src/builtins/errors.rs": "bd4ef7d6a4f6bf2799dbb8d35edaf3a65bd7639fb02a5be8df547125da3c39b7",
+        "crates/trust-js/src/builtins/function_proto.rs": "42a9e29cb5cf7ad48ab2fe667006bf5fffa10b4207f2d475a47cf3d8b4469533",
+        "crates/trust-js/src/builtins/globals.rs": "83ede33ecdaca3877db8639c56299b9a6b2de24ee80dfe2672f2e17c9e267be9",
+        "crates/trust-js/src/builtins/host.rs": "756c7b304096c80f5287f6c562ee2ee4eed5f3df89094fda8fadf229e61febe3",
+        "crates/trust-js/src/builtins/json.rs": "336f95eed3b198f70c57930eafa8f55c890d4b350042d1630c892f7092a765fa",
+        "crates/trust-js/src/builtins/math.rs": "99770e26db87dd6a1527e0346b3aadbba216124bf1d44cf0b66eb79ecdd48500",
+        "crates/trust-js/src/builtins/mod.rs": "ec8f0541fe5e6ec27cfc7da743579b8a67ed0204dc1145f5b55711e4cab6e9b0",
+        "crates/trust-js/src/builtins/primitives.rs": "62ac3bf0ea4c6d11d7447cfb24987cf239cad8b4eb75c0a3b353820825a2c4e3",
+        "crates/trust-js/src/builtins/promise.rs": "5b417f06f3ed950773bcf74ebcc5f442c920c1cad7d4a0bb25f1d316012e4aaf",
+        "crates/trust-js/src/builtins/proxy.rs": "0004dc754061d462fdbdd0a2792c5ccd3ee17df077444daccc1804532dc2a439",
+        "crates/trust-js/src/builtins/reflect.rs": "5db546308f1f0d2c22a92a1de778af6b9f335a4db86264fae47e4df4be82d15b",
+        "crates/trust-js/src/builtins/regexp.rs": "ec9378bed2269f87d2c2790cb47fa2c60e96d79ee7be3ac7bf99f11763d23e9d",
+        "crates/trust-js/src/builtins/shadowrealm.rs": "a94f05c53b5ae33544d17035799dd33374f9ccb071da2b56105b224c3df786af",
+        "crates/trust-js/src/builtins/typedarray.rs": "2c034101a87e2c265abae2c9c6bc6d4905d3d9c03c8e2906b55bcf786628615a",
+        "crates/trust-js/src/builtins/weakrefs.rs": "2db6886442bb19abc112c7534875f01bd7bb5075eebfa66814fc53db9ddf30cf",
+        "crates/trust-js/src/bytecode.rs": "4964072cf92000a7e79ecb1592e6d26cce45dbc2ba758e187a88efd7ccd77580",
+        "crates/trust-js/src/bytecode_activation.rs": "de47b93857dcd69a6fe9f21402bc198ee9e47bb0d77eca2fa27e1dde887675e7",
+        "crates/trust-js/src/bytecode_computed_read_tests.rs": "6c59d5541ca31e852cc4b2e6e3a9949e523617144244396a20b1b835d592207d",
+        "crates/trust-js/src/bytecode_fragment_cache.rs": "558b5b533691a056c6c3585cdce105b6844a72175dca6e3d85277c1947a58b14",
+        "crates/trust-js/src/bytecode_inline_prepared_tests.rs": "1854cf0699e92382cd0c8b5419550bd03078f8acc35eaada97d2f27a122cb237",
+        "crates/trust-js/src/bytecode_loop_fragment.rs": "26336a83e870b5d953629dc07ce5851015185d040ab975bbbaa95f28eaffe93f",
+        "crates/trust-js/src/bytecode_named_read_tests.rs": "e1311da3220769526952232d5aecc48c2bba73715187058046fc443473345486",
+        "crates/trust-js/src/bytecode_names.rs": "e2aa2574148e5fe193cc2744fe6ff5d0cf002f3fca6e5dac0fa2389708dbdc34",
+        "crates/trust-js/src/bytecode_native_deopt.rs": "9369f7d63e908cd453a8c175bf98df98fbd7d5cb08e747cb5248a458bfaf821b",
+        "crates/trust-js/src/bytecode_osr_tests.rs": "86eba5b29e755772c4a34d31cee3d615c8b6904aa3bee04f205a024962c3e46a",
+        "crates/trust-js/src/cache.rs": "33725300d7d3f8038c9a688c3be9cad50937cf48a0ce3e79e3b3111e3f4fe24a",
+        "crates/trust-js/src/call_cache_diagnostics.rs": "7f5250642cebcb25702dc8b9b8886ef2f3a2674c9518eb3f540cc5667fa9de17",
+        "crates/trust-js/src/call_error_name_tests.rs": "beb1ba8728ff4b3e05fa46aee623bb8187019df2ab9ad09e5f72ef53c90fc667",
+        "crates/trust-js/src/call_global_env_pin_tests.rs": "36791ad4270480ea73c56151aad4eab60fe5389b4d35510b6e7a719ab3bb8446",
+        "crates/trust-js/src/call_guard_tests.rs": "f6d65f87f7c5cb6f1ca1fb95cb7e230194757f0c4ee3d4cec887203f8df5493b",
+        "crates/trust-js/src/callback.rs": "3e1b08f0177381b1ef63ea9228fc32a979dfb7341408608c10e4c4cb2d7cdd4b",
+        "crates/trust-js/src/callee_name.rs": "54ece3d42d26f424a8ef98aa7c576e6bfd2a697c0ad6e7dc949e2b57f7a7c408",
+        "crates/trust-js/src/chain_bail_tests.rs": "13b6ccdbd455c237a5a95feb4ec64e53a998dc0aab9baaf3d00bef01f6b4f9c2",
+        "crates/trust-js/src/cldr_collation.bin": "cd84edcd562d9a9168cbe420355b1163a085a9c8b19810ce71e62bc85141d674",
+        "crates/trust-js/src/cldr_collation.rs": "7d5eb61bc65f6be5a14f589f6a464c83276dc2eb7353bb3e8d6aa3b0839f6ff6",
+        "crates/trust-js/src/cldr_dates.data": "fd5a5a5c911b8abd0a532c7213c520a2cbfd3696a716be4482d16a44fda41e62",
+        "crates/trust-js/src/cldr_dates.inputs.json": "2af0f3cb3e0aa1ee19df7653faf3e1f2578ed299a1056af4a6140dcea8a59c00",
+        "crates/trust-js/src/cldr_dates.rs": "40546420ce797ce0c7f7898f78de2efce63bc6180d7571a2cd8d6bfbe4d8a32f",
+        "crates/trust-js/src/cldr_dates_packed_tests.rs": "6c71e517c841053f5ee6891cbb82873074f94d201f3490f5482d06764457a772",
+        "crates/trust-js/src/cldr_datetime_patterns.data": "7055452d0d373e037c952690fcf8dde2205606d39899e6ac9a0feeb5de667a45",
+        "crates/trust-js/src/cldr_datetime_patterns.rs": "6f920d59191e4047ffd22716c6b65ff8d86daba1b257ca04950545cd31d9bb27",
+        "crates/trust-js/src/cldr_display_names.data": "c2ce3b95f709242d9fbbeef431bb577b1ea56dfc983da0b529f0fb35c5a2026e",
+        "crates/trust-js/src/cldr_display_names.inputs.json": "caf7422e9b666e24c4ff2d90105b8a61d6faa5c347226745135686ab0a6b2217",
+        "crates/trust-js/src/cldr_display_names.rs": "de28688067fec98d5311361c263e3162c642600a2ffef403176546eed914270b",
+        "crates/trust-js/src/cldr_display_names_packed_tests.rs": "3faed083e97e6c190207ac8aa8c50f773744ce999a0015a3d22f68be200e6668",
+        "crates/trust-js/src/cldr_likely.rs": "b087c48f1285234cb20c2b2022dc1cf6ddec1b958e41676b8558075158d4e99c",
+        "crates/trust-js/src/cldr_lists.rs": "5bcc2f1b333bb07b6ca6bf7f5587d2fdc3b1d85071b19b213bf057c233875cd3",
+        "crates/trust-js/src/cldr_locale_info.rs": "62fe1be38f13fa52d9462fa5615e861891c7aedd0bd6f21f6e6b822912fae9a6",
+        "crates/trust-js/src/cldr_locales.rs": "52631e859226acbd263c3af8d1041b4748b56920afe520f0003d29425988e80e",
+        "crates/trust-js/src/cldr_numbers.data": "260a7f95d871e1bb59b595f95ab14116c4eed2e98a783c41c166e0804ce8c7cf",
+        "crates/trust-js/src/cldr_numbers.inputs.json": "126622be6740ac69d01477e0bf1e22183d1799f10ae6708b4bbb911496080afa",
+        "crates/trust-js/src/cldr_numbers.rs": "ad4eca94df6cbec25db86d7ba023f5c388582d4727fca20c019879edd380d9cd",
+        "crates/trust-js/src/cldr_numbers_packed_tests.rs": "bec282f548aa5aaca9207d242211c2b17dde43c4aff513ad6215b1bdf8d4ae48",
+        "crates/trust-js/src/cldr_plurals.rs": "c21f82dfbcef29681c92867d0471bade30875103912836d1898821442079f4b5",
+        "crates/trust-js/src/cldr_relative_time.rs": "8d65522ad4e5641a44a193501dabddd0a7bc01fbcf2a85c620645ebf2d587067",
+        "crates/trust-js/src/cldr_root_collation.bin": "ca9a5da9ab599b2e618a72fb192742384f1268b6202f4aebe10b1a7246646251",
+        "crates/trust-js/src/cldr_tz_names.data": "5bf1bfd7e84575eb6cc74aa61b0530af4342e91b17a3a0098434e4dbaf80f1fc",
+        "crates/trust-js/src/cldr_tz_names.rs": "e1e48638ba307559ce02ecf9b8ba3fa314cb32d3fca09e79a5753ea5fa7527ac",
+        "crates/trust-js/src/cldr_units.rs": "bf98b7fc9c1eb0894e2c1e38d021d0fd6f3a40cce70d8d14888c8b32fbead4e5",
+        "crates/trust-js/src/cldr_windows_zones.rs": "e4e7ea727e558127ed609be130f7872c34d41b34a9b6e1ddfbd59062e058c8d2",
+        "crates/trust-js/src/code_point_intrinsic_tests.rs": "f5a768b4c61ae258ae0db233e40bd208747c7d9b04b32b0ec9739dfb813de207",
+        "crates/trust-js/src/computed_key_tests.rs": "b45ad2b830578264b279a181f76598b62fe30b84aeee56f04cfc1e92fad5edb1",
+        "crates/trust-js/src/computed_reference_tests.rs": "84d82478216f742b75604a1af2d793aa17bcf1daac9d4407f3c3f4a219b29b0f",
+        "crates/trust-js/src/constructor_transfer_tests.rs": "4b47e53b2bbac9ee640e2c42ce9f1425dd4a5c8f20e6e621e6e5d653b80f2e4a",
+        "crates/trust-js/src/coroutine.rs": "779ca96898e3794f78e7d39401e76ad8e3bbeb29315ed73ff88f68d59f4c5802",
+        "crates/trust-js/src/data_copy_tests.rs": "e15165d66c808702da374d365f2669fde4c79ce2129197e7a7a5aa4d1c95111a",
+        "crates/trust-js/src/dataview_access_tests.rs": "dfb154874f594adf35688502a061a8a6d93978f02b105d4f7008f420a18ede73",
+        "crates/trust-js/src/dense_deque.rs": "7890dccdb4fd76c1b7b198631e686a3f75ce42d843fb548884d17625fcaa6904",
+        "crates/trust-js/src/dense_slot_tests.rs": "6c64948591316f39fc1f10c6b3bb5a65d9440e2738b0c493b8b837ed8e01c0f0",
+        "crates/trust-js/src/entry_tests.rs": "54914fea1d5c0655bd5243bc3f8854a273d3fca8466f3d8190f1e009e9bb9a58",
+        "crates/trust-js/src/eval.rs": "c756495bef115ca7d68de342b3ea732e59d51154657c2f17ef02e3c76cddab2e",
+        "crates/trust-js/src/eval_prepared_reference.rs": "f1200cb9a0331c1b0c7485dd0e56eaaab1c424190f23821c772cb51e305d11cf",
+        "crates/trust-js/src/execution_storage.rs": "ab4d8b8b17522eee64f91026cfd575f1d517cfdfa37a9310a78a31f82362e999",
+        "crates/trust-js/src/fastalloc.rs": "ae4f4bdd5ca4945050efae5ff58105be681d9f367b32d928f1d2f438e0b7921f",
+        "crates/trust-js/src/fasthash.rs": "53d912bbdae4590b88c2dd7457c5c315fb10ca291fb854fd6605943acb4e528b",
+        "crates/trust-js/src/feedback.rs": "496ec9d9f83676bfc93dcae2d26a4e72017da6ec577e821328d59cb5720ce537",
+        "crates/trust-js/src/finalization_cells.rs": "c268fe9db70aef2e128da7519135928e5e5a264e025dc7fd22feaf3c59afdc2e",
+        "crates/trust-js/src/for_in_cache_tests.rs": "862bbbb3c3cc8a98c104f229a214624e3f6965a7176193612b4bbf8a88abf3a9",
+        "crates/trust-js/src/function_realm_identity_tests.rs": "5e0b5a848845aa6fb00af6623bf7b5569a0fa972a45eefe3092c83f55eb9dc5a",
+        "crates/trust-js/src/function_tiering_tests.rs": "bd07419989a59a8671250474d71bb587f69852df48903a802bc263e9a407c9db",
+        "crates/trust-js/src/gc_diagnostics.rs": "42c9e2e48b55a99f89cd37429bd09a19b9cb48dcf2c17297dbf60e7a823ff456",
+        "crates/trust-js/src/gc_edges.rs": "3a4991908a5ad0dc2e4a1e739a7316365c7c0ca03b02e838481b704294ad44f3",
+        "crates/trust-js/src/gc_generational.rs": "d29fa5eb3653d70844a3f6df13cc9e181ec3630e22ee228372e6ab48a78dce93",
+        "crates/trust-js/src/gc_handle.rs": "eeab10e1bd9feff54b698120a0c2725d452c3ac6e6a8871af1082842d6ae9c76",
+        "crates/trust-js/src/gc_native.rs": "0f7ab37ec73e65c878eb5cbacd4543fb81ce4eea26166da654acb48a6d66f0d5",
+        "crates/trust-js/src/gc_sweep.rs": "94268f6196b5bceb15693122ba75c857c41185fd4b92e303765f37a7ad0d4f3b",
+        "crates/trust-js/src/group_by_tests.rs": "5cc73ceafae42764c1bc5bfa7598d411c9167736bcb9d04b9bf9cf13420e6f2f",
+        "crates/trust-js/src/heap.rs": "ca43361cba8247e1ab433b6376924a5471a10a6966ab9467622a032eaf764da6",
+        "crates/trust-js/src/host.rs": "d0f730604ba4930d5b54130172afa4cfe93df515c702dc6edf7bb98ff371fcc0",
+        "crates/trust-js/src/host_collections.rs": "24194e71c0fd3a0e05ec9df31247171e067f3e44070fa13683a37b767a4c22b3",
+        "crates/trust-js/src/host_memory.rs": "a4d1c323336a91a9770c9236d707cc28a24cf54f0d6cad2fadde4b5fa3133d9a",
+        "crates/trust-js/src/host_string_tests.rs": "da332da9acb5e459b81b63b0686bf5af79fb41f9702351ad124abeb6045294ae",
+        "crates/trust-js/src/internal_slot_tests.rs": "b5254f620f6a64d2a5972a002133a47ed9bf9bdf00d7f7a7d1cfec5c17603c31",
+        "crates/trust-js/src/interpreter.rs": "de2f2edaa607a82008fb863dbbd3edfab4850d598e67e15d2612aaf5ef305fa0",
+        "crates/trust-js/src/interrupt.rs": "e05af20098c737aa9818d707d91fe9b70da9b2795fa00f6be269de2eaa83b4c6",
+        "crates/trust-js/src/intl/collator.rs": "23143b13b4aa13e4f981fadb6295c6d57ae4c9a4248855c8efe80e562c3f37f0",
+        "crates/trust-js/src/intl/data.rs": "ac6884c140f4209f923c962b5e40af01e0fa4d2a5e792c43f06a4d2b2bfd12e3",
+        "crates/trust-js/src/intl/datetimeformat.rs": "9b935da892a2fcb00e84312ee4881b6fe5418175c3c62c19a68e45a28ecd7935",
+        "crates/trust-js/src/intl/displaynames.rs": "69ebfcfdb476be12da50ee5499193358ffc9e70f81c10a446df369d23c210dd9",
+        "crates/trust-js/src/intl/dtf_interval.rs": "6b5ff431d6cc01d53daa70c7bde01d9097cbbcb8f66a3596d2fb0f5d4310ac5d",
+        "crates/trust-js/src/intl/dtf_pattern.rs": "1b965f6dcb32a6b95904fc19f92f144b67990cd67a8d4a856e393c938102f877",
+        "crates/trust-js/src/intl/durationformat.rs": "dde7db30737d319139f99cbd5975efdf8cc5e6c68724a5f4a8039490da0e7a74",
+        "crates/trust-js/src/intl/listformat.rs": "2b39f2632301b58ea4ded790865f2d4caac9373d7e20127f7cf0faa3b7399469",
+        "crates/trust-js/src/intl/locale.rs": "ab38093733bbf7e09ce9a6a509967402a985ee909f921ece207bfc29702a47f6",
+        "crates/trust-js/src/intl/numberformat.rs": "d2456d75d2f66292aab6efc7c7d2c086678f19f4be43987cea345a8615b45965",
+        "crates/trust-js/src/intl/pluralrules.rs": "6c832f4140d45035e2429d0e8112635a80b0dd7c94fc1955ca3d933c63f6dce5",
+        "crates/trust-js/src/intl/relativetimeformat.rs": "ff07e19e3e0bf5bd9b2812e66511449a9f3f53287a20594d8f6a7123077c58fa",
+        "crates/trust-js/src/intl/segmenter.rs": "b96e4f377d4f42b15f20eb30d2e913a0d93c8e96d43af6f8a6fb03e40cb761b8",
+        "crates/trust-js/src/intl/service.rs": "4d44426b53d1c5c78309ee34403e97b90d2621ae8dc204d0f7616ecbec34d744",
+        "crates/trust-js/src/intl/tags/aliases.rs": "ef2a497852976f042f12f50a3d2bf12ef065fc06263e42869fa54cd60c19a078",
+        "crates/trust-js/src/intl/tags.rs": "9bea6efc5ce2ab1635652cc9a9c22a3efa61dfe2a0d00a29e250995fb63d0a22",
+        "crates/trust-js/src/intl/tz_names.rs": "c1e3c66dbdbd41aa091ed07df55dee630ad736a42b66586ef8e3badcbdc7cbe9",
+        "crates/trust-js/src/intl.rs": "a0724f941f063f44b76b39db9726345a89c04d47137ab79db99271c0828960a5",
+        "crates/trust-js/src/iterator_result_tests.rs": "0ad3023f0f184629f820addc3c39961b7be1d8e37c5472c92f934c86f45d6107",
+        "crates/trust-js/src/jit.rs": "ba03518819a03d06445d1785aad1ad59419da576d44c2bf21cc9c84bbbb5b323",
+        "crates/trust-js/src/jit_assignment_tests.rs": "86cbb3bfd074ce0bd6a9b9debddf7f4b665c30d513a595edb977503afd60370c",
+        "crates/trust-js/src/jit_cache.rs": "b90951efc6d349ab1ba65622a321700698ad81581b40f732fc211b62299fa0d9",
+        "crates/trust-js/src/jit_cache_admission_tests.rs": "29e03012cc813ae2fbbd218ee259d407de33b251f74a8cabb3532c6a8d6c4cd7",
+        "crates/trust-js/src/jit_cache_directory.rs": "1d0224f3e463410262d0be63fd1bb0086be0da20e7fc7be8b5e4a3a41d09633e",
+        "crates/trust-js/src/jit_cache_tests.rs": "5304f8016449146e41b673648c41eae042bbaa4ac538acd5dd99d4a2cd759b01",
+        "crates/trust-js/src/jit_call_closure_tests.rs": "00ed79f4809d8f52c13f247f686915aefcaf92d4ac7f1805479b17f96b5f9faf",
+        "crates/trust-js/src/jit_call_epoch_tests.rs": "5a2f3dc4cde3c5f5587ec56affb1e2b16705134d82449ed7dfc70539dcb956d6",
+        "crates/trust-js/src/jit_call_reference_tests.rs": "d8f8202241376f392726af4fb44f44e3ecef274610e9d2aeccd4269d51c90934",
+        "crates/trust-js/src/jit_call_stub.rs": "4dad77921467c28d823d52173d8cfc509afa34ad5b4e453cd7a44be77d1a9357",
+        "crates/trust-js/src/jit_constant_tests.rs": "41de0afa333e2dc2afbeb36d40523daa6ba9fa4127b29c2276f7038a86841cca",
+        "crates/trust-js/src/jit_continuation_tests.rs": "3199c254cc2c322942c2cd6bbd6827547d670fcc2ec020f499ecb3056c96bacf",
+        "crates/trust-js/src/jit_coverage_tests.rs": "2b2b20bedde3e7677ef8d18984476950564f3db7f2b941ffc1d70afd5b87c251",
+        "crates/trust-js/src/jit_exec_memory_tests.rs": "ac27dd3018cbed65f025e5df60ff06f7e4f41cc8b7baa95438301db00bbe7bc5",
+        "crates/trust-js/src/jit_exec_values.rs": "166c4381cecde279207cfca2bfb664d500d167558a4ef7d93a2a17de6b6e4189",
+        "crates/trust-js/src/jit_inline_context_tests.rs": "69e8720e1aa83eb95f1ee510a04904ca99f0f2682d0a39f0012c68409d77825b",
+        "crates/trust-js/src/jit_inline_realm_selection_tests.rs": "dda9f9aa2d863251d2c15a4b0dd43bf1f3ab7620a7fee6546877cc678cd778bc",
+        "crates/trust-js/src/jit_int_typed_tests.rs": "7839700f864a671b8dca04a02a35484364dad9b9bc9c4a5ca837c3dae1e52456",
+        "crates/trust-js/src/jit_ir.rs": "ea9c0893218dff5af76efd837a0959c084e3004ee923c0807c4f6f92e4d951a3",
+        "crates/trust-js/src/jit_loop_latch_tests.rs": "55d413fc5d25d87e73d1563a3b5c6be478e014cc2c21d50a2fa1eb09cfafe0f3",
+        "crates/trust-js/src/jit_math_intrinsic_tests.rs": "f14c9b88135808bcbb2d71fd8b8230cf82c78ddec230c2965898daf9f5fd2a12",
+        "crates/trust-js/src/jit_name_dispatch_tests.rs": "f296473ed003793f609afc293899cb48c53ca21832a3186bdedbfcd6ee84b881",
+        "crates/trust-js/src/jit_names.rs": "32bfe51ea74b068724f4b2f521e85711cef355e41de9fd135c1d3fb7199bc5f8",
+        "crates/trust-js/src/jit_names_tests.rs": "30bffb443264cb7455f72d77e3a0f2cdf380e75f70bee2bfeb805095b34232a5",
+        "crates/trust-js/src/jit_native_operations_tests.rs": "f07509bd8f659512030e0aeb5c96234e88a0ae7eed4f1fa6bb8d22a8b91d9c90",
+        "crates/trust-js/src/jit_numeric_array_tests.rs": "f6ef23cbc75a7420fbfdc58b848e7c2eea55e0d650150803d6f142e13018ec40",
+        "crates/trust-js/src/jit_operations.rs": "ba0508a40d37984befb7b37aef0c8bf8dc8abae53fb171557f399aa5ee2ca15f",
+        "crates/trust-js/src/jit_optimizing.rs": "d0d0d55846e224aa87c7d02e970f7658cfdff24124164273a009e938553e1528",
+        "crates/trust-js/src/jit_optimizing_bitwise.rs": "90d694a73bd5e524ef140c4e51e5f987a10c7b16953e873296ae222e9b877c44",
+        "crates/trust-js/src/jit_optimizing_call_tests.rs": "4a3e6e7059b9e16845943cdd84e3ffca153a27b02fc0be6be089748961a572df",
+        "crates/trust-js/src/jit_optimizing_creation.rs": "467dd3a75ddf247cff0b0bb628d672bb75727c66e6e4233161ba64fb5da382a4",
+        "crates/trust-js/src/jit_optimizing_creation_tests.rs": "43501ad07b23091a62a8d8210d45d52a28b8f3994320d29b0e6564a880023233",
+        "crates/trust-js/src/jit_optimizing_deopt_tests.rs": "d61ba7839b6c368e7f41d9aa81572cd6472d95a125bf92c998837ac2afe41d39",
+        "crates/trust-js/src/jit_optimizing_diagnostic_tests.rs": "4e566e5f593659f84c671bc7e2247c5bc3a9eee50cfa9ed82439224a46fae4ca",
+        "crates/trust-js/src/jit_optimizing_diagnostics.rs": "19d154ce706da568fd725c5ee9b85d13fd7b51d6928298f1bea0913725774ca0",
+        "crates/trust-js/src/jit_optimizing_effects.rs": "19dbcafb5390051df872e84cad8f50252bd57386cd3a07bbe66e5da06f19d778",
+        "crates/trust-js/src/jit_optimizing_elements.rs": "31224eea7127eb11bb37180612640a72ec131f3fd13ed56f323fdbca91129dcf",
+        "crates/trust-js/src/jit_optimizing_frame.rs": "128d09110c889c0b091b5dec2129c072b76e44d03bf08c6eee7620e473af4aa2",
+        "crates/trust-js/src/jit_optimizing_heap_proof_tests.rs": "b84ba9faecfdc6a423630ddb0e52fad8bef0b2bc1fbb809ffeb5dacec34bf88b",
+        "crates/trust-js/src/jit_optimizing_heap_proofs.rs": "c9d68cc852824b0ebe375613f0b1baf22a8b9468e9ffb8e951fd9f8e4034c04d",
+        "crates/trust-js/src/jit_optimizing_heap_tests.rs": "190171fadcd678254ad4a83bc5b5f36ae59d95ad81847e35f3226acf9b6afb9d",
+        "crates/trust-js/src/jit_optimizing_inline.rs": "2ea4dd9d058370d804961dfb52b8494f02695e35fdb3c53da680fb353306e3b8",
+        "crates/trust-js/src/jit_optimizing_inline_tests.rs": "974a8916e4d724fdaa25b2d12ee24b7fbcc93c75ca17bfdea6b2174d0bcd1f7b",
+        "crates/trust-js/src/jit_optimizing_integer_tests.rs": "694cba534ea8d24d339f6acd223c65285d30192c7a2d375f2f372573326057fd",
+        "crates/trust-js/src/jit_optimizing_integers.rs": "353fc6f7d0006e23655cd1eefa62d36a447ebda1ef927ddbfc0530ce0f9496aa",
+        "crates/trust-js/src/jit_optimizing_loop.rs": "782916d1d47eda91397dea8f1fa4ef99df73298ad9dd98b3ffe85aab969f938c",
+        "crates/trust-js/src/jit_optimizing_loop_facts.rs": "efb7047625d81ee465a840afa7df2f16d08f7b00d6240bee8b5834f6b3b1d41c",
+        "crates/trust-js/src/jit_optimizing_loop_facts_tests.rs": "dd5923488266e900107b8811bba203495cd588c3861e8f126facde6e0be4bd86",
+        "crates/trust-js/src/jit_optimizing_names.rs": "bb8a1ec2d0f59985c0724ba9d9d85f79d6adabd01a0e07300d8c25ffae23dcfe",
+        "crates/trust-js/src/jit_optimizing_names_tests.rs": "ef086fc152e6add6fdbc99ef3d69d18757c062b9b5bde253262e86ec70a938da",
+        "crates/trust-js/src/jit_optimizing_ownership.rs": "6648f525255336e475e004850104a07593df1c113acdff737b70fbdd123f563a",
+        "crates/trust-js/src/jit_optimizing_ownership_tests.rs": "0acedc2b5801abd92f5f65d9e40976886824dc729a9a1fdbd765fbae8307fe75",
+        "crates/trust-js/src/jit_optimizing_property.rs": "da24db95a601e2bcdb91dbdb63e064e5ce4e1505a2737bf2609aeec1296161bf",
+        "crates/trust-js/src/jit_optimizing_property_tests.rs": "6e59709324c6995f440453c6cb8a4702ab5b156574e299e7ca4d8796820197b7",
+        "crates/trust-js/src/jit_optimizing_ranges.rs": "15072ac83fdc29faae577c3a4c195568826960e6b63216f8cde407c58e2a8b9d",
+        "crates/trust-js/src/jit_optimizing_specialization.rs": "4bdc0533510a704869cdfb9d84e030090d6daf9b189bef070917af8bdb87baa8",
+        "crates/trust-js/src/jit_optimizing_specialization_tests.rs": "8eee898cc47f7aa6acc7105f8dde44ec4b94ac7662058deee096fe3c56b28bd7",
+        "crates/trust-js/src/jit_optimizing_stack.rs": "3028827d9f11afad4bf88353faa22a703ef2d61399ec4003afe689540896cc7b",
+        "crates/trust-js/src/jit_optimizing_stack_lowering.rs": "afb1414463ce5cb5e7c5208600cbbf7cbca22fdd763ad81abf0eb82dee7eb5ba",
+        "crates/trust-js/src/jit_optimizing_stack_tests.rs": "f446ac770f78a0ebc14260c9ee1b81c4161e7becc2ff48e63d58060757d2b0aa",
+        "crates/trust-js/src/jit_optimizing_stores.rs": "d749dbafa989c383f91b149ef2a823d1dfce53c1c6d1c2daf9838f1127cd2e02",
+        "crates/trust-js/src/jit_optimizing_values.rs": "e86de0611e402e0c283ca13f46ae404dcd3821e10c83a7de5d57cca80e1902e2",
+        "crates/trust-js/src/jit_osr_entry_tests.rs": "9cbfa4bbdf9dfa72d5f60ca43b1c3f0c43b3caa60c247d190986c2645faecbb0",
+        "crates/trust-js/src/jit_profiler.rs": "51166dc67be872f3b15810f2f8e66c0b0fcc0333bf36d3783d7e3d794faa88e2",
+        "crates/trust-js/src/jit_property_store_tests.rs": "a9ad651c4fe6aeec84a6c0a045ddf3b36c80781c210454b10c5c53e2a6eb7c84",
+        "crates/trust-js/src/jit_region_edge_tests.rs": "1bf32feb41eab92b391f8b3e6feed5f66686b17da950396bf1ba036c43a5b9bc",
+        "crates/trust-js/src/jit_region_effect_tests.rs": "716c571406eacebc006294e8270ba463ead2f370799d0f52666114a071aaf180",
+        "crates/trust-js/src/jit_region_predicate_tests.rs": "a65f2670a76a865ab32e0dddc683045a9e7ebad15803d2eb76ed67581fd5eeed",
+        "crates/trust-js/src/jit_region_result_tests.rs": "3773257929d17977452b76a0d7775f8480a4e432ad204bb9d055dea595a39a89",
+        "crates/trust-js/src/jit_region_scalar_tests.rs": "0b7ca81f383264b11da75efaeef77e4186a9a447339421cfe1a22e9bb1dec384",
+        "crates/trust-js/src/jit_regions.rs": "613288f5a09e739ad990b408d92f579094f0770d1ebe00dadd960940a90841c3",
+        "crates/trust-js/src/jit_return_tests.rs": "996970adaa23c0a6cf6b9282e490a026bfeac6b949198ad03575653efb6c9259",
+        "crates/trust-js/src/jit_typed_array.rs": "93651ece735b669628187c9b34d2940370d11a5711fdbf513314a015ff9821b5",
+        "crates/trust-js/src/jit_update_elem_tests.rs": "d56ec2a90b073a8bef55e0e75d569bc38a67d9c445d61e083852c0094333e4f5",
+        "crates/trust-js/src/jit_x64.rs": "fdf10e57ff69417d09ac1cbb0dffd497240726e7a0d36222e33970af854d76a6",
+        "crates/trust-js/src/jit_x64_names.rs": "967d2d24466667768d318f16faa17f5fbb32740e91c78d6df83e033bafebbccc",
+        "crates/trust-js/src/jit_x64_names_tests.rs": "4a619b0ec8a6ba358158ee3d281f2379fccb42dd46ac8cde6f7e662a857baf6a",
+        "crates/trust-js/src/json_stringify_space_tests.rs": "3ede80313690888d958061fa5c4efa0d0621a50e5272796a9c86b15b01fbdb70",
+        "crates/trust-js/src/jstr.rs": "6c68ae28e7551ad57b994b91a9cb36b2cef3abcc2e8d48b5566c607fd778e9de",
+        "crates/trust-js/src/lazy_function_prototype.rs": "29b9a0bd74589e30c1ee0bd70574fbfc4b7a1671e76704e3a6b9e71d23335d18",
+        "crates/trust-js/src/lazy_snapshot_body_tests.rs": "ea710bd98f9e9527adb5b21ddbea14df5375faef37629cae69cf79046a9559fd",
+        "crates/trust-js/src/lexer.rs": "14ed2365d0fbf9d54b2d61b7b8f2662c65adc3b853f394f723edabe3fe26b6de",
+        "crates/trust-js/src/lib.rs": "0e8e071e78121aa31ddaec423eddab3b75d4b4c473a3c0120717a6b5ab7c12d1",
+        "crates/trust-js/src/loop_completion_tests.rs": "5ad259004868ef0c2af34e98d6ed728431553f5cab202113679c784b28d70417",
+        "crates/trust-js/src/loop_fragment_tests.rs": "7321fde155d8a5b7a809557a92ad89b29df1932e269cb4201052ad8b5024a508",
+        "crates/trust-js/src/lstr.rs": "517e4c24fb47ec0dc8d72ff9d41cdef58cfcc8da5ff81af1e45b322f50e9e52c",
+        "crates/trust-js/src/memory.rs": "a04535de131590854541e6e60738afe8d4140108492668e3d88e7ee8ca1274c0",
+        "crates/trust-js/src/modules.rs": "ca4d06dc72ad85d49e8d66dd62bb934a23c37f33ef229ad6a0ddc77c69f24687",
+        "crates/trust-js/src/native_array_local_tests.rs": "564853b9cae24d3ea93682ad5ad99d97d32fb00b81c7a35c334a8c2c998e68b5",
+        "crates/trust-js/src/native_captures.rs": "b3850e2be490b481964a942f79cafe0882d607e256b1af3d5d9a25c9458b2c75",
+        "crates/trust-js/src/native_constructor_tests.rs": "3b2ac5923b0a5b67604e8370ff493780098b4cc3f5a58d7e2aafe1dce7aba691",
+        "crates/trust-js/src/native_typed_array.rs": "322a06729fcf2a31abfe595ef08813f1d03bd75b01bf14b68ace87e9196765f1",
+        "crates/trust-js/src/numbering.rs": "3335c1730fa80127933416a39a493ce24c652d8d9fae308c23e9a5a0f4fd8231",
+        "crates/trust-js/src/object_alloc_bench.rs": "99a89574db23a021c6847ee9bd7d2b8c33c1abca208ec2bc05a950f88fd15e19",
+        "crates/trust-js/src/object_literal_jit_tests.rs": "4e0a15878efe53ada03252a31095af77a2dcdc0dacc438df4a3b8414a78989a9",
+        "crates/trust-js/src/ordered_collection.rs": "3cd806e5bb61df322eb831d8add12d8ffed53c26e847f22f27580f890c301b5e",
+        "crates/trust-js/src/ordered_collection_tests.rs": "9593545aeaec55ce81d94a7fcf06a78a25a86584e2ee8bc19a12909cdb82b24b",
+        "crates/trust-js/src/ordinary_data_read_tests.rs": "50654f32d130da5474e4436c29d0d75990b70e3037d7255eb1ea30f43e31002e",
+        "crates/trust-js/src/packed_owner_layout.rs": "359b45c830a73c7f2d9c16522d74511971598ea8ca547107887eb93f8c7a28be",
+        "crates/trust-js/src/parser.rs": "d44d44e64945875b6b6df7ac01f4161f27b7ab8c1dda77b840336d3e5ba2585f",
+        "crates/trust-js/src/prepared_reference_own_tests.rs": "971cfcde250d63f0ece37fcadef42d9baf9ec2633a10a34eb29c3b59e3d05aab",
+        "crates/trust-js/src/prepared_reference_tests.rs": "38cb7598672108cd246894fd3878a73e1425cfc672855f1a36076faf1349fdf4",
+        "crates/trust-js/src/private_name_cache_tests.rs": "7f7ce374f84a2a4848376717d0bfa8929e9b2d54aee939f16c53c500637e5293",
+        "crates/trust-js/src/property_key_security_tests.rs": "5a3edb8685b161b82ef8b6b69ed59d9111ca58d6cb0e796d222e6918c1b2a2a7",
+        "crates/trust-js/src/property_read.rs": "a573e736b8b296125385a7095cd2abb8e7e8ed8252e3f23e120dcdef2d4252a4",
+        "crates/trust-js/src/property_read_tests.rs": "3b6f7be6f1debe0d1bb1d49deadee59cd2d07673e9a715d23617c60a36d0ba50",
+        "crates/trust-js/src/property_shape_tests.rs": "8374fc223c7756a6c2dbdfcf35de354f2d33a2707b3f83fd05006de9ef900b14",
+        "crates/trust-js/src/property_shapes.rs": "6adfea16cdd7a0e8dd03148bc8373ad874e4a02efd74e3cc9e188802bcc0b862",
+        "crates/trust-js/src/realm_inline_guard_tests.rs": "f912c40191ea30018bc0f197d19802a715fbfa23ce1eeeb7b7831c6084899d39",
+        "crates/trust-js/src/record_enumeration_tests.rs": "5f4dcf633878819e4de32c1f01314243a15514414be9ea5db87e218a580d361c",
+        "crates/trust-js/src/regex.rs": "469ed2dd4ae183471b89df6819abed11e06a1170716177c4d1b88f59fc72c59e",
+        "crates/trust-js/src/regex_emoji.rs": "bad1256af0f54592b30a9914bfda7ca10c20784dac27e52dd504f7ba1846383d",
+        "crates/trust-js/src/regex_fold.rs": "37f168719f5020879f54e59a8c61b32e35510c151397988eb95fcad63d7ead21",
+        "crates/trust-js/src/regex_native_generated.rs": "a4124ac54807002d7dc16ed16a06420e7aa390fb7634a30edcc23092a631c569",
+        "crates/trust-js/src/regexp_tests.rs": "36d3ed908c4a099d0f47b67b39d54d0166a40d5e9f14591de919ac7146ccda42",
+        "crates/trust-js/src/script_caller_tests.rs": "d29d354d71003687c283cd55ccc6772309cb29879da6e6c47046a5734e3085de",
+        "crates/trust-js/src/script_entry_tests.rs": "ff4405e02907a18a6c3bff8e57f4ac278237f27770dd588a7344f50dcff381ee",
+        "crates/trust-js/src/script_scope_tests.rs": "b155f454baf72aa2e292d1b8c0cebe7cb5d382cdb6e200cc8ee6c2fdcf8f84b3",
+        "crates/trust-js/src/script_tiering_tests.rs": "651647780824f1dd8336454921046e77314f380ef0ffd795091096e636d4b4e5",
+        "crates/trust-js/src/self_hosted/array.js": "32fbf2805ab90776a14472268f6a5f768b618a7a2e83c7b64ca3ce95d02500c5",
+        "crates/trust-js/src/self_hosted.rs": "bb18942c2204f370bf977b47afe6318d3d4e32dbc8941ca0f3b5cfca02ebf9e1",
+        "crates/trust-js/src/shape_proof_tests.rs": "68a454e1ffd2cfdb67a5e4a0194d1a700ebffcd18074563d6d608bf45561da2d",
+        "crates/trust-js/src/shared_buffer_lifetime_tests.rs": "9d5c425b6ac7e0fd5cba954325b168d48a3e2763fd16acdb458e3df229a62fe6",
+        "crates/trust-js/src/shared_layout_tests.rs": "c1a1fcee2485889e4a3826ab2d3c3da14ebd1ca91ef0cd0d556b779dd8f34474",
+        "crates/trust-js/src/shared_snapshot_realm_tests.rs": "fe26a00579d63b575f4e31a71826bec3d743d915d8eed301d565a18ea01dae9b",
+        "crates/trust-js/src/snapshot.rs": "1d46791923e666520bcc749a862674d5479e5c3eee5771ce4c52a42e8d6aa5d0",
+        "crates/trust-js/src/spread.rs": "1c2bfa16ab2fbd6ee63049de18f2c83fa6c816ff1a7bd985e6001b7f940f510b",
+        "crates/trust-js/src/stack_trace.rs": "00c27f959496fa992bb8c24c445571bd1ab1cf2b7a3445c75f04f2eeacd1b39b",
+        "crates/trust-js/src/string_concat_tests.rs": "cde4dd8f4ba58ba1e691bd02344244096a6dd40b0c78b445b31ecb7508a22c1b",
+        "crates/trust-js/src/string_replace_split_tests.rs": "09442b6c4ea57e9bfe7ed1751ca8cb0a3288f30bc225687b8a2cf52f5a0bd941",
+        "crates/trust-js/src/string_slice_tests.rs": "82e96a284dff5e24d77058d2249e14619b8268224d9aa756885eb6381433198f",
+        "crates/trust-js/src/tagged.rs": "5557b269c49d224daaf2f0b99fa236291406ba5b00125879dc8f3e425b34ee44",
+        "crates/trust-js/src/tail_tests.rs": "b482487352b8b878ee1d2b7b469081d2c687f97fcfb7dbe4120e186a79223153",
+        "crates/trust-js/src/temporal.rs": "c28e4393bc94e8ea9a163d81f149ec6ca1faea2bb77ad2dfc93eddf7e1c2cf50",
+        "crates/trust-js/src/tests.rs": "1862806810b851432e0a8859e79487db5e795d789f88a9c9f8a57e8cb686e652",
+        "crates/trust-js/src/tiering.rs": "9aecbc6568daccf319cef975819405ff3f14f229e1873c5ff8f76ebd6871c62a",
+        "crates/trust-js/src/token.rs": "8e66a7ae7289eedbbe1592bdf7839bd47dfa939738b0f3997445091c414c2194",
+        "crates/trust-js/src/typedarray_allocation_tests.rs": "a09fbe02a05b7555cc48832ce0a028db91e5a51d2ad9279053694b013b94e304",
+        "crates/trust-js/src/typedarray_conversion_tests.rs": "0558ef9e14cecb256d587b7ecbe1d1f02dc58159dc679a9a2c40299153148829",
+        "crates/trust-js/src/typedarray_search_tests.rs": "f89514d6059a4c12b9c18ec73df6c01c12637b4d34934a9ec1cc02d979e07581",
+        "crates/trust-js/src/tz.rs": "a473285cd69480df9082fe9dba79664afd70b56614ba2fecfd2c7109d5cea91b",
+        "crates/trust-js/src/tzdata.rs": "3619ee28275dd2de90b7320211a29fbb77cea618a09d0d59d034504c01e58c4b",
+        "crates/trust-js/src/tzrules.rs": "d6b5607459e1643974aadb042a3b418ca7893b6e3fd16372b8c3494cd74db738",
+        "crates/trust-js/src/umalqura.rs": "c541c78962563bc2403ec6257a0dd03cc4c94b935074158dc407ea9c3987f80d",
+        "crates/trust-js/src/uncacheable_shape_tests.rs": "470856ce47f9f7bb296f9c1492b488c23fca20b5b36d3f1026e0a2f9c4ed2f28",
+        "crates/trust-js/src/unicode_collation.bin": "108490c6b490634122162e6826a83be1a14e9ef0021c90602ee2c9d33463b8a2",
+        "crates/trust-js/src/unicode_collation.rs": "0edbe821150824816d44bd1d3a919e60b86bffea88e641879a9f2422288cfc0d",
+        "crates/trust-js/src/unicode_norm.rs": "ebc080ac6e96fe377e6f3f7b6f59cfa376b4f3b011d0bac12a868cf9787f2a6a",
+        "crates/trust-js/src/unicode_norm_impl.rs": "21903c253005ca42644ed13bddedcf0fe2cf6a37f6250689911ed08445f5a2cb",
+        "crates/trust-js/src/unicode_props.rs": "793824aa74b6a4e1edf8984b10c30a66029e94afa0029f879d8f2aaf26241f39",
+        "crates/trust-js/src/unicode_segment.rs": "a52c76eb76b23b78d71f7cb3713364d5aea3d9682cac9bfd1409db4776425f76",
+        "crates/trust-js/src/units.rs": "2dd85febbab842fc443fdfdcfb05b75fb488764d612d4fce6621f7fb674a6f3f",
+        "crates/trust-js/src/value.rs": "becf8ba789d575e5e6a7d6ac8ecaf900f8140e62d07a1dcb25ac88e2c65d9c05",
+        "crates/trust-js/src/value_array_shift_tests.rs": "a2dedcffc14f27fd9a9bc0c2f3794338a3ed977ebc526df500fb0ff4b21aede3",
+        "crates/trust-js/src/value_dense_elements_tests.rs": "425f31a60170f51b9d9bf058687fb508b3dc098eb5160c3bc3756fb501447c54",
+        "crates/trust-js/src/value_host_array_tests.rs": "63679a6cfc2ecc1801c2f4282ba4850b2d770d5c2f0f7c1b2683b9ee05700ad1",
+        "crates/trust-js/src/value_numeric_mirror_tests.rs": "fdebf72fab6cbe2df089886f37985e888023b4815cb46b3a197c7ff2a759b5e5",
+        "crates/trust-js/src/weak_metadata.rs": "bffa68c6ed965f68d3019e78c556beabad8f929f01a9c8c4e576f1c1f4b1a808",
+        "crates/trust-js/src/workload_metrics.rs": "65c3e1791db6ecd6c3c7e3c21205589a28e354de02ebdc998b09207e72622f0f",
+        "crates/trust-js/tests/allocation_failure.rs": "29194d643923841a5fc46a3af24681069f7cd59297bdf4507e3cb82f6df3823c",
+        "crates/trust-js/tests/cldr-48/CollationTest_CLDR_NON_IGNORABLE_SHORT.txt": "7063c05ad292803f8d4269abc64e2ce50ab96d0038f799670ed325f9a5e20bb8",
+        "crates/trust-js/tests/math_random.rs": "57ea4cc52b46b5c03d04cebec23672c9ad07ef30f5db2ef510f4bed58c161bdd",
+        "crates/trust-js/tests/unicode-17.0.0/CollationTest_NON_IGNORABLE_SHORT.txt": "06a8d9d2191574c74623f66af960682feadeb714a9fa12ab4657c425f8683f53",
+        "crates/trust-js/tests/unicode-17.0.0/GraphemeBreakTest.txt": "e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec",
+        "crates/trust-js/tests/unicode-17.0.0/NormalizationTest.txt": "5019ffd530751a741900c849c0e010332f142a3612234639bd200b82138a87db",
+        "crates/trust-js/tests/unicode-17.0.0/SentenceBreakTest.txt": "12cb47d028ded0c1cb8a28558f95479cbcd24559c46977015c82f3b50a1cc6e4",
+        "crates/trust-js/tests/unicode-17.0.0/WordBreakTest.txt": "1de23a75f37904abc7d206239ee8d34f8fdf0fb4ab32a7174dfbabbde25419b2",
+        "Cargo.toml": "bfcea6964c4a4811a162e0d3dffbaf5961063dabbdb52902dfd56136ce26f2fa",
+        "Cargo.lock": "d3a26fd0cd4df4a536df4a685390bd1534b79b630afa6aef7d0908629bc87bce"
+      }
+    },
+    "root_frozen_v2_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/candidate-source-v2.json",
+      "sha256": "0a3122c9bfe0533cd17b5c389d0a154ece14c95712b7f6ca13f2d2d725bcbfa4",
+      "scope": "Root independently froze the integrated compiler-v2 source; whole-v2 validation/performance evidence belongs to its separate record."
+    }
+  },
+  "runs": [
+    {
+      "name": "candidate_optional_template",
+      "command": "env CARGO_TARGET_DIR=/big/Code/trust-js/target/compiler-review-20261014/checked-call-build TRUST_JS_OPT_JIT=0 TRUST_JS_INLINE_AT=0 taskset -c 10,11,13,14 cargo test -j4 -p trust-js --lib --features embed,optimizing-jit call_guard_tests -- --test-threads=1",
+      "log": "candidate-optional.log",
+      "passed": 13,
+      "failed": 0,
+      "elapsed_test_seconds": 2.56,
+      "exit_code": 0,
+      "log_sha256": "dd02de259d165f6d69fdb8b016b759853811341cbc2cf6842f7bc9b70dd43cb7",
+      "working_directory": "/tmp/trust-js-checked-call-20261014",
+      "raw_log": "   Compiling foldhash v0.2.0\n   Compiling cranelift-srcgen v0.136.2\n   Compiling libm v0.2.16\n   Compiling wasmtime-internal-core v49.0.2\n   Compiling cranelift-isle v0.136.2\n   Compiling hashbrown v0.17.1\n   Compiling cranelift-assembler-x64-meta v0.136.2\n   Compiling find-msvc-tools v0.1.14\n   Compiling shlex v2.0.1\n   Compiling object v0.39.1\n   Compiling cc v1.6.0\n   Compiling memchr v2.8.3\n   Compiling heck v0.5.0\n   Compiling cranelift-codegen-shared v0.136.2\n   Compiling cranelift-codegen-meta v0.136.2\n   Compiling cranelift-bitset v0.136.2\n   Compiling cranelift-assembler-x64 v0.136.2\n   Compiling target-lexicon v0.13.5\n   Compiling equivalent v1.0.2\n   Compiling allocator-api2 v0.2.21\n   Compiling bumpalo v3.20.3\n   Compiling indexmap v2.14.2\n   Compiling cranelift-entity v0.136.2\n   Compiling hashbrown v0.16.1\n   Compiling rustc-hash v2.1.3\n   Compiling arbitrary v1.5.0\n   Compiling log v0.4.34\n   Compiling cranelift-codegen v0.136.2\n   Compiling fnv v1.0.7\n   Compiling smallvec v1.16.2\n   Compiling regalloc2 v0.15.2\n   Compiling cranelift-control v0.136.2\n   Compiling gimli v0.33.0\n   Compiling ar_archive_writer v0.5.3\n   Compiling psm v0.1.32\n   Compiling cranelift-bforest v0.136.2\n   Compiling libc v0.2.190\n   Compiling stacker v0.1.25\n   Compiling cfg-if v1.0.5\n   Compiling cranelift-native v0.136.2\n   Compiling cranelift-frontend v0.136.2\n   Compiling trust-js v0.1.3 (/tmp/trust-js-checked-call-20261014/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 34s\n     Running unittests src/lib.rs (/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-02b40a0fd73d0540)\n\nrunning 13 tests\ntest call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation ... ok\ntest call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes ... ok\ntest call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap ... ok\ntest call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw ... ok\ntest call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments ... ok\ntest call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents ... ok\ntest call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement ... ok\ntest call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists ... ok\ntest call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity ... ok\ntest call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup ... ok\ntest call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters ... ok\ntest call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill ... ok\ntest call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards ... ok\n\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2264 filtered out; finished in 2.56s\n\n",
+      "raw_log_bytes": 3005,
+      "observed_test_names": [
+        [
+          "call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation",
+          "ok"
+        ],
+        [
+          "call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes",
+          "ok"
+        ],
+        [
+          "call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement",
+          "ok"
+        ],
+        [
+          "call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists",
+          "ok"
+        ],
+        [
+          "call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards",
+          "ok"
+        ]
+      ]
+    },
+    {
+      "name": "candidate_default_template",
+      "command": "env CARGO_TARGET_DIR=/big/Code/trust-js/target/compiler-review-20261014/checked-call-build TRUST_JS_OPT_JIT=0 TRUST_JS_INLINE_AT=0 taskset -c 10,11,13,14 cargo test -j4 -p trust-js --lib call_guard_tests -- --test-threads=1",
+      "log": "candidate-default.log",
+      "passed": 13,
+      "failed": 0,
+      "elapsed_test_seconds": 2.46,
+      "exit_code": 0,
+      "log_sha256": "499974a998c81609aba0286bf04588d716cf7f85aad7f69a814c9f4f99e1ed98",
+      "working_directory": "/tmp/trust-js-checked-call-20261014",
+      "raw_log": "   Compiling trust-js v0.1.3 (/tmp/trust-js-checked-call-20261014/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 09s\n     Running unittests src/lib.rs (/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-f7cc15ebe73eb7b5)\n\nrunning 13 tests\ntest call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation ... ok\ntest call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes ... ok\ntest call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap ... ok\ntest call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw ... ok\ntest call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments ... ok\ntest call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents ... ok\ntest call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement ... ok\ntest call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists ... ok\ntest call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity ... ok\ntest call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup ... ok\ntest call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters ... ok\ntest call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill ... ok\ntest call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards ... ok\n\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1990 filtered out; finished in 2.46s\n\n",
+      "raw_log_bytes": 1629,
+      "observed_test_names": [
+        [
+          "call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation",
+          "ok"
+        ],
+        [
+          "call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes",
+          "ok"
+        ],
+        [
+          "call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement",
+          "ok"
+        ],
+        [
+          "call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists",
+          "ok"
+        ],
+        [
+          "call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards",
+          "ok"
+        ]
+      ]
+    },
+    {
+      "name": "candidate_optional_forced_optimizer",
+      "command": "env TRUST_JS_OPT_JIT=1 TRUST_JS_INLINE_AT=0 taskset -c 10 /big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-02b40a0fd73d0540 call_guard_tests --test-threads=1",
+      "log": "candidate-optional-forced.log",
+      "passed": 13,
+      "failed": 0,
+      "elapsed_test_seconds": 37.02,
+      "exit_code": 0,
+      "log_sha256": "b534e02e37b62837866fbfeb4304f3cdca41d3686395de79f628e219c35564fa",
+      "working_directory": "/tmp/trust-js-checked-call-20261014",
+      "raw_log": "\nrunning 13 tests\ntest call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation ... ok\ntest call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes ... ok\ntest call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap ... ok\ntest call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw ... ok\ntest call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments ... ok\ntest call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents ... ok\ntest call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement ... ok\ntest call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists ... ok\ntest call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity ... ok\ntest call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup ... ok\ntest call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters ... ok\ntest call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill ... ok\ntest call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards ... ok\n\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2264 filtered out; finished in 37.02s\n\n",
+      "raw_log_bytes": 1330,
+      "observed_test_names": [
+        [
+          "call_guard_tests::cached_calls_still_dispatch_proxy_traps_and_revocation",
+          "ok"
+        ],
+        [
+          "call_guard_tests::cached_constructors_preserve_proxy_new_target_and_live_prototypes",
+          "ok"
+        ],
+        [
+          "call_guard_tests::calling_a_proxy_of_a_non_callable_target_never_reads_its_trap",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement",
+          "ok"
+        ],
+        [
+          "call_guard_tests::enabled_native_intrinsics_preserve_exotic_receivers_and_lists",
+          "ok"
+        ],
+        [
+          "call_guard_tests::fresh_closure_call_cache_uses_the_live_function_identity",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_intrinsic_dispatches_getownproperty_after_warmup",
+          "ok"
+        ],
+        [
+          "call_guard_tests::hasown_preserves_coercion_order_and_does_not_invoke_data_getters",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_disable_ordinary_call_and_construct_cache_fill",
+          "ok"
+        ],
+        [
+          "call_guard_tests::proxies_do_not_weaken_realm_or_class_call_guards",
+          "ok"
+        ]
+      ]
+    },
+    {
+      "name": "negative_control_old_parent_walk",
+      "command": "env CARGO_TARGET_DIR=/big/Code/trust-js/target/compiler-review-20261014/checked-call-build TRUST_JS_OPT_JIT=0 TRUST_JS_INLINE_AT=0 taskset -c 10,11,13,14 cargo test -j4 -p trust-js --lib --features embed,optimizing-jit checked_calls_ -- --test-threads=1",
+      "log": "baseline-parent-walk-control.log",
+      "passed": 1,
+      "failed": 3,
+      "exit_code": 101,
+      "expected_failure": true,
+      "only_source_change": "Restore original bounded lexical-parent Realm proof; retain borrowed-owner optimization and candidate fixtures.",
+      "negative_interpreter_sha256": "3691b47dfee3e5ade2254ee0bd9bdb5648672135b77d08af5646f5092f9798fd",
+      "log_sha256": "1b07c580f86ae898836863649547042154cf22f14fa4c362d556c2f35df94bff",
+      "working_directory": "/tmp/trust-js-checked-call-20261014",
+      "raw_log": "   Compiling trust-js v0.1.3 (/tmp/trust-js-checked-call-20261014/crates/trust-js)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.65s\n     Running unittests src/lib.rs (/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-02b40a0fd73d0540)\n\nrunning 4 tests\ntest call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw ... ok\ntest call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments ... FAILED\ntest call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents ... FAILED\ntest call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement ... FAILED\n\nfailures:\n\n---- call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments stdout ----\n\nthread 'call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments' (3339349) panicked at crates/trust-js/src/call_guard_tests.rs:333:18:\ndeep same-Realm closure fills the native call cache\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents stdout ----\n\nthread 'call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents' (3339354) panicked at crates/trust-js/src/call_guard_tests.rs:100:18:\nprivate self-hosted method fills the native call cache\n\n---- call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement stdout ----\n\nthread 'call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement' (3339357) panicked at crates/trust-js/src/call_guard_tests.rs:173:5:\nassertion `left != right` failed\n  left: 273903285259696\n right: 273903285259696\n\n\nfailures:\n    call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments\n    call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents\n    call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement\n\ntest result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 2273 filtered out; finished in 0.69s\n\nerror: test failed, to rerun pass `-p trust-js --lib`\n",
+      "raw_log_bytes": 2309,
+      "observed_test_names": [
+        [
+          "call_guard_tests::checked_calls_borrow_last_callee_owner_through_gc_return_and_throw",
+          "ok"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_deep_same_realm_closures_without_flattening_environments",
+          "FAILED"
+        ],
+        [
+          "call_guard_tests::checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents",
+          "FAILED"
+        ],
+        [
+          "call_guard_tests::checked_calls_use_creation_realm_after_host_environment_replacement",
+          "FAILED"
+        ]
+      ]
+    }
+  ],
+  "binary_provenance": {
+    "current_optional_path": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-02b40a0fd73d0540",
+      "bytes": 224367936,
+      "sha256": "58159f297a4c9e46db5021cc3651c3030c43e639f4271334fdfb7854f97d077b",
+      "role": "CONTROL ONLY: contains restored old bounded parent walk, expected three failing cache-admission/refill fixtures. Do not use as candidate correctness/performance artifact.",
+      "source_restoration_did_not_rebuild_this_binary": true,
+      "optional_candidate_binary_overwritten": true
+    },
+    "default_candidate_binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-f7cc15ebe73eb7b5",
+      "bytes": 168048360,
+      "sha256": "dcc22ae5fa5255665b6840a8184292828a19295bb1564d391542a0177fb384b0",
+      "role": "default-feature candidate correctness artifact"
+    },
+    "original_optional_candidate_binary": "Original optional-feature candidate executable ran the two passing optional selections, then was overwritten by the explicit negative-control rebuild at the same path. No pre-overwrite executable hash was captured; exact tested source hashes and full raw logs are preserved."
+  },
+  "negative_control": {
+    "expected_failure": true,
+    "only_source_change": "Restore exact original bounded lexical-parent Realm proof in isolated interpreter.rs; retain borrowed-owner optimization and all candidate fixtures.",
+    "interpreter_sha256": "3691b47dfee3e5ade2254ee0bd9bdb5648672135b77d08af5646f5092f9798fd",
+    "assertions_that_fail": [
+      "Parentless self-hosted native cache fill",
+      "Deep same-Realm native cache fill",
+      "Active-genv cache refill after host environment replacement"
+    ],
+    "functional_results_before_path_assertions": "Observable JS result assertions pass; failures are private cache admission and active-global-env refill assertions.",
+    "owner_lifetime_fixture": "Still passes both return and throw cases and checks both the last callee object and captured payload destruction.",
+    "control_binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/checked-call-build/debug/deps/trust_js-02b40a0fd73d0540",
+      "bytes": 224367936,
+      "sha256": "58159f297a4c9e46db5021cc3651c3030c43e639f4271334fdfb7854f97d077b",
+      "role": "CONTROL ONLY: contains restored old bounded parent walk, expected three failing cache-admission/refill fixtures. Do not use as candidate correctness/performance artifact.",
+      "source_restoration_did_not_rebuild_this_binary": true,
+      "optional_candidate_binary_overwritten": true
+    },
+    "candidate_source_after_control": "Restored exact previously passing source by SHA256 for all three changed files; no restoration-only rebuild performed."
+  },
+  "node_oracle": {
+    "command": "taskset -c 0 node --expose-gc target/compiler-review-20261014/validation/checked-call-node/run.cjs",
+    "working_directory": "/big/Code/trust-js",
+    "version": "v24.21.0",
+    "result": {
+      "node_version": "v24.21.0",
+      "exposed_gc": true,
+      "checks": 9,
+      "all_passed": true,
+      "results": [
+        {
+          "name": "checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents",
+          "adaptation": "Node vm Realm harness; $262.gc maps to Node --expose-gc. JS snippets unchanged.",
+          "checks": [
+            {
+              "field": "setup",
+              "expected": "2,,4",
+              "actual": "2,,4",
+              "ok": true
+            },
+            {
+              "field": "expression",
+              "expected": "2:2:true:true",
+              "actual": "2:2:true:true",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "name": "checked_calls_use_creation_realm_after_host_environment_replacement",
+          "adaptation": "Node vm Realm harness. Rust-only switch_host_job_context cannot be reproduced in Node; no host-environment replacement claimed.",
+          "checks": [
+            {
+              "field": "setup",
+              "expected": "ready",
+              "actual": "ready",
+              "ok": true
+            },
+            {
+              "field": "expression",
+              "expected": "8",
+              "actual": "8",
+              "ok": true
+            },
+            {
+              "field": "followup",
+              "expected": "true",
+              "actual": "true",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "name": "checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_1",
+          "adaptation": "Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.",
+          "checks": [
+            {
+              "field": "expression",
+              "expected": "18",
+              "actual": "18",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "name": "checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_2",
+          "adaptation": "Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.",
+          "checks": [
+            {
+              "field": "expression",
+              "expected": "owned throw",
+              "actual": "owned throw",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "name": "checked_calls_cache_deep_same_realm_closures_without_flattening_environments",
+          "adaptation": "Rust-generated JS constructed identically; Node vm Realm harness + exposed gc; Rust cache/depth assertions excluded.",
+          "checks": [
+            {
+              "field": "setup",
+              "expected": "56",
+              "actual": "56",
+              "ok": true
+            },
+            {
+              "field": "expression",
+              "expected": "65",
+              "actual": "65",
+              "ok": true
+            }
+          ]
+        }
+      ]
+    },
+    "embedded_artifacts": {
+      "run.cjs": {
+        "original_path": "/big/Code/trust-js/target/compiler-review-20261014/validation/checked-call-node/run.cjs",
+        "bytes": 1276,
+        "sha256": "29367c9c32bcc317ef647062b03fc10b5698e38cd6076c53507c7cc2580f92db",
+        "text": "const fs = require('node:fs');\nconst vm = require('node:vm');\nconst path = require('node:path');\nconst dir = __dirname;\nconst fixtures = JSON.parse(fs.readFileSync(path.join(dir,'fixtures.json'),'utf8'));\nconst results=[];\nfor(const fixture of fixtures){\n const context=vm.createContext({});\n context.$262={createRealm(){const realm=vm.createContext({});return {global:vm.runInContext('globalThis',realm)};},gc:global.gc};\n const checks=[];\n for(const [field,expected] of [['setup',fixture.setup_expected],['expression',fixture.expected],['followup',fixture.followup_expected]]){\n  if(fixture[field]===undefined)continue;\n  const actual=String(vm.runInContext(fixture[field],context));\n  if(expected!==undefined){const ok=actual===expected;checks.push({field,expected,actual,ok});if(!ok)throw new Error(fixture.name+': '+field+' '+actual+' != '+expected);}\n }\n results.push({name:fixture.name,adaptation:fixture.adaptation,checks});\n}\nconst result={node_version:process.version,exposed_gc:typeof global.gc==='function',checks:results.reduce((n,r)=>n+r.checks.length,0),all_passed:true,results};\nfs.writeFileSync(path.join(dir,'result.json'),JSON.stringify(result,null,2)+'\\n');\nconsole.log(JSON.stringify({node_version:process.version,checks:result.checks,all_passed:true}));\n"
+      },
+      "fixtures.json": {
+        "original_path": "/big/Code/trust-js/target/compiler-review-20261014/validation/checked-call-node/fixtures.json",
+        "bytes": 6337,
+        "sha256": "ba8e840e2fda5e67a0ce072511fddc7fcb325112494f81b252a178e7e32a8080",
+        "text": "[\n  {\n    \"name\": \"checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents\",\n    \"setup\": \"\\n            var foreign = $262.createRealm().global;\\n            var mappingMethod = Array.prototype.map;\\n            function callback(x) { return x + 1; }\\n            function mapDrive(values, fn) { return values.map(fn).join(','); }\\n            var result;\\n            for (var n=0; n<12; n++) result = mapDrive([1,,3], callback);\\n            result\\n        \",\n    \"setup_expected\": \"2,,4\",\n    \"expression\": \"\\n            var calls = 0;\\n            try {\\n                mapDrive([1,2,3], function (x) { calls++; if (x === 2) throw x; return x; });\\n            } catch (error) { result = error + ':' + calls; }\\n            var foreignResult = foreign.Array.prototype.map.call([4], callback);\\n            result + ':' + (Object.getPrototypeOf(foreignResult) === foreign.Array.prototype)\\n                + ':' + (Object.getPrototypeOf(mapDrive([5], callback)) === String.prototype)\\n        \",\n    \"expected\": \"2:2:true:true\",\n    \"adaptation\": \"Node vm Realm harness; $262.gc maps to Node --expose-gc. JS snippets unchanged.\"\n  },\n  {\n    \"name\": \"checked_calls_use_creation_realm_after_host_environment_replacement\",\n    \"setup\": \"\\n        var foreign = $262.createRealm().global;\\n        function realmLeaf(x) { return x + 3; }\\n        function realmDrive(fn, x) { return fn(x); }\\n        for (var n=0; n<12; n++) realmDrive(realmLeaf, n);\\n        'ready'\\n    \",\n    \"setup_expected\": \"ready\",\n    \"expression\": \"\\n        Object.setPrototypeOf(realmLeaf, foreign.Function.prototype);\\n        realmDrive(realmLeaf, 5)\\n    \",\n    \"expected\": \"8\",\n    \"followup\": \"\\n        var proxyCalls = 0;\\n        var proxy = new Proxy(realmLeaf, {apply(f,t,a) { proxyCalls++; return Reflect.apply(f,t,a); }});\\n        class ClassOnly {}\\n        var checks = realmDrive(proxy, 6) === 9 && proxyCalls === 1\\n            && realmDrive(realmLeaf.bind(null), 7) === 10;\\n        try { realmDrive(ClassOnly, 0); checks = false; }\\n        catch (error) { checks = checks && error instanceof TypeError; }\\n        foreign.eval('globalThis.foreignLeaf = function(x) { return [x+4, new TypeError()]; };');\\n        var foreignAnswer = realmDrive(foreign.foreignLeaf, 5);\\n        checks = checks && foreignAnswer[0] === 9\\n            && foreignAnswer[1] instanceof foreign.TypeError\\n            && !(foreignAnswer[1] instanceof TypeError);\\n        var scoped, scope = {marker: 11};\\n        with (scope) { scoped = function() { return marker; }; }\\n        checks = checks && realmDrive(scoped, 0) === 11;\\n        scope.marker = 12;\\n        checks && realmDrive(scoped, 0) === 12\\n    \",\n    \"followup_expected\": \"true\",\n    \"adaptation\": \"Node vm Realm harness. Rust-only switch_host_job_context cannot be reproduced in Node; no host-environment replacement claimed.\"\n  },\n  {\n    \"name\": \"checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_1\",\n    \"setup\": \"\\n            var foreign = $262.createRealm().global;\\n            var token = {number: 17};\\n            function make(token) {\\n                return function (x) {\\n                    var home = x;\\n                    function capture() { return home; }\\n                    var number = token.number;\\n                    if (x) {\\n                        victim.prototype = null;\\n                        victim = null;\\n                        $262.gc();\\n                        if (x === 2) throw 'owned throw';\\n                    }\\n                    return number + capture();\\n                };\\n            }\\n            var victim = make(token);\\n            function checkedDrive(f, x) { return f((f=null,x)); }\\n            for (var n=0; n<12; n++) checkedDrive(victim, 0);\\n        \",\n    \"expression\": \"token=null; try { checkedDrive(victim,1) } catch(error) { error }\",\n    \"expected\": \"18\",\n    \"adaptation\": \"Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.\"\n  },\n  {\n    \"name\": \"checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_2\",\n    \"setup\": \"\\n            var foreign = $262.createRealm().global;\\n            var token = {number: 17};\\n            function make(token) {\\n                return function (x) {\\n                    var home = x;\\n                    function capture() { return home; }\\n                    var number = token.number;\\n                    if (x) {\\n                        victim.prototype = null;\\n                        victim = null;\\n                        $262.gc();\\n                        if (x === 2) throw 'owned throw';\\n                    }\\n                    return number + capture();\\n                };\\n            }\\n            var victim = make(token);\\n            function checkedDrive(f, x) { return f((f=null,x)); }\\n            for (var n=0; n<12; n++) checkedDrive(victim, 0);\\n        \",\n    \"expression\": \"token=null; try { checkedDrive(victim,2) } catch(error) { error }\",\n    \"expected\": \"owned throw\",\n    \"adaptation\": \"Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.\"\n  },\n  {\n    \"name\": \"checked_calls_cache_deep_same_realm_closures_without_flattening_environments\",\n    \"setup\": \"\\n        var foreign = $262.createRealm().global;\\n        var deep = (function () { let capture0=0; return (function () { let capture1=1; return (function () { let capture2=2; return (function () { let capture3=3; return (function () { let capture4=4; return (function () { let capture5=5; return (function () { let capture6=6; return (function () { let capture7=7; return (function () { let capture8=8; return (function () { let capture9=9; return function (x) { return capture0+capture1+capture2+capture3+capture4+capture5+capture6+capture7+capture8+capture9+x; }; })(); })(); })(); })(); })(); })(); })(); })(); })(); })();\\n        function deepDrive(f, x) { return f(x); }\\n        var answer;\\n        for(var n=0;n<12;n++) answer = deepDrive(deep, n);\\n        answer\\n    \",\n    \"setup_expected\": \"56\",\n    \"expression\": \"$262.gc(); deepDrive(deep, 20)\",\n    \"expected\": \"65\",\n    \"adaptation\": \"Rust-generated JS constructed identically; Node vm Realm harness + exposed gc; Rust cache/depth assertions excluded.\"\n  }\n]\n"
+      },
+      "result.json": {
+        "original_path": "/big/Code/trust-js/target/compiler-review-20261014/validation/checked-call-node/result.json",
+        "bytes": 2574,
+        "sha256": "29ae6d264c4445a109eb18224e9d653f5dfe73cbcc6501b1a5739d07b1864b86",
+        "text": "{\n  \"node_version\": \"v24.21.0\",\n  \"exposed_gc\": true,\n  \"checks\": 9,\n  \"all_passed\": true,\n  \"results\": [\n    {\n      \"name\": \"checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents\",\n      \"adaptation\": \"Node vm Realm harness; $262.gc maps to Node --expose-gc. JS snippets unchanged.\",\n      \"checks\": [\n        {\n          \"field\": \"setup\",\n          \"expected\": \"2,,4\",\n          \"actual\": \"2,,4\",\n          \"ok\": true\n        },\n        {\n          \"field\": \"expression\",\n          \"expected\": \"2:2:true:true\",\n          \"actual\": \"2:2:true:true\",\n          \"ok\": true\n        }\n      ]\n    },\n    {\n      \"name\": \"checked_calls_use_creation_realm_after_host_environment_replacement\",\n      \"adaptation\": \"Node vm Realm harness. Rust-only switch_host_job_context cannot be reproduced in Node; no host-environment replacement claimed.\",\n      \"checks\": [\n        {\n          \"field\": \"setup\",\n          \"expected\": \"ready\",\n          \"actual\": \"ready\",\n          \"ok\": true\n        },\n        {\n          \"field\": \"expression\",\n          \"expected\": \"8\",\n          \"actual\": \"8\",\n          \"ok\": true\n        },\n        {\n          \"field\": \"followup\",\n          \"expected\": \"true\",\n          \"actual\": \"true\",\n          \"ok\": true\n        }\n      ]\n    },\n    {\n      \"name\": \"checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_1\",\n      \"adaptation\": \"Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.\",\n      \"checks\": [\n        {\n          \"field\": \"expression\",\n          \"expected\": \"18\",\n          \"actual\": \"18\",\n          \"ok\": true\n        }\n      ]\n    },\n    {\n      \"name\": \"checked_calls_borrow_last_callee_owner_through_gc_return_and_throw_mode_2\",\n      \"adaptation\": \"Node vm Realm harness + exposed gc; Rust Weak/destructor/private cache assertions excluded.\",\n      \"checks\": [\n        {\n          \"field\": \"expression\",\n          \"expected\": \"owned throw\",\n          \"actual\": \"owned throw\",\n          \"ok\": true\n        }\n      ]\n    },\n    {\n      \"name\": \"checked_calls_cache_deep_same_realm_closures_without_flattening_environments\",\n      \"adaptation\": \"Rust-generated JS constructed identically; Node vm Realm harness + exposed gc; Rust cache/depth assertions excluded.\",\n      \"checks\": [\n        {\n          \"field\": \"setup\",\n          \"expected\": \"56\",\n          \"actual\": \"56\",\n          \"ok\": true\n        },\n        {\n          \"field\": \"expression\",\n          \"expected\": \"65\",\n          \"actual\": \"65\",\n          \"ok\": true\n        }\n      ]\n    }\n  ]\n}\n"
+      },
+      "source-inventory.json": {
+        "original_path": "/big/Code/trust-js/target/compiler-review-20261014/validation/checked-call-node/source-inventory.json",
+        "bytes": 210,
+        "sha256": "4d97c8dfb8282c0f2872a43e064421dfb3d5432bd5de57d31fc0e039afbb7352",
+        "text": "{\n  \"source\": \"/tmp/trust-js-checked-call-20261014/crates/trust-js/src/call_guard_tests.rs\",\n  \"sha256\": \"f6d65f87f7c5cb6f1ca1fb95cb7e230194757f0c4ee3d4cec887203f8df5493b\",\n  \"node_private_assertions\": false\n}\n"
+      }
+    },
+    "adaptation_limits": [
+      "Two Node vm contexts implement the $262.createRealm host harness.",
+      "Exposed Node gc implements $262.gc; authored JS snippets remain unchanged, and the deep-closure source is constructed identically to Rust.",
+      "Node cannot reproduce Rust switch_host_job_context; no Node validation of host-environment replacement is claimed.",
+      "Private native/cache counters, Rust Scope-depth assertions and Weak/destructor checks are validated by engine tests and excluded from Node claims."
+    ]
+  },
+  "limits": [
+    "Focused ARM64 Linux correctness evidence. This record establishes neither x86-64/wasm32 correctness nor whole-engine conformance.",
+    "No throughput, startup, compilation-cost, memory improvement or application speedup is claimed from these test durations.",
+    "Forced-optimizer selection passed the same cache/semantic tests; unsupported bodies may retain the template tier under the established eligibility policy.",
+    "The expected failing negative-control executable is not a candidate artifact. Browser candidate v2 and its performance/validation manifests are managed separately."
+  ]
+}

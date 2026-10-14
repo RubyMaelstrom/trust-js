@@ -5,6 +5,10 @@ policy. The local investigation runners and provisioning helpers have been remov
 
 ## Regression policy
 
+- Prioritize Speedometer 3.1 segments and actual browser pages using widely used frameworks
+  for engine performance acceptance. Selected suites are sufficient for iteration; a full
+  Speedometer run is optional. Record the exact subset and per-suite results, and never label
+  a partial run as a full Speedometer score. Synthetic tests provide diagnostic controls.
 - Standards, Test262/WPT, tier-differential, and real-site failures are release blockers regardless
   of performance.
 - Compare interleaved distributions from the same manifest and machine. Do not promote a single
@@ -71,3 +75,8 @@ The 2026-10-14 investigation is documented in
 [the pinned Ladybird source comparison](../docs/ladybird-comparison-2026-10-14.txt).
 The `review-*-2026-10-14.json` files retain versioned samples and validation evidence;
 earlier candidates remain in the record when a regression required further work.
+
+The [compiler checkpoint](../docs/compiler-review-2026-10-14.txt) records the separate
+inlining, range-analysis and property-proof work, its exact validation artifacts, and
+selected browser methodology. Correctness records and diagnostic profiles do not by
+themselves establish application performance acceptance.

@@ -75,7 +75,28 @@ impl Lowering<'_, '_> {
         object
     }
 
-    fn element_index(&mut self, key: Value, known_number: bool, slow: Block) -> Value {
+    fn element_index(
+        &mut self,
+        key: Value,
+        known_number: bool,
+        range: Option<ranges::IntegerRange>,
+        integer: Option<Value>,
+        slow: Block,
+    ) -> Value {
+        if range.is_some_and(ranges::IntegerRange::index) {
+            #[cfg(test)]
+            ranges::record_index_proof();
+            if let Some(integer) = integer {
+                #[cfg(test)]
+                integers::record(1);
+                // The proof is the exact nonnegative Number key; live dense
+                // storage bounds and descriptor checks still apply below.
+                return integer;
+            }
+            let number = self.b.ins().bitcast(types::F64, MemFlags::new(), key);
+            let index = self.b.ins().fcvt_to_uint_sat(types::I32, number);
+            return self.b.ins().uextend(types::I64, index);
+        }
         let string = (!known_number).then(|| self.b.create_block());
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I64);
@@ -353,8 +374,10 @@ impl Lowering<'_, '_> {
             self.stack_read(2)
         };
         let key = self.stack_read(1);
-        let numeric_key = self.input_types().top.is_number();
-        let index = self.element_index(key, numeric_key, slow);
+        let range = self.input_ranges().top;
+        let numeric_key = self.input_types().top.is_number() || range.is_some();
+        let integer = self.stack_integer(1);
+        let index = self.element_index(key, numeric_key, range, integer, slow);
         let object = self.element_receiver(receiver, slow);
         let (property, value) = self.element_property(object, index, slow);
         self.property_data(property, false, slow);
@@ -394,8 +417,11 @@ impl Lowering<'_, '_> {
         };
         let key = self.stack_read(2);
         let incoming = self.stack_read(1);
-        let numeric_key = self.input_types().second.is_number();
-        let index = self.element_index(key, numeric_key, slow);
+        let incoming_integer = self.stack_integer(1);
+        let range = self.input_ranges().second;
+        let numeric_key = self.input_types().second.is_number() || range.is_some();
+        let integer = self.stack_integer(2);
+        let index = self.element_index(key, numeric_key, range, integer, slow);
         let object = self.element_receiver(receiver, slow);
         let (property, old) = self.element_property(object, index, slow);
         self.property_data(property, true, slow);
@@ -414,7 +440,7 @@ impl Lowering<'_, '_> {
         self.element_mirror_store(object, index, incoming);
         let consumed = if local { 2 } else { 3 };
         if keep {
-            self.stack_write(consumed, incoming);
+            self.stack_write_integer(consumed, incoming, incoming_integer);
         }
         self.change_top(-8 * (consumed - usize::from(keep)) as i64);
         self.jump_normal(next);

@@ -542,6 +542,7 @@ fn function_profile_enter(
     closure: &Env,
     fn_obj: &Gc,
     realm_key: usize,
+    genv: usize,
 ) -> Option<FunctionProfileGuard> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     static SOURCE: OnceLock<bool> = OnceLock::new();
@@ -572,7 +573,7 @@ fn function_profile_enter(
             // In particular, do not call an author's getters or keep extra JS
             // roots alive. This distinguishes a slow caller from a callee whose
             // compiled entry is unavailable or ineligible for cached dispatch.
-            let compiled = func.execution_code();
+            let compiled = func.execution_code_for(genv);
             let chunk = compiled.and_then(Option::as_ref);
             let code = chunk.and_then(|chunk| chunk.jit.get());
             let tier = match (compiled, chunk, code) {
@@ -4523,6 +4524,31 @@ impl Interp {
         *self.array_iteration_protector.borrow_mut() = Default::default();
     }
 
+    /// Exchange an owned Realm snapshot with the active one. Cross-Realm calls
+    /// retain the caller's owners in `saved` until return, so transferring those
+    /// owners avoids cloning and dropping every intrinsic twice per boundary.
+    /// The registry still owns the target snapshot throughout author execution.
+    pub(crate) fn swap_realm(&mut self, saved: &mut RealmState) {
+        std::mem::swap(&mut self.global, &mut saved.global);
+        std::mem::swap(&mut self.global_env, &mut saved.global_env);
+        std::mem::swap(&mut self.global_var_names, &mut saved.global_var_names);
+        std::mem::swap(&mut self.host_job_context, &mut saved.host_job_context);
+        std::mem::swap(&mut self.object_proto, &mut saved.object_proto);
+        std::mem::swap(&mut self.function_proto, &mut saved.function_proto);
+        std::mem::swap(&mut self.array_proto, &mut saved.array_proto);
+        std::mem::swap(&mut self.array_ctor, &mut saved.array_ctor);
+        std::mem::swap(&mut self.string_proto, &mut saved.string_proto);
+        std::mem::swap(&mut self.number_proto, &mut saved.number_proto);
+        std::mem::swap(&mut self.boolean_proto, &mut saved.boolean_proto);
+        std::mem::swap(&mut self.symbol_proto, &mut saved.symbol_proto);
+        std::mem::swap(&mut self.error_protos, &mut saved.error_protos);
+        std::mem::swap(&mut self.eval_fn, &mut saved.eval_fn);
+        std::mem::swap(&mut self.extra_protos, &mut saved.extra_protos);
+        self.elems_protector.set((0, false));
+        self.species_protector.set((0, u32::MAX));
+        *self.array_iteration_protector.borrow_mut() = Default::default();
+    }
+
     /// Select the global lexical state associated with an embedder settings
     /// object while retaining this ECMAScript realm's global object and
     /// intrinsics. Context zero is the default standalone state.
@@ -4790,16 +4816,14 @@ impl Interp {
             Value::Obj(o) => Rc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
         };
-        let realm = match self.realms.get(&ptr) {
+        let mut saved = match self.realms.get(&ptr) {
             Some(r) => r.snapshot_clone(),
             None => return Err(self.throw("TypeError", "unknown realm")),
         };
-        let saved = self.snapshot_realm();
-        self.restore_realm(&realm);
+        self.swap_realm(&mut saved);
         let result = body(self);
-        let updated = self.snapshot_realm();
-        self.realms.insert(ptr, updated);
-        self.restore_realm(&saved);
+        self.swap_realm(&mut saved);
+        self.realms.insert(ptr, saved);
         result
     }
 }
@@ -4844,19 +4868,17 @@ impl Interp {
             Value::Obj(global) => Rc::as_ptr(global) as usize,
             _ => return Err(self.make_error("TypeError", "not a realm global")),
         };
-        let target = match self.realms.get(&key) {
+        let mut saved = match self.realms.get(&key) {
             Some(realm) => realm.snapshot_clone(),
             None => return Err(self.make_error("TypeError", "unknown realm")),
         };
-        let saved = self.snapshot_realm();
-        self.restore_realm(&target);
+        self.swap_realm(&mut saved);
         Ok((key, saved))
     }
 
-    pub(crate) fn leave_embed_realm(&mut self, key: usize, saved: RealmState) {
-        let updated = self.snapshot_realm();
-        self.realms.insert(key, updated);
-        self.restore_realm(&saved);
+    pub(crate) fn leave_embed_realm(&mut self, key: usize, mut saved: RealmState) {
+        self.swap_realm(&mut saved);
+        self.realms.insert(key, saved);
     }
 
     /// Run one embedder operation with `realm_global` installed as the active
@@ -12301,7 +12323,17 @@ impl Interp {
         }
         self.construct_capacity_hints
             .retain(|_, (pin, _)| pin.strong_count() != 0);
-        self.global_env_pins.retain(|pin| pin.strong_count() != 0);
+        if self
+            .global_env_pins
+            .iter()
+            .any(|pin| pin.strong_count() == 0)
+        {
+            // Call/construct/overflow entries can outlive a host settings environment,
+            // especially when their callee is native or their AST serves another Realm.
+            // Fence every raw genv comparison BEFORE releasing allocation-header pins.
+            crate::bytecode::invalidate_call_caches();
+            self.global_env_pins.retain(|pin| pin.strong_count() != 0);
+        }
         self.htmldda.retain(|_, pin| pin.strong_count() != 0);
         self.symbol_agent
             .borrow_mut()
@@ -12586,13 +12618,11 @@ impl Interp {
                 // a caller-realm Array); invoking the trap function swaps on its own.
                 if !self.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
                     if let Some(gptr) = self.callee_realm_global(o) {
-                        let saved = self.snapshot_realm();
-                        let target = self.realms[&gptr].snapshot_clone();
-                        self.restore_realm(&target);
+                        let mut saved = self.realms[&gptr].snapshot_clone();
+                        self.swap_realm(&mut saved);
                         let r = self.call_dispatch(callee, this, args);
-                        let updated = self.snapshot_realm();
-                        self.realms.insert(gptr, updated);
-                        self.restore_realm(&saved);
+                        self.swap_realm(&mut saved);
+                        self.realms.insert(gptr, saved);
                         return r;
                     }
                 }
@@ -12602,10 +12632,23 @@ impl Interp {
     }
 
     /// The realm (keyed by its global's pointer) a function belongs to, when it is NOT the active
-    /// realm. A user function's realm is the one whose global scope its environment chain is
-    /// rooted in; anything else is resolved by finding which realm's %Function.prototype% sits on
-    /// its prototype chain.
+    /// realm. A user function's immutable [[Realm]] is recorded at creation; its lexical
+    /// environment and mutable [[Prototype]] do not determine that identity. Other callables
+    /// retain their existing native registration/prototype lookup.
     pub(crate) fn callee_realm_global(&self, obj: &Gc) -> Option<usize> {
+        if let Callable::User(user) = &obj.borrow().call {
+            // ECMA-262 e28783d5 GetFunctionRealm / PrepareForOrdinaryCall use [[Realm]].
+            // User callables are freshly allocated by make_fn, never native registrations.
+            // Host settings may replace the active global environment, and author code may
+            // replace [[Prototype]]; neither changes this immutable creation identity.
+            // An author closure's Env chain retains its defining global scope's immutable
+            // internal `this` binding. That edge keeps the Realm global live through GC even
+            // after host settings replace the RealmState's current global environment.
+            let realm = user.realm;
+            return (realm != Rc::as_ptr(&self.global) as usize
+                && self.realms.contains_key(&realm))
+            .then_some(realm);
+        }
         if let Some((_, realm)) = self
             .native_function_realms
             .borrow()
@@ -12614,34 +12657,6 @@ impl Interp {
             return (*realm != Rc::as_ptr(&self.global) as usize
                 && self.realms.contains_key(realm))
             .then_some(*realm);
-        }
-        if let Callable::User(user) = &obj.borrow().call {
-            // Walk to the scope root by raw pointer — every hop is kept alive transitively by
-            // `env` (which the callee's `call` field owns) and nothing mutates the parent links,
-            // so this skips a refcount round-trip per hop on every construct/call that asks.
-            let root = {
-                let mut cur: *const RefCell<Scope> = Rc::as_ptr(&user.env);
-                loop {
-                    let parent = unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) };
-                    match parent {
-                        Some(p) => cur = p,
-                        None => break,
-                    }
-                }
-                cur
-            };
-            // The overwhelmingly common case: the callee closes over THIS realm's global scope.
-            if root == Rc::as_ptr(&self.global_env) {
-                return None;
-            }
-            for (g, rs) in &self.realms {
-                if root == Rc::as_ptr(&rs.global_env) {
-                    if Rc::ptr_eq(&rs.global, &self.global) {
-                        return None;
-                    }
-                    return Some(*g);
-                }
-            }
         }
         let mut cur = obj.borrow().proto.clone();
         let mut hops = 0;
@@ -13565,17 +13580,17 @@ impl Interp {
         };
         let current_key = Rc::as_ptr(&self.global) as usize;
         if self.realms.len() > 1 && target_key != 0 && target_key != current_key {
-            if let Some(target) = self.realms.get(&target_key).map(RealmState::snapshot_clone) {
-                let saved = self.snapshot_realm();
-                self.restore_realm(&target);
-                self.switch_host_job_context(target.host_job_context);
+            if let Some(mut saved) = self.realms.get(&target_key).map(RealmState::snapshot_clone) {
+                let target_context = saved.host_job_context;
+                let caller_context = self.host_job_context;
+                self.swap_realm(&mut saved);
+                self.switch_host_job_context(target_context);
                 self.suspend_gc();
                 let result = self.call_user_active(func, closure, this, args, is_construct, fn_obj);
                 self.resume_gc();
-                let updated = self.snapshot_realm();
-                self.realms.insert(target_key, updated);
-                self.restore_realm(&saved);
-                self.switch_host_job_context(saved.host_job_context);
+                self.swap_realm(&mut saved);
+                self.realms.insert(target_key, saved);
+                self.switch_host_job_context(caller_context);
                 return result;
             }
         }
@@ -13793,9 +13808,9 @@ impl Interp {
     ) {
         let runs = chunk.jit_runs.get().saturating_add(1);
         chunk.jit_runs.set(runs);
-        // Prepared bodies currently dispatch their original chunk after FDI, rather than
-        // Function::code2; do not publish a second stage they cannot consume.
-        if chunk.inline_retry_due(runs) && !chunk.prepared_entry {
+        // A prepared body retains its original FunctionDeclarationInstantiation even when
+        // its canonical caller chunk is recompiled with frame-independent callee splices.
+        if chunk.inline_retry_due(runs) {
             self.try_inline_recompile(func, chunk, realm, global_env);
         }
     }
@@ -14200,7 +14215,13 @@ impl Interp {
             return;
         }
         crate::jit::perf_inline_attempt();
-        let plan = crate::bytecode::plan_inlines(chunk, func, realm, genv);
+        // A cached native checkpoint must still describe the active Realm. Borrow its live
+        // environment for planning; raw addresses cannot manufacture a lifetime pin.
+        if genv != Rc::as_ptr(&self.global_env) as usize {
+            crate::jit::perf_inline_suppressed();
+            return;
+        }
+        let plan = crate::bytecode::plan_inlines(chunk, func, realm, &self.global_env);
         if plan.is_empty() {
             crate::jit::perf_inline_empty_plan();
             if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
@@ -14364,7 +14385,7 @@ impl Interp {
                     if same_realm {
                         let runtime = user
                             .func
-                            .execution_code()
+                            .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
                             .and_then(Option::as_ref)
                             .filter(|initializer_chunk| {
                                 initializer_chunk
@@ -14969,7 +14990,7 @@ impl Interp {
             }
             (b.props.shape(), slot as u32)
         };
-        let chunk = match func.execution_code() {
+        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -15077,24 +15098,13 @@ impl Interp {
         if env.borrow().under_with {
             return None;
         }
-        if self.multi_realm() {
-            type ScopeCell = RefCell<Scope>;
-            let mut cur: *const ScopeCell = Rc::as_ptr(&env);
-            let root_is_active = 'walk: {
-                for _ in 0..8 {
-                    if cur == Rc::as_ptr(&self.global_env) {
-                        break 'walk true;
-                    }
-                    match unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) } {
-                        Some(p) => cur = p,
-                        None => break 'walk false,
-                    }
-                }
-                false
-            };
-            if !root_is_active {
-                return None;
-            }
+        // PrepareForOrdinaryCall selects immutable [[Realm]], independently of
+        // [[Environment]] and the function object's mutable prototype. Private
+        // self-hosted environments have no global parent, and host settings may
+        // replace a Realm's global environment while ordinary closures survive.
+        // Cache fills still pin and guard the currently active global environment.
+        if self.multi_realm() && realm != Rc::as_ptr(&self.global) as usize {
+            return None;
         }
         if !self.class_info.is_empty() && self.class_info.contains_key(&(Rc::as_ptr(o) as usize)) {
             return None;
@@ -15102,7 +15112,7 @@ impl Interp {
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
         // Function's chunk handles remain set-once, but native residency is
         // reclaimable. Hold the owned code lease through GC and the whole call.
-        let chunk = match func.execution_code() {
+        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -15298,7 +15308,13 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         let realm_key = Rc::as_ptr(&self.global) as usize;
-        let _profile = function_profile_enter(func, &closure, fn_obj, realm_key);
+        let _profile = function_profile_enter(
+            func,
+            &closure,
+            fn_obj,
+            realm_key,
+            Rc::as_ptr(&self.global_env) as usize,
+        );
         // The callee runs (or compiles) now: read a snapshot-encoded body once, ahead of the
         // body-fact scan below.
         func.body.prepare_to_run();
@@ -15350,7 +15366,7 @@ impl Interp {
                 }
             }
             if let Some(chunk) = func
-                .execution_code()
+                .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
             {
@@ -15644,8 +15660,7 @@ impl Interp {
             && allow_compiled_body
         {
             if let Some(chunk) = func
-                .code
-                .get()
+                .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| chunk.prepared_entry)
             {
@@ -15840,7 +15855,7 @@ impl Interp {
             func.calls.set(n);
             let _ = func.code.set(crate::bytecode::compile(func));
         }
-        match func.execution_code() {
+        match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
             Some(Some(chunk)) => Some(chunk.clone()),
             _ => None,
         }
@@ -16275,15 +16290,13 @@ impl Interp {
             if let Value::Obj(o) = &callee {
                 if !self.proxies.contains_key(&(Rc::as_ptr(o) as usize)) {
                     if let Some(gptr) = self.callee_realm_global(o) {
-                        let saved = self.snapshot_realm();
-                        let target = self.realms[&gptr].snapshot_clone();
-                        self.restore_realm(&target);
+                        let mut saved = self.realms[&gptr].snapshot_clone();
+                        self.swap_realm(&mut saved);
                         let saved_ccr = self.ctor_caller_realm.replace(saved.snapshot_clone());
                         let r = self.construct_dispatch(callee, args, new_target);
                         self.ctor_caller_realm = saved_ccr;
-                        let updated = self.snapshot_realm();
-                        self.realms.insert(gptr, updated);
-                        self.restore_realm(&saved);
+                        self.swap_realm(&mut saved);
+                        self.realms.insert(gptr, saved);
                         return r;
                     }
                 }

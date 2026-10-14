@@ -425,6 +425,7 @@ pub(crate) struct Visitor {
     functions: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
+    inline_site_allocations: HashSet<usize>,
     jit_codes: HashSet<usize>,
     #[cfg(feature = "optimizing-jit")]
     jit_call_stubs: HashSet<usize>,
@@ -690,6 +691,14 @@ impl Visitor {
         self.function_bytecode_metadata = self.function_bytecode_metadata.saturating_add(bytes);
     }
 
+    pub(crate) fn inline_sites_bytes(&mut self, identity: usize, bytes: usize) -> usize {
+        if self.inline_site_allocations.insert(identity) {
+            bytes
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn mark_function_bytecode_opaque_storage(&mut self) {
         self.function_bytecode_opaque_storage = true;
     }
@@ -843,6 +852,10 @@ impl Visitor {
             self.chunk(chunk);
         }
         if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        #[cfg(feature = "optimizing-jit")]
+        if let Some(chunk) = function.optimizing_code.get().and_then(Option::as_ref) {
             self.chunk(chunk);
         }
         if let Some(maps) = function.fn_maps.get() {

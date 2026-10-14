@@ -939,6 +939,7 @@ impl CallIc {
 
 /// A speculative-inline site's guard data: the pinned expected callee plus how the call site's
 /// stack is shaped when the guard runs (`argc` arguments above the callee).
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 pub struct InlineTarget {
     /// Stored `Rc` pointer of the expected callee function object.
     pub expected: usize,
@@ -954,6 +955,10 @@ pub struct InlineTarget {
     /// while that Realm is active. Code cached on a shared AST runs in other Realms too, where
     /// a closure from the planning Realm may reach the site; the guard then takes the call.
     pub expected_genv: usize,
+    /// Keeps the planning global-environment allocation from address reuse, without owning
+    /// any bindings or Realm objects. Self-hosted callees may have a private environment
+    /// that does not retain this global environment. Native guards have no epoch check.
+    pub genv_pin: std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>,
     pub argc: u16,
     /// Sloppy callee that reads `this`: the receiver must already be an object (the generic
     /// path would box a primitive or substitute the global object).
@@ -2040,6 +2045,7 @@ enum PendingCompletion {
 }
 
 /// How one captured binding seeds into the activation environment at entry (in order).
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 pub(crate) enum CapInit {
     /// A captured parameter: seed from argument `k`.
     Param(u16, Rc<str>),
@@ -2054,6 +2060,7 @@ pub(crate) enum CapInit {
     Lexical(Rc<str>, bool),
 }
 
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct LexicalBinding {
     name: Rc<str>,
     is_const: bool,
@@ -2066,6 +2073,7 @@ struct LexicalBinding {
 /// record's key set never changes afterwards (a direct eval declares its own lexical names in a
 /// new record and its vars in the variable environment). Guarded name caches filled against one
 /// such record therefore serve every later one (ECMA-262 §9.1, §14.2.3, §14.7.4.4).
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct LexicalScope {
     bindings: Vec<LexicalBinding>,
     /// Nonzero process-unique identity of `bindings`' names and order; zero if identities are
@@ -2104,6 +2112,7 @@ impl LexicalScope {
 /// Names of call and `new` targets by operation index (see `crate::callee_name`), read only
 /// when such an operation throws because its target is not callable or not a constructor.
 #[derive(Default)]
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 pub(crate) struct CallNames {
     /// (operation index, end of its name in `text`), in increasing operation order.
     sites: Vec<(u32, u32)>,
@@ -2170,6 +2179,7 @@ impl CallNames {
 /// operation order; read only when a call records its position or an operation throws.
 /// Inlined chunks separately cache their implicit positions by PC for checked-operation entry.
 #[derive(Default)]
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 pub(crate) struct SourcePositions {
     /// (first operation, position): each run lasts until the next one starts.
     runs: Vec<(u32, u32)>,
@@ -2406,6 +2416,10 @@ pub struct Chunk {
     inline_sites: crate::stack_trace::InlineSites,
     /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
     inline_targets: Vec<InlineTarget>,
+    /// Every splice depends on this planning Realm's global environment. Zero means the
+    /// chunk has no exclusive single-Realm constraint (no targets, mixed or unrestricted
+    /// targets). New invocations can avoid a body whose every inline guard must miss.
+    inline_planning_genv: usize,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
     /// Bytecode VM runs that a loop-free body made while it waited for native admission
@@ -2448,6 +2462,7 @@ pub struct Chunk {
 #[cfg(feature = "optimizing-jit")]
 pub(crate) const SPECIALIZATION_MISS_LIMIT: u8 = 8;
 
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct FunctionOsrEntry {
     site: usize,
     pc: usize,
@@ -2664,7 +2679,7 @@ impl Chunk {
                 .map_or(0, CallNames::retained_bytes),
         );
         bytes = bytes.saturating_add(self.positions.retained_bytes());
-        bytes = bytes.saturating_add(self.inline_sites.retained_bytes());
+        bytes = bytes.saturating_add(self.inline_sites.scan_retained_memory(visitor));
         bytes = bytes.saturating_add(
             (self.call_positions.len() + self.construct_positions.len())
                 * std::mem::size_of::<u32>(),
@@ -2837,18 +2852,21 @@ pub(crate) struct SimpleConstructor<'a> {
 /// One visible slot-backed binding projected into the temporary Environment Record used by a
 /// generic destructuring-assignment operation. Captured bindings already live in `env` and are
 /// intentionally absent; free names continue resolving through the plan environment's parent.
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct AssignmentLocal {
     name: Rc<str>,
     slot: u16,
     mutable: bool,
 }
 
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct AssignmentTargetPlan {
     target: Expr,
     locals: Vec<AssignmentLocal>,
     strict: bool,
 }
 
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct EvalExprPlan {
     expr: Expr,
     locals: Vec<AssignmentLocal>,
@@ -2856,6 +2874,7 @@ struct EvalExprPlan {
     name: Option<String>,
 }
 
+#[cfg_attr(feature = "optimizing-jit", derive(Clone))]
 struct ClassPlan {
     class: Rc<Class>,
     inferred_name: Option<String>,
@@ -6296,6 +6315,8 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         calls: std::cell::Cell::new(0),
         code: std::cell::OnceCell::new(),
         code2: std::cell::OnceCell::new(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_code: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
         env_layouts: std::cell::OnceCell::new(),
     };
@@ -6341,6 +6362,8 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
         calls: std::cell::Cell::new(0),
         code: std::cell::OnceCell::new(),
         code2: std::cell::OnceCell::new(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_code: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
         env_layouts: std::cell::OnceCell::new(),
     };
@@ -6373,7 +6396,10 @@ pub(crate) fn compile_with_inlines(
 ) -> Option<Rc<Chunk>> {
     let seed = (!env_flag!("TRUST_JS_JIT_NO_CACHE_SEED")).then_some(hot);
     let started = crate::jit::perf_stage_start();
-    let result = compile_inner(func, plan, seed, None, false, false, false);
+    // Recompilation retains the caller's established entry contract. A prepared caller
+    // already owns its mapped arguments/eval/closure environment; only the eligible callee
+    // body is remapped into fresh slots, never the caller's authoritative bindings.
+    let result = compile_inner(func, plan, seed, None, false, hot.prepared_entry, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     result
 }
@@ -6385,31 +6411,395 @@ pub(crate) fn compile_for_optimizer(
     inputs: &[(u16, u32)],
     properties: &[(u32, u32)],
 ) -> Option<Rc<Chunk>> {
-    // A separate immutable Chunk keeps the old activation's bytecode, handlers, raw ICs and
-    // executable owner intact. Reuse normal cache seeding; do not splice baseline bytecode
-    // inlines that this backend deliberately sends through their original-call fallback.
-    let mut next = compile_with_inlines(func, &Default::default(), hot)?;
-    let unique = Rc::get_mut(&mut next).expect("new unpublished optimizing chunk");
-    // Rebind only an identical lowering of this immutable Function. A transformed/inlined
-    // body must never inherit a coincidentally equal PC or formal-slot identity.
-    let (layout, bindings) = feedback_layout_for_ops(&unique.ops, &unique.names);
-    if unique.ops != hot.ops
-        || unique.names != hot.names
-        || unique.slot_names != hot.slot_names
-        || unique.n_params != hot.n_params
-        || layout != *hot.feedback.layout()
+    let started = crate::jit::perf_stage_start();
+    // The caller selects this Function's warmed baseline, which may already contain inline
+    // splices. Regenerating the AST loses their canonical PCs and hidden frame slots.
+    let next = if hot.debug_origin
+        != (
+            func.start,
+            func.source.as_ref().map_or(0, |text| text.len() as u32),
+        )
+        || hot
+            .consts
+            .iter()
+            .any(|value| matches!(value, Value::Obj(_)))
     {
-        return None;
+        None
+    } else {
+        Some(Rc::new(hot.clone_for_optimizer(inputs, properties)))
+    };
+    crate::jit::perf_bytecode_compile_end(started, next.is_some());
+    next
+}
+
+#[cfg(feature = "optimizing-jit")]
+impl Chunk {
+    /// Snapshot the exact warmed lowering. Canonical slots, PCs, hidden inline homes and
+    /// logical source identities survive; runtime ownership and native residency do not.
+    fn clone_for_optimizer(&self, inputs: &[(u16, u32)], properties: &[(u32, u32)]) -> Self {
+        let (layout, bindings) = feedback_layout_for_ops(&self.ops, &self.names);
+        let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let old_call_pins = self.call_pins.borrow();
+        let mut call_pins = crate::fasthash::FastMap::default();
+        let call_caches = self
+            .call_caches
+            .iter()
+            .map(|site| {
+                let old_func_pins = site.func_pins.borrow();
+                let mut func_pins = std::array::from_fn(|_| std::rc::Weak::new());
+                let entries = std::array::from_fn(|way| {
+                    let entry = site.entries[way].get();
+                    let pin = old_call_pins.get(&entry.callee);
+                    let pinned = pin.is_some_and(|pin| pin.as_ptr() as usize == entry.callee)
+                        && if entry.func.is_null() {
+                            entry.native != 0
+                        } else {
+                            old_func_pins[way].as_ptr() == entry.func
+                        };
+                    if epoch != u32::MAX && entry.epoch == epoch && pinned {
+                        // Native residency remains guarded by the epoch. Allocation identities
+                        // carry their own Weak pins, including code-keyed closure retries.
+                        call_pins.insert(entry.callee, pin.unwrap().clone());
+                        func_pins[way] = old_func_pins[way].clone();
+                        std::cell::Cell::new(entry)
+                    } else {
+                        std::cell::Cell::new(CallIc::EMPTY)
+                    }
+                });
+                CallSite {
+                    entries,
+                    func_pins: std::cell::RefCell::new(func_pins),
+                    next: std::cell::Cell::new(site.next.get()),
+                }
+            })
+            .collect();
+        let pins = self.name_pins.borrow();
+        let name_seeds: Vec<_> = self
+            .name_caches
+            .iter()
+            .enumerate()
+            .map(|(site, cell)| {
+                let state = cell.get();
+                let pin = pins.get(site).cloned().flatten();
+                // Indexed homes depend only on preserved layout IDs. Pointer homes must carry
+                // the matching Weak allocation pin; separately owned deep proofs start empty.
+                let safe = state.env == FIXED_NAME_IC
+                    || (state.env > FIXED_NAME_IC
+                        && state.env != lexical_cache::DEEP_NAME_IC
+                        && pin
+                            .as_ref()
+                            .is_some_and(|pin| pin.as_ptr() as usize == state.env & !7));
+                if safe {
+                    (
+                        state,
+                        pin,
+                        self.name_num_bits[site].get(),
+                        self.name_num_valid[site].get(),
+                    )
+                } else {
+                    (NameIc::EMPTY, None, 0, false)
+                }
+            })
+            .collect();
+        Self {
+            debug_origin: self.debug_origin,
+            prepared_entry: self.prepared_entry,
+            lean_new_target: self.lean_new_target,
+            rest_slot: self.rest_slot,
+            lazy_arguments: self.lazy_arguments,
+            arguments_count: self.arguments_count,
+            ops: self.ops.clone(),
+            jit_needs_activation_state: self.jit_needs_activation_state,
+            has_tail_calls: self.has_tail_calls,
+            consts: self.consts.clone(),
+            names: self.names.clone(),
+            n_slots: self.n_slots,
+            slot_names: self.slot_names.clone(),
+            borrowed_parameter_aliases: self.borrowed_parameter_aliases,
+            function_osr_entries: self.function_osr_entries.clone(),
+            n_refs: self.n_refs,
+            n_params: self.n_params,
+            arguments_slot: self.arguments_slot,
+            uses_this: self.uses_this,
+            lexical_this: self.lexical_this,
+            strict: self.strict,
+            resumable: self.resumable,
+            instance_capacity_hint: self.instance_capacity_hint,
+            instance_layout: self.instance_layout.clone(),
+            forwarded_capacity_hint: std::cell::Cell::new(0),
+            initializer_layout: std::cell::OnceCell::new(),
+            funcs: self.funcs.clone(),
+            templates: self.templates.clone(),
+            eval_exprs: self.eval_exprs.clone(),
+            class_plans: self.class_plans.clone(),
+            assignment_targets: self.assignment_targets.clone(),
+            lexical_scopes: self.lexical_scopes.clone(),
+            cap_inits: self.cap_inits.clone(),
+            activation_plan: std::cell::OnceCell::new(),
+            binding_layout_id: self.binding_layout_id,
+            reuse_activation: self.reuse_activation,
+            env_this: self.env_this,
+            env_arguments: self.env_arguments,
+            caches: self
+                .caches
+                .iter()
+                .map(|cell| {
+                    let state = cell.get();
+                    // Creation proofs depend on the running interpreter's weak prototype directory.
+                    // Keep only structural, live-guarded property seeds in this independent chunk.
+                    std::cell::Cell::new(
+                        if state.depth != IC_CREATE && state.has_cacheable_shapes() {
+                            state
+                        } else {
+                            IcState::EMPTY
+                        },
+                    )
+                })
+                .collect(),
+            feedback: crate::feedback::FeedbackVector::new_with_enabled(layout, bindings, false),
+            feedback_pc_identity: true,
+            feedback_shapes: std::cell::RefCell::new(Vec::new()),
+            obj_maps: (0..self.obj_maps.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+            record_getter: std::cell::OnceCell::new(),
+            name_caches: name_seeds
+                .iter()
+                .map(|seed| std::cell::Cell::new(seed.0))
+                .collect(),
+            deep_name_caches: std::cell::RefCell::new(Vec::new()),
+            resolution_caches: std::cell::OnceCell::new(),
+            name_pins: std::cell::RefCell::new(
+                name_seeds.iter().map(|seed| seed.1.clone()).collect(),
+            ),
+            name_num_bits: name_seeds
+                .iter()
+                .map(|seed| std::cell::Cell::new(seed.2))
+                .collect(),
+            name_num_valid: name_seeds
+                .iter()
+                .map(|seed| std::cell::Cell::new(seed.3))
+                .collect(),
+            cap_caches: vec![std::cell::Cell::new(NameIc::EMPTY); self.cap_caches.len()],
+            cap_pins: std::cell::RefCell::new(vec![None; self.cap_caches.len()]),
+            initializer_plan: std::cell::OnceCell::new(),
+            simple_constructor_shapes: std::cell::Cell::new(InitializerShapes::default()),
+            simple_constructor_plan: std::cell::OnceCell::new(),
+            arguments_forwarder: std::cell::OnceCell::new(),
+            arguments_forwarder_runtime: std::cell::RefCell::new(None),
+            regexp_literals: (0..self.regexp_literals.len())
+                .map(|_| std::cell::OnceCell::new())
+                .collect(),
+            call_caches,
+            call_names: self.call_names.clone(),
+            positions: self.positions.clone(),
+            call_positions: self.call_positions.clone(),
+            construct_positions: self.construct_positions.clone(),
+            construct_caches: vec![
+                std::cell::Cell::new(ConstructSite::EMPTY);
+                self.construct_caches.len()
+            ],
+            private_sites: (0..self.private_sites.len())
+                .map(|_| PrivateSite::new())
+                .collect(),
+            call_pins: std::cell::RefCell::new(call_pins),
+            inline_sites: self.inline_sites.clone(),
+            inline_targets: self.inline_targets.clone(),
+            inline_planning_genv: self.inline_planning_genv,
+            jit_runs: std::cell::Cell::new(0),
+            vm_runs: std::cell::Cell::new(0),
+            inline_attempted: std::cell::Cell::new(true),
+            inline_retry_at: std::cell::Cell::new(0),
+            inline_checks: std::cell::Cell::new(0),
+            inline_feedback: std::cell::Cell::new(0),
+            jit: crate::jit::cache::NativeCodeSlot::new(),
+            jit_budget_wait_bytes: std::cell::Cell::new(0),
+            optimizing_remaining: std::cell::Cell::new(0),
+            optimizing_candidate: true,
+            optimizing_misses: std::cell::Cell::new(0),
+            optimizing_samples: std::cell::OnceCell::new(),
+            optimizing_inputs: inputs.into(),
+            optimizing_properties: properties.into(),
+            optimizing_loop: std::cell::OnceCell::new(),
+            osr: std::cell::OnceCell::new(),
+        }
     }
-    unique.feedback = crate::feedback::FeedbackVector::new_with_enabled(layout, bindings, false);
-    unique.feedback_pc_identity = true;
-    unique.optimizing_inputs = inputs.into();
-    unique.optimizing_properties = properties.into();
-    unique.optimizing_candidate = true;
-    unique.optimizing_remaining.set(0);
-    unique.inline_attempted.set(true);
-    unique.inline_retry_at.set(0);
-    Some(next)
+}
+
+#[cfg(all(test, feature = "optimizing-jit"))]
+mod optimizer_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn warmed_snapshot_preserves_homes_and_guards_without_sharing_runtime_state() {
+        let mut engine = crate::Engine::new();
+        engine.set_tier(Tier::Bytecode);
+        engine.set_tier_threshold(0);
+        engine
+            .eval(
+                "var outer=2; function subject(o){return o.x+outer} subject({x:3})",
+                false,
+            )
+            .expect("snapshot fixture parses");
+        let env = engine.interp.global_env.clone();
+        let value = engine.interp.get_var("subject", &env).ok().unwrap();
+        let function = {
+            let object = value.as_obj().unwrap().borrow();
+            let crate::value::Callable::User(user) = &object.call else {
+                panic!("user function")
+            };
+            user.func.clone()
+        };
+        let hot = function.code.get().and_then(Option::as_ref).unwrap();
+        hot.jit_runs.set(23);
+        hot.optimizing_misses.set(SPECIALIZATION_MISS_LIMIT);
+        hot.jit_budget_wait_bytes.set(123);
+        let next = compile_for_optimizer(&function, hot, &[(0, 1)], &[]).unwrap();
+        assert_eq!(next.ops, hot.ops);
+        assert_eq!(next.names, hot.names);
+        assert_eq!(next.slot_names, hot.slot_names);
+        assert_eq!(next.binding_layout_id, hot.binding_layout_id);
+        assert_eq!(next.positions.runs, hot.positions.runs);
+        assert_eq!(next.call_positions, hot.call_positions);
+        assert_eq!(next.construct_positions, hot.construct_positions);
+        assert_eq!(next.jit_runs.get(), 0);
+        assert_eq!(next.optimizing_misses.get(), 0);
+        assert_eq!(next.jit_budget_wait_bytes.get(), 0);
+        assert!(next.jit.get().is_none());
+        assert!(next.optimizing_samples.get().is_none());
+        assert!(next.osr.get().is_none());
+        assert!(next
+            .call_caches
+            .iter()
+            .all(|site| site.entries.iter().all(|entry| entry.get().callee == 0)));
+        let cache = hot
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::GetProp(_, cache) | Op::GetPropLocal(_, _, cache) => Some(*cache as usize),
+                _ => None,
+            })
+            .expect("actual warmed property site");
+        assert!(hot.caches[cache].get().has_cacheable_shapes());
+        assert_eq!(
+            next.caches[cache].get().recv_shape,
+            hot.caches[cache].get().recv_shape
+        );
+        next.caches[cache].set(IcState::EMPTY);
+        assert!(
+            hot.caches[cache].get().has_cacheable_shapes(),
+            "cache cells must be independent"
+        );
+        assert!(
+            matches!(engine.eval("subject({x:7})", false), Ok(crate::Completion::Value(value)) if value == "9")
+        );
+    }
+
+    #[test]
+    fn snapshot_call_seeds_require_epoch_and_both_allocation_pins() {
+        let statements = crate::parser::parse_script(
+            "function caller(x){return leaf(x)} function leaf(x){return x+1}",
+            false,
+        )
+        .ok()
+        .expect("snapshot fixture parses");
+        let (Stmt::FuncDecl(function), Stmt::FuncDecl(leaf)) = (&statements[0], &statements[1])
+        else {
+            panic!("functions")
+        };
+        let hot = compile(function).unwrap();
+        let engine = crate::Engine::new();
+        let callee = engine.interp.new_object();
+        let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let mut entry = CallIc::EMPTY;
+        entry.callee = Rc::as_ptr(&callee) as usize;
+        entry.func = Rc::as_ptr(leaf);
+        entry.epoch = epoch;
+        hot.call_pins
+            .borrow_mut()
+            .insert(entry.callee, Rc::downgrade(&callee));
+        hot.call_caches[0].fill(entry, Some(leaf));
+        let next = compile_for_optimizer(function, &hot, &[], &[]).unwrap();
+        let seeded = next.call_caches[0].entries[0].get();
+        if epoch != u32::MAX && CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed) == epoch {
+            assert_eq!(
+                seeded.callee, entry.callee,
+                "paired current-epoch seeds remain warm"
+            );
+        }
+        if seeded.callee != 0 {
+            assert_eq!(seeded.epoch, epoch);
+            assert_eq!(
+                next.call_pins.borrow()[&seeded.callee].as_ptr() as usize,
+                seeded.callee
+            );
+            assert_eq!(
+                next.call_caches[0].func_pins.borrow()[0].as_ptr(),
+                seeded.func
+            );
+        }
+        hot.call_caches[0].func_pins.borrow_mut()[0] = std::rc::Weak::new();
+        let missing_function = compile_for_optimizer(function, &hot, &[], &[]).unwrap();
+        assert_eq!(missing_function.call_caches[0].entries[0].get().callee, 0);
+        hot.call_caches[0].fill(entry, Some(leaf));
+        hot.call_pins.borrow_mut().clear();
+        let missing_callee = compile_for_optimizer(function, &hot, &[], &[]).unwrap();
+        assert_eq!(missing_callee.call_caches[0].entries[0].get().callee, 0);
+        drop(callee);
+        assert!(next
+            .call_pins
+            .borrow()
+            .values()
+            .all(|pin| pin.upgrade().is_none()));
+    }
+
+    #[test]
+    fn snapshot_scope_pins_are_weak_and_reject_unpaired_pointer_proofs() {
+        use crate::interpreter::{new_scope, Binding};
+        let statements = crate::parser::parse_script("function f(){return outer}", false)
+            .ok()
+            .expect("snapshot fixture parses");
+        let Stmt::FuncDecl(function) = &statements[0] else {
+            panic!("function")
+        };
+        let hot = compile(function).unwrap();
+        let (name, cache) = hot
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::LoadName(name, cache) => Some((*name, *cache as usize)),
+                _ => None,
+            })
+            .unwrap();
+        let mut engine = crate::Engine::new();
+        let env = new_scope(None);
+        env.borrow_mut()
+            .vars
+            .insert("outer", Binding::data(Value::Num(7.), true, true));
+        assert!(matches!(
+            hot.load_name_ic(&mut engine.interp, &env, name, cache as u32),
+            Ok(Value::Num(7.))
+        ));
+        let weak = Rc::downgrade(&env);
+        let next = compile_for_optimizer(function, &hot, &[], &[]).unwrap();
+        assert_eq!(
+            next.name_caches[cache].get().env,
+            hot.name_caches[cache].get().env
+        );
+        hot.name_pins.borrow_mut()[cache] = None;
+        let unpinned = compile_for_optimizer(function, &hot, &[], &[]).unwrap();
+        assert_eq!(unpinned.name_caches[cache].get().env, 0);
+        drop(env);
+        assert!(
+            weak.upgrade().is_none(),
+            "neither a snapshot nor its seed pins own a scope"
+        );
+        assert!(next.name_pins.borrow()[cache]
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .is_none());
+    }
 }
 
 fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
@@ -7216,6 +7606,7 @@ fn finish_chunk(
         .ops
         .iter()
         .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
+    let inline_planning_genv = exclusive_inline_genv(&c.inline_targets);
     Some(Rc::new(Chunk {
         debug_origin: source.map_or((0, 0), |func| {
             (
@@ -7297,12 +7688,12 @@ fn finish_chunk(
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
         call_pins: std::cell::RefCell::new(c.call_pins),
         inline_targets: c.inline_targets,
+        inline_planning_genv,
         jit_runs: std::cell::Cell::new(0),
         vm_runs: std::cell::Cell::new(0),
-        // Hot optimization is another possible second-stage result, not a reservation
-        // of that slot. Unadmitted functions retain the established inlining policy.
-        // Both publishers check code2; an inlined body keeps its original-call fallback
-        // and is excluded from the optimizer's single-frame recovery contract.
+        // Baseline inlining and whole-function optimization have separate publication
+        // slots. The optimizer snapshots the selected canonical body, including guarded
+        // inline homes; retirement returns to this warmed baseline without recompilation.
         inline_attempted: std::cell::Cell::new(inline_recompile_at() == 0),
         inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
         inline_checks: std::cell::Cell::new(0),
@@ -7335,6 +7726,19 @@ pub(crate) fn inline_recompile_at() -> u32 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100)
+    })
+}
+
+/// A mixed or unrestricted graph may contain a useful way in another Realm. Only a
+/// uniform nonzero dependency proves that every spliced way would miss there.
+fn exclusive_inline_genv(targets: &[InlineTarget]) -> usize {
+    targets.first().map_or(0, |first| {
+        let genv = first.expected_genv;
+        if genv != 0 && targets.iter().all(|target| target.expected_genv == genv) {
+            genv
+        } else {
+            0
+        }
     })
 }
 
@@ -7409,7 +7813,7 @@ pub(crate) fn plan_inlines(
     // The optimized function's [[Realm]] (`UserCallable::realm` identity): splices run in it.
     realm: usize,
     // That Realm's global environment, which every splice's guard requires at run time.
-    genv: usize,
+    genv: &Env,
 ) -> crate::fasthash::FastMap<u32, InlinePlanEntry> {
     // Bound the *whole* optimized body rather than stopping after one arbitrary nesting level.
     // OO hot loops tend to be call chains (dispatcher -> virtual method -> small scheduler
@@ -7649,7 +8053,7 @@ fn plan_inlines_at(
     chunk: &Chunk,
     caller: &Function,
     realm: usize,
-    genv: usize,
+    genv: &Env,
     depth: u32,
     // The enclosing splice repeats in a loop of the optimized body.
     outer_in_loop: bool,
@@ -7800,7 +8204,8 @@ fn plan_inlines_at(
                 obj,
                 free_names,
                 expected_env: 0,
-                expected_genv: genv,
+                expected_genv: Rc::as_ptr(genv) as usize,
+                genv_pin: Rc::downgrade(genv),
                 nested,
             });
         }
@@ -8164,6 +8569,7 @@ pub struct InlineWay {
     pub expected_env: usize,
     /// The planning Realm's global environment (see [`InlineTarget::expected_genv`]).
     pub expected_genv: usize,
+    pub genv_pin: std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>,
     /// The callee's OWN inline plan (depth-capped recursion): call sites inside the spliced
     /// body splice too, keyed by the callee-frame ordinal — its first-compile cache numbering,
     /// which the splice reproduces by walking the same AST in the same order.
@@ -8891,6 +9297,7 @@ impl Compiler {
             pin: Rc::downgrade(&w.obj),
             expected_env: w.expected_env,
             expected_genv: w.expected_genv,
+            genv_pin: w.genv_pin.clone(),
             argc,
             check_this: has_this && w.check_this,
         });
@@ -19588,6 +19995,11 @@ impl Chunk {
         &self.inline_targets[t as usize]
     }
 
+    /// O(1) invocation selection; this never changes an active frame or its canonical PCs.
+    pub(crate) fn inline_realm_compatible(&self, genv: usize) -> bool {
+        self.inline_planning_genv == 0 || self.inline_planning_genv == genv
+    }
+
     /// The [[Environment]] of an inline target's pinned function. `LoadNameIn` sites are
     /// dominated by that target's identity guard, so the function (and therefore this
     /// environment) is alive whenever they run; `None` only for a dead pin.
@@ -22318,8 +22730,10 @@ unsafe fn jit_call_hit_inner(
     // way's function. PrepareForOrdinaryCall's F is the LIVE closure: run the shared code with
     // its identity and [[Environment]], never the filling closure's (a local copy; the way is
     // unchanged, like `Interp::resolve_cached_call`'s code-sharing retry).
-    if let Value::Obj(callee) = (*sp.sub(argc + 1)).unpack() {
-        let key = Rc::as_ptr(&callee) as usize;
+    // The callee's operand remains an owner through the whole committed call.
+    // This observer-free inspection therefore needs no unpack/clone/drop round trip.
+    let _ = (*sp.sub(argc + 1)).with_object(|callee| {
+        let key = Rc::as_ptr(callee) as usize;
         if key != ic.callee {
             if let crate::value::Callable::User(user) = &callee.borrow().call {
                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
@@ -22327,7 +22741,7 @@ unsafe fn jit_call_hit_inner(
                 ic.env = Rc::as_ptr(&user.env);
             }
         }
-    }
+    });
     // The emitted probe already validated this epoch. Acquire before inline
     // recompilation, which may now reclaim other inactive native code.
     let code = crate::jit::cache::lease_raw(ic.code);

@@ -3,8 +3,10 @@
 //! ECMA-262 e28783d5: Execution Contexts, GetValue/PutValue, Completion Records,
 //! TryStatement Evaluation, IteratorClose and WeakRef liveness. This is continuation,
 //! not a new Call: never repeat argument binding, getters, coercions or completed cleanup.
-//! Logical inlined frames and suspended entries need additional reconstruction and are
-//! deliberately outside this entry contract.
+//! Frame-independent inline bodies already use this immutable Chunk's remapped slots,
+//! operand stack and logical source positions. Continue that exact flattened bytecode,
+//! including partially completed argument binding, without inventing a fresh callee frame.
+//! General context-bearing inlines and suspended entries remain outside this contract.
 
 use super::{drive_vm, new_native_activation, Op, PackedValue, Value, VmStep};
 use crate::jit::JitCtx;
@@ -29,7 +31,8 @@ thread_local! {
 /// operand owners in `[stack_base, sp)` have been published with their exact ownership. No owner is
 /// represented only in a register; no borrowed duplicate masquerades as an owning word.
 /// `pc` is a verified bytecode boundary with its actual incoming stack/lexical state.
-/// The entry is non-resumable and contains no speculative inline bytecode.
+/// The entry is non-resumable. Any inline body was emitted by the bytecode compiler's
+/// frame-independent splice contract, with its callee owner and logical positions intact.
 pub(crate) unsafe extern "C" fn resume_before(
     raw: *mut JitCtx,
     pc: u32,
@@ -42,10 +45,6 @@ pub(crate) unsafe extern "C" fn resume_before(
         "deoptimization requires an ordinary frame"
     );
     assert!((pc as usize) <= chunk.ops.len(), "deoptimization PC");
-    debug_assert!(
-        chunk.inline_targets.is_empty(),
-        "logical inline frames need separate reconstruction"
-    );
     debug_assert!(
         ctx.resume_activation.is_null() || (*ctx.resume_activation).chunk != ctx.chunk,
         "ordinary deoptimization cannot consume a continuation's borrowed allocation"
@@ -149,7 +148,11 @@ pub(crate) unsafe extern "C" fn resume_before(
 }
 
 pub(crate) fn supported(chunk: &super::Chunk) -> bool {
-    !chunk.resumable
-        && chunk.inline_targets.is_empty()
-        && !chunk.ops.iter().any(|op| matches!(op, Op::FragmentExit(_)))
+    !chunk.resumable && !chunk.ops.iter().any(|op| matches!(op, Op::FragmentExit(_)))
+}
+
+/// The separate active-loop experiment has not established entry/recovery proofs for
+/// flattened inline bodies. Full-body continuation support must not widen its admission.
+pub(crate) fn supported_loop_continuation(chunk: &super::Chunk) -> bool {
+    supported(chunk) && chunk.inline_targets.is_empty()
 }

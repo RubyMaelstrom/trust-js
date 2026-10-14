@@ -31,7 +31,7 @@ fn threshold() -> Option<u32> {
 pub(in crate::jit) fn counter(chunk: &Chunk, pc: usize) -> Option<*const Cell<u32>> {
     let threshold = threshold()?;
     if chunk.jit_ops().len() > 512
-        || !bytecode::native_deopt::supported(chunk)
+        || !bytecode::native_deopt::supported_loop_continuation(chunk)
         || chunk.jit_detailed_feedback_enabled()
         || super::selected(chunk)
     {

@@ -8,6 +8,21 @@ use crate::bytecode::{
 };
 use crate::value::PACK_OBJ;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_COMPACT_STORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static TEST_FORCE_POLYMORPHIC_STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static TEST_BODY_SIZE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn compact_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_POLYMORPHIC_STORES.with(std::cell::Cell::get) {
+        return false;
+    }
+    std::env::var("TRUST_JS_OPT_JIT_COMPACT_STORES").as_deref() != Ok("0")
+}
+
 impl Lowering<'_, '_> {
     fn store_receiver(&mut self, op: &Op, slow: Block) -> Value {
         if matches!(op, Op::SetPropThisDrop(..)) {
@@ -51,70 +66,86 @@ impl Lowering<'_, '_> {
             // Array named shapes do not identify arbitrary entry slots. Until that path
             // has its own key proof, only ordinary receivers use the named-slot cache.
             self.property_ordinary(object, slow);
-            let creation =
-                self.native_creation && creation::supported(self.values, self.chunk.jit_name(name));
-            let probe = self.b.create_block();
-            self.b.append_block_param(probe, types::I64);
-            self.b.append_block_param(probe, types::I32);
-            let miss = self.b.create_block();
-            let hit = self.b.create_block();
-            self.b.append_block_param(hit, types::I64);
-            let cache = self
-                .b
-                .ins()
-                .iconst(types::I64, self.chunk.jit_cache_ptr(cache) as i64);
-            let ways = self.b.ins().iconst(types::I32, PROP_IC_WAYS as i64);
-            self.b.ins().jump(probe, &[cache.into(), ways.into()]);
-            self.b.switch_to_block(probe);
-            let cache = self.b.block_params(probe)[0];
-            let ways = self.b.block_params(probe)[1];
-            let depth = self.property_load(types::I8, cache, IC_OFF_DEPTH as usize);
-            let shape = self.property_load(types::I32, cache, IC_OFF_RECV_SHAPE as usize);
-            self.property_shape(object, shape, miss);
-            if creation {
-                let create = self.b.create_block();
-                let overwrite = self.b.create_block();
-                let creates = self
+            let compact = compact_enabled()
+                .then(|| self.chunk.jit_cache_preferred(cache))
+                .flatten()
+                .filter(|state| state.depth == 0);
+            let slot = if let Some(state) = compact {
+                // A warmed monomorphic existing-own-field site needs no creation
+                // resolver. Only shape/slot scalars are frozen; current bounds,
+                // storage, descriptor flags and alias-aware owners stay guarded.
+                // Any changed shape or descriptor takes the complete checked Set.
+                #[cfg(test)]
+                TEST_COMPACT_STORES.with(|count| count.set(count.get() + 1));
+                let shape = self.b.ins().iconst(types::I32, state.recv_shape as i64);
+                self.property_shape(object, shape, slow);
+                self.b.ins().iconst(types::I64, state.slot as i64)
+            } else {
+                let creation = self.native_creation
+                    && creation::supported(self.values, self.chunk.jit_name(name));
+                let probe = self.b.create_block();
+                self.b.append_block_param(probe, types::I64);
+                self.b.append_block_param(probe, types::I32);
+                let miss = self.b.create_block();
+                let hit = self.b.create_block();
+                self.b.append_block_param(hit, types::I64);
+                let cache = self
                     .b
                     .ins()
-                    .icmp_imm_s(IntCC::Equal, depth, IC_CREATE as i64);
-                self.b.ins().brif(creates, create, &[], overwrite, &[]);
-                self.b.switch_to_block(create);
-                self.property_create(
-                    op,
-                    object,
-                    receiver,
-                    incoming,
-                    cache,
-                    self.chunk.jit_name(name),
-                    miss,
-                    next,
+                    .iconst(types::I64, self.chunk.jit_cache_ptr(cache) as i64);
+                let ways = self.b.ins().iconst(types::I32, PROP_IC_WAYS as i64);
+                self.b.ins().jump(probe, &[cache.into(), ways.into()]);
+                self.b.switch_to_block(probe);
+                let cache = self.b.block_params(probe)[0];
+                let ways = self.b.block_params(probe)[1];
+                let depth = self.property_load(types::I8, cache, IC_OFF_DEPTH as usize);
+                let shape = self.property_load(types::I32, cache, IC_OFF_RECV_SHAPE as usize);
+                self.property_shape(object, shape, miss);
+                if creation {
+                    let create = self.b.create_block();
+                    let overwrite = self.b.create_block();
+                    let creates = self
+                        .b
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, depth, IC_CREATE as i64);
+                    self.b.ins().brif(creates, create, &[], overwrite, &[]);
+                    self.b.switch_to_block(create);
+                    self.property_create(
+                        op,
+                        object,
+                        receiver,
+                        incoming,
+                        cache,
+                        self.chunk.jit_name(name),
+                        miss,
+                        next,
+                    );
+                    // Both native arms start with the original SSA operands. A successful
+                    // creation already terminates at `next`; misses have made no effects.
+                    self.stack_state = self.stack_plan.at[pc];
+                    self.b.switch_to_block(overwrite);
+                }
+                let own = self.b.ins().icmp_imm_s(IntCC::Equal, depth, 0);
+                self.property_guard(own, miss);
+                let slot = self.property_load(types::I32, cache, IC_OFF_SLOT as usize);
+                let slot = self.b.ins().uextend(types::I64, slot);
+                self.b.ins().jump(hit, &[slot.into()]);
+                self.b.switch_to_block(miss);
+                let remaining = self.b.ins().iadd_imm_s(ways, -1);
+                let cache = self
+                    .b
+                    .ins()
+                    .iadd_imm_s(cache, std::mem::size_of::<IcState>() as i64);
+                self.b.ins().brif(
+                    remaining,
+                    probe,
+                    &[cache.into(), remaining.into()],
+                    slow,
+                    &[],
                 );
-                // Both native arms start with the original SSA operands. A successful
-                // creation already terminates at `next`; misses have made no effects.
-                self.stack_state = self.stack_plan.at[pc];
-                self.b.switch_to_block(overwrite);
-            }
-            let own = self.b.ins().icmp_imm_s(IntCC::Equal, depth, 0);
-            self.property_guard(own, miss);
-            let slot = self.property_load(types::I32, cache, IC_OFF_SLOT as usize);
-            let slot = self.b.ins().uextend(types::I64, slot);
-            self.b.ins().jump(hit, &[slot.into()]);
-            self.b.switch_to_block(miss);
-            let remaining = self.b.ins().iadd_imm_s(ways, -1);
-            let cache = self
-                .b
-                .ins()
-                .iadd_imm_s(cache, std::mem::size_of::<IcState>() as i64);
-            self.b.ins().brif(
-                remaining,
-                probe,
-                &[cache.into(), remaining.into()],
-                slow,
-                &[],
-            );
-            self.b.switch_to_block(hit);
-            let slot = self.b.block_params(hit)[0];
+                self.b.switch_to_block(hit);
+                self.b.block_params(hit)[0]
+            };
             let length = self.load(
                 object,
                 (self.values.obj_props + self.values.props_entries + self.values.vec_len_off)
@@ -159,7 +190,8 @@ impl Lowering<'_, '_> {
         let consumed_receiver = matches!(op, Op::SetProp(..) | Op::SetPropDrop(..));
         let keep = matches!(op, Op::SetProp(..));
         if keep {
-            self.stack_write(2, incoming);
+            let integer = self.stack_integer(1);
+            self.stack_write_integer(2, incoming, integer);
         }
         let consumed = 1 + usize::from(consumed_receiver) - usize::from(keep);
         self.change_top(-8 * consumed as i64);

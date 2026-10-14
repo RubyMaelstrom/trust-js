@@ -8,7 +8,38 @@ impl Lowering<'_, '_> {
     /// Truncate and reduce modulo 2^32, including huge finite Numbers, signed
     /// zero, infinities and NaN. The common range takes one machine conversion;
     /// the rare large range extracts the low integer bits from the IEEE value.
-    pub(super) fn number_i32(&mut self, word: Value, number: Value) -> Value {
+    pub(super) fn number_i32(
+        &mut self,
+        word: Value,
+        number: Value,
+        range: Option<ranges::IntegerRange>,
+        integer: Option<Value>,
+    ) -> Value {
+        if let Some(integer) = integer {
+            debug_assert!(range.is_some());
+            #[cfg(test)]
+            {
+                integers::record(0);
+                ranges::record_conversion_proof();
+            }
+            // For exact integral Numbers in the semantic I64 domain, the low
+            // bits implement ToInt32 modulo 2^32, including U32 and Int53.
+            return self.b.ins().ireduce(types::I32, integer);
+        }
+        if let Some(range) = range {
+            if range.signed32() {
+                #[cfg(test)]
+                ranges::record_conversion_proof();
+                return self.b.ins().fcvt_to_sint_sat(types::I32, number);
+            }
+            if range.unsigned32() {
+                #[cfg(test)]
+                ranges::record_conversion_proof();
+                // ToInt32 keeps these unsigned bits; no signed reinterpretation
+                // or floating-point round trip is needed by the bitwise op.
+                return self.b.ins().fcvt_to_uint_sat(types::I32, number);
+            }
+        }
         let magnitude = self.b.ins().band_imm_s(word, i64::MAX);
         let small = self.b.ins().icmp_imm_s(
             IntCC::UnsignedLessThan,
@@ -54,9 +85,12 @@ impl Lowering<'_, '_> {
         right_word: Value,
         left: Value,
         right: Value,
-    ) -> Value {
-        let left = self.number_i32(left_word, left);
-        let right = self.number_i32(right_word, right);
+    ) -> (Value, Option<Value>) {
+        let ranges = self.input_ranges();
+        let left_integer = self.stack_integer(2);
+        let right_integer = self.stack_integer(1);
+        let left = self.number_i32(left_word, left, ranges.second, left_integer);
+        let right = self.number_i32(right_word, right, ranges.top, right_integer);
         let integer = match op {
             Op::BitAnd => self.b.ins().band(left, right),
             Op::BitOr => self.b.ins().bor(left, right),
@@ -67,10 +101,15 @@ impl Lowering<'_, '_> {
             Op::UShr => self.b.ins().ushr(left, right),
             _ => unreachable!("Number bitwise operation"),
         };
+        let mirrored = self.integer_stack_output(self.stack_state.depth - 2);
         if matches!(op, Op::UShr) {
-            self.b.ins().fcvt_from_uint(types::F64, integer)
+            let number = self.b.ins().fcvt_from_uint(types::F64, integer);
+            let semantic = mirrored.then(|| self.b.ins().uextend(types::I64, integer));
+            (number, semantic)
         } else {
-            self.b.ins().fcvt_from_sint(types::F64, integer)
+            let number = self.b.ins().fcvt_from_sint(types::F64, integer);
+            let semantic = mirrored.then(|| self.b.ins().sextend(types::I64, integer));
+            (number, semantic)
         }
     }
 }

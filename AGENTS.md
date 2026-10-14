@@ -49,6 +49,11 @@ on supported desktop platforms, with checked helpers for slow paths. Other targe
 fall back to bytecode. Backend coverage differs; check both `jit.rs` and
 `jit_x64.rs` when changing shared operations or layouts.
 
+Baseline inlining preserves a caller's prepared activation: callers with mapped arguments,
+captured bindings or direct eval can retain their existing live environments while eligible
+frame-independent callees use remapped slots. Post-instantiation dispatch selects the current
+compiled version without repeating parameter initialization, hoisting or argument mapping.
+
 The default tier is JIT. Useful diagnostic controls:
 
 - `TRUST_JS_TIER=interp|bytecode|jit` selects the tier.
@@ -127,19 +132,24 @@ JIT/VM. `TRUST_JS_OPT_JIT=hot` instead starts with template code and admits freq
 ordinary functions using four bounded entry samples, guarded Number/Boolean input facts,
 numeric own-data field results, and an estimated compilation/removed-check work budget.
 Field sampling only inspects an already warmed ordinary descriptor; it invokes no getter,
-proxy or conversion. Native reads guard live receiver/descriptor/value state on each access
-and resume before that access on a miss. Generic bodies, environment-homed inputs and
+proxy or conversion. Native reads guard live receiver/descriptor/value state and resume
+before that access on a miss. Dominating own-data metadata proofs can remove repeated
+guards across effect-free CFG paths; current storage and field values remain live reads.
+Generic bodies, environment-homed inputs and
 bodies above 256 bytecodes remain on the established tier. `TRUST_JS_OPT_JIT_HOT_AT`
 overrides the admission distance for diagnostics; it does not waive positive semantic benefit
 or the IR budget. A candidate must compile successfully before second-stage publication and
-call-cache invalidation. Hot mode preserves the established bytecode inliner for unadmitted
-functions. Both transformations check the same second-stage slot; a published inlined body
-is outside the optimizer's single-frame recovery contract and stays on the template tier.
+call-cache invalidation. Baseline inlining and optimizing compilation have separate publication
+slots. The optimizer snapshots the selected immutable bytecode, including existing guarded
+inline bodies, hidden parameter/receiver/callee slots and shared logical source positions.
+Recovery resumes that exact flattened VM body without replaying binding or completed effects.
+The existing frame-independent inline eligibility remains in force; general context-bearing
+inlining and reconstruction of arbitrary logical activations remain separate work.
 This whole-function policy does not migrate active frames. The separate opt-in
 loop-continuation experiment below handles a restricted active-frame case.
 Eight specialization misses retire that version: future dispatch stops publishing its address,
-active native frames and Rust leases finish before reclamation, and later calls use the template
-tier. Successful native entries gain no retirement counter. This is a bounded one-version
+active native frames and Rust leases finish before reclamation, and later calls use the warmed
+baseline, including its guarded inlines. Successful native entries gain no retirement counter. This is a bounded one-version
 policy, not adaptive reoptimization.
 Its cost estimate and real application repayment still require validation. The feature and runtime switch
 are both off by default. `TRUST_JS_OPT_JIT_LOG=1` reports
@@ -151,7 +161,7 @@ guarded continuations at hot loop headers. It continues the existing invocation,
 without repeating parameter binding or prefix effects. `TRUST_JS_OPT_JIT_OSR_AT=N`
 sets the header-visit threshold (default 65,536, minimum 2). Eligible bodies have
 at most 512 operations and at most eight tracked headers; unsupported frames,
-detailed-feedback bodies and whole-function optimized bodies keep their existing
+detailed-feedback bodies, flattened inline bodies and whole-function optimized bodies keep their existing
 execution. Canonical owners remain live across entry, callbacks and recovery.
 Effect-scoped Number fields can remain in registers between observers; changed
 proofs recover at the correct before- or after-effect bytecode boundary. Eight
@@ -175,7 +185,8 @@ of ordinary builds; use them only for diagnostics, never performance acceptance.
 `TRUST_JS_OPT_JIT_DEOPT_AT=N` is a development stress hook: an eligible optimized function
 exits to its ordinary VM continuation when it reaches bytecode boundary N, before that operation.
 It is unset by default, is not a type-specialization policy, and must be absent during
-performance measurements. Suspended or baseline-inlined frames are not admitted by this hook.
+performance measurements. Suspended frames are not admitted by this hook; eligible flattened
+inline bodies continue in their canonical remapped slots and logical source frames.
 The experimental ARM64 call-stub integration reuses the template tier's guarded shared-frame
 calls. `TRUST_JS_OPT_JIT_CALL_STUBS=0` is its diagnostic ablation switch; it retains checked calls,
 not a different JavaScript behavior. Stubs are weak-directory cached and pinned by referring
@@ -193,6 +204,25 @@ analysis and its guard/owner-check elisions. The analysis proves normal-result c
 not immutable heap contents or numeric ranges; unknown effects and completion landings
 retain dynamic checks. Budget exhaustion also retains those checks. This switch skips
 analysis itself, unlike the reload-emission-only ablation above.
+`TRUST_JS_OPT_JIT_RANGES=0` disables bounded integer-interval analysis and the resulting
+ToInt32/index-conversion guard elisions. Facts come from constants and successful language
+operations, with conservative CFG joins and loop widening; entry samples alone provide no
+integer proof. Negative zero, nonintegral values, NaN, infinity and BigInt retain their required
+behavior. The active-loop continuation experiment does not use these range facts.
+`TRUST_JS_OPT_JIT_INT_SSA=0` disables demanded semantic integer register mirrors while
+retaining interval-only lowering. Exact safe-integer Number proofs exclude negative zero;
+signed bitwise results sign-extend and unsigned shifts zero-extend to I64. Bitwise,
+element-index, equality, ordering and truthiness consumers use those mirrors across checked
+copies and joins. Loose equality bypasses coercions only when both operands are proved
+Numbers. Canonical packed owners and F64 copies remain eager, and observer publication/recovery
+remains authoritative; mixed and unproved inputs retain their complete checked operations.
+This development path does not yet specialize integer arithmetic or array-length reads,
+does not cover borrowed loop continuations, and has no application performance acceptance.
+`TRUST_JS_OPT_JIT_HEAP_PROOFS=0` disables repeated own-data metadata guard elimination.
+The initial proof domain covers stable private receiver slots and `this`; joins intersect facts,
+and polls, callbacks, generic slow paths and unknown effects invalidate them. It caches neither
+property values nor storage pointers and preserves live Number result guards. These switches
+are diagnostic ablations inside the opt-in backend, not production-default changes.
 `TRUST_JS_OPT_JIT_HEAP_OPS=0` disables the experimental native own-element reads/overwrites
 and ordinary own-data property writes, retaining their checked helpers. The native path
 keeps live descriptor/exotic guards, canonical numeric mirrors and alias-aware owner
@@ -204,6 +234,13 @@ append into a small ordinary receiver's reserved field storage, retaining its sh
 layout. Extensibility/prototype changes, exotics, storage growth, sidecar maintenance and
 last-owned layout destruction stay checked. Computed non-index creation and object allocation
 are not covered by this path. `TRUST_JS_OPT_JIT_HEAP_OPS=0` also disables creation.
+`TRUST_JS_OPT_JIT_COMPACT_STORES=0` retains the dynamic property-cache probe at warmed
+monomorphic own-field overwrite sites. The compact path freezes only shape and slot scalars;
+it checks the live receiver, storage bounds, descriptor flags and owner transfers, and sends
+misses through the full checked Set. Creation and polymorphic sites retain their existing paths.
+Release optimizing compilation validates finalized CLIF once before backend work.
+`TRUST_JS_OPT_JIT_VERIFY=1`, debug builds and tests additionally enable Cranelift's repeated
+internal verifier passes. This diagnostic does not change JavaScript guards or recovery.
 
 The standalone engine shell accepts `--tier=interp|bytecode|jit`. The runtime CLI's
 current argument parser only accepts `--tier=interp|bytecode`; use `TRUST_JS_TIER=jit`

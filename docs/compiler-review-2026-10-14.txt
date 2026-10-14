@@ -1,0 +1,354 @@
+Compiler review checkpoint, 2026-10-14
+====================================
+
+This checkpoint lets the optional whole-function backend optimize an already
+inlined canonical bytecode body. It also adds bounded integer interval proofs and
+reuses guarded own-property metadata across effect-free control-flow paths.
+Prepared callers can use baseline inlining while retaining their live activation.
+The optional backend remains disabled by default. Correctness validation below
+covers the first two frozen candidates and separately identified follow-ups;
+browser performance acceptance is pending.
+
+The user prioritizes Speedometer 3.1 segments and common-framework browser pages.
+Selected suites are sufficient for iteration and acceptance. No full-suite run is
+required for every change, and a subset must never be reported as a full score.
+Synthetic profiles below identify compiler mechanisms; they do not establish an
+application improvement or determine acceptance.
+
+Implemented contracts
+---------------------
+A Function has a separate optional optimizing-code slot. Successful compilation
+publishes an immutable clone of its selected warmed baseline Chunk, preserving
+existing guarded inlines, canonical remapped slots, bytecode PCs and logical source
+positions. The previous baseline stays resident for active calls and retirement.
+Eight specialization misses select that warmed baseline, including its inlines.
+Publication invalidates future call caches only after native compilation succeeds.
+Cloned runtime/admission state is independent. Cache seeds require current epochs
+and matching weak identities; compiled code adds no JavaScript object owners.
+Shared inline-source metadata unregisters on final-owner drop and is counted once.
+
+Native InlineGuard tests the actual packed callee identity, closure/global context
+and required sloppy receiver category before mutating operands. A miss retains the
+original call fallback. Recovery continues the exact flattened bytecode and its
+canonical owners, including partially completed inline argument binding. Existing
+frame-independent splice eligibility remains the limit; this does not implement
+arbitrary inlining of context-bearing callees or suspended functions. The separate
+experimental loop-continuation policy retains its previous no-inline restriction.
+
+Prepared callers preserve FunctionDeclarationInstantiation. Recompilation retains
+the prepared-entry contract, and post-instantiation dispatch selects the current
+body. Mapped arguments, captured bindings and direct eval keep their authoritative
+live environment. Parameter initialization and caller hoisting are not repeated.
+The existing callee eligibility and constructor-entry restrictions remain in force.
+
+Bounded integer intervals derive from constants and language operations, excluding
+negative zero and precision-losing arithmetic. Unguarded entry samples do not become
+range facts. Normal joins take hulls; natural loop headers widen or lose proofs;
+dynamic completion roots begin unknown. Used proofs remove redundant numeric and
+ToInt32/index conversion checks while retaining live element bounds and ownership.
+TRUST_JS_OPT_JIT_RANGES=0 is an ablation. This checkpoint does not add integer SSA
+lanes; that next tranche is being developed in an isolated checkout.
+
+A separate bounded heap metadata analysis requires facts on every incoming path.
+The lowering bridge uses stable receiver identities and warmed numeric own-data
+reads with terminal misses. It can reuse ordinary-object, shape, slot-bound and
+descriptor proofs. It still reads the current storage pointer and value and checks
+the live result category. Calls, polls, generic helpers and mutation paths clear
+proofs; private-slot preservation does not imply immutable heap contents.
+TRUST_JS_OPT_JIT_HEAP_PROOFS=0 is an ablation. There is no heap-value CSE, general
+receiver-phi lowering, pointer hoisting or prototype dependency invalidation here.
+
+Pinned standards
+----------------
+Local official ECMA-262 source: e28783d5fc9dc12b3de905961e2c71410b38a202,
+fetched 2026-09-06, /big/web-standards/repositories/tc39/ecma262/spec.html.
+PrepareForOrdinaryCall (line13860), OrdinaryCallBindThis (13887) and
+FunctionDeclarationInstantiation (14247) require preserving call/activation state:
+https://tc39.es/ecma262/#sec-prepareforordinarycall
+https://tc39.es/ecma262/#sec-ordinarycallbindthis
+https://tc39.es/ecma262/#sec-functiondeclarationinstantiation
+ToInt32 (5416) governs wraparound and nonfinite conversion:
+https://tc39.es/ecma262/#sec-toint32
+OrdinaryGet (13389) and OrdinarySetWithOwnDescriptor (13449) require preserving
+observable getters, prototype lookup, descriptors and mutation behavior:
+https://tc39.es/ecma262/#sec-ordinaryget
+https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor
+These are pinned living-standard sources, not a claim of current upstream freshness.
+
+Frozen candidate v1 and correctness
+----------------------------------
+Baseline engine: e62c6f0d99d5fa842f0ecd884b099866083a0034.
+Candidate base: e67ec560 (the intervening commit records evidence/documentation).
+Candidate source patch SHA256:
+  67d08449dd1893c233f102ebf8af59554441be5058b8e8d53e2b34704e4b5a62
+Frozen source: /tmp/trust-js-compiler-candidate-20261014.
+Frozen release engine SHA256:
+  a63df7d72fccdb276a1978eee123fc74184b105247463f935b2a1ab15f9ecf13
+Release settings: intl + optimizing-jit compiled, opt-level3, fat LTO, one codegen
+unit, panic=abort. Runtime optimizer selection is explicit and normally off.
+Machine: crystal, native AArch64 GNU/Linux, Rust1.99.0. Full artifact hashes,
+source inventory, commands, environments and raw unit logs are retained in
+benchmarks/review-compiler-validation-v1-2026-10-14.json.
+
+Default library suite: 1,991 passed, zero failed, three ignored.
+Optional optimizing library suite: 2,177 passed, zero failed, three ignored.
+Workspace all-target check with optimizing-jit: passed.
+Test262 revision d86b2294eb0a17eaa281ff12c73c473ec864c72f:
+  4,471 selected cases passed, zero failed/skipped, in each of interpreter,
+  bytecode, template JIT and forced optimizing JIT. Threshold0 and inline-at2
+  exercise early compilation. Complete per-mode failure/skip reports are retained.
+  Scope includes arguments, calls, assignment, bitwise shifts, loops, functions,
+  try/return, Function/eval, forEach, defineProperty and Reflect get/set.
+Differential seeds1..2000: 1,859 agreed, 141 budget-inconclusive, no divergences.
+  Forced optimizing mode and inline-at2; no existing default-path corpus cases.
+Node24.21.0: 26 observable checks across17 scenarios cover all nine new inline/
+  prepared fixtures. Shared-Realm setup uses an explicitly documented Node vm
+  adaptation. Native entry/ownership counters are separate Rust-only assertions.
+
+The native recovery tests sweep all bytecode boundaries and verify actually
+reached exits, rather than counting an unreachable stress request as coverage.
+They exercise nested/polymorphic hits and misses, missing/surplus arguments,
+coercions, Realm guards, GC ownership, mapped arguments, eval, closures, exceptions,
+logical stack names and finalizers. Range tests include signed/unsigned boundaries,
+negative zero, NaN/infinities, BigInt, precision loss and computed compound keys.
+Heap tests cover aliasing/mutation, joins, loop/root invalidation and real lowering.
+A native-write fixture uses explicit generous test compiler limits; it does not
+establish production-budget admission for that shape.
+
+The initial x86-64 attempt stopped because installed Rust/LLVM and clang have only
+AArch64 backends. An isolated official Rust1.99.0 toolchain, matching the installed
+compiler revision, then passed the Linux-musl x86-64 all-target check and test build
+with embed/optimizing-jit. Installed tools and the frozen source remained unchanged.
+QEMU7.2.22 ran nine focused tests successfully with actual native-entry assertions:
+inline identity/Realm/ownership guards, heap proofs, ranges, prepared callers and
+single-PC recovery. A broad thirteen-variant element test hit its120s cap; it is
+incomplete evidence, not a pass or an observed assertion failure. Guest syscall
+tracing recorded six successful RX publications and no RWX mmap/mprotect requests.
+This is software-emulated Linux-musl validation, not physical x64 hardware, other
+operating systems, wasm32 execution or x64 performance evidence. The JSON record
+retains exact tool/archive/artifact hashes, commands, logs and the incomplete run.
+
+Clippy found two needless format borrows in the earlier GroupBy change and one
+lazy bool constructor in range analysis. Pure Rust style cleanups were applied to
+the main working tree after v1 was frozen. They are not part of its source hash
+or measurements. The all-target optimizing-feature lint rerun passed with
+warnings denied (46.23s).
+
+Application and reference methodology
+------------------------------------
+Matched browser worktrees use TRust4ea9b42bf48b29f0298576df527c28bdd5b962d9,
+identical ordinary browser release profile, mimalloc, embed/intl/optimizing-jit and
+single style thread. This differs from the engine shell's fat-LTO profile, so an
+engine-shell binary is not a browser performance proxy. Neither installed browser
+nor main browser target is replaced.
+
+The unchanged official Speedometer3.1 archive at revision
+1386415be8fef2f6b6bbdbe1828872471c5d802a contains1,118 verified files.
+The initial measured screen covers React Complex DOM, Angular Complex DOM, Vue
+and jQuery: one iteration, twelve completed actions in each fresh process.
+TipTap and Chart.js remain additional planned coverage. Each record identifies its subset,
+iterations, completed steps and Sync/Async phases. Functional observers, error
+traces, compiler metrics and profiling are separate from acceptance timings.
+TRust headless work includes JS, DOM, layout and frame scheduling; it does not
+continuously rasterize/present desktop frames. These results cannot isolate a
+percentage gain to the JS compiler or establish desktop responsiveness alone.
+
+A native cached Chromium reference is available:151.0.7922.34,
+revision782af9cb30a53f54487e5d2e44738645a8ec457c, V8 15.1.206.8.
+It is distinct from the pinned Node24/V8 architecture comparison. Its functional
+React pilot and TRust's match100 added items,100 checked/completed items, then0,
+including matching label hashes. These state-observed pilots are not timings.
+Ladybird was cloned and audited at d8afe7ddba448c54ee9ded2c808c1a77d3791ca1;
+no Ladybird binary comparison is claimed. See the separate source comparison.
+
+A baseline React hot-mode diagnostic covering the complete selected interaction
+reported934 native compilations,0.1907s native compilation and20,794,356 generated
+bytes. It published no optimizing body. Counts include bootstrap, a functional
+observer and a delayed diagnostic timer; this is admission evidence, not timing
+acceptance. Candidate coverage and current framework CPU profiles must determine
+which admission, representation or call/heap mechanisms to improve next.
+
+The initial three-round browser screen is descriptive.
+Candidate/off subset duration was effectively unchanged (median paired loss
+-0.046%); candidate/hot was 1.081% slower. Candidate/off's first launch-to-report
+outlier (+7.06%) did not repeat in the other two pairs (-0.645%, +0.031%). These
+three pairs do not establish a performance acceptance or a regression interval.
+The first attempted cohort was interrupted by an unattributed Cargo process and
+is explicitly invalid for timing acceptance; its records are retained.
+
+Four more alternating default-mode pairs extend the valid comparison to N7.
+Independent root recomputation checked all fourteen raw process reports, forty-three
+timing metrics, ninety-three recorded file hashes and the exact functional states.
+Median paired duration losses are aggregate +0.0997%, React +0.7066%, Angular -0.1288%,
+Vue -0.1793% and jQuery -0.0239%. No component meets the existing 3% median-loss
+regression rule, but there is no application performance gain. React is slower in
+all seven pairs; its smaller change remains visible rather than being rounded away.
+Launch-to-report median loss is +0.1805%; the +7.06% candidate outlier repeated at
++7.48%. Both have roughly 1.2 seconds of extra sampled CPU during untimed official
+runner preparation/transitions. Launch-minus-official residuals and measured action sums
+remain stable. The exact cause is unresolved, so these tails are retained as a risk.
+Observed peak RSS median loss is -0.092%, with a separate large baseline memory
+outlier retained. Sampling cannot establish complete GC or tail-cost accounting.
+Nominal bootstrap and conservative sign intervals are both recorded; N7's min/max
+median interval has 98.4375% coverage only under independent continuous pairs.
+The separate hot-mode comparison remains N3 and is not accepted for performance.
+
+Three native Chromium four-TodoMVC reference processes completed all twelve actions;
+their selected geometric-duration median is 211.87ms. A separate functional companion
+matches the same logical states. The browser, presentation and runtime differences
+prevent interpreting this as a Node or Ladybird JavaScript-engine ratio.
+
+Candidate/hot's complete React diagnostic without the functional observer recorded
+zero optimizer requests or publications, 910 template compilations, 0.1890s native
+compilation, 20.45MB generated code, 152 successful baseline inlines and eight GCs
+(0.08749s). Therefore this pass does not measure optimized application execution.
+A separate HOT_AT=1 diagnostic produced 102 requests, 84 publications and 18 IR
+budget declines, costing 1.81475s to compile. Seven publications were already
+present during bootstrap; publication alone does not prove application entries.
+This override is an admission diagnostic, not a proposed production threshold.
+
+The first four-TodoMVC CPU profile registered generated symbols and also printed
+541,759 JIT-map lines (27MB). Its large syscall-cancellation share is affected by
+that logging. Exact source joins identify framework and platform chunks, but its
+CPU percentages are not acceptance evidence or an unbiased bottleneck estimate.
+A registration-only companion is required before using those cost shares.
+
+The registration-only companion completed all twelve TodoMVC actions without
+JIT-map printing, performance counters, traces or functional observers. During
+17.679 sampled CPU seconds, symbol-name grouping attributed approximately 38.26%
+to engine Rust, 10.62% to generated JavaScript, 24.44% to DOM/layout/style and 7.75%
+to mimalloc. Unknown/generic symbols and other native work remain separate; these
+are heuristic attribution buckets, not an exact JavaScript/DOM partition. The
+syscall-cancellation sample fell from 5.785s in the verbose run to 0.242s. Exclusive
+samples included WeakMap.get 0.198s, jit_call_hit 0.164s, Props::get 0.147s,
+restore_realm 0.138s, callee_realm_global 0.098s and call_dispatch 0.096s. No single
+author JavaScript body dominated exclusive samples. Generated-address reuse makes
+some source joins ambiguous; the record does not assign them a guessed owner.
+Profiler registration remains instrumentation, so this is diagnosis rather than
+acceptance timing. The profile is retained under the matched browser experiment's
+candidate-hot-todomvc-profile-v1-nomap directory.
+
+Post-v1 work is kept separate from the frozen artifacts: integer SSA mirrors,
+Realm-aware selection of shared inlined bodies, owned Realm state transfers and
+reduced repeated release compiler verification are under development and focused
+validation. None of their results may be attributed to the v1 source hash above.
+
+The first integer-SSA tranche passed 188 optimizing-tier tests in its isolated
+source tree (single-thread debug, 1558.66s), including native-consumer assertions,
+deoptimization boundaries, private-slot reloads and flattened inlines. It carries
+exact safe-integer mirrors through SSA for ToInt32 and element-index consumers;
+canonical packed owners and Number mirrors remain eager. Disabling integer SSA,
+range facts, value facts or sparse reloads preserves the focused observable
+results. These controls establish mechanism/correctness, not application speed.
+The incremental source patch has SHA-256
+b0bb394778db21fde586192cea910114f90e1926eaea563921aa648a5e25848b.
+
+Subsequent main-tree Realm work selects compatible shared inlined bodies at entry,
+pins inline planning-environment allocation headers with Weak handles, invalidates
+call-cache epochs before expired environment headers are released, and uses a
+function's immutable creation Realm independently of its lexical environment and
+mutable prototype. Owned Realm swaps reduce repeated intrinsic-map cloning while
+retaining caller roots and target registry ownership. Main-tree validation passed
+58 Realm tests, the expired-environment cache regression and seven integer
+integration tests. The embed/optimizing-jit all-target lint check passed with
+warnings denied; the default-feature all-target check also passed. Source hashes,
+commands and complete logs are in
+benchmarks/review-compiler-post-v1-validation-2026-10-14.json. Neither this work nor
+the integer tranche is in the v1 browser binary.
+
+The second frozen candidate includes these changes together with native integer
+comparison/branch consumers, compact guarded own-property stores, immutable-Realm
+checked-call proofs and a release code-generator verification policy. Release
+compilation verifies the final input IR once; debug/test builds and the explicit
+verification control retain internal verifier passes. Native guards, ownership
+publication and checked fallbacks remain in place. The source patch SHA-256 is
+deb0f8a569aa3dd71116690f30f5aaed33027ffffc34d402aee39291869ccf0b;
+its manifest records 499 source/manifests/lockfile hashes.
+
+On Linux ARM64, the exact combined candidate passed 2000 default library tests and
+2286 embed/optimizing-jit library tests, with zero failures and three intentionally
+ignored diagnostic benchmarks in each suite. The all-target embed/optimizing-jit
+Clippy check passed with warnings denied, as did the workspace all-target check
+with optimizing-jit. Emulated x86-64 Linux musl validation passed its all-target
+check, test build and 35 focused case executions (31 distinct cases), including
+selected controls. An additional guest syscall trace recorded three successful
+RX transitions and no RWX requests. Root independently verified 43 evidence and
+artifact hashes and recomputed test totals from logs. This is focused emulated
+correctness evidence; native x64 hardware, other operating systems and browser
+performance are separate gates. Full records are in
+benchmarks/review-compiler-validation-v2-2026-10-14.json.
+
+The frozen v2 release artifacts also passed 4,471 selected Test262 files in each
+of interpreter, bytecode, template-JIT and forced-optimizer modes. Another 226
+Reflect.construct/Array.map files passed in both native modes. The external
+three-Realm constructor-recovery regression passed all four modes and its Node
+oracle. Every selected conformance run had zero failures and skips. Test262 is
+pinned to d86b2294eb0a17eaa281ff12c73c473ec864c72f; this is not a full-suite result.
+Bounded differential testing produced 1,859 agreements, 141 inconclusive cases
+and zero divergences across 2,000 generated seeds. The regression corpus was
+empty. Root independently parsed all ten raw conformance reports and differential
+completion lines, verifying 32 evidence hashes. Full reports and exact controls:
+benchmarks/review-compiler-release-validation-v2-2026-10-14.json.
+
+The v2 three-pair default-mode browser screen completed all nine processes
+(three initial baselines and six paired processes), with all twelve actions and
+no sampled quiet-window violations. Root independently recomputed all 43 timing
+metrics and verified 69 artifact/evidence hashes. Median paired duration changes
+are aggregate -0.691%, React +1.322%, Angular -1.314%, Vue -0.064% and jQuery -2.873%.
+This is descriptive, not acceptance: React pair changes span roughly -15.7% to
++17.4%, and baseline/candidate both have retained own-CPU and outside-action tails.
+The launch-minus-official residual has a separate +20.03% paired median increase
+(.627/.670/.626s baseline versus .627/.822/.751s candidate). Source review shows
+that it includes both the prefix before collector timing and the suffix for
+report construction, transport and Node validation. The historical raw field
+name launch_before_official_interval_s is misleading; existing records cannot
+partition this residual or isolate browser startup. The first attempted cohort is retained but
+excluded because a transient unattributed Cargo process violated its quiet policy.
+The unchanged retry uses the same runner, hashes and exclusion rules. More paired
+observations remain required; background load sampling does not establish the
+cause of these tails. A separate functional run matched all twelve expected
+states, including item labels/counts, completed status and final deletion, with
+zero reported JavaScript/module errors. Functional observation was excluded from
+acceptance timing.
+
+The intended seven-pair confirmation remains incomplete. Three supplementary
+cohorts were interrupted by the same strict Cargo-process guard. All three entire
+cohorts are retained but excluded; valid-looking individual pairs were not joined
+selectively with the original three pairs. A later metadata-only process monitor
+observed recurring Cargo activity in another project. That later evidence cannot
+identify the earlier short-lived guard PIDs. No application-performance acceptance
+is claimed, and the original variance/regression rules have not been relaxed.
+The third attempt used a user-reserved window with all owned compiler workers
+paused, but the guard still observed Cargo PID 3549358 at 12:12:22.329 UTC. That
+PID's parent, working directory and CPU ticks were not captured; its identity
+cannot be inferred. The whole supplementary cohort remains excluded, and no
+automatic retry was started.
+
+A separate wasm32 compile check found a pre-existing portability defect: shared
+JIT entry wrappers refer to the live-heap-counter address helper on every target,
+while that helper was conditionally compiled only for native JIT targets. Commit
+bff624b5 makes the real platform-independent Cell address available to those
+wrappers. The clean baseline fails and the isolated fix passes both default
+engine/embed + wasm bindings and no-Intl engine/embed checks. Composition with
+frozen v2 also passes. Existing warnings remain recorded; these are compile
+checks, not WebAssembly runtime tests. The frozen v2 source/artifacts retain the
+original defect and remain immutable. The current main source has this separate
+fix in addition to the v2 compiler work. Evidence:
+benchmarks/review-wasm-portability-2026-10-14.json.
+
+Two test-only follow-ups are now integrated after independent root execution and
+source review. One exercises nested three-Realm constructor callbacks, GC and
+caller-context errors; the other proves that live null-prototype callables retain
+their creation Realm through the old global environment after host environment
+replacement, and that releasing those callables permits reclamation. Each test
+passed in separate default and forced-optimizer processes covering all three
+tiers. The main source matches the immutable combined test artifact except for
+the separately validated portable helper above. Parentless self-hosted function
+ownership has a separate source proof and is not claimed as executed coverage.
+Evidence: benchmarks/review-compiler-followup-regressions-2026-10-14.json.
+
+Earlier compiler diagnostics are retained in:
+  benchmarks/review-compiler-attribution-v3-2026-10-14.json
+  benchmarks/review-optional-compiler-baseline-diagnostics-2026-10-14.json
+They show that replacing the code generator alone does not establish a speedup.
+Their synthetic workloads are not the acceptance set for this work.

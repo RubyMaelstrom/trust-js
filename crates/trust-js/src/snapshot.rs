@@ -1545,6 +1545,8 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         calls: Cell::new(0),
         code: OnceCell::new(),
         code2: OnceCell::new(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_code: OnceCell::new(),
         fn_maps: OnceCell::new(),
         env_layouts: OnceCell::new(),
     })

@@ -1,8 +1,65 @@
-Optimizing tier — development record, 2026-09-29
+Optimizing tier — development record, 2026-10-14
 ================================================================
 
 Current implementation and decision
 ------------------------------------
+The October 14 compiler work composes existing guarded bytecode inlining with the
+whole-function backend. A separate Function optimizing slot owns an immutable
+snapshot of the selected baseline Chunk. Remapped inline homes and shared logical
+source registrations survive compilation and before-effect VM recovery. Retirement
+selects the warmed baseline, including its inlines. The established frame-independent
+splice eligibility remains the boundary; this is not arbitrary activation reconstruction.
+
+Bounded integer-interval analysis now informs ToInt32 and element-index conversion
+lowering. Constants and language operations establish facts; unguarded input samples
+do not. A separate heap metadata must-analysis reuses own-data guards across effect-free
+CFG paths for stable receiver identities. Mutable values and storage pointers are still
+read live; callbacks, polls and generic slow paths invalidate metadata proofs. Diagnostic
+switches TRUST_JS_OPT_JIT_RANGES=0 and TRUST_JS_OPT_JIT_HEAP_PROOFS=0 retain the prior
+lowering. Frozen October 14 candidate v1 passed the full default/optional unit suites,
+selected Test262 cases in four execution modes, and bounded differential testing.
+See compiler-review-2026-10-14.txt for exact artifacts, scope and limitations.
+Seven paired processes on the selected React/Angular/Vue/jQuery TodoMVC subset show
+no application gain for candidate v1 with the optimizer disabled: median duration
++0.10%. Two untimed setup/transition CPU outliers remain unexplained. The separate
+three-pair hot-mode screen also did not establish a gain. The backend remains off by default;
+these results do not accept the later changes described below.
+The previous measurements below remain historical evidence, not measurements of this
+new compiler work.
+
+The subsequent integer SSA tranche remains development code, integrated after focused
+native tests, independent review and diagnostic ablations. Bounded backward register
+demand retains sparse semantic I64 mirrors of proved exact safe-integer Numbers. Signed
+bitwise results sign-extend and unsigned right shifts zero-extend; used ToInt32 and
+element-index consumers avoid repeated floating conversions. Exact integer operands also
+use mathematical I64 equality, ordering and truthiness, including loose equality when both
+operands are proved Numbers. Mixed inputs retain checked coercions. Publication planning
+preserves dirty owners only at the exact selected equality/not sites that invoke no helper.
+Packed words and F64 copies remain eager, canonical publication/recovery is unchanged,
+and private-write effects and independent completion roots govern reloads.
+TRUST_JS_OPT_JIT_INT_SSA=0 skips mirror-demand
+analysis and retains the interval-only lowering. This does not add Array-length proofs,
+integer arithmetic or application performance acceptance.
+
+Warmed monomorphic own-field overwrite sites now use a compact native shape/slot
+probe. Only scalar cache facts are frozen: live receiver kind, shape, storage bounds,
+descriptor flags and alias-aware owner transfers remain guarded. Changed facts use
+the checked Set algorithm. Creation and polymorphic sites retain their dynamic probes.
+TRUST_JS_OPT_JIT_COMPACT_STORES=0 restores the dynamic probe for comparison.
+The focused fixture shrinks from 367 to 223 CLIF instructions and fits the unchanged
+hot-compilation budget; this static result does not establish application repayment.
+Release compilation validates finalized CLIF once before code generation instead of
+repeating internal development checks. Debug/tests and TRUST_JS_OPT_JIT_VERIFY=1 keep
+those repeated checks. Invalid input IR is still rejected before executable allocation.
+
+Current acceptance direction (user instruction, October 14): prioritize Speedometer
+3.1 segments and actual browser pages using widely used frameworks. Selected suites
+are acceptable for iteration and acceptance; a full 30-minute-plus run is optional,
+not required for every change. Record the exact subset and per-suite results without
+reporting a partial run as a full Speedometer score. Synthetic workloads remain useful
+for diagnosis, but do not decide this effort's real-application performance acceptance.
+This supersedes the older full-suite-only requirement in the historical record below.
+
 The September 29 source includes separate opt-in hot-loop continuations in
 addition to whole-function entry specialization. TRUST_JS_OPT_JIT_OSR=1 enables
 them only when the optional optimizing-jit feature is compiled. They retain the
@@ -87,7 +144,10 @@ Execution contract implemented by the first backend
 * Native callbacks and strict-mode proper-tail-call handoff retain the ordinary Call driver.
 * Suspensions/disposal retain the existing native-slice/VM path until whole-function frame
   reconstruction covers them. This is a coverage boundary, not discarded functionality.
-* Existing speculative inline bytecode takes its original-call fallback in this backend.
+* Existing frame-independent speculative inline bytecode uses live callee, closure-context,
+  Realm and receiver guards in this backend. A miss retains the original-call fallback.
+  Hidden inline owners and source markers remain canonical across checked effects and VM
+  recovery at the exact flattened bytecode boundary.
 * Register-backed local SSA spans the entire function, with phi values at normal joins and
   loop backedges. A bounded may-dirty dataflow analysis selects canonical local stores before
   checked calls. Guarded slow paths publish the ORIGINAL incoming state; normal fast paths keep
@@ -129,11 +189,12 @@ Execution contract implemented by the first backend
   for diagnostics but retains semantic and IR requirements. Actual lowered IR must fit the
   estimated envelope before code generation. A separate immutable Chunk must preserve exact
   source operation/name/slot/schema identity and compile successfully before publication;
-  declines do not publish code2 or invalidate callers. Old active owners remain protected.
-  This shares Function::code2 with baseline bytecode inlining; hot mode does not reserve
-  that slot or disable the existing inliner's bounded policy. Both publishers check the
-  slot, and already inlined bodies retain template execution because their logical frames
-  are outside this recovery contract. It is not optimizing
+  declines do not publish optimizing_code or invalidate callers. Old active owners remain
+  protected. Function::code2 retains baseline bytecode inlining; a separate optimizing_code
+  slot snapshots the currently selected canonical body without reserving or replacing the
+  baseline slot. Shared source registrations retain logical inline identities until their
+  final Chunk owner dies. The caller's active frame does not migrate during publication.
+  It is not optimizing
   OSR, background compilation or a complete reoptimization policy. Optional runtime diagnostics
   count specialization bailouts separately from forced recovery stress. Eight misses retire
   a version: its slot immediately stops publishing addresses and invalidates raw call caches,

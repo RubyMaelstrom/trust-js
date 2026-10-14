@@ -26690,6 +26690,34 @@ fn cross_realm_construct_semantics() {
 }
 
 #[test]
+fn cross_realm_nested_constructor_callbacks_restore_caller_errors_across_gc() {
+    // ECMA-262 [[Construct]], snapshot e28783d5fc9d: pop the callee context before
+    // validating a derived constructor's primitive return; forward an existing throw.
+    // The identical fixture is also verified with Node's vm Realms and exposed GC.
+    let source = include_str!("test_fixtures/nested-third-realm-constructor-recovery.js");
+    let expected = concat!(
+        r#"{"status":"ok","rounds":32,"outerErrors":32,"callbackErrors":32,"#,
+        r#""nestedErrors":64,"bounceCalls":64}"#,
+    );
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(1);
+        run_in(&mut engine, source);
+        // A fresh host entry must still find the original Realm's final state.
+        assert_eq!(
+            run_in(&mut engine, "JSON.stringify(result)"),
+            expected,
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
 fn dynamic_function_coerces_params_before_body() {
     assert_eq!(
         run("var order = [];

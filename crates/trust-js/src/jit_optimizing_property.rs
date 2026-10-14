@@ -18,6 +18,7 @@ use crate::value::{JitLayout, PACK_OBJ, PROP_ACCESSOR};
 thread_local! {
     pub(super) static TEST_READ_HELPERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static TEST_COMPACT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static TEST_METADATA_ELISIONS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
 }
 
 /// No Rust layout is guessed from a target name. The parent obtains these offsets from the
@@ -107,13 +108,44 @@ impl Lowering<'_, '_> {
             | Op::GetPropLocal(_, name, cache) => (name, cache),
             _ => unreachable!("named property read"),
         };
+        let frozen_metadata = numeric_result
+            .then(|| self.heap_metadata_plan.and_then(|plan| plan.read(pc)))
+            .flatten();
+        let compact = frozen_metadata.map(|(state, _)| state).or_else(|| {
+            self.chunk.jit_cache_preferred(cache).filter(|state| {
+                state.depth <= IC_MAX_DEPTH
+                    && (state.depth < 2 || {
+                        let needed = (1u8 << (state.depth - 1)) - 1;
+                        state.mid_ok & needed == needed
+                    })
+            })
+        });
+        let metadata = frozen_metadata.map(|(_, proof)| proof).unwrap_or_default();
+        #[cfg(test)]
+        TEST_METADATA_ELISIONS.with(|count| {
+            let mut counts = count.get();
+            for (index, removed) in [
+                metadata.ordinary,
+                metadata.shape,
+                metadata.bounds,
+                metadata.data,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                counts[index] += usize::from(removed);
+            }
+            count.set(counts);
+        });
         let slow = self.b.create_block();
         let receiver = if matches!(op, Op::GetPropThis(..)) {
             // Value is repr(u8) with fixed discriminants, separate from packed local storage.
             let this = self.load(self.ctx, offset_of!(JitCtx, this_raw) as i32);
-            let tag = self.property_load(types::I8, this, 0);
-            let object = self.b.ins().icmp_imm_s(IntCC::Equal, tag, 8);
-            self.property_guard(object, slow);
+            if !metadata.ordinary {
+                let tag = self.property_load(types::I8, this, 0);
+                let object = self.b.ins().icmp_imm_s(IntCC::Equal, tag, 8);
+                self.property_guard(object, slow);
+            }
             self.load(this, 8)
         } else {
             let word = if let Op::GetPropLocal(slot, ..) = op {
@@ -121,12 +153,14 @@ impl Lowering<'_, '_> {
             } else {
                 self.stack_read(1)
             };
-            let tag = self.b.ins().ushr_imm_u(word, 48);
-            let object = self
-                .b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, tag, (PACK_OBJ >> 48) as i64);
-            self.property_guard(object, slow);
+            if !metadata.ordinary {
+                let tag = self.b.ins().ushr_imm_u(word, 48);
+                let object = self
+                    .b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, tag, (PACK_OBJ >> 48) as i64);
+                self.property_guard(object, slow);
+            }
             self.b.ins().band_imm_s(word, 0x0000_ffff_ffff_ffff)
         };
         if matches!(op, Op::GetProp(..)) {
@@ -142,53 +176,59 @@ impl Lowering<'_, '_> {
             .b
             .ins()
             .iadd_imm_s(receiver, self.values.obj_from_rc as i64);
-        self.property_plain(receiver_object, slow);
-        let exotic = self.property_load(types::I8, receiver_object, self.values.obj_exotic);
-        let ordinary =
-            self.b
-                .ins()
-                .icmp_imm_s(IntCC::Equal, exotic, self.values.exotic_none_tag as i64);
-        // Arrays may prove ABSENCE of a non-index named property below an ordinary holder,
-        // never a holder slot: indexed elements do not participate in their named shape.
-        let array = if !self
-            .chunk
-            .jit_name(name)
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_digit)
-        {
-            Some(
+        let exotic = if metadata.ordinary {
+            None
+        } else {
+            self.property_plain(receiver_object, slow);
+            Some(self.property_load(types::I8, receiver_object, self.values.obj_exotic))
+        };
+        let ordinary = match exotic {
+            Some(exotic) => {
                 self.b
                     .ins()
-                    .icmp_imm_s(IntCC::Equal, exotic, self.values.exotic_array_tag as i64),
-            )
+                    .icmp_imm_s(IntCC::Equal, exotic, self.values.exotic_none_tag as i64)
+            }
+            None => self.b.ins().iconst(types::I8, 1),
+        };
+        // Arrays may prove ABSENCE of a non-index named property below an ordinary holder,
+        // never a holder slot: indexed elements do not participate in their named shape.
+        let array = if !metadata.ordinary
+            && !self
+                .chunk
+                .jit_name(name)
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_digit)
+        {
+            Some(self.b.ins().icmp_imm_s(
+                IntCC::Equal,
+                exotic.expect("unguarded exotic"),
+                self.values.exotic_array_tag as i64,
+            ))
         } else {
             None
         };
         let receiver_ok = array.map_or(ordinary, |array| self.b.ins().bor(ordinary, array));
-        self.property_guard(receiver_ok, slow);
+        if !metadata.ordinary {
+            self.property_guard(receiver_ok, slow);
+        }
 
         let hit = self.b.create_block();
         self.b.append_block_param(hit, types::I64);
         self.b.append_block_param(hit, types::I64);
-        let compact = self.chunk.jit_cache_preferred(cache).filter(|state| {
-            state.depth <= IC_MAX_DEPTH
-                && (state.depth < 2 || {
-                    let needed = (1u8 << (state.depth - 1)) - 1;
-                    state.mid_ok & needed == needed
-                })
-        });
         if let Some(state) = compact {
             // Compile observed monomorphic shape facts, not an entire empty-cache resolver.
             // Identity is NOT embedded: every hit rewalks live links and reads live flags/value.
             // Changed shapes take the exact operation's fallback before any ownership effect.
             #[cfg(test)]
             TEST_COMPACT_READS.with(|count| count.set(count.get() + 1));
-            if state.depth == 0 {
+            if state.depth == 0 && !metadata.ordinary {
                 self.property_guard(ordinary, slow);
             }
-            let shape = self.b.ins().iconst(types::I32, state.recv_shape as i64);
-            self.property_shape(receiver_object, shape, slow);
+            if !metadata.shape {
+                let shape = self.b.ins().iconst(types::I32, state.recv_shape as i64);
+                self.property_shape(receiver_object, shape, slow);
+            }
             let mut holder = receiver_object;
             for hop in 1..=state.depth {
                 let proto = self.load(holder, self.values.obj_proto as i32);
@@ -305,22 +345,27 @@ impl Lowering<'_, '_> {
         self.b.switch_to_block(hit);
         let holder = self.b.block_params(hit)[0];
         let slot = self.b.block_params(hit)[1];
-        let length = self.load(
-            holder,
-            (self.values.obj_props + self.values.props_entries + self.values.vec_len_off) as i32,
-        );
-        let valid = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, length);
-        self.property_guard(valid, slow);
+        if !metadata.bounds {
+            let length = self.load(
+                holder,
+                (self.values.obj_props + self.values.props_entries + self.values.vec_len_off)
+                    as i32,
+            );
+            let valid = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, length);
+            self.property_guard(valid, slow);
+        }
         let entries = self.load(
             holder,
             (self.values.obj_props + self.values.props_entries + self.values.vec_ptr_off) as i32,
         );
         let offset = self.b.ins().imul_imm_s(slot, self.values.entry_size as i64);
         let entry = self.b.ins().iadd(entries, offset);
-        let flags = self.property_load(types::I8, entry, self.values.entry_accessor);
-        let accessor = self.b.ins().band_imm_s(flags, PROP_ACCESSOR as i64);
-        let data = self.b.ins().icmp_imm_s(IntCC::Equal, accessor, 0);
-        self.property_guard(data, slow);
+        if !metadata.data {
+            let flags = self.property_load(types::I8, entry, self.values.entry_accessor);
+            let accessor = self.b.ins().band_imm_s(flags, PROP_ACCESSOR as i64);
+            let data = self.b.ins().icmp_imm_s(IntCC::Equal, accessor, 0);
+            self.property_guard(data, slow);
+        }
         let value = self.load(entry, self.values.entry_value as i32);
         if numeric_result {
             let number = self.number(value);

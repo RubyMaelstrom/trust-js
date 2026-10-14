@@ -13,7 +13,12 @@
 //! No compiled address captures a realm, closure, caller Chunk, stack or TLS heap pointer.
 
 use super::ExecutableBuffer;
-use crate::bytecode::{Chunk, Op};
+use crate::bytecode::Chunk;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+use crate::bytecode::Op;
 use crate::interpreter::InterpLayout;
 use crate::value::JitLayout;
 use std::rc::Rc;

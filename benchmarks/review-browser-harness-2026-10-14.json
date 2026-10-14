@@ -1,0 +1,1795 @@
+{
+  "schema_version": 1,
+  "status": "v1_n7_audited_v2_n3_valid_v2_n7_pending_three_wholly_excluded_supplements_no_application_acceptance",
+  "created_utc": "2026-10-14T09:16:51.831038+00:00",
+  "scope": "Selected single-core headless browser application measurements; no full-suite Speedometer score, desktop responsiveness or isolated JS-only claim",
+  "user_scope": "Representative selected Speedometer3.1 segments authorized; full suite optional",
+  "browser_revision": "4ea9b42bf48b29f0298576df527c28bdd5b962d9",
+  "baseline": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/baseline-manifest.json",
+    "sha256": "812668321cd6fdb26e1065c7306d04ff46d0461ff19f648c297486e42c5d9f63"
+  },
+  "candidate_v1": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v1-manifest.json",
+    "sha256": "e7bf09ad913f888f9529f8b4b52b90aaa5d47bfe9abf3fdb65d54da3a2be89a9"
+  },
+  "stack_controls": {
+    "browser_profile": {
+      "opt_level": 3,
+      "lto": false,
+      "codegen_units": 64,
+      "incremental": true,
+      "strip": "none"
+    },
+    "features": [
+      "mimalloc",
+      "trust-js/embed",
+      "trust-js/intl",
+      "trust-js/optimizing-jit"
+    ],
+    "engine_dependency": "Absolute frozen engine source paths in isolated browser worktrees; identical browser source except Cargo dependency path",
+    "tier": "jit",
+    "TRUST_STYLE_THREADS": "1",
+    "cpu": 5,
+    "artifact_copies": "Fresh independent tmpfs copy per timed process; exact SHA verified",
+    "inherited_controls": "TRUST_* and LUMEN_* scrubbed; explicit mode controls only",
+    "build_manifest_harness_hashes": "Snapshot at browser build; each timed control.json and cohort runner_files records authoritative actual runtime hashes"
+  },
+  "fixture": {
+    "path": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official",
+    "revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+    "manifest": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-manifest.txt",
+    "manifest_sha256": "8fe295c903426f6292f40e353de0ae89637ac8ee78c98fdf14fcde13aa9de085",
+    "verified_git_blobs": 1118,
+    "verified_bytes": 61022359,
+    "missing": 0,
+    "mismatches": 0
+  },
+  "selected_suites": [
+    "TodoMVC-React-Complex-DOM",
+    "TodoMVC-Angular-Complex-DOM",
+    "TodoMVC-Vue",
+    "TodoMVC-jQuery"
+  ],
+  "iterations_per_fresh_process": 1,
+  "measurement": "Official RAF Sync/Async phases and exact completion collector; cold-to-warm pass per fresh browser",
+  "wider_prepared_subset": [
+    "Editor-TipTap",
+    "Charts-chartjs"
+  ],
+  "phase0": {
+    "Geomean": {
+      "values": [
+        2168.1766123722705,
+        2160.651962255921,
+        2165.5395739423716
+      ],
+      "median": 2165.5395739423716,
+      "median_absolute_deviation": 2.637038429898894,
+      "relative_mad": 0.0012177281180311829,
+      "min": 2160.651962255921,
+      "max": 2168.1766123722705
+    },
+    "Iteration-0-Total": {
+      "values": [
+        2755.375244140625,
+        2750.1248168945312,
+        2761.924865722656
+      ],
+      "median": 2755.375244140625,
+      "median_absolute_deviation": 5.25042724609375,
+      "relative_mad": 0.0019055216734123297,
+      "min": 2750.1248168945312,
+      "max": 2761.924865722656
+    },
+    "Score": {
+      "values": [
+        0.46121704029722393,
+        0.4628232669901669,
+        0.461778677255709
+      ],
+      "median": 0.461778677255709,
+      "median_absolute_deviation": 0.0005616369584850456,
+      "relative_mad": 0.001216247059787995,
+      "min": 0.46121704029722393,
+      "max": 0.4628232669901669
+    },
+    "TodoMVC-Angular-Complex-DOM": {
+      "values": [
+        2350.800048828125,
+        2344.399658203125,
+        2341.399658203125
+      ],
+      "median": 2344.399658203125,
+      "median_absolute_deviation": 3.0,
+      "relative_mad": 0.0012796452983188723,
+      "min": 2341.399658203125,
+      "max": 2350.800048828125
+    },
+    "TodoMVC-Angular-Complex-DOM/Adding100Items": {
+      "values": [
+        1088.099853515625,
+        1090.89990234375,
+        1077.199951171875
+      ],
+      "median": 1088.099853515625,
+      "median_absolute_deviation": 2.800048828125,
+      "relative_mad": 0.0025733381169734636,
+      "min": 1077.199951171875,
+      "max": 1090.89990234375
+    },
+    "TodoMVC-Angular-Complex-DOM/Adding100Items/Async": {
+      "values": [
+        211.199951171875,
+        212,
+        207.5
+      ],
+      "median": 211.199951171875,
+      "median_absolute_deviation": 0.800048828125,
+      "relative_mad": 0.0037881108574401062,
+      "min": 207.5,
+      "max": 212
+    },
+    "TodoMVC-Angular-Complex-DOM/Adding100Items/Sync": {
+      "values": [
+        876.89990234375,
+        878.89990234375,
+        869.699951171875
+      ],
+      "median": 876.89990234375,
+      "median_absolute_deviation": 2.0,
+      "relative_mad": 0.002280762028430456,
+      "min": 869.699951171875,
+      "max": 878.89990234375
+    },
+    "TodoMVC-Angular-Complex-DOM/CompletingAllItems": {
+      "values": [
+        817.300048828125,
+        810.5,
+        818.199951171875
+      ],
+      "median": 817.300048828125,
+      "median_absolute_deviation": 0.89990234375,
+      "relative_mad": 0.0011010672824996318,
+      "min": 810.5,
+      "max": 818.199951171875
+    },
+    "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Async": {
+      "values": [
+        365.300048828125,
+        365.800048828125,
+        365.699951171875
+      ],
+      "median": 365.699951171875,
+      "median_absolute_deviation": 0.10009765625,
+      "relative_mad": 0.00027371525735576377,
+      "min": 365.300048828125,
+      "max": 365.800048828125
+    },
+    "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Sync": {
+      "values": [
+        452,
+        444.699951171875,
+        452.5
+      ],
+      "median": 452,
+      "median_absolute_deviation": 0.5,
+      "relative_mad": 0.0011061946902654867,
+      "min": 444.699951171875,
+      "max": 452.5
+    },
+    "TodoMVC-Angular-Complex-DOM/DeletingAllItems": {
+      "values": [
+        445.400146484375,
+        442.999755859375,
+        445.999755859375
+      ],
+      "median": 445.400146484375,
+      "median_absolute_deviation": 0.599609375,
+      "relative_mad": 0.0013462262635807974,
+      "min": 442.999755859375,
+      "max": 445.999755859375
+    },
+    "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Async": {
+      "values": [
+        109.900146484375,
+        109.7998046875,
+        109.39990234375
+      ],
+      "median": 109.7998046875,
+      "median_absolute_deviation": 0.100341796875,
+      "relative_mad": 0.000913861342108774,
+      "min": 109.39990234375,
+      "max": 109.900146484375
+    },
+    "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Sync": {
+      "values": [
+        335.5,
+        333.199951171875,
+        336.599853515625
+      ],
+      "median": 335.5,
+      "median_absolute_deviation": 1.099853515625,
+      "relative_mad": 0.0032782519094634874,
+      "min": 333.199951171875,
+      "max": 336.599853515625
+    },
+    "TodoMVC-React-Complex-DOM": {
+      "values": [
+        2055.000244140625,
+        2038.800048828125,
+        2037.69970703125
+      ],
+      "median": 2038.800048828125,
+      "median_absolute_deviation": 1.100341796875,
+      "relative_mad": 0.0005397006918395268,
+      "min": 2037.69970703125,
+      "max": 2055.000244140625
+    },
+    "TodoMVC-React-Complex-DOM/Adding100Items": {
+      "values": [
+        840.10009765625,
+        829.300048828125,
+        827.699951171875
+      ],
+      "median": 829.300048828125,
+      "median_absolute_deviation": 1.60009765625,
+      "relative_mad": 0.0019294556397423115,
+      "min": 827.699951171875,
+      "max": 840.10009765625
+    },
+    "TodoMVC-React-Complex-DOM/Adding100Items/Async": {
+      "values": [
+        174.800048828125,
+        174.800048828125,
+        173.89990234375
+      ],
+      "median": 174.800048828125,
+      "median_absolute_deviation": 0.0,
+      "relative_mad": 0.0,
+      "min": 173.89990234375,
+      "max": 174.800048828125
+    },
+    "TodoMVC-React-Complex-DOM/Adding100Items/Sync": {
+      "values": [
+        665.300048828125,
+        654.5,
+        653.800048828125
+      ],
+      "median": 654.5,
+      "median_absolute_deviation": 0.699951171875,
+      "relative_mad": 0.0010694441128724216,
+      "min": 653.800048828125,
+      "max": 665.300048828125
+    },
+    "TodoMVC-React-Complex-DOM/CompletingAllItems": {
+      "values": [
+        815.000244140625,
+        810.39990234375,
+        810.39990234375
+      ],
+      "median": 810.39990234375,
+      "median_absolute_deviation": 0.0,
+      "relative_mad": 0.0,
+      "min": 810.39990234375,
+      "max": 815.000244140625
+    },
+    "TodoMVC-React-Complex-DOM/CompletingAllItems/Async": {
+      "values": [
+        322.400146484375,
+        320.699951171875,
+        321.89990234375
+      ],
+      "median": 321.89990234375,
+      "median_absolute_deviation": 0.500244140625,
+      "relative_mad": 0.0015540363230393279,
+      "min": 320.699951171875,
+      "max": 322.400146484375
+    },
+    "TodoMVC-React-Complex-DOM/CompletingAllItems/Sync": {
+      "values": [
+        492.60009765625,
+        489.699951171875,
+        488.5
+      ],
+      "median": 489.699951171875,
+      "median_absolute_deviation": 1.199951171875,
+      "relative_mad": 0.002450380419690589,
+      "min": 488.5,
+      "max": 492.60009765625
+    },
+    "TodoMVC-React-Complex-DOM/DeletingAllItems": {
+      "values": [
+        399.89990234375,
+        399.10009765625,
+        399.599853515625
+      ],
+      "median": 399.599853515625,
+      "median_absolute_deviation": 0.300048828125,
+      "relative_mad": 0.0007508732185089943,
+      "min": 399.10009765625,
+      "max": 399.89990234375
+    },
+    "TodoMVC-React-Complex-DOM/DeletingAllItems/Async": {
+      "values": [
+        88,
+        88.300048828125,
+        88.800048828125
+      ],
+      "median": 88.300048828125,
+      "median_absolute_deviation": 0.300048828125,
+      "relative_mad": 0.0033980595946106608,
+      "min": 88,
+      "max": 88.800048828125
+    },
+    "TodoMVC-React-Complex-DOM/DeletingAllItems/Sync": {
+      "values": [
+        311.89990234375,
+        310.800048828125,
+        310.7998046875
+      ],
+      "median": 310.800048828125,
+      "median_absolute_deviation": 0.000244140625,
+      "relative_mad": 7.855231230514117e-07,
+      "min": 310.7998046875,
+      "max": 311.89990234375
+    },
+    "TodoMVC-Vue": {
+      "values": [
+        784.500244140625,
+        781.2998046875,
+        783.2001953125
+      ],
+      "median": 783.2001953125,
+      "median_absolute_deviation": 1.300048828125,
+      "relative_mad": 0.0016599189273775337,
+      "min": 781.2998046875,
+      "max": 784.500244140625
+    },
+    "TodoMVC-Vue/Adding100Items": {
+      "values": [
+        388.400146484375,
+        386.300048828125,
+        386.5
+      ],
+      "median": 386.5,
+      "median_absolute_deviation": 0.199951171875,
+      "relative_mad": 0.0005173380902328589,
+      "min": 386.300048828125,
+      "max": 388.400146484375
+    },
+    "TodoMVC-Vue/Adding100Items/Async": {
+      "values": [
+        324.7001953125,
+        322.5,
+        324
+      ],
+      "median": 324,
+      "median_absolute_deviation": 0.7001953125,
+      "relative_mad": 0.0021610966435185184,
+      "min": 322.5,
+      "max": 324.7001953125
+    },
+    "TodoMVC-Vue/Adding100Items/Sync": {
+      "values": [
+        63.699951171875,
+        63.800048828125,
+        62.5
+      ],
+      "median": 63.699951171875,
+      "median_absolute_deviation": 0.10009765625,
+      "relative_mad": 0.0015713929823889005,
+      "min": 62.5,
+      "max": 63.800048828125
+    },
+    "TodoMVC-Vue/CompletingAllItems": {
+      "values": [
+        289.60009765625,
+        288.2998046875,
+        289.300048828125
+      ],
+      "median": 289.300048828125,
+      "median_absolute_deviation": 0.300048828125,
+      "relative_mad": 0.0010371544330545928,
+      "min": 288.2998046875,
+      "max": 289.60009765625
+    },
+    "TodoMVC-Vue/CompletingAllItems/Async": {
+      "values": [
+        218.60009765625,
+        217.89990234375,
+        218.300048828125
+      ],
+      "median": 218.300048828125,
+      "median_absolute_deviation": 0.300048828125,
+      "relative_mad": 0.0013744789785239057,
+      "min": 217.89990234375,
+      "max": 218.60009765625
+    },
+    "TodoMVC-Vue/CompletingAllItems/Sync": {
+      "values": [
+        71,
+        70.39990234375,
+        71
+      ],
+      "median": 71,
+      "median_absolute_deviation": 0,
+      "relative_mad": 0.0,
+      "min": 70.39990234375,
+      "max": 71
+    },
+    "TodoMVC-Vue/DeletingAllItems": {
+      "values": [
+        106.5,
+        106.699951171875,
+        107.400146484375
+      ],
+      "median": 106.699951171875,
+      "median_absolute_deviation": 0.199951171875,
+      "relative_mad": 0.0018739574824445191,
+      "min": 106.5,
+      "max": 107.400146484375
+    },
+    "TodoMVC-Vue/DeletingAllItems/Async": {
+      "values": [
+        24.699951171875,
+        25.099853515625,
+        25.400146484375
+      ],
+      "median": 25.099853515625,
+      "median_absolute_deviation": 0.30029296875,
+      "relative_mad": 0.011963933118695834,
+      "min": 24.699951171875,
+      "max": 25.400146484375
+    },
+    "TodoMVC-Vue/DeletingAllItems/Sync": {
+      "values": [
+        81.800048828125,
+        81.60009765625,
+        82
+      ],
+      "median": 81.800048828125,
+      "median_absolute_deviation": 0.199951171875,
+      "relative_mad": 0.0024443893951106243,
+      "min": 81.60009765625,
+      "max": 82
+    },
+    "TodoMVC-jQuery": {
+      "values": [
+        5831.200439453125,
+        5835.999755859375,
+        5885.39990234375
+      ],
+      "median": 5835.999755859375,
+      "median_absolute_deviation": 4.79931640625,
+      "relative_mad": 0.0008223640519229735,
+      "min": 5831.200439453125,
+      "max": 5885.39990234375
+    },
+    "TodoMVC-jQuery/Adding100Items": {
+      "values": [
+        1412.900146484375,
+        1414.699951171875,
+        1424.199951171875
+      ],
+      "median": 1414.699951171875,
+      "median_absolute_deviation": 1.7998046875,
+      "relative_mad": 0.0012722165474093085,
+      "min": 1412.900146484375,
+      "max": 1424.199951171875
+    },
+    "TodoMVC-jQuery/Adding100Items/Async": {
+      "values": [
+        281.5,
+        281.5,
+        279.39990234375
+      ],
+      "median": 281.5,
+      "median_absolute_deviation": 0.0,
+      "relative_mad": 0.0,
+      "min": 279.39990234375,
+      "max": 281.5
+    },
+    "TodoMVC-jQuery/Adding100Items/Sync": {
+      "values": [
+        1131.400146484375,
+        1133.199951171875,
+        1144.800048828125
+      ],
+      "median": 1133.199951171875,
+      "median_absolute_deviation": 1.7998046875,
+      "relative_mad": 0.0015882498809135755,
+      "min": 1131.400146484375,
+      "max": 1144.800048828125
+    },
+    "TodoMVC-jQuery/CompletingAllItems": {
+      "values": [
+        2688.199951171875,
+        2701,
+        2712.89990234375
+      ],
+      "median": 2701,
+      "median_absolute_deviation": 11.89990234375,
+      "relative_mad": 0.004405739483061829,
+      "min": 2688.199951171875,
+      "max": 2712.89990234375
+    },
+    "TodoMVC-jQuery/CompletingAllItems/Async": {
+      "values": [
+        365.5,
+        366,
+        368.39990234375
+      ],
+      "median": 366,
+      "median_absolute_deviation": 0.5,
+      "relative_mad": 0.001366120218579235,
+      "min": 365.5,
+      "max": 368.39990234375
+    },
+    "TodoMVC-jQuery/CompletingAllItems/Sync": {
+      "values": [
+        2322.699951171875,
+        2335,
+        2344.5
+      ],
+      "median": 2335,
+      "median_absolute_deviation": 9.5,
+      "relative_mad": 0.004068522483940043,
+      "min": 2322.699951171875,
+      "max": 2344.5
+    },
+    "TodoMVC-jQuery/DeletingAllItems": {
+      "values": [
+        1730.100341796875,
+        1720.2998046875,
+        1748.300048828125
+      ],
+      "median": 1730.100341796875,
+      "median_absolute_deviation": 9.800537109375,
+      "relative_mad": 0.005664721792492222,
+      "min": 1720.2998046875,
+      "max": 1748.300048828125
+    },
+    "TodoMVC-jQuery/DeletingAllItems/Async": {
+      "values": [
+        413.7001953125,
+        406.39990234375,
+        417.5
+      ],
+      "median": 413.7001953125,
+      "median_absolute_deviation": 3.7998046875,
+      "relative_mad": 0.009184923600603358,
+      "min": 406.39990234375,
+      "max": 417.5
+    },
+    "TodoMVC-jQuery/DeletingAllItems/Sync": {
+      "values": [
+        1316.400146484375,
+        1313.89990234375,
+        1330.800048828125
+      ],
+      "median": 1316.400146484375,
+      "median_absolute_deviation": 2.500244140625,
+      "relative_mad": 0.001899304058345968,
+      "min": 1313.89990234375,
+      "max": 1330.800048828125
+    }
+  },
+  "screen": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-phase0-screen-quiet2/report.json",
+    "sha256": "0a3dc07c16de955dcefe49797a04d169e702ce4592f1b61c2f8fed8a989b98bb"
+  },
+  "screen_resources": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-phase0-screen-quiet2/resource-analysis.json",
+    "sha256": "ab5a51efa48214ca96c4db1ae055358d3d6e20599693e292d69c99fbf99bfe77"
+  },
+  "interrupted_cohort": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-phase0-screen/report.json",
+    "sha256": "11501c1e1dce36e958262d50f1053d7cf378a3d534590717bdc772eb2e5f6eef"
+  },
+  "interrupted_cohort_policy": "Unattributed transient Cargo PID3219561 triggered strict quiet guard; retain one baseline completion as diagnostic only; no candidate timings and no confirmed build attribution",
+  "functional_coverage": {
+    "baseline_react_three_states": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/baseline-react-state-metrics-pilot/summary.json",
+      "sha256": "b6712392c5ae15efa1806a6eb5de94e6e2d8987e8ecc5eb9d8ebbe602862d762"
+    },
+    "candidate_react_error_visibility": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-react-terminal-diagnostic-v1/exit.json",
+      "sha256": "cdec95ac1f0e0ac54c18cdc070efc0e010c4cde65b1b295e962371d20ab062b8"
+    },
+    "common_framework_four_suite_states": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-functional-comparison.json",
+      "sha256": "5b045493db2a12a4c66838e161bddd5dc61d6a7768db7fa07a894ba493ef8e52"
+    },
+    "policy": "State hook runs after official phase clocks, in separate timing-ineligible process; zero runtime errors/rejections plus normal final headless outcome required",
+    "headless_exit3": "Expected bounded interactive-page timeout after valid official completion and zero-error outcome; not benchmark failure on its own",
+    "todo_assertions": "All100 exact pinned English labels,100completed/checked with labels unchanged,0remaining after deletion; helper latesthash applies to future companions.",
+    "editor_assertions": "Longeditablecontent/paragraphs; highlight bold with text unchanged",
+    "chart_assertions": "Nonblank bounded full RGBA hash and pixel changes for tooltip/opaque redraw; not exact cross-renderer pixel equality",
+    "compiler_coverage_excludes_functional_observer": "Observer hashing loops could themselves optimize; admission diagnostics use observerOFF",
+    "common_framework_result": "Bothbaseline/off andcandidate/off12exactlabel/count/completion/deletion states identical; zeroerrors/panics/module skips andownedprocesses after normalboundedexit3."
+  },
+  "compiler_diagnostics": {
+    "candidate_default_hot_react": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-react-terminal-diagnostic-v1/parsed-engine-metrics.json",
+      "sha256": "2c9afd1d83175b00adfa27cea2330320dca0daedac5fb18bf0f08feeba847b74"
+    },
+    "candidate_hot_at1_react": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-at1-react-terminal-diagnostic-v1/parsed-engine-metrics.json",
+      "sha256": "d6617b225800e1fc8c38162c615c65016629a77cc4dcb488c63fabb22a8acee2"
+    },
+    "default_hot_terminal_requests": 0,
+    "hot_at1_terminal_requests": 102,
+    "hot_at1_terminal_published": 84,
+    "hot_at1_terminal_declines": 18,
+    "hot_at1_compile_seconds": 1.814754151,
+    "hot_at1_policy": "Diagnostic-only; no threshold/default policy change or performance proposal",
+    "terminal_snapshot": "Post-report11000ms no-op timer triggers next checkpoint beyond10s interval; sampled metrics forcesGC and includes bootstrap/collector/timer overhead",
+    "entry_coverage": "Compile-only static counters do not establish actual optimized application entries; source ownership remains distinct from bootstrap/host/collector"
+  },
+  "current_profile": {
+    "analysis": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1/profile-exclusive-analysis.json",
+      "sha256": "10d9daa238b1fe4789f6719d871c4052d8988f623a7c8cbb1e59dc560d6b9dd7"
+    },
+    "functions": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1/functions-cpu.txt",
+      "sha256": "c5d2dc5a6fdb3a9f49693156b5dc1c37595f108667ffb0195971e6c6f03a2052"
+    },
+    "experiment": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1/profile.er",
+    "instrumentation": "gprofng1ms/liveJITsymbols + JIT_MAP; no PERF/trace/stateobserver",
+    "limitations": "27MB/541759lines JIT_MAP logging: __syscall_cancel callers attribute5.599s/94.99% to stderr write_all, only0.007s epoll wait. Current shares contaminated; source/chunk/helper inventory valid, registration-only companion pending."
+  },
+  "chromium_reference": {
+    "manifest": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/references/chromium-manifest.json",
+      "sha256": "e7ce1886ba54a111ab3e640f0fad23696e854dd4743a0011188465e673858b42"
+    },
+    "functional_react": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/references/chromium-react-functional-pilot/exit.json",
+      "sha256": "74c413475f675abae3ace6a9bdfcbcea83b9a7686d892bc75f799313583250d7"
+    },
+    "scope": "Cached nativeARM64 Chromium151/V8 headless browser context; sandbox enabled; no Node equivalence or identical desktop renderer claim",
+    "timed_reference": "Threefresh4suite/12step processes valid; zeroJSexceptions/consoleerrors/ownedprocesses. N3descriptive browser context only.",
+    "completed_reference_directory": "/big/Code/TRust/target/browser-engine-review-20261014/references/chromium-four-todomvc-reference-v1",
+    "completed_files": {
+      "manifest.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/references/chromium-four-todomvc-reference-v1/manifest.json",
+        "sha256": "a8cc2f1282e539dffa132959189e2bb741e71c20bb283db9b3f8c5b7a70e6d9c"
+      },
+      "results.json": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/references/chromium-four-todomvc-reference-v1/results.json",
+        "sha256": "0e3b15f290950344b073706d9debc2cf1bfc4550b4dbd0a0d7e9d3ea9e4e29ef"
+      }
+    },
+    "runtime_version": {
+      "Chromium": "151.0.7922.34",
+      "V8": "15.1.206.8"
+    },
+    "suite_median_ms": {
+      "TodoMVC-React-Complex-DOM": 220.1,
+      "TodoMVC-Angular-Complex-DOM": 202.4,
+      "TodoMVC-Vue": 103.4,
+      "TodoMVC-jQuery": 465.1
+    },
+    "selected_geomean_samples_ms": [
+      222.0015,
+      211.8682,
+      209.6246
+    ],
+    "functional_result": "Separatecompanion12exactstatespassed; noNode/Ladybirdengine ratio inferred."
+  },
+  "acceptance_status": {
+    "candidate_off": "N7raw/state/provenance/math audits pass; noapplicationgain; untimedsetupCPUoutliers unresolved; performance_acceptance remainsfalse.",
+    "candidate_hot": "OriginalN3descriptive optional/unaccepted; Reactdefaulthot0requests; noadmission/repaymentproof.",
+    "additional_applications": "Editor/chartfixturesprepared; functionaltests/measurementsnotyetusedforacceptance.",
+    "overall_engine_catchup": "Notestablished; ChromiumbrowsercontextdoesnotproveNode/LadybirdJSengine ratios."
+  },
+  "quiet_window": "V1N7/Chromiumfinished, allownedbrowserprocesses0; buildwindowreleased forv2validation. V2browserbuildpreparation isseparate.",
+  "performance_acceptance": false,
+  "updated_utc": "2026-10-14T12:17:02.358443+00:00",
+  "final_default_n7": {
+    "analysis": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-default-n7-analysis.json",
+      "sha256": "a2418541e0208bfff2fb8bf597d0e6e78a9fb9cda54755189e4679a14a0870d8"
+    },
+    "analysis_script": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/analyze-selected-default.py",
+      "sha256": "749fc294872c9a373e7d0ce73d9d261e5ca9d92570d4846b4f149b03b55881a8"
+    },
+    "additional_four_pair_report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-default-confirmation/report.json",
+      "sha256": "c3974242bdb1beb52a5518c46d0221ccac1696a3ab822b68bbd514145bb7e65f"
+    },
+    "supplement_runner": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/confirm-selected-default.py",
+      "sha256": "3562acec5e7b2d361cccf8b9c69c89801eb50d089491b2dd5d5e342c3320350d"
+    },
+    "paired_rounds": 7,
+    "per_suite_median_loss_percent": {
+      "Geomean": 0.09971802536119512,
+      "TodoMVC-React-Complex-DOM": 0.7065942406771386,
+      "TodoMVC-Angular-Complex-DOM": -0.12876086943764964,
+      "TodoMVC-Vue": -0.17927611835787394,
+      "TodoMVC-jQuery": -0.023859802894055093
+    },
+    "measurement_dependencies": {
+      "measure-browser.mjs": "5cc6444f9b177ab11eabcc1595f8f895790341ec53075d93802d1e1695f705f8",
+      "speedometer-collector.js": "556d39edc8361b0fdee906f9f122e677e24c6e35cab5729887f227ae6eb8e6f3",
+      "browser-process-scope.mjs": "4d6aed2cff3ba4213da185d683cf250651d3a796dba64206e7e2c83b7c0b0fc4",
+      "browser-result-validation.mjs": "ee47cc009651d4b16545eddf11096648a984f21be4c9787a6e3cc2e96b64f453"
+    },
+    "gate_review": {
+      "nominal_bootstrap_concerns": [],
+      "conservative_concerns": [],
+      "zero_baseline_components": [],
+      "resource_nominal_bootstrap_concerns": [],
+      "resource_conservative_concerns": []
+    },
+    "performance_interpretation": "No measured application gain; nominal/conservative3%+interval regression gates not triggered; wide bounds are not equivalence evidence."
+  },
+  "independent_reviews": {
+    "root": {
+      "audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/browser-n7-root-audit.json",
+        "sha256": "cb4819c43771b09c58a1f01be975cf70c7cba270940ece59e8d02cdcc8264948"
+      },
+      "script": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/audit-browser-n7-root.py",
+        "sha256": "d112b51ee9ce33228cb6c02a5454aeb39a2756e86be9011aaaabaa0005e04f9d"
+      },
+      "result": "independent raw arithmetic, completion, file hashes and logical-state checks passed"
+    },
+    "review_agent": {
+      "audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/browser-n7-independent-audit-20261014.json",
+        "sha256": "dac0e42c891838209b09b10465cdef3b1f9bfce14593028d9d253428fcfd256c"
+      },
+      "result": "All14 completions/43 components/three resources/fixture blobs/provenance/hash/states recompute cleanly; interval widths/untimed setup risk retained"
+    }
+  },
+  "untimed_setup_risk": {
+    "status": "unresolved regression risk; never noise-dismissed",
+    "classification": "Benchmark-wide preparation/scheduling overhead inside official collector wall clock, outside measured action phases; not isolated browser startup.",
+    "candidate_outlier_launch_seconds": [
+      18.591523965,
+      18.639697166
+    ],
+    "candidate_collector_measurement_ms": [
+      17971.10009765625,
+      18017.5
+    ],
+    "candidate_unmeasured_inside_ms": [
+      6992.998779296873,
+      7007.60009765625
+    ],
+    "paired_baseline_unmeasured_inside_ms": [
+      5726.098876953125,
+      5724.999755859375
+    ],
+    "extra_unmeasured_inside_ms": [
+      1266.8999023437482,
+      1282.600341796875
+    ],
+    "launch_minus_collector_seconds_range": [
+      0.6177,
+      0.6319
+    ],
+    "cpu_evidence": "Bothcandidateoutliershave~1.2s extra sampledprocessCPU; measuredsuite/action durations stable.",
+    "existing_timestamp_coverage": "Timing log/progress only finalcompletion; no per-stage markers. Process2ssamples retained; fine localization requires separatediagnostic/source review."
+  },
+  "rss_outlier": {
+    "paired_loss_percent": -10.17651332194538,
+    "baseline_vm_hwm_kib": 611172,
+    "candidate_vm_hwm_kib": 548976,
+    "interpretation": "Reductiondrivenbybaselinehighpeak; candidateisnearitsordinaryrange, notanomalouslylow. Bothrecordsretained."
+  },
+  "matched_default_compilation_postgc_diagnostics": {
+    "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-default-compilation-postgc-diagnostics.json",
+    "sha256": "0e53ef7571705e0825c168ac924d280e47ae49feccf2156548180c301d6a8430"
+  },
+  "current_registration_only_profile": {
+    "analysis": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1-nomap/profile-exclusive-analysis.json",
+      "sha256": "88dd462393af571b53d7fd1b4106cf24e46eaa400dd92530231c44bd009bd831"
+    },
+    "manifest": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1-nomap/manifest.json",
+      "sha256": "d218622a773b567e4863ed7b54e58cca1aa692d7b79dc63cec74f935f90fe284"
+    },
+    "functions": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-hot-todomvc-profile-v1-nomap/functions-cpu.txt",
+      "sha256": "4b30db8395b3d07d78918eb66dc410f3f06a19e37089841e5f9fe8b9b30ce8b9"
+    },
+    "scope": "Instrumenteddiagnostic, noJIT_MAP/PERF/TRACE/stateobserver; liveJITregistration andrunnerframe observations",
+    "interpretation": "Heuristicexclusivebuckets, noAmdahl/engine-only claim; stoppedcompilerresidentmemory remains; pausehold155.66s vsprofile21.166s recorded."
+  },
+  "candidate_v2": {
+    "build_manifest": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v2-manifest.json",
+      "sha256": "78c5ec6ad51a0a49b88e73e503bada94252f2b69cb95a416e3114d882ca7f3bd"
+    },
+    "engine_source_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/candidate-source-v2.json",
+      "sha256": "0a3122c9bfe0533cd17b5c389d0a154ece14c95712b7f6ca13f2d2d725bcbfa4"
+    },
+    "engine_source_patch_sha256": "deb0f8a569aa3dd71116690f30f5aaed33027ffffc34d402aee39291869ccf0b",
+    "artifacts": {
+      "trust-headless": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v2/trust-headless",
+        "sha256": "cd3c506293400cb7f444da2d1e36100be7519aaff256c798a39ad4505a46b26b",
+        "bytes": 96083952
+      },
+      "trust-desktop": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v2/trust-desktop",
+        "sha256": "ca92dcbebebd54cc7589bffc29594ab632aafc150747e62d29bb7b3d1b8dd634",
+        "bytes": 123086736
+      }
+    },
+    "runtime_harness_attestation": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v2-runtime-harness-attestation.json",
+      "sha256": "fb2c6a07c9b8baf0bd1732449bf8731256b985f93d8b33159355a42217947750"
+    },
+    "provenance_note": "Build manifest harness block preserves a historical build-time harness snapshot. Actual comparisons use per-run runtime controls and the screen measurement_dependency_hashes, identical to audited v1 ordinary measurement JS/imports."
+  },
+  "v2_initial_screen": {
+    "status": "complete_independently_recomputed_by_root",
+    "performance_acceptance": false,
+    "report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/report.json",
+      "sha256": "7ac9a91b34c61d971a3adf8f10599e5bb8bb4d0f682b3f827138430a82b7d061"
+    },
+    "root_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/browser-v2-screen-root-audit.json",
+      "sha256": "2aca86baa5af5e344b2aa50f0eb81ed241ed45fb2720de207d2de34ba1da1a19"
+    },
+    "root_audit_script": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/audit-browser-v2-screen-root.py",
+      "sha256": "33b5d6443753baccb23c66bdfd262ea16ae53734e31b0fa293fafe43ea0f7dba"
+    },
+    "root_audit_result": {
+      "reviewer": "root",
+      "status": "Independent raw arithmetic, completion and evidence hash verification passed",
+      "source_report": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/report.json",
+      "source_report_sha256": "7ac9a91b34c61d971a3adf8f10599e5bb8bb4d0f682b3f827138430a82b7d061",
+      "checked_file_hashes": {
+        "/big/Code/TRust/target/browser-engine-review-20261014/baseline/trust-headless": "3953ca992e05efc44c6705c04c8ae10c8c56d23fe0155a3a9d7bed55b6997d65",
+        "/big/Code/TRust/target/browser-engine-review-20261014/candidate-v2/trust-headless": "cd3c506293400cb7f444da2d1e36100be7519aaff256c798a39ad4505a46b26b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/harness/measure-browser.mjs": "5cc6444f9b177ab11eabcc1595f8f895790341ec53075d93802d1e1695f705f8",
+        "/big/Code/TRust/target/browser-engine-review-20261014/harness/speedometer-collector.js": "556d39edc8361b0fdee906f9f122e677e24c6e35cab5729887f227ae6eb8e6f3",
+        "/big/Code/TRust/target/browser-engine-review-20261014/harness/browser-process-scope.mjs": "4d6aed2cff3ba4213da185d683cf250651d3a796dba64206e7e2c83b7c0b0fc4",
+        "/big/Code/TRust/target/browser-engine-review-20261014/harness/browser-result-validation.mjs": "ee47cc009651d4b16545eddf11096648a984f21be4c9787a6e3cc2e96b64f453",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/control.json": "55eb7bf618a0233e42c25871b2024e579e4d8e65ec035e823604e94b6c6a0fb0",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/browser.log": "6b507d63a5bbb0d3af452de14a098bd6190a6156ae2c935a505a6edd68476ada",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/process.jsonl": "cddd5645c3a581da3cda4d305c56cd0f900245a5a0cacba7a7edbd45bc488e4b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/progress.jsonl": "e4102183e98b2c3a757ab34a0f1be97f9a2f8eba7727ef976fb9d675fa09a96e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/summary.json": "ba4e36540ebcd1868670955ca908028806cf6a598e0de099007335132b480edb",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1/exit.json": "c485603ffb7b60cc20a2cc65ffd144c4a9886b9f86538f44cf1b4fa26109fb5d",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-1-background-load.jsonl": "13eb75673462d9ca2073766b9886cfcd5586f194d0dab4ecf044fa90aba18c3c",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/control.json": "81489a4928692fa496efb83a12d1a4efbde3c700aaeb3974adb203b327adf79c",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/browser.log": "917096ecc7bdc2cb1227aa6782dbfd77c8685cd005cd6545d15b367b2e70473b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/process.jsonl": "30c7017f241f29bb397165cd74c65a2c79c3ba7addf75e1016464dacc00b6047",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/progress.jsonl": "a95a04bded0f8b47fa2771a206edee7a76abc55f8dddc4a62ab8b93e6622d98e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/summary.json": "f15bbe55795d02c420bc9ebd9523dd741b6904df03e42ba97e7844fdb3a8d739",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2/exit.json": "a1b5d47114c94cfac06a43751234971837ebdfcc93a7510cb2ba3a6fd5d85214",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-2-background-load.jsonl": "948483d65035d47be18c85b9ece7d3bc44a5e4c760994f8c7b3cdec29376bc3c",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/control.json": "2ec4780cb269da7eb0dabd427a603d65fce877dfeefb6b29f197754ce3a5e639",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/browser.log": "7645faf53040633ae9bdc78c1fc3b35544c7df875b7639a260fb820744bf0914",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/process.jsonl": "7ebc2d783fc65742fd8567e3d11a991fbc205d3ffc42fbaec67abddac5bcd872",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/progress.jsonl": "9667380760caadaadc5cc93c608401cd43d6d02b6d33bb8d72588bab1c91422a",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/summary.json": "30c6c9b99c549461bb34b3894205ba7da410992666b966e76b284f2987a659b6",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3/exit.json": "6358b3d013586ebcdc61ee7c3da2d64b64baa78fabd01a337652a905f01547ba",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/phase0-3-background-load.jsonl": "be381fb296683a399d9bc7f9bdfb3f2528a0be56f429d07270576ee9854be80e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/control.json": "d563b69464cd9e7079a997d45fb49a66ba692eeae6d596b2550be6cb814aefcb",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/browser.log": "b67c711aa026f998ebe00668bba6d0b2ed64db21fb45066bd2964e3284dcf581",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/process.jsonl": "274fbc02d724861409a675f63c95dda95925535611691508f9b61120a650a0cb",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/progress.jsonl": "e17351c26c1d1976f8ae2766ab6e3dabd965c2747cbbdeaebc9d1023f5e4232f",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/summary.json": "3bab2c32dee7375316d4cb5d3ad4ce83671c8672e58e2ae051044faccd417157",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0/exit.json": "74252218f84a7f872ef0b304004c73ac4b5f80db633ae1d3289065d6f95bd5dd",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-baseline-0-background-load.jsonl": "2993df5d9090dbc203d06cc9b978e3ef1a2c6429b3afa73b046737890db88c52",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/control.json": "23127e546a9105c3417fc8263fb2184a51839690a6cddd89c3ef804056ceb832",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/browser.log": "7d22da9fdff7cf61303a5026cab74b14f4d9b83c8eb3aab3045c2263a2753418",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/process.jsonl": "2f6007fee22019c9a05bb1e1e9051d8c292ebe60033ce5a4bdecaaa8b74a8a3e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/progress.jsonl": "a9e456b296ccefa76dfe12c9a972a791342c1bd1e35239a8d250121cf11c8d53",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/summary.json": "0b6dbc02816f8e8d2db169634df2dfdb3bdb1b7e65e00b30c9ccc39762365f9b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0/exit.json": "4f3a087a88e5c5cc94d8b1bf9591753a151e008cede4a67ed05a76147f464d5b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair1-candidate-0-background-load.jsonl": "8c8604161706bcff4dbd994b77848a91599e97e72fcc5c581e667a0458bd8002",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/control.json": "8b2213cb60a5f06906ae8c4d73a146d75fb6e774e42d9dece0f343812fbc0810",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/browser.log": "d69092e22ba54dfa9d243374db40de03a84b1ee4f7aa35eec23ac3ebb6e1108c",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/process.jsonl": "dd0de27debdfac522987e6ce4e174d60c58202971f3f8756ea24e840632bce70",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/progress.jsonl": "bff196ee77f22ac54f35abe45d8767b02df0be5c6f8f6a84e7886b64e3001044",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/summary.json": "4e3953f9d772746e5d00aca8776001c79d00208fb95fe212ddc5bcfb725887b4",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0/exit.json": "f91af088fee39e3ab6ac52389b74ea68b1ca4a9824b2344387795259eeacbd7e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-candidate-0-background-load.jsonl": "bc9e19ea9e3595ea0dc16869ce1d85acaa50b8173a4bf78b8641c05827a9f402",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/control.json": "0186e4e7a1dd52f110021e9028fcfde7042c65f64224d2c3f4cb5f355d6cf602",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/browser.log": "c93be752d8e20a0f35b36e0cac114845fbb8155f72443a8494a7fed6ba55af71",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/process.jsonl": "cec587791d2de02f1d770abd06ea20d78b13f625c1471a8625c48db8f49800cc",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/progress.jsonl": "94712d4d9851daa82801c58b1c54e8bda1fc11eb295b019b6a28fdb87a516483",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/summary.json": "42ebc7fd23e651d7f63e9bef62e543857ccfda548df794b83a76ea1aecf7c6fd",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0/exit.json": "ee0df27039b1057c3833e9d6eff8fbf1c51dcf1ac0e5780b909d31225c981534",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair2-baseline-0-background-load.jsonl": "f56c42e4910dd94a6305d8696203494b9a83437944c03e49e1c0459b37e5795d",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/control.json": "6e23b51994b9824c15bedbf7d925cdbed5fbb16f03234fa6c8ce2694f99283b5",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/browser.log": "bbd4d9022f2ab0bb7ab7efa70fd8a18ce39c5c5b1798a66c835198e6a2b0e2be",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/process.jsonl": "0bc8e8751d10ab1d62d7af0a531657191d1414c66a7c87f9f6d335b33d57417a",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/progress.jsonl": "dfa1769e4bfe6afe0089cb7fd5cb26a8bff65bd3163d85f8c8832907562ac51b",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/summary.json": "033de6bb7bea1977ecb928f737c3ddd339f72da6812e77fcf51d18304f4647d9",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0/exit.json": "94c5ca8b4079d2fae5a0d67ecbeb13ed9a55d5cf8cdf3618749abe13d48d2919",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-baseline-0-background-load.jsonl": "0dcd026c74f1edc50133a31eca183c118c26314d312a44475d327a19d566e043",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/control.json": "fded47aab5c101e3010a491ecd616efa612f6c3693ef56a87d5236063d3af49a",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/browser.log": "1c56f1186c7df1a8e6be1d2e448c6f7bc218879f0259e50daa11f94b53a6a38e",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/process.jsonl": "9ba3456d59d304eeffde3b73f7bf18bc076f9b626609121ee01ce0f12b79ce19",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/progress.jsonl": "64d2c6a568bf6ed85f64f587459ebc29ee68bf0ab2e7802475682950a1cc5ad8",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/summary.json": "ea9d85a89832e15973e7d5ac1f2d7d7fcbb3aa1307e021ae3878cce32a6484a3",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0/exit.json": "f34ff1147d75529e851df5dc5ed4443bc5a5aa67c3364224d5216a93f96c26f3",
+        "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/pair3-candidate-0-background-load.jsonl": "3c865b934962fe4d6fb16e5434bcfa9f2f5c424aca124db92edf7e70653a83eb"
+      },
+      "paired_processes": 6,
+      "phase0_processes": 3,
+      "metric_count": 43,
+      "paired_median_loss_percent": {
+        "Geomean": -0.691083467013609,
+        "Iteration-0-Total": -1.4897185616185693,
+        "Score": -0.691083467013609,
+        "TodoMVC-Angular-Complex-DOM": -1.314209788913756,
+        "TodoMVC-Angular-Complex-DOM/Adding100Items": -1.516775632840317,
+        "TodoMVC-Angular-Complex-DOM/Adding100Items/Async": -0.7119120121247491,
+        "TodoMVC-Angular-Complex-DOM/Adding100Items/Sync": -1.9498607242339872,
+        "TodoMVC-Angular-Complex-DOM/CompletingAllItems": -0.6791817484081308,
+        "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Async": -0.32492580915781666,
+        "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Sync": -0.9665867345597934,
+        "TodoMVC-Angular-Complex-DOM/DeletingAllItems": -1.0945696866581645,
+        "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Async": 0.9063965700802701,
+        "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Sync": -0.8621121348143412,
+        "TodoMVC-React-Complex-DOM": 1.3218498541824442,
+        "TodoMVC-React-Complex-DOM/Adding100Items": 1.6590954325190754,
+        "TodoMVC-React-Complex-DOM/Adding100Items/Async": 0.8645533141210304,
+        "TodoMVC-React-Complex-DOM/Adding100Items/Sync": 1.866611686334263,
+        "TodoMVC-React-Complex-DOM/CompletingAllItems": 0.6484527555209452,
+        "TodoMVC-React-Complex-DOM/CompletingAllItems/Async": 0.7140031015930859,
+        "TodoMVC-React-Complex-DOM/CompletingAllItems/Sync": 0.6058158917222389,
+        "TodoMVC-React-Complex-DOM/DeletingAllItems": 1.9870834723022313,
+        "TodoMVC-React-Complex-DOM/DeletingAllItems/Async": -0.11209137907937095,
+        "TodoMVC-React-Complex-DOM/DeletingAllItems/Sync": 2.585412190820846,
+        "TodoMVC-Vue": -0.06444307114206183,
+        "TodoMVC-Vue/Adding100Items": 0.31956089796938425,
+        "TodoMVC-Vue/Adding100Items/Async": 0.38337098142970927,
+        "TodoMVC-Vue/Adding100Items/Sync": -0.9632378586180046,
+        "TodoMVC-Vue/CompletingAllItems": -0.5896470078145422,
+        "TodoMVC-Vue/CompletingAllItems/Async": 0.09193157327587187,
+        "TodoMVC-Vue/CompletingAllItems/Sync": -3.3804880061619746,
+        "TodoMVC-Vue/DeletingAllItems": -2.0541075311957147,
+        "TodoMVC-Vue/DeletingAllItems/Async": -0.3915824142156854,
+        "TodoMVC-Vue/DeletingAllItems/Sync": -1.960608318149315,
+        "TodoMVC-jQuery": -2.873251998459392,
+        "TodoMVC-jQuery/Adding100Items": -3.2161143738457576,
+        "TodoMVC-jQuery/Adding100Items/Async": -0.6077767138509049,
+        "TodoMVC-jQuery/Adding100Items/Sync": -3.8575836471386182,
+        "TodoMVC-jQuery/CompletingAllItems": -3.142182735413257,
+        "TodoMVC-jQuery/CompletingAllItems/Async": -0.1625839873954371,
+        "TodoMVC-jQuery/CompletingAllItems/Sync": -3.7933227821098536,
+        "TodoMVC-jQuery/DeletingAllItems": -2.9182148678361886,
+        "TodoMVC-jQuery/DeletingAllItems/Async": -1.925924603316309,
+        "TodoMVC-jQuery/DeletingAllItems/Sync": -3.2241201965895194
+      },
+      "performance_acceptance": false,
+      "limits": [
+        "Three paired runs are descriptive, not acceptance.",
+        "Four selected Speedometer TodoMVC suites; not a full Speedometer score.",
+        "Background CPU and resource values are sampled; independent recomputation does not prove causal attribution."
+      ]
+    },
+    "phase0_processes": 3,
+    "paired_rounds": 3,
+    "all_nine_runs_valid": true,
+    "runtime_measurement_hashes": {
+      "measure-browser.mjs": "5cc6444f9b177ab11eabcc1595f8f895790341ec53075d93802d1e1695f705f8",
+      "speedometer-collector.js": "556d39edc8361b0fdee906f9f122e677e24c6e35cab5729887f227ae6eb8e6f3",
+      "browser-process-scope.mjs": "4d6aed2cff3ba4213da185d683cf250651d3a796dba64206e7e2c83b7c0b0fc4",
+      "browser-result-validation.mjs": "ee47cc009651d4b16545eddf11096648a984f21be4c9787a6e3cc2e96b64f453"
+    },
+    "aggregate_and_suite_median_duration_change_percent": {
+      "Geomean": -0.691083467013609,
+      "TodoMVC-React-Complex-DOM": 1.3218498541824442,
+      "TodoMVC-Angular-Complex-DOM": -1.314209788913756,
+      "TodoMVC-Vue": -0.06444307114206183,
+      "TodoMVC-jQuery": -2.873251998459392
+    },
+    "resources": {
+      "observed_browser_peak_rss_kib": {
+        "baseline": [
+          549372,
+          551384,
+          544864
+        ],
+        "candidate": [
+          547992,
+          543032,
+          551492
+        ],
+        "paired_ratios": [
+          0.9974880408903257,
+          0.984852661665917,
+          1.0121645034357198
+        ],
+        "paired_median_loss_percent": -0.25119591096742777,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "observed_process_cpu_seconds": {
+        "baseline": [
+          17.33,
+          18.72,
+          17.35
+        ],
+        "candidate": [
+          17.16,
+          17.39,
+          18.57
+        ],
+        "paired_ratios": [
+          0.990190421234853,
+          0.9289529914529916,
+          1.0703170028818443
+        ],
+        "paired_median_loss_percent": -0.9809578765146987,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "observer_sampled_process_cpu_seconds": {
+        "baseline": [
+          17.33,
+          18.72,
+          17.35
+        ],
+        "candidate": [
+          17.16,
+          17.39,
+          18.57
+        ],
+        "paired_ratios": [
+          0.990190421234853,
+          0.9289529914529916,
+          1.0703170028818443
+        ],
+        "paired_median_loss_percent": -0.9809578765146987,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "official_measurement_wall_s": {
+        "baseline": [
+          16.90060009765625,
+          18.267900146484376,
+          16.941800048828124
+        ],
+        "candidate": [
+          16.687699951171876,
+          16.7837001953125,
+          18.039800048828123
+        ],
+        "paired_ratios": [
+          0.9874028055066579,
+          0.9187536641173556,
+          1.0648101144409357
+        ],
+        "paired_median_loss_percent": -1.2597194493342068,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "official_action_sum_s": {
+        "baseline": [
+          11.1162001953125,
+          11.469300048828124,
+          11.14860107421875
+        ],
+        "candidate": [
+          10.95060009765625,
+          10.9052998046875,
+          11.261
+        ],
+        "paired_ratios": [
+          0.9851028143838144,
+          0.9508252254505931,
+          1.0100818860620255
+        ],
+        "paired_median_loss_percent": -1.4897185616185582,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "inside_official_wall_outside_actions_s": {
+        "baseline": [
+          5.78439990234375,
+          6.79860009765625,
+          5.793198974609375
+        ],
+        "candidate": [
+          5.737099853515625,
+          5.878400390625,
+          6.778800048828125
+        ],
+        "paired_ratios": [
+          0.9918228252495199,
+          0.8646486491611002,
+          1.17013071336553
+        ],
+        "paired_median_loss_percent": -0.8177174750480076,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      },
+      "launch_before_official_interval_s": {
+        "baseline": [
+          0.6274878113437516,
+          0.6698730045156225,
+          0.6256959421718769
+        ],
+        "candidate": [
+          0.627087142828124,
+          0.8216378956875019,
+          0.751015753171874
+        ],
+        "paired_ratios": [
+          0.9993614720343815,
+          1.2265577059365438,
+          1.200288674663599
+        ],
+        "paired_median_loss_percent": 20.028867466359902,
+        "scope": "Descriptive N3 screen; every sample retained, no confidence or acceptance claim."
+      }
+    },
+    "phase0": {
+      "Geomean": {
+        "values": [
+          2190.5465037862223,
+          2175.9503225581043,
+          2335.280082203569
+        ],
+        "median": 2190.5465037862223,
+        "median_absolute_deviation": 14.596181228117985,
+        "relative_mad": 0.006663260151240524,
+        "min": 2175.9503225581043,
+        "max": 2335.280082203569
+      },
+      "Iteration-0-Total": {
+        "values": [
+          2806.9251098632812,
+          2776.324951171875,
+          2930.700134277344
+        ],
+        "median": 2806.9251098632812,
+        "median_absolute_deviation": 30.60015869140625,
+        "relative_mad": 0.010901665521420596,
+        "min": 2776.324951171875,
+        "max": 2930.700134277344
+      },
+      "Score": {
+        "values": [
+          0.4565070854563291,
+          0.4595693153621144,
+          0.4282141605286166
+        ],
+        "median": 0.4565070854563291,
+        "median_absolute_deviation": 0.003062229905785252,
+        "relative_mad": 0.006707957013907497,
+        "min": 0.4282141605286166,
+        "max": 0.4595693153621144
+      },
+      "TodoMVC-Angular-Complex-DOM": {
+        "values": [
+          2366.2001953125,
+          2362.5,
+          2375.000244140625
+        ],
+        "median": 2366.2001953125,
+        "median_absolute_deviation": 3.7001953125,
+        "relative_mad": 0.0015637710282630256,
+        "min": 2362.5,
+        "max": 2375.000244140625
+      },
+      "TodoMVC-Angular-Complex-DOM/Adding100Items": {
+        "values": [
+          1104.2001953125,
+          1098.89990234375,
+          1107.900146484375
+        ],
+        "median": 1104.2001953125,
+        "median_absolute_deviation": 3.699951171875,
+        "relative_mad": 0.0033507974256677935,
+        "min": 1098.89990234375,
+        "max": 1107.900146484375
+      },
+      "TodoMVC-Angular-Complex-DOM/Adding100Items/Async": {
+        "values": [
+          211.400146484375,
+          208,
+          211.400146484375
+        ],
+        "median": 211.400146484375,
+        "median_absolute_deviation": 0.0,
+        "relative_mad": 0.0,
+        "min": 208,
+        "max": 211.400146484375
+      },
+      "TodoMVC-Angular-Complex-DOM/Adding100Items/Sync": {
+        "values": [
+          892.800048828125,
+          890.89990234375,
+          896.5
+        ],
+        "median": 892.800048828125,
+        "median_absolute_deviation": 1.900146484375,
+        "relative_mad": 0.0021283001573186534,
+        "min": 890.89990234375,
+        "max": 896.5
+      },
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems": {
+        "values": [
+          818.89990234375,
+          820.5,
+          818.39990234375
+        ],
+        "median": 818.89990234375,
+        "median_absolute_deviation": 0.5,
+        "relative_mad": 0.0006105752346153227,
+        "min": 818.39990234375,
+        "max": 820.5
+      },
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Async": {
+        "values": [
+          365.800048828125,
+          368.60009765625,
+          368.39990234375
+        ],
+        "median": 368.39990234375,
+        "median_absolute_deviation": 0.2001953125,
+        "relative_mad": 0.0005434184733121886,
+        "min": 365.800048828125,
+        "max": 368.60009765625
+      },
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Sync": {
+        "values": [
+          453.099853515625,
+          451.89990234375,
+          450
+        ],
+        "median": 451.89990234375,
+        "median_absolute_deviation": 1.199951171875,
+        "relative_mad": 0.0026553472697195325,
+        "min": 450,
+        "max": 453.099853515625
+      },
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems": {
+        "values": [
+          443.10009765625,
+          443.10009765625,
+          448.7001953125
+        ],
+        "median": 443.10009765625,
+        "median_absolute_deviation": 0.0,
+        "relative_mad": 0.0,
+        "min": 443.10009765625,
+        "max": 448.7001953125
+      },
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Async": {
+        "values": [
+          108.900146484375,
+          109.699951171875,
+          110.800048828125
+        ],
+        "median": 109.699951171875,
+        "median_absolute_deviation": 0.7998046875,
+        "relative_mad": 0.007290839047383777,
+        "min": 108.900146484375,
+        "max": 110.800048828125
+      },
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Sync": {
+        "values": [
+          334.199951171875,
+          333.400146484375,
+          337.900146484375
+        ],
+        "median": 334.199951171875,
+        "median_absolute_deviation": 0.7998046875,
+        "relative_mad": 0.002393192113569969,
+        "min": 333.400146484375,
+        "max": 337.900146484375
+      },
+      "TodoMVC-React-Complex-DOM": {
+        "values": [
+          2078.1005859375,
+          2083.999755859375,
+          2663.699951171875
+        ],
+        "median": 2083.999755859375,
+        "median_absolute_deviation": 5.899169921875,
+        "relative_mad": 0.0028306960714793226,
+        "min": 2078.1005859375,
+        "max": 2663.699951171875
+      },
+      "TodoMVC-React-Complex-DOM/Adding100Items": {
+        "values": [
+          854.2001953125,
+          857.39990234375,
+          1154.099853515625
+        ],
+        "median": 857.39990234375,
+        "median_absolute_deviation": 3.19970703125,
+        "relative_mad": 0.0037318723999191323,
+        "min": 854.2001953125,
+        "max": 1154.099853515625
+      },
+      "TodoMVC-React-Complex-DOM/Adding100Items/Async": {
+        "values": [
+          174.60009765625,
+          174,
+          234.39990234375
+        ],
+        "median": 174.60009765625,
+        "median_absolute_deviation": 0.60009765625,
+        "relative_mad": 0.0034369835086316106,
+        "min": 174,
+        "max": 234.39990234375
+      },
+      "TodoMVC-React-Complex-DOM/Adding100Items/Sync": {
+        "values": [
+          679.60009765625,
+          683.39990234375,
+          919.699951171875
+        ],
+        "median": 683.39990234375,
+        "median_absolute_deviation": 3.7998046875,
+        "relative_mad": 0.005560148127719075,
+        "min": 679.60009765625,
+        "max": 919.699951171875
+      },
+      "TodoMVC-React-Complex-DOM/CompletingAllItems": {
+        "values": [
+          819.7001953125,
+          818.2998046875,
+          998.300048828125
+        ],
+        "median": 819.7001953125,
+        "median_absolute_deviation": 1.400390625,
+        "relative_mad": 0.0017084180692016541,
+        "min": 818.2998046875,
+        "max": 998.300048828125
+      },
+      "TodoMVC-React-Complex-DOM/CompletingAllItems/Async": {
+        "values": [
+          322.60009765625,
+          320.599853515625,
+          408.800048828125
+        ],
+        "median": 322.60009765625,
+        "median_absolute_deviation": 2.000244140625,
+        "relative_mad": 0.006200382935892293,
+        "min": 320.599853515625,
+        "max": 408.800048828125
+      },
+      "TodoMVC-React-Complex-DOM/CompletingAllItems/Sync": {
+        "values": [
+          497.10009765625,
+          497.699951171875,
+          589.5
+        ],
+        "median": 497.699951171875,
+        "median_absolute_deviation": 0.599853515625,
+        "relative_mad": 0.001205251304953107,
+        "min": 497.10009765625,
+        "max": 589.5
+      },
+      "TodoMVC-React-Complex-DOM/DeletingAllItems": {
+        "values": [
+          404.2001953125,
+          408.300048828125,
+          511.300048828125
+        ],
+        "median": 408.300048828125,
+        "median_absolute_deviation": 4.099853515625,
+        "relative_mad": 0.010041276084566045,
+        "min": 404.2001953125,
+        "max": 511.300048828125
+      },
+      "TodoMVC-React-Complex-DOM/DeletingAllItems/Async": {
+        "values": [
+          89.10009765625,
+          90.199951171875,
+          133.300048828125
+        ],
+        "median": 90.199951171875,
+        "median_absolute_deviation": 1.099853515625,
+        "relative_mad": 0.01219350455666258,
+        "min": 89.10009765625,
+        "max": 133.300048828125
+      },
+      "TodoMVC-React-Complex-DOM/DeletingAllItems/Sync": {
+        "values": [
+          315.10009765625,
+          318.10009765625,
+          378
+        ],
+        "median": 318.10009765625,
+        "median_absolute_deviation": 3.0,
+        "relative_mad": 0.009430993646666226,
+        "min": 315.10009765625,
+        "max": 378
+      },
+      "TodoMVC-Vue": {
+        "values": [
+          780,
+          773.699951171875,
+          798.800537109375
+        ],
+        "median": 780,
+        "median_absolute_deviation": 6.300048828125,
+        "relative_mad": 0.008076985677083334,
+        "min": 773.699951171875,
+        "max": 798.800537109375
+      },
+      "TodoMVC-Vue/Adding100Items": {
+        "values": [
+          382.10009765625,
+          378,
+          400.500244140625
+        ],
+        "median": 382.10009765625,
+        "median_absolute_deviation": 4.10009765625,
+        "relative_mad": 0.010730428182037746,
+        "min": 378,
+        "max": 400.500244140625
+      },
+      "TodoMVC-Vue/Adding100Items/Async": {
+        "values": [
+          319.5,
+          315.60009765625,
+          324.400146484375
+        ],
+        "median": 319.5,
+        "median_absolute_deviation": 3.89990234375,
+        "relative_mad": 0.01220626711658842,
+        "min": 315.60009765625,
+        "max": 324.400146484375
+      },
+      "TodoMVC-Vue/Adding100Items/Sync": {
+        "values": [
+          62.60009765625,
+          62.39990234375,
+          76.10009765625
+        ],
+        "median": 62.60009765625,
+        "median_absolute_deviation": 0.2001953125,
+        "relative_mad": 0.003198003198003198,
+        "min": 62.39990234375,
+        "max": 76.10009765625
+      },
+      "TodoMVC-Vue/CompletingAllItems": {
+        "values": [
+          291.099853515625,
+          289.199951171875,
+          290.60009765625
+        ],
+        "median": 290.60009765625,
+        "median_absolute_deviation": 0.499755859375,
+        "relative_mad": 0.001719737410295573,
+        "min": 289.199951171875,
+        "max": 291.099853515625
+      },
+      "TodoMVC-Vue/CompletingAllItems/Async": {
+        "values": [
+          219.599853515625,
+          218,
+          219.10009765625
+        ],
+        "median": 219.10009765625,
+        "median_absolute_deviation": 0.499755859375,
+        "relative_mad": 0.0022809476797179514,
+        "min": 218,
+        "max": 219.599853515625
+      },
+      "TodoMVC-Vue/CompletingAllItems/Sync": {
+        "values": [
+          71.5,
+          71.199951171875,
+          71.5
+        ],
+        "median": 71.5,
+        "median_absolute_deviation": 0.0,
+        "relative_mad": 0.0,
+        "min": 71.199951171875,
+        "max": 71.5
+      },
+      "TodoMVC-Vue/DeletingAllItems": {
+        "values": [
+          106.800048828125,
+          106.5,
+          107.7001953125
+        ],
+        "median": 106.800048828125,
+        "median_absolute_deviation": 0.300048828125,
+        "relative_mad": 0.002809444671770453,
+        "min": 106.5,
+        "max": 107.7001953125
+      },
+      "TodoMVC-Vue/DeletingAllItems/Async": {
+        "values": [
+          25.5,
+          25.5,
+          25.400146484375
+        ],
+        "median": 25.5,
+        "median_absolute_deviation": 0.0,
+        "relative_mad": 0.0,
+        "min": 25.400146484375,
+        "max": 25.5
+      },
+      "TodoMVC-Vue/DeletingAllItems/Sync": {
+        "values": [
+          81.300048828125,
+          81,
+          82.300048828125
+        ],
+        "median": 81.300048828125,
+        "median_absolute_deviation": 0.300048828125,
+        "relative_mad": 0.0036906352757466103,
+        "min": 81,
+        "max": 82.300048828125
+      },
+      "TodoMVC-jQuery": {
+        "values": [
+          6003.399658203125,
+          5885.10009765625,
+          5885.2998046875
+        ],
+        "median": 5885.2998046875,
+        "median_absolute_deviation": 0.19970703125,
+        "relative_mad": 3.393319590803822e-05,
+        "min": 5885.10009765625,
+        "max": 6003.399658203125
+      },
+      "TodoMVC-jQuery/Adding100Items": {
+        "values": [
+          1473.89990234375,
+          1422.199951171875,
+          1430.89990234375
+        ],
+        "median": 1430.89990234375,
+        "median_absolute_deviation": 8.699951171875,
+        "relative_mad": 0.006080055745076835,
+        "min": 1422.199951171875,
+        "max": 1473.89990234375
+      },
+      "TodoMVC-jQuery/Adding100Items/Async": {
+        "values": [
+          285,
+          281.699951171875,
+          283.800048828125
+        ],
+        "median": 283.800048828125,
+        "median_absolute_deviation": 1.199951171875,
+        "relative_mad": 0.0042281570310853415,
+        "min": 281.699951171875,
+        "max": 285
+      },
+      "TodoMVC-jQuery/Adding100Items/Sync": {
+        "values": [
+          1188.89990234375,
+          1140.5,
+          1147.099853515625
+        ],
+        "median": 1147.099853515625,
+        "median_absolute_deviation": 6.599853515625,
+        "relative_mad": 0.005753512647916227,
+        "min": 1140.5,
+        "max": 1188.89990234375
+      },
+      "TodoMVC-jQuery/CompletingAllItems": {
+        "values": [
+          2733.199951171875,
+          2724.10009765625,
+          2707.099853515625
+        ],
+        "median": 2724.10009765625,
+        "median_absolute_deviation": 9.099853515625,
+        "relative_mad": 0.0033404989498933223,
+        "min": 2707.099853515625,
+        "max": 2733.199951171875
+      },
+      "TodoMVC-jQuery/CompletingAllItems/Async": {
+        "values": [
+          376.800048828125,
+          367.10009765625,
+          363.699951171875
+        ],
+        "median": 367.10009765625,
+        "median_absolute_deviation": 3.400146484375,
+        "relative_mad": 0.00926217809824413,
+        "min": 363.699951171875,
+        "max": 376.800048828125
+      },
+      "TodoMVC-jQuery/CompletingAllItems/Sync": {
+        "values": [
+          2356.39990234375,
+          2357,
+          2343.39990234375
+        ],
+        "median": 2356.39990234375,
+        "median_absolute_deviation": 0.60009765625,
+        "relative_mad": 0.00025466715375990464,
+        "min": 2343.39990234375,
+        "max": 2357
+      },
+      "TodoMVC-jQuery/DeletingAllItems": {
+        "values": [
+          1796.2998046875,
+          1738.800048828125,
+          1747.300048828125
+        ],
+        "median": 1747.300048828125,
+        "median_absolute_deviation": 8.5,
+        "relative_mad": 0.004864648178600326,
+        "min": 1738.800048828125,
+        "max": 1796.2998046875
+      },
+      "TodoMVC-jQuery/DeletingAllItems/Async": {
+        "values": [
+          455.89990234375,
+          412.800048828125,
+          413.300048828125
+        ],
+        "median": 413.300048828125,
+        "median_absolute_deviation": 0.5,
+        "relative_mad": 0.0012097748389280497,
+        "min": 412.800048828125,
+        "max": 455.89990234375
+      },
+      "TodoMVC-jQuery/DeletingAllItems/Sync": {
+        "values": [
+          1340.39990234375,
+          1326,
+          1334
+        ],
+        "median": 1334,
+        "median_absolute_deviation": 6.39990234375,
+        "relative_mad": 0.0047975279938155925,
+        "min": 1326,
+        "max": 1340.39990234375
+      }
+    },
+    "above3percent_descriptive_metric_concerns": [],
+    "limitations": [
+      "N3 screen is descriptive, not acceptance, reliable uncertainty or equivalence evidence. Final default comparison requires at least seven retained matched pairs, final conformance and v2 functional evidence.",
+      "Phase0 baseline own-CPU tail20.09s versus17.39/17.32s and inside-official outside-actions7.837s versus5.742/5.793s is retained; MAD alone understates variability.",
+      "React paired duration changes span -15.7% to +17.4%; one baseline and one candidate paired process also have retained own-CPU/untimed-setup tails.",
+      "Launch before official collector median +20.03% (about0.13\u20130.20s); this is a separate preflight/startup/resource concern, not a claim of isolated startup cost.",
+      "All observed browser thread affinities are CPU5; approximate CPU5 busy-minus-sampled-browser counters retain negative/rounded residuals and miss final process CPU. They do not identify a tail cause.",
+      "The one-second outer /proc observer does not modify JS/official collector, but it is additional host monitoring onCPU4; own heavy jobs were held and non-owned machine activity was left untouched."
+    ]
+  },
+  "v2_initial_screen_invalid_cohort": {
+    "report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load/report.json",
+      "sha256": "b47240e0a5341fe0e594165297bcd5484e49953a3f433baa5370e273b683a8b6"
+    },
+    "performance_acceptance": false,
+    "timing_eligible": false,
+    "policy": "All five complete raw samples retained as diagnostics; strict guard detected unattributed CargoPID3392514 at11:00:51.521UTC. No team ownership/build activity inferred, no user process killed, no thresholds/guards changed."
+  },
+  "v2_functional_coverage": {
+    "comparison": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-functional-comparison.json",
+      "sha256": "0b9b94ef2e85581e91b97b63fd1246ba37d2a5e4493f3b3f19acaf3b54b243d0"
+    },
+    "states_match_exactly": true,
+    "expected_states": 12,
+    "native_exit_code": 3,
+    "headless_js_error_count": 0,
+    "remaining_owned_processes": 0,
+    "scope": "Four selected TodoMVC suites/12 actions; every100 English label, item/completed/checked count and deletion state. V2 fresh companion is excluded from timing and overlaps release conformance CPUs0\u20133.",
+    "timing_eligible": false
+  },
+  "v2_baseline_phase_natural_gc_diagnostic": {
+    "report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/baseline-off-todomvc-stage-repeat-v2/report.json",
+      "sha256": "39aae8b5083bbadfe99c14798560b7a9dc27092f3518f958e72d5645718245fe"
+    },
+    "driver": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/measure-browser-stage-gc-diagnostic.mjs",
+      "sha256": "6a0f34b272380d2334e023451a1e76edc60b98ee3f6fc88e302e78fddb897ede"
+    },
+    "attempts_retained": 5,
+    "valid": true,
+    "timing_eligible": false,
+    "interpretation": {
+      "performance_acceptance": false,
+      "verified_phase_timeline": "Every expected suite prepare/start/end measure equals its official mark endpoints within0.001ms. Completion epoch differs from controller receive by1.2\u20131.7ms; stderr timestamps are receipt times, not GC starts/pauses.",
+      "ordinary_logged_attempts": [
+        1,
+        3
+      ],
+      "retained_long_outside_actions_attempt": 5,
+      "phase_localization": "Tail outside-actions6.920s versus5.69\u20135.83s largely adds React preparation(1.585s versus1.077\u20131.100s) and a first-action pre-Sync gap(1.023s versus~0.18s); later pre-Complete gap shrinks.",
+      "independent_measured_action_variation": "Tail jQuery official actions7.832s versus5.86\u20136.08s; diagnostic validation contention/logging can change occurrence and cost.",
+      "causality_limit": "One extra logged task collection occurs in React suite envelope, but no pause timing or per-function compile counters exist in these logs. No assertion that GC caused the gap, or that this diagnostic tail has the same cause as uninstrumented cohort tails.",
+      "logging_off_limit": "Two entries-only companions retained; GC collection counts are unavailable, never interpreted as zero collections. No logged-companion causality/speed claim from N5."
+    },
+    "protocol": {
+      "max_attempts_including_pilot": 6,
+      "natural_gc_log_policy": "Pilot on; then alternate off/on. All processes fresh, same frozen baseline file, normal35s bounded teardown.",
+      "stop_rule": "At least three attempts, both <6500ms and >=6500ms diagnostic outside-action populations observed, and at least one no-GC-log companion; otherwise stop at six.",
+      "6500ms_scope": "Descriptive investigation bucket derived from retained prior tails, not an acceptance or exclusion threshold and not proof of a common cause.",
+      "instrumentation": "Existing official entries read once after completion; no inter-action hooks, functional observer, runtime TRACE or PERF forced collection. Diagnostic FRAME observation enabled by driver.",
+      "contention": "Diagnostic-only runs overlap frozen-v2 conformance CPUs0\u20133 where active and root-announced background suite CPUs6\u20139/x64 validation CPUs15\u201318 where active. None are idle-machine timing comparisons."
+    },
+    "limitations": [
+      "All records retained; diagnostic durations do not establish performance gains or losses.",
+      "Performance measures bracket marks, while official action numbers bracket separate performance.now reads; differences retained.",
+      "Clock residual is checked at completion; stderr receipt adds buffering/scheduling and cannot timestamp GC start or pause.",
+      "Native GC lines expose cause/live/reclaimed counts but no pause time or compilation totals. Sampler forced-GC compilation reports are separate.",
+      "Natural-GC logging and diagnostic frame observations can affect occurrence. Small alternating companions do not isolate logging causality.",
+      "No injected state-checker/hash loop runs, and no optimizing execution inferred from this default-off diagnostic."
+    ]
+  },
+  "v2_react_forced_distance_compiler_diagnostic": {
+    "comparison": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/react-hot-at1-compiler-diagnostics-v2-comparison.json",
+      "sha256": "be369225906f91eca061b96d991cd5980d4cc7832585ed1dbaf81aaf810930c5"
+    },
+    "performance_acceptance": false,
+    "limits": [
+      "Each setting has one diagnostic observation with validation occupancy; no confidence interval, actual optimized entry or repayment evidence.",
+      "Nested optimizer time is included in outer native compilation; do not add them.",
+      "PERF sampler forces two explicit collections in each run; not natural-GC acceptance.",
+      "Generated bytes and compiler populations may vary with dynamic sampling/address placement;85vs84 publications must not be interpreted as changed threshold policy.",
+      "Compile-only records have runtime_counters:false; zero entry counters are uninstrumented, not proof of zero execution.",
+      "V2 verification ablation keeps repeated release verification; default verifies finalized input once.",
+      "Default versusVERIFY1 has identical per-sequence static counts for85bodies, but four body sizes differ -68/-16/+8/-16bytes, aggregate -92bytes. Sequence ids are not cross-process source identities; no code/relocation dump exists to establish an address/layout cause or identical machine code."
+    ],
+    "code_identity_review": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/react-hot-at1-v2-verify-code-size-review.json",
+      "sha256": "978f0ecc3bfffa1dd39376538e57b3da2c6b46467e48546a709a7a1117f62004"
+    }
+  },
+  "v2_default_n7_status": {
+    "status": "pending_three_wholly_excluded_supplementary_cohorts",
+    "performance_acceptance": false,
+    "valid_initial_n3": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-phase0-screen-load-quiet2/report.json",
+      "sha256": "7ac9a91b34c61d971a3adf8f10599e5bb8bb4d0f682b3f827138430a82b7d061"
+    },
+    "interrupted_supplementary_blocks": [
+      {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-default-confirmation-load/report.json",
+        "sha256": "9e59d1b071e35497be3352a88af9c1f1f0525e5c7d72d1cff7d15099fc4867f0"
+      },
+      {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-default-confirmation-load-quiet2/report.json",
+        "sha256": "be4b2d3fc029497bf90e663cb8cf09d991c997dc0e648080ecdc32c78b0423f1"
+      },
+      {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v2-default-confirmation-load-reserved/report.json",
+        "sha256": "7afc2a3a403987d0aff9b7d9fde84d6ccb12486cd04c023879b4b347eed807ff"
+      }
+    ],
+    "retained_completed_processes": [
+      4,
+      9,
+      9
+    ],
+    "policy": "Each whole supplemental cohort is timing-ineligible after strict sampledCargo guard hits; every official/control completion is valid and all raw samples/tails remain retained. No N7 composite created, no selective pair joining, guard/threshold waiver or source ownership inference. Retries stopped after the authorized final retry.",
+    "quiet_guard_events": [
+      {
+        "pid": 3490832,
+        "utc": "2026-10-14T11:28:48.853Z"
+      },
+      {
+        "pid": 3498607,
+        "utc": "2026-10-14T11:35:35.157Z"
+      },
+      {
+        "pid": 3549358,
+        "utc": "2026-10-14T12:12:22.329Z"
+      }
+    ],
+    "helper_probe_audit": "Own Python controller, Node driver/collector/validator/process scope/observer, frozen runtime source and local shell initialization show no Cargo/toolchain probes. Observations remain unattributed; no unrelated commandlines/environments collected.",
+    "later_background_activity_context": {
+      "summary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/cargo-process-attribution-summary.json",
+        "sha256": "a18b381a66e8d2530b8231c2e4b5502d2ca476c358dae6aea2105c03acb29367"
+      },
+      "scope": "Later metadata-only root monitor observed16 Cargo processes in180seconds,12 in an unrelated project, allPPID1. Raw journal is retained separately; no arguments/environments collected or processes signalled. Aggregate summary omits unrelated project path. This does not identify already-dead guard PIDs, qualify any previous interrupted sample or change strict exclusion."
+    },
+    "reserved_window_limitation": "All nine official/control completions valid; strict guard exclusion remains unchanged despite user reservation. No pair4, no supplement joining, no N7 composite, no automatic timing retry."
+  }
+}

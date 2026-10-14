@@ -192,7 +192,7 @@ pub(crate) fn jit_packed_owners_supported(layout: &JitLayout) -> bool {
 impl PackedValue {
     /// Borrow the encoded bits without transferring their reference ownership. Generated code
     /// may copy this word only after applying the matching clone/move ownership operation.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "optimizing-jit"))]
     #[inline]
     pub(crate) fn bits(&self) -> u64 {
         self.0.get()

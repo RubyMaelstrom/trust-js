@@ -82,6 +82,16 @@ fn effect(op: &Op) -> Effect {
     }
 }
 
+fn selected_effect(op: &Op, scalar_path: bool) -> Effect {
+    if scalar_path && matches!(op, Op::EqEq | Op::NotEq | Op::Not) {
+        // These proved Number-only paths invoke no helper. Their incoming
+        // owning SSA words remain dirty until a real publication boundary.
+        Effect::Preserve
+    } else {
+        effect(op)
+    }
+}
+
 pub(super) struct FramePlan {
     pub(super) tracked: Vec<u16>,
     pub(super) dirty_at: Vec<Vec<u16>>,
@@ -114,7 +124,18 @@ fn members(mask: &[u64]) -> Vec<u16> {
 
 impl FramePlan {
     pub(super) fn build(chunk: &Chunk, cfg: &Cfg, local_effects: bool) -> Option<Self> {
+        Self::with_scalar_paths(chunk, cfg, local_effects, &[])
+    }
+
+    pub(super) fn with_scalar_paths(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        local_effects: bool,
+        scalar_paths: &[bool],
+    ) -> Option<Self> {
         let ops = chunk.jit_ops();
+        let selected =
+            |pc: usize| selected_effect(&ops[pc], scalar_paths.get(pc).copied().unwrap_or(false));
         let (_, slots) = chunk.jit_frame();
         let words = slots.div_ceil(64);
         let blocks = cfg.blocks();
@@ -155,8 +176,8 @@ impl FramePlan {
         let mut generated = incoming.clone();
         let mut kills = vec![false; blocks.len()];
         for (id, block) in blocks.iter().enumerate() {
-            for op in &ops[block.start..block.end] {
-                match effect(op) {
+            for pc in block.start..block.end {
+                match selected(pc) {
                     Effect::Write(slot) => write(&mut generated[id], slot),
                     Effect::Barrier => {
                         generated[id].fill(0);
@@ -206,7 +227,7 @@ impl FramePlan {
                     return None;
                 }
                 dirty_at[pc] = entries;
-                match effect(&ops[pc]) {
+                match selected(pc) {
                     Effect::Write(slot) => write(&mut dirty, slot),
                     Effect::Barrier => dirty.fill(0),
                     Effect::Preserve => {}
@@ -214,7 +235,19 @@ impl FramePlan {
             }
         }
         let written = members(&written);
-        let live = reload_liveness(ops, &tracked, &dirty_at, &written, slots, local_effects)?;
+        let live = if scalar_paths.is_empty() {
+            reload_liveness(ops, &tracked, &dirty_at, &written, slots, local_effects)?
+        } else {
+            reload_liveness_with_scalar_paths(
+                ops,
+                &tracked,
+                &dirty_at,
+                &written,
+                slots,
+                local_effects,
+                scalar_paths,
+            )?
+        };
         Some(Self {
             tracked,
             dirty_at,
@@ -248,6 +281,18 @@ fn reload_liveness(
     written: &[u16],
     slots: usize,
     local_effects: bool,
+) -> Option<ReloadLiveness> {
+    reload_liveness_with_scalar_paths(ops, tracked, dirty_at, written, slots, local_effects, &[])
+}
+
+fn reload_liveness_with_scalar_paths(
+    ops: &[Op],
+    tracked: &[u16],
+    dirty_at: &[Vec<u16>],
+    written: &[u16],
+    slots: usize,
+    local_effects: bool,
+    scalar_paths: &[bool],
 ) -> Option<ReloadLiveness> {
     let words = tracked.len().div_ceil(64);
     if (ops.len() + 1).checked_mul(words)? > 1_048_576 {
@@ -296,7 +341,7 @@ fn reload_liveness(
         let writes = if local_effects {
             checked_writes(op)
         } else {
-            match effect(op) {
+            match selected_effect(op, scalar_paths.get(pc).copied().unwrap_or(false)) {
                 Effect::Barrier => SlotWrites::All,
                 Effect::Preserve => SlotWrites::None,
                 Effect::Write(slot) => SlotWrites::One(slot),
