@@ -2,7 +2,7 @@
 //! ECMA-262 e28783d5 IsLooselyEqual, Number::equal and ToBoolean.
 
 use super::integer_consumers::TEST_SCALARS;
-use crate::bytecode::{self, Op, Tier, native_deopt::ENTRIES};
+use crate::bytecode::{self, native_deopt::ENTRIES, Op, Tier};
 use crate::interpreter::Interp;
 use crate::value::Value;
 use crate::{Completion, Engine};

@@ -13,14 +13,25 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 const MAX_LIVE_RECORDS: usize = 8192;
-pub(super) const COUNTERS: usize = 16;
+const LEGACY_COUNTERS: usize = 16;
+pub(super) const NORMAL_EXIT: usize = 16;
+pub(super) const ERROR_EXIT: usize = 17;
+pub(super) const VM_RECOVERY: usize = 18;
+pub(super) const VM_RECOVERY_NORMAL: usize = 19;
+pub(super) const RETIREMENT_REQUEST: usize = 20;
+const SITE_BASE: usize = 21;
+const MAX_SITES: usize = 8;
+const MAX_OMITTED_PCS: usize = 32;
+pub(super) const OWNER_LEAF: usize = SITE_BASE + MAX_SITES;
+pub(super) const OWNER_LEAF_GUARDS: usize = OWNER_LEAF + 1;
+pub(super) const COUNTERS: usize = OWNER_LEAF_GUARDS + 1;
 pub(super) const SHARED_CALL: usize = 10;
 pub(super) const RETAIN: usize = 11;
 pub(super) const RELEASE: usize = 12;
 pub(super) const PUBLICATION: usize = 13;
 pub(super) const HEAP_GUARD: usize = 14;
 pub(super) const SPECIALIZATION_BAILOUT: usize = 15;
-const LABELS: [&str; COUNTERS] = [
+const LABELS: [&str; SITE_BASE] = [
     "entries",
     "ownership_helper",
     "property_read_helper",
@@ -37,9 +48,27 @@ const LABELS: [&str; COUNTERS] = [
     "published_words",
     "heap_guards",
     "specialization_bailouts",
+    "normal_exits",
+    "error_exits",
+    "terminal_vm_recoveries",
+    "terminal_vm_normal_completions",
+    "specialization_retirement_requests",
 ];
 
-static CONFIG: OnceLock<Option<bool>> = OnceLock::new();
+fn labels() -> impl Iterator<Item = (usize, &'static str)> {
+    LABELS.iter().copied().enumerate().chain([
+        (OWNER_LEAF, "shared_owner_leaf"),
+        (OWNER_LEAF_GUARDS, "owner_leaf_guards"),
+    ])
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Compile,
+    Full,
+    Execution,
+}
+static CONFIG: OnceLock<Option<Mode>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -51,11 +80,37 @@ pub(super) fn enabled() -> bool {
     configuration().is_some()
 }
 
-fn configuration() -> Option<bool> {
+#[cfg(test)]
+thread_local! { static TEST_MODE: Cell<Option<Option<Mode>>> = const { Cell::new(None) }; }
+
+#[cfg(test)]
+pub(super) fn with_test_mode<T>(setting: &str, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Option<Mode>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MODE.with(|mode| mode.set(self.0));
+        }
+    }
+    let mode = match setting {
+        "compile" => Some(Mode::Compile),
+        "execution" => Some(Mode::Execution),
+        "1" => Some(Mode::Full),
+        _ => None,
+    };
+    let _reset = Reset(TEST_MODE.with(|current| current.replace(Some(mode))));
+    run()
+}
+
+fn configuration() -> Option<Mode> {
+    #[cfg(test)]
+    if let Some(mode) = TEST_MODE.with(Cell::get) {
+        return mode;
+    }
     *CONFIG.get_or_init(
         || match std::env::var("TRUST_JS_OPT_JIT_DIAGNOSTICS").as_deref() {
-            Ok("1") => Some(true),
-            Ok("compile") => Some(false),
+            Ok("1") => Some(Mode::Full),
+            Ok("compile") => Some(Mode::Compile),
+            Ok("execution") => Some(Mode::Execution),
             _ => None,
         },
     )
@@ -108,14 +163,32 @@ pub(super) fn category(op: &Op) -> usize {
 
 /// Owns stable counter addresses embedded in the executable mapping. The referring JitCode
 /// owns this Rc until its mapping is unmapped; Weak records never pin executable or JS state.
+struct Site {
+    pc: usize,
+    position: u32,
+    op: String,
+    key: String,
+    key_truncated: bool,
+    kind: &'static str,
+}
+
 pub(super) struct Code {
     id: u64,
     chunk: usize,
     created: Instant,
     ops: usize,
     pub runtime_counters: bool,
+    pub execution_counters: bool,
+    source_origin: (u32, u32),
+    slots: Vec<String>,
+    slot_truncated: Vec<bool>,
+    continuation: Cell<bool>,
+    sites: RefCell<Vec<Site>>,
+    omitted_pcs: RefCell<Vec<usize>>,
+    omitted_sites: Cell<usize>,
     pub counters: [Cell<u64>; COUNTERS],
     pub emitted_helpers: Cell<u64>,
+    pub emitted_owner_leaf_calls: Cell<u64>,
     pub emitted_publications: Cell<u64>,
     pub emitted_guards: Cell<u64>,
     pub ir_instructions: Cell<usize>,
@@ -128,8 +201,11 @@ pub(super) struct Code {
 }
 
 impl Code {
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
     pub(super) fn new(chunk: &Chunk) -> Option<Rc<Self>> {
-        let runtime_counters = configuration()?;
+        let mode = configuration()?;
         LIVE.with(|live| {
             let mut live = live.borrow_mut();
             if live.len() == MAX_LIVE_RECORDS {
@@ -144,9 +220,28 @@ impl Code {
                 chunk: chunk as *const Chunk as usize,
                 created: Instant::now(),
                 ops: chunk.jit_ops().len(),
-                runtime_counters,
+                runtime_counters: mode == Mode::Full,
+                execution_counters: mode == Mode::Execution,
+                source_origin: chunk.debug_origin,
+                slots: chunk
+                    .jit_slot_names()
+                    .iter()
+                    .take(4)
+                    .map(|name| name.chars().take(32).collect())
+                    .collect(),
+                slot_truncated: chunk
+                    .jit_slot_names()
+                    .iter()
+                    .take(4)
+                    .map(|name| name.chars().count() > 32)
+                    .collect(),
+                continuation: Cell::new(false),
+                sites: RefCell::new(Vec::new()),
+                omitted_pcs: RefCell::new(Vec::new()),
+                omitted_sites: Cell::new(0),
                 counters: std::array::from_fn(|_| Cell::new(0)),
                 emitted_helpers: Cell::new(0),
+                emitted_owner_leaf_calls: Cell::new(0),
                 emitted_publications: Cell::new(0),
                 emitted_guards: Cell::new(0),
                 ir_instructions: Cell::new(0),
@@ -162,6 +257,116 @@ impl Code {
         })
     }
 
+    pub(super) fn set_continuation(&self, continuation: bool) {
+        self.continuation.set(continuation);
+    }
+
+    pub(super) fn counts(&self, index: usize) -> bool {
+        (self.runtime_counters
+            && (index < LEGACY_COUNTERS || matches!(index, OWNER_LEAF | OWNER_LEAF_GUARDS)))
+            || (self.execution_counters
+                && (matches!(
+                    index,
+                    0 | SPECIALIZATION_BAILOUT
+                        | NORMAL_EXIT
+                        | ERROR_EXIT
+                        | VM_RECOVERY
+                        | VM_RECOVERY_NORMAL
+                        | RETIREMENT_REQUEST
+                ) || (SITE_BASE..SITE_BASE + MAX_SITES).contains(&index)))
+    }
+
+    /// Compiler-only selection. Runtime sites embed stable Cell addresses, never a lookup.
+    pub(super) fn select_site(
+        &self,
+        chunk: &Chunk,
+        pc: usize,
+        kind: &'static str,
+    ) -> Option<usize> {
+        if !self.execution_counters {
+            return None;
+        }
+        let mut sites = self.sites.borrow_mut();
+        if let Some(index) = sites.iter().position(|site| site.pc == pc) {
+            return Some(SITE_BASE + index);
+        }
+        if sites.len() == MAX_SITES {
+            self.omitted_sites
+                .set(self.omitted_sites.get().saturating_add(1));
+            let mut omitted = self.omitted_pcs.borrow_mut();
+            if omitted.len() < MAX_OMITTED_PCS {
+                omitted.push(pc);
+            }
+            return None;
+        }
+        let op = &chunk.jit_ops()[pc];
+        let name = match op {
+            Op::GetProp(name, _)
+            | Op::GetMethod(name, _)
+            | Op::GetPropLocal(_, name, _)
+            | Op::GetPropThis(name, _)
+            | Op::SetProp(name, _)
+            | Op::SetPropDrop(name, _)
+            | Op::SetPropLocalDrop(_, name, _)
+            | Op::SetPropThisDrop(name, _) => Some(*name),
+            _ => None,
+        };
+        sites.push(Site {
+            pc,
+            position: chunk.position(pc),
+            op: format!("{op:?}"),
+            key: name.map_or_else(String::new, |name| {
+                chunk.jit_name(name).chars().take(64).collect()
+            }),
+            key_truncated: name.is_some_and(|name| chunk.jit_name(name).chars().count() > 64),
+            kind,
+        });
+        Some(SITE_BASE + sites.len() - 1)
+    }
+
+    #[cfg(test)]
+    pub(super) fn site_stats(&self) -> Vec<(usize, &'static str, u64)> {
+        self.sites
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(index, site)| (site.pc, site.kind, self.counters[SITE_BASE + index].get()))
+            .collect()
+    }
+
+    /// Heap-requested payloads owned by this record; allocator rounding is excluded.
+    /// Chunk/cache/JS roots are borrowed and are never included here.
+    pub(super) fn retained_heap_metadata_bytes(&self) -> usize {
+        let sites = self.sites.borrow();
+        let mut bytes =
+            std::mem::size_of::<Self>().saturating_add(2 * std::mem::size_of::<usize>());
+        bytes = bytes.saturating_add(
+            self.slots
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        );
+        for slot in &self.slots {
+            bytes = bytes.saturating_add(slot.capacity());
+        }
+        bytes = bytes.saturating_add(
+            self.slot_truncated
+                .capacity()
+                .saturating_mul(std::mem::size_of::<bool>()),
+        );
+        bytes = bytes.saturating_add(sites.capacity().saturating_mul(std::mem::size_of::<Site>()));
+        for site in sites.iter() {
+            bytes = bytes
+                .saturating_add(site.op.capacity())
+                .saturating_add(site.key.capacity());
+        }
+        bytes.saturating_add(
+            self.omitted_pcs
+                .borrow()
+                .capacity()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
+    }
+
     pub(super) fn counter(&self, index: usize) -> *const Cell<u64> {
         &self.counters[index]
     }
@@ -169,23 +374,44 @@ impl Code {
     pub(super) fn json(&self) -> String {
         use std::fmt::Write;
         let mut result = format!(
-            "{{\"id\":{},\"chunk\":{},\"ops\":{},\"age_ns\":{},\"analysis_ns\":{},\"lowering_ns\":{},\"codegen_ns\":{},\"finish_ns\":{},\"ir_instructions\":{},\"ir_blocks\":{},\"native_bytes\":{},\"emitted_helpers\":{},\"emitted_publication_words\":{},\"emitted_heap_guards\":{},\"counters\":{{",
+            "{{\"id\":{},\"chunk\":{},\"ops\":{},\"age_ns\":{},\"analysis_ns\":{},\"lowering_ns\":{},\"codegen_ns\":{},\"finish_ns\":{},\"ir_instructions\":{},\"ir_blocks\":{},\"native_bytes\":{},\"emitted_helpers\":{},\"emitted_owner_leaf_calls\":{},\"emitted_publication_words\":{},\"emitted_heap_guards\":{},\"counters\":{{",
             self.id, self.chunk, self.ops, nanos(self.created), self.analysis_ns.get(),
             self.lowering_ns.get(), self.codegen_ns.get(), self.finish_ns.get(),
             self.ir_instructions.get(), self.ir_blocks.get(), self.native_bytes.get(),
-            self.emitted_helpers.get(), self.emitted_publications.get(), self.emitted_guards.get(),
+            self.emitted_helpers.get(), self.emitted_owner_leaf_calls.get(), self.emitted_publications.get(), self.emitted_guards.get(),
         );
-        for (index, label) in LABELS.iter().enumerate() {
+        for (index, label) in labels() {
             if index != 0 {
                 result.push(',');
             }
             let _ = write!(result, "\"{label}\":{}", self.counters[index].get());
         }
-        let _ = write!(
-            result,
-            "}},\"runtime_counters\":{}}}",
-            self.runtime_counters
-        );
+        let mode = if self.execution_counters {
+            "execution"
+        } else if self.runtime_counters {
+            "full"
+        } else {
+            "compile"
+        };
+        let quote = |text: &str| {
+            let mut out = String::from("\"");
+            super::json_escape_into(&mut out, text);
+            out.push('"');
+            out
+        };
+        let tracked = labels()
+            .filter(|(index, _)| self.counts(*index))
+            .map(|(_, label)| quote(label))
+            .collect::<Vec<_>>()
+            .join(",");
+        let saturated = labels()
+            .filter(|(index, _)| self.counts(*index) && self.counters[*index].get() == u64::MAX)
+            .map(|(_, label)| quote(label))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sites = self.sites.borrow();
+        let rows = sites.iter().enumerate().map(|(index, site)| format!("{{\"pc\":{},\"position_token\":{},\"source_byte_offset\":{},\"op\":{},\"key\":{},\"key_truncated\":{},\"kind\":{},\"native_fast_successes\":{},\"saturated\":{}}}", site.pc, site.position, if site.position == crate::stack_trace::NO_POSITION || crate::stack_trace::is_inline_position(site.position) {"null".into()} else {site.position.to_string()}, quote(&site.op), quote(&site.key), site.key_truncated, quote(site.kind), self.counters[SITE_BASE+index].get(), self.counters[SITE_BASE+index].get()==u64::MAX)).collect::<Vec<_>>().join(",");
+        let _ = write!(result, "}},\"runtime_counters\":{},\"counter_mode\":{},\"tracked_counter_labels\":[{}],\"saturated_counter_labels\":[{}],\"source_start\":{},\"source_bytes\":{},\"slots\":[{}],\"slot_label_limit_chars\":32,\"slot_label_count_limit\":4,\"slot_labels_truncated\":{:?},\"key_label_limit_chars\":64,\"entry_kind\":{},\"execution_scope\":\"physical optimizing-native entries; normal exits include terminal VM completions; native-control-flow normal completions = normal_exits - terminal_vm_normal_completions, except saturated counters; checked helpers and author calls may execute within native control flow\",\"execution_counters_saturate\":{},\"sites\":[{}],\"site_selection\":\"first eight emitted committed data-read/existing-property-overwrite fast-success PCs; creation, loop-scalar field operations, element accesses and other operation families excluded; no estimate for omitted sites\",\"site_limit\":{},\"omitted_site_count\":{},\"omitted_pcs\":{:?},\"omitted_pc_list_truncated\":{}}}", self.runtime_counters || self.execution_counters, quote(mode), tracked, saturated, self.source_origin.0, self.source_origin.1, self.slots.iter().map(|slot|quote(slot)).collect::<Vec<_>>().join(","), self.slot_truncated, quote(if self.continuation.get() {"loop_continuation"} else {"whole_function"}), self.execution_counters, rows, MAX_SITES, self.omitted_sites.get(), self.omitted_pcs.borrow(), self.omitted_sites.get()>self.omitted_pcs.borrow().len());
         result
     }
 
@@ -225,6 +451,98 @@ pub(super) fn snapshot_json() -> String {
         let dropped = DROPPED.with(Cell::get);
         format!("{{\"dropped_records\":{dropped},\"live\":[{records}]}}")
     })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::{bytecode::Tier, value::Callable, Engine};
+
+    #[test]
+    fn retained_metadata_counts_capacity_and_releases_string_payloads() {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        engine
+            .eval("function subject(o){return o.x;}subject({x:1})", false)
+            .unwrap();
+        let env = engine.interp.global_env.clone();
+        let value = engine.interp.get_var("subject", &env).ok().unwrap();
+        let chunk = {
+            let object = value.as_obj().unwrap().borrow();
+            let Callable::User(user) = &object.call else {
+                panic!("user function")
+            };
+            user.func.code.get().unwrap().as_ref().unwrap().clone()
+        };
+        let record = with_test_mode("execution", || Code::new(&chunk).unwrap());
+        let mut record = Rc::try_unwrap(record).ok().unwrap();
+        assert!(!record.counts(1), "execution mode excludes owner helpers");
+        assert!(record.counts(SITE_BASE + MAX_SITES - 1));
+        assert!(!record.counts(OWNER_LEAF));
+        assert!(!record.counts(OWNER_LEAF_GUARDS));
+        for (mode, expected) in [("compile", false), ("1", true)] {
+            let owner_record = with_test_mode(mode, || Code::new(&chunk).unwrap());
+            assert_eq!(owner_record.counts(OWNER_LEAF), expected);
+            assert_eq!(owner_record.counts(OWNER_LEAF_GUARDS), expected);
+            assert!(!owner_record.counts(SITE_BASE));
+            assert!(!owner_record.counts(COUNTERS));
+        }
+        assert!(
+            !record.counts(COUNTERS),
+            "future counters require explicit admission"
+        );
+        record.slots.clear();
+        record.slots.shrink_to_fit();
+        record.slot_truncated.clear();
+        record.slot_truncated.shrink_to_fit();
+        let base = std::mem::size_of::<Code>() + 2 * std::mem::size_of::<usize>();
+        assert_eq!(record.retained_heap_metadata_bytes(), base);
+
+        // Reserved-but-unused backing storage is retained too. Payload strings use
+        // deliberately larger capacities than lengths, independently of labels' bounds.
+        record.slots.reserve_exact(7);
+        let mut slot = String::from("局部");
+        slot.reserve_exact(91);
+        let slot_capacity = slot.capacity();
+        record.slots.push(slot);
+        record.slot_truncated.reserve_exact(5);
+        record.slot_truncated.push(false);
+        let mut op = String::from("GetMethod");
+        op.reserve_exact(113);
+        let mut key = String::from("界");
+        key.reserve_exact(127);
+        let site_strings = op.capacity() + key.capacity();
+        record.sites.get_mut().reserve_exact(13);
+        record.sites.get_mut().push(Site {
+            pc: 1,
+            position: crate::stack_trace::NO_POSITION,
+            op,
+            key,
+            key_truncated: false,
+            kind: "data_property_read",
+        });
+        record.omitted_pcs.get_mut().reserve_exact(23);
+        let backing = record.slots.capacity() * std::mem::size_of::<String>()
+            + record.slot_truncated.capacity() * std::mem::size_of::<bool>()
+            + record.sites.get_mut().capacity() * std::mem::size_of::<Site>()
+            + record.omitted_pcs.get_mut().capacity() * std::mem::size_of::<usize>();
+        let chunk_owners = Rc::strong_count(&chunk);
+        assert_eq!(
+            record.retained_heap_metadata_bytes(),
+            base + backing + slot_capacity + site_strings
+        );
+        assert_eq!(Rc::strong_count(&chunk), chunk_owners);
+        record.slots.clear();
+        record.slot_truncated.clear();
+        record.sites.get_mut().clear();
+        assert_eq!(record.retained_heap_metadata_bytes(), base + backing);
+        record.slots.shrink_to_fit();
+        record.slot_truncated.shrink_to_fit();
+        record.sites.get_mut().shrink_to_fit();
+        record.omitted_pcs.get_mut().shrink_to_fit();
+        assert_eq!(record.retained_heap_metadata_bytes(), base);
+    }
 }
 
 // Cranelift's default features already enable its pass-timing API. Override its thread-local
@@ -290,6 +608,9 @@ pub(super) mod passes {
     }
     impl Scope {
         pub(in crate::jit) fn start(code: &Code) -> Self {
+            Self::start_id(code.id)
+        }
+        pub(in crate::jit) fn start_id(id: u64) -> Self {
             let state = Rc::new(RefCell::new(State {
                 costs: [Cost::default(); NUM_PASSES],
                 children: Vec::new(),
@@ -298,7 +619,7 @@ pub(super) mod passes {
             Self {
                 previous: Some(previous),
                 state,
-                id: code.id,
+                id,
             }
         }
     }

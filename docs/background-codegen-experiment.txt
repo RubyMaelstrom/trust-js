@@ -1,0 +1,175 @@
+Bounded background hot-codegen experiment (isolated prototype)
+============================================================
+
+This experiment moves Cranelift backend compilation off the Agent thread after
+TRust has finished analyses, lowered the exact immutable warmed Chunk, sealed
+SSA and checked the existing instruction/block budgets. It is off by default.
+TRUST_JS_OPT_JIT_BACKGROUND=1 affects only TRUST_JS_OPT_JIT=hot; explicit optimizing
+mode, diagnostic direct compilation and background-disabled hot mode remain
+synchronous. The process reads this startup switch once; a host changing its
+environment later cannot split one request between synchronous and queued paths.
+This is not production enablement or a performance acceptance.
+
+Ownership and executable publication
+------------------------------------
+The Agent retains the prepared Chunk, native-cache CompilePermit, stable boxed
+CodeResidency, shared-call-stub leases and optional diagnostic record. The worker
+receives an owned Cranelift Context, Arc<TargetIsa>, numeric job ID, atomic cancel
+token and a bounded reply sender. Its IR contains runtime addresses only as
+integer constants; no engine Rc, JavaScript Value, Object, Environment Record or
+Interp pointer is accessed by the worker. Upstream regalloc's private Rc arena
+stays wholly inside its Send Context and is never split between threads.
+
+The worker validates and compiles the owned IR using the same verifier wrapper as
+synchronous compilation. It rejects external relocations and returns ordinary
+bytes or an owned String error, plus codegen timing. Worker-side pass profiling is
+created/dropped on that thread and carries only the numeric diagnostic identity.
+
+The Agent checks that the target Function still exists, the planned global
+Environment Record still exists, no optimizing version was published, and the
+Function's live execution_code_for(planning_global) still selects precisely the
+original warmed baseline allocation. An inliner publishing code2 during the job
+therefore cancels publication. No existing native mapping or active frame changes.
+ExecutableBuffer allocation, capacity reservation, platform W^X transitions,
+instruction-cache synchronization, profiling registration, JitCode construction,
+a second selected-baseline check, cache-permit commit, Function publication and call-cache invalidation all stay on
+the Agent thread. Runtime guards/weak identity pins remain authoritative even if
+objects, descriptors or bindings changed while codegen ran.
+
+Scheduling and lifetime bounds
+------------------------------
+One lazy process-owned worker accepts at most four outstanding jobs process-wide,
+including preparation, queued work, codegen and completed replies. A WorkSlot is
+reserved before snapshot/CLIF preparation and follows the plain job/result data
+until its final drop. Each Agent retains at most four pending versions/reply slots. Each hot job obeys the existing 16,384
+CLIF instruction cap and existing block/body admission limits; no optimization
+admission threshold is lowered. Queue pressure leaves baseline execution intact
+and retries at the existing bounded hot countdown checkpoint without snapshotting
+or lowering. A dead/unavailable worker and exhausted job identities disable that
+candidate. A failed send after preparation accounts that work and releases all
+engine owners/permits; disconnected sends disable the candidate, and Full remains
+a bounded resource deferral. Native allocation failure also disables the candidate.
+
+Completed replies retain their WorkSlot until the originating Agent drains or
+drops them. Four idle live Agents with ready replies can therefore consume the
+whole process quota and defer another Agent's optimization. Draining or dropping
+those Agents releases capacity. Baseline execution continues throughout. There
+is no promise of prompt or fair publication across idle Agents and no additional
+cross-Agent safe-point drain mechanism in this experiment.
+
+The same checkpoint drains at most four ready replies. No lock or try_recv is
+added to every function call. A pending baseline rearms its existing countdown and entry-sample interval;
+every terminal completion/cancellation stops the old baseline with both fields zero.
+Publication can lag worker completion until a later checkpoint. Current frames
+continue their current baseline; whole-function optimization never migrates them.
+
+Interp destruction cancels and drops pending engine owners/permits before heap
+teardown, drops its reply receiver and does not join the backend worker. A queued
+cancelled job is skipped; an already compiling job may finish private IR, then
+its stale bytes are dropped. The worker never executes bytes or dereferences their
+integer address constants. Job IDs never wrap within a controller; reply channels
+belong to that controller, so a later Agent cannot receive an old Agent's result.
+
+Limits and validation gates
+---------------------------
+Cranelift 0.136.2 exposes no supported wall-clock deadline/cooperative cancellation
+hook in Context::compile. Cancellation bounds publication/lifetime, not the CPU
+cost of a backend pass already in progress. There is one worker and finite queued
+IR; a single backend compilation still runs to completion. Do not claim a hard
+per-job latency bound. The process worker may remain parked after an Agent dies.
+
+Pending immutable chunks participate in the memory visitor. Opaque Cranelift IR,
+channel storage, backend scratch and pending native metadata do not yet have an
+exact inventory. Reports mark the compiler population incomplete while any Agent controller exists
+(including its empty opaque channels) or any process job exists, including after
+its originating Agent was destroyed. Known State/Chunk
+metadata is counted. The managed snapshot covers the current Agent and its
+ShadowRealm/heap/AST/cache roots, not whole-process RSS. A parked process worker's
+thread/stack and empty shared work channel retain no Agent owner and remain outside
+that scope, like process-wide stubs and allocator/thread storage. Dropping the last
+Agent controller and outstanding job therefore clears the Agent compiler flag; it
+does not claim the parked process worker was reclaimed. Diagnostics explicitly
+report worker initialization and that process worker storage is outside the managed
+snapshot. RSS/startup measurements must include that external process cost.
+Scheduling requests include pressure, unavailable workers and
+ID exhaustion, with reservation elapsed time reported separately. Only successful
+work-slot reservation starts a compiler attempt, before snapshotting/lowering.
+Failed clone, unsupported preparation, IR-budget decline, failed queue send, native
+backend error and allocation failure retain their attempt and elapsed preparation
+cost. Pressure before reservation never counts as compiler work or terminal hot
+rejection. Pending and ready-unpublished attempts do not count as completed
+declines; monotonic terminal counters include failure, cancellation and stale
+publication, with native success recorded separately from publication.
+Async counters report reservation, prepare, queue wait, codegen and finish
+separately; existing compilation totals add prepare/codegen/finish elapsed work and
+exclude reservation/queue wait. These are elapsed components, not a claim of
+exclusive CPU timing. The enclosing JIT failure total uses the same pending-aware
+accounting as the optimizing subset.
+Panic/disconnected results cannot keep pending engine owners indefinitely: owned
+backend errors arrive normally, and a lost-job status removes pending versions
+at the next bounded checkpoint. Panic=abort retains the existing process-abort
+policy; this experiment does not promise recovery from process aborts.
+
+Tests use channel rendezvous/barriers, not sleeps: actual native publication,
+a selected-baseline change during codegen, collection during an in-flight job,
+Agent destruction with a blocked worker, unknown stale completion IDs, work
+reservation/ID exhaustion, lost completions, disconnected channels, worker-loop
+death and an injected backend panic. A
+separate child-process test checks the actual hot submission/countdown/publish
+path without sleeps. Focused accounting tests cover failed preparation and
+IR-budget decline, Full/disconnected sends, pending/ready metrics and memory
+population coverage. Pressure tests prove no lowering while saturated, ordinary
+checkpoint resumption, and capacity release after an idle Agent drains or drops.
+The rebased isolated tree uses the frozen v2 integer SSA/Realm selection/Weak
+planning-pin/expired-pin-epoch source and its integrated verifier wrapper. Native
+publication tests on AArch64/Linux additionally clear and observe the native-entry
+residency marker, check active frames returned to zero, and assert no specialization
+miss for the final scalar call.
+Further gates: additional native-platform checks; repeatable application latency/CPU/compilation
+repayment measurements, including short-lived programs and contention.
+
+Acceptance tests (jit::optimizing::background::tests namespace)
+------------------------------------------------------------
+publishes_actual_native_code_after_engine_thread_finish
+queued_native_misses_recover_once_retire_and_release_owners
+hot_checkpoint_submits_then_publishes_ready_code
+a_new_selected_baseline_refuses_stale_background_publication
+shutdown_drops_engine_pins_without_waiting_for_a_running_worker
+unknown_completed_job_ids_do_not_mutate_a_live_pending_version
+work_reservations_bound_lowering_and_refuse_id_wrap
+capacity_pressure_skips_preparation_and_resumes_at_hot_checkpoint
+idle_ready_agents_hold_quota_until_drain_or_drop
+queue_send_pressure_releases_preparation_and_all_engine_owners
+failed_preparations_record_attempts_and_elapsed_work
+disconnected_submission_disables_hot_candidate_without_repreparation
+backend_panic_returns_failure_and_releases_pending_owners
+worker_loop_panic_marks_loss_and_disables_future_reservations
+lost_completion_releases_engine_owners_at_the_checkpoint
+disconnected_reply_is_detected_without_leaking_pending_owners
+executable_budget_failure_releases_permit_and_disables_candidate
+unfinished_attempts_are_not_reported_as_completed_declines
+memory_reports_pending_compiler_population_as_incomplete
+background_disabled_and_forced_modes_preserve_sync_publication
+
+Untested acceptance gates remain explicit: native x86-64 and macOS/Windows worker
+publication; broad whole-engine/conformance/differential regression scope beyond
+the isolated AArch64/Linux focused composition tests;
+application background latency, total CPU, compiler repayment and contention.
+An OS thread-spawn failure is handled as terminal unavailability but cannot be
+reliably induced in a unit test; the same unavailable-worker result is tested
+after deterministic worker death. Release panic=abort follows the existing abort
+policy, so unwind recovery tests do not claim recovery from aborts.
+
+Primary local implementation evidence
+-------------------------------------
+Pinned versions: Cargo.lock Cranelift 0.136.2 and regalloc2 0.15.2.
+cranelift-codegen/src/context.rs:39,131,220: owned Context and compile pipeline;
+code is not relocated; relocs are explicit in CompiledCode.buffer.
+cranelift-codegen/src/isa/mod.rs:284: TargetIsa: Send + Sync.
+regalloc2/src/ion/data_structures.rs:568-599: compile-time Ctx Send+Sync assertion
+and single-thread-at-a-time ownership justification for its private Rc arena.
+cranelift-control/src/lib.rs:19-30: fuel belongs to fuzz/chaos perturbations and
+is not a production compile-deadline/cancellation facility.
+Engine contracts: jit_cache.rs Pending CompilePermit lifecycle; jit.rs
+ExecutableBuffer W^X/ISA-cache publication; bytecode.rs weak guard pins and exact
+warmed snapshots; stack_trace.rs shared logical inline identities.

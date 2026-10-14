@@ -69,6 +69,20 @@ mod optimizing_diagnostics;
 ))]
 #[path = "jit_optimizing.rs"]
 mod optimizing;
+#[cfg(all(
+    feature = "optimizing-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub(crate) use optimizing::background::State as OptimizingBackground;
+#[cfg(all(
+    feature = "optimizing-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub(crate) fn optimizing_background_in_flight() -> bool {
+    optimizing::background::work_in_flight()
+}
 
 #[path = "jit_cache.rs"]
 pub(crate) mod cache;
@@ -975,7 +989,20 @@ pub(crate) fn performance_metrics_json(managed_memory: &str) -> Option<String> {
     );
     Some(format!(
         "{{\"schema_version\":1,\"jit_compile_attempts\":{attempts},\"jit_compile_successes\":{successes},\"jit_compile_failures\":{},\"jit_compile_seconds\":{:.9},\"jit_generated_code_bytes\":{generated},\"jit_largest_code_bytes\":{largest},\"jit_inline_attempts\":{inline_attempts},\"jit_inline_empty_plans\":{inline_empty},\"jit_inline_plan_sites\":{inline_sites},\"jit_inline_successes\":{inline_successes},\"jit_inline_failures\":{inline_failures},\"jit_inline_suppressed\":{inline_suppressed},\"lex_calls\":{lex_calls},\"lex_seconds\":{:.9},\"lex_failures\":{lex_failures},\"parse_calls\":{parse_calls},\"parse_seconds\":{:.9},\"parse_failures\":{parse_failures},\"bytecode_compile_attempts\":{bytecode_attempts},\"bytecode_compile_successes\":{bytecode_successes},\"bytecode_compile_failures\":{},\"bytecode_compile_seconds\":{:.9},\"snapshot_encode_calls\":{snapshot_encode_calls},\"snapshot_encode_seconds\":{:.9},\"snapshot_decode_attempts\":{snapshot_decode_attempts},\"snapshot_decode_successes\":{snapshot_decode_successes},\"snapshot_decode_failures\":{},\"snapshot_decode_seconds\":{:.9},\"native_calls\":{native_calls},\"native_failures\":{native_failures},\"native_seconds\":{:.9},\"error_constructions\":{error_constructions},\"error_caught\":{error_caught},\"error_escaped\":{error_escaped},\"error_object_seconds\":{:.9},\"error_message_seconds\":{:.9},\"error_stack_capture_calls\":{error_stack_capture_calls},\"error_stack_capture_seconds\":{:.9},\"error_stack_format_calls\":{error_stack_format_calls},\"error_stack_format_seconds\":{:.9},\"iterator_get_calls\":{iterator_get_calls},\"iterator_get_failures\":{iterator_get_failures},\"iterator_get_seconds\":{:.9},\"iterator_step_calls\":{iterator_step_calls},\"iterator_step_failures\":{iterator_step_failures},\"iterator_step_seconds\":{:.9},\"iterator_close_calls\":{iterator_close_calls},\"iterator_close_seconds\":{:.9},\"to_primitive_object_calls\":{to_primitive_calls},\"to_primitive_object_failures\":{to_primitive_failures},\"to_primitive_object_seconds\":{:.9},\"to_string_object_calls\":{to_string_object_calls},\"to_string_object_failures\":{to_string_object_failures},\"to_string_object_seconds\":{:.9},\"iterate_fast_calls\":{iterate_fast_calls},\"iterate_fast_seconds\":{:.9},\"iterate_protocol_calls\":{iterate_protocol_calls},\"iterate_protocol_failures\":{iterate_protocol_failures},\"iterate_protocol_seconds\":{:.9},{gc},{code_metrics},\"managed_memory\":{managed_memory},\"native_by_operation\":{native_by_op}}}",
-        attempts.saturating_sub(successes),
+        {
+            #[cfg(all(
+                feature = "optimizing-jit",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            ))]
+            { optimizing::background::compile_declines(attempts, successes) }
+            #[cfg(not(all(
+                feature = "optimizing-jit",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
+            )))]
+            { attempts.saturating_sub(successes) }
+        },
         nanos as f64 / 1_000_000_000.0,
         lex_nanos as f64 / 1_000_000_000.0,
         parse_nanos as f64 / 1_000_000_000.0,
@@ -1677,9 +1704,11 @@ impl JitCode {
             self.call_stubs.capacity() * std::mem::size_of::<Rc<call_stub::SharedCallStub>>(),
         );
         #[cfg(feature = "optimizing-jit")]
-        let bytes = bytes.saturating_add(self.optimizing_diagnostics.as_ref().map_or(0, |_| {
-            std::mem::size_of::<optimizing_diagnostics::Code>() + 2 * std::mem::size_of::<usize>()
-        }));
+        let bytes = bytes.saturating_add(
+            self.optimizing_diagnostics
+                .as_ref()
+                .map_or(0, |record| record.retained_heap_metadata_bytes()),
+        );
         bytes
     }
 

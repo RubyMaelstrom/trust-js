@@ -82,12 +82,8 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         for _ in 0..8 {
             eval(&mut engine, "subject(5);");
         }
-        let plan = bytecode::plan_inlines(
-            &primary,
-            &user.func,
-            user.realm,
-            &engine.interp.global_env,
-        );
+        let plan =
+            bytecode::plan_inlines(&primary, &user.func, user.realm, &engine.interp.global_env);
         assert!(!plan.is_empty());
         let chunk =
             bytecode::compile_with_inlines(&user.func, &plan, &primary).expect("prepared splice");

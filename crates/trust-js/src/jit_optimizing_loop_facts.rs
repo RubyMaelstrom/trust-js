@@ -486,7 +486,11 @@ impl Lowering<'_, '_> {
         dispatch.emit(&mut self.b, token, self.error);
         self.b.switch_to_block(miss);
         self.b.set_cold_block(miss);
+        self.count_runtime(diagnostics::SPECIALIZATION_BAILOUT, 1);
+        self.count_loop_retirement_request();
+        self.count_terminal_recovery_start();
         let success = self.canonical_helper_value(loop_entry::miss, resume_pc);
+        self.count_terminal_recovery_result(success);
         self.b.ins().brif(success, self.ok, &[], self.error, &[]);
     }
 

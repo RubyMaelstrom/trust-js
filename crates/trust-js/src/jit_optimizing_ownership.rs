@@ -14,9 +14,100 @@ thread_local! {
         const { std::cell::Cell::new([0; 4]) };
     pub(super) static TEST_OWNERSHIP_SITES: std::cell::Cell<[usize; 4]> =
         const { std::cell::Cell::new([0; 4]) };
+    // retain calls/IR/blocks; release calls/IR/blocks; multi-owner calls/IR/blocks.
+    pub(super) static TEST_OWNER_IR: std::cell::Cell<[usize; 9]> =
+        const { std::cell::Cell::new([0; 9]) };
+}
+
+#[cfg(test)]
+fn record_owner_ir(kind: usize, before: (usize, usize), after: (usize, usize)) {
+    TEST_OWNER_IR.with(|cell| {
+        let mut counts = cell.get();
+        counts[kind * 3] += 1;
+        counts[kind * 3 + 1] += after.0 - before.0;
+        counts[kind * 3 + 2] += after.1 - before.1;
+        cell.set(counts);
+    });
 }
 
 impl Lowering<'_, '_> {
+    fn owner_leaf_count(&mut self, counter: usize, amount: Value) {
+        if let Some(record) = self.diagnostics.filter(|record| record.runtime_counters) {
+            let address = self
+                .b
+                .ins()
+                .iconst(types::I64, record.counter(counter) as i64);
+            let previous = self.load(address, 0);
+            let next = self.b.ins().iadd(previous, amount);
+            let no_overflow = self
+                .b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, next, previous);
+            let maximum = self.b.ins().iconst(types::I64, -1);
+            let next = self.b.ins().select(no_overflow, next, maximum);
+            self.store(next, address, 0);
+        }
+    }
+
+    /// Pure scalar C call, not an observing helper: canonical owners, private
+    /// words, storage and metadata remain live. Cranelift preserves every live
+    /// SSA value across the ABI caller-clobbered registers. No final_sp reload
+    /// or JavaScript frame publication is needed because the leaf cannot GC.
+    fn shared_owner(&mut self, value: Value, retain: bool, slow: Block) -> bool {
+        let Some(signature) = self.owner_leaf_sig else {
+            return false;
+        };
+        let helper = if retain {
+            owner_leaf::retain
+        } else {
+            owner_leaf::release
+        };
+        if let Some(record) = self.diagnostics {
+            record.emitted_helpers.set(record.emitted_helpers.get() + 1);
+            record
+                .emitted_owner_leaf_calls
+                .set(record.emitted_owner_leaf_calls.get() + 1);
+        }
+        if self
+            .diagnostics
+            .is_some_and(|record| record.runtime_counters)
+        {
+            let one = self.b.ins().iconst(types::I64, 1);
+            self.owner_leaf_count(diagnostics::OWNER_LEAF, one);
+        }
+        let callee = self.b.ins().iconst(types::I64, helper as usize as i64);
+        let call = self.b.ins().call_indirect(signature, callee, &[value]);
+        let status = self.b.inst_results(call)[0];
+        if self
+            .diagnostics
+            .is_some_and(|record| record.runtime_counters)
+        {
+            let guards = self
+                .b
+                .ins()
+                .ushr_imm_u(status, i64::from(owner_leaf::GUARD_SHIFT));
+            self.owner_leaf_count(diagnostics::OWNER_LEAF_GUARDS, guards);
+        }
+        let success = self.b.ins().band_imm_s(status, owner_leaf::SUCCESS as i64);
+        self.owner_guard(success, slow);
+        if self
+            .diagnostics
+            .is_some_and(|record| record.runtime_counters)
+        {
+            let transfer = self.b.ins().band_imm_s(status, owner_leaf::TRANSFER as i64);
+            let transfer = self.b.ins().ushr_imm_u(transfer, 1);
+            self.owner_leaf_count(
+                if retain {
+                    diagnostics::RETAIN
+                } else {
+                    diagnostics::RELEASE
+                },
+                transfer,
+            );
+        }
+        true
+    }
+
     fn owner_guard(&mut self, pass: Value, miss: Block) {
         self.count_heap_guard();
         let next = self.b.create_block();
@@ -44,6 +135,18 @@ impl Lowering<'_, '_> {
     }
 
     pub(super) fn retain_word(&mut self, value: Value, slow: Block) {
+        #[cfg(test)]
+        let before = (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks());
+        self.retain_word_body(value, slow);
+        #[cfg(test)]
+        record_owner_ir(
+            0,
+            before,
+            (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks()),
+        );
+    }
+
+    fn retain_word_body(&mut self, value: Value, slow: Block) {
         let immediate = self.immediate(value);
         if !self.owners_valid {
             self.owner_guard(immediate, slow);
@@ -53,6 +156,11 @@ impl Lowering<'_, '_> {
         let done = self.b.create_block();
         self.b.ins().brif(immediate, done, &[], heap, &[]);
         self.b.switch_to_block(heap);
+        if self.shared_owner(value, true, slow) {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+            return;
+        }
         let owner = self.owned_pointer(value, slow);
         let count = self.load(owner, self.values.rc_strong_off as i32);
         let incremented = self.b.ins().iadd_imm_s(count, 1);
@@ -68,6 +176,18 @@ impl Lowering<'_, '_> {
     }
 
     fn release_word(&mut self, value: Value, slow: Block) {
+        #[cfg(test)]
+        let before = (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks());
+        self.release_word_body(value, slow);
+        #[cfg(test)]
+        record_owner_ir(
+            1,
+            before,
+            (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks()),
+        );
+    }
+
+    fn release_word_body(&mut self, value: Value, slow: Block) {
         let immediate = self.immediate(value);
         if !self.owners_valid {
             self.owner_guard(immediate, slow);
@@ -77,6 +197,11 @@ impl Lowering<'_, '_> {
         let done = self.b.create_block();
         self.b.ins().brif(immediate, done, &[], heap, &[]);
         self.b.switch_to_block(heap);
+        if self.shared_owner(value, false, slow) {
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+            return;
+        }
         let owner = self.owned_pointer(value, slow);
         let count = self.load(owner, self.values.rc_strong_off as i32);
         let shared = self
@@ -111,6 +236,8 @@ impl Lowering<'_, '_> {
             }
             return;
         }
+        #[cfg(test)]
+        let before = (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks());
         let zero = self.b.ins().iconst(types::I64, 0);
         let mut owners = Vec::with_capacity(changes.len());
         for &(word, _) in changes {
@@ -209,6 +336,12 @@ impl Lowering<'_, '_> {
                 self.store(next, address, 0);
             }
         }
+        #[cfg(test)]
+        record_owner_ir(
+            2,
+            before,
+            (self.b.func.dfg.num_insts(), self.b.func.dfg.num_blocks()),
+        );
     }
 
     pub(super) fn ownership(&mut self, pc: usize, op: &Op, next: Block) {

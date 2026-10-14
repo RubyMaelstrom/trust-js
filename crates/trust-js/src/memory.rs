@@ -454,6 +454,7 @@ pub(crate) struct Visitor {
     callable_metadata: usize,
     function_bytecode_metadata: usize,
     function_bytecode_opaque_storage: bool,
+    background_compiler_unmeasured: bool,
     jit_heap_metadata: usize,
     regexp_metadata: usize,
     detached_property_storage: usize,
@@ -701,6 +702,15 @@ impl Visitor {
 
     pub(crate) fn mark_function_bytecode_opaque_storage(&mut self) {
         self.function_bytecode_opaque_storage = true;
+    }
+
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    pub(crate) fn mark_background_compiler_unmeasured(&mut self) {
+        self.background_compiler_unmeasured = true;
     }
 
     pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
@@ -2346,6 +2356,22 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
 
 fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    if let Some(state) = &interp.optimizing_background {
+        state.scan_retained_memory(&mut visitor);
+    }
+    #[cfg(all(
+        feature = "optimizing-jit",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    if crate::jit::optimizing_background_in_flight() {
+        visitor.mark_background_compiler_unmeasured();
+    }
     let mut totals = DirectTotals::default();
     scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
     scan_symbol_agent(interp, &mut visitor, &mut totals);
@@ -2394,7 +2420,12 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
                 "native closure captured allocations are unreported or have conflicting identities",
             )
         },
-        function_bytecode_metadata: if visitor.function_bytecode_opaque_storage {
+        function_bytecode_metadata: if visitor.background_compiler_unmeasured {
+            Category::incomplete_lower_bound(
+                visitor.function_bytecode_metadata,
+                "background compiler IR, scratch, channels and pending native metadata are unmeasured",
+            )
+        } else if visitor.function_bytecode_opaque_storage {
             Category::lower_bound(
                 visitor.function_bytecode_metadata,
                 "Chunk call-pin HashMap bucket storage is opaque",

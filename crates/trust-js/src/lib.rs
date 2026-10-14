@@ -79,6 +79,10 @@ mod feedback;
 mod finalization_cells;
 #[cfg(test)]
 mod for_in_cache_tests;
+#[cfg(test)]
+mod function_realm_identity_tests;
+#[cfg(test)]
+mod function_realm_lifetime_tests;
 mod gc_diagnostics;
 mod gc_edges;
 mod gc_generational;
@@ -132,10 +136,6 @@ mod parser;
 mod private_name_cache_tests;
 #[cfg(test)]
 mod realm_inline_guard_tests;
-#[cfg(test)]
-mod function_realm_identity_tests;
-#[cfg(test)]
-mod function_realm_lifetime_tests;
 #[cfg(test)]
 mod record_enumeration_tests;
 mod regex;

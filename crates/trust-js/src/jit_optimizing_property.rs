@@ -93,8 +93,9 @@ impl Lowering<'_, '_> {
             .property_results
             .iter()
             .any(|&(site, ty)| site as usize == pc && ty.is_number());
+        let generic_own = self.generic_own_plan.and_then(|plan| plan.read(pc));
         if !supported(self.values) {
-            if numeric_result {
+            if numeric_result || generic_own.is_some() {
                 self.specialization_bailout(pc);
             } else {
                 self.checked(get_property, pc as u32, next);
@@ -108,9 +109,17 @@ impl Lowering<'_, '_> {
             | Op::GetPropLocal(_, name, cache) => (name, cache),
             _ => unreachable!("named property read"),
         };
-        let frozen_metadata = numeric_result
-            .then(|| self.heap_metadata_plan.and_then(|plan| plan.read(pc)))
-            .flatten();
+        let frozen_metadata = generic_own
+            .map(|site| (site.state, site.removed))
+            .or_else(|| {
+                numeric_result
+                    .then(|| self.heap_metadata_plan.and_then(|plan| plan.read(pc)))
+                    .flatten()
+            });
+        #[cfg(test)]
+        if let Some(site) = generic_own {
+            generic_own::record(false, site.removed);
+        }
         let compact = frozen_metadata.map(|(state, _)| state).or_else(|| {
             self.chunk.jit_cache_preferred(cache).filter(|state| {
                 state.depth <= IC_MAX_DEPTH
@@ -384,11 +393,12 @@ impl Lowering<'_, '_> {
         } else {
             self.push(value);
         }
+        self.count_native_site_success(pc, "data_property_read");
         self.jump_normal(next);
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
         self.stack_state = self.stack_plan.at[pc];
-        if numeric_result {
+        if numeric_result || generic_own.is_some() {
             // The complete frame is still before this access. In particular an accessor
             // miss must execute its getter once in the VM, never replay an observed call.
             self.specialization_bailout(pc);

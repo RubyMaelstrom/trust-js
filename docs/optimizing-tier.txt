@@ -951,3 +951,73 @@ The pinned Cranelift crate sources and official API documentation govern the bac
 https://docs.rs/cranelift-codegen/0.136.2/cranelift_codegen/
 https://docs.rs/cranelift-frontend/0.136.2/cranelift_frontend/
 GC boundary explanation: https://bytecodealliance.org/articles/new-stack-maps-for-wasmtime
+
+Experimental arbitrary-value own-data admission
+------------------------------------------------
+TRUST_JS_OPT_JIT_GENERIC_OWN=1 explicitly enables a structural specialization inside the
+optional backend. It is off by default. Forced mode can select warmed ordinary own-data
+reads/overwrites; hot mode records at most 32 named private-local/This sites at four separated
+entry checkpoints. A site must keep the same truly monomorphic, cacheable, depth-zero scalar
+IC state at every observation. Those observations select a version, never prove a live object.
+The warmed immutable opcode/name/slot/cache graph is cloned together with the exact selected
+states, and compilation validates the entire selection before using it. Indexed/prototype,
+creation, polymorphic, missing, accessor, environment-homed and stale selections decline.
+
+Each CFG block begins with no metadata facts. Successful selected native checks can remove
+later ordinary/shape/bounds/data tests for the same unchanged private receiver word. Unselected
+operations, rebindings, helpers, polls and cleanup kill the facts. Reads still load current
+values and retain their actual owners; stores keep their existing alias-aware owner transaction.
+Neither boxes, retain/drop operations, values, pointers nor heap contents are credited as saved.
+Required proof failure declines the candidate; no cheaper admission can silently fall back to
+unproven helper rejoins. A live guard/owner miss resumes before that exact access, preserving any
+earlier completed read's owning RHS, and eight misses retire the version as before.
+
+Structural admission uses the minimum removed checks across reachable normal/explicit-throw
+terminals and possible earlier checked-operation errors. Shortest CFG paths do not assume
+loop trip counts; handler/resumption roots decline structural credit. The estimate excludes
+host cancellation/resource termination and specialization misses, which remain separate
+outcomes. The existing numeric benefit remains its older static-body estimate; mixed benefit
+is not wholly a guaranteed saving per entry. Numeric credit obeys VALUE_FACTS, and HEAP_OPS=0
+or COMPACT_STORES=0 disables structural selection. The 4096-entry floor, 256-op body bound and
+40-IR/op bounded candidate compiler remain unchanged. Past entry counts are a work heuristic,
+not prepaid savings or proof of future calls. Publication, actual entries, successful selected
+accesses, VM recovery, compilation cost and workload phase must be reported separately. This
+capability and forced emission fixtures establish no framework adoption or performance gain.
+
+Compiler size, background work and execution observations
+----------------------------------------------------------
+Terminal recovery now shares a cold native block only when the helper kind, error epilogue,
+exact dirty-local set and owning operand suffix agree. The originating bytecode PC remains
+a dynamic argument. The shared block publishes the same owners and resumes the same VM
+invocation; it does not spill clean register copies that may have become stale after a
+callback. TRUST_JS_OPT_JIT_SHARED_RECOVERY=0 retains the previous per-site scaffolding.
+This transformation is inside the optional backend, whose feature/runtime defaults remain off.
+
+TRUST_JS_OPT_JIT_SHARED_OWNERS=1 separately selects shared scalar C-ABI retain/release leaves.
+It is off by default. A live runtime layout proof gates the calls. Immediate values bypass
+them; unsupported tags, null payloads, zero/overflow counts and last-owner release take the
+existing checked path without mutation. Successful leaves change one strong count without
+allocation, collection, author callbacks or final destruction. Multi-owner alias transactions
+retain their existing implementation. Smaller emitted IR/code does not establish that the
+extra native calls and spills improve throughput on an application.
+
+TRUST_JS_OPT_JIT_BACKGROUND=1 experiments with bounded background code generation in hot
+mode. JavaScript ownership, analysis and publication remain on the Agent thread; the worker
+receives only compiler-owned Send data. Publication revalidates the originating baseline and
+Realm. Pending/ready jobs remain within the shared quota, cancellation releases Agent owners,
+and retirement preserves active native leases. See background-codegen-experiment.txt for
+the complete queue, retry, shutdown and memory-accounting contract. It remains off by default.
+
+TRUST_JS_OPT_JIT_DIAGNOSTICS=execution observes physical optimizing-native entries, exits,
+terminal VM recoveries, specialization misses/retirement and at most eight emitted committed
+named-property fast-success PCs. It excludes the broader Full-mode helper/owner instrumentation.
+Whole-function and loop-continuation retirement use their respective live miss state. A normal
+native ABI exit may include a completed VM recovery; subtract terminal VM normal completions
+to identify normal exits through native control flow, except when counters saturate. Checked
+helpers and author calls can still occur within that native control flow. Creation, computed
+element operations and loop-scalar field operations are outside the selected site counters.
+Compile-only mode adds no native counters. Code-owned diagnostic vector/string capacities are
+included in retained metadata; the bounded directory keeps weak references, not JavaScript
+owners. Full-mode shared-owner counters occupy separate slots from the eight execution sites.
+All runtime diagnostic modes perturb emission and may change compiler-budget admission, so
+their runs are not performance acceptance measurements.

@@ -175,6 +175,28 @@ emission adds no native instructions. `TRUST_JS_OPT_JIT_DIAGNOSTICS=compile` rec
 compilation/static counts and emits the ordinary uninstrumented body. Instrumented
 IR is larger and still subject
 to the same compiler limits; diagnostic runs cannot be acceptance timings.
+`TRUST_JS_OPT_JIT_DIAGNOSTICS=execution` separately records physical optimized entries,
+normal/error exits, terminal VM recoveries, specialization retirement and up to eight
+committed named-property fast-success sites. Normal exits include recovered VM completions;
+native control flow may still call checked helpers or author code. Loop-continuation and
+whole-function retirement use separate miss states. Creation, computed elements and scalar
+loop-field accesses are outside the site counters. Execution counters saturate; the legacy
+Full-mode counters keep their existing behavior. Shared-owner leaf counters are Full-only
+and have distinct storage from execution sites. Dynamic diagnostic metadata capacities are
+included in retained memory, and the directory holds weak references.
+`TRUST_JS_OPT_JIT_GENERIC_OWN=1` enables experimental selected ordinary own-field reads and
+overwrites with arbitrary owned values. Hot admission freezes at most 32 stable scalar IC
+states from four checkpoints and credits only conservative structural-check removal; actual
+values, descriptors and owner transactions remain live and guarded. It is off by default.
+`TRUST_JS_OPT_JIT_SHARED_OWNERS=1` separately moves single-owner retain/release checks into
+validated scalar native leaves with no allocation, GC, callbacks or final destruction.
+It is off by default; alias-aware multi-owner transactions retain their existing guarded implementation.
+`TRUST_JS_OPT_JIT_SHARED_RECOVERY=0` disables shared terminal recovery blocks, whose grouping
+preserves exact dirty locals, owning stack suffixes and the originating before-effect PC.
+`TRUST_JS_OPT_JIT_BACKGROUND=1` experiments with bounded worker code generation in hot mode,
+keeping JavaScript owners, analysis, Realm validation and publication on the Agent thread.
+It is off by default. See `docs/background-codegen-experiment.txt` and
+`docs/optimizing-tier.txt` for contracts and the separate application acceptance requirements.
 The separate `architecture-diagnostics` feature records allocation sites/lifetimes
 in the live Rc heap and call-cache epoch/refill traffic. It adds no object owners;
 site and registry-slot limits report untracked allocations. Initial exotic family

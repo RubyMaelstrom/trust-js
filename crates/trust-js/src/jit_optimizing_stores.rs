@@ -24,12 +24,14 @@ fn compact_enabled() -> bool {
 }
 
 impl Lowering<'_, '_> {
-    fn store_receiver(&mut self, op: &Op, slow: Block) -> Value {
+    fn store_receiver(&mut self, op: &Op, slow: Block, ordinary: bool) -> Value {
         if matches!(op, Op::SetPropThisDrop(..)) {
             let this = self.load(self.ctx, offset_of!(JitCtx, this_raw) as i32);
-            let tag = self.property_load(types::I8, this, 0);
-            let object = self.b.ins().icmp_imm_s(IntCC::Equal, tag, 8);
-            self.property_guard(object, slow);
+            if !ordinary {
+                let tag = self.property_load(types::I8, this, 0);
+                let object = self.b.ins().icmp_imm_s(IntCC::Equal, tag, 8);
+                self.property_guard(object, slow);
+            }
             let owner = self.load(this, 8);
             self.b.ins().bor_imm_s(owner, PACK_OBJ as i64)
         } else if let Op::SetPropLocalDrop(slot, ..) = op {
@@ -47,15 +49,45 @@ impl Lowering<'_, '_> {
             | Op::SetPropLocalDrop(_, name, cache) => (name, cache),
             _ => unreachable!("named property write"),
         };
+        let generic_own = self.generic_own_plan.and_then(|plan| plan.write(pc));
+        let metadata = generic_own.map(|site| site.removed).unwrap_or_default();
+        #[cfg(test)]
+        if let Some(site) = generic_own {
+            generic_own::record(true, site.removed);
+        }
         let index = crate::value::canonical_index(self.chunk.jit_name(name));
         if !elements::supported(self.values) {
-            self.checked(set_property, pc as u32, next);
+            if generic_own.is_some() {
+                self.specialization_bailout(pc);
+            } else {
+                self.checked(set_property, pc as u32, next);
+            }
             return;
         }
         let slow = self.b.create_block();
-        let receiver = self.store_receiver(op, slow);
+        let receiver = self.store_receiver(op, slow, metadata.ordinary);
         let incoming = self.stack_read(1);
-        let object = self.element_receiver(receiver, slow);
+        let object = if generic_own.is_some() {
+            if !metadata.ordinary {
+                let tag = self.b.ins().ushr_imm_u(receiver, 48);
+                let object = self
+                    .b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, tag, (PACK_OBJ >> 48) as i64);
+                self.property_guard(object, slow);
+            }
+            let owner = self.b.ins().band_imm_s(receiver, 0x0000_ffff_ffff_ffff);
+            let object = self
+                .b
+                .ins()
+                .iadd_imm_s(owner, self.values.obj_from_rc as i64);
+            if !metadata.ordinary {
+                self.property_ordinary(object, slow);
+            }
+            object
+        } else {
+            self.element_receiver(receiver, slow)
+        };
         let (property, old, index) = if let Some(index) = index {
             // A constant canonical array index has the same dense-storage and mirror
             // obligations as a computed numeric key, even when the receiver is ordinary.
@@ -65,11 +97,15 @@ impl Lowering<'_, '_> {
         } else {
             // Array named shapes do not identify arbitrary entry slots. Until that path
             // has its own key proof, only ordinary receivers use the named-slot cache.
-            self.property_ordinary(object, slow);
-            let compact = compact_enabled()
-                .then(|| self.chunk.jit_cache_preferred(cache))
-                .flatten()
-                .filter(|state| state.depth == 0);
+            if generic_own.is_none() {
+                self.property_ordinary(object, slow);
+            }
+            let compact = generic_own.map(|site| site.state).or_else(|| {
+                compact_enabled()
+                    .then(|| self.chunk.jit_cache_preferred(cache))
+                    .flatten()
+                    .filter(|state| state.depth == 0)
+            });
             let slot = if let Some(state) = compact {
                 // A warmed monomorphic existing-own-field site needs no creation
                 // resolver. Only shape/slot scalars are frozen; current bounds,
@@ -77,8 +113,10 @@ impl Lowering<'_, '_> {
                 // Any changed shape or descriptor takes the complete checked Set.
                 #[cfg(test)]
                 TEST_COMPACT_STORES.with(|count| count.set(count.get() + 1));
-                let shape = self.b.ins().iconst(types::I32, state.recv_shape as i64);
-                self.property_shape(object, shape, slow);
+                if !metadata.shape {
+                    let shape = self.b.ins().iconst(types::I32, state.recv_shape as i64);
+                    self.property_shape(object, shape, slow);
+                }
                 self.b.ins().iconst(types::I64, state.slot as i64)
             } else {
                 let creation = self.native_creation
@@ -146,13 +184,15 @@ impl Lowering<'_, '_> {
                 self.b.switch_to_block(hit);
                 self.b.block_params(hit)[0]
             };
-            let length = self.load(
-                object,
-                (self.values.obj_props + self.values.props_entries + self.values.vec_len_off)
-                    as i32,
-            );
-            let valid = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, length);
-            self.property_guard(valid, slow);
+            if !metadata.bounds {
+                let length = self.load(
+                    object,
+                    (self.values.obj_props + self.values.props_entries + self.values.vec_len_off)
+                        as i32,
+                );
+                let valid = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, length);
+                self.property_guard(valid, slow);
+            }
             let data = self.load(
                 object,
                 (self.values.obj_props + self.values.props_entries + self.values.vec_ptr_off)
@@ -163,7 +203,9 @@ impl Lowering<'_, '_> {
             let old = self.load(property, self.values.entry_value as i32);
             (property, old, None)
         };
-        self.property_data(property, true, slow);
+        if !metadata.data {
+            self.property_data(property, true, slow);
+        }
         let consumed_receiver = matches!(op, Op::SetProp(..) | Op::SetPropDrop(..));
         let keep = matches!(op, Op::SetProp(..));
         let mut owners = vec![(old, false)];
@@ -178,15 +220,29 @@ impl Lowering<'_, '_> {
         if let Some(index) = index {
             self.element_mirror_store(object, index, incoming);
         }
-        self.finish_property_store(op, incoming, next);
+        self.commit_property_store_stack(op, incoming);
+        // The overwrite, alias-aware owners, result and operand top have committed.
+        self.count_native_site_success(pc, "existing_property_overwrite");
+        self.jump_normal(next);
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
         self.stack_state = self.stack_plan.at[pc];
-        self.checked(set_property, pc as u32, next);
+        if generic_own.is_some() {
+            // The previous read still owns its RHS stack word. Publish that
+            // exact before-store state; never replay or fuse a completed read.
+            self.specialization_bailout(pc);
+        } else {
+            self.checked(set_property, pc as u32, next);
+        }
     }
 
     /// Complete either a native overwrite or creation, after all owner transfers.
     pub(super) fn finish_property_store(&mut self, op: &Op, incoming: Value, next: Block) {
+        self.commit_property_store_stack(op, incoming);
+        self.jump_normal(next);
+    }
+
+    fn commit_property_store_stack(&mut self, op: &Op, incoming: Value) {
         let consumed_receiver = matches!(op, Op::SetProp(..) | Op::SetPropDrop(..));
         let keep = matches!(op, Op::SetProp(..));
         if keep {
@@ -195,6 +251,5 @@ impl Lowering<'_, '_> {
         }
         let consumed = 1 + usize::from(consumed_receiver) - usize::from(keep);
         self.change_top(-8 * consumed as i64);
-        self.jump_normal(next);
     }
 }

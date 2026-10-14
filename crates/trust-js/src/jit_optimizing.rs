@@ -13,15 +13,17 @@
 //! The production Rc graph remains authoritative: owning local words may live in SSA only
 //! between publication barriers. Their exact owners are restored before any checked call.
 
+#[path = "jit_optimizing_background.rs"]
+pub(crate) mod background;
 #[path = "jit_optimizing_bitwise.rs"]
 mod bitwise;
 #[cfg(test)]
 #[path = "jit_optimizing_call_tests.rs"]
 mod call_tests;
-#[path = "jit_optimizing_creation.rs"]
-mod creation;
 #[path = "jit_optimizing_codegen.rs"]
 mod codegen;
+#[path = "jit_optimizing_creation.rs"]
+mod creation;
 #[cfg(test)]
 #[path = "jit_optimizing_creation_tests.rs"]
 mod creation_tests;
@@ -35,8 +37,21 @@ mod diagnostic_tests;
 mod effects;
 #[path = "jit_optimizing_elements.rs"]
 mod elements;
+#[cfg(test)]
+#[path = "jit_optimizing_execution_tests.rs"]
+mod execution_tests;
 #[path = "jit_optimizing_frame.rs"]
 mod frame;
+#[path = "jit_optimizing_generic_admission.rs"]
+mod generic_admission;
+#[cfg(test)]
+#[path = "jit_optimizing_generic_admission_tests.rs"]
+mod generic_admission_tests;
+#[path = "jit_optimizing_generic_own.rs"]
+mod generic_own;
+#[cfg(test)]
+#[path = "jit_optimizing_generic_own_tests.rs"]
+mod generic_own_tests;
 #[cfg(test)]
 #[path = "jit_optimizing_heap_proof_tests.rs"]
 mod heap_proof_tests;
@@ -50,21 +65,29 @@ mod inline;
 #[cfg(test)]
 #[path = "jit_optimizing_inline_tests.rs"]
 mod inline_tests;
-#[path = "jit_optimizing_integer_consumers.rs"]
-mod integer_consumers;
 #[cfg(test)]
 #[path = "jit_optimizing_integer_consumer_tests.rs"]
 mod integer_consumer_tests;
+#[path = "jit_optimizing_integer_consumers.rs"]
+mod integer_consumers;
 #[cfg(test)]
 #[path = "jit_optimizing_integer_tests.rs"]
 mod integer_tests;
 #[path = "jit_optimizing_integers.rs"]
 mod integers;
+#[cfg(test)]
+#[path = "jit_optimizing_integration_tests.rs"]
+mod integration_tests;
 #[path = "jit_optimizing_names.rs"]
 mod names;
 #[cfg(test)]
 #[path = "jit_optimizing_names_tests.rs"]
 mod names_tests;
+#[path = "jit_optimizing_owner_leaf.rs"]
+mod owner_leaf;
+#[cfg(test)]
+#[path = "jit_optimizing_owner_leaf_tests.rs"]
+mod owner_leaf_tests;
 #[path = "jit_optimizing_ownership.rs"]
 mod ownership;
 #[cfg(test)]
@@ -77,6 +100,8 @@ mod property;
 mod property_tests;
 #[path = "jit_optimizing_ranges.rs"]
 mod ranges;
+#[path = "jit_optimizing_recovery.rs"]
+mod recovery;
 #[path = "jit_optimizing_specialization.rs"]
 mod specialization;
 #[cfg(test)]
@@ -89,11 +114,11 @@ mod stack_lowering;
 #[cfg(test)]
 #[path = "jit_optimizing_stack_tests.rs"]
 mod stack_tests;
-#[path = "jit_optimizing_stores.rs"]
-mod stores;
 #[cfg(test)]
 #[path = "jit_optimizing_store_tests.rs"]
 mod store_tests;
+#[path = "jit_optimizing_stores.rs"]
+mod stores;
 #[path = "jit_optimizing_values.rs"]
 mod value_facts;
 
@@ -145,15 +170,16 @@ pub(super) fn metrics_json() -> String {
     let successes = COMPILE_SUCCESSES.load(Relaxed);
     let nanos = COMPILE_NANOS.load(Relaxed);
     let bytes = GENERATED_BYTES.load(Relaxed);
+    let background = background::metrics_json();
     let hot_requests = HOT_REQUESTS.load(Relaxed);
     let hot_published = HOT_PUBLISHED.load(Relaxed);
     let call_stubs = super::call_stub::metrics_json();
     let diagnostics = diagnostics::snapshot_json();
     format!(
-        "{{\"compile_attempts\":{attempts},\"compile_successes\":{successes},\"compile_declines\":{},\"compile_seconds\":{:.9},\"generated_code_bytes\":{bytes},\"hot_requests\":{hot_requests},\"hot_published\":{hot_published},\"hot_declines\":{},\"shared_call_stubs\":{call_stubs},\"diagnostics\":{diagnostics}}}",
-        attempts.saturating_sub(successes),
+        "{{\"compile_attempts\":{attempts},\"compile_successes\":{successes},\"compile_declines\":{},\"compile_seconds\":{:.9},\"generated_code_bytes\":{bytes},\"hot_requests\":{hot_requests},\"hot_published\":{hot_published},\"background\":{background},\"hot_declines\":{},\"shared_call_stubs\":{call_stubs},\"diagnostics\":{diagnostics}}}",
+        background::compile_declines(attempts, successes),
         nanos as f64 / 1_000_000_000.0,
-        hot_requests.saturating_sub(hot_published)
+        background::hot_declines(hot_requests, hot_published)
     )
 }
 
@@ -238,7 +264,7 @@ fn has_sampling_source(chunk: &Chunk) -> bool {
         }
         Op::GetPropThis(..) => true,
         _ => false,
-    })
+    }) || generic_admission::has_source(chunk)
 }
 
 /// Called at bounded baseline entry checkpoints, before executing any bytecode.
@@ -249,6 +275,17 @@ fn has_sampling_source(chunk: &Chunk) -> bool {
 pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let ctx = &mut *ctx;
     let chunk = &*ctx.chunk;
+    let use_background = background::enabled();
+    if use_background {
+        let state = (&mut *ctx.interp)
+            .optimizing_background
+            .get_or_insert_with(Default::default);
+        state.poll();
+        if state.contains(chunk) || !state.available() {
+            background::rearm(chunk, Ok(()));
+            return;
+        }
+    }
     if chunk.jit_ops().len() > 256
         || chunk.jit_detailed_feedback_enabled()
         || !bytecode::native_deopt::supported(chunk)
@@ -272,6 +309,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             .take(16)
             .map(|pc| (pc as u32, std::cell::Cell::new(0)))
             .collect();
+        samples.structural = generic_admission::observations(chunk);
         Box::new(samples)
     });
     samples.entries.set(
@@ -294,7 +332,8 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             observed.get() | sampled_property(ctx, *pc as usize).map_or(u32::MAX, sampled_number),
         );
     }
-    if count == 0 && samples.properties.is_empty() {
+    generic_admission::observe(chunk, &samples.structural);
+    if count == 0 && samples.properties.is_empty() && samples.structural.is_empty() {
         return;
     }
     let rearm = |distance: u64| {
@@ -322,12 +361,30 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let Some(stack) = stack::StackPlan::build(chunk, &cfg) else {
         return;
     };
-    let Some(plan) = specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties) else {
+    let numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
+        .then(|| specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties))
+        .flatten();
+    let structural = generic_admission::Plan::build(
+        chunk,
+        &cfg,
+        &stack,
+        &generic_admission::selected(&samples.structural),
+    );
+    let estimated_entries = if let Some(structural) = &structural {
+        generic_admission::admission_entries(
+            chunk,
+            numeric.as_ref().map_or(0, |plan| plan.saved_tests),
+            structural.minimum_tests,
+        )
+    } else {
+        numeric.as_ref().map(|plan| plan.admission_entries(chunk))
+    };
+    let Some(estimated_entries) = estimated_entries else {
         return;
     };
     let target = admission_override()
         .map(u64::from)
-        .unwrap_or_else(|| plan.admission_entries(chunk).max(4096));
+        .unwrap_or_else(|| estimated_entries.max(4096));
     if samples.entries.get() < target {
         rearm(target - samples.entries.get());
         return;
@@ -360,10 +417,33 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         return;
     }
     let counted = super::perf_metrics_enabled();
-    if counted {
-        HOT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let Some(next) = bytecode::compile_for_optimizer(&function, chunk, &inputs, &properties) else {
+    let ticket = if use_background {
+        let state = i.optimizing_background.get_or_insert_with(Default::default);
+        match state.reserve(background::Preparation::new(counted)) {
+            Ok(ticket) => Some(ticket),
+            Err(reason) => {
+                background::rearm(chunk, Err(reason));
+                return;
+            }
+        }
+    } else {
+        if counted {
+            HOT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        None
+    };
+    let next = if let Some(structural) = &structural {
+        bytecode::compile_for_optimizer_with_structural(
+            &function,
+            chunk,
+            &inputs,
+            &properties,
+            &structural.selected,
+        )
+    } else {
+        bytecode::compile_for_optimizer(&function, chunk, &inputs, &properties)
+    };
+    let Some(next) = next else {
         return;
     };
     let Some(permit) = next.jit.begin_compile() else {
@@ -375,6 +455,48 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     if !i.interp_layout.get().valid {
         let layout = crate::interpreter::interp_layout(i);
         i.interp_layout.set(layout);
+    }
+    if use_background {
+        let Some(baseline) = function
+            .execution_code_for(ctx.genv)
+            .and_then(Option::as_ref)
+            .cloned()
+        else {
+            return;
+        };
+        let genv = i.global_env.clone();
+        if std::rc::Rc::as_ptr(&genv) as usize != ctx.genv {
+            return;
+        }
+        let instructions = next
+            .jit_ops()
+            .len()
+            .saturating_mul(40)
+            .saturating_add(names::instruction_allowance(&next))
+            .min(16_384);
+        let Ok(prepared) = prepare_entry_with_limits(
+            &next,
+            &values,
+            &i.interp_layout.get(),
+            None,
+            instructions,
+            65_536,
+            None,
+        ) else {
+            return;
+        };
+        let state = i.optimizing_background.get_or_insert_with(Default::default);
+        let outcome = state.submit(
+            ticket.expect("reserved background work"),
+            &function,
+            &baseline,
+            &genv,
+            next,
+            prepared,
+            permit,
+        );
+        background::rearm(chunk, outcome);
+        return;
     }
     // Do not invalidate every caller just to publish an uncompiled or declined version.
     // The old mapping is active/pinned; the new slot is reserved before any code emission.
@@ -462,7 +584,11 @@ fn isa() -> Option<&'static Arc<dyn TargetIsa>> {
         flags
             .set(
                 "enable_verifier",
-                if codegen::verify_every_pass() { "true" } else { "false" },
+                if codegen::verify_every_pass() {
+                    "true"
+                } else {
+                    "false"
+                },
             )
             .ok()?;
         flags.set("preserve_frame_pointers", "true").ok()?;
@@ -643,6 +769,7 @@ thread_local! {
     /// Emitted local reloads / all-tracked alternative, not runtime timings.
     static TEST_LOCAL_RELOADS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static TEST_VALUE_PROOFS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static TEST_PREPARATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 struct Lowering<'a, 'b> {
@@ -659,12 +786,14 @@ struct Lowering<'a, 'b> {
     value_plan: Option<&'b value_facts::ValuePlan>,
     numeric_plan: Option<&'b ranges::NumericPlan>,
     heap_metadata_plan: Option<&'b heap_proofs::MetadataPlan>,
+    generic_own_plan: Option<&'b generic_own::Plan>,
     property_results: &'b [(u32, value_facts::Types)],
     loop_facts: Option<&'b loop_facts::Plan>,
     loop_field_addresses: Vec<Variable>,
     loop_field_values: Vec<Variable>,
     loop_validation: Option<Block>,
     loop_validation_returns: Vec<Block>,
+    terminal_recoveries: recovery::Plan<'b>,
     loop_scalars: bool,
     sparse_reloads: bool,
     local_effects: bool,
@@ -683,6 +812,7 @@ struct Lowering<'a, 'b> {
     pc: usize,
     sp: Variable,
     helper_sig: SigRef,
+    owner_leaf_sig: Option<SigRef>,
     call_sig: SigRef,
     call_stubs: &'b [std::rc::Rc<super::call_stub::SharedCallStub>],
     diagnostics: Option<&'b diagnostics::Code>,
@@ -697,6 +827,55 @@ impl Lowering<'_, '_> {
     fn count_runtime(&mut self, counter: usize, amount: usize) {
         if let Some(record) = self.diagnostics {
             emit_diagnostic_count(&mut self.b, record, counter, amount);
+        }
+    }
+
+    fn count_retirement_request(&mut self) {
+        self.count_retirement_cell(&self.chunk.optimizing_misses);
+    }
+
+    fn count_loop_retirement_request(&mut self) {
+        if let Some(state) = self.chunk.optimizing_loop.get() {
+            self.count_retirement_cell(&state.misses);
+        }
+    }
+
+    fn count_retirement_cell(&mut self, misses: &std::cell::Cell<u8>) {
+        if let Some(record) = self.diagnostics.filter(|record| record.execution_counters) {
+            // Cold miss path only. This is the same frame-pinned immutable Cell
+            // that the next helper increments; no observer intervenes.
+            let address = self.b.ins().iconst(types::I64, misses as *const _ as i64);
+            let previous = self
+                .b
+                .ins()
+                .load(types::I8, MemFlags::trusted(), address, 0);
+            let triggers = self.b.ins().icmp_imm_s(
+                IntCC::Equal,
+                previous,
+                (SPECIALIZATION_MISS_LIMIT - 1) as i64,
+            );
+            let amount = self.b.ins().uextend(types::I64, triggers);
+            emit_execution_count(&mut self.b, record, diagnostics::RETIREMENT_REQUEST, amount);
+        }
+    }
+
+    fn count_terminal_recovery_start(&mut self) {
+        self.count_runtime(diagnostics::VM_RECOVERY, 1);
+    }
+
+    fn count_terminal_recovery_result(&mut self, success: Value) {
+        if let Some(record) = self.diagnostics.filter(|record| record.execution_counters) {
+            let normal = self.b.ins().icmp_imm_s(IntCC::NotEqual, success, 0);
+            let amount = self.b.ins().uextend(types::I64, normal);
+            emit_execution_count(&mut self.b, record, diagnostics::VM_RECOVERY_NORMAL, amount);
+        }
+    }
+
+    pub(super) fn count_native_site_success(&mut self, pc: usize, kind: &'static str) {
+        if let Some(record) = self.diagnostics {
+            if let Some(counter) = record.select_site(self.chunk, pc, kind) {
+                self.count_runtime(counter, 1);
+            }
         }
     }
 
@@ -896,8 +1075,14 @@ impl Lowering<'_, '_> {
     }
 
     fn canonical_helper_value(&mut self, helper: Helper, immediate: Value) -> Value {
-        if let Some(record) = self.diagnostics {
-            record.emitted_helpers.set(record.emitted_helpers.get() + 1);
+        self.count_helper_runtime(helper);
+        self.canonical_helper_call(helper, immediate)
+    }
+
+    /// Attribute runtime helper traffic at its originating bytecode site. A shared terminal
+    /// call carries a dynamic PC, so its late-emitted block must not inspect `self.pc` here.
+    fn count_helper_runtime(&mut self, helper: Helper) {
+        if self.diagnostics.is_some() {
             let category = if std::ptr::fn_addr_eq(helper, bytecode::jit_unwind_pc as Helper) {
                 9
             } else {
@@ -907,6 +1092,14 @@ impl Lowering<'_, '_> {
                     .map_or(9, diagnostics::category)
             };
             self.count_runtime(category, 1);
+        }
+    }
+
+    /// Emit one physical helper call, after its caller has published every canonical owner.
+    /// Runtime attribution is separate so shared terminal recovery retains the origin's category.
+    fn canonical_helper_call(&mut self, helper: Helper, immediate: Value) -> Value {
+        if let Some(record) = self.diagnostics {
+            record.emitted_helpers.set(record.emitted_helpers.get() + 1);
         }
         let callee = self.b.ins().iconst(types::I64, helper as usize as i64);
         let sp = self.top();
@@ -989,18 +1182,13 @@ impl Lowering<'_, '_> {
     /// Terminal, before-effect bailout. The VM finishes this SAME invocation, so neither
     /// the normal successor nor the native completion router may run afterwards.
     fn deopt_before(&mut self, pc: usize, error: Block) {
-        self.publish_locals();
-        self.publish_stack(self.stack_state.depth);
-        let success = self.canonical_helper(bytecode::native_deopt::resume_before, pc as u32);
-        self.b.ins().brif(success, self.ok, &[], error, &[]);
+        self.terminal_recovery(recovery::Kind::BeforeEffect, pc, error);
     }
 
     fn specialization_bailout(&mut self, pc: usize) {
         self.count_runtime(diagnostics::SPECIALIZATION_BAILOUT, 1);
-        self.publish_locals();
-        self.publish_stack(self.stack_state.depth);
-        let success = self.canonical_helper(specialization_miss, pc as u32);
-        self.b.ins().brif(success, self.ok, &[], self.error, &[]);
+        self.count_retirement_request();
+        self.terminal_recovery(recovery::Kind::Specialization, pc, self.error);
     }
 
     /// Numbers occupy the IEEE range through the canonical NaN, with either sign. All
@@ -1551,12 +1739,33 @@ fn emit_diagnostic_count(
     counter: usize,
     amount: usize,
 ) {
-    if amount == 0 || !record.runtime_counters {
+    if amount == 0 || !record.counts(counter) {
         return;
     }
+    if record.execution_counters {
+        let amount = b.ins().iconst(types::I64, amount as i64);
+        emit_execution_count(b, record, counter, amount);
+    } else {
+        let address = b.ins().iconst(types::I64, record.counter(counter) as i64);
+        let previous = b.ins().load(types::I64, MemFlags::trusted(), address, 0);
+        let next = b.ins().iadd_imm_s(previous, amount as i64);
+        b.ins().store(MemFlags::trusted(), next, address, 0);
+    }
+}
+
+/// Bounded execution counters saturate; wrapped zero never masquerades as no entry.
+fn emit_execution_count(
+    b: &mut FunctionBuilder<'_>,
+    record: &diagnostics::Code,
+    counter: usize,
+    amount: Value,
+) {
     let address = b.ins().iconst(types::I64, record.counter(counter) as i64);
     let previous = b.ins().load(types::I64, MemFlags::trusted(), address, 0);
-    let next = b.ins().iadd_imm_s(previous, amount as i64);
+    let next = b.ins().iadd(previous, amount);
+    let overflow = b.ins().icmp(IntCC::UnsignedLessThan, next, previous);
+    let maximum = b.ins().iconst(types::I64, -1);
+    let next = b.ins().select(overflow, maximum, next);
     b.ins().store(MemFlags::trusted(), next, address, 0);
 }
 
@@ -1593,6 +1802,95 @@ fn compile_entry_with_limits(
     block_limit: usize,
     continuation: Option<(usize, &[(u16, value_facts::Types)], &[u32])>,
 ) -> Result<JitCode, CompileError> {
+    prepare_entry_with_limits(
+        chunk,
+        values,
+        layout,
+        deopt_at,
+        instruction_limit,
+        block_limit,
+        continuation,
+    )?
+    .compile_sync()
+}
+
+struct PreparedCode {
+    context: Context,
+    isa: Arc<dyn TargetIsa>,
+    finish: NativeFinish,
+}
+
+struct NativeFinish {
+    residency: Box<CodeResidency>,
+    call_stubs: Vec<std::rc::Rc<super::call_stub::SharedCallStub>>,
+    diagnostic: Option<std::rc::Rc<diagnostics::Code>>,
+    max_stack: usize,
+    needs_global: bool,
+    entry_kind: NativeEntryKind,
+}
+
+impl PreparedCode {
+    fn compile_sync(mut self) -> Result<JitCode, CompileError> {
+        let passes = self
+            .finish
+            .diagnostic
+            .as_deref()
+            .map(diagnostics::passes::Scope::start);
+        let started = self
+            .finish
+            .diagnostic
+            .as_ref()
+            .map(|_| std::time::Instant::now());
+        let result = codegen::compile(&mut self.context, &*self.isa);
+        if let (Some(record), Some(started)) = (&self.finish.diagnostic, started) {
+            record.codegen_ns.set(diagnostics::nanos(started));
+        }
+        drop(passes);
+        let code = result.map_err(CompileError::Codegen)?;
+        if !code.buffer.relocs().is_empty() {
+            return Err(CompileError::Relocation);
+        }
+        self.finish.finish(code.code_buffer())
+    }
+}
+
+impl NativeFinish {
+    fn finish(self, bytes: &[u8]) -> Result<JitCode, CompileError> {
+        let finish_started = self.diagnostic.as_ref().map(|_| std::time::Instant::now());
+        let executable = ExecutableBuffer::from_bytes(bytes).ok_or(CompileError::Capacity)?;
+        if let (Some(record), Some(started)) = (&self.diagnostic, finish_started) {
+            record.native_bytes.set(executable.len());
+            record.finish_ns.set(diagnostics::nanos(started));
+            record.compiled();
+        }
+        Ok(JitCode {
+            mem: executable.as_ptr() as *mut u8,
+            len: executable.len(),
+            pc_offsets: Vec::new(),
+            max_stack: self.max_stack,
+            needs_global: self.needs_global,
+            resume_depths: Vec::new(),
+            entry_kind: self.entry_kind,
+            osr_entry_depths: Vec::new(),
+            executable,
+            residency: self.residency,
+            call_stubs: self.call_stubs,
+            optimizing_diagnostics: self.diagnostic,
+        })
+    }
+}
+
+fn prepare_entry_with_limits(
+    chunk: &Chunk,
+    values: &crate::value::JitLayout,
+    layout: &InterpLayout,
+    deopt_at: Option<usize>,
+    instruction_limit: usize,
+    block_limit: usize,
+    continuation: Option<(usize, &[(u16, value_facts::Types)], &[u32])>,
+) -> Result<PreparedCode, CompileError> {
+    #[cfg(test)]
+    TEST_PREPARATIONS.with(|count| count.set(count.get() + 1));
     let ops = chunk.jit_ops();
     if !layout.valid
         || [layout.strict, layout.gc_next, layout.interrupt_poll_tick]
@@ -1602,7 +1900,9 @@ fn compile_entry_with_limits(
         || ops.len() > 65_535
         || chunk.jit_is_resumable()
         || chunk.jit_detailed_feedback_enabled()
-        || ((!chunk.optimizing_inputs.is_empty() || !chunk.optimizing_properties.is_empty())
+        || ((!chunk.optimizing_inputs.is_empty()
+            || !chunk.optimizing_properties.is_empty()
+            || !chunk.optimizing_structural.is_empty())
             && !bytecode::native_deopt::supported(chunk))
         || deopt_at.is_some_and(|pc| pc > ops.len() || !bytecode::native_deopt::supported(chunk))
         || ops.iter().any(|op| {
@@ -1633,6 +1933,9 @@ fn compile_entry_with_limits(
         return Err(CompileError::LoweringBudget);
     }
     let diagnostic = diagnostics::Code::new(chunk);
+    if let Some(record) = &diagnostic {
+        record.set_continuation(continuation.is_some());
+    }
     let analysis_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
     let cfg = Cfg::build(chunk).map_err(CompileError::ControlFlow)?;
     let entry_pc = continuation.map_or(0, |(pc, _, _)| pc);
@@ -1732,7 +2035,33 @@ fn compile_entry_with_limits(
             )
         })
         .flatten();
-    if chunk.optimizing_candidate && specialization.is_none() {
+    let structural_admission = (!chunk.optimizing_structural.is_empty() && continuation.is_none())
+        .then(|| {
+            generic_admission::Plan::build(chunk, &cfg, &stack_plan, &chunk.optimizing_structural)
+        })
+        .flatten();
+    if !chunk.optimizing_structural.is_empty() && structural_admission.is_none() {
+        return Err(CompileError::Unsupported);
+    }
+    let generic_own_plan =
+        (continuation.is_none() && property::supported(values) && elements::supported(values))
+            .then(|| {
+                if chunk.optimizing_candidate {
+                    generic_own::Plan::build_hot(
+                        chunk,
+                        &cfg,
+                        &frame,
+                        &stack_plan,
+                        &chunk.optimizing_structural,
+                    )
+                } else {
+                    generic_own::Plan::build(chunk, &cfg, &frame, &stack_plan)
+                }
+            })
+            .flatten();
+    if !chunk.optimizing_structural.is_empty() && generic_own_plan.is_none()
+        || chunk.optimizing_candidate && specialization.is_none() && structural_admission.is_none()
+    {
         return Err(CompileError::Unsupported);
     }
     if std::env::var_os("TRUST_JS_OPT_JIT_LOG").is_some() {
@@ -1778,6 +2107,13 @@ fn compile_entry_with_limits(
     call_sig.params.push(AbiParam::new(types::I64));
     let call_sig = context.func.import_signature(call_sig);
     let helper_sig = context.func.import_signature(helper_sig);
+    let owners_valid = crate::value::jit_packed_owners_supported(values);
+    let owner_leaf_sig = (owners_valid && owner_leaf::requested()).then(|| {
+        let mut signature = Signature::new(convention);
+        signature.params.push(AbiParam::new(types::I64));
+        signature.returns.push(AbiParam::new(types::I64));
+        context.func.import_signature(signature)
+    });
     let residency = Box::<CodeResidency>::default();
     let mut builder_context = FunctionBuilderContext::new();
     {
@@ -1892,7 +2228,7 @@ fn compile_entry_with_limits(
             b,
             chunk,
             values,
-            owners_valid: crate::value::jit_packed_owners_supported(values),
+            owners_valid,
             ctx,
             interp,
             slots,
@@ -1902,6 +2238,7 @@ fn compile_entry_with_limits(
             value_plan,
             numeric_plan: numeric_plan.as_ref(),
             heap_metadata_plan: heap_metadata_plan.as_ref(),
+            generic_own_plan: generic_own_plan.as_ref(),
             property_results: specialization
                 .as_ref()
                 .map_or(&[], |plan| plan.properties.as_slice()),
@@ -1910,6 +2247,7 @@ fn compile_entry_with_limits(
             loop_field_values: Vec::new(),
             loop_validation: None,
             loop_validation_returns: Vec::new(),
+            terminal_recoveries: recovery::Plan::new(),
             loop_scalars: std::env::var("TRUST_JS_OPT_JIT_LOOP_SCALARS").as_deref() != Ok("0"),
             sparse_reloads: std::env::var("TRUST_JS_OPT_JIT_SPARSE_RELOADS").as_deref() != Ok("0"),
             local_effects,
@@ -1930,6 +2268,7 @@ fn compile_entry_with_limits(
             pc: entry_pc,
             sp,
             helper_sig,
+            owner_leaf_sig,
             call_sig,
             call_stubs: &call_stubs,
             diagnostics: diagnostic.as_deref(),
@@ -1978,10 +2317,9 @@ fn compile_entry_with_limits(
             // No bytecode, getter, coercion or owner transfer has happened. Preserve the
             // actual inputs and finish this invocation once through its ordinary VM.
             if continuation.is_some() {
-                lower.publish_locals();
-                lower.publish_stack(lower.stack_state.depth);
-                let success = lower.canonical_helper(loop_entry::miss, entry_pc as u32);
-                lower.b.ins().brif(success, lower.ok, &[], error, &[]);
+                lower.count_runtime(diagnostics::SPECIALIZATION_BAILOUT, 1);
+                lower.count_loop_retirement_request();
+                lower.terminal_recovery(recovery::Kind::LoopEntry, entry_pc, error);
             } else {
                 lower.specialization_bailout(0);
             }
@@ -2036,6 +2374,7 @@ fn compile_entry_with_limits(
             lower.b.ins().jump(error, &[]);
         }
         lower.emit_loop_validation();
+        lower.emit_terminal_recoveries();
         lower.b.switch_to_block(unwind);
         lower.b.set_cold_block(unwind);
         let target = lower.canonical_helper(bytecode::jit_unwind_pc, 0);
@@ -2078,6 +2417,14 @@ fn compile_entry_with_limits(
         }
         for (block, success) in [(ok, 1), (error, 0)] {
             lower.b.switch_to_block(block);
+            lower.count_runtime(
+                if success == 1 {
+                    diagnostics::NORMAL_EXIT
+                } else {
+                    diagnostics::ERROR_EXIT
+                },
+                1,
+            );
             let sp = lower.top();
             lower.store(sp, ctx, offset_of!(JitCtx, final_sp) as i32);
             lower.store(saved_strict, interp, layout.strict as i32);
@@ -2111,55 +2458,39 @@ fn compile_entry_with_limits(
     stores::TEST_BODY_SIZE.with(|size| {
         size.set((context.func.dfg.num_insts(), context.func.dfg.num_blocks()));
     });
+    #[cfg(test)]
+    execution_tests::capture_graph(
+        &context.func,
+        (&*residency as *const CodeResidency) as usize,
+    );
+    #[cfg(test)]
+    recovery::capture_ir_shape(&context.func);
     if std::env::var_os("TRUST_JS_OPT_JIT_DUMP").is_some() {
         eprintln!("{}", context.func.display());
     }
-    let passes = diagnostic.as_deref().map(diagnostics::passes::Scope::start);
-    let codegen_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
-    let result = codegen::compile(&mut context, &**isa);
-    if let (Some(record), Some(started)) = (&diagnostic, codegen_started) {
-        record.codegen_ns.set(diagnostics::nanos(started));
-    }
-    drop(passes);
-    let code = result.map_err(CompileError::Codegen)?;
-    let finish_started = diagnostic.as_ref().map(|_| std::time::Instant::now());
-    // All runtime calls are explicit indirect calls. Refuse any unexpected libcall/relocation
-    // before allocating executable memory; never publish an unlinked buffer.
-    if !code.buffer.relocs().is_empty() {
-        return Err(CompileError::Relocation);
-    }
-    let executable =
-        ExecutableBuffer::from_bytes(code.code_buffer()).ok_or(CompileError::Capacity)?;
-    if let (Some(record), Some(started)) = (&diagnostic, finish_started) {
-        record.native_bytes.set(executable.len());
-        record.finish_ns.set(diagnostics::nanos(started));
-        record.compiled();
-    }
-    Ok(JitCode {
-        mem: executable.as_ptr() as *mut u8,
-        len: executable.len(),
-        pc_offsets: Vec::new(),
-        max_stack: cfg.jit_stack_capacity(),
-        needs_global: ops.iter().any(|op| {
-            matches!(
-                op,
-                Op::LoadName(..)
-                    | Op::LoadNameForCall(..)
-                    | Op::LoadNameIn(..)
-                    | Op::LoadNameForCallIn(..)
-            )
-        }),
-        resume_depths: Vec::new(),
-        entry_kind: if continuation.is_some() {
-            NativeEntryKind::OptimizingContinuation
-        } else {
-            NativeEntryKind::FreshFrame
+    Ok(PreparedCode {
+        context,
+        isa: isa.clone(),
+        finish: NativeFinish {
+            residency,
+            call_stubs,
+            diagnostic,
+            max_stack: cfg.jit_stack_capacity(),
+            needs_global: ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::LoadName(..)
+                        | Op::LoadNameForCall(..)
+                        | Op::LoadNameIn(..)
+                        | Op::LoadNameForCallIn(..)
+                )
+            }),
+            entry_kind: if continuation.is_some() {
+                NativeEntryKind::OptimizingContinuation
+            } else {
+                NativeEntryKind::FreshFrame
+            },
         },
-        osr_entry_depths: Vec::new(),
-        executable,
-        residency,
-        call_stubs,
-        optimizing_diagnostics: diagnostic,
     })
 }
 
