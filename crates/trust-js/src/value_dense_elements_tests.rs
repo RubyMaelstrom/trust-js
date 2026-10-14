@@ -151,3 +151,217 @@ fn dense_elements_numeric_loops_and_cycles_keep_owners() {
         engine.interp.gc_collect();
     }
 }
+
+#[test]
+fn dense_elements_far_deletion_and_truncation_restore_packed_coverage() {
+    for length in [0, 3, 40, 4096] {
+        for truncate in [false, true] {
+            let mut props = Props::packed_array_from_values(
+                (0..length).map(|n| Value::Num(n as f64)).collect(),
+            );
+            props.insert("1000000", Property::plain(Value::Num(1.0)));
+            props.insert("2000000", Property::plain(Value::Num(2.0)));
+            assert!(props.has_far.get());
+            assert!(!props.prepare_packed_numeric_mirror());
+            assert!(props.remove("2000000"));
+            assert!(props.has_far.get(), "another far key survives");
+            if truncate {
+                props.remove_indices_from(length);
+            } else {
+                assert!(props.remove("1000000"));
+            }
+            assert!(!props.has_far.get(), "{length}, truncate={truncate}");
+            assert_eq!(props.entries.len(), 1);
+            assert!(props.get("1000000").is_none());
+            if length != 0 {
+                assert!(props.prepare_packed_numeric_mirror());
+                assert_eq!(
+                    props.mirror_get(length as u32 - 1),
+                    Some((length - 1) as f64)
+                );
+            }
+            assert!(props
+                .try_append_element(length as u32, Property::plain(Value::Num(7.0)))
+                .is_ok());
+            assert_eq!(
+                props.pop_last_element(length as u32).unwrap().as_num_opt(),
+                Some(7.0)
+            );
+        }
+    }
+}
+
+#[test]
+fn dense_elements_recovery_keeps_named_indices_outside_packed_storage_guarded() {
+    let mut props = Props::packed_array_from_values(vec![Value::Num(0.0)]);
+    props.insert("1000000", Property::plain(Value::Num(1.0)));
+    // While packed growth is blocked, even a nearby canonical key is a named entry.
+    props.insert("1", Property::data(Value::Num(11.0), false, true, false));
+    assert!(props.elems.get(1).is_some());
+    assert!(props.remove("1000000"));
+    assert!(props.has_far.get(), "a dense-map slot is not a packed slot");
+    assert!(props
+        .try_append_element(1, Property::plain(Value::Num(2.0)))
+        .is_err());
+    props.remove_indices_from(2);
+    assert!(props.has_far.get());
+    assert_eq!(props.get("1").unwrap().number_value(), Some(11.0));
+    assert!(!props.get("1").unwrap().configurable());
+    // The caller's ArraySetLength validation owns configurability checks. Here only
+    // the storage proof is tested, after a validated boundary removes that index.
+    props.remove_indices_from(1);
+    assert!(!props.has_far.get());
+    assert!(props
+        .try_append_element(1, Property::plain(Value::Num(2.0)))
+        .is_ok());
+    assert_eq!(props.get_index(1).unwrap().number_value(), Some(2.0));
+    assert_eq!(props.keys().iter().filter(|key| &***key == "1").count(), 1);
+}
+
+#[test]
+fn dense_elements_classic_recovery_bounds_delete_work_and_rebuilds_on_truncation() {
+    for length in [12, 300] {
+        let mut props = Props::packed_array_from_values(Vec::new());
+        props.insert("1000000", Property::plain(Value::Num(1.0)));
+        for n in 0..length {
+            props.insert(index_key(n), Property::plain(Value::Num(n as f64)));
+        }
+        assert!(!props.elems.packed_is_some());
+        assert!(props.remove("1000000"));
+        assert_eq!(props.has_far.get(), length > 256);
+        props.remove_indices_from(length / 2);
+        assert!(!props.has_far.get());
+        for n in 0..length / 2 {
+            assert_eq!(
+                props.get_index(n as u32).unwrap().number_value(),
+                Some(n as f64)
+            );
+        }
+        assert!(props
+            .try_append_element((length / 2) as u32, Property::plain(Value::Num(9.0)))
+            .is_ok());
+        props.insert("1000000", Property::plain(Value::Num(1.0)));
+        props.clear();
+        assert!(!props.has_far.get());
+    }
+}
+
+#[test]
+fn dense_elements_recovered_numeric_mirror_rechecks_descriptors_and_holes() {
+    for blocked in ["hole", "accessor", "non-writable", "non-number"] {
+        let mut props = Props::packed_array_from_values(vec![Value::Num(-0.0), Value::Num(2.0)]);
+        props.insert("1000000", Property::plain(Value::Num(1.0)));
+        match blocked {
+            "hole" => assert!(props.remove("1")),
+            "accessor" => props.insert("1", Property::accessor_prop(None, None, true, true)),
+            "non-writable" => props.get_mut("1").unwrap().set_writable(false),
+            "non-number" => props.get_mut("1").unwrap().set_value(Value::lstr("s")),
+            _ => unreachable!(),
+        }
+        assert!(!props.prepare_packed_numeric_mirror());
+        assert!(props.remove("1000000"));
+        assert!(!props.has_far.get());
+        assert!(!props.prepare_packed_numeric_mirror(), "{blocked}");
+        props.insert("1", Property::plain(Value::Num(2.0)));
+        assert!(props.prepare_packed_numeric_mirror(), "{blocked}");
+        assert_eq!(props.mirror_get(0).unwrap().to_bits(), (-0.0f64).to_bits());
+    }
+}
+
+#[test]
+fn dense_elements_sparse_recovery_preserves_observers_and_partial_length_failure() {
+    let source = r#"
+    (function () {
+        function assert(ok, message) { if (!ok) throw new Error(message); }
+        function sum(a) { var total=0; for(var k=0;k<a.length;k++)total+=a[k]; return total; }
+        function recover(a) { a[1000000]=7; a.length=3; return a; }
+        var a=[1,2,3];
+        for(var k=0;k<4;k++)assert(sum(a)===6,'numeric warm');
+        recover(a);
+        for(var k=0;k<40;k++){a.push(k);assert(a.pop()===k,'tail');assert(sum(a)===6,'numeric');}
+        a[2000000]=8; a[1000000]=7; delete a[2000000];
+        assert(a[1000000]===7,'remaining far key'); a.length=3;
+        var log=[];
+        Object.defineProperty(a,'2',{get:function(){log.push('get');return 30;},configurable:true});
+        assert(a.pop()===30 && log.join()==='get','own accessor');
+        a.push(3); delete a[1];
+        var proto=Object.create(Array.prototype);
+        Object.defineProperty(proto,'1',{get:function(){return 20;},configurable:true});
+        Object.defineProperty(proto,'3',{set:function(v){log.push('set'+v);},
+            get:function(){log.push('proto');return 99;},configurable:true});
+        Object.setPrototypeOf(a,proto);
+        assert(sum(a)===24 && !Object.hasOwn(a,1),'hole');
+        assert(a.push(4)===4 && !Object.hasOwn(a,3),'inherited setter');
+        assert(a.pop()===99 && log.join()==='get,set4,proto','inherited getter');
+        var b=recover([1,2,3]);Object.defineProperty(b,'length',{writable:false});
+        var error='';try{b.push(4);}catch(e){error=e.name;}
+        assert(error==='TypeError' && b.length===3,'length writable');
+        b=recover([1,2,3]);Object.preventExtensions(b);
+        assert(!Reflect.set(b,3,4) && b.length===3,'extensible');
+        var c=[1,2,3];
+        Object.defineProperty(c,'4096',{value:41,writable:true,enumerable:true,configurable:false});
+        c[1000000]=7;
+        assert(!Reflect.defineProperty(c,'length',{value:3}) && c.length===4097,'shrink barrier');
+        assert(!Object.hasOwn(c,1000000) && c[4096]===41,'partial shrink');
+        assert(c.push(42)===4098 && c.pop()===42,'surviving far key');
+        error='';try{c.pop();}catch(e){error=e.name;}
+        assert(error==='TypeError' && c.length===4097 && c[4096]===41,'barrier descriptor');
+        // A nearby named index must never be overwritten by restored packed growth.
+        var d=[0]; d[1000000]=7;
+        Object.defineProperty(d,'1',{value:11,writable:false,enumerable:true,configurable:true});
+        d.length=2;
+        assert(d[1]===11 && !Reflect.set(d,1,2),'named index descriptor');
+        d.length=1;assert(d.push(2)===2 && d[1]===2,'named index removal');
+        var n=recover([-0,NaN,Infinity]);
+        assert(Object.is(n[0],-0) && Number.isNaN(n[1]) && n[2]===Infinity,'number bits');
+        assert(Reflect.ownKeys(n).join()==='0,1,2,length','own key order');
+        return 'ok';
+    })()
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(eval(&mut engine, source), "ok", "{tier:?}");
+        engine.interp.gc_collect();
+    }
+}
+
+#[test]
+fn dense_elements_sparse_recovery_preserves_cyclic_owners_across_gc() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            var alive=[], gone;
+            for(var k=0;k<40;k++)alive.push({n:k,owner:alive});
+            (function(){var far={owner:alive};far.self=far;
+                gone=new WeakRef(far);alive[1000000]=far;})();
+            alive.length=40;
+            alive.push(alive[0]);var tail=alive.pop();
+            if(tail!==alive[0])throw 'owner move';tail=null;
+            'ready'
+        "#,
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            eval(
+                &mut engine,
+                r#"
+            if(gone.deref()!==undefined)throw 'far owner retained';
+            if(alive[39].n!==39 || alive[39].owner!==alive)throw 'packed owner lost';
+            alive.unshift(alive[39]);alive.pop();
+            if(alive[0].n!==39 || alive[0].owner!==alive)throw 'recovered edit owner';
+            'ok'
+        "#
+            ),
+            "ok",
+            "{tier:?}"
+        );
+        eval(&mut engine, "alive=null");
+        engine.interp.gc_collect();
+    }
+}

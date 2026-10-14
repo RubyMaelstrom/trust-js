@@ -3938,8 +3938,8 @@ pub struct Props {
     mirror_holes: u32,
     /// Some canonical-index key lives ONLY in the string-keyed map (inserted too far past the
     /// dense frontier — see `note_inserted`): `elems` coverage is no longer proof of element
-    /// absence, so the dense append/pop fast paths stand down. One-way (sparse arrays are rare
-    /// and stay sparse).
+    /// absence, so the dense append/pop fast paths stand down. Truncation rebuilds this proof;
+    /// deleting a far key can restore it after a bounded scan of the remaining named entries.
     has_far: std::cell::Cell<bool>,
     /// This `Props` belongs to an `Exotic::Array` object: canonical-index key inserts skip the
     /// shape transition. Array shapes encode the *named*-key sequence only (matching
@@ -5226,6 +5226,12 @@ impl Props {
             return;
         }
         if let Some(n) = canonical_index(key) {
+            // Packed elements and named index entries can coexist after a sparse write.
+            // Even a named index recorded in `elems` must block packed growth: appending
+            // into its index would otherwise create a second owning descriptor for it.
+            if self.elems.packed_is_some() {
+                self.has_far.set(true);
+            }
             let n = n as usize;
             if n < self.elems.len() {
                 let filled_hole = self.elems[n] == NO_SLOT;
@@ -5929,6 +5935,7 @@ impl Props {
         self.mirror_holes = 0;
         self.len_slot.set(NO_SLOT);
         self.proto_slot.set(NO_SLOT);
+        self.has_far.set(false);
         self.shape = shape_fresh();
     }
     /// Append the next dense element while *building a fresh array in order* (element index ==
@@ -6138,6 +6145,9 @@ impl Props {
             MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES
         };
         self.mirror_holes = 0;
+        // We already rebuild every named index below. Forget the old conservative proof
+        // and let the surviving keys reassert it, including those outside packed storage.
+        self.has_far.set(false);
         for slot in 0..self.entries.len() {
             self.note_inserted(slot);
         }
@@ -6157,6 +6167,10 @@ impl Props {
         let Some(i) = self.find(key) else {
             return false;
         };
+        let removed_far = self.has_far.get()
+            && canonical_index(key).is_some_and(|n| {
+                self.elems.packed_is_some() || self.elems.get(n as usize).copied() != Some(i as u32)
+            });
         self.note_structural();
         self.entries.remove(i);
         // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
@@ -6215,7 +6229,31 @@ impl Props {
             }
         }
         self.elems.release_symbol_key(key);
+        if removed_far {
+            self.recover_dense_coverage();
+        }
         true
+    }
+
+    /// A single sparse write must not permanently disable a surviving dense array after
+    /// its key is removed. Cap this extra work: large sparse maps keep their conservative
+    /// proof until a truncation rebuilds them, rather than rescanning on every deletion.
+    fn recover_dense_coverage(&mut self) {
+        const MAX_RECOVERY_ENTRIES: usize = 256;
+        if self.entries.len() > MAX_RECOVERY_ENTRIES {
+            return;
+        }
+        let packed = self.elems.packed_is_some();
+        let remains = self.entries.keys().iter().enumerate().any(|(slot, key)| {
+            canonical_index(key)
+                .is_some_and(|n| packed || self.elems.get(n as usize).copied() != Some(slot as u32))
+        });
+        self.has_far.set(remains);
+        if !remains && self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
+            // The existing bounded mirror validator must retry after the far-key guard
+            // changes; it still checks every live descriptor, number and owner boundary.
+            self.mirror_invalidate();
+        }
     }
     /// Ordinary property keys in insertion order. Engine state and private elements live in a
     /// separate slot map and never participate in ordinary key, descriptor or lookup operations.
