@@ -10796,7 +10796,9 @@ pub(crate) fn nf_string_replace(
     // `ascii_hint` is representation-local and avoids an LRU lookup on every hot literal call;
     // a cleared hint conservatively falls through to the exact UTF-16 path.
     let source_ascii = s.ascii_hint();
-    let pattern_ascii = pat.ascii_hint();
+    // Views may clear the hint for ASCII bytes. Only an actual non-ASCII pattern proves that
+    // the ASCII receiver cannot contain it.
+    let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.is_ascii());
     if source_ascii && pattern_ascii {
         let Some(pos) = s.as_str().find(pat.as_ref()) else {
             return Ok(Value::Str(s));
@@ -10821,10 +10823,14 @@ pub(crate) fn nf_string_replace(
     // of an astral code point, which has no UTF-8 byte boundary.
     let source_units = i.units_full(&s);
     let pattern_units = i.units_full(&pat);
-    let Some(pos) = source_units
-        .windows(pattern_units.len())
-        .position(|window| window == pattern_units.as_ref())
-    else {
+    let position = if pattern_units.is_empty() {
+        Some(0)
+    } else {
+        source_units
+            .windows(pattern_units.len())
+            .position(|window| window == pattern_units.as_ref())
+    };
+    let Some(pos) = position else {
         return Ok(Value::Str(s));
     };
     let end = pos + pattern_units.len();
@@ -10950,10 +10956,23 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
             // Splitting on "" yields one piece per UTF-16 code unit (a surrogate pair
             // becomes its two lone halves).
             let mut parts: Vec<Value> = if sep.is_empty() {
-                crate::jstr::units(&s)
-                    .into_iter()
-                    .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
-                    .collect()
+                // Split's empty separator only returns the first `limit` code units. Decode
+                // that prefix lazily, including lone halves of an ordinary astral scalar.
+                if s.ascii_hint() || s.view_owner().is_some_and(|owner| owner.ascii_hint()) {
+                    // Bytes are already code units. The exact iterator length reserves the
+                    // complete result once, including when `limit` requests the whole string.
+                    // An ASCII owner proves the same for a view without scanning its bytes.
+                    s.as_bytes()
+                        .iter()
+                        .take(limit)
+                        .map(|&byte| Value::Str(crate::jstr::unit_lstr(byte as u16)))
+                        .collect()
+                } else {
+                    crate::jstr::unit_iter(&s)
+                        .take(limit)
+                        .map(|u| Value::Str(crate::jstr::unit_lstr(u)))
+                        .collect()
+                }
             } else if s.ascii_hint() && sep.is_ascii() {
                 // For ASCII operands, byte and UTF-16-unit boundaries coincide. Keep each
                 // substring as an LStr directly instead of allocating a Rust String before the
@@ -11776,7 +11795,7 @@ fn install_string(it: &mut Interp) {
             return Ok(Value::lstr(crate::jstr::canonicalize(&out).unwrap_or(out)));
         }
         let source_ascii = s.ascii_hint();
-        let pattern_ascii = pat.ascii_hint();
+        let pattern_ascii = pat.ascii_hint() || (source_ascii && pat.is_ascii());
         if source_ascii && pattern_ascii {
             let Some(first) = s.as_str().find(pat.as_ref()) else {
                 return Ok(Value::Str(s));
@@ -12167,14 +12186,16 @@ fn string_replacement(
     i: &mut Interp,
     repl: &Repl,
     matched: &str,
-    whole: &str,
+    whole: &crate::lstr::LStr,
     pos: usize,
 ) -> Result<String, Value> {
     let before = &whole[..pos.min(whole.len())];
     let after = whole.get(pos + matched.len()..).unwrap_or("");
-    // Text replacements never consume the callback offset; avoid rescanning a long ASCII prefix
-    // for every match. Callable replacements still receive the required UTF-16 position.
-    let unit_pos = if matches!(repl, Repl::Fn(_)) {
+    // An ASCII hint proves the byte offset already is the UTF-16 callback offset. Avoid a
+    // prefix scan per match; text replacements do not consume the offset at all.
+    let unit_pos = if whole.ascii_hint() {
+        pos
+    } else if matches!(repl, Repl::Fn(_)) {
         crate::jstr::unit_len(before)
     } else {
         0
@@ -12191,7 +12212,7 @@ fn string_replacement_parts(
     i: &mut Interp,
     repl: &Repl,
     matched: &str,
-    whole: &str,
+    whole: &crate::lstr::LStr,
     unit_pos: usize,
     before: &str,
     after: &str,
@@ -12202,9 +12223,9 @@ fn string_replacement_parts(
             f.clone(),
             Value::Undefined,
             &[
-                Value::lstr(matched.to_string()),
+                Value::lstr(matched),
                 Value::Num(unit_pos as f64),
-                Value::lstr(whole.to_string()),
+                Value::Str(whole.clone()),
             ],
         ))?;
         return Ok(ab(i.to_string(&r))?.to_string());

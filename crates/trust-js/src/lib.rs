@@ -156,6 +156,8 @@ mod stack_trace;
 #[cfg(test)]
 mod string_concat_tests;
 #[cfg(test)]
+mod string_replace_split_tests;
+#[cfg(test)]
 mod string_slice_tests;
 mod tagged;
 mod temporal;
