@@ -1019,26 +1019,37 @@ impl Interp {
         for name in &names {
             match self.resolve_export(key, name, &mut Vec::new()) {
                 Resolution::Local(env, local) => {
-                    live.insert(name.clone(), NsBinding::Live(env, local));
+                    live.insert(
+                        crate::value::encode_owned_string_key(name.clone()),
+                        NsBinding::Live(env, local),
+                    );
                     // A placeholder own property makes the name enumerable / own-key-visible; reads
                     // go through the live map (see `get_member`).
                     ns.borrow_mut().props.insert(
-                        name.as_str(),
+                        crate::value::encode_string_key(name).as_ref(),
                         Property::data(Value::Undefined, true, true, false),
                     );
                 }
                 Resolution::Ns(v) => {
-                    live.insert(name.clone(), NsBinding::Static(v.clone()));
-                    ns.borrow_mut()
-                        .props
-                        .insert(name.as_str(), Property::data(v, true, true, false));
+                    live.insert(
+                        crate::value::encode_owned_string_key(name.clone()),
+                        NsBinding::Static(v.clone()),
+                    );
+                    ns.borrow_mut().props.insert(
+                        crate::value::encode_string_key(name).as_ref(),
+                        Property::data(v, true, true, false),
+                    );
                 }
                 Resolution::DeferNs(dep) => {
                     let v = self.make_deferred_ns(&dep);
-                    live.insert(name.clone(), NsBinding::Static(v.clone()));
-                    ns.borrow_mut()
-                        .props
-                        .insert(name.as_str(), Property::data(v, true, true, false));
+                    live.insert(
+                        crate::value::encode_owned_string_key(name.clone()),
+                        NsBinding::Static(v.clone()),
+                    );
+                    ns.borrow_mut().props.insert(
+                        crate::value::encode_string_key(name).as_ref(),
+                        Property::data(v, true, true, false),
+                    );
                 }
                 // Ambiguous / unresolvable star names are omitted from the namespace.
                 _ => {}
@@ -1768,7 +1779,7 @@ impl Interp {
             },
         };
         let referrer = match meta {
-            Some(m) => match self.get_member(&m, "url") {
+            Some(m) => match self.get_member_key(&m, "url") {
                 Ok(Value::Str(s)) => s.to_string(),
                 _ => self.import_base.clone(),
             },

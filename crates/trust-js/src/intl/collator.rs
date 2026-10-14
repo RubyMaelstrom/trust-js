@@ -6,7 +6,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 use std::rc::Rc;
 
 const COLLATIONS: [&str; 12] = [
@@ -30,14 +30,19 @@ pub fn install(it: &mut Interp, ns: &Gc) {
 fn install_compare_getter(it: &mut Interp, proto: &Gc) {
     let g = it.make_native("get compare", 0, |i, this, _| {
         let o = brand_slot(i, &this, "#\u{0}co")?;
-        if let Some(f) = o.borrow().props.get("#\u{0}co_bound").map(|p| p.value()) {
+        if let Some(f) = o
+            .borrow()
+            .internal_slots()
+            .get("#\u{0}co_bound")
+            .map(|p| p.value())
+        {
             return Ok(f);
         }
         let f = i.make_native("", 2, |i, that, a| {
             compare(i, &that, &arg(a, 0), &arg(a, 1))
         });
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), this.clone());
-        set_builtin(&o, "#\u{0}co_bound", bound.clone());
+        set_internal_slot(&o, "#\u{0}co_bound", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -82,22 +87,22 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.Collator")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}co", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}co_locale", Value::lstr(slots.locale));
-    set_builtin(&obj, "#\u{0}co_usage", Value::lstr(slots.usage));
-    set_builtin(&obj, "#\u{0}co_sensitivity", Value::lstr(slots.sensitivity));
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}co", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}co_locale", Value::lstr(slots.locale));
+    set_internal_slot(&obj, "#\u{0}co_usage", Value::lstr(slots.usage));
+    set_internal_slot(&obj, "#\u{0}co_sensitivity", Value::lstr(slots.sensitivity));
+    set_internal_slot(
         &obj,
         "#\u{0}co_ignorepunct",
         Value::Bool(slots.ignore_punct),
     );
-    set_builtin(&obj, "#\u{0}co_numeric", Value::Bool(slots.numeric));
-    set_builtin(&obj, "#\u{0}co_collation", Value::lstr(slots.collation));
-    set_builtin(&obj, "#\u{0}co_casefirst", Value::lstr(slots.case_first));
+    set_internal_slot(&obj, "#\u{0}co_numeric", Value::Bool(slots.numeric));
+    set_internal_slot(&obj, "#\u{0}co_collation", Value::lstr(slots.collation));
+    set_internal_slot(&obj, "#\u{0}co_casefirst", Value::lstr(slots.case_first));
     // Never reused, so `compare` can recognize the Collator whose parameters it last built.
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    set_builtin(&obj, "#\u{0}co_id", Value::Num(id as f64));
+    set_internal_slot(&obj, "#\u{0}co_id", Value::Num(id as f64));
     Ok(Value::Obj(obj))
 }
 
@@ -110,7 +115,7 @@ fn initialize(i: &mut Interp, locales: &Value, options: &Value) -> Result<Collat
     read_locale_matcher(i, &options)?;
     let collation_opt = get_option(i, &options, "collation", &[], None)?;
     let numeric = {
-        let v = ab(i.get_member(&options, "numeric"))?;
+        let v = ab(i.get_member_key(&options, "numeric"))?;
         if matches!(v, Value::Undefined) {
             None
         } else {
@@ -127,7 +132,7 @@ fn initialize(i: &mut Interp, locales: &Value, options: &Value) -> Result<Collat
     )?
     .unwrap();
     let ignore_punct_opt = {
-        let v = ab(i.get_member(&options, "ignorePunctuation"))?;
+        let v = ab(i.get_member_key(&options, "ignorePunctuation"))?;
         if matches!(v, Value::Undefined) {
             None
         } else {
@@ -247,7 +252,10 @@ thread_local! {
 /// The comparison parameters stored in Collator `o`'s internal slots.
 fn stored_collate_opts(o: &Gc) -> Rc<CollateOpts> {
     let body = o.borrow();
-    let id = body.props.get("#\u{0}co_id").and_then(|p| p.number_value());
+    let id = body
+        .internal_slots()
+        .get("#\u{0}co_id")
+        .and_then(|p| p.number_value());
     if let Some(opts) = LAST_COMPARE.with_borrow(|last| {
         last.as_ref()
             .filter(|(last, _)| Some(*last) == id)
@@ -255,13 +263,13 @@ fn stored_collate_opts(o: &Gc) -> Rc<CollateOpts> {
     }) {
         return opts;
     }
-    let get = |k: &str| match body.props.get(k).map(|p| p.value()) {
+    let get = |k: &str| match body.internal_slots().get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     };
     let getb = |k: &str| {
         matches!(
-            body.props.get(k).map(|p| p.value()),
+            body.internal_slots().get(k).map(|p| p.value()),
             Some(Value::Bool(true))
         )
     };
@@ -730,7 +738,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = brand_slot(i, &this, "#\u{0}co")?;
     let get = |k: &str| {
         o.borrow()
-            .props
+            .internal_slots()
             .get(k)
             .map(|p| p.value())
             .unwrap_or(Value::Undefined)

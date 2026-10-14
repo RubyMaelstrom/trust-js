@@ -78,11 +78,10 @@ impl SelfHostedSource {
         let array_methods = statements
             .into_iter()
             .rev()
-            .find_map(|statement| match statement {
-                Stmt::Expr(mut expr @ Expr::Paren(_)) => match &mut expr {
-                    Expr::Paren(inner) => Some(std::mem::replace(&mut **inner, Expr::Null)),
-                    _ => None,
-                },
+            .find_map(|mut statement| match statement {
+                Stmt::Expr(Expr::Paren(ref mut inner)) => {
+                    Some(std::mem::replace(&mut **inner, Expr::Null))
+                }
                 Stmt::Expr(expr @ Expr::Object(_)) => Some(expr),
                 _ => None,
             })
@@ -202,7 +201,7 @@ pub(crate) fn length_of_array_like(i: &mut Interp, object: &Value) -> Result<f64
             }
         }
     }
-    let length = i.get_member(object, "length")?;
+    let length = i.get_member_key(object, "length")?;
     let length = i.to_number(&length)?;
     // ToLength: ToIntegerOrInfinity, then clamp to [+0, 2^53 − 1] (NaN and -0 become +0).
     Ok(if length.is_nan() || length <= 0.0 {

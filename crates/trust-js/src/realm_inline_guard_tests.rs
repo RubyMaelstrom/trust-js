@@ -55,7 +55,7 @@ pub(crate) fn eval_string(it: &mut Interp, source: &str) -> String {
 pub(crate) fn set_global(it: &mut Interp, name: &str, value: Value) {
     let global = Value::Obj(it.global.clone());
     assert!(
-        it.set_member(&global, name, value).is_ok(),
+        it.set_member_key(&global, name, value).is_ok(),
         "set global {name}"
     );
 }

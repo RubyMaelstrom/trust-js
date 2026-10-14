@@ -12,7 +12,7 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Object, Property, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Object, Property, Value};
 use std::rc::Rc;
 
 pub fn install(it: &mut Interp, ns: &Gc) {
@@ -69,9 +69,9 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.Segmenter")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}sg", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}sg_locale", Value::lstr(resolved.locale));
-    set_builtin(&obj, "#\u{0}sg_granularity", Value::lstr(granularity));
+    set_internal_slot(&obj, "#\u{0}sg", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}sg_locale", Value::lstr(resolved.locale));
+    set_internal_slot(&obj, "#\u{0}sg_granularity", Value::lstr(granularity));
     Ok(Value::Obj(obj))
 }
 
@@ -572,8 +572,8 @@ fn segment(i: &mut Interp, this: &Value, input: &Value) -> Result<Value, Value> 
     let string = ab(i.to_string(input))?;
     // CreateSegmentsObject: [[SegmentsSegmenter]] and [[SegmentsString]].
     let segments = Object::new(i.extra_protos.get("%IntlSegmentsPrototype%").cloned());
-    set_builtin(&segments, SEGMENTER_SLOT, Value::Obj(segmenter));
-    set_builtin(&segments, STRING_SLOT, Value::Str(string));
+    set_internal_slot(&segments, SEGMENTER_SLOT, Value::Obj(segmenter));
+    set_internal_slot(&segments, STRING_SLOT, Value::Str(string));
     Ok(Value::Obj(segments))
 }
 
@@ -606,8 +606,8 @@ fn segments_slots(i: &mut Interp, this: &Value) -> Result<SegmentsSlots, Value> 
 fn slots_of(this: &Value, segmenter_slot: &str, string_slot: &str) -> Option<SegmentsSlots> {
     this.as_obj().and_then(|holder| {
         let object = holder.borrow();
-        let segmenter = object.props.get(segmenter_slot)?.value();
-        let string = object.props.get(string_slot)?.value();
+        let segmenter = object.internal_slots().get(segmenter_slot)?.value();
+        let string = object.internal_slots().get(string_slot)?.value();
         match (segmenter, string) {
             (Value::Obj(segmenter), Value::Str(string)) => Some(SegmentsSlots {
                 holder: holder.clone(),
@@ -622,7 +622,7 @@ fn slots_of(this: &Value, segmenter_slot: &str, string_slot: &str) -> Option<Seg
 fn granularity_of(segmenter: &Gc) -> String {
     match segmenter
         .borrow()
-        .props
+        .internal_slots()
         .get("#\u{0}sg_granularity")
         .map(|p| p.value())
     {
@@ -636,7 +636,7 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
     let cached = slots
         .holder
         .borrow()
-        .props
+        .internal_slots()
         .get(BOUNDARIES_SLOT)
         .map(|p| p.value());
     if let Some(Value::Obj(buffer)) = cached {
@@ -675,7 +675,7 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
     push(unit, byte, false);
     let storage = Rc::new(std::cell::RefCell::new(bytes));
     let (buffer, _) = crate::builtins::array_buffer_with_storage(i, storage.clone());
-    set_builtin(&slots.holder, BOUNDARIES_SLOT, buffer);
+    set_internal_slot(&slots.holder, BOUNDARIES_SLOT, buffer);
     storage
 }
 
@@ -752,26 +752,26 @@ fn segments_iterator(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
     );
     // [[IteratingSegmenter]], [[IteratedString]] and [[IteratedStringNextSegmentCodeUnitIndex]];
     // the iterator shares its Segments object's boundary cache.
-    set_builtin(
+    set_internal_slot(
         &iterator,
         ITERATING_SEGMENTER_SLOT,
         Value::Obj(slots.segmenter.clone()),
     );
-    set_builtin(
+    set_internal_slot(
         &iterator,
         ITERATED_STRING_SLOT,
         Value::Str(slots.string.clone()),
     );
-    set_builtin(&iterator, NEXT_INDEX_SLOT, Value::Num(0.0));
+    set_internal_slot(&iterator, NEXT_INDEX_SLOT, Value::Num(0.0));
     boundary_records(i, &slots);
     let buffer = slots
         .holder
         .borrow()
-        .props
+        .internal_slots()
         .get(BOUNDARIES_SLOT)
         .map(|p| p.value());
     if let Some(buffer) = buffer {
-        set_builtin(&iterator, BOUNDARIES_SLOT, buffer);
+        set_internal_slot(&iterator, BOUNDARIES_SLOT, buffer);
     }
     Ok(Value::Obj(iterator))
 }
@@ -783,7 +783,7 @@ fn segment_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Va
     let start = match slots
         .holder
         .borrow()
-        .props
+        .internal_slots()
         .get(NEXT_INDEX_SLOT)
         .map(|p| p.value())
     {
@@ -798,7 +798,7 @@ fn segment_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Va
     }
     let index = segment_at(&bytes, start);
     let (end, _, _) = record_at(&bytes, index + 1);
-    set_builtin(&slots.holder, NEXT_INDEX_SLOT, Value::Num(end as f64));
+    set_internal_slot(&slots.holder, NEXT_INDEX_SLOT, Value::Num(end as f64));
     let data = segment_data(i, &slots, &bytes, index);
     drop(bytes);
     Ok(i.iter_result_obj(data, false))
@@ -808,7 +808,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = brand_slot(i, &this, "#\u{0}sg")?;
     let get = |k: &str| {
         o.borrow()
-            .props
+            .internal_slots()
             .get(k)
             .map(|p| p.value())
             .unwrap_or(Value::Undefined)

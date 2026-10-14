@@ -25,11 +25,11 @@ pub(super) fn install_errors(it: &mut Interp) {
                 "Error.prototype.toString called on a non-object",
             ));
         }
-        let name = match ab(i.get_member(&this, "name"))? {
+        let name = match ab(i.get_member_key(&this, "name"))? {
             Value::Undefined => crate::lstr::LStr::from("Error"),
             v => ab(i.to_string(&v))?,
         };
-        let msg = match ab(i.get_member(&this, "message"))? {
+        let msg = match ab(i.get_member_key(&this, "message"))? {
             Value::Undefined => crate::lstr::LStr::from(""),
             v => ab(i.to_string(&v))?,
         };
@@ -96,7 +96,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             // Set(this, "stack", v) with Throw=true.
             if let Some((t, h)) = proxy_pair(i, &this) {
                 // Surface the proxy [[Set]] result: a falsy trap return throws under Throw=true.
-                let trap = ab(i.get_member(&h, "set"))?;
+                let trap = ab(i.get_member_key(&h, "set"))?;
                 if trap.is_callable() {
                     let res = ab(i.call(
                         trap,
@@ -109,7 +109,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                         );
                     }
                 } else {
-                    ab(i.set_member(&t, "stack", v))?;
+                    ab(i.set_member_key(&t, "stack", v))?;
                 }
             } else {
                 assign_set(i, &this, "stack", v)?;
@@ -211,7 +211,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
-            let proto = match i.get_member(&nt, "prototype") {
+            let proto = match i.get_member_key(&nt, "prototype") {
                 Ok(Value::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "AggregateError")?
                     .or_else(|| i.error_protos.get("AggregateError").cloned()),
@@ -264,7 +264,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         // OrdinaryCreateFromConstructor: prototype from new.target (cross-realm aware).
         if matches!(i.new_target, Value::Obj(_)) {
             let nt = i.new_target.clone();
-            let proto = match i.get_member(&nt, "prototype") {
+            let proto = match i.get_member_key(&nt, "prototype") {
                 Ok(Value::Obj(p)) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "SuppressedError")?
                     .or_else(|| i.error_protos.get("SuppressedError").cloned()),
@@ -323,11 +323,11 @@ fn constructor_skip(i: &Interp) -> Skip {
 /// "Error") followed by the formatted frame `lines`.
 fn stack_string(i: &mut Interp, error: &Value, lines: &str) -> Result<Value, Value> {
     let perf_started = crate::jit::perf_stage_start();
-    let name = match ab(i.get_member(error, "name"))? {
+    let name = match ab(i.get_member_key(error, "name"))? {
         Value::Undefined => "Error".to_string(),
         v => ab(i.to_string(&v))?.to_string(),
     };
-    let msg = match ab(i.get_member(error, "message"))? {
+    let msg = match ab(i.get_member_key(error, "message"))? {
         Value::Undefined => String::new(),
         v => ab(i.to_string(&v))?.to_string(),
     };
@@ -419,7 +419,7 @@ fn make_err(i: &mut Interp, kind: &str, args: &[Value]) -> Result<Value, Value> 
     // OrdinaryCreateFromConstructor: a subclass / Reflect.construct new.target sets the prototype.
     if matches!(i.new_target, Value::Obj(_)) {
         let nt = i.new_target.clone();
-        let proto = match i.get_member(&nt, "prototype") {
+        let proto = match i.get_member_key(&nt, "prototype") {
             Ok(Value::Obj(p)) => Some(p),
             _ => ctor_realm_proto(i, &nt, kind)?.or_else(|| i.error_protos.get(kind).cloned()),
         };
@@ -455,7 +455,7 @@ pub(super) fn install_error_cause(
 ) -> Result<(), Value> {
     if let Some(opts @ Value::Obj(_)) = options {
         if ab(i.js_has_property(opts, "cause"))? {
-            let cause = ab(i.get_member(opts, "cause"))?;
+            let cause = ab(i.get_member_key(opts, "cause"))?;
             if let Some(e) = err.as_obj() {
                 e.borrow_mut()
                     .props

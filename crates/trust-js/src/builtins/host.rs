@@ -38,7 +38,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
             Value::Str(s) => s,
             other => return Ok(other),
         };
-        let rg = ab(i.get_member(&this, "#\u{0}realm_global"))?;
+        let rg = ab(i.get_internal_slot(&this, "#\u{0}realm_global"))?;
         if let Value::Obj(_) = &rg {
             return match i.eval_script_in_realm(&rg, &code) {
                 Ok(value) => Ok(value),
@@ -141,12 +141,13 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
     Value::Obj(ctor)
 }
 
-/// Reconstruct a SharedArrayBuffer object in this agent that aliases the global shared block `id`.
-fn agent_make_shared(i: &mut Interp, id: u64, len: usize) -> Value {
+/// Reconstruct a SharedArrayBuffer object in this agent from an owning broadcast block.
+fn agent_make_shared(i: &mut Interp, block: crate::interpreter::SharedMem, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
     let p = Rc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, BufferData::Shared(id));
+    let id = block.id();
+    i.array_buffers.insert(p, BufferData::Shared(block));
     set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(len as f64));
     set_internal(&obj, "#\u{0}abResizable", Value::Bool(false));
     set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
@@ -193,13 +194,13 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
             }
             None => return Err(i.make_error("TypeError", "broadcast requires a SharedArrayBuffer")),
         };
-        let id = i
-            .shared_block_id(p)
+        let block = i
+            .shared_block(p)
             .ok_or_else(|| i.make_error("TypeError", "broadcast requires a SharedArrayBuffer"))?;
         let len = i.array_buffer_byte_length(p).unwrap_or(0);
         if let Some(ag) = &i.agent {
             for tx in &ag.agent_broadcast_txs {
-                let _ = tx.send((id, len));
+                let _ = tx.send((block.clone(), len));
             }
         }
         Ok(Value::Undefined)
@@ -244,8 +245,8 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
                 None => None,
             }
         };
-        if let Some((id, len)) = received {
-            let sab = agent_make_shared(i, id, len);
+        if let Some((block, len)) = received {
+            let sab = agent_make_shared(i, block, len);
             ab(i.call(cb, Value::Undefined, &[sab]))?;
         }
         Ok(Value::Undefined)

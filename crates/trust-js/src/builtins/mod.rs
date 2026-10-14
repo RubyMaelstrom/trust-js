@@ -18,6 +18,7 @@ mod atomics;
 mod collections;
 pub(crate) use collections::{is_operand_only_native, map_get, map_set, weak_map_get};
 mod dataview;
+pub(crate) use dataview::dataview_intrinsic;
 mod date;
 pub(crate) use date::system_time_zone;
 #[cfg(test)]
@@ -148,7 +149,7 @@ pub(crate) fn nf_function_apply(
                 });
                 match own.flatten() {
                     Some(value) => v.push(value),
-                    None => v.push(ab(i.get_member(&Value::Obj(o.clone()), &k.to_string()))?),
+                    None => v.push(ab(i.get_member_key(&Value::Obj(o.clone()), &k.to_string()))?),
                 }
             }
             v
@@ -193,7 +194,10 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
     if !ok {
         return Err(i.make_error(
             "TypeError",
-            format!("Cannot assign to read only property '{key}'"),
+            format!(
+                "Cannot assign to read only property '{}'",
+                crate::value::decode_string_key(key)
+            ),
         ));
     }
     Ok(())
@@ -215,10 +219,10 @@ pub(crate) fn static_name(name: &str) -> &'static str {
     interned
 }
 
-/// Define an internal-slot-style data property: writable, non-enumerable, non-configurable.
+/// Set internal state separately from author-visible properties.
 fn set_internal(obj: &Gc, key: &str, v: Value) {
     obj.borrow_mut()
-        .props
+        .internal_slots_mut()
         .insert(key, Property::data(v, true, false, false));
 }
 
@@ -247,7 +251,7 @@ fn date_style_default(i: &mut Interp, options: &Value, date: bool) -> Result<Val
     let mut need = true;
     if user_obj.is_some() {
         for k in dim.iter().chain(["dateStyle", "timeStyle"].iter()) {
-            if !matches!(ab(i.get_member(options, k))?, Value::Undefined) {
+            if !matches!(ab(i.get_member_key(options, k))?, Value::Undefined) {
                 need = false;
                 break;
             }
@@ -293,7 +297,7 @@ fn date_all_default(i: &mut Interp, options: &Value) -> Result<Value, Value> {
             "dateStyle",
             "timeStyle",
         ] {
-            if !matches!(ab(i.get_member(options, k))?, Value::Undefined) {
+            if !matches!(ab(i.get_member_key(options, k))?, Value::Undefined) {
                 need = false;
                 break;
             }
@@ -374,7 +378,7 @@ pub(crate) fn intl_delegate(
 ) -> Result<Value, Value> {
     let ctor = intl_service(i, service)?;
     let inst = ab(i.construct(ctor, &[locales, options]))?;
-    let f = ab(i.get_member(&inst, method))?;
+    let f = ab(i.get_member_key(&inst, method))?;
     ab(i.call(f, inst, call_args))
 }
 
@@ -400,7 +404,7 @@ pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Val
                 out.push(s);
             }
         } else {
-            out.push(Value::lstr(k));
+            out.push(crate::value::string_key_value(k));
         }
     }
     Ok(out)
@@ -420,7 +424,7 @@ pub(crate) fn proxy_own_keys(
     let Value::Obj(target_object) = target else {
         return Ok(Vec::new());
     };
-    let trap = ab(i.get_member(handler, "ownKeys"))?;
+    let trap = ab(i.get_member_key(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         return object_own_property_keys(i, target_object);
     }
@@ -496,7 +500,7 @@ pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Valu
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "isExtensible"))?;
+        let trap = ab(i.get_member_key(&handler, "isExtensible"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_is_extensible(i, &target);
         }
@@ -523,7 +527,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "setPrototypeOf"))?;
+        let trap = ab(i.get_member_key(&handler, "setPrototypeOf"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_set_prototype_of(i, &target, proto);
         }
@@ -606,7 +610,7 @@ pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Ve
     let mut out = Vec::new();
     for k in keys {
         if let Value::Str(ks) = &k {
-            if proxy_key_enumerable(i, &target, &handler, ks)? {
+            if proxy_key_enumerable(i, &target, &handler, &crate::value::encode_string_key(ks))? {
                 out.push(k);
             }
         }
@@ -620,7 +624,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
-        let trap = ab(i.get_member(&handler, "preventExtensions"))?;
+        let trap = ab(i.get_member_key(&handler, "preventExtensions"))?;
         if matches!(trap, Value::Undefined | Value::Null) {
             return js_prevent_extensions(i, &target);
         }
@@ -656,7 +660,10 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 .and_then(|b| b.as_obj())
                 .is_some_and(|b| {
                     matches!(
-                        b.borrow().props.get("#\u{0}abResizable").map(|p| p.value()),
+                        b.borrow()
+                            .internal_slots()
+                            .get("#\u{0}abResizable")
+                            .map(|p| p.value()),
                         Some(Value::Bool(true))
                     )
                 });
@@ -671,7 +678,7 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
 }
 
 fn proxy_get_prototype(i: &mut Interp, target: &Value, handler: &Value) -> Result<Value, Value> {
-    let trap = ab(i.get_member(handler, "getPrototypeOf"))?;
+    let trap = ab(i.get_member_key(handler, "getPrototypeOf"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         // Forward to the target's [[GetPrototypeOf]] (recursing for a proxy target).
         return js_get_prototype_of(i, target);
@@ -818,9 +825,6 @@ pub(crate) fn has_own_property_trapped(
     v: &Value,
     key: &str,
 ) -> Result<bool, Value> {
-    if Interp::is_private_key(key) {
-        return Ok(false);
-    }
     let Value::Obj(o) = v else { return Ok(false) };
     {
         let object = o.borrow();
@@ -867,17 +871,11 @@ pub(crate) fn object_get_own_property(
 ) -> Result<Option<Property>, Value> {
     {
         let body = o.borrow();
-        if body.ic_plain.get()
-            && matches!(body.exotic, Exotic::None | Exotic::Array)
-            && !Interp::is_private_key(key)
-        {
+        if body.ic_plain.get() && matches!(body.exotic, Exotic::None | Exotic::Array) {
             return Ok(body.props.get(key).cloned());
         }
     }
     ab(i.defer_trigger(o, Some(key)))?;
-    if Interp::is_private_key(key) {
-        return Ok(None); // a private-name slot is not a property
-    }
     let ptr = Rc::as_ptr(o) as usize;
     // A mapped arguments index reports the live parameter value (§10.4.4.1).
     if let Some(value) = i.mapped_arg_value(ptr, key) {
@@ -942,7 +940,7 @@ fn proxy_get_own_property(
     if matches!(handler, Value::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
-    let trap = ab(i.get_member(handler, "getOwnPropertyDescriptor"))?;
+    let trap = ab(i.get_member_key(handler, "getOwnPropertyDescriptor"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
         return target_own_property(i, target, key);
     }
@@ -954,7 +952,7 @@ fn proxy_get_own_property(
     }
     let key_val = i
         .sym_from_key(key)
-        .unwrap_or_else(|| Value::lstr(key.to_string()));
+        .unwrap_or_else(|| crate::value::string_key_value(key));
     let result = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
     if !matches!(result, Value::Obj(_) | Value::Undefined) {
         return Err(i.make_error(
@@ -986,7 +984,10 @@ fn proxy_get_own_property(
     if !is_compatible_property_descriptor(extensible_target, &result_desc, target_desc.as_ref()) {
         return Err(i.make_error(
             "TypeError",
-            format!("proxy reported an incompatible descriptor for '{key}'"),
+            format!(
+                "proxy reported an incompatible descriptor for '{}'",
+                crate::value::decode_string_key(key)
+            ),
         ));
     }
     if result_desc.configurable == Some(false) {
@@ -1104,16 +1105,16 @@ fn proxy_key_enumerable(
     handler: &Value,
     key: &str,
 ) -> Result<bool, Value> {
-    let trap = ab(i.get_member(handler, "getOwnPropertyDescriptor"))?;
+    let trap = ab(i.get_member_key(handler, "getOwnPropertyDescriptor"))?;
     if trap.is_callable() {
         let kv = i
             .sym_from_key(key)
-            .unwrap_or_else(|| Value::lstr(key.to_string()));
+            .unwrap_or_else(|| crate::value::string_key_value(key));
         let res = ab(i.call(trap, handler.clone(), &[target.clone(), kv]))?;
         if matches!(res, Value::Undefined) {
             return Ok(false);
         }
-        let enum_v = ab(i.get_member(&res, "enumerable"))?;
+        let enum_v = ab(i.get_member_key(&res, "enumerable"))?;
         Ok(i.to_boolean(&enum_v))
     } else if let Some((t2, h2)) = proxy_pair(i, target) {
         // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
@@ -1139,7 +1140,7 @@ fn proxy_define_property(
     key: &str,
     desc: &Value,
 ) -> Result<bool, Abrupt> {
-    let trap = i.get_member(handler, "defineProperty")?;
+    let trap = i.get_member_key(handler, "defineProperty")?;
     if matches!(trap, Value::Undefined | Value::Null) {
         if let Some((t2, h2)) = proxy_pair(i, target) {
             return proxy_define_property(i, &t2, &h2, key, desc);
@@ -1155,7 +1156,7 @@ fn proxy_define_property(
     }
     let key_val = i
         .sym_from_key(key)
-        .unwrap_or_else(|| Value::lstr(key.to_string()));
+        .unwrap_or_else(|| crate::value::string_key_value(key));
     // The trap receives FromPropertyDescriptor(desc): a fresh object holding only the present
     // fields, in the spec's order (value, writable, get, set, enumerable, configurable).
     let pd = build_partial(i, desc)?;
@@ -1351,8 +1352,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let Value::Str(ks) = &k {
-                if proxy_key_enumerable(i, &t, &h, ks)? {
-                    let v = ab(i.get_member(o, ks))?;
+                if proxy_key_enumerable(i, &t, &h, &crate::value::encode_string_key(ks))? {
+                    let v = ab(i.get_member_key(o, &crate::value::encode_string_key(ks)))?;
                     out.push(if entries {
                         i.make_array(vec![Value::Str(ks.clone()), v])
                     } else {
@@ -1367,10 +1368,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     }) {
         debug_assert_eq!(i.host_indexed_len(&object), Some(length));
         let keys = ordinary_own_keys_ordered(i, &object)?;
-        for key in keys
-            .into_iter()
-            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-        {
+        for key in keys.into_iter().filter(|key| !Interp::is_sym_key(key)) {
             // EnumerableOwnProperties snapshots [[OwnPropertyKeys]], then observes each current
             // descriptor and performs a separate Get. An earlier indexed getter can therefore
             // delete or change a later expando, but cannot add it to the snapshot.
@@ -1386,9 +1384,9 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             if !enumerable {
                 continue;
             }
-            let value = ab(i.get_member(o, &key))?;
+            let value = ab(i.get_member_key(o, &key))?;
             out.push(if entries {
-                i.make_array(vec![Value::lstr(key), value])
+                i.make_array(vec![crate::value::string_key_value(key), value])
             } else {
                 value
             });
@@ -1422,9 +1420,9 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
                 .as_obj()
                 .and_then(|obj| obj.borrow().props.get(&k).map(|p| p.enumerable()));
             if enumerable == Some(true) {
-                let v = ab(i.get_member(o, &k))?;
+                let v = ab(i.get_member_key(o, &k))?;
                 out.push(if entries {
-                    i.make_array(vec![Value::Str(k.clone().into()), v])
+                    i.make_array(vec![crate::value::string_key_value(&k), v])
                 } else {
                     v
                 });
@@ -1451,9 +1449,9 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             if live != Some(true) {
                 continue;
             }
-            let v = ab(i.get_member(o, &k))?;
+            let v = ab(i.get_member_key(o, &k))?;
             out.push(if entries {
-                i.make_array(vec![Value::Str(k.into()), v])
+                i.make_array(vec![crate::value::string_key_value(k), v])
             } else {
                 v
             });
@@ -1738,7 +1736,13 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
     if let Some((target, handler)) = proxy_pair(i, holder) {
         let ok = ab(i.proxy_delete(target, handler, key))?;
         if !ok {
-            return Err(i.make_error("TypeError", format!("Cannot delete property '{key}'")));
+            return Err(i.make_error(
+                "TypeError",
+                format!(
+                    "Cannot delete property '{}'",
+                    crate::value::decode_string_key(key)
+                ),
+            ));
         }
         return Ok(());
     }
@@ -1747,12 +1751,24 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
             let supported = crate::value::canonical_index(key)
                 .is_some_and(|index| index < i.host_indexed_len(o).unwrap_or(0));
             if supported {
-                return Err(i.make_error("TypeError", format!("Cannot delete property '{key}'")));
+                return Err(i.make_error(
+                    "TypeError",
+                    format!(
+                        "Cannot delete property '{}'",
+                        crate::value::decode_string_key(key)
+                    ),
+                ));
             }
             return Ok(());
         }
         if ab(i.host_named_visible(o, key))? {
-            return Err(i.make_error("TypeError", format!("Cannot delete named property '{key}'")));
+            return Err(i.make_error(
+                "TypeError",
+                format!(
+                    "Cannot delete named property '{}'",
+                    crate::value::decode_string_key(key)
+                ),
+            ));
         }
         let present = o.borrow().props.contains(key);
         if !present {
@@ -1765,7 +1781,13 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
             .map(|p| p.configurable())
             .unwrap_or(true);
         if !configurable {
-            return Err(i.make_error("TypeError", format!("Cannot delete property '{key}'")));
+            return Err(i.make_error(
+                "TypeError",
+                format!(
+                    "Cannot delete property '{}'",
+                    crate::value::decode_string_key(key)
+                ),
+            ));
         }
         o.borrow_mut().props.remove(key);
     }
@@ -1775,7 +1797,7 @@ fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Valu
 fn set_internal_obj(target: &Value, key: &str, v: Value) {
     if let Value::Obj(o) = target {
         o.borrow_mut()
-            .props
+            .internal_slots_mut()
             .insert(key, Property::data(v, true, false, false));
     }
 }
@@ -1928,8 +1950,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
             .props
             .ordered_keys()
             .iter()
-            .filter(|k| !Interp::is_private_key(k))
-            .map(|k| crate::value::PropertyKey::string(k.to_string()))
+            .map(|k| crate::value::PropertyKey::stored(k.to_string()))
             .collect()
     };
     for key in keys {
@@ -1969,7 +1990,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
 
 pub(crate) fn new_from_ctor(i: &mut Interp, default_proto: &str) -> Result<Gc, Value> {
     let proto = match &i.new_target {
-        nt @ Value::Obj(_) => match ab(i.get_member(&nt.clone(), "prototype"))? {
+        nt @ Value::Obj(_) => match ab(i.get_member_key(&nt.clone(), "prototype"))? {
             Value::Obj(p) => Some(p),
             // The constructor's `prototype` isn't an object — use its realm's intrinsic
             // (GetFunctionRealm, which throws for a proxy revoked mid-construct — the
@@ -2026,8 +2047,7 @@ fn object_define_properties(
     } else {
         ordinary_own_keys_ordered(i, props.as_obj().unwrap())?
             .into_iter()
-            .filter(|k| !Interp::is_private_key(k))
-            .map(crate::value::PropertyKey::string)
+            .map(crate::value::PropertyKey::stored)
             .collect()
     };
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
@@ -2037,7 +2057,7 @@ fn object_define_properties(
             let d = proxy_gopd_value(i, &t, &h, &key)?;
             match &d {
                 Value::Obj(_) => {
-                    let e = ab(i.get_member(&d, "enumerable"))?;
+                    let e = ab(i.get_member_key(&d, "enumerable"))?;
                     i.to_boolean(&e)
                 }
                 _ => false,
@@ -2056,7 +2076,7 @@ fn object_define_properties(
             }
         };
         if enumerable {
-            let desc_obj = ab(i.get_member(&props, &key))?;
+            let desc_obj = ab(i.get_member_key(&props, &key))?;
             descs.push((key, desc_obj));
         }
     }
@@ -2181,7 +2201,7 @@ fn advance_string_index(index: usize, s: &str, unicode: bool) -> usize {
 /// RegExpExec(R, S): call `R.exec` if it is callable (validating the result is an Object or null),
 /// otherwise fall back to the built-in `RegExp.prototype.exec` (which requires a real RegExp).
 fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Result<Value, Value> {
-    let exec = ab(i.get_member(r, "exec"))?;
+    let exec = ab(i.get_member_key(r, "exec"))?;
     if exec.is_callable() {
         let res = ab(i.call(exec, r.clone(), &[Value::Str(s)]))?;
         if !matches!(res, Value::Obj(_) | Value::Null) {
@@ -2327,7 +2347,7 @@ pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result
         };
         match own {
             Some(v) => v,
-            None => ab(i.get_member(&this, "lastIndex"))?,
+            None => ab(i.get_member_key(&this, "lastIndex"))?,
         }
     };
     let read_units = to_length_val(i, &li)?;
@@ -2859,7 +2879,7 @@ fn update_regexp_legacy_statics_lazy(
     });
 }
 
-/// Materialize the pending legacy-statics match (if any) into its constructor's hidden props.
+/// Materialize the pending legacy-statics match (if any) into its constructor's internal slots.
 /// Called by the `RegExp.$1`/`lastMatch`/… accessors before they read.
 pub(super) fn flush_regexp_legacy(i: &mut Interp) {
     let Some(mut m) = i.regexp_last.take() else {
@@ -2879,7 +2899,7 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
     let (caps, text, ctor) = (&m.caps, &m.text, &ctor);
     let put = |k: &'static str, v: String| {
         ctor.borrow_mut()
-            .props
+            .internal_slots_mut()
             .insert(k, Property::data(Value::lstr(v), true, false, false));
     };
     let (start, end) = caps[0].unwrap();
@@ -3175,7 +3195,7 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
         return array_create(i, len);
     }
     // 3. Get(originalArray, "constructor").
-    let mut c = ab(i.get_member(original, "constructor"))?;
+    let mut c = ab(i.get_member_key(original, "constructor"))?;
     // 4. Another Realm's intrinsic %Array% counts as the default; its @@species is never read.
     //    SameValue(C, ctorRealm.[[Intrinsics]].[[%Array%]]) holds exactly when C is the %Array%
     //    of the Realm GetFunctionRealm(C) names.
@@ -3195,7 +3215,7 @@ fn array_species_create(i: &mut Interp, original: &Value, len: u64) -> Result<Va
     // 5. Get(C, @@species); null becomes undefined.
     if matches!(&c, Value::Obj(_)) {
         if let Some(key) = well_known_key(i, "species") {
-            c = ab(i.get_member(&c, &key))?;
+            c = ab(i.get_member_key(&c, &key))?;
         }
         if matches!(c, Value::Null) {
             c = Value::Undefined;
@@ -3269,7 +3289,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Number"
             } else if matches!(b.exotic, Exotic::StrWrap(_)) {
                 "String"
-            } else if b.props.contains("#\u{0}date_ms") {
+            } else if b.internal_slots().contains("#\u{0}date_ms") {
                 "Date"
             } else if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)) {
                 "RegExp"
@@ -3578,8 +3598,13 @@ pub(crate) fn make_bound_len(
 /// functions (and reject a second invocation). `args = [cap, resolve, reject]`.
 fn capability_executor(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let cap = arg(args, 0);
-    let already = !matches!(ab(i.get_member(&cap, "#\u{0}resolve"))?, Value::Undefined)
-        || !matches!(ab(i.get_member(&cap, "#\u{0}reject"))?, Value::Undefined);
+    let already = !matches!(
+        ab(i.get_internal_slot(&cap, "#\u{0}resolve"))?,
+        Value::Undefined
+    ) || !matches!(
+        ab(i.get_internal_slot(&cap, "#\u{0}reject"))?,
+        Value::Undefined
+    );
     if already {
         return Err(i.make_error("TypeError", "promise capability executor already invoked"));
     }
@@ -3600,25 +3625,25 @@ fn pf_then_finally(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Valu
     // bound args [onFinally, C]; called with (value)
     let (on_finally, c, value) = (arg(a, 0), arg(a, 1), arg(a, 2));
     let result = ab(i.call(on_finally, Value::Undefined, &[]))?;
-    let resolve = ab(i.get_member(&c, "resolve"))?;
+    let resolve = ab(i.get_member_key(&c, "resolve"))?;
     let p = ab(i.call(resolve, c.clone(), &[result]))?;
     let thunk = make_bound_len(i, pf_return, vec![value], 0.0);
-    let then = ab(i.get_member(&p, "then"))?;
+    let then = ab(i.get_member_key(&p, "then"))?;
     ab(i.call(then, p, &[thunk]))
 }
 fn pf_catch_finally(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let (on_finally, c, reason) = (arg(a, 0), arg(a, 1), arg(a, 2));
     let result = ab(i.call(on_finally, Value::Undefined, &[]))?;
-    let resolve = ab(i.get_member(&c, "resolve"))?;
+    let resolve = ab(i.get_member_key(&c, "resolve"))?;
     let p = ab(i.call(resolve, c.clone(), &[result]))?;
     let thrower = make_bound_len(i, pf_throw, vec![reason], 0.0);
-    let then = ab(i.get_member(&p, "then"))?;
+    let then = ab(i.get_member_key(&p, "then"))?;
     ab(i.call(then, p, &[thrower]))
 }
 
 /// SpeciesConstructor(O, defaultCtor): O.constructor[@@species], or the default.
 fn species_constructor(i: &mut Interp, obj: &Value, default_ctor: &Value) -> Result<Value, Value> {
-    let c = ab(i.get_member(obj, "constructor"))?;
+    let c = ab(i.get_member_key(obj, "constructor"))?;
     if matches!(c, Value::Undefined) {
         return Ok(default_ctor.clone());
     }
@@ -3626,7 +3651,7 @@ fn species_constructor(i: &mut Interp, obj: &Value, default_ctor: &Value) -> Res
         return Err(i.make_error("TypeError", "constructor is not an object"));
     }
     let species = match well_known_key(i, "species") {
-        Some(k) => ab(i.get_member(&c, &k))?,
+        Some(k) => ab(i.get_member_key(&c, &k))?,
         None => Value::Undefined,
     };
     if matches!(species, Value::Undefined | Value::Null) {
@@ -3640,7 +3665,7 @@ fn species_constructor(i: &mut Interp, obj: &Value, default_ctor: &Value) -> Res
 
 /// GetPromiseResolve(C): read `C.resolve` once, requiring it to be callable.
 fn get_promise_resolve(i: &mut Interp, ctor: &Value) -> Result<Value, Value> {
-    let r = ab(i.get_member(ctor, "resolve"))?;
+    let r = ab(i.get_member_key(ctor, "resolve"))?;
     if !r.is_callable() {
         return Err(i.make_error(
             "TypeError",
@@ -3718,8 +3743,8 @@ fn new_promise_capability_full(
     // GetCapabilitiesExecutor is an anonymous built-in function of length 2.
     let executor = make_bound_len(i, capability_executor, vec![Value::Obj(cap.clone())], 2.0);
     let promise = ab(i.construct(ctor.clone(), &[executor]))?;
-    let resolve = ab(i.get_member(&Value::Obj(cap.clone()), "#\u{0}resolve"))?;
-    let reject = ab(i.get_member(&Value::Obj(cap.clone()), "#\u{0}reject"))?;
+    let resolve = ab(i.get_internal_slot(&Value::Obj(cap.clone()), "#\u{0}resolve"))?;
+    let reject = ab(i.get_internal_slot(&Value::Obj(cap.clone()), "#\u{0}reject"))?;
     if !resolve.is_callable() || !reject.is_callable() {
         return Err(i.make_error("TypeError", "promise capability functions are not callable"));
     }
@@ -3736,21 +3761,24 @@ fn promise_all_element(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     // [[AlreadyCalled]]: a second settlement of the same element is a no-op.
     if let Value::Obj(o) = &already {
         if matches!(
-            o.borrow().props.get("#\u{0}called").map(|p| p.value()),
+            o.borrow()
+                .internal_slots()
+                .get("#\u{0}called")
+                .map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
-    let results = ab(i.get_member(&state, "#\u{0}results"))?;
+    let results = ab(i.get_internal_slot(&state, "#\u{0}results"))?;
     // CreateDataProperty: a direct own data property, so Array.prototype index setters aren't invoked.
     if let Value::Obj(o) = &results {
         crate::value::set_data(o, &idx.to_string(), value);
     }
-    let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
-    ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
+    ab(i.set_internal_slot(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
         ab(i.call(resolve_fn, Value::Undefined, &[results]))?;
     }
@@ -3788,11 +3816,12 @@ fn promise_keyed_combinator(
             if let Some((target, handler)) = proxy_pair(i, &input) {
                 for k in proxy_own_keys(i, &target, &handler)? {
                     let Value::Str(ks) = &k else { continue };
-                    let desc = proxy_gopd_value(i, &target, &handler, ks)?;
+                    let key = crate::value::encode_string_key(ks);
+                    let desc = proxy_gopd_value(i, &target, &handler, &key)?;
                     if matches!(desc, Value::Obj(_)) {
-                        let en = ab(i.get_member(&desc, "enumerable"))?;
+                        let en = ab(i.get_member_key(&desc, "enumerable"))?;
                         if i.to_boolean(&en) {
-                            out.push(ks.to_string());
+                            out.push(crate::value::encode_owned_string_key(ks.to_string()));
                         }
                     }
                 }
@@ -3833,11 +3862,11 @@ fn promise_keyed_combinator(
     set_internal(&state, "#\u{0}keys", keys_arr);
     set_internal(&state, "#\u{0}remaining", Value::Num(1.0));
     for (idx, key) in keys.iter().enumerate() {
-        let value = match ab(i.get_member(&input, key)) {
+        let value = match ab(i.get_member_key(&input, key)) {
             Ok(v) => v,
             Err(e) => reject_with!(e),
         };
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
         let p = match i.call(promise_resolve.clone(), t.clone(), &[value]) {
@@ -3863,7 +3892,7 @@ fn promise_keyed_combinator(
         } else {
             (mk(i, promise_keyed_element), reject_fn.clone())
         };
-        let then = match i.get_member(&p, "then") {
+        let then = match i.get_member_key(&p, "then") {
             Ok(t) => t,
             Err(e) => reject_with!(crate::interpreter::abrupt_value(e)),
         };
@@ -3871,7 +3900,7 @@ fn promise_keyed_combinator(
             reject_with!(crate::interpreter::abrupt_value(e));
         }
     }
-    let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))?;
     set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
     if rem - 1.0 == 0.0 {
@@ -3883,18 +3912,18 @@ fn promise_keyed_combinator(
 
 /// Assemble the keyed combinator's result: a plain object with the recorded values in key order.
 fn promise_keyed_result(i: &mut Interp, state: &Value) -> Result<Value, Value> {
-    let keys = ab(i.get_member(state, "#\u{0}keys"))?;
-    let values = ab(i.get_member(state, "#\u{0}values"))?;
-    let len = match ab(i.get_member(&keys, "length"))? {
+    let keys = ab(i.get_internal_slot(state, "#\u{0}keys"))?;
+    let values = ab(i.get_internal_slot(state, "#\u{0}values"))?;
+    let len = match ab(i.get_member_key(&keys, "length"))? {
         Value::Num(n) => n as usize,
         _ => 0,
     };
     let out = i.new_object();
     out.borrow_mut().proto = None; // the keyed result is a null-prototype object
     for k in 0..len {
-        let kv = ab(i.get_member(&keys, &k.to_string()))?;
+        let kv = ab(i.get_member_key(&keys, &k.to_string()))?;
         let key = ab(i.to_string(&kv))?;
-        let v = ab(i.get_member(&values, &k.to_string()))?;
+        let v = ab(i.get_member_key(&values, &k.to_string()))?;
         set_data(&out, &key, v);
     }
     Ok(Value::Obj(out))
@@ -3909,20 +3938,23 @@ fn promise_keyed_record(i: &mut Interp, args: &[Value], payload: Value) -> Resul
     let resolve_fn = arg(args, 3);
     if let Value::Obj(o) = &already {
         if matches!(
-            o.borrow().props.get("#\u{0}called").map(|p| p.value()),
+            o.borrow()
+                .internal_slots()
+                .get("#\u{0}called")
+                .map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
-    let values = ab(i.get_member(&state, "#\u{0}values"))?;
+    let values = ab(i.get_internal_slot(&state, "#\u{0}values"))?;
     if let Value::Obj(o) = &values {
         crate::value::set_data(o, &idx.to_string(), payload);
     }
-    let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
-    ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
+    ab(i.set_internal_slot(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
         let out = promise_keyed_result(i, &state)?;
         ab(i.call(resolve_fn, Value::Undefined, &[out]))?;
@@ -3963,7 +3995,10 @@ fn promise_settled(i: &mut Interp, args: &[Value], fulfilled: bool) -> Result<Va
     // The fulfill and reject functions for one index share this [[AlreadyCalled]] record.
     if let Value::Obj(o) = &already {
         if matches!(
-            o.borrow().props.get("#\u{0}called").map(|p| p.value()),
+            o.borrow()
+                .internal_slots()
+                .get("#\u{0}called")
+                .map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Ok(Value::Undefined);
@@ -3977,13 +4012,13 @@ fn promise_settled(i: &mut Interp, args: &[Value], fulfilled: bool) -> Result<Va
         Value::lstr(if fulfilled { "fulfilled" } else { "rejected" }),
     );
     set_data(&status, if fulfilled { "value" } else { "reason" }, value);
-    let results = ab(i.get_member(&state, "#\u{0}results"))?;
+    let results = ab(i.get_internal_slot(&state, "#\u{0}results"))?;
     if let Value::Obj(o) = &results {
         crate::value::set_data(o, &idx.to_string(), Value::Obj(status));
     }
-    let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
-    ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
+    ab(i.set_internal_slot(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
         ab(i.call(resolve_fn, Value::Undefined, &[results]))?;
     }
@@ -4003,22 +4038,25 @@ fn promise_any_reject(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, V
     let reason = arg(a, 4);
     if let Value::Obj(o) = &already {
         if matches!(
-            o.borrow().props.get("#\u{0}called").map(|p| p.value()),
+            o.borrow()
+                .internal_slots()
+                .get("#\u{0}called")
+                .map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Ok(Value::Undefined);
         }
         set_internal(o, "#\u{0}called", Value::Bool(true));
     }
-    let errors = ab(i.get_member(&state, "#\u{0}errors"))?;
+    let errors = ab(i.get_internal_slot(&state, "#\u{0}errors"))?;
     // Step 9 replaces an element of the errors List: an own data property of the internal
     // Array, so an inherited Array.prototype index setter never runs.
     if let Value::Obj(o) = &errors {
         crate::value::set_data(o, &idx.to_string(), reason);
     }
-    let rem_v = ab(i.get_member(&state, "#\u{0}remaining"))?;
+    let rem_v = ab(i.get_internal_slot(&state, "#\u{0}remaining"))?;
     let rem = ab(i.to_number(&rem_v))? - 1.0;
-    ab(i.set_member(&state, "#\u{0}remaining", Value::Num(rem)))?;
+    ab(i.set_internal_slot(&state, "#\u{0}remaining", Value::Num(rem)))?;
     if rem == 0.0 {
         let agg = make_aggregate_error(i, errors);
         ab(i.call(reject_fn, Value::Undefined, &[agg]))?;
@@ -4079,7 +4117,12 @@ fn install_object(it: &mut Interp) {
         let key = arg(args, 0);
         if let Value::Str(key) = &key {
             let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
-            return has_own_property_trapped(i, &Value::Obj(o), key.as_str()).map(Value::Bool);
+            return has_own_property_trapped(
+                i,
+                &Value::Obj(o),
+                &crate::value::encode_string_key(key),
+            )
+            .map(Value::Bool);
         }
         if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
             let o = to_object_arg(i, this, "Object.prototype.hasOwnProperty")?;
@@ -4119,7 +4162,13 @@ fn install_object(it: &mut Interp) {
             ab(define_own_property(i, &o, &key, &Value::Obj(desc)))?
         };
         if !ok {
-            return Err(i.make_error("TypeError", format!("cannot define accessor '{key}'")));
+            return Err(i.make_error(
+                "TypeError",
+                format!(
+                    "cannot define accessor '{}'",
+                    crate::value::decode_string_key(&key)
+                ),
+            ));
         }
         Ok(Value::Undefined)
     }
@@ -4147,7 +4196,7 @@ fn install_object(it: &mut Interp) {
                     if !is_accessor {
                         return Ok(Value::Undefined);
                     }
-                    return ab(i.get_member(&desc, if is_get { "get" } else { "set" }));
+                    return ab(i.get_member_key(&desc, if is_get { "get" } else { "set" }));
                 }
             } else if let Value::Obj(co) = &cur {
                 if let Some(p) = co.borrow().props.get(&key) {
@@ -4212,7 +4261,7 @@ fn install_object(it: &mut Interp) {
             let e = match desc {
                 Value::Undefined => false,
                 d => {
-                    let ev = ab(i.get_member(&d, "enumerable"))?;
+                    let ev = ab(i.get_member_key(&d, "enumerable"))?;
                     i.to_boolean(&ev)
                 }
             };
@@ -4246,7 +4295,7 @@ fn install_object(it: &mut Interp) {
         // (ECMA-262 §20.1.3.6). Keep a String @@toStringTag borrowed through the one result
         // allocation instead of copying it into a temporary Rust `String` first.
         match to_string_tag_key(i) {
-            Some(key) => match ab(i.get_member(&this, &key))? {
+            Some(key) => match ab(i.get_member_key(&this, &key))? {
                 Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                     "[object ",
                     s.as_str(),
@@ -4266,7 +4315,7 @@ fn install_object(it: &mut Interp) {
     });
     // Object.prototype.toLocaleString(): the default just invokes `this.toString()`.
     it.def_method(&op, "toLocaleString", 0, |i, this, _args| {
-        let to_string = ab(i.get_member(&this, "toString"))?;
+        let to_string = ab(i.get_member_key(&this, "toString"))?;
         if !to_string.is_callable() {
             return Err(i.make_error("TypeError", "toString is not callable"));
         }
@@ -4315,7 +4364,7 @@ fn install_object(it: &mut Interp) {
                     Some(c) if Rc::ptr_eq(c, &nt)
                 );
                 if !is_self {
-                    let proto = match ab(i.get_member(&Value::Obj(nt.clone()), "prototype"))? {
+                    let proto = match ab(i.get_member_key(&Value::Obj(nt.clone()), "prototype"))? {
                         Value::Obj(p) => Some(p),
                         _ => ctor_realm_proto(i, &Value::Obj(nt), "Object")?
                             .or_else(|| Some(i.object_proto.clone())),
@@ -4384,10 +4433,7 @@ fn install_object(it: &mut Interp) {
             // EnumerableOwnProperties asks [[GetOwnProperty]] for each key. For a Web IDL
             // indexed property that operation invokes the platform getter even though
             // Object.keys ultimately keeps only the key.
-            for key in own_keys
-                .into_iter()
-                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-            {
+            for key in own_keys.into_iter().filter(|key| !Interp::is_sym_key(key)) {
                 let enumerable = if ab(i.host_indexed_own_value(&o, &key))?.is_some() {
                     crate::value::canonical_index(&key).is_some()
                 } else {
@@ -4397,7 +4443,7 @@ fn install_object(it: &mut Interp) {
                         .is_some_and(|property| property.enumerable())
                 };
                 if enumerable {
-                    keys.push(Value::lstr(key));
+                    keys.push(crate::value::string_key_value(key));
                 }
             }
             return Ok(i.make_array(keys));
@@ -4409,7 +4455,7 @@ fn install_object(it: &mut Interp) {
             keys.extend(
                 ordered_enum_keys(&o)
                     .into_iter()
-                    .map(|k| Value::Str(k.into())),
+                    .map(crate::value::string_key_value),
             );
             return Ok(i.make_array(keys));
         }
@@ -4424,7 +4470,10 @@ fn install_object(it: &mut Interp) {
                 }
             }
         }
-        let keys: Vec<Value> = names.into_iter().map(|k| Value::Str(k.into())).collect();
+        let keys: Vec<Value> = names
+            .into_iter()
+            .map(crate::value::string_key_value)
+            .collect();
         Ok(i.make_array(keys))
     });
     it.def_method(&ctor, "getOwnPropertyNames", 1, |i, _this, args| {
@@ -4444,8 +4493,8 @@ fn install_object(it: &mut Interp) {
             let n = i.ta_len(&info).unwrap_or(0);
             let mut keys: Vec<Value> = (0..n).map(|k| Value::lstr(k.to_string())).collect();
             for k in o.borrow().props.ordered_keys() {
-                if !Interp::is_sym_key(&k) && !Interp::is_private_key(&k) {
-                    keys.push(Value::Str(k.into()));
+                if !Interp::is_sym_key(&k) {
+                    keys.push(crate::value::string_key_value(k));
                 }
             }
             return Ok(i.make_array(keys));
@@ -4453,8 +4502,8 @@ fn install_object(it: &mut Interp) {
         // Spec order: array-index keys ascending, then other string keys in insertion order.
         let keys: Vec<Value> = ordinary_own_keys_ordered(i, &o)?
             .into_iter()
-            .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-            .map(Value::lstr)
+            .filter(|key| !Interp::is_sym_key(key))
+            .map(crate::value::string_key_value)
             .collect();
         Ok(i.make_array(keys))
     });
@@ -4637,7 +4686,7 @@ fn install_object(it: &mut Interp) {
                 for key in proxy_own_keys(i, &t, &h)? {
                     let pk = ab(i.to_property_key(&key))?;
                     if proxy_key_enumerable(i, &t, &h, &pk)? {
-                        let v = ab(i.get_member(&from, &pk))?;
+                        let v = ab(i.get_member_key(&from, &pk))?;
                         assign_set(i, &to_val, &pk, v)?;
                     }
                 }
@@ -4646,9 +4695,6 @@ fn install_object(it: &mut Interp) {
             let o = from.as_obj().unwrap();
             let keys = ordinary_own_keys_ordered(i, o)?;
             for k in keys {
-                if Interp::is_private_key(&k) {
-                    continue;
-                }
                 let enumerable = if ab(i.host_indexed_own_value(o, &k))?.is_some() {
                     crate::value::canonical_index(&k).is_some()
                 } else {
@@ -4658,7 +4704,7 @@ fn install_object(it: &mut Interp) {
                         .is_some_and(|property| property.enumerable())
                 };
                 if enumerable {
-                    let v = ab(i.get_member(&from, &k))?;
+                    let v = ab(i.get_member_key(&from, &k))?;
                     assign_set(i, &to_val, &k, v)?;
                 }
             }
@@ -4703,8 +4749,8 @@ fn install_object(it: &mut Interp) {
                         i.make_error("TypeError", "Object.fromEntries entry is not an object")
                     );
                 }
-                let k = ab(i.get_member(&entry, "0"))?;
-                let v = ab(i.get_member(&entry, "1"))?;
+                let k = ab(i.get_member_key(&entry, "0"))?;
+                let v = ab(i.get_member_key(&entry, "1"))?;
                 let key = ab(i.to_property_key(&k))?;
                 obj.borrow_mut()
                     .props
@@ -4782,12 +4828,12 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
                 Value::Obj(d) => d.clone(),
                 _ => continue,
             };
-            let c = ab(i.get_member(&desc, "configurable"))?;
+            let c = ab(i.get_member_key(&desc, "configurable"))?;
             if i.to_boolean(&c) {
                 return Ok(false);
             }
             if frozen && d.borrow().props.contains("value") {
-                let w = ab(i.get_member(&desc, "writable"))?;
+                let w = ab(i.get_member_key(&desc, "writable"))?;
                 if i.to_boolean(&w) {
                     return Ok(false);
                 }
@@ -4939,7 +4985,7 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     let base = Value::Obj(o.clone());
     let bool_field = |i: &mut Interp, k: &str| -> Result<Option<bool>, Abrupt> {
         if i.js_has_property(&base, k)? {
-            let v = i.get_member(&base, k)?;
+            let v = i.get_member_key(&base, k)?;
             Ok(Some(i.to_boolean(&v)))
         } else {
             Ok(None)
@@ -4948,18 +4994,18 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     let enumerable = bool_field(i, "enumerable")?;
     let configurable = bool_field(i, "configurable")?;
     let value = if i.js_has_property(&base, "value")? {
-        Some(i.get_member(&base, "value")?)
+        Some(i.get_member_key(&base, "value")?)
     } else {
         None
     };
     let writable = bool_field(i, "writable")?;
     let get = if i.js_has_property(&base, "get")? {
-        Some(i.get_member(&base, "get")?)
+        Some(i.get_member_key(&base, "get")?)
     } else {
         None
     };
     let set = if i.js_has_property(&base, "set")? {
-        Some(i.get_member(&base, "set")?)
+        Some(i.get_member_key(&base, "set")?)
     } else {
         None
     };
@@ -5097,7 +5143,7 @@ fn define_own_property_record(
         if d.is_accessor() {
             i.unmap_argument(args_ptr, key);
         } else {
-            if let Some(v) = d.value.clone() {
+            if let Some(v) = &d.value {
                 i.mapped_arg_write(args_ptr, key, v);
             }
             if d.writable == Some(false) {
@@ -5981,7 +6027,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
         set_throw(i, &ov, "length", Value::Num(0.0))?;
         return Ok(Value::Undefined);
     }
-    let last = ab(i.get_member(&ov, &(len - 1).to_string()))?;
+    let last = ab(i.get_member_key(&ov, &(len - 1).to_string()))?;
     delete_or_throw(i, &ov, &(len - 1).to_string())?;
     set_throw(i, &ov, "length", Value::Num((len - 1) as f64))?;
     Ok(last)
@@ -6081,7 +6127,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(first);
             }
         }
-        let first = ab(i.get_member(&ov, "0"))?;
+        let first = ab(i.get_member_key(&ov, "0"))?;
         for k in 1..len {
             let to = (k - 1).to_string();
             if let Some(v) = array_get_present_index(i, &o, &ov, k)? {
@@ -6103,9 +6149,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             if len + n > 9007199254740991 {
                 return Err(i.make_error("TypeError", "unshift result is too long"));
             }
-            if edit_plain_elements(i, &o, len, n, |elements| {
-                elements.splice(0..0, args.iter().map(|item| Property::plain(item.clone())));
-            }) {
+            if len + n <= u64::from(u32::MAX)
+                && matches!(o.borrow().exotic, Exotic::Array)
+                && i.ordinary_get_ptr(Rc::as_ptr(&o) as usize)
+                && o.borrow().extensible
+                && i.array_append_unshadowed(&o)
+                && o.borrow_mut().props.unshift_dense_array(len as usize, args)
+            {
                 return Ok(Value::Num((len + n) as f64));
             }
             for k in (0..len).rev() {
@@ -6253,6 +6303,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // ToObject(this): a primitive receiver is boxed (and spread/appended as its wrapper).
         let recv = Value::Obj(arr_to_object(i, &this)?);
         let result = array_species_create(i, &recv, 0)?;
+        // Each CreateDataPropertyOrThrow is interleaved with the next source's
+        // HasProperty/Get. Only an ordinary result can define properties without
+        // invoking author code that changes the source between those reads.
+        let unobservable_defines = result.as_obj().is_some_and(|object| {
+            matches!(object.borrow().exotic, Exotic::None | Exotic::Array)
+                && i.ordinary_get_ptr(Rc::as_ptr(object) as usize)
+        });
         let mut n = 0u64;
         // ECMA-262 §23.1.3.2 prepends the receiver to `items`, then processes each item in order.
         // Borrow that sequence directly so ordinary concat calls do not allocate a temporary
@@ -6262,7 +6319,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let spreadable = if let Value::Obj(_) = v {
                 let key = well_known_key(i, "isConcatSpreadable");
                 let flag = match &key {
-                    Some(k) => ab(i.get_member(v, k))?,
+                    Some(k) => ab(i.get_member_key(v, k))?,
                     None => Value::Undefined,
                 };
                 match flag {
@@ -6280,10 +6337,16 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 if n + len > 9007199254740991 {
                     return Err(i.make_error("TypeError", "concat result is too long"));
                 }
-                // An ordinary Array's own data elements are read without observable
-                // HasProperty/Get work.
+                // Snapshot own data only when destination writes cannot observe or
+                // alias the source. A species Proxy must retain each ordered read.
                 if let Some(values) = v
                     .as_obj()
+                    .filter(|source| {
+                        unobservable_defines
+                            && result
+                                .as_obj()
+                                .is_some_and(|target| !Rc::ptr_eq(source, target))
+                    })
                     .and_then(|object| own_data_elements(object, 0..len as usize))
                 {
                     for value in values {
@@ -6347,7 +6410,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
     });
     it.def_method(&ap, "toString", 0, |i, this, _args| {
         let ov = Value::Obj(arr_to_object(i, &this)?);
-        let join = ab(i.get_member(&ov, "join"))?;
+        let join = ab(i.get_member_key(&ov, "join"))?;
         if join.is_callable() {
             ab(i.call(join, ov, &[]))
         } else {
@@ -6360,7 +6423,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 builtin_tag(i, &ov)
             };
             match to_string_tag_key(i) {
-                Some(key) => match ab(i.get_member(&ov, &key))? {
+                Some(key) => match ab(i.get_member_key(&ov, &key))? {
                     Value::Str(s) => Ok(Value::Str(crate::lstr::LStr::concat3(
                         "[object ",
                         s.as_str(),
@@ -6388,7 +6451,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let el = array_get_index(i, &o, &ov, k)?;
             if !matches!(el, Value::Undefined | Value::Null) {
                 // ToString(? Invoke(element, "toLocaleString", « locales, options »)).
-                let tls = ab(i.get_member(&el, "toLocaleString"))?;
+                let tls = ab(i.get_member_key(&el, "toLocaleString"))?;
                 if !tls.is_callable() {
                     return Err(i.make_error("TypeError", "toLocaleString is not a function"));
                 }
@@ -6456,7 +6519,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 unreachable!("make_array returns an Array object")
             };
             let properties = std::mem::take(&mut materialized.borrow_mut().props);
-            o.borrow_mut().props = properties;
+            o.borrow_mut().replace_properties(properties);
             return Ok(Value::Obj(o));
         }
         let ov = Value::Obj(o.clone());
@@ -6811,7 +6874,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 }
             }
         }
-        ab(i.set_member(&arr, "length", Value::Num(len as f64)))?;
+        ab(i.set_member_key(&arr, "length", Value::Num(len as f64)))?;
         Ok(arr)
     });
     it.def_method(&ctor, "from", 1, |i, this, args| {
@@ -6828,7 +6891,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // is a TypeError.
         let iter_method = match well_known_key(i, "iterator") {
             Some(k) if !matches!(source, Value::Undefined | Value::Null) => {
-                ab(i.get_member(&source, &k))?
+                ab(i.get_member_key(&source, &k))?
             }
             _ => Value::Undefined,
         };
@@ -6858,7 +6921,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 i.make_array(Vec::new())
             };
             let iter = ab(i.call(iter_method, source.clone(), &[]))?;
-            let next = crate::callback::Callback::new(ab(i.get_member(&iter, "next"))?);
+            let next = crate::callback::Callback::new(ab(i.get_member_key(&iter, "next"))?);
             let mut k = 0u64;
             loop {
                 let Some(raw) = ab(next.iterator_step(i, &iter))? else {
@@ -6916,7 +6979,7 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
         // `new Array(len)` sets length without materializing elements; the length setter
         // validates that it is a valid uint32 (else RangeError: Invalid array length).
         let a = i.make_array(Vec::new());
-        ab(i.set_member(&a, "length", args[0].clone()))?;
+        ab(i.set_member_key(&a, "length", args[0].clone()))?;
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -6936,7 +6999,7 @@ pub(crate) fn nf_array_ctor(i: &mut Interp, _this: Value, args: &[Value]) -> Res
     if i.constructing {
         let nt = i.new_target.clone();
         if let Value::Obj(_) = &nt {
-            let proto = match ab(i.get_member(&nt, "prototype"))? {
+            let proto = match ab(i.get_member_key(&nt, "prototype"))? {
                 Value::Obj(p) => Some(p),
                 _ => ctor_realm_proto(i, &nt, "Array")?,
             };
@@ -6968,7 +7031,7 @@ fn edit_plain_elements(
     object: &Gc,
     len: u64,
     growth: u64,
-    edit: impl FnOnce(&mut Vec<Property>),
+    edit: impl FnOnce(&mut DenseDeque<Property>),
 ) -> bool {
     if len.saturating_add(growth) > u64::from(u32::MAX)
         || !matches!(object.borrow().exotic, Exotic::Array)
@@ -7012,7 +7075,7 @@ fn array_get_index(
         return Ok(value);
     }
     let key = index.to_string();
-    ab(i.get_member(receiver, &key))
+    ab(i.get_member_key(receiver, &key))
 }
 
 /// `Get` after a caller has already performed the method's required `HasProperty` operation.
@@ -7029,7 +7092,7 @@ fn array_get_index_after_has(
     if let Some(value) = i.fast_get_elem(object, index as f64) {
         return Ok(value);
     }
-    ab(i.get_member(receiver, key))
+    ab(i.get_member_key(receiver, key))
 }
 
 /// Read an index for the HasProperty-based Array callbacks. An own dense data element has no
@@ -7090,7 +7153,7 @@ fn flatten_into(
             let mut target_index = start;
             for element in values {
                 if depth > 0 && json_is_array(i, &element)? {
-                    let len_val = ab(i.get_member(&element, "length"))?;
+                    let len_val = ab(i.get_member_key(&element, "length"))?;
                     let el_len = to_length_val(i, &len_val)?;
                     target_index =
                         flatten_nested(i, target, &element, el_len, target_index, depth)?;
@@ -7115,7 +7178,7 @@ fn flatten_into(
         }
         let mut element = match source {
             Value::Obj(object) => array_get_index_after_has(i, object, source, k, &key)?,
-            _ => ab(i.get_member(source, &key))?,
+            _ => ab(i.get_member_key(source, &key))?,
         };
         if let Some(m) = mapper {
             element = ab(m.call(
@@ -7125,7 +7188,7 @@ fn flatten_into(
             ))?;
         }
         if depth > 0 && json_is_array(i, &element)? {
-            let len_val = ab(i.get_member(&element, "length"))?;
+            let len_val = ab(i.get_member_key(&element, "length"))?;
             let el_len = to_length_val(i, &len_val)?;
             target_index = flatten_nested(i, target, &element, el_len, target_index, depth)?;
         } else {
@@ -7226,7 +7289,7 @@ fn array_splice(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Va
             cdp_index_or_throw(i, &removed, k as u64, v)?;
         }
     }
-    ab(i.set_member(&removed, "length", Value::Num(delete_count as f64)))?;
+    ab(i.set_member_key(&removed, "length", Value::Num(delete_count as f64)))?;
     let item_count = items.len() as i64;
     // Shift the trailing elements (preserving holes) to open or close the gap.
     if item_count < delete_count {
@@ -7494,7 +7557,7 @@ fn install_iterator(it: &mut Interp) {
     });
     it.def_method(&proto, "toArray", 0, |i, this, _| {
         require_iterator_object(i, &this)?;
-        let next = ab(i.get_member(&this, "next"))?;
+        let next = ab(i.get_member_key(&this, "next"))?;
         let mut out = Vec::new();
         while let Some(v) = step_iter_with(i, &this, &next)? {
             out.push(v);
@@ -7512,7 +7575,7 @@ fn install_iterator(it: &mut Interp) {
                 "Iterator.prototype.forEach argument is not callable",
             ));
         }
-        let next = ab(i.get_member(&this, "next"))?;
+        let next = ab(i.get_member_key(&this, "next"))?;
         let mut k = 0.0;
         let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
@@ -7532,7 +7595,7 @@ fn install_iterator(it: &mut Interp) {
             i.iterator_close(&this);
             return Err(i.make_error("TypeError", "reducer is not callable"));
         }
-        let next = ab(i.get_member(&this, "next"))?;
+        let next = ab(i.get_member_key(&this, "next"))?;
         let mut acc;
         let mut k = 0.0;
         if a.len() >= 2 {
@@ -7574,7 +7637,7 @@ fn install_iterator(it: &mut Interp) {
             i.iterator_close(&this);
             return Err(i.make_error("TypeError", "predicate is not callable"));
         }
-        let next = ab(i.get_member(&this, "next"))?;
+        let next = ab(i.get_member_key(&this, "next"))?;
         let mut k = 0.0;
         let f = crate::callback::Callback::new(f);
         while let Some(v) = step_iter_with(i, &this, &next)? {
@@ -7610,9 +7673,9 @@ fn install_iterator(it: &mut Interp) {
     {
         let wrap_proto = Object::new(Some(proto.clone()));
         fn wrap_slot(this: &Value, key: &str) -> Option<Value> {
-            // [[Iterated]] internal-slot access: read own properties directly (no observable get).
+            // [[Iterated]] internal-slot access bypasses observable property algorithms.
             let o = this.as_obj()?;
-            let v = o.borrow().props.get(key).map(|p| p.value());
+            let v = o.borrow().internal_slots().get(key).map(|p| p.value());
             v.filter(|v| !matches!(v, Value::Undefined))
         }
         it.def_method(&wrap_proto, "next", 0, |i, this, _a| {
@@ -7627,7 +7690,7 @@ fn install_iterator(it: &mut Interp) {
                 return Err(i.make_error("TypeError", "return called on an incompatible receiver"));
             };
             // GetMethod(iterator, "return"); its result is returned as-is.
-            let rm = ab(i.get_member(&iter, "return"))?;
+            let rm = ab(i.get_member_key(&iter, "return"))?;
             if matches!(rm, Value::Undefined | Value::Null) {
                 return Ok(iter_result(i, Value::Undefined, true));
             }
@@ -7668,7 +7731,7 @@ fn install_iterator(it: &mut Interp) {
         }
         // OrdinaryCreateFromConstructor: a newTarget whose `prototype` is not an object falls
         // back to the newTarget realm's %Iterator.prototype%.
-        let proto = match ab(i.get_member(&nt, "prototype"))? {
+        let proto = match ab(i.get_member_key(&nt, "prototype"))? {
             Value::Obj(p) => Some(p),
             _ => ctor_realm_proto(i, &nt, "%IteratorPrototype%")?
                 .or_else(|| i.extra_protos.get("%IteratorPrototype%").cloned()),
@@ -7684,7 +7747,7 @@ fn install_iterator(it: &mut Interp) {
         let iter = get_iterator_flattenable(i, &v, true)?;
         // GetIteratorDirect's `next` get happens before the OrdinaryHasInstance walk, whose
         // [[GetPrototypeOf]] a proxy observes.
-        let next = ab(i.get_member(&iter, "next"))?;
+        let next = ab(i.get_member_key(&iter, "next"))?;
         let iter_proto = i.extra_protos.get("%IteratorPrototype%").cloned();
         let mut inherits = false;
         let mut cur = iter.clone();
@@ -7710,8 +7773,8 @@ fn install_iterator(it: &mut Interp) {
                 .get("%WrapForValidIteratorPrototype%")
                 .cloned(),
         );
-        set_builtin(&obj, "#\u{0}wrap_iter", iter);
-        set_builtin(&obj, "#\u{0}wrap_next", next);
+        set_internal_slot(&obj, "#\u{0}wrap_iter", iter);
+        set_internal_slot(&obj, "#\u{0}wrap_next", next);
         Ok(Value::Obj(obj))
     });
     it.def_method(&ctor, "zip", 1, |i, _t, a| iterator_zip(i, a, false));
@@ -7729,7 +7792,7 @@ fn install_iterator(it: &mut Interp) {
             if !matches!(v, Value::Obj(_)) {
                 return Err(i.make_error("TypeError", "Iterator.concat argument is not an object"));
             }
-            let m = ab(i.get_member(v, &iter_key))?;
+            let m = ab(i.get_member_key(v, &iter_key))?;
             if !m.is_callable() {
                 return Err(i.make_error("TypeError", "Iterator.concat argument is not iterable"));
             }
@@ -7739,27 +7802,27 @@ fn install_iterator(it: &mut Interp) {
         let obj = Object::new(i.extra_protos.get("%IteratorPrototype%").cloned());
         let items_arr = i.make_array(items);
         let methods_arr = i.make_array(methods);
-        set_builtin(&obj, "#\u{0}cc_items", items_arr);
-        set_builtin(&obj, "#\u{0}cc_methods", methods_arr);
-        set_builtin(&obj, "#\u{0}cc_idx", Value::Num(0.0));
-        set_builtin(&obj, "#\u{0}cc_cur", Value::Undefined);
-        set_builtin(&obj, "#\u{0}cc_curnext", Value::Undefined);
-        set_builtin(&obj, "#\u{0}cc_done", Value::Bool(false));
+        set_internal_slot(&obj, "#\u{0}cc_items", items_arr);
+        set_internal_slot(&obj, "#\u{0}cc_methods", methods_arr);
+        set_internal_slot(&obj, "#\u{0}cc_idx", Value::Num(0.0));
+        set_internal_slot(&obj, "#\u{0}cc_cur", Value::Undefined);
+        set_internal_slot(&obj, "#\u{0}cc_curnext", Value::Undefined);
+        set_internal_slot(&obj, "#\u{0}cc_done", Value::Bool(false));
         i.def_method(&obj, "next", 0, concat_next);
         // return() closes the currently-open inner iterator (once), then reports done.
         i.def_method(&obj, "return", 0, |i, this, _a| {
-            let running = ab(i.get_member(&this, "#\u{0}cc_running"))?;
+            let running = ab(i.get_internal_slot(&this, "#\u{0}cc_running"))?;
             if i.to_boolean(&running) {
                 return Err(
                     i.make_error("TypeError", "Iterator.concat iterator is already running")
                 );
             }
-            let done = ab(i.get_member(&this, "#\u{0}cc_done"))?;
+            let done = ab(i.get_internal_slot(&this, "#\u{0}cc_done"))?;
             if !i.to_boolean(&done) {
                 let o = this.as_obj().unwrap().clone();
-                let cur = ab(i.get_member(&this, "#\u{0}cc_cur"))?;
+                let cur = ab(i.get_internal_slot(&this, "#\u{0}cc_cur"))?;
                 if matches!(cur, Value::Obj(_)) {
-                    let started = ab(i.get_member(&this, "#\u{0}cc_gstarted"))?;
+                    let started = ab(i.get_internal_slot(&this, "#\u{0}cc_gstarted"))?;
                     let started = i.to_boolean(&started);
                     if started {
                         // Suspended at a yield: the close runs in the executing state.
@@ -7914,7 +7977,7 @@ fn async_dispose_via_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result
     // throwing call, or a rejected result — surfaces as a rejection of the returned promise, and a
     // fulfilled result is discarded (the promise fulfills with undefined).
     let promise = i.new_promise();
-    let ret = match i.get_member(&this, "return") {
+    let ret = match i.get_member_key(&this, "return") {
         Ok(v) => v,
         Err(e) => {
             let reason = crate::interpreter::abrupt_value(e);
@@ -7980,29 +8043,45 @@ fn create_regexp_string_iterator(
 
 fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let o = match &this {
-        Value::Obj(o) if o.borrow().props.contains("#\u{0}rsi_regexp") => o.clone(),
+        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}rsi_regexp") => o.clone(),
         _ => return Err(i.make_error("TypeError", "next called on a non-RegExp-String-Iterator")),
     };
     let done = o
         .borrow()
-        .props
+        .internal_slots()
         .get("#\u{0}rsi_done")
         .map(|p| matches!(p.value(), Value::Bool(true)))
         .unwrap_or(true);
     if done {
         return Ok(i.iter_result_obj(Value::Undefined, true));
     }
-    let r = o.borrow().props.get("#\u{0}rsi_regexp").unwrap().value();
-    let s = match o.borrow().props.get("#\u{0}rsi_string").map(|p| p.value()) {
+    let r = o
+        .borrow()
+        .internal_slots()
+        .get("#\u{0}rsi_regexp")
+        .unwrap()
+        .value();
+    let s = match o
+        .borrow()
+        .internal_slots()
+        .get("#\u{0}rsi_string")
+        .map(|p| p.value())
+    {
         Some(Value::Str(s)) => s,
         _ => crate::lstr::LStr::from(""),
     };
     let global = matches!(
-        o.borrow().props.get("#\u{0}rsi_global").map(|p| p.value()),
+        o.borrow()
+            .internal_slots()
+            .get("#\u{0}rsi_global")
+            .map(|p| p.value()),
         Some(Value::Bool(true))
     );
     let unicode = matches!(
-        o.borrow().props.get("#\u{0}rsi_unicode").map(|p| p.value()),
+        o.borrow()
+            .internal_slots()
+            .get("#\u{0}rsi_unicode")
+            .map(|p| p.value()),
         Some(Value::Bool(true))
     );
     let m = regexp_exec_abstract(i, &r, s.clone())?;
@@ -8011,13 +8090,13 @@ fn regexp_string_iterator_next(i: &mut Interp, this: Value, _a: &[Value]) -> Res
         return Ok(i.iter_result_obj(Value::Undefined, true));
     }
     if global {
-        let m0_v = ab(i.get_member(&m, "0"))?;
+        let m0_v = ab(i.get_member_key(&m, "0"))?;
         let m0 = ab(i.to_string(&m0_v))?;
         if m0.is_empty() {
-            let li_v = ab(i.get_member(&r, "lastIndex"))?;
+            let li_v = ab(i.get_member_key(&r, "lastIndex"))?;
             let li = to_length_val(i, &li_v)?;
             let next = advance_string_index(li, &s, unicode);
-            ab(i.set_member(&r, "lastIndex", Value::Num(next as f64)))?;
+            ab(i.set_member_key(&r, "lastIndex", Value::Num(next as f64)))?;
         }
     } else {
         set_internal(&o, "#\u{0}rsi_done", Value::Bool(true));
@@ -8178,7 +8257,7 @@ impl FromAsyncCoro {
         // AsyncIteratorClose(iteratorRecord, ThrowCompletion(error)), ECMA-262 §7.4.15. An abrupt
         // return getter/call is discarded in favour of the original throw; only a normal call
         // result introduces the required Await.
-        let ret = match i.get_member(&iterator, "return") {
+        let ret = match i.get_member_key(&iterator, "return") {
             Ok(value) => value,
             Err(_) => return self.finish(Suspend::Throw(error)),
         };
@@ -8259,7 +8338,7 @@ impl FromAsyncCoro {
                         let error = i.make_error("TypeError", "iterator result is not an object");
                         return self.finish(Suspend::Throw(error));
                     }
-                    let done = match i.get_member(&result, "done") {
+                    let done = match i.get_member_key(&result, "done") {
                         Ok(value) => i.to_boolean(&value),
                         Err(error) => {
                             return self
@@ -8272,7 +8351,7 @@ impl FromAsyncCoro {
                         }
                         return self.finish(Suspend::Done(state.array));
                     }
-                    let value = match i.get_member(&result, "value") {
+                    let value = match i.get_member_key(&result, "value") {
                         Ok(value) => value,
                         Err(error) => {
                             return self
@@ -8319,7 +8398,7 @@ impl FromAsyncCoro {
                         }
                         return self.finish(Suspend::Done(state.array));
                     }
-                    let value = match i.get_member(&state.source, &state.index.to_string()) {
+                    let value = match i.get_member_key(&state.source, &state.index.to_string()) {
                         Ok(value) => value,
                         Err(error) => {
                             return self
@@ -8389,7 +8468,7 @@ impl FromAsyncCoro {
 /// GetMethod with the well-known iterator key.
 fn from_async_get_method(i: &mut Interp, source: &Value, name: &str) -> Result<Value, Value> {
     let method = match well_known_key(i, name) {
-        Some(key) => ab(i.get_member(source, &key))?,
+        Some(key) => ab(i.get_member_key(source, &key))?,
         None => Value::Undefined,
     };
     if matches!(method, Value::Undefined | Value::Null) {
@@ -8426,7 +8505,7 @@ fn from_async_start(
         if !matches!(iterator, Value::Obj(_)) {
             return Err(i.make_error("TypeError", "iterator method returned a non-object"));
         }
-        let next = ab(i.get_member(&iterator, "next"))?;
+        let next = ab(i.get_member_key(&iterator, "next"))?;
         let array = if i.value_is_constructor(&ctor) {
             ab(i.construct(ctor, &[]))?
         } else {
@@ -8493,14 +8572,14 @@ fn from_async_sync_next(i: &mut Interp, iterator: &Value, next: &Value) -> Value
         i.reject_promise(&promise, error);
         return promise;
     }
-    let done = match i.get_member(&result, "done") {
+    let done = match i.get_member_key(&result, "done") {
         Ok(value) => i.to_boolean(&value),
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
             return promise;
         }
     };
-    let value = match i.get_member(&result, "value") {
+    let value = match i.get_member_key(&result, "value") {
         Ok(value) => value,
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
@@ -8531,7 +8610,7 @@ fn from_async_sync_next(i: &mut Interp, iterator: &Value, next: &Value) -> Value
 /// closeOnRejection=false, exactly as ECMA-262 §27.1.5.2.2 requires.
 fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
     let promise = i.new_promise();
-    let ret = match i.get_member(iterator, "return") {
+    let ret = match i.get_member_key(iterator, "return") {
         Ok(value) => value,
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
@@ -8560,14 +8639,14 @@ fn from_async_sync_close(i: &mut Interp, iterator: &Value) -> Value {
         i.reject_promise(&promise, error);
         return promise;
     }
-    let done = match i.get_member(&result, "done") {
+    let done = match i.get_member_key(&result, "done") {
         Ok(value) => i.to_boolean(&value),
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
             return promise;
         }
     };
-    let value = match i.get_member(&result, "value") {
+    let value = match i.get_member_key(&result, "value") {
         Ok(value) => value,
         Err(error) => {
             i.reject_promise(&promise, crate::interpreter::abrupt_value(error));
@@ -8747,7 +8826,13 @@ pub(crate) fn cdp_or_throw(
     };
     match r {
         Ok(true) => Ok(()),
-        Ok(false) => Err(i.make_error("TypeError", format!("cannot define element '{key}'"))),
+        Ok(false) => Err(i.make_error(
+            "TypeError",
+            format!(
+                "cannot define element '{}'",
+                crate::value::decode_string_key(key)
+            ),
+        )),
         Err(a) => Err(crate::interpreter::abrupt_value(a)),
     }
 }
@@ -8757,7 +8842,7 @@ pub(crate) fn cdp_or_throw(
 fn set_length_throw(i: &mut Interp, arr: &Value, n: f64) -> Result<(), Value> {
     let saved = i.strict;
     i.strict = true;
-    let r = i.set_member(arr, "length", Value::Num(n));
+    let r = i.set_member_key(arr, "length", Value::Num(n));
     i.strict = saved;
     r.map_err(crate::interpreter::abrupt_value)
 }
@@ -8770,7 +8855,7 @@ fn iter_some_every(i: &mut Interp, this: Value, a: &[Value], want: bool) -> Resu
         i.iterator_close(&this);
         return Err(i.make_error("TypeError", "predicate is not callable"));
     }
-    let next = ab(i.get_member(&this, "next"))?;
+    let next = ab(i.get_member_key(&this, "next"))?;
     let mut k = 0.0;
     let f = crate::callback::Callback::new(f);
     while let Some(v) = step_iter_with(i, &this, &next)? {
@@ -8812,7 +8897,7 @@ fn iterator_includes(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, 
             "skippedElements is outside the permitted range",
         ));
     }
-    let next = ab(i.get_member(&this, "next"))?;
+    let next = ab(i.get_member_key(&this, "next"))?;
     let mut skipped = 0.0;
     while let Some(value) = step_iter_with(i, &this, &next)? {
         if skipped < to_skip {
@@ -8840,7 +8925,7 @@ fn iterator_join(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Valu
             }
         },
     };
-    let next = ab(i.get_member(&this, "next"))?;
+    let next = ab(i.get_member_key(&this, "next"))?;
     let mut result = String::new();
     let mut first = true;
     while let Some(value) = step_iter_with(i, &this, &next)? {
@@ -8928,18 +9013,18 @@ fn make_iter_helper(i: &mut Interp, source: Value, kind: &str, f: Value) -> Resu
         .cloned();
     let obj = Object::new(proto);
     // GetIteratorDirect: read the source's `next` method exactly once, now.
-    let next = ab(i.get_member(&source, "next"))?;
-    set_builtin(&obj, "#\u{0}ih_next", next);
-    set_builtin(&obj, "#\u{0}ih_src", source);
-    set_builtin(&obj, "#\u{0}ih_kind", Value::lstr(kind));
-    set_builtin(&obj, "#\u{0}ih_fn", f.clone());
+    let next = ab(i.get_member_key(&source, "next"))?;
+    set_internal_slot(&obj, "#\u{0}ih_next", next);
+    set_internal_slot(&obj, "#\u{0}ih_src", source);
+    set_internal_slot(&obj, "#\u{0}ih_kind", Value::lstr(kind));
+    set_internal_slot(&obj, "#\u{0}ih_fn", f.clone());
     if let Some(n) = limit {
-        set_builtin(&obj, "#\u{0}ih_n", Value::Num(n));
-        set_builtin(&obj, "#\u{0}ih_started", Value::Bool(false));
+        set_internal_slot(&obj, "#\u{0}ih_n", Value::Num(n));
+        set_internal_slot(&obj, "#\u{0}ih_started", Value::Bool(false));
     }
-    set_builtin(&obj, "#\u{0}ih_count", Value::Num(0.0));
-    set_builtin(&obj, "#\u{0}ih_source_done", Value::Bool(false));
-    set_builtin(&obj, "#\u{0}ih_done", Value::Bool(false));
+    set_internal_slot(&obj, "#\u{0}ih_count", Value::Num(0.0));
+    set_internal_slot(&obj, "#\u{0}ih_source_done", Value::Bool(false));
+    set_internal_slot(&obj, "#\u{0}ih_done", Value::Bool(false));
     Ok(Value::Obj(obj))
 }
 
@@ -8974,43 +9059,43 @@ fn make_chunking_helper(
             return Err(i.make_error("TypeError", "invalid undersized mode"));
         }
     };
-    let next = ab(i.get_member(&source, "next"))?;
+    let next = ab(i.get_member_key(&source, "next"))?;
     let proto = i
         .extra_protos
         .get("%IteratorHelperPrototype%")
         .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
         .cloned();
     let obj = Object::new(proto);
-    set_builtin(&obj, "#\u{0}ih_next", next);
-    set_builtin(&obj, "#\u{0}ih_src", source);
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}ih_next", next);
+    set_internal_slot(&obj, "#\u{0}ih_src", source);
+    set_internal_slot(
         &obj,
         "#\u{0}ih_kind",
         Value::lstr(if is_windows { "windows" } else { "chunks" }),
     );
-    set_builtin(&obj, "#\u{0}ih_fn", Value::Undefined);
-    set_builtin(&obj, "#\u{0}ih_size", Value::Num(size));
-    set_builtin(&obj, "#\u{0}ih_undersized", Value::lstr(mode));
-    set_builtin(&obj, "#\u{0}ih_buf", i.make_array(Vec::new()));
-    set_builtin(&obj, "#\u{0}ih_source_done", Value::Bool(false));
-    set_builtin(&obj, "#\u{0}ih_count", Value::Num(0.0));
-    set_builtin(&obj, "#\u{0}ih_done", Value::Bool(false));
+    set_internal_slot(&obj, "#\u{0}ih_fn", Value::Undefined);
+    set_internal_slot(&obj, "#\u{0}ih_size", Value::Num(size));
+    set_internal_slot(&obj, "#\u{0}ih_undersized", Value::lstr(mode));
+    set_internal_slot(&obj, "#\u{0}ih_buf", i.make_array(Vec::new()));
+    set_internal_slot(&obj, "#\u{0}ih_source_done", Value::Bool(false));
+    set_internal_slot(&obj, "#\u{0}ih_count", Value::Num(0.0));
+    set_internal_slot(&obj, "#\u{0}ih_done", Value::Bool(false));
     Ok(Value::Obj(obj))
 }
 
 /// %IteratorHelperPrototype%.return: closes the underlying iterator once.
 fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("#\u{0}ih_kind")) {
+    if !matches!(&this, Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind")) {
         return Err(i.make_error("TypeError", "return called on an incompatible receiver"));
     }
-    let running = ab(i.get_member(&this, "#\u{0}ih_running"))?;
+    let running = ab(i.get_internal_slot(&this, "#\u{0}ih_running"))?;
     if i.to_boolean(&running) {
         return Err(i.make_error("TypeError", "iterator helper is already running"));
     }
-    let done = ab(i.get_member(&this, "#\u{0}ih_done"))?;
+    let done = ab(i.get_internal_slot(&this, "#\u{0}ih_done"))?;
     if !i.to_boolean(&done) {
         let o = this.as_obj().unwrap().clone();
-        let started = ab(i.get_member(&this, "#\u{0}ih_gstarted"))?;
+        let started = ab(i.get_internal_slot(&this, "#\u{0}ih_gstarted"))?;
         let started = i.to_boolean(&started);
         if started {
             // Suspended at a yield: the close runs in the executing state.
@@ -9021,13 +9106,13 @@ fn iter_helper_return(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value
         }
         let res = (|i: &mut Interp| -> Result<(), Value> {
             // A helper suspended inside a flatMap inner iterator closes it first.
-            let inner = ab(i.get_member(&this, "#\u{0}ih_inner"))?;
+            let inner = ab(i.get_internal_slot(&this, "#\u{0}ih_inner"))?;
             if matches!(inner, Value::Obj(_)) {
                 ab(i.iterator_close_normal(&inner))?;
             }
-            let source_done = ab(i.get_member(&this, "#\u{0}ih_source_done"))?;
+            let source_done = ab(i.get_internal_slot(&this, "#\u{0}ih_source_done"))?;
             if !i.to_boolean(&source_done) {
-                let src = ab(i.get_member(&this, "#\u{0}ih_src"))?;
+                let src = ab(i.get_internal_slot(&this, "#\u{0}ih_src"))?;
                 // A normal return() propagates an error from the source's return method.
                 ab(i.iterator_close_normal(&src))?;
             }
@@ -9100,7 +9185,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     let options = arg(a, 1);
     let mode = match &options {
         Value::Undefined => "shortest".to_string(),
-        Value::Obj(_) => match ab(i.get_member(&options, "mode"))? {
+        Value::Obj(_) => match ab(i.get_member_key(&options, "mode"))? {
             Value::Undefined => "shortest".to_string(),
             Value::Str(m) if matches!(&*m.to_string(), "shortest" | "longest" | "strict") => {
                 m.to_string()
@@ -9111,7 +9196,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     // The padding option is read (and type-checked) before the inputs are opened.
     let padding_value = if mode == "longest" && matches!(&options, Value::Obj(_)) {
-        let p = ab(i.get_member(&options, "padding"))?;
+        let p = ab(i.get_member_key(&options, "padding"))?;
         if !matches!(p, Value::Undefined | Value::Obj(_)) {
             return Err(i.make_error("TypeError", "Iterator.zip padding is not an object"));
         }
@@ -9129,7 +9214,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                     nexts: &mut Vec<Value>|
      -> Result<(), Value> {
         let iter = get_iterator_flattenable(i, v, false)?;
-        let next = ab(i.get_member(&iter, "next"))?;
+        let next = ab(i.get_member_key(&iter, "next"))?;
         iters.push(iter);
         nexts.push(next);
         Ok(())
@@ -9156,7 +9241,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             let o = input.as_obj().unwrap();
             ordinary_own_keys_ordered(i, o)?
                 .into_iter()
-                .map(crate::value::PropertyKey::string)
+                .map(crate::value::PropertyKey::stored)
                 .collect()
         };
         for k in all_keys {
@@ -9165,7 +9250,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
                 match proxy_gopd_value(i, &t, &h, &k) {
                     Ok(Value::Undefined) => false,
                     Ok(d) => {
-                        let ev = ab(i.get_member(&d, "enumerable"))?;
+                        let ev = ab(i.get_member_key(&d, "enumerable"))?;
                         i.to_boolean(&ev)
                     }
                     Err(e) => {
@@ -9189,7 +9274,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             if !enumerable {
                 continue;
             }
-            let v = match ab(i.get_member(&input, &k)) {
+            let v = match ab(i.get_member_key(&input, &k)) {
                 Ok(v) => v,
                 Err(e) => {
                     close_setup(i, &iters, None);
@@ -9234,7 +9319,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     if mode == "longest" && !matches!(padding_value, Value::Undefined) {
         if keyed {
             for (j, k) in keys.iter().enumerate() {
-                match ab(i.get_member(&padding_value, k)) {
+                match ab(i.get_member_key(&padding_value, k)) {
                     Ok(v) => padding[j] = v,
                     Err(e) => {
                         close_setup(i, &iters, None);
@@ -9281,34 +9366,34 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
             .cloned(),
     );
-    set_builtin(&obj, "#\u{0}zip_iters", i.make_array(iters));
-    set_builtin(&obj, "#\u{0}zip_nexts", i.make_array(nexts));
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}zip_iters", i.make_array(iters));
+    set_internal_slot(&obj, "#\u{0}zip_nexts", i.make_array(nexts));
+    set_internal_slot(
         &obj,
         "#\u{0}zip_state",
         i.make_array(vec![Value::Bool(false); n_iters]),
     );
-    set_builtin(&obj, "#\u{0}zip_mode", Value::lstr(mode.clone()));
-    set_builtin(&obj, "#\u{0}zip_pad", i.make_array(padding));
-    set_builtin(&obj, "#\u{0}zip_finished", Value::Bool(false));
+    set_internal_slot(&obj, "#\u{0}zip_mode", Value::lstr(mode.clone()));
+    set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding));
+    set_internal_slot(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
         let karr = i.make_array(keys.into_iter().map(|key| key.into_value()).collect());
-        set_builtin(&obj, "#\u{0}zip_keys", karr);
+        set_internal_slot(&obj, "#\u{0}zip_keys", karr);
     }
     i.def_method(&obj, "next", 0, zip_next);
     // return(): close every still-open input in reverse order; the close runs in the executing
     // state, and the first close error wins (later ones are swallowed).
     i.def_method(&obj, "return", 0, |i, this, _a| {
-        let finished = ab(i.get_member(&this, "#\u{0}zip_finished"))?;
+        let finished = ab(i.get_internal_slot(&this, "#\u{0}zip_finished"))?;
         if i.to_boolean(&finished) {
             return Ok(iter_result(i, Value::Undefined, true));
         }
-        let running = ab(i.get_member(&this, "#\u{0}zip_running"))?;
+        let running = ab(i.get_internal_slot(&this, "#\u{0}zip_running"))?;
         if i.to_boolean(&running) {
             return Err(i.make_error("TypeError", "Iterator.zip iterator is already running"));
         }
         let o = this.as_obj().unwrap().clone();
-        let started = ab(i.get_member(&this, "#\u{0}zip_started"))?;
+        let started = ab(i.get_internal_slot(&this, "#\u{0}zip_started"))?;
         let res = if i.to_boolean(&started) {
             // Suspended at a yield: the close runs in the executing state and the
             // generator completes afterwards.
@@ -9372,20 +9457,20 @@ pub(crate) fn ordinary_own_keys_ordered(i: &mut Interp, o: &Gc) -> Result<Vec<St
 /// error (`err`) all close errors are swallowed and the pending error is returned; on a normal
 /// completion the first close error wins (later closes still run but are swallowed).
 fn zip_close_open(i: &mut Interp, this: &Value, err: Option<Value>) -> Result<(), Value> {
-    let iters = ab(i.get_member(this, "#\u{0}zip_iters"))?;
-    let state = ab(i.get_member(this, "#\u{0}zip_state"))?;
+    let iters = ab(i.get_internal_slot(this, "#\u{0}zip_iters"))?;
+    let state = ab(i.get_internal_slot(this, "#\u{0}zip_state"))?;
     let n = match &iters {
         Value::Obj(o) => i.array_length(o),
         _ => 0,
     };
     let mut pending = err;
     for j in (0..n).rev() {
-        let closed = ab(i.get_member(&state, &j.to_string()))?;
+        let closed = ab(i.get_member_key(&state, &j.to_string()))?;
         if i.to_boolean(&closed) {
             continue;
         }
-        ab(i.set_member(&state, &j.to_string(), Value::Bool(true)))?;
-        let it = ab(i.get_member(&iters, &j.to_string()))?;
+        ab(i.set_member_key(&state, &j.to_string(), Value::Bool(true)))?;
+        let it = ab(i.get_member_key(&iters, &j.to_string()))?;
         if pending.is_some() {
             i.iterator_close(&it);
         } else if let Err(e) = i.iterator_close_normal(&it) {
@@ -9400,11 +9485,11 @@ fn zip_close_open(i: &mut Interp, this: &Value, err: Option<Value>) -> Result<()
 
 fn zip_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     // GeneratorValidate: re-entering the running zip iterator throws.
-    let running = ab(i.get_member(&this, "#\u{0}zip_running"))?;
+    let running = ab(i.get_internal_slot(&this, "#\u{0}zip_running"))?;
     if i.to_boolean(&running) {
         return Err(i.make_error("TypeError", "Iterator.zip iterator is already running"));
     }
-    let finished = ab(i.get_member(&this, "#\u{0}zip_finished"))?;
+    let finished = ab(i.get_internal_slot(&this, "#\u{0}zip_finished"))?;
     if i.to_boolean(&finished) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
@@ -9430,11 +9515,11 @@ fn zip_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
 
 /// One lockstep round of the zip closure.
 fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
-    let iters = ab(i.get_member(&this, "#\u{0}zip_iters"))?;
-    let nexts = ab(i.get_member(&this, "#\u{0}zip_nexts"))?;
-    let state = ab(i.get_member(&this, "#\u{0}zip_state"))?;
-    let pad = ab(i.get_member(&this, "#\u{0}zip_pad"))?;
-    let mode_v = ab(i.get_member(&this, "#\u{0}zip_mode"))?;
+    let iters = ab(i.get_internal_slot(&this, "#\u{0}zip_iters"))?;
+    let nexts = ab(i.get_internal_slot(&this, "#\u{0}zip_nexts"))?;
+    let state = ab(i.get_internal_slot(&this, "#\u{0}zip_state"))?;
+    let pad = ab(i.get_internal_slot(&this, "#\u{0}zip_pad"))?;
+    let mode_v = ab(i.get_internal_slot(&this, "#\u{0}zip_mode"))?;
     let mode = ab(i.to_string(&mode_v))?.to_string();
     let n = match &iters {
         Value::Obj(o) => i.array_length(o),
@@ -9444,18 +9529,18 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         return Ok(iter_result(i, Value::Undefined, true));
     }
     let mark = |i: &mut Interp, state: &Value, j: usize| -> Result<(), Value> {
-        ab(i.set_member(state, &j.to_string(), Value::Bool(true)))
+        ab(i.set_member_key(state, &j.to_string(), Value::Bool(true)))
     };
     let mut values = vec![Value::Undefined; n];
     for j in 0..n {
-        let closed = ab(i.get_member(&state, &j.to_string()))?;
+        let closed = ab(i.get_member_key(&state, &j.to_string()))?;
         if i.to_boolean(&closed) {
             // An exhausted input in `longest` mode contributes its padding value.
-            values[j] = ab(i.get_member(&pad, &j.to_string()))?;
+            values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
             continue;
         }
-        let it = ab(i.get_member(&iters, &j.to_string()))?;
-        let nx = ab(i.get_member(&nexts, &j.to_string()))?;
+        let it = ab(i.get_member_key(&iters, &j.to_string()))?;
+        let nx = ab(i.get_member_key(&nexts, &j.to_string()))?;
         match step_iter_with(i, &it, &nx) {
             Ok(Some(v)) => values[j] = v,
             Ok(None) => {
@@ -9476,8 +9561,8 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         // The first input finished: every other input must be done too
                         // (checked with IteratorStep — `done` is read, values are not).
                         for k in 1..n {
-                            let kit = ab(i.get_member(&iters, &k.to_string()))?;
-                            let knx = ab(i.get_member(&nexts, &k.to_string()))?;
+                            let kit = ab(i.get_member_key(&iters, &k.to_string()))?;
+                            let knx = ab(i.get_member_key(&nexts, &k.to_string()))?;
                             let res = (|i: &mut Interp| -> Result<bool, Value> {
                                 if !knx.is_callable() {
                                     return Err(i.make_error(
@@ -9492,7 +9577,7 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                                         "iterator result is not an object",
                                     ));
                                 }
-                                let d = ab(i.get_member(&r, "done"))?;
+                                let d = ab(i.get_member_key(&r, "done"))?;
                                 Ok(i.to_boolean(&d))
                             })(i);
                             match res {
@@ -9514,10 +9599,10 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                     }
                     _ => {
                         // longest: exhausted inputs are padded; finish when all are done.
-                        values[j] = ab(i.get_member(&pad, &j.to_string()))?;
+                        values[j] = ab(i.get_member_key(&pad, &j.to_string()))?;
                         let mut any_open = false;
                         for k in 0..n {
-                            let c = ab(i.get_member(&state, &k.to_string()))?;
+                            let c = ab(i.get_member_key(&state, &k.to_string()))?;
                             if !i.to_boolean(&c) {
                                 any_open = true;
                                 break;
@@ -9536,11 +9621,11 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
         }
     }
     // finishResults: zip yields an Array; zipKeyed a null-prototype object keyed like the input.
-    let keys = ab(i.get_member(&this, "#\u{0}zip_keys"))?;
+    let keys = ab(i.get_internal_slot(&this, "#\u{0}zip_keys"))?;
     let result = if matches!(keys, Value::Obj(_)) {
         let o = Object::new(None);
         for (j, v) in values.into_iter().enumerate() {
-            let k = ab(i.get_member(&keys, &j.to_string()))?;
+            let k = ab(i.get_member_key(&keys, &j.to_string()))?;
             let k = ab(i.to_property_key(&k))?;
             o.borrow_mut()
                 .props
@@ -9556,11 +9641,11 @@ fn zip_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
 /// `Iterator.concat`'s iterator: opens each captured iterable in order and yields its values.
 fn concat_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     // GeneratorValidate: re-entering the running concat iterator throws.
-    let running = ab(i.get_member(&this, "#\u{0}cc_running"))?;
+    let running = ab(i.get_internal_slot(&this, "#\u{0}cc_running"))?;
     if i.to_boolean(&running) {
         return Err(i.make_error("TypeError", "Iterator.concat iterator is already running"));
     }
-    let done = ab(i.get_member(&this, "#\u{0}cc_done"))?;
+    let done = ab(i.get_internal_slot(&this, "#\u{0}cc_done"))?;
     if i.to_boolean(&done) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
@@ -9586,12 +9671,12 @@ fn concat_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value
 
 fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
     loop {
-        let cur = ab(i.get_member(&this, "#\u{0}cc_cur"))?;
+        let cur = ab(i.get_internal_slot(&this, "#\u{0}cc_cur"))?;
         if matches!(cur, Value::Undefined) {
             // Open the next item's iterator (or finish).
-            let idx = ab(i.get_member(&this, "#\u{0}cc_idx"))?;
+            let idx = ab(i.get_internal_slot(&this, "#\u{0}cc_idx"))?;
             let idx = ab(i.to_number(&idx))? as usize;
-            let methods = ab(i.get_member(&this, "#\u{0}cc_methods"))?;
+            let methods = ab(i.get_internal_slot(&this, "#\u{0}cc_methods"))?;
             let mlen = match &methods {
                 Value::Obj(o) => i.array_length(o),
                 _ => 0,
@@ -9599,14 +9684,14 @@ fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             if idx >= mlen {
                 return Ok(iter_result(i, Value::Undefined, true));
             }
-            let items = ab(i.get_member(&this, "#\u{0}cc_items"))?;
-            let item = ab(i.get_member(&items, &idx.to_string()))?;
-            let method = ab(i.get_member(&methods, &idx.to_string()))?;
+            let items = ab(i.get_internal_slot(&this, "#\u{0}cc_items"))?;
+            let item = ab(i.get_member_key(&items, &idx.to_string()))?;
+            let method = ab(i.get_member_key(&methods, &idx.to_string()))?;
             let iter = ab(i.call(method, item, &[]))?;
             if !matches!(iter, Value::Obj(_)) {
                 return Err(i.make_error("TypeError", "@@iterator did not return an object"));
             }
-            let next = ab(i.get_member(&iter, "next"))?;
+            let next = ab(i.get_member_key(&iter, "next"))?;
             set_internal(this.as_obj().unwrap(), "#\u{0}cc_cur", iter);
             set_internal(this.as_obj().unwrap(), "#\u{0}cc_curnext", next);
             set_internal(
@@ -9615,8 +9700,8 @@ fn concat_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                 Value::Num((idx + 1) as f64),
             );
         }
-        let cur = ab(i.get_member(&this, "#\u{0}cc_cur"))?;
-        let next = ab(i.get_member(&this, "#\u{0}cc_curnext"))?;
+        let cur = ab(i.get_internal_slot(&this, "#\u{0}cc_cur"))?;
+        let next = ab(i.get_internal_slot(&this, "#\u{0}cc_curnext"))?;
         match step_iter_with(i, &cur, &next)? {
             Some(v) => return Ok(iter_result(i, v, false)),
             None => set_internal(this.as_obj().unwrap(), "#\u{0}cc_cur", Value::Undefined),
@@ -9639,7 +9724,7 @@ fn get_iterator_flattenable(
         .clone()
         .map(|s| Interp::sym_key(&s))
         .unwrap_or_default();
-    let itf = ab(i.get_member(v, &iter_key))?;
+    let itf = ab(i.get_member_key(v, &iter_key))?;
     let iter = if matches!(itf, Value::Undefined | Value::Null) {
         v.clone()
     } else if itf.is_callable() {
@@ -9656,17 +9741,17 @@ fn get_iterator_flattenable(
 fn iter_helper_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     // Brand check: only real iterator-helper objects carry the [[UnderlyingIterator]] slots (a
     // generator also inherits from %IteratorPrototype% but must be rejected here).
-    if !matches!(&this, Value::Obj(o) if o.borrow().props.contains("#\u{0}ih_kind") || o.borrow().props.contains("#\u{0}zip_iters"))
+    if !matches!(&this, Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}ih_kind") || o.borrow().internal_slots().contains("#\u{0}zip_iters"))
     {
         return Err(i.make_error("TypeError", "next called on an incompatible receiver"));
     }
     // GeneratorValidate: re-entering a running helper throws.
-    let running = ab(i.get_member(&this, "#\u{0}ih_running"))?;
+    let running = ab(i.get_internal_slot(&this, "#\u{0}ih_running"))?;
     if i.to_boolean(&running) {
         return Err(i.make_error("TypeError", "iterator helper is already running"));
     }
     // A helper that has already finished stays done (and never re-touches the source).
-    let done = ab(i.get_member(&this, "#\u{0}ih_done"))?;
+    let done = ab(i.get_internal_slot(&this, "#\u{0}ih_done"))?;
     if i.to_boolean(&done) {
         return Ok(iter_result(i, Value::Undefined, true));
     }
@@ -9692,12 +9777,12 @@ fn iter_helper_next(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
 }
 
 fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
-    let src = ab(i.get_member(&this, "#\u{0}ih_src"))?;
-    let inext = ab(i.get_member(&this, "#\u{0}ih_next"))?;
-    let kind_v = ab(i.get_member(&this, "#\u{0}ih_kind"))?;
+    let src = ab(i.get_internal_slot(&this, "#\u{0}ih_src"))?;
+    let inext = ab(i.get_internal_slot(&this, "#\u{0}ih_next"))?;
+    let kind_v = ab(i.get_internal_slot(&this, "#\u{0}ih_kind"))?;
     let kind = ab(i.to_string(&kind_v))?;
-    let f = ab(i.get_member(&this, "#\u{0}ih_fn"))?;
-    let count_v = ab(i.get_member(&this, "#\u{0}ih_count"))?;
+    let f = ab(i.get_internal_slot(&this, "#\u{0}ih_fn"))?;
+    let count_v = ab(i.get_internal_slot(&this, "#\u{0}ih_count"))?;
     let count = ab(i.to_number(&count_v))?;
     match &*kind {
         "map" => match step_iter_with(i, &src, &inext)? {
@@ -9745,7 +9830,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
         }
         "take" => {
-            let nv = ab(i.get_member(&this, "#\u{0}ih_n"))?;
+            let nv = ab(i.get_internal_slot(&this, "#\u{0}ih_n"))?;
             let n = ab(i.to_number(&nv))?;
             if count >= n {
                 set_internal(this.as_obj().unwrap(), "#\u{0}ih_done", Value::Bool(true));
@@ -9763,10 +9848,10 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
         }
         "drop" => {
-            let started_v = ab(i.get_member(&this, "#\u{0}ih_started"))?;
+            let started_v = ab(i.get_internal_slot(&this, "#\u{0}ih_started"))?;
             let started = i.to_boolean(&started_v);
             if !started {
-                let nv = ab(i.get_member(&this, "#\u{0}ih_n"))?;
+                let nv = ab(i.get_internal_slot(&this, "#\u{0}ih_n"))?;
                 let n = ab(i.to_number(&nv))?;
                 let mut skipped = 0.0;
                 while skipped < n {
@@ -9792,11 +9877,11 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
         }
         "chunks" => {
-            let source_done = ab(i.get_member(&this, "#\u{0}ih_source_done"))?;
+            let source_done = ab(i.get_internal_slot(&this, "#\u{0}ih_source_done"))?;
             if i.to_boolean(&source_done) {
                 return Ok(iter_result(i, Value::Undefined, true));
             }
-            let size = ab(i.get_member(&this, "#\u{0}ih_size"))?;
+            let size = ab(i.get_internal_slot(&this, "#\u{0}ih_size"))?;
             let size = ab(i.to_number(&size))? as usize;
             let mut buffer = Vec::with_capacity(size.min(1024));
             loop {
@@ -9823,13 +9908,13 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
         }
         "windows" => {
-            let source_done = ab(i.get_member(&this, "#\u{0}ih_source_done"))?;
+            let source_done = ab(i.get_internal_slot(&this, "#\u{0}ih_source_done"))?;
             if i.to_boolean(&source_done) {
                 return Ok(iter_result(i, Value::Undefined, true));
             }
-            let size = ab(i.get_member(&this, "#\u{0}ih_size"))?;
+            let size = ab(i.get_internal_slot(&this, "#\u{0}ih_size"))?;
             let size = ab(i.to_number(&size))? as usize;
-            let stored = ab(i.get_member(&this, "#\u{0}ih_buf"))?;
+            let stored = ab(i.get_internal_slot(&this, "#\u{0}ih_buf"))?;
             let mut buffer = match stored {
                 Value::Obj(o) => {
                     let len = i.array_length(&o);
@@ -9868,7 +9953,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                             "#\u{0}ih_source_done",
                             Value::Bool(true),
                         );
-                        let mode = ab(i.get_member(&this, "#\u{0}ih_undersized"))?;
+                        let mode = ab(i.get_internal_slot(&this, "#\u{0}ih_undersized"))?;
                         let allow_partial =
                             matches!(mode, Value::Str(s) if s.to_string() == "allow-partial");
                         return if allow_partial && !buffer.is_empty() && buffer.len() < size {
@@ -9888,9 +9973,9 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             let mut c = count;
             loop {
                 // Drain the active inner iterator first (lazily — it may be infinite).
-                let inner = ab(i.get_member(&this, "#\u{0}ih_inner"))?;
+                let inner = ab(i.get_internal_slot(&this, "#\u{0}ih_inner"))?;
                 if matches!(inner, Value::Obj(_)) {
-                    let inext = ab(i.get_member(&this, "#\u{0}ih_inner_next"))?;
+                    let inext = ab(i.get_internal_slot(&this, "#\u{0}ih_inner_next"))?;
                     match step_iter_with(i, &inner, &inext) {
                         Ok(Some(v)) => return Ok(iter_result(i, v, false)),
                         Ok(None) => {
@@ -9925,7 +10010,7 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         // GetIteratorFlattenable (reject primitives), fetching `next` once.
                         let opened = (|i: &mut Interp| -> Result<(Value, Value), Value> {
                             let it = get_iterator_flattenable(i, &mapped, false)?;
-                            let n = ab(i.get_member(&it, "next"))?;
+                            let n = ab(i.get_member_key(&it, "next"))?;
                             Ok((it, n))
                         })(i);
                         match opened {
@@ -10245,7 +10330,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
             }
             // LengthOfArrayLike through [[Get]], so a proxy target's traps are honored.
             Value::Obj(_) => {
-                let lv = ab(i.get_member(&target, "length"))?;
+                let lv = ab(i.get_member_key(&target, "length"))?;
                 let n = ab(i.to_number(&lv))?;
                 if n.is_nan() || n <= 0.0 {
                     0
@@ -10291,8 +10376,8 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
             Value::Obj(object) => i
                 .fast_get_elem(object, idx as f64)
                 .map(Ok)
-                .unwrap_or_else(|| i.get_member(&target, &idx.to_string())),
-            _ => i.get_member(&target, &idx.to_string()),
+                .unwrap_or_else(|| i.get_member_key(&target, &idx.to_string())),
+            _ => i.get_member_key(&target, &idx.to_string()),
         })?
     };
     let value = match kind {
@@ -10638,7 +10723,7 @@ fn is_js_ws(c: char) -> bool {
 fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
     if let Value::Obj(o) = v {
         if let Some(k) = well_known_key(i, "match") {
-            let m = ab(i.get_member(v, &k))?;
+            let m = ab(i.get_member_key(v, &k))?;
             if !matches!(m, Value::Undefined | Value::Null) {
                 return Ok(i.to_boolean(&m));
             }
@@ -10692,7 +10777,7 @@ pub(crate) fn nf_string_replace(
     let search = arg(args, 0);
     if matches!(search, Value::Obj(_)) {
         if let Some(key) = well_known_key(i, "replace") {
-            let replacer = ab(i.get_member(&search, &key))?;
+            let replacer = ab(i.get_member_key(&search, &key))?;
             if !matches!(replacer, Value::Undefined | Value::Null) {
                 if !replacer.is_callable() {
                     return Err(i.make_error("TypeError", "@@replace is not callable"));
@@ -10765,7 +10850,7 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     let regexp = arg(a, 0);
     if matches!(regexp, Value::Obj(_)) {
         if let Some(key) = well_known_key(i, "match") {
-            let matcher = ab(i.get_member(&regexp, &key))?;
+            let matcher = ab(i.get_member_key(&regexp, &key))?;
             if !matches!(matcher, Value::Undefined | Value::Null) {
                 if !matcher.is_callable() {
                     return Err(i.make_error("TypeError", "@@match is not callable"));
@@ -10783,7 +10868,7 @@ pub(crate) fn nf_string_match(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     };
     let rx = ab(i.make_regexp(&pattern, ""))?;
     let key = well_known_key(i, "match").unwrap();
-    let matcher = ab(i.get_member(&rx, &key))?;
+    let matcher = ab(i.get_member_key(&rx, &key))?;
     ab(i.call(matcher, rx, &[Value::Str(s)]))
 }
 
@@ -10798,7 +10883,7 @@ pub(crate) fn nf_string_split(i: &mut Interp, this: Value, args: &[Value]) -> Re
     let separator = arg(args, 0);
     if matches!(separator, Value::Obj(_)) {
         if let Some(key) = well_known_key(i, "split") {
-            let splitter = ab(i.get_member(&separator, &key))?;
+            let splitter = ab(i.get_member_key(&separator, &key))?;
             if !matches!(splitter, Value::Undefined | Value::Null) {
                 if !splitter.is_callable() {
                     return Err(i.make_error("TypeError", "@@split is not callable"));
@@ -11534,7 +11619,7 @@ fn install_string(it: &mut Interp) {
         let regexp = arg(a, 0);
         if matches!(regexp, Value::Obj(_)) {
             if let Some(key) = well_known_key(i, "search") {
-                let searcher = ab(i.get_member(&regexp, &key))?;
+                let searcher = ab(i.get_member_key(&regexp, &key))?;
                 if !matches!(searcher, Value::Undefined | Value::Null) {
                     if !searcher.is_callable() {
                         return Err(i.make_error("TypeError", "@@search is not callable"));
@@ -11552,7 +11637,7 @@ fn install_string(it: &mut Interp) {
         };
         let rx = ab(i.make_regexp(&pattern, ""))?;
         let key = well_known_key(i, "search").unwrap();
-        let searcher = ab(i.get_member(&rx, &key))?;
+        let searcher = ab(i.get_member_key(&rx, &key))?;
         ab(i.call(searcher, rx, &[Value::Str(s)]))
     });
     it.def_method(&sp, "matchAll", 1, |i, this, a| {
@@ -11567,7 +11652,7 @@ fn install_string(it: &mut Interp) {
         if !matches!(regexp, Value::Undefined | Value::Null) {
             // A RegExp argument must be global; then dispatch to its @@matchAll if present.
             if arg_is_regexp(i, &regexp)? {
-                let flags = ab(i.get_member(&regexp, "flags"))?;
+                let flags = ab(i.get_member_key(&regexp, "flags"))?;
                 if matches!(flags, Value::Undefined | Value::Null) {
                     return Err(i.make_error("TypeError", "regexp.flags is null or undefined"));
                 }
@@ -11582,7 +11667,7 @@ fn install_string(it: &mut Interp) {
             // Only an Object's @@matchAll is consulted; a primitive goes to the string path.
             if matches!(regexp, Value::Obj(_)) {
                 if let Some(key) = well_known_key(i, "matchAll") {
-                    let matcher = ab(i.get_member(&regexp, &key))?;
+                    let matcher = ab(i.get_member_key(&regexp, &key))?;
                     if !matches!(matcher, Value::Undefined | Value::Null) {
                         if !matcher.is_callable() {
                             return Err(i.make_error("TypeError", "@@matchAll is not callable"));
@@ -11601,7 +11686,7 @@ fn install_string(it: &mut Interp) {
         };
         let rx = ab(i.make_regexp(&pattern, "g"))?;
         let key = well_known_key(i, "matchAll").unwrap();
-        let matcher = ab(i.get_member(&rx, &key))?;
+        let matcher = ab(i.get_member_key(&rx, &key))?;
         ab(i.call(matcher, rx, &[Value::Str(s)]))
     });
     it.def_method(&sp, "replace", 2, nf_string_replace);
@@ -11621,7 +11706,7 @@ fn install_string(it: &mut Interp) {
             // A RegExp search value must be global: read `flags`, require it coercible, and check
             // for "g" — a non-global (or missing-flags) regexp is a TypeError.
             if arg_is_regexp(i, &search)? {
-                let flags = ab(i.get_member(&search, "flags"))?;
+                let flags = ab(i.get_member_key(&search, "flags"))?;
                 if matches!(flags, Value::Undefined | Value::Null) {
                     return Err(i.make_error("TypeError", "regexp flags is null or undefined"));
                 }
@@ -11635,7 +11720,7 @@ fn install_string(it: &mut Interp) {
             }
             // GetMethod(search, @@replace): if present, delegate with the raw receiver O.
             if let Some(key) = well_known_key(i, "replace") {
-                let replacer = ab(i.get_member(&search, &key))?;
+                let replacer = ab(i.get_member_key(&search, &key))?;
                 if !matches!(replacer, Value::Undefined | Value::Null) {
                     if !replacer.is_callable() {
                         return Err(i.make_error("TypeError", "@@replace is not callable"));
@@ -11797,13 +11882,13 @@ fn install_string(it: &mut Interp) {
     it.def_method(&ctor, "fromCharCode", 1, nf_from_char_code);
     it.def_method(&ctor, "raw", 1, |i, _this, args| {
         let template = arg(args, 0);
-        let raw = ab(i.get_member(&template, "raw"))?;
+        let raw = ab(i.get_member_key(&template, "raw"))?;
         let raw_obj =
             this_obj(&raw).ok_or_else(|| i.make_error("TypeError", "raw is not an object"))?;
         let len = ab(i.to_length(&raw_obj))?;
         let mut out = String::new();
         for k in 0..len {
-            let seg = ab(i.get_member(&raw, &k.to_string()))?;
+            let seg = ab(i.get_member_key(&raw, &k.to_string()))?;
             let piece = ab(i.to_string(&seg))?;
             push_str_checked(i, &mut out, &piece)?;
             if k + 1 < len {
@@ -11956,7 +12041,7 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
             _ => "",
         };
         if !key.is_empty() {
-            match i.get_member(&nt, "prototype") {
+            match i.get_member_key(&nt, "prototype") {
                 Ok(Value::Obj(p)) => o.borrow_mut().proto = Some(p),
                 Ok(_) => {
                     if let Some(p) = ctor_realm_proto(i, &nt, key)? {

@@ -46,8 +46,8 @@ fn for_in_cache_distinguishes_foreign_heaps_and_mixed_prototypes() {
         reader.set_tier(tier);
         reader.set_tier_threshold(0);
         let global = reader.global_this();
-        assert!(reader.ctx().set_member(&global, "first", a).is_ok());
-        assert!(reader.ctx().set_member(&global, "second", b).is_ok());
+        assert!(reader.ctx().set_member_key(&global, "first", a).is_ok());
+        assert!(reader.ctx().set_member_key(&global, "second", b).is_ok());
         assert_eq!(run(&mut reader, "function keys(o){var out='';for(var k in o)out+=k+',';return out;}keys(first)+'|'+keys(second)+'|'+keys(first)"),
             "alpha,|beta,|alpha,", "{tier:?}");
         assert_eq!(run(&mut reader, "var a=Object.create(first),b=Object.create(second);a.own=1;b.own=2;keys(a)+'|'+keys(b)+'|'+keys(a)"),
@@ -65,7 +65,7 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
     let _foreign_shape = owned_value(&mut foreign, "({beta:1})");
     assert!(foreign
         .ctx()
-        .set_member(&original, "delta", Value::Num(3.0))
+        .set_member_key(&original, "delta", Value::Num(3.0))
         .is_ok());
     assert_ne!(
         original.as_obj().unwrap().borrow().props.shape(),

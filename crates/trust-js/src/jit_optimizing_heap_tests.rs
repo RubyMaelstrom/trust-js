@@ -124,6 +124,7 @@ fn native_elements_cover_inline_vector_and_classic_dense_storage() {
     for initializer in [
         "[1,2,3]",
         "[1,2,3,4,5,6,7,8,9,10,11,12]",
+        "(function(){var a=[0,1,2,3,4,5,6,7,8,9,10,11,12];a.shift();return a;})()",
         "({'0':1,'1':2,'2':3})",
     ] {
         let source = format!(
@@ -557,7 +558,8 @@ fn native_heap_transfers_remain_canonical_at_reentrant_gc_boundaries() {
     tests::check_with_installer(
         r#"
         function subject() {
-            var row={value:makeOwner()},a=[row.value];row.value=null;
+            var row={value:makeOwner()},a=[0,row.value,2,3,4,5,6,7,8,9,10,11,12];
+            a.shift();row.value=null;
             for(var k=0;k<16;k++) {
                 row.value=a[0];a[0]=null;collectOwners();
                 a[0]=row.value;row.value=null;collectOwners();

@@ -5,7 +5,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "NumberFormat", 0, construct);
@@ -161,7 +161,7 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
         // Cache a bound function on the instance so repeated reads return the same object.
         if let Some(f) = o
             .borrow()
-            .props
+            .internal_slots()
             .get("#\u{0}nf_boundformat")
             .map(|p| p.value())
         {
@@ -170,7 +170,7 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
         let f = i.make_native("", 1, |i, that, a| format_number(i, &that, &arg(a, 0)));
         // Bind `this` = the (possibly unwrapped) NumberFormat instance.
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_builtin(&o, "#\u{0}nf_boundformat", bound.clone());
+        set_internal_slot(&o, "#\u{0}nf_boundformat", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -182,7 +182,7 @@ fn install_format_getter(it: &mut Interp, proto: &Gc) {
 /// Bind `this_arg` onto `target` via Function.prototype.bind, then normalise the result to match the
 /// spec's `format`/`compare` bound functions: name `""`, length 1, and not a constructor.
 pub(crate) fn bind_this(i: &mut Interp, target: Value, this_arg: Value) -> Value {
-    if let Ok(bindfn) = i.get_member(&target, "bind") {
+    if let Ok(bindfn) = i.get_member_key(&target, "bind") {
         if let Ok(bound) = i.call(bindfn, target.clone(), &[this_arg]) {
             if let Value::Obj(o) = &bound {
                 o.borrow_mut().is_constructor = false;
@@ -307,7 +307,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     let raw_digits = read_raw_digits(i, &options)?;
 
     let rounding_increment = {
-        let v = ab(i.get_member(&options, "roundingIncrement"))?;
+        let v = ab(i.get_member_key(&options, "roundingIncrement"))?;
         if matches!(v, Value::Undefined) {
             1u32
         } else {
@@ -403,53 +403,53 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.NumberFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}nf", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}nf_locale", Value::lstr(resolved_locale));
-    set_builtin(&obj, "#\u{0}nf_nu", Value::lstr(numbering));
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}nf", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}nf_locale", Value::lstr(resolved_locale));
+    set_internal_slot(&obj, "#\u{0}nf_nu", Value::lstr(numbering));
+    set_internal_slot(
         &obj,
         "#\u{0}nf_roundingincrement",
         Value::Num(rounding_increment as f64),
     );
-    set_builtin(
+    set_internal_slot(
         &obj,
         "#\u{0}nf_roundingpriority",
         Value::lstr(rounding_priority),
     );
-    set_builtin(&obj, "#\u{0}nf_trailingzero", Value::lstr(trailing_zero));
-    set_builtin(&obj, "#\u{0}nf_style", Value::lstr(style));
+    set_internal_slot(&obj, "#\u{0}nf_trailingzero", Value::lstr(trailing_zero));
+    set_internal_slot(&obj, "#\u{0}nf_style", Value::lstr(style));
     if let Some(c) = currency.filter(|_| get_str(&obj, "#\u{0}nf_style") == "currency") {
-        set_builtin(&obj, "#\u{0}nf_currency", Value::lstr(c.to_uppercase()));
-        set_builtin(
+        set_internal_slot(&obj, "#\u{0}nf_currency", Value::lstr(c.to_uppercase()));
+        set_internal_slot(
             &obj,
             "#\u{0}nf_currencydisplay",
             Value::lstr(currency_display),
         );
-        set_builtin(&obj, "#\u{0}nf_currencysign", Value::lstr(currency_sign));
+        set_internal_slot(&obj, "#\u{0}nf_currencysign", Value::lstr(currency_sign));
     }
     if let Some(u) = unit {
-        set_builtin(&obj, "#\u{0}nf_unit", Value::lstr(u));
-        set_builtin(&obj, "#\u{0}nf_unitdisplay", Value::lstr(unit_display));
+        set_internal_slot(&obj, "#\u{0}nf_unit", Value::lstr(u));
+        set_internal_slot(&obj, "#\u{0}nf_unitdisplay", Value::lstr(unit_display));
     }
-    set_builtin(&obj, "#\u{0}nf_minint", Value::Num(digits.min_int as f64));
-    set_builtin(&obj, "#\u{0}nf_minfrac", Value::Num(digits.min_frac as f64));
-    set_builtin(&obj, "#\u{0}nf_maxfrac", Value::Num(digits.max_frac as f64));
+    set_internal_slot(&obj, "#\u{0}nf_minint", Value::Num(digits.min_int as f64));
+    set_internal_slot(&obj, "#\u{0}nf_minfrac", Value::Num(digits.min_frac as f64));
+    set_internal_slot(&obj, "#\u{0}nf_maxfrac", Value::Num(digits.max_frac as f64));
     if let Some(v) = digits.min_sig {
-        set_builtin(&obj, "#\u{0}nf_minsig", Value::Num(v as f64));
+        set_internal_slot(&obj, "#\u{0}nf_minsig", Value::Num(v as f64));
     }
     if let Some(v) = digits.max_sig {
-        set_builtin(&obj, "#\u{0}nf_maxsig", Value::Num(v as f64));
+        set_internal_slot(&obj, "#\u{0}nf_maxsig", Value::Num(v as f64));
     }
-    set_builtin(&obj, "#\u{0}nf_notation", Value::lstr(notation));
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}nf_notation", Value::lstr(notation));
+    set_internal_slot(
         &obj,
         "#\u{0}nf_compactdisplay",
         Value::lstr(compact_display),
     );
-    set_builtin(&obj, "#\u{0}nf_grouping", use_grouping);
-    set_builtin(&obj, "#\u{0}nf_signdisplay", Value::lstr(sign_display));
-    set_builtin(&obj, "#\u{0}nf_roundingmode", Value::lstr(rounding_mode));
-    set_builtin(
+    set_internal_slot(&obj, "#\u{0}nf_grouping", use_grouping);
+    set_internal_slot(&obj, "#\u{0}nf_signdisplay", Value::lstr(sign_display));
+    set_internal_slot(&obj, "#\u{0}nf_roundingmode", Value::lstr(rounding_mode));
+    set_internal_slot(
         &obj,
         "#\u{0}nf_roundingtype",
         Value::lstr(digits.rounding_type),
@@ -607,7 +607,7 @@ fn read_range_opt(
     lo: u32,
     hi: u32,
 ) -> Result<Option<u32>, Value> {
-    let v = ab(i.get_member(options, prop))?;
+    let v = ab(i.get_member_key(options, prop))?;
     if matches!(v, Value::Undefined) {
         return Ok(None);
     }
@@ -626,7 +626,7 @@ fn read_use_grouping(i: &mut Interp, options: &Value, notation: &str) -> Result<
     // GetStringOrBooleanOption: undefined → fallback; `true` → "always"; a falsy value → false;
     // otherwise ToString and validate against ["min2","auto","always"] (so the string "true" is a
     // RangeError, not "always"). The fallback is "auto" (or "min2" for compact notation).
-    let v = ab(i.get_member(options, "useGrouping"))?;
+    let v = ab(i.get_member_key(options, "useGrouping"))?;
     let default = Value::lstr(if notation == "compact" {
         "min2"
     } else {
@@ -677,7 +677,7 @@ fn instance_unwrap(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
 }
 
 fn get_str(o: &Gc, k: &str) -> String {
-    match o.borrow().props.get(k).map(|p| p.value()) {
+    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     }
@@ -713,7 +713,7 @@ fn cldr_number_symbols(o: &Gc) -> crate::cldr_numbers::Symbols {
 }
 
 fn get_num(o: &Gc, k: &str) -> Option<u32> {
-    match o.borrow().props.get(k).map(|p| p.value()) {
+    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
         Some(Value::Num(n)) => Some(n as u32),
         _ => None,
     }
@@ -1547,7 +1547,7 @@ fn assemble_number_exact(i: &mut Interp, o: &Gc, mv: &IntlMv) -> FormattedNumber
         && frac_part.as_deref().unwrap_or("").chars().all(|c| c == '0');
     let grouping = o
         .borrow()
-        .props
+        .internal_slots()
         .get("#\u{0}nf_grouping")
         .map(|p| p.value())
         .unwrap_or(Value::lstr("auto"));
@@ -2265,7 +2265,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = instance_unwrap(i, &this)?;
     let res = i.new_object();
     let put = |i: &mut Interp, res: &Gc, k: &str, slot: &str| {
-        if let Some(v) = o.borrow().props.get(slot).map(|p| p.value()) {
+        if let Some(v) = o.borrow().internal_slots().get(slot).map(|p| p.value()) {
             set_data(res, k, v);
         }
         let _ = i;
@@ -2283,7 +2283,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         // Spec key order: fraction digits, then significant digits. Under a *Precision rounding
         // type (e.g. the compact-notation default) BOTH pairs are present.
         let rtype = get_str(&o, "#\u{0}nf_roundingtype");
-        let has_sig = o.borrow().props.contains("#\u{0}nf_minsig");
+        let has_sig = o.borrow().internal_slots().contains("#\u{0}nf_minsig");
         if !has_sig || rtype.contains("Precision") {
             put(i, &res, "minimumFractionDigits", "#\u{0}nf_minfrac");
             put(i, &res, "maximumFractionDigits", "#\u{0}nf_maxfrac");
@@ -2298,14 +2298,14 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
         &res,
         "useGrouping",
         o.borrow()
-            .props
+            .internal_slots()
             .get("#\u{0}nf_grouping")
             .map(|p| p.value())
             .unwrap_or(Value::lstr("auto")),
     );
     put(i, &res, "notation", "#\u{0}nf_notation");
     // compactDisplay only appears when notation is compact.
-    if matches!(o.borrow().props.get("#\u{0}nf_notation").map(|p| p.value()), Some(Value::Str(s)) if &*s == "compact")
+    if matches!(o.borrow().internal_slots().get("#\u{0}nf_notation").map(|p| p.value()), Some(Value::Str(s)) if &*s == "compact")
     {
         put(i, &res, "compactDisplay", "#\u{0}nf_compactdisplay");
     }

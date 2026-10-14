@@ -30,8 +30,8 @@ fn pair(reader: &mut Engine) -> (Engine, Engine) {
         b.as_obj().unwrap().borrow().props.shape()
     );
     let global = reader.global_this();
-    assert!(reader.ctx().set_member(&global, "first", a).is_ok());
-    assert!(reader.ctx().set_member(&global, "second", b).is_ok());
+    assert!(reader.ctx().set_member_key(&global, "first", a).is_ok());
+    assert!(reader.ctx().set_member_key(&global, "second", b).is_ok());
     // Keep the producing Engines alive: their explicit shutdown clears their own
     // heaps. The active TLS heap is the reader, not either producer.
     (first, second)
@@ -92,7 +92,7 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         let _different_prefix = value(&mut foreign, "({beta:1})");
         assert!(foreign
             .ctx()
-            .set_member(&original, "delta", Value::Num(3.0))
+            .set_member_key(&original, "delta", Value::Num(3.0))
             .is_ok());
         assert_ne!(
             original.as_obj().unwrap().borrow().props.shape(),
@@ -101,8 +101,16 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         owner.set_tier(tier);
         owner.set_tier_threshold(0);
         let global = owner.global_this();
-        owner.ctx().set_member(&global, "a", local).ok().unwrap();
-        owner.ctx().set_member(&global, "b", original).ok().unwrap();
+        owner
+            .ctx()
+            .set_member_key(&global, "a", local)
+            .ok()
+            .unwrap();
+        owner
+            .ctx()
+            .set_member_key(&global, "b", original)
+            .ok()
+            .unwrap();
         assert_eq!(run(&mut owner, "function read(o){return o.gamma;}for(var n=0;n<200;n++)read(a);read(a)+'|'+read(b)+'|'+b.delta"), "2|undefined|3", "{tier:?}");
     }
 }

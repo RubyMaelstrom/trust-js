@@ -28,6 +28,16 @@ impl VmTiering {
         }
     }
 
+    /// The AST activation already proved 128 executed backedges. Its first subsequent VM
+    /// edge may compile native code; a now-false loop test completes without native emission.
+    pub(crate) fn hot() -> Self {
+        Self {
+            edges: 128,
+            work: 4096,
+            ..Self::new()
+        }
+    }
+
     pub(crate) fn backedge(&mut self, from: usize, to: usize) -> bool {
         if self.disabled || to > from {
             return false;

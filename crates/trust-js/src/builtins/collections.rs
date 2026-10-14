@@ -170,7 +170,7 @@ fn set_record(i: &mut Interp, other: &Value) -> Result<(Value, Value, f64), Valu
     }
     // GetSetRecord: size → ToNumber (NaN throws TypeError), ToIntegerOrInfinity (negative throws
     // RangeError); then `has` and `keys` must be callable.
-    let size_v = ab(i.get_member(other, "size"))?;
+    let size_v = ab(i.get_member_key(other, "size"))?;
     let size = ab(i.to_number(&size_v))?;
     if size.is_nan() {
         return Err(i.make_error("TypeError", "set-like size is NaN"));
@@ -183,11 +183,11 @@ fn set_record(i: &mut Interp, other: &Value) -> Result<(Value, Value, f64), Valu
     if int_size < 0.0 {
         return Err(i.make_error("RangeError", "set-like size is negative"));
     }
-    let has = ab(i.get_member(other, "has"))?;
+    let has = ab(i.get_member_key(other, "has"))?;
     if !has.is_callable() {
         return Err(i.make_error("TypeError", "set-like has is not callable"));
     }
-    let keys = ab(i.get_member(other, "keys"))?;
+    let keys = ab(i.get_member_key(other, "keys"))?;
     if !keys.is_callable() {
         return Err(i.make_error("TypeError", "set-like keys is not callable"));
     }
@@ -203,7 +203,7 @@ fn set_like_open(i: &mut Interp, keys: &Value, other: &Value) -> Result<(Value, 
     if !matches!(iter, Value::Obj(_)) {
         return Err(i.make_error("TypeError", "set-like keys did not return an object"));
     }
-    let next = ab(i.get_member(&iter, "next"))?;
+    let next = ab(i.get_member_key(&iter, "next"))?;
     // GetIteratorDirect reads next without checking callability. IteratorNext performs Call.
     Ok((iter, next))
 }
@@ -214,11 +214,13 @@ fn set_like_next(i: &mut Interp, iter: &Value, next: &Value) -> Result<Option<Va
     if !matches!(r, Value::Obj(_)) {
         return Err(i.make_error("TypeError", "iterator result is not an object"));
     }
-    let done = ab(i.get_member(&r, "done"))?;
+    let done = ab(i.get_member_key(&r, "done"))?;
     if i.to_boolean(&done) {
         Ok(None)
     } else {
-        Ok(Some(canonicalize_map_key(ab(i.get_member(&r, "value"))?)))
+        Ok(Some(canonicalize_map_key(ab(
+            i.get_member_key(&r, "value")
+        )?)))
     }
 }
 
@@ -439,7 +441,7 @@ fn collection_ctor(
     let mv = Value::Obj(obj);
     if let Some(src) = args.first() {
         if !matches!(src, Value::Undefined | Value::Null) {
-            let add_fn = ab(i.get_member(&mv, if is_set { "add" } else { "set" }))?;
+            let add_fn = ab(i.get_member_key(&mv, if is_set { "add" } else { "set" }))?;
             if !add_fn.is_callable() {
                 return Err(i.make_error("TypeError", "adder is not callable"));
             }
@@ -458,8 +460,8 @@ fn collection_ctor(
                         "iterator value is not an entry object",
                     )))
                 } else {
-                    i.get_member(&item, "0")
-                        .and_then(|k| i.get_member(&item, "1").map(|v| (k, v)))
+                    i.get_member_key(&item, "0")
+                        .and_then(|k| i.get_member_key(&item, "1").map(|v| (k, v)))
                         .and_then(|(k, v)| i.call(add_fn.clone(), mv.clone(), &[k, v]))
                 };
                 if let Err(e) = step {

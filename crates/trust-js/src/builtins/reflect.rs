@@ -31,7 +31,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if matches!(handler, Value::Null) {
                 return Err(i.make_error("TypeError", "proxy is revoked"));
             }
-            let trap = ab(i.get_member(&handler, "set"))?;
+            let trap = ab(i.get_member_key(&handler, "set"))?;
             if trap.is_callable() {
                 let receiver = if a.len() > 3 {
                     arg(a, 3)
@@ -44,7 +44,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
                     &[
                         ptarget.clone(),
                         i.sym_from_key(&key)
-                            .unwrap_or_else(|| Value::lstr(key.to_string())),
+                            .unwrap_or_else(|| crate::value::string_key_value(key.as_str())),
                         value.clone(),
                         receiver,
                     ],

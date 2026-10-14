@@ -317,6 +317,7 @@ fn run_once_bootstrap_functions_never_get_native_code() {
         SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(SOURCE).expect("source parses"));
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
     let it = &mut *engine.interp;
     let program = it.shared_snapshot_program(snapshot).expect("decodes");
     if let Err(Abrupt::Throw(error)) = it.run_classic_program(&program, None) {
@@ -327,7 +328,7 @@ fn run_once_bootstrap_functions_never_get_native_code() {
     assert!(bootstrap.run_once);
     assert!(
         bootstrap.code.get().is_some_and(Option::is_some),
-        "a loop still compiles the bootstrap to bytecode on its first call"
+        "explicitly forced bytecode compiles the bootstrap on its first call"
     );
     assert!(!has_native_code(&bootstrap), "but it runs on the VM");
     let hot = global_function(it, "hot");
@@ -339,6 +340,7 @@ fn run_once_bootstrap_functions_never_get_native_code() {
 
     let mut parsed_engine = Engine::new();
     parsed_engine.set_tier(Tier::Jit);
+    parsed_engine.set_tier_threshold(0);
     let it = &mut *parsed_engine.interp;
     let Ok(parsed) = crate::parser::parse_script(SOURCE, false) else {
         panic!("source parses")
@@ -355,24 +357,60 @@ fn run_once_bootstrap_functions_never_get_native_code() {
     );
 }
 
-/// A run-once bootstrap body of more than `RUN_ONCE_INTERPRETED_STATEMENTS` statements is not
-/// compiled on its first call although it contains a loop: each Realm interprets it until the
+#[test]
+fn run_once_outer_cleanup_fragments_remain_on_the_vm() {
+    const SOURCE: &str = r#"(function () {
+        let total = 0;
+        try { for (let index = 0; index < 3000; index++) total += index; }
+        finally { globalThis.bootstrapCleanup = 1; }
+        globalThis.bootstrapTotal = total;
+    })();"#;
+    static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let snapshot: &'static [u8] =
+        SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(SOURCE).expect("source parses"));
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(32);
+        let it = &mut *engine.interp;
+        let program = it.shared_snapshot_program(snapshot).expect("decodes");
+        let bootstrap = bootstrap_function(&program);
+        assert!(bootstrap.run_once);
+        crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.set(0));
+        crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
+        if let Err(Abrupt::Throw(error)) = it.run_classic_program(&program, None) {
+            panic!("snapshot threw: {}", render(it, &error));
+        }
+        assert_eq!(
+            eval_string(it, "bootstrapTotal+':'+bootstrapCleanup"),
+            "4498500:1"
+        );
+        assert!(
+            crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.get()) > 0
+        );
+        assert_eq!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()), 0);
+        assert!(!has_native_code(&bootstrap));
+    }
+}
+
+/// A cold run-once bootstrap body is not compiled on its first call for containing a short
+/// loop: each Realm interprets it until the
 /// call-count threshold compiles it (to bytecode that stays on the VM). Results are the same
 /// in every Realm and in parsed source.
 #[test]
 fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
+    const STATEMENTS: usize = 1000;
     fn source() -> String {
-        let limit = crate::interpreter::RUN_ONCE_INTERPRETED_STATEMENTS;
         format!(
             "(function () {{ let total = 0; for (let i = 0; i < 3; i++) total += i; {} \
              globalThis.bootstrapTotal = total; }})();",
-            "total += 1; ".repeat(limit)
+            "total += 1; ".repeat(STATEMENTS)
         )
     }
     static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let snapshot: &'static [u8] =
         SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(&source()).expect("source parses"));
-    let expected = (3 + crate::interpreter::RUN_ONCE_INTERPRETED_STATEMENTS).to_string();
+    let expected = (3 + STATEMENTS).to_string();
     for tier in [Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -417,7 +455,7 @@ fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
     }
     assert_eq!(eval_string(it, "bootstrapTotal"), expected);
     assert!(
-        has_native_code(&bootstrap_function(&parsed)),
-        "parsed source compiles on its first call"
+        bootstrap_function(&parsed).code.get().is_none(),
+        "parsed source also defers cold-loop compilation"
     );
 }

@@ -49,6 +49,7 @@ mod binding_reference_tests;
 #[cfg(test)]
 mod bootstrap_operation_tests;
 mod builtins;
+pub use interpreter::SharedMem;
 pub mod bytecode;
 mod cache;
 mod callback;
@@ -90,6 +91,8 @@ mod host_collections;
 mod host_memory;
 #[cfg(test)]
 mod host_string_tests;
+#[cfg(test)]
+mod internal_slot_tests;
 mod interpreter;
 mod interrupt;
 #[cfg(feature = "intl")]
@@ -141,6 +144,8 @@ mod script_scope_tests;
 #[cfg(test)]
 mod script_tiering_tests;
 mod self_hosted;
+#[cfg(test)]
+mod shared_buffer_lifetime_tests;
 #[cfg(test)]
 mod shared_layout_tests;
 #[cfg(test)]
@@ -560,7 +565,7 @@ impl Engine {
     pub fn run_as_agent(
         &mut self,
         src: &str,
-        broadcast_rx: std::sync::mpsc::Receiver<(u64, usize)>,
+        broadcast_rx: std::sync::mpsc::Receiver<(SharedMem, usize)>,
         report_tx: std::sync::mpsc::Sender<String>,
     ) {
         self.interp.can_block = true;
@@ -889,11 +894,11 @@ impl Engine {
 
     fn describe_throw(&mut self, thrown: Value) -> Completion {
         // Pull the constructor name + message off an Error object; fall back to the rendered value.
-        let name = match self.interp.get_member(&thrown, "name") {
+        let name = match self.interp.get_member_key(&thrown, "name") {
             Ok(Value::Undefined) | Err(_) => {
                 // No own/inherited `name` (e.g. Test262Error): use the constructor's name.
-                match self.interp.get_member(&thrown, "constructor") {
-                    Ok(ctor @ Value::Obj(_)) => match self.interp.get_member(&ctor, "name") {
+                match self.interp.get_member_key(&thrown, "constructor") {
+                    Ok(ctor @ Value::Obj(_)) => match self.interp.get_member_key(&ctor, "name") {
                         Ok(Value::Undefined) | Err(_) => String::new(),
                         Ok(v) => self.render(&v),
                     },
@@ -903,7 +908,7 @@ impl Engine {
             Ok(v) => self.render(&v),
         };
         let message = match &thrown {
-            Value::Obj(_) => match self.interp.get_member(&thrown, "message") {
+            Value::Obj(_) => match self.interp.get_member_key(&thrown, "message") {
                 Ok(Value::Undefined) | Err(_) => String::new(),
                 Ok(v) => self.render(&v),
             },
@@ -1289,11 +1294,10 @@ impl Engine {
             // `def_method` would otherwise collide across namespaces sharing method names.
             crate::jit::perf_native_relabel(*f as usize, format!("{name}.{op}"));
         }
-        self.interp
-            .global
-            .borrow_mut()
-            .props
-            .insert(name, crate::value::Property::builtin(Value::Obj(ns)));
+        self.interp.global.borrow_mut().props.insert(
+            crate::value::encode_string_key(name).as_ref(),
+            crate::value::Property::builtin(Value::Obj(ns)),
+        );
     }
 
     /// Call a JS function value; `Err` is the thrown value. This is how the runtime's event

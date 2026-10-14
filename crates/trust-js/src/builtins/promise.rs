@@ -44,7 +44,7 @@ pub(super) fn install_promise(it: &mut Interp) {
     });
     it.def_method(&proto, "catch", 1, |i, this, a| {
         // Catch is `this.then(undefined, onRejected)` through the actual then method.
-        let then = ab(i.get_member(&this, "then"))?;
+        let then = ab(i.get_member_key(&this, "then"))?;
         ab(i.call(then, this.clone(), &[Value::Undefined, arg(a, 0)]))
     });
     it.def_method(&proto, "finally", 1, |i, this, a| {
@@ -53,7 +53,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         }
         let default_ctor = intrinsic_promise(i);
         let c = species_constructor(i, &this, &default_ctor)?;
-        let then = ab(i.get_member(&this, "then"))?;
+        let then = ab(i.get_member_key(&this, "then"))?;
         if !then.is_callable() {
             return Err(i.make_error("TypeError", "then is not callable"));
         }
@@ -79,7 +79,7 @@ pub(super) fn install_promise(it: &mut Interp) {
         let promise = i.new_promise();
         // OrdinaryCreateFromConstructor: newTarget's prototype (its getter may throw).
         if let (Value::Obj(p), nt @ Value::Obj(_)) = (&promise, &i.new_target.clone()) {
-            match ab(i.get_member(nt, "prototype"))? {
+            match ab(i.get_member_key(nt, "prototype"))? {
                 Value::Obj(proto) => p.borrow_mut().proto = Some(proto),
                 _ => {
                     if let Some(proto) = ctor_realm_proto(i, &nt.clone(), "Promise")? {
@@ -175,7 +175,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
@@ -203,7 +203,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                 ],
             );
             // Subscribe via the resolved value's `.then`; a throwing getter/call closes the iterator.
-            let then = match i.get_member(&p, "then") {
+            let then = match i.get_member_key(&p, "then") {
                 Ok(t) => t,
                 Err(e) => {
                     i.iterator_close(&iter);
@@ -227,8 +227,8 @@ pub(super) fn install_promise(it: &mut Interp) {
             idx += 1;
         }
         // The values array's length is the element count (CreateDataProperty set each index).
-        ab(i.set_member(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        ab(i.set_member_key(&results, "length", Value::Num(idx as f64)))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -282,7 +282,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let then = match i.get_member(&p, "then") {
+            let then = match i.get_member_key(&p, "then") {
                 Ok(t) => t,
                 Err(e) => {
                     i.iterator_close(&iter);
@@ -344,7 +344,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
@@ -382,7 +382,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     resolve_fn.clone(),
                 ],
             );
-            let then = match i.get_member(&p, "then") {
+            let then = match i.get_member_key(&p, "then") {
                 Ok(t) => t,
                 Err(e) => {
                     i.iterator_close(&iter);
@@ -405,8 +405,8 @@ pub(super) fn install_promise(it: &mut Interp) {
             }
             idx += 1;
         }
-        ab(i.set_member(&results, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        ab(i.set_member_key(&results, "length", Value::Num(idx as f64)))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -452,7 +452,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     return Ok(result);
                 }
             };
-            let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+            let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
             let rem = ab(i.to_number(&rem_v))?;
             set_internal(&state, "#\u{0}remaining", Value::Num(rem + 1.0));
             let p = match i.call(promise_resolve.clone(), t.clone(), &[item]) {
@@ -479,7 +479,7 @@ pub(super) fn install_promise(it: &mut Interp) {
                     reject_fn.clone(),
                 ],
             );
-            let then = match i.get_member(&p, "then") {
+            let then = match i.get_member_key(&p, "then") {
                 Ok(t) => t,
                 Err(e) => {
                     i.iterator_close(&iter);
@@ -503,8 +503,8 @@ pub(super) fn install_promise(it: &mut Interp) {
             }
             idx += 1;
         }
-        ab(i.set_member(&errors, "length", Value::Num(idx as f64)))?;
-        let rem_v = ab(i.get_member(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
+        ab(i.set_member_key(&errors, "length", Value::Num(idx as f64)))?;
+        let rem_v = ab(i.get_internal_slot(&Value::Obj(state.clone()), "#\u{0}remaining"))?;
         let rem = ab(i.to_number(&rem_v))?;
         set_internal(&state, "#\u{0}remaining", Value::Num(rem - 1.0));
         if rem - 1.0 == 0.0 {
@@ -610,7 +610,7 @@ fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
 fn promise_resolve(i: &mut Interp, ctor: &Value, resolution: Value) -> Result<Value, Value> {
     if let Value::Obj(o) = &resolution {
         if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
-            let resolution_ctor = ab(i.get_member(&resolution, "constructor"))?;
+            let resolution_ctor = ab(i.get_member_key(&resolution, "constructor"))?;
             if same_value(&resolution_ctor, ctor) {
                 return Ok(resolution);
             }

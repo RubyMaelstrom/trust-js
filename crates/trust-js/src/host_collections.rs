@@ -8,15 +8,18 @@ use std::rc::Rc;
 
 impl Interp {
     pub(crate) fn host_named_supported(&self, object: &Gc, key: &str) -> bool {
-        if object.borrow().ic_plain.get() || Self::is_sym_key(key) || Self::is_private_key(key) {
+        if object.borrow().ic_plain.get() || Self::is_sym_key(key) {
             return false;
         }
         self.host_indexed
             .get(&(Rc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
             .is_some_and(|live| {
-                live.names
-                    .is_some_and(|names| names(self, &live.state).iter().any(|name| name == key))
+                live.names.is_some_and(|names| {
+                    names(self, &live.state)
+                        .iter()
+                        .any(|name| name == crate::value::decode_string_key(key))
+                })
             })
     }
 
@@ -24,7 +27,6 @@ impl Interp {
         if self.host_indexed.is_empty()
             || object.borrow().ic_plain.get()
             || Self::is_sym_key(key)
-            || Self::is_private_key(key)
             || !self
                 .host_indexed
                 .get(&(Rc::as_ptr(object) as usize))
@@ -91,7 +93,7 @@ impl Interp {
         self.call_callback(
             getter,
             Value::Obj(object.clone()),
-            &[Value::lstr(key.to_owned())],
+            &[crate::value::string_key_value(key)],
         )
         .map(Some)
     }
@@ -118,6 +120,7 @@ impl Interp {
         };
         let mut result = Vec::new();
         for name in names(self, &live.state) {
+            let name = crate::value::encode_owned_string_key(name);
             if self.host_named_visible(object, &name)? {
                 result.push(name);
             }

@@ -6,7 +6,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 use std::rc::Rc;
 
 /// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
@@ -209,14 +209,19 @@ fn range_type_tag(i: &Interp, v: &Value) -> u8 {
 fn install_format_getter(it: &mut Interp, proto: &Gc) {
     let g = it.make_native("get format", 0, |i, this, _| {
         let o = crate::intl::brand_slot_legacy(i, &this, "#\u{0}dtf", "Intl.DateTimeFormat")?;
-        if let Some(f) = o.borrow().props.get("#\u{0}dtf_bound").map(|p| p.value()) {
+        if let Some(f) = o
+            .borrow()
+            .internal_slots()
+            .get("#\u{0}dtf_bound")
+            .map(|p| p.value())
+        {
             return Ok(f);
         }
         let f = i.make_native("", 1, |i, that, a| {
             Ok(Value::lstr(do_format(i, &that, &arg(a, 0))?))
         });
         let bound = crate::intl::numberformat::bind_this(i, Value::Obj(f), Value::Obj(o.clone()));
-        set_builtin(&o, "#\u{0}dtf_bound", bound.clone());
+        set_internal_slot(&o, "#\u{0}dtf_bound", bound.clone());
         Ok(bound)
     });
     proto.borrow_mut().props.insert(
@@ -265,7 +270,7 @@ fn dtf_pattern_width(pattern: &str, fields: &str) -> Option<usize> {
 fn install_style_components(obj: &Gc, pattern: &str) {
     let put_width = |slot: &str, fields: &str, value: fn(usize) -> &'static str| {
         if let Some(width) = dtf_pattern_width(pattern, fields) {
-            set_builtin(obj, slot, Value::lstr(value(width)));
+            set_internal_slot(obj, slot, Value::lstr(value(width)));
         }
     };
     put_width("#\u{0}dtfx_weekday", "Eec", |width| match width {
@@ -321,7 +326,7 @@ fn install_style_components(obj: &Gc, pattern: &str) {
         }
     });
     if let Some(width) = dtf_pattern_width(pattern, "zZvVOXx") {
-        set_builtin(
+        set_internal_slot(
             obj,
             "#\u{0}dtfx_tzname",
             Value::lstr(if width >= 4 { "long" } else { "short" }),
@@ -333,10 +338,10 @@ fn install_style_components(obj: &Gc, pattern: &str) {
 /// This avoids attaching a numeric locale suffix twice and makes `resolvedOptions()` describe the
 /// selected format (Japanese `month: "short"`, for example, resolves to numeric here).
 fn install_resolved_components(obj: &Gc, pattern: &str) {
-    if obj.borrow().props.contains("#\u{0}dtf_month") {
+    if obj.borrow().internal_slots().contains("#\u{0}dtf_month") {
         if let Some(width) = dtf_pattern_width(pattern, "ML") {
             // The requested width stays in `dtf_month`: the format pattern is matched from it.
-            set_builtin(
+            set_internal_slot(
                 obj,
                 "#\u{0}dtfr_month",
                 Value::lstr(match width {
@@ -410,7 +415,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
         }
     }
     let hour12 = {
-        let v = ab(i.get_member(&options, "hour12"))?;
+        let v = ab(i.get_member_key(&options, "hour12"))?;
         if matches!(v, Value::Undefined) {
             None
         } else {
@@ -425,7 +430,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
         None,
     )?;
     let time_zone = {
-        let v = ab(i.get_member(&options, "timeZone"))?;
+        let v = ab(i.get_member_key(&options, "timeZone"))?;
         if matches!(v, Value::Undefined) {
             // ECMA-402 #sec-createdatetimeformat: SystemTimeZoneIdentifier().
             crate::builtins::system_time_zone().to_string()
@@ -454,7 +459,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     let minute = get_option(i, &options, "minute", &["2-digit", "numeric"], None)?;
     let second = get_option(i, &options, "second", &["2-digit", "numeric"], None)?;
     let frac_sec = {
-        let v = ab(i.get_member(&options, "fractionalSecondDigits"))?;
+        let v = ab(i.get_member_key(&options, "fractionalSecondDigits"))?;
         if matches!(v, Value::Undefined) {
             None
         } else {
@@ -548,7 +553,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.DateTimeFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}dtf", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}dtf", Value::Bool(true));
     let locale_lang = resolved_locale.split('-').next().unwrap_or("").to_string();
     // ResolveLocale for the `ca` key: the locale's -u-ca- extension value (if supported) is used and
     // reflected in the resolved locale, unless a supported calendar option overrides it with a
@@ -608,13 +613,13 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     } else {
         format!("{base}-u{ext}")
     };
-    set_builtin(&obj, "#\u{0}dtf_locale", Value::lstr(resolved_locale));
-    set_builtin(&obj, "#\u{0}dtf_ca", Value::lstr(eff_cal));
-    set_builtin(&obj, "#\u{0}dtf_nu", Value::lstr(nu_final));
-    set_builtin(&obj, "#\u{0}dtf_tz", Value::lstr(time_zone));
+    set_internal_slot(&obj, "#\u{0}dtf_locale", Value::lstr(resolved_locale));
+    set_internal_slot(&obj, "#\u{0}dtf_ca", Value::lstr(eff_cal));
+    set_internal_slot(&obj, "#\u{0}dtf_nu", Value::lstr(nu_final));
+    set_internal_slot(&obj, "#\u{0}dtf_tz", Value::lstr(time_zone));
     let put = |obj: &Gc, k: &str, v: &Option<String>| {
         if let Some(v) = v {
-            set_builtin(obj, k, Value::lstr(v.clone()));
+            set_internal_slot(obj, k, Value::lstr(v.clone()));
         }
     };
     put(&obj, "#\u{0}dtf_weekday", &weekday);
@@ -627,7 +632,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
     put(&obj, "#\u{0}dtf_minute", &minute);
     put(&obj, "#\u{0}dtf_second", &second);
     if let Some(f) = frac_sec {
-        set_builtin(&obj, "#\u{0}dtf_fracsec", Value::Num(f as f64));
+        set_internal_slot(&obj, "#\u{0}dtf_fracsec", Value::Num(f as f64));
     }
     put(&obj, "#\u{0}dtf_tzname", &tz_name);
     put(&obj, "#\u{0}dtf_datestyle", &date_style);
@@ -671,17 +676,17 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
                 .unwrap_or_else(|| locale_hour_cycle.to_string())
         };
         let h12 = matches!(hc.as_str(), "h11" | "h12");
-        set_builtin(&obj, "#\u{0}dtf_hourcycle", Value::lstr(hc));
-        set_builtin(&obj, "#\u{0}dtf_hour12", Value::Bool(h12));
-        set_builtin(&obj, "#\u{0}dtf_hourshown", Value::Bool(shows_hour));
+        set_internal_slot(&obj, "#\u{0}dtf_hourcycle", Value::lstr(hc));
+        set_internal_slot(&obj, "#\u{0}dtf_hour12", Value::Bool(h12));
+        set_internal_slot(&obj, "#\u{0}dtf_hourshown", Value::Bool(shows_hour));
     }
     // Default components when nothing was requested: year/month/day numeric. Flagged so a Temporal
     // receiver's compatibility check ignores them (only *explicit* options can conflict).
     if !has_explicit && date_style.is_none() && time_style.is_none() {
-        set_builtin(&obj, "#\u{0}dtf_year", Value::lstr("numeric"));
-        set_builtin(&obj, "#\u{0}dtf_month", Value::lstr("numeric"));
-        set_builtin(&obj, "#\u{0}dtf_day", Value::lstr("numeric"));
-        set_builtin(&obj, "#\u{0}dtf_defaults", Value::Bool(true));
+        set_internal_slot(&obj, "#\u{0}dtf_year", Value::lstr("numeric"));
+        set_internal_slot(&obj, "#\u{0}dtf_month", Value::lstr("numeric"));
+        set_internal_slot(&obj, "#\u{0}dtf_day", Value::lstr("numeric"));
+        set_internal_slot(&obj, "#\u{0}dtf_defaults", Value::Bool(true));
     }
     if date_style.is_none() && time_style.is_none() {
         let mut requested = Vec::new();
@@ -697,7 +702,7 @@ fn construct(i: &mut Interp, t: Value, a: &[Value]) -> Result<Value, Value> {
             ("#\u{0}dtf_second", "second"),
             ("#\u{0}dtf_tzname", "timeZoneName"),
         ] {
-            if obj.borrow().props.contains(slot) {
+            if obj.borrow().internal_slots().contains(slot) {
                 requested.push((kind, String::new()));
             }
         }
@@ -780,7 +785,12 @@ fn dtf_ms_kind(i: &mut Interp, o: &Gc, date: &Value) -> Result<(f64, u8), Value>
                 .get(&ptr)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "iso8601".to_string());
-            let dcal = match o.borrow().props.get("#\u{0}dtf_ca").map(|p| p.value()) {
+            let dcal = match o
+                .borrow()
+                .internal_slots()
+                .get("#\u{0}dtf_ca")
+                .map(|p| p.value())
+            {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => "iso8601".to_string(),
             };
@@ -832,14 +842,14 @@ fn temporal_compat_check(
         _ => return Ok(()), // DateTime / Instant / Zoned overlap everything
     };
     // A fully-defaulted formatter adapts its fields to the receiver, so it always overlaps.
-    if o.borrow().props.contains("#\u{0}dtf_defaults") {
+    if o.borrow().internal_slots().contains("#\u{0}dtf_defaults") {
         return Ok(());
     }
     // A field is requested if set explicitly (`__dtf_`) or via a dateStyle/timeStyle (`__dtfx_`).
     let present = |field: &str| {
         let b = o.borrow();
-        b.props.contains(&format!("#\u{0}dtf_{field}"))
-            || b.props.contains(&format!("#\u{0}dtfx_{field}"))
+        b.internal_slots().contains(&format!("#\u{0}dtf_{field}"))
+            || b.internal_slots().contains(&format!("#\u{0}dtfx_{field}"))
     };
     const ALL: &[&str] = &[
         "weekday",
@@ -870,7 +880,12 @@ fn do_format(i: &mut Interp, this: &Value, date: &Value) -> Result<String, Value
 
 /// The formatter's numbering system id (`latn` unless set).
 fn dtf_nu(o: &Gc) -> String {
-    match o.borrow().props.get("#\u{0}dtf_nu").map(|p| p.value()) {
+    match o
+        .borrow()
+        .internal_slots()
+        .get("#\u{0}dtf_nu")
+        .map(|p| p.value())
+    {
         Some(Value::Str(s)) => s.to_string(),
         _ => "latn".to_string(),
     }
@@ -891,7 +906,12 @@ fn do_format_ms(o: &Gc, ms: f64, kind: u8) -> String {
 }
 
 fn dtf_slot(o: &Gc, slot: &str) -> Option<String> {
-    match o.borrow().props.get(slot).map(|property| property.value()) {
+    match o
+        .borrow()
+        .internal_slots()
+        .get(slot)
+        .map(|property| property.value())
+    {
         Some(Value::Str(value)) => Some(value.to_string()),
         _ => None,
     }
@@ -972,7 +992,7 @@ fn requested_skeleton(o: &Gc, kind: u8) -> String {
     };
     let hour = hour_letter(o);
     let mut skeleton = String::new();
-    let defaulted = o.borrow().props.contains("#\u{0}dtf_defaults");
+    let defaulted = o.borrow().internal_slots().contains("#\u{0}dtf_defaults");
     if defaulted {
         if let Some(era) = slot("era").filter(|_| kind_allows(kind, "era")) {
             skeleton.push_str(&width(&era, 'G', true));
@@ -1007,8 +1027,11 @@ fn requested_skeleton(o: &Gc, kind: u8) -> String {
             }
         }
         if kind_allows(kind, "fracsec") {
-            if let Some(Value::Num(digits)) =
-                o.borrow().props.get("#\u{0}dtf_fracsec").map(|p| p.value())
+            if let Some(Value::Num(digits)) = o
+                .borrow()
+                .internal_slots()
+                .get("#\u{0}dtf_fracsec")
+                .map(|p| p.value())
             {
                 skeleton.extend(std::iter::repeat_n('S', digits as usize));
             }
@@ -1040,8 +1063,8 @@ fn formatter_pattern(o: &Gc, kind: u8) -> (String, String) {
         return (pattern, numbers);
     }
     let (pattern, numbers) = select_pattern(o, kind);
-    set_builtin(o, &pattern_slot, Value::lstr(pattern.clone()));
-    set_builtin(o, &numbers_slot, Value::lstr(numbers.clone()));
+    set_internal_slot(o, &pattern_slot, Value::lstr(pattern.clone()));
+    set_internal_slot(o, &numbers_slot, Value::lstr(numbers.clone()));
     (pattern, numbers)
 }
 
@@ -1975,7 +1998,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = crate::intl::brand_slot_legacy(i, &this, "#\u{0}dtf", "Intl.DateTimeFormat")?;
     let res = i.new_object();
     let put = |i: &mut Interp, res: &Gc, k: &str, slot: &str| {
-        if let Some(v) = o.borrow().props.get(slot).map(|p| p.value()) {
+        if let Some(v) = o.borrow().internal_slots().get(slot).map(|p| p.value()) {
             set_data(res, k, v);
         }
         let _ = i;
@@ -1988,7 +2011,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     // resolvedOptions when the resolved pattern actually shows an hour.
     if matches!(
         o.borrow()
-            .props
+            .internal_slots()
             .get("#\u{0}dtf_hourshown")
             .map(|p| p.value()),
         Some(Value::Bool(true))
@@ -1999,7 +2022,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     put(i, &res, "weekday", "#\u{0}dtf_weekday");
     put(i, &res, "era", "#\u{0}dtf_era");
     put(i, &res, "year", "#\u{0}dtf_year");
-    if o.borrow().props.contains("#\u{0}dtfr_month") {
+    if o.borrow().internal_slots().contains("#\u{0}dtfr_month") {
         put(i, &res, "month", "#\u{0}dtfr_month");
     } else {
         put(i, &res, "month", "#\u{0}dtf_month");

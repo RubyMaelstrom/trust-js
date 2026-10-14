@@ -83,6 +83,16 @@ fn packed_mirror_mutable_escapes_and_structural_edits_invalidate_the_view() {
         let mut props = packed(3);
         assert!(props.prepare_packed_numeric_mirror());
         edit(&mut props);
+        if name == "pop" {
+            // A validated tail removal preserves both the canonical descriptors
+            // and their numeric view; only the removed index ceases to exist.
+            assert_eq!(props.mirror_get(0), Some(0.0));
+            assert_eq!(props.mirror_get(1), Some(1.0));
+            assert!(props.mirror_get(2).is_none());
+            assert!(props.get_index(2).is_none());
+            assert!(props.elems.inline_packed.packed_plain.get());
+            continue;
+        }
         if dense_elements_enabled() && matches!(name, "append" | "push") {
             assert_eq!(props.mirror_get(0), Some(0.0), "{name}");
             assert_eq!(props.mirror_get(3), Some(8.0), "{name}");

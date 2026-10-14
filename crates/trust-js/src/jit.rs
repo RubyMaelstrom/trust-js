@@ -1402,7 +1402,7 @@ mod executable_code_budget_tests {
         let global = Value::Obj(engine.interp.global.clone());
         let function = engine
             .interp
-            .get_member(&global, "hot")
+            .get_member_key(&global, "hot")
             .unwrap_or_else(|_| panic!("hot function binding exists"));
         let budget = executable_code_budget();
         let held =
@@ -18177,7 +18177,7 @@ pub(crate) unsafe fn run_continuation(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &mut [PackedValue],
+    slots: &[PackedValue],
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
@@ -18203,7 +18203,7 @@ pub(crate) unsafe fn run_borrowed_frame(
     chunk: &Chunk,
     code: &JitCode,
     state: &mut crate::bytecode::NativeContinuation,
-    slots: &mut [PackedValue],
+    slots: &[PackedValue],
     pc: &mut usize,
     this_val: &Value,
     handlers: &mut Vec<crate::bytecode::Handler>,
@@ -18232,7 +18232,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         helpers: i.jit_helpers.as_ptr(),
         stack_base,
         final_sp: stack_base.add(initial_depth),
-        slots: slots.as_mut_ptr(),
+        slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Rc::as_ptr(env) as *const u8,
         this_raw: std::ptr::null(),

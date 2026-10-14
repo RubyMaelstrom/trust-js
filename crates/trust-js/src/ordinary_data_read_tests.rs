@@ -425,7 +425,7 @@ fn ordinary_data_read_proxy_dispatch_receivers_and_invariants_all_tiers() {
                 };
                 let name = engine
                     .interp
-                    .get_member(&error, "name")
+                    .get_member_key(&error, "name")
                     .ok()
                     .expect("error name");
                 assert!(matches!(name, Value::Str(s) if s.as_str()=="TypeError"));

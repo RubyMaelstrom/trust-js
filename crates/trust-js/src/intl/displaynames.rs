@@ -8,7 +8,7 @@ use super::{
 };
 use crate::interpreter::Interp;
 use crate::intl::tags;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DisplayNames", 2, construct);
@@ -66,14 +66,14 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     .unwrap();
     let resolved = resolve_locale(i, &requested, &[]);
 
-    set_builtin(&obj, "#\u{0}dn", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}dn_locale", Value::lstr(resolved.locale));
-    set_builtin(&obj, "#\u{0}dn_style", Value::lstr(style));
+    set_internal_slot(&obj, "#\u{0}dn", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}dn_locale", Value::lstr(resolved.locale));
+    set_internal_slot(&obj, "#\u{0}dn_style", Value::lstr(style));
     let is_language = kind == "language";
-    set_builtin(&obj, "#\u{0}dn_type", Value::lstr(kind));
-    set_builtin(&obj, "#\u{0}dn_fallback", Value::lstr(fallback));
+    set_internal_slot(&obj, "#\u{0}dn_type", Value::lstr(kind));
+    set_internal_slot(&obj, "#\u{0}dn_fallback", Value::lstr(fallback));
     if is_language {
-        set_builtin(&obj, "#\u{0}dn_langdisplay", Value::lstr(language_display));
+        set_internal_slot(&obj, "#\u{0}dn_langdisplay", Value::lstr(language_display));
     }
     Ok(Value::Obj(obj))
 }
@@ -81,7 +81,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
     match object
         .borrow()
-        .props
+        .internal_slots()
         .get(key)
         .map(|property| property.value())
     {
@@ -309,7 +309,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = brand_slot(i, &this, "#\u{0}dn")?;
     let get = |k: &str| {
         o.borrow()
-            .props
+            .internal_slots()
             .get(k)
             .map(|p| p.value())
             .unwrap_or(Value::Undefined)

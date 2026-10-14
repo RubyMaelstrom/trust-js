@@ -673,7 +673,9 @@ impl Visitor {
             Callable::AccessorGet(name)
             | Callable::AccessorSet(name)
             | Callable::PropGet(name)
-            | Callable::PropSet(name) => {
+            | Callable::PropSet(name)
+            | Callable::PrivatePropGet(name)
+            | Callable::PrivatePropSet(name) => {
                 let outer = Rc::as_ptr(name) as usize;
                 if self.callable_allocations.insert(outer) {
                     self.callable_metadata =
@@ -985,7 +987,10 @@ impl Visitor {
         if let Some(layout) = object.props.shared_layout() {
             self.property_layout(layout);
         }
-        for (_, property) in object.props.iter() {
+        for (key, _) in object.internal_slots().iter() {
+            self.rc_str(key);
+        }
+        for (_, property) in object.props.iter().chain(object.internal_slots().iter()) {
             property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);
@@ -1005,7 +1010,7 @@ impl Visitor {
             }
         }
         self.callable(&object.call);
-        let mut internal_bytes = 0;
+        let mut internal_bytes = object.internal_slots().retained_storage_bytes();
         if let Some(view) = &object.native_typed_array {
             internal_bytes += size_of::<crate::native_typed_array::NativeTypedArray>();
             internal_bytes += self.native_buffer(&view.buffer);
@@ -1929,6 +1934,11 @@ fn scan_realm(
             totals.interpreter_side_tables.add(name.capacity());
         }
     }
+    if let Some(registry) = &interp.borrowed_parameters {
+        totals
+            .interpreter_side_tables
+            .add(registry.scan_retained_memory(visitor));
+    }
     for (module, source) in &interp.module_source_objs {
         totals.interpreter_side_tables.add(module.capacity());
         visitor.value(source);
@@ -2077,6 +2087,7 @@ fn scan_realm(
     );
     for wait in &interp.pending_async_waits {
         visitor.value(&wait.promise);
+        visitor.shared_array_buffer(wait.block.id());
     }
     for (callback, _) in &interp.pending_timers {
         visitor.value(callback);
@@ -2250,7 +2261,9 @@ fn scan_realm(
     for data in interp.array_buffers.values() {
         match data {
             crate::interpreter::BufferData::Local(bytes) => visitor.array_buffer(bytes),
-            crate::interpreter::BufferData::Shared(id) => visitor.shared_array_buffer(*id),
+            crate::interpreter::BufferData::Shared(block) => {
+                visitor.shared_array_buffer(block.id())
+            }
         }
     }
 
@@ -3072,8 +3085,9 @@ mod tests {
             .array_buffers
             .insert(2, BufferData::Local(shared_buffer));
         let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
+        let shared_id = shared_data_block.id();
         root.array_buffers
-            .insert(3, BufferData::Shared(shared_data_block));
+            .insert(3, BufferData::Shared(shared_data_block.clone()));
         shadow
             .array_buffers
             .insert(4, BufferData::Shared(shared_data_block));
@@ -3102,12 +3116,12 @@ mod tests {
         assert_eq!(aggregate.shared_array_buffer_backing.allocations.len(), 1);
         assert_eq!(
             aggregate.shared_array_buffer_backing.allocations[0].id,
-            shared_data_block
+            shared_id
         );
         assert!(aggregate.shared_array_buffer_backing.bytes() >= 337);
         let json = aggregate.json(5, 7);
         assert!(json.contains(&format!(
-            "\"allocation_id\":\"shared-data-block:{shared_data_block}\""
+            "\"allocation_id\":\"shared-data-block:{shared_id}\""
         )));
         assert!(json.contains("\"externally_shared\":true"));
         assert!(
@@ -3123,16 +3137,15 @@ mod tests {
 
     #[test]
     fn absent_shared_backing_identity_is_unavailable_not_zero() {
-        let mut interp = Interp::new();
         let absent_id = crate::interpreter::next_shared_id();
-        interp
-            .array_buffers
-            .insert(1, crate::interpreter::BufferData::Shared(absent_id));
-
-        let snapshot = measure(&interp, &[], &[]);
-        assert_eq!(snapshot.shared_array_buffer_backing.unavailable_ids, 1);
-        assert!(!snapshot.complete());
-        let json = snapshot.json(1, 1);
+        let mut visitor = Visitor::default();
+        visitor.shared_array_buffer(absent_id);
+        let category = SharedBackingCategory {
+            allocations: visitor.shared_array_buffer_allocations,
+            unavailable_ids: visitor.unavailable_shared_array_buffers,
+        };
+        assert_eq!(category.unavailable_ids, 1);
+        let json = format!("\"shared_array_buffer_backing\":{}", category.json());
         assert!(json.contains(
             "\"shared_array_buffer_backing\":{\"bytes\":null,\"quality\":\"unavailable\""
         ));
@@ -3438,7 +3451,7 @@ mod tests {
         );
         let registry = match engine
             .interp
-            .get_member(&Value::Obj(engine.interp.global.clone()), "memoryFinalizer")
+            .get_member_key(&Value::Obj(engine.interp.global.clone()), "memoryFinalizer")
         {
             Ok(registry) => registry,
             Err(_) => panic!("registry global is readable"),
@@ -3648,6 +3661,7 @@ mod tests {
                 promise: Value::lstr("wait promise payload"),
                 token: 0,
                 id: 0,
+                block: crate::interpreter::alloc_shared_mem(8).unwrap(),
                 index: 0,
                 deadline: None,
             });

@@ -102,7 +102,7 @@ impl Interp {
         // rather than introduce raw layouts.
         self.fast_get_elem(source.as_obj().expect("binding Array"), index as f64)
             .map(Ok)
-            .unwrap_or_else(|| self.get_member(source, &index.to_string()))
+            .unwrap_or_else(|| self.get_member_key(source, &index.to_string()))
     }
 
     /// The iterator walk of a flat array pattern (`Op::DestructureArr`): `count` element values
@@ -125,12 +125,13 @@ impl Interp {
         };
         let array = source.as_obj()?;
         let mut done = false;
-        for _ in index..count {
+        let remaining = count.saturating_sub(index);
+        for _ in 0..remaining {
             if !done {
                 if index < self.array_length(array) {
                     let value = match self.fast_get_elem(array, index as f64) {
                         Some(value) => value,
-                        None => match self.get_member(source, &index.to_string()) {
+                        None => match self.get_member_key(source, &index.to_string()) {
                             Ok(value) => value,
                             Err(error) => return Some(Err(error)),
                         },

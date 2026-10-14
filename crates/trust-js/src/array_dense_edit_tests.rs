@@ -108,6 +108,36 @@ fn concat_copies_own_data_elements_and_keeps_spreadability_and_hole_steps() {
 }
 
 #[test]
+fn concat_species_writes_recheck_source_properties_and_aliases() {
+    check(
+        r#"(function(){
+        var a=[1,2,3],log=[];
+        a.constructor={[Symbol.species]:function(){
+            return new Proxy([],{
+                defineProperty(target,key,descriptor){
+                    log.push(key+':'+descriptor.value);
+                    if(key==='0')delete a[1];
+                    if(key==='2')a[3]=4;
+                    return Reflect.defineProperty(target,key,descriptor);
+                }
+            });
+        }};
+        var result=a.concat();
+        if(!(0 in result)||(1 in result)||!(2 in result)||result.length!==3)
+            throw 'species must recheck HasProperty';
+        if(log.join('|')!=='0:1|2:3|length:3')throw 'define order '+log.join('|');
+        var b=[4,5,6];b.constructor={[Symbol.species]:function(){return b;}};
+        // A destination that is also a later spread source overwrites source
+        // indices ahead of that source's subsequent Get operations.
+        var c=[1,2];c.constructor={[Symbol.species]:function(){return b;}};
+        var aliased=c.concat(b);
+        return result.join(',')+'|'+a.join(',')+'|'+aliased.join(',');
+        })()"#,
+        "1,,3|1,,3,4|1,2,1,2,1",
+    );
+}
+
+#[test]
 fn plain_element_edits_keep_values_alive_and_numeric_reads_coherent() {
     check(
         r#"(function(){

@@ -876,9 +876,9 @@ fn baseline_bytes(op: &Op) -> usize {
 /// §10.2.11). Consequently author code entered by a Call/Get/Set cannot read or
 /// change the caller's private slots. Its heap effects still invalidate object
 /// facts; that is distinct from invalidating these numeric register homes.
-/// This is the current activation contract, not a proof for future compiled
-/// `function.arguments` reflection: live activation mirrors must publish homes
-/// before author effects and invalidate their cached representations after writes.
+/// Borrowed AST activations are the exception: their ordinary/legacy argument maps may
+/// alias these slots. `region_frame_effect` strengthens their observer boundary to publish
+/// all homes before author effects and reload cached representations after writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameEffect {
     Independent,
@@ -950,7 +950,29 @@ fn frame_effect(op: &Op) -> FrameEffect {
 /// numeric register home: writing Empty would invalidate the DReg proof, so the
 /// established full reload must deopt at the post-Tdz boundary. Tagged homes are
 /// refreshed by the ordinary Write postlude after the canonical owner is released.
-fn region_frame_effect(op: &Op, plan: &Plan) -> FrameEffect {
+fn region_frame_effect(op: &Op, plan: &Plan, parameter_aliases: bool) -> FrameEffect {
+    if parameter_aliases
+        && !matches!(
+            op,
+            Op::Void
+                | Op::Typeof
+                | Op::TypeofIs(..)
+                | Op::Not
+                | Op::Pop
+                | Op::Dup
+                | Op::LoadThis
+                | Op::Undef
+                | Op::Const(..)
+                | Op::StoreLocal(..)
+                | Op::Tdz(..)
+                | Op::DestructureGuard
+        )
+    {
+        // A live AST ParameterMap can read/write formal slots from any author callback.
+        // Publish the canonical cells before conversion/property/call effects, and reload
+        // every cached home afterwards. Guarded pure Number operations never reach here.
+        return FrameEffect::Full;
+    }
     match *op {
         Op::Tdz(slot) if plan.reg(slot).is_none() => FrameEffect::Write(slot),
         _ => frame_effect(op),
@@ -2268,7 +2290,8 @@ pub(super) fn emit(
     direct_finish: usize,
     entry_kind: NativeEntryKind,
 ) -> Emission {
-    let _ = entry_kind;
+    let parameter_aliases =
+        entry_kind == NativeEntryKind::BorrowedFrame && chunk.jit_borrowed_parameter_aliases();
     let emission_start = a.checkpoint();
     let plain = a.new_label();
     let mut saved_work = 0usize;
@@ -2397,8 +2420,8 @@ pub(super) fn emit(
         let mut fusing: Option<(usize, NameElementPlan, Vec<Operand>, bool)> = None;
         // Block-local facts are established by executed stores, never imported
         // from SSA demand or a different predecessor/OSR entry. CaptureScan keeps
-        // author-visible bindings out of these slots. Future live f.arguments
-        // activation mirrors must invalidate these facts after author effects.
+        // author-visible bindings out of fresh-frame slots. Borrowed activation aliases
+        // invalidate these facts through their full observer barrier.
         let mut numeric_locals = crate::fasthash::FastSet::default();
         for pc in start..end {
             if let Some(labels) = tdz_array_continuations.get(&pc) {
@@ -2490,7 +2513,7 @@ pub(super) fn emit(
             // A region keeps its private CFG, but does not discard the baseline's
             // stronger ownership-aware local templates. Spans stay within one block;
             // independent original entries remain separately emitted in the baseline.
-            if pc + 3 < end && fast & 2 != 0 && eq_inlinable(layout) {
+            if !parameter_aliases && pc + 3 < end && fast & 2 != 0 && eq_inlinable(layout) {
                 if let (
                     Op::LoadLocal(lhs),
                     Op::LoadLocal(rhs),
@@ -2787,7 +2810,10 @@ pub(super) fn emit(
             }
             // A fused name/element access (see `NameElementPlan`): the LoadName waits for the
             // element operation, which reads the binding itself.
-            if fusing.is_none() && tdz_array_pairs.is_empty() && matches!(ops[pc], Op::LoadName(..))
+            if !parameter_aliases
+                && fusing.is_none()
+                && tdz_array_pairs.is_empty()
+                && matches!(ops[pc], Op::LoadName(..))
             {
                 if let Some(found) = plan_name_element(
                     chunk,
@@ -3138,7 +3164,8 @@ pub(super) fn emit(
                     }
                 }
                 Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq
-                    if !stack[depth - 2..].iter().all(|value| value.numeric()) =>
+                    if !parameter_aliases
+                        && !stack[depth - 2..].iter().all(|value| value.numeric()) =>
                 {
                     // Equality is not exclusively numeric. Preserve the ordinary
                     // identity/nullish/string/coercion template inside the region
@@ -3419,7 +3446,7 @@ pub(super) fn emit(
                     own_facts.clear();
                     let before = stack.clone();
                     materialize(a, layout, &stack, physical);
-                    let effect = region_frame_effect(&ops[pc], plan);
+                    let effect = region_frame_effect(&ops[pc], plan, parameter_aliases);
                     match effect {
                         FrameEffect::Independent => {}
                         FrameEffect::Read(slot) | FrameEffect::Write(slot) => {

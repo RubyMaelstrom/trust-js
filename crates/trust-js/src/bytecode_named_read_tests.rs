@@ -368,7 +368,7 @@ fn collect_named_read(
 fn error_name(engine: &mut Engine, error: &Value) -> String {
     match engine
         .interp
-        .get_member(error, "name")
+        .get_member_key(error, "name")
         .ok()
         .expect("error name read")
     {

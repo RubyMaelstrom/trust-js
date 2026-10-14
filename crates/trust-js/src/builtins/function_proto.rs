@@ -67,7 +67,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         // max(0, ToIntegerOrInfinity(len) - boundArgs). name = "bound " + Get(target, "name").
         let has_own_len = has_own_property_trapped(i, &this, "length")?;
         let l: f64 = if has_own_len {
-            match ab(i.get_member(&this, "length"))? {
+            match ab(i.get_member_key(&this, "length"))? {
                 Value::Num(n) if n == f64::INFINITY => f64::INFINITY,
                 Value::Num(n) if n.is_finite() => (n.trunc() - bound_args.len() as f64).max(0.0),
                 _ => 0.0,
@@ -75,7 +75,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         } else {
             0.0
         };
-        let target_name = ab(i.get_member(&this, "name"))?;
+        let target_name = ab(i.get_member_key(&this, "name"))?;
         let name = match &target_name {
             Value::Str(s) => format!("bound {s}"),
             _ => "bound ".to_string(),
@@ -307,7 +307,7 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
                     "async function*" => "%AsyncGeneratorFunction.prototype%",
                     _ => "Function",
                 };
-                match ab(i.get_member(&nt, "prototype"))? {
+                match ab(i.get_member_key(&nt, "prototype"))? {
                     Value::Obj(p) => {
                         if let Value::Obj(fo) = &func {
                             fo.borrow_mut().proto = Some(p);

@@ -206,11 +206,13 @@ fn context_check(source: &str, expected: &str, minimum_fragments: usize) {
             Property::data(Value::Obj(enable), true, true, true),
         );
         crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|n| n.set(0));
+        crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|n| n.set(0));
         match engine.eval(source, false).expect("context fixture parses") {
             Completion::Value(value) => assert_eq!(value, expected, "{tier:?}: {source}"),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}\n{source}"),
         }
-        let entries = crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|n| n.get());
+        let entries = crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|n| n.get())
+            + crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|n| n.get());
         if tier == Tier::Interp {
             assert_eq!(entries, 0);
         } else {

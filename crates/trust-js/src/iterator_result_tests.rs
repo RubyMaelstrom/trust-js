@@ -13,7 +13,7 @@ fn global(engine: &mut Engine, name: &str) -> Value {
     let global = Value::Obj(engine.interp.global.clone());
     engine
         .interp
-        .get_member(&global, name)
+        .get_member_key(&global, name)
         .unwrap_or_else(|_| panic!("global {name}"))
 }
 
@@ -30,7 +30,7 @@ fn iterator_results_remove_wrapper_allocations_but_public_next_keeps_identity() 
         let iterator = global(&mut engine, "iterator");
         let next = engine
             .interp
-            .get_member(&iterator, "next")
+            .get_member_key(&iterator, "next")
             .unwrap_or_else(|_| panic!("next"));
         let before = crate::value::heap_allocated_objects(&engine.interp.gc_heap);
         for _ in 0..3 {

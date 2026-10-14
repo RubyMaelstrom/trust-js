@@ -15,6 +15,7 @@ pub(super) enum RootKind {
 }
 
 /// Borrowed syntax only: the cold path neither clones the AST nor analyzes the subtree.
+#[derive(Clone, Copy)]
 pub(crate) enum Source<'a> {
     While(&'a Expr, &'a Stmt),
     DoWhile(&'a Stmt, &'a Expr),
@@ -109,6 +110,7 @@ pub(super) struct Plan {
     pub(super) source_bytes: usize,
     pub(super) completion_slot: u16,
     pub(super) seed_slots: Vec<u16>,
+    pub(super) private_slots: Vec<(Rc<str>, u16)>,
     pub(super) active: std::cell::Cell<usize>,
 }
 
@@ -161,6 +163,9 @@ pub(crate) fn enter(
         return Ok(None);
     }
     i.interrupt_poll_force()?;
+    if let Some(completion) = super::try_function_osr(i, site, env)? {
+        return Ok(Some(completion));
+    }
     let token = site.token();
     let realm = i.global.clone();
     let context = Context::current(i);
@@ -179,10 +184,12 @@ pub(crate) fn enter(
             #[cfg(test)]
             TEST_FRAGMENT_COMPILES.with(|counter| counter.set(counter.get() + 1));
             let started = crate::jit::perf_stage_start();
-            let compiled = compile(source, labels, context);
+            let private = function_private_bindings(i, site, &source, env);
+            let compiled = compile_with_private(source, labels, context, &private)
+                .or_else(|| compile_with_private(source, labels, context, &[]));
             crate::jit::perf_bytecode_compile_end(started, compiled.is_some());
             i.interrupt_poll_force()?;
-            let Some((chunk, completion_slot, seed_slots)) = compiled else {
+            let Some((chunk, completion_slot, seed_slots, private_slots)) = compiled else {
                 i.fragment_cache
                     .unsupported(token, &realm, kind, context, labels);
                 return Ok(None);
@@ -193,6 +200,7 @@ pub(crate) fn enter(
                 source_bytes,
                 completion_slot,
                 seed_slots,
+                private_slots,
                 active: std::cell::Cell::new(0),
             });
             i.fragment_cache
@@ -206,6 +214,10 @@ pub(crate) fn enter(
     let seed_slots = &plan.seed_slots;
     #[cfg(test)]
     TEST_FRAGMENT_ENTRIES.with(|counter| counter.set(counter.get() + 1));
+    #[cfg(test)]
+    if !plan.private_slots.is_empty() {
+        TEST_PRIVATE_FRAGMENT_ENTRIES.with(|counter| counter.set(counter.get() + 1));
+    }
 
     // No make_run_env, ScriptEvaluation, FDI, binding initialization, iterator acquisition or
     // receiver binding occurs here. Rust-owned outer environments remain collector roots.
@@ -215,6 +227,34 @@ pub(crate) fn enter(
     debug_assert!(slots.is_empty() && stack.is_empty());
     slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
     slots.write_value(completion_slot as usize, completion.clone());
+    // Proven private homes can live in frame slots while this loop runs. Keep their original
+    // records pinned and publish the final values before any parked AST catch/finally resumes.
+    let mut private = Vec::with_capacity(plan.private_slots.len());
+    for (name, slot) in &plan.private_slots {
+        let before = private.len();
+        let mut cursor = Some(env.clone());
+        while let Some(environment) = cursor {
+            let scope = environment.borrow();
+            if let Some(binding) = scope.vars.get(name) {
+                slots.write_value(
+                    *slot as usize,
+                    if binding.initialized {
+                        binding.value.clone()
+                    } else {
+                        Value::Empty
+                    },
+                );
+                private.push((environment.clone(), name.clone(), *slot));
+                break;
+            }
+            cursor = scope.parent.clone();
+        }
+        assert_eq!(
+            private.len(),
+            before + 1,
+            "private fragment binding must remain present"
+        );
+    }
     match seed {
         Seed::None => debug_assert!(seed_slots.is_empty()),
         Seed::ForIn(source, keys, cursor) => {
@@ -237,15 +277,29 @@ pub(crate) fn enter(
         .map(|_| crate::eval::PreparedReferenceSlot::default())
         .collect::<Vec<_>>();
     let mut tiering = crate::tiering::VmTiering::new();
+    // The exact projected records stay parked while shared slot Cells are canonical. This
+    // also preserves sloppy ordinary/legacy argument maps when the fragment moves a formal.
+    let aliases = if private.is_empty() {
+        None
+    } else {
+        let registry = i.borrowed_parameters.get_or_insert_with(Default::default);
+        Some(unsafe { registry.enter(&private, &slots) })
+    };
     // LoadThis is lexical in every fragment, including a not-yet-initialized derived receiver.
-    let native = matches!(i.tier, Tier::Jit);
+    let run_once = i.fn_frames.last().is_some_and(|frame| {
+        let callee = frame.callee();
+        let borrowed = callee.borrow();
+        matches!(&borrowed.call, crate::value::Callable::User(user)
+            if user.func.run_once && function_owns_loop(&user.func, site))
+    });
+    let native = matches!(i.tier, Tier::Jit) && !run_once;
     let result = drive_vm(
         i,
         chunk,
         &mut current_env,
         &cap_env,
         &mut references,
-        &mut slots,
+        &slots,
         &mut stack,
         &mut pc,
         &Value::Undefined,
@@ -256,6 +310,7 @@ pub(crate) fn enter(
         false,
         native.then_some(&mut tiering),
     );
+    drop(aliases);
     slots.clear();
     stack.clear();
     if i.vm_pool.len() < 64 {
@@ -289,15 +344,164 @@ pub(crate) fn enter(
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_FRAGMENT_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_PRIVATE_FRAGMENT_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TEST_FRAGMENT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TEST_FRAGMENT_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
 fn compile(
     source: Source<'_>,
     labels: &[&str],
     context: Context,
 ) -> Option<(Rc<Chunk>, u16, Vec<u16>)> {
+    let (chunk, completion, seeds, _) = compile_with_private(source, labels, context, &[])?;
+    Some((chunk, completion, seeds))
+}
+
+fn function_owns_loop(function: &Function, site: &LoopSite) -> bool {
+    let mut pending = function.body.iter().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
+        if let Some(body) = statement.loop_body() {
+            if std::ptr::eq(&body.site, site) {
+                return true;
+            }
+            pending.push(&body.statement);
+            continue;
+        }
+        match statement {
+            Stmt::Block(body) => pending.extend(body),
+            Stmt::If { cons, alt, .. } => {
+                pending.push(cons);
+                if let Some(alt) = alt {
+                    pending.push(alt);
+                }
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                pending.extend(block);
+                if let Some((_, body)) = handler {
+                    pending.extend(body);
+                }
+                if let Some(body) = finalizer {
+                    pending.extend(body);
+                }
+            }
+            Stmt::Switch { cases, .. } => {
+                for case in cases {
+                    pending.extend(&case.body);
+                }
+            }
+            Stmt::Labeled { body, .. }
+            | Stmt::With { body, .. }
+            | Stmt::ExportDecl(body)
+            | Stmt::ExportDefault(body) => pending.push(body),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn function_private_bindings(
+    i: &Interp,
+    site: &LoopSite,
+    source: &Source<'_>,
+    env: &Env,
+) -> Vec<(Rc<str>, bool)> {
+    let Some(frame) = i.fn_frames.last() else {
+        return Vec::new();
+    };
+    let callee = frame.callee();
+    let (function, closure) = match &callee.borrow().call {
+        crate::value::Callable::User(user) => (user.func.clone(), user.env.clone()),
+        _ => return Vec::new(),
+    };
+    if env.borrow().under_with || !function_owns_loop(&function, site) {
+        return Vec::new();
+    }
+    let Some((captured, _, _, runtime_lexicals, direct_eval)) = CaptureScan::run(&function, false)
+    else {
+        return Vec::new();
+    };
+    if direct_eval {
+        return Vec::new();
+    }
+    let root = crate::interpreter::nearest_var_env(env);
+    if Rc::ptr_eq(&root, &closure)
+        || Rc::ptr_eq(&root, &i.global_env)
+        || root.borrow().parent.is_none()
+    {
+        return Vec::new();
+    }
+    let mut names = root
+        .borrow()
+        .vars
+        .iter()
+        .filter(|(name, binding)| {
+            !name.starts_with('%')
+                && name.as_ref() != "this"
+                && name.as_ref() != "arguments"
+                && !binding.imported
+                && !binding.deletable
+                && !captured.contains(name.as_ref())
+                && !runtime_lexicals.contains(name.as_ref())
+        })
+        .map(|(name, binding)| (name.clone(), !binding.mutable))
+        .take(64)
+        .collect::<Vec<_>>();
+    if let Source::For(
+        Some(ForInit::VarDecl {
+            kind: DeclKind::Let | DeclKind::Const,
+            decls,
+        }),
+        ..,
+    ) = source
+    {
+        let mut head = crate::fasthash::FastSet::default();
+        for (pattern, _) in decls {
+            pat_idents(pattern, &mut head);
+        }
+        for name in head {
+            if captured.contains(&name) || runtime_lexicals.contains(&name) {
+                continue;
+            }
+            let mut cursor = Some(env.clone());
+            while let Some(environment) = cursor {
+                let scope = environment.borrow();
+                if let Some(binding) = scope.vars.get(name.as_str()) {
+                    names.retain(|(old, _)| old.as_ref() != name);
+                    names.push((Rc::from(name.as_str()), !binding.mutable));
+                    break;
+                }
+                cursor = scope.parent.clone();
+            }
+        }
+    }
+    // A surrounding block/catch can shadow a function home. Both the value and its immutable
+    // binding rules belong to that exact nearest record, rather than the root's same name.
+    for (name, is_const) in &mut names {
+        let mut cursor = Some(env.clone());
+        while let Some(environment) = cursor {
+            let scope = environment.borrow();
+            if let Some(binding) = scope.vars.get(name) {
+                *is_const = !binding.mutable;
+                break;
+            }
+            cursor = scope.parent.clone();
+        }
+    }
+    names
+}
+
+fn compile_with_private(
+    source: Source<'_>,
+    labels: &[&str],
+    context: Context,
+    private: &[(Rc<str>, bool)],
+) -> Option<(Rc<Chunk>, u16, Vec<u16>, Vec<(Rc<str>, u16)>)> {
     let (kind, source) = source.owned();
     let mut c = Compiler {
         // Fragments borrow a tree-walker frame and never know its function. Self-hosted
@@ -310,6 +514,7 @@ fn compile(
         arguments_length_only: false,
         strict: context.strict,
         fragment_entry: true,
+        borrowed_parameter_aliases: !context.strict && !private.is_empty(),
         fragment_root: Some(kind),
         lexical_this: true,
         fragment_async_generator: context.async_generator,
@@ -320,6 +525,15 @@ fn compile(
         ..Compiler::default()
     };
     c.push_compile_scope();
+    let mut private_slots = Vec::with_capacity(private.len());
+    for (name, is_const) in private {
+        let slot = c.fresh_slot(name);
+        c.scope_bind(name, slot, *is_const);
+        // Admission can occur before a later body-level lexical declaration initializes its
+        // cell. Preserve Reference-before-key ordering in the compiler's local element fusions.
+        c.tdz_slots.insert(slot);
+        private_slots.push((name.clone(), slot));
+    }
     // A non-source control context anchors external cleanup at handler depth zero. It cannot
     // capture unlabelled break/continue, and is never a runtime destination itself.
     c.loops.push(LoopCtx {
@@ -327,13 +541,43 @@ fn compile(
         ..LoopCtx::default()
     });
     let completion = c.fresh_slot("%fragment-completion%");
-    c.script_completion = Some(completion);
+    // A private projection proves this exact loop belongs to the active FunctionBody.
+    // Its ordinary/break/continue statement value is discarded by FunctionBody Evaluation;
+    // explicit return/throw operands and finally completion routing remain independent.
+    // Script/eval loops retain UpdateEmpty, including empty-value declarations and labels.
+    let discard_completion = !private.is_empty();
+    if !discard_completion {
+        c.script_completion = Some(completion);
+    }
     c.stmt(&source).ok()?;
-    c.emit(Op::LoadLocal(completion));
+    if c.borrowed_parameter_aliases
+        && (c.eval_exprs.iter().any(|plan| {
+            plan.locals
+                .iter()
+                .any(|local| private_slots.iter().any(|(_, slot)| *slot == local.slot))
+        }) || c.assignment_targets.iter().any(|plan| {
+            plan.locals
+                .iter()
+                .any(|local| private_slots.iter().any(|(_, slot)| *slot == local.slot))
+        }))
+    {
+        // Retained evaluator projections copy bindings rather than sharing these slot Cells.
+        // Keep the original Environment Records canonical for those uncommon operations.
+        return None;
+    }
+    c.emit(if discard_completion {
+        Op::Undef
+    } else {
+        Op::LoadLocal(completion)
+    });
     c.emit(Op::FragmentExit(FragmentExitKind::Normal));
     for (jump, kind) in std::mem::take(&mut c.fragment_exits) {
         c.patch(jump);
-        c.emit(Op::LoadLocal(completion));
+        c.emit(if discard_completion {
+            Op::Undef
+        } else {
+            Op::LoadLocal(completion)
+        });
         c.emit(Op::FragmentExit(kind));
     }
     // Actual own suspension cannot cross a parked Rust AST activation. Nested functions are
@@ -353,7 +597,12 @@ fn compile(
         return None;
     }
     let seeds = std::mem::take(&mut c.fragment_seed_slots);
-    Some((finish_chunk(c, None, true, false, None)?, completion, seeds))
+    Some((
+        finish_chunk(c, None, true, false, None)?,
+        completion,
+        seeds,
+        private_slots,
+    ))
 }
 
 impl Compiler {
@@ -433,6 +682,10 @@ impl Compiler {
             }
             let mut names: Vec<_> = names.into_iter().collect();
             names.sort();
+            names.retain(|name| !matches!(self.home(name), Some(Home::Slot(..))));
+            if names.is_empty() {
+                return self.fragment_for_slot_remainder(labels, test, update, body, None);
+            }
             // The AST already owns this exact per-iteration Environment Record. Register its
             // binding schema without PushLex or the initial CreatePerIterationEnvironment.
             let index = self.lexical_scopes.len() as u32;
@@ -452,6 +705,17 @@ impl Compiler {
         } else {
             None
         };
+        self.fragment_for_slot_remainder(labels, test, update, body, per_iteration)
+    }
+
+    fn fragment_for_slot_remainder(
+        &mut self,
+        labels: Vec<String>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+        per_iteration: Option<u32>,
+    ) -> CResult {
         let start = self.ops.len();
         let exit = if let Some(test) = test {
             self.expr(test)?;

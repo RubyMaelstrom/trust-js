@@ -528,3 +528,122 @@ fn legacy_caller_finds_spliced_activations() {
         }
     }
 }
+
+#[test]
+fn legacy_caller_keeps_splices_across_implicit_author_calls() {
+    // Expected results verified with Node. Legacy caller is an implementation extension;
+    // ECMA-262 Forbidden Extensions still forbids exposing a strict function as its value.
+    let source = r#"
+        var seen, fail = false;
+        function observe() {
+            if (fail) throw new Error('getter');
+            return observe.caller;
+        }
+        function store(value) { seen = store.caller; }
+        function number() { seen = number.caller; return 7; }
+        var receiver = {
+            named() { return this.value; },
+            computed(key) { return this[key]; },
+            write() { this.value = 1; return 1; },
+            writeComputed(key) { this[key] = 1; return 1; },
+            numeric() { return +this.numericValue; },
+            strict() { 'use strict'; return this.value; }
+        };
+        Object.defineProperty(receiver, 'value', { get: observe, set: store });
+        receiver.numericValue = { valueOf: number };
+        function invokeNamed() { return receiver.named(); }
+        function invokeComputed(key) { return receiver.computed(key); }
+        function invokeWrite() { return receiver.write(); }
+        function invokeWriteComputed(key) { return receiver.writeComputed(key); }
+        function invokeNumeric() { return receiver.numeric(); }
+        function invokeStrict() { 'use strict'; return receiver.strict(); }
+        function nested() { return invokeNamed(); }
+        function direct() { return observe(); }
+        var bad = 0;
+        for (var n = 0; n < 2000; n++) {
+            if (invokeNamed() !== receiver.named) bad++;
+            if (invokeComputed('value') !== receiver.computed) bad++;
+            if (nested() !== receiver.named) bad++;
+            invokeWrite();
+            if (seen !== receiver.write) bad++;
+            invokeWriteComputed('value');
+            if (seen !== receiver.writeComputed) bad++;
+            if (invokeNumeric() !== 7 || seen !== receiver.numeric) bad++;
+            if (invokeStrict() !== null) bad++;
+        }
+        fail = true;
+        try { nested(); } catch (error) { if (error.message !== 'getter') bad++; }
+        fail = false;
+        if (direct() !== direct || invokeNamed() !== receiver.named) bad++;
+        String(bad);
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(evaluate(&mut engine, source), "0", "{tier:?}");
+        if tier == Tier::Jit {
+            for name in [
+                "invokeNamed",
+                "invokeComputed",
+                "invokeWrite",
+                "invokeWriteComputed",
+                "invokeNumeric",
+                "invokeStrict",
+                "nested",
+            ] {
+                require_hot_native(&mut engine, name, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn spliced_implicit_callbacks_preserve_captured_and_thrown_stack_positions() {
+    let source = r#"var throwing = false;
+function observeStack() {
+    var error = new Error('getter');
+    if (throwing) throw error;
+    return error;
+}
+function storeStack(value) { throw new Error('setter'); }
+var receiver = {
+    read() { return this.value; },
+    write() { this.value = 1; },
+    directError() { return null.value; }
+};
+Object.defineProperty(receiver, 'value', {get: observeStack, set: storeStack});
+function invokeRead() { return receiver.read(); }
+function invokeWrite() { return receiver.write(); }
+function invokeDirect() { return receiver.directError(); }
+function firstFrames(error) { return error.stack.split('\n').slice(0, 4).join('\n'); }
+for (var n = 0; n < 1500; n++) {
+    invokeRead();
+    try { invokeWrite(); } catch (error) {}
+    try { invokeDirect(); } catch (error) {}
+}
+var result = firstFrames(invokeRead());
+throwing = true;
+try { invokeRead(); } catch (error) { result += '|' + firstFrames(error); }
+try { invokeWrite(); } catch (error) { result += '|' + firstFrames(error); }
+try { invokeDirect(); } catch (error) {
+    result += '|' + firstFrames(error).replace(/^[^\n]*/, 'TypeError');
+}
+result;"#;
+    let mut expected = None;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let result = evaluate(&mut engine, source);
+        match &expected {
+            None => expected = Some(result),
+            Some(expected) => assert_eq!(&result, expected, "{tier:?}"),
+        }
+        if tier == Tier::Jit {
+            for name in ["invokeRead", "invokeWrite", "invokeDirect"] {
+                require_hot_native(&mut engine, name, true);
+            }
+        }
+    }
+}

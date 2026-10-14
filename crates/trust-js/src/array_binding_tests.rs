@@ -135,11 +135,11 @@ fn array_binding_declines_final_old_slot_owners_without_effects() {
     let global = crate::value::Value::Obj(engine.interp.global.clone());
     let source = engine
         .interp
-        .get_member(&global, "source")
+        .get_member_key(&global, "source")
         .unwrap_or_else(|_| panic!("source"));
     let old = engine
         .interp
-        .get_member(&global, "old")
+        .get_member_key(&global, "old")
         .unwrap_or_else(|_| panic!("old"));
     eval(&mut engine, "old=null;");
     // The temporary plus one simulated slot are the only owners.
@@ -285,7 +285,7 @@ fn array_binding_slot_replacement_runs_final_host_owners_before_the_next_read() 
         let global = Value::Obj(engine.interp.global.clone());
         let source = engine
             .interp
-            .get_member(&global, "nextPair")
+            .get_member_key(&global, "nextPair")
             .unwrap_or_else(|_| panic!("next pair"));
         let source = source.as_obj().unwrap().clone();
         let drops = Rc::new(Cell::new(0usize));

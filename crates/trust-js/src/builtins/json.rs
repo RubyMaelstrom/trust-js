@@ -25,7 +25,7 @@ pub(super) fn install_json(it: &mut Interp) {
             // large replacer array does not repeatedly rescan the prefix of `list`.
             let mut list_seen = crate::fasthash::FastSet::default();
             for k in 0..len {
-                let item = ab(i.get_member(&replacer, &k.to_string()))?;
+                let item = ab(i.get_member_key(&replacer, &k.to_string()))?;
                 // String/Number primitives and their wrappers contribute a key via ToString.
                 let key = match &item {
                     Value::Str(s) => Some(s.to_string()),
@@ -39,7 +39,7 @@ pub(super) fn install_json(it: &mut Interp) {
                 };
                 if let Some(key) = key {
                     if list_seen.insert(key.clone()) {
-                        list.push(Rc::from(key));
+                        list.push(Rc::from(crate::value::encode_owned_string_key(key)));
                     }
                 }
             }
@@ -159,7 +159,7 @@ pub(super) fn install_json(it: &mut Interp) {
     });
     it.def_method(&j, "isRawJSON", 1, |_i, _t, args| {
         Ok(Value::Bool(
-            matches!(arg(args, 0), Value::Obj(o) if o.borrow().props.contains("\u{0}raw_json")),
+            matches!(arg(args, 0), Value::Obj(o) if o.borrow().internal_slots().contains("\u{0}raw_json")),
         ))
     });
     set_to_string_tag(it, &j, "JSON");
@@ -296,7 +296,7 @@ fn internalize_json_property(
     reviver: &Value,
     record: Option<&JsonRecord>,
 ) -> Result<Value, Value> {
-    let val = ab(i.get_member(holder, name))?;
+    let val = ab(i.get_member_key(holder, name))?;
     if matches!(val, Value::Obj(_)) {
         if json_is_array(i, &val)? {
             let len = match val.as_obj() {
@@ -323,7 +323,7 @@ fn internalize_json_property(
                 proxy_enum_string_keys(i, &val)?
                     .iter()
                     .filter_map(|k| match k {
-                        Value::Str(s) => Some(s.to_string()),
+                        Value::Str(s) => Some(crate::value::encode_owned_string_key(s.to_string())),
                         _ => None,
                     })
                     .collect()
@@ -339,9 +339,10 @@ fn internalize_json_property(
             };
             for k in keys {
                 let child = match record {
-                    Some(JsonRecord::Obj(entries)) => {
-                        entries.iter().find(|(key, _)| key == &k).map(|(_, r)| r)
-                    }
+                    Some(JsonRecord::Obj(entries)) => entries
+                        .iter()
+                        .find(|(key, _)| key == crate::value::decode_string_key(&k))
+                        .map(|(_, r)| r),
                     _ => None,
                 };
                 let new_el = nested(i, |i| {
@@ -366,7 +367,11 @@ fn internalize_json_property(
     ab(i.call(
         reviver.clone(),
         holder.clone(),
-        &[Value::lstr(name.to_string()), val, Value::Obj(context)],
+        &[
+            crate::value::string_key_value(name),
+            val,
+            Value::Obj(context),
+        ],
     ))
 }
 
@@ -412,7 +417,7 @@ enum JsonKey<'k> {
 impl JsonKey<'_> {
     fn value(self) -> Value {
         match self {
-            JsonKey::Name(name) => Value::lstr(name.to_string()),
+            JsonKey::Name(name) => crate::value::string_key_value(name),
             JsonKey::Index(index) => Value::lstr(index.to_string()),
         }
     }
@@ -439,7 +444,7 @@ fn json_get(i: &mut Interp, holder: &Value, object: &Gc, key: &str) -> Result<Va
             }
         }
     }
-    ab(i.get_member(holder, key))
+    ab(i.get_member_key(holder, key))
 }
 
 /// [`json_get`] for an array element.
@@ -456,7 +461,7 @@ fn json_get_index(
             }
         }
     }
-    ab(i.get_member(holder, &index.to_string()))
+    ab(i.get_member_key(holder, &index.to_string()))
 }
 
 /// GetV(value, "toJSON") for SerializeJSONProperty step 2. Most values have no toJSON anywhere
@@ -483,7 +488,7 @@ fn json_to_json_method(i: &mut Interp, value: &Value) -> Result<Value, Value> {
             }
         }
     }
-    ab(i.get_member(value, "toJSON"))
+    ab(i.get_member_key(value, "toJSON"))
 }
 
 /// SerializeJSONProperty (ECMA-262 §25.5.2.2) for a `value` already read from `holder[key]`,
@@ -512,7 +517,7 @@ fn json_serialize_property(
             let object = o.borrow();
             match object.proto {
                 None => object
-                    .props
+                    .internal_slots()
                     .get("\u{0}raw_json")
                     .map(|property| property.value()),
                 Some(_) => None,
@@ -634,7 +639,7 @@ fn json_serialize_object(
         None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
             .filter_map(|key| match key {
-                Value::Str(key) => Some(Rc::from(key.as_str())),
+                Value::Str(key) => Some(Rc::from(crate::value::encode_string_key(key).as_ref())),
                 _ => None,
             })
             .collect(),
@@ -649,7 +654,6 @@ fn json_serialize_object(
                 let mut keys = object.props.ordered_keys();
                 keys.retain(|key| {
                     !Interp::is_sym_key(key)
-                        && !Interp::is_private_key(key)
                         && object
                             .props
                             .get(key)
@@ -661,10 +665,7 @@ fn json_serialize_object(
         None => {
             let mut keys = Vec::new();
             let own_keys = ordinary_own_keys_ordered(i, object)?;
-            for key in own_keys
-                .into_iter()
-                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
-            {
+            for key in own_keys.into_iter().filter(|key| !Interp::is_sym_key(key)) {
                 let enumerable = if ab(i.host_indexed_own_value(object, &key))?.is_some() {
                     crate::value::canonical_index(&key).is_some()
                 } else {
@@ -686,7 +687,7 @@ fn json_serialize_object(
     for key in &keys {
         let member_start = s.out.len();
         json_separator(s, !any);
-        json_quote_into(&mut s.out, key);
+        json_quote_into(&mut s.out, crate::value::decode_string_key(key));
         s.out.push(':');
         if !s.gap.is_empty() {
             s.out.push(' ');
@@ -830,7 +831,7 @@ fn json_parse_value(i: &mut Interp, input: JsonInput<'_>, pos: &mut usize) -> Re
                 }
                 *pos += 1;
                 let v = nested(i, |i| json_parse_value(i, input, pos))?;
-                set_data(&obj, &key, v);
+                set_data(&obj, &crate::value::encode_string_key(&key), v);
                 json_skip_ws(input, pos);
                 match input.get(*pos) {
                     Some(',') => {
@@ -992,7 +993,7 @@ fn json_parse_recorded(
                 }
                 *pos += 1;
                 let (v, vr) = nested(i, |i| json_parse_recorded(i, input, pos))?;
-                set_data(&obj, &key, v);
+                set_data(&obj, &crate::value::encode_string_key(&key), v);
                 rec.retain(|(k, _)| k != &key);
                 rec.push((key, vr));
                 json_skip_ws(input, pos);

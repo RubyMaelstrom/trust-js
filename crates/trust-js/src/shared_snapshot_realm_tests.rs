@@ -108,10 +108,10 @@ fn run_shared(it: &mut Interp) {
 
 fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     let global = Value::Obj(it.global.clone());
-    let Ok(shared) = it.get_member(&global, "shared") else {
+    let Ok(shared) = it.get_member_key(&global, "shared") else {
         panic!("shared is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member(&shared, name) else {
+    let Ok(Value::Obj(function)) = it.get_member_key(&shared, name) else {
         panic!("shared.{name} is a function");
     };
     let borrowed = function.borrow();
@@ -124,10 +124,10 @@ fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
 /// The AST Function behind a probe method, to prove both Realms run the same code.
 fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     let global = Value::Obj(it.global.clone());
-    let Ok(probe) = it.get_member(&global, "probe") else {
+    let Ok(probe) = it.get_member_key(&global, "probe") else {
         panic!("probe is defined");
     };
-    let Ok(Value::Obj(function)) = it.get_member(&probe, name) else {
+    let Ok(Value::Obj(function)) = it.get_member_key(&probe, name) else {
         panic!("probe.{name} is a function");
     };
     let borrowed = function.borrow();

@@ -124,7 +124,7 @@ pub(crate) fn canonicalize_locale_list(
     // and canonicalizing each element in turn (an element's ToString may mutate later indices).
     match locales {
         Value::Str(_) => process_locale_item(i, locales, &mut seen)?,
-        Value::Obj(o) if o.borrow().props.contains("#\u{0}locale_tag") => {
+        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}locale_tag") => {
             process_locale_item(i, locales, &mut seen)?
         }
         Value::Null => return Err(i.make_error("TypeError", "Cannot convert null to object")),
@@ -132,12 +132,12 @@ pub(crate) fn canonicalize_locale_list(
             // CanonicalizeLocaleList does ToObject(locales) first, so a primitive (number, boolean,
             // symbol) is boxed and its inherited `length`/indexed properties are read.
             let obj = crate::builtins::box_primitive_pub(i, locales.clone());
-            let lenv = ab(i.get_member(&obj, "length"))?;
+            let lenv = ab(i.get_member_key(&obj, "length"))?;
             let len = to_length(i, &lenv)?;
             for k in 0..len {
                 let key = k.to_string();
                 if ab(i.js_has_property(&obj, &key))? {
-                    let item = ab(i.get_member(&obj, &key))?;
+                    let item = ab(i.get_member_key(&obj, &key))?;
                     process_locale_item(i, &item, &mut seen)?;
                 }
             }
@@ -149,8 +149,13 @@ pub(crate) fn canonicalize_locale_list(
 /// Canonicalize one locale-list element (a String, Locale, or Object) and append it (deduplicated).
 fn process_locale_item(i: &mut Interp, item: &Value, seen: &mut Vec<String>) -> Result<(), Value> {
     let tag = match item {
-        Value::Obj(o) if o.borrow().props.contains("#\u{0}locale_tag") => {
-            match o.borrow().props.get("#\u{0}locale_tag").map(|p| p.value()) {
+        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}locale_tag") => {
+            match o
+                .borrow()
+                .internal_slots()
+                .get("#\u{0}locale_tag")
+                .map(|p| p.value())
+            {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => String::new(),
             }
@@ -303,7 +308,7 @@ pub(crate) fn brand_slot_legacy(
     proto_key: &str,
 ) -> Result<Gc, Value> {
     if let Some(o) = this.as_obj() {
-        if o.borrow().props.contains(marker) {
+        if o.borrow().internal_slots().contains(marker) {
             return Ok(o.clone());
         }
         let symv = i
@@ -313,9 +318,9 @@ pub(crate) fn brand_slot_legacy(
         if let Some(Value::Sym(sd)) = symv {
             if inherits_service_proto(i, o, proto_key) {
                 let key = crate::interpreter::Interp::sym_key(&sd);
-                let v = ab(i.get_member(this, &key))?;
+                let v = ab(i.get_member_key(this, &key))?;
                 if let Some(inner) = v.as_obj() {
-                    if inner.borrow().props.contains(marker) {
+                    if inner.borrow().internal_slots().contains(marker) {
                         return Ok(inner.clone());
                     }
                 }
@@ -388,7 +393,7 @@ pub(crate) fn get_boolean_option(
     property: &str,
     fallback: bool,
 ) -> Result<bool, Value> {
-    let v = ab(i.get_member(options, property))?;
+    let v = ab(i.get_member_key(options, property))?;
     if matches!(v, Value::Undefined) {
         return Ok(fallback);
     }

@@ -15,6 +15,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+#[path = "borrowed_parameters.rs"]
+pub(crate) mod borrowed_parameters;
+
 /// Dirty metadata is a host synchronization aid, not part of the ECMAScript Data Block.
 /// SetValueInBuffer must store the bytes immediately (ECMA-262, local snapshot
 /// e28783d5fc9d, https://tc39.es/ecma262/#sec-setvalueinbuffer); retaining every distinct byte
@@ -656,29 +659,26 @@ pub type ArrayBufferBytes = Rc<RefCell<Vec<u8>>>;
 pub(crate) enum BufferData {
     /// An ArrayBuffer's own bytes, which an embedder resource such as wasm memory may share.
     Local(ArrayBufferBytes),
-    /// A SharedArrayBuffer's Shared Data Block: its id in the process-wide registry
-    /// (`shared_mem_get`), which holds the bytes and the current length that every agent
-    /// sharing the block observes.
-    Shared(u64),
+    /// A SharedArrayBuffer's owning reference to its Shared Data Block. Every agent sharing
+    /// the block observes the same bytes and current length.
+    Shared(SharedMem),
 }
 
 impl BufferData {
-    /// The block's current byte length, or `None` for a Shared Data Block missing from the
-    /// registry.
+    /// The block's current byte length.
     pub(crate) fn byte_len(&self) -> Option<usize> {
         match self {
             BufferData::Local(bytes) => Some(bytes.borrow().len()),
-            BufferData::Shared(id) => shared_mem_get(*id).map(|block| block.lock().unwrap().len()),
+            BufferData::Shared(block) => Some(block.lock().unwrap().len()),
         }
     }
 
     /// Run `f` over the block's bytes: borrowed for an ArrayBuffer's, under the block's lock for
-    /// a Shared Data Block. `None` (without calling `f`) for a shared block missing from the
-    /// registry.
+    /// a Shared Data Block.
     pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         match self {
             BufferData::Local(bytes) => Some(f(&bytes.borrow())),
-            BufferData::Shared(id) => shared_mem_get(*id).map(|block| f(&block.lock().unwrap())),
+            BufferData::Shared(block) => Some(f(&block.lock().unwrap())),
         }
     }
 
@@ -687,9 +687,7 @@ impl BufferData {
     pub(crate) fn with_bytes_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
         match self {
             BufferData::Local(bytes) => Some(f(&mut bytes.borrow_mut())),
-            BufferData::Shared(id) => {
-                shared_mem_get(*id).map(|block| f(&mut block.lock().unwrap()))
-            }
+            BufferData::Shared(block) => Some(f(&mut block.lock().unwrap())),
         }
     }
 }
@@ -709,10 +707,10 @@ impl WeakValue {
 /// `$262.agent` wiring. The main agent holds a broadcast sender per spawned agent plus the report
 /// receiver; a spawned agent holds its broadcast receiver and a clone of the report sender.
 pub struct AgentChannels {
-    pub agent_broadcast_txs: Vec<std::sync::mpsc::Sender<(u64, usize)>>,
+    pub agent_broadcast_txs: Vec<std::sync::mpsc::Sender<(SharedMem, usize)>>,
     pub report_rx: Option<std::sync::mpsc::Receiver<String>>,
     pub report_tx: std::sync::mpsc::Sender<String>,
-    pub broadcast_rx: Option<std::sync::mpsc::Receiver<(u64, usize)>>,
+    pub broadcast_rx: Option<std::sync::mpsc::Receiver<(SharedMem, usize)>>,
 }
 
 /// A contiguous, getter-backed set of read-only indexed properties installed by an embedder.
@@ -737,9 +735,35 @@ pub(crate) struct HostIndexedLive {
     pub(crate) named_getter: Option<Value>,
 }
 
-/// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
-/// shared across agent threads (each agent runs its own single-threaded `Interp`).
-pub type SharedMem = Arc<Mutex<Vec<u8>>>;
+/// An owning reference to a SharedArrayBuffer's Shared Data Block. Buffer wrappers, queued
+/// broadcasts and pending asynchronous waits retain it across agents; the identity directory
+/// keeps only a weak reference, so the last owner releases the allocation.
+pub type SharedMem = Arc<SharedDataBlock>;
+
+pub struct SharedDataBlock {
+    id: u64,
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl SharedDataBlock {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl std::ops::Deref for SharedDataBlock {
+    type Target = Mutex<Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl Drop for SharedDataBlock {
+    fn drop(&mut self) {
+        shared_mem_registry().lock().unwrap().remove(&self.id);
+    }
+}
 
 /// Hashable language identity for values accepted by CanBeHeldWeakly. ECMA-262 WeakMap and WeakSet
 /// operations compare keys with SameValue; for objects and symbols that is exactly pointer/id
@@ -808,47 +832,70 @@ pub(crate) struct FinalizationState {
     pub(crate) cleanup_scheduled: bool,
 }
 
-pub fn shared_mem_registry() -> &'static Mutex<HashMap<u64, SharedMem>> {
-    static R: OnceLock<Mutex<HashMap<u64, SharedMem>>> = OnceLock::new();
+fn shared_mem_registry() -> &'static Mutex<HashMap<u64, std::sync::Weak<SharedDataBlock>>> {
+    static R: OnceLock<Mutex<HashMap<u64, std::sync::Weak<SharedDataBlock>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Default::default()))
 }
 pub fn next_shared_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, AtomicOrdering::SeqCst)
 }
-/// `len` zero bytes, or `None` when the allocator cannot provide them. The block comes from the
-/// allocator already zeroed, so a large one is fresh pages that cost neither time nor resident
-/// memory until they are written (emscripten and asm.js heaps of hundreds of MiB are allocated
-/// up front), where filling a reserved Vec would touch every page.
-pub(crate) fn try_zeroed_bytes(len: usize) -> Option<Vec<u8>> {
-    if len == 0 {
+/// `len` zero bytes with a maximum capacity reservation, or `None` when allocation fails.
+/// Fixed blocks use the allocator's zeroed path (system calloc supplies lazy zero pages for
+/// large asm.js heaps). Resizable/growable blocks initialize only the logical prefix: a host
+/// allocator's default `alloc_zeroed` may otherwise touch every reserved byte. Spare capacity
+/// is inaccessible until `Vec::resize` initializes it. An impossible maximum must fail even
+/// when `len` is zero (ECMA-262 AllocateArrayBuffer/AllocateSharedArrayBuffer).
+pub(crate) fn try_zeroed_bytes_with_capacity(len: usize, capacity: usize) -> Option<Vec<u8>> {
+    if len > capacity {
+        return None;
+    }
+    if capacity == 0 {
         return Some(Vec::new());
     }
-    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
-    // SAFETY: `layout` has a non-zero size.
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    let layout = std::alloc::Layout::array::<u8>(capacity).ok()?;
+    // SAFETY: `layout` has a non-zero size. The nonzero logical prefix, if any, lies entirely
+    // within the allocation; only that prefix needs initialization before the Vec owns it.
+    let ptr = unsafe {
+        if len == capacity {
+            std::alloc::alloc_zeroed(layout)
+        } else {
+            let ptr = std::alloc::alloc(layout);
+            if !ptr.is_null() && len != 0 {
+                ptr.write_bytes(0, len);
+            }
+            ptr
+        }
+    };
     if ptr.is_null() {
         return None;
     }
     // SAFETY: `ptr` is a live allocation from the global allocator with exactly the layout a
-    // `Vec<u8>` of capacity `len` uses (`len` bytes, alignment 1), and all `len` bytes are
-    // initialized (to zero); the Vec takes ownership and frees it with that layout.
-    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
+    // `Vec<u8>` of capacity `capacity` uses (`capacity` bytes, alignment 1), and its `len` live
+    // bytes are initialized (to zero); the Vec owns and frees the allocation with that layout.
+    Some(unsafe { Vec::from_raw_parts(ptr, len, capacity) })
 }
 
-/// Allocate a fresh shared-memory block of `len` zero bytes; returns its global id, or `None`
+/// Allocate a fresh shared-memory block of `len` zero bytes; returns its owner, or `None`
 /// when the memory is not available.
-pub fn alloc_shared_mem(len: usize) -> Option<u64> {
-    let block = try_zeroed_bytes(len)?;
-    let id = next_shared_id();
+#[cfg(test)]
+pub fn alloc_shared_mem(len: usize) -> Option<SharedMem> {
+    alloc_shared_mem_with_capacity(len, len)
+}
+
+pub(crate) fn alloc_shared_mem_with_capacity(len: usize, capacity: usize) -> Option<SharedMem> {
+    let block = Arc::new(SharedDataBlock {
+        id: next_shared_id(),
+        bytes: Mutex::new(try_zeroed_bytes_with_capacity(len, capacity)?),
+    });
     shared_mem_registry()
         .lock()
         .unwrap()
-        .insert(id, Arc::new(Mutex::new(block)));
-    Some(id)
+        .insert(block.id(), Arc::downgrade(&block));
+    Some(block)
 }
 pub fn shared_mem_get(id: u64) -> Option<SharedMem> {
-    shared_mem_registry().lock().unwrap().get(&id).cloned()
+    shared_mem_registry().lock().unwrap().get(&id)?.upgrade()
 }
 /// Milliseconds since a fixed process-global instant (for `$262.agent.monotonicNow`).
 pub fn monotonic_now_ms() -> f64 {
@@ -953,6 +1000,8 @@ pub(crate) struct AsyncWait {
     pub(crate) promise: Value,
     pub(crate) token: u64,
     pub(crate) id: u64,
+    /// The waiter retains its Shared Data Block even after every JavaScript wrapper dies.
+    pub(crate) block: SharedMem,
     pub(crate) index: usize,
     /// When its timeout job runs (EnqueueAtomicsWaitAsyncTimeoutJob); `None` never times out.
     pub(crate) deadline: Option<std::time::Instant>,
@@ -3136,7 +3185,7 @@ pub struct Interp {
     /// dead-result specializations. Values/accessors remain live-checked on every operation.
     pub(crate) regexp_dependency_cache: std::cell::Cell<RegexpDependencyCache>,
     /// The last successful `exec` match, kept raw for the legacy `RegExp.$1`-style statics:
-    /// the 14 strings materialize into the constructor's hidden props only when an accessor
+    /// the 14 strings materialize into the constructor's internal slots only when an accessor
     /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
     pub(crate) regexp_last: Option<RegexpLastMatch>,
     /// Live ECMAScript execution depth. Native builds use it to decide when direct JIT calls must
@@ -3280,7 +3329,8 @@ pub struct Interp {
     /// The Data Block of every attached ArrayBuffer and every SharedArrayBuffer, keyed by the
     /// buffer object's pointer: an ArrayBuffer's own bytes, whose indirection lets an embedder
     /// identify them with an external resource such as wasm linear memory, or a
-    /// SharedArrayBuffer's Shared Data Block id. Detaching an ArrayBuffer removes its entry.
+    /// SharedArrayBuffer's owning Shared Data Block reference. Detaching an ArrayBuffer removes
+    /// its entry; sweeping the last shared owner releases that block's allocation.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, BufferData>,
     pub(crate) native_buffers:
         crate::fasthash::FastMap<usize, Rc<crate::native_typed_array::NativeBuffer>>,
@@ -3513,6 +3563,8 @@ pub struct Interp {
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
+    /// Live AST-to-VM formal aliases. Allocated only while a sloppy activation needs them.
+    pub(crate) borrowed_parameters: Option<borrowed_parameters::Registry>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
     pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
     /// WeakRef [[WeakRefTarget]] slots, keyed by the WeakRef instance.
@@ -3710,6 +3762,7 @@ interp_memory_inventory! {
     deferred_ns_objs => "measured",
     promise_forward => "measured",
     mapped_arguments => "measured",
+    borrowed_parameters => "measured",
     module_source_objs => "measured",
     weak_refs => "measured",
     weak_metadata => "measured",
@@ -3738,7 +3791,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 167);
+    assert_eq!(names.len(), 168);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3761,6 +3814,11 @@ impl Drop for Interp {
         let mut coroutines = std::mem::take(&mut self.generators);
         for coroutine in coroutines.values_mut() {
             coroutine.terminate(self);
+        }
+        // A terminated agent cannot resolve its pending waitAsync promises. Remove its waiter
+        // records before releasing their Shared Data Block owners and notification inboxes.
+        for wait in std::mem::take(&mut self.pending_async_waits) {
+            futex_remove_async(wait.id, wait.index, wait.token);
         }
         // The whole Agent is ending, not merely reaching a GC safepoint. Its global,
         // intrinsics and environment roots are still live during Drop, so an ordinary
@@ -3923,7 +3981,7 @@ pub struct ClassInfo {
     /// Instance initializers registered by decorators via `context.addInitializer`, run on each new
     /// instance after its fields are set, with `this` = the instance.
     pub instance_initializers: Vec<Value>,
-    /// Instance private methods and accessors, stamped as own properties on each instance when
+    /// Instance private methods and accessors, stamped as private elements on each instance when
     /// `this` is created (before the fields run). Stamping twice is a TypeError.
     pub private_members: Vec<(String, crate::value::Property)>,
 }
@@ -4308,11 +4366,15 @@ pub const MAX_ARGUMENTS_LEN: usize = 1 << 20; // ~1M arguments
 // never reach the array limit.
 const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN);
 
-/// Byte ceiling for a single ArrayBuffer/SharedArrayBuffer allocation (real programs allocate
-/// tens of MB; runaway growth is still stopped well below the process heap cap).
-pub const MAX_BUFFER_BYTES: usize = 1 << 28; // 256 MiB
-                                             // Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
-                                             // string growth still dies as a RangeError rather than an OOM.
+/// Match Node/V8's non-sandboxed ArrayBuffer ceiling: the maximum safe integer on 64-bit
+/// targets, or 2 GiB minus one on 32-bit targets. Allocation is fallible; unavailable virtual
+/// memory still produces a RangeError. Node v24.21.0: deps/v8/include/v8-array-buffer.h.
+#[cfg(target_pointer_width = "64")]
+pub const MAX_BUFFER_BYTES: usize = ((1u64 << 53) - 1) as usize;
+#[cfg(target_pointer_width = "32")]
+pub const MAX_BUFFER_BYTES: usize = i32::MAX as usize;
+// Large enough for suite tests that build 2^24-char escape strings, small enough that runaway
+// string growth still dies as a RangeError rather than an OOM.
 pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
 
 // Builders check MAX_STR_LEN as they accumulate. A few (escaping, case mapping, normalization)
@@ -4326,17 +4388,8 @@ pub(crate) struct HostSettingsState {
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
 }
 
-/// A run-once bootstrap function (`Function::run_once`) whose body has more statements than this
-/// is not compiled on its first call for containing a loop; the call-count threshold still
-/// compiles it. Its bytecode would be the largest compiled object an Agent keeps (TRust's
-/// 3,207-statement platform IIFE compiles to 21,700 operations, 4.2 MiB per Agent), while
-/// running it on the tree-walker costs each later Realm of the Agent a few milliseconds.
-/// Smaller run-once bodies still compile on their first call (and stay on the VM): interpreting
-/// them too would save less memory for a similar cost in every later Realm.
 /// See [`Interp::jit_admit_runs`].
 pub(crate) const DEFAULT_JIT_ADMIT_RUNS: u32 = 0;
-
-pub(crate) const RUN_ONCE_INTERPRETED_STATEMENTS: usize = 1000;
 
 /// One decoded static host snapshot (see `Interp::shared_snapshots`). Every evaluation runs a
 /// fresh ScriptEvaluation of the same Script body in the then-active Realm: function objects,
@@ -4668,7 +4721,7 @@ impl Interp {
         // Tag this realm's `eval` so an *indirect* call to it (`otherRealm.eval(code)`) runs the code
         // in this realm's global scope, not the caller's (see `call_inner`).
         if let Some(ef) = &self.eval_fn {
-            ef.borrow_mut().props.insert(
+            ef.borrow_mut().internal_slots_mut().insert(
                 "#\u{0}eval_realm",
                 Property::data(Value::Obj(self.global.clone()), false, false, false),
             );
@@ -5205,6 +5258,7 @@ impl Interp {
             deferred_ns_objs: Default::default(),
             promise_forward: Default::default(),
             mapped_arguments: Default::default(),
+            borrowed_parameters: None,
             module_source_objs: Default::default(),
             weak_refs: Default::default(),
             weak_metadata: Default::default(),
@@ -5374,11 +5428,11 @@ impl Interp {
             // lookup.
             Some(BufferData::Local(buf)) => decode(&buf.borrow()),
             // Keep the shared length witness and synchronized data read.
-            Some(&BufferData::Shared(id)) => {
+            Some(BufferData::Shared(mem)) => {
                 if idx >= self.ta_len(info).unwrap_or(0) {
                     return Value::Undefined;
                 }
-                shared_mem_get(id).map_or(Value::Undefined, |mem| decode(&mem.lock().unwrap()))
+                decode(&mem.lock().unwrap())
             }
             None => Value::Undefined,
         }
@@ -5426,11 +5480,7 @@ impl Interp {
                 }
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
-            Some(&BufferData::Shared(id)) => {
-                if let Some(mem) = shared_mem_get(id) {
-                    put(&mut mem.lock().unwrap());
-                }
-            }
+            Some(BufferData::Shared(mem)) => put(&mut mem.lock().unwrap()),
             None => {}
         }
     }
@@ -5523,12 +5573,10 @@ impl Interp {
                 fits
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
-            Some(&BufferData::Shared(id)) => {
-                if let Some(mem) = shared_mem_get(id) {
-                    let mut buf = mem.lock().unwrap();
-                    if start + es <= buf.len() {
-                        buf[start..start + es].copy_from_slice(&bytes);
-                    }
+            Some(BufferData::Shared(mem)) => {
+                let mut buf = mem.lock().unwrap();
+                if start + es <= buf.len() {
+                    buf[start..start + es].copy_from_slice(&bytes);
                 }
                 false
             }
@@ -5553,16 +5601,14 @@ impl Interp {
                 in_bounds
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
-            Some(&BufferData::Shared(id)) => {
+            Some(BufferData::Shared(mem)) => {
                 if idx >= self.ta_len(info).unwrap_or(0) {
                     return;
                 }
                 let start = info.offset + idx * es;
-                if let Some(mem) = shared_mem_get(id) {
-                    let mut buf = mem.lock().unwrap();
-                    if start + es <= buf.len() {
-                        info.kind.write_into(n, &mut buf[start..start + es]);
-                    }
+                let mut buf = mem.lock().unwrap();
+                if start + es <= buf.len() {
+                    info.kind.write_into(n, &mut buf[start..start + es]);
                 }
                 false
             }
@@ -5720,18 +5766,14 @@ impl Interp {
         Value::Sym(symbol)
     }
 
-    /// The internal property-map key a symbol maps to. A leading NUL never appears in a real
-    /// JS-authored property name in the suite, so it cleanly separates symbol keys from string keys.
+    /// Internal Symbol key. Leading-NUL String keys are escaped by ToPropertyKey and
+    /// static property-name compilation, so no author String can alias this identity.
     pub(crate) fn sym_key(data: &SymbolData) -> String {
         format!("\u{0}{}", data.id)
     }
     pub(crate) fn is_sym_key(key: &str) -> bool {
-        // `\0<digits>` (symbol slot) or `\0<lowercase word>` (internal marker) — a user-authored
-        // string key that merely begins with NUL (legal in JS) must not be mistaken for either.
-        key.strip_prefix('\u{0}').is_some_and(|r| {
-            !r.is_empty()
-                && r.bytes()
-                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_' || b == b'-')
+        key.strip_prefix('\0').is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         })
     }
 
@@ -5845,15 +5887,12 @@ impl Interp {
             CallTargetKind::NonCallable => CallEnvironmentKind::Unknown,
         }
     }
-    /// Whether `key` is an internal private-element key. Every runtime private name carries a
-    /// `\u{1}<serial>` suffix (auto-accessor backings a `\u{0}` marker), so a user property whose
-    /// *string* name merely starts with `#` (a computed key) is not mistaken for one.
-    pub(crate) fn is_private_key(key: &str) -> bool {
-        key.starts_with('#') && (key.contains('\u{1}') || key.contains('\u{0}'))
-    }
     /// Recover the symbol `Value` behind an internal symbol key (for `getOwnPropertySymbols`).
     pub(crate) fn sym_from_key(&self, key: &str) -> Option<Value> {
-        let id: u64 = key.strip_prefix('\u{0}')?.parse().ok()?;
+        if !Self::is_sym_key(key) {
+            return None;
+        }
+        let id: u64 = key.strip_prefix('\0')?.parse().ok()?;
         self.symbol_agent
             .borrow()
             .symbols
@@ -6129,24 +6168,26 @@ impl Interp {
     /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
     /// the crate-internal `Abrupt` completion, so op crates can propagate it as `Err(Value)`.
     pub fn member_get(&mut self, base: &Value, key: &str) -> Result<Value, Value> {
-        self.get_member(base, key).map_err(|a| match a {
-            Abrupt::Throw(v) => v,
-            _ => self.make_error(
-                "Error",
-                "unexpected non-throw completion during property get",
-            ),
-        })
+        self.get_member_key(base, &crate::value::encode_string_key(key))
+            .map_err(|a| match a {
+                Abrupt::Throw(v) => v,
+                _ => self.make_error(
+                    "Error",
+                    "unexpected non-throw completion during property get",
+                ),
+            })
     }
 
     /// [[Set]] for embedders (see [`Self::member_get`]).
     pub fn member_set(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Value> {
-        self.set_member(base, key, value).map_err(|a| match a {
-            Abrupt::Throw(v) => v,
-            _ => self.make_error(
-                "Error",
-                "unexpected non-throw completion during property set",
-            ),
-        })
+        self.set_member_key(base, &crate::value::encode_string_key(key), value)
+            .map_err(|a| match a {
+                Abrupt::Throw(v) => v,
+                _ => self.make_error(
+                    "Error",
+                    "unexpected non-throw completion during property set",
+                ),
+            })
     }
 
     // ----- embed helpers for host addons (N-API) ---------------------------------------------
@@ -6398,11 +6439,10 @@ impl Interp {
                 && matches!(borrowed.call, Callable::None)
                 && borrowed.extensible
                 && self.ordinary_get_ptr(ptr);
-            let has_index = borrowed.props.keys().iter().any(|key| {
-                !Self::is_sym_key(key)
-                    && !Self::is_private_key(key)
-                    && crate::value::canonical_index(key).is_some()
-            });
+            let has_index =
+                borrowed.props.keys().iter().any(|key| {
+                    !Self::is_sym_key(key) && crate::value::canonical_index(key).is_some()
+                });
             if !ordinary || has_index {
                 return Err(self.make_error(
                     "TypeError",
@@ -6491,9 +6531,10 @@ impl Interp {
         enumerable: bool,
     ) {
         if let Some(o) = target.as_obj() {
-            o.borrow_mut()
-                .props
-                .insert(name, Property::accessor_prop(get, set, enumerable, true));
+            o.borrow_mut().props.insert(
+                crate::value::encode_string_key(name).as_ref(),
+                Property::accessor_prop(get, set, enumerable, true),
+            );
         }
     }
 
@@ -6530,8 +6571,8 @@ impl Interp {
                 self.mark_array_buffer_dirty(info.buffer);
                 ptr
             }
-            // The registry keeps a Shared Data Block alive; only a grow moves its bytes.
-            BufferData::Shared(id) => shared_mem_get(*id)?.lock().unwrap().as_mut_ptr(),
+            // The backing buffer owns the Shared Data Block; only a grow moves its bytes.
+            BufferData::Shared(block) => block.lock().unwrap().as_mut_ptr(),
         };
         // SAFETY: `ta_len` placed the view's `byte_len` bytes from `info.offset` inside the
         // block, so the offset stays within (or one past the end of) its allocation.
@@ -6593,7 +6634,7 @@ impl Interp {
         {
             return string;
         }
-        let string = crate::lstr::LStr::from(key.as_ref());
+        let string = crate::lstr::LStr::from(crate::value::decode_string_key(key));
         let bytes = key.len().saturating_add(string.retained_requested_bytes());
         self.property_key_strings
             .insert(identity, (key.clone(), string.clone()), bytes);
@@ -6984,10 +7025,10 @@ impl Interp {
     /// Define a native method on `target` (non-enumerable, as built-ins are).
     pub fn def_method(&self, target: &Gc, name: &str, len: usize, f: NativeFn) {
         let func = self.make_native(name, len, f);
-        target
-            .borrow_mut()
-            .props
-            .insert(name, Property::builtin(Value::Obj(func)));
+        target.borrow_mut().props.insert(
+            crate::value::encode_string_key(name).as_ref(),
+            Property::builtin(Value::Obj(func)),
+        );
     }
 
     /// Embedder host state (typed per-subsystem slots + the resource table). This is how a
@@ -7167,7 +7208,10 @@ impl Interp {
         }
         let buffer = self.ta_buffer.get(&ptr)?.as_obj()?.borrow();
         if !matches!(
-            buffer.props.get("#\u{0}abResizable").map(|p| p.value()),
+            buffer
+                .internal_slots()
+                .get("#\u{0}abResizable")
+                .map(|p| p.value()),
             Some(Value::Bool(false))
         ) {
             return None;
@@ -7614,7 +7658,44 @@ impl Interp {
     /// Get `base[key]`, walking the prototype chain and invoking getters. Primitive bases are
     /// handled by routing to their wrapper prototype (and string index/length specially). The
     /// receiver defaults to `base`.
+    /// Read engine-only state from this object. Internal slots are never inherited and no
+    /// Proxy, accessor or host property callback participates in this lookup.
+    pub(crate) fn get_internal_slot(&self, base: &Value, key: &str) -> Result<Value, Abrupt> {
+        Ok(base
+            .as_obj()
+            .and_then(|object| {
+                object
+                    .borrow()
+                    .internal_slots()
+                    .get(key)
+                    .map(Property::value)
+            })
+            .unwrap_or(Value::Undefined))
+    }
+
+    pub(crate) fn set_internal_slot(
+        &self,
+        base: &Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Abrupt> {
+        if let Some(object) = base.as_obj() {
+            object
+                .borrow_mut()
+                .internal_slots_mut()
+                .insert(key, Property::plain(value));
+        }
+        Ok(())
+    }
+
+    /// Read an author String key. Every String, including a leading-NUL name, is
+    /// distinct from every Symbol key; hosts cannot forge an encoded Symbol identity.
     pub fn get_member(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
+        self.get_member_key(base, &crate::value::encode_string_key(key))
+    }
+
+    /// Engine [[Get]] for an already encoded String-or-Symbol property key.
+    pub(crate) fn get_member_key(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
         let result = self.get_member_recv(base, key, base.clone());
         if matches!(result, Ok(Value::Undefined)) {
             self.trace_undefined_property(base, key);
@@ -8046,6 +8127,9 @@ impl Interp {
         base: &Value,
         key: &crate::lstr::LStr,
     ) -> Result<Value, Abrupt> {
+        if key.as_str().starts_with('\0') {
+            return self.get_member_key(base, &crate::value::encode_string_key(key));
+        }
         let cacheable = key.len() <= COMPUTED_STUB_KEY_MAX_BYTES
             && key.as_str() != "length"
             && key.as_str() != "description"
@@ -8080,7 +8164,7 @@ impl Interp {
                 }
             }
         }
-        self.get_member(base, key)
+        self.get_member_key(base, key)
     }
 
     fn get_prop_ic_impl(
@@ -8512,7 +8596,7 @@ impl Interp {
                 return Ok(());
             }
         }
-        self.set_member(base, name, v)
+        self.set_member_key(base, name, v)
     }
 
     /// Profile-enabled form of [`Self::set_prop_ic`]. Ordinary IC hits are retained by the
@@ -8892,7 +8976,7 @@ impl Interp {
         .map(Some)
     }
 
-    /// [[Get]](P, Receiver): like [`get_member`] but with an explicit `receiver` — the `this` a
+    /// [[Get]](P, Receiver): like [`Self::get_member_key`] but with an explicit `receiver` — the `this` a
     /// getter is invoked with, the proxy `get` trap's Receiver argument, and what a forwarded
     /// `[[Get]]` carries through a proxy target chain.
     /// The deferred-namespace evaluation trigger: most operations with a string key (and all
@@ -8917,8 +9001,7 @@ impl Interp {
     }
 
     fn defer_trigger_slow(&mut self, o: &Gc, key: Option<&str>) -> Result<(), Abrupt> {
-        if matches!(key, Some(k) if Interp::is_sym_key(k) || k == "then" || Interp::is_private_key(k))
-        {
+        if matches!(key, Some(k) if Interp::is_sym_key(k) || k == "then") {
             return Ok(());
         }
         let module_key = match self.deferred_ns.get(&(Rc::as_ptr(o) as usize)) {
@@ -8966,7 +9049,11 @@ impl Interp {
                 }
                 Err(self.throw(
                     "TypeError",
-                    format!("cannot read property '{key}' of {}", type_name(base)),
+                    format!(
+                        "cannot read property '{}' of {}",
+                        crate::value::decode_string_key(key),
+                        type_name(base)
+                    ),
                 ))
             }
             Value::Str(s) => {
@@ -9027,28 +9114,17 @@ impl Interp {
                 let o = o.clone();
                 let ptr = Rc::as_ptr(&o) as usize;
                 // A mapped `arguments` index aliases its parameter binding.
-                if !self.mapped_arguments.is_empty() {
-                    if let Some(name) = self.mapped_arg_name(ptr, key) {
-                        if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
-                            let v = env
-                                .borrow()
-                                .vars
-                                .get(name.as_str())
-                                .map(|b| b.value.clone());
-                            if let Some(v) = v {
-                                let shape = o.borrow().props.shape();
-                                if let Some(trace) = trace.as_deref_mut() {
-                                    trace.record(
-                                        crate::feedback::PropertyOutcome::Exotic,
-                                        Some(shape),
-                                        0,
-                                        None,
-                                    );
-                                }
-                                return Ok(v);
-                            }
-                        }
+                if let Some(v) = self.mapped_arg_value(ptr, key) {
+                    let shape = o.borrow().props.shape();
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(shape),
+                            0,
+                            None,
+                        );
                     }
+                    return Ok(v);
                 }
                 // String wrapper (`new String(...)`/`Object("...")`): own indexed chars + `length`.
                 let wrapped_string = match &o.borrow().exotic {
@@ -9217,8 +9293,10 @@ impl Interp {
             // Forward to the target's [[Get]], preserving the original Receiver.
             return self.proxy_forward(|me| me.get_member_recv(&target, key, receiver));
         };
-        let key_value =
-            key_value.unwrap_or_else(|| self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key)));
+        let key_value = key_value.unwrap_or_else(|| {
+            self.sym_from_key(key)
+                .unwrap_or_else(|| crate::value::string_key_value(key))
+        });
         let res = self.proxy_call_trap(
             PROXY_TRAP_GET,
             &trap,
@@ -9248,7 +9326,7 @@ impl Interp {
             // -0 is the index 0: ToString(-0) is "0".
             Value::Str(crate::jstr::index_lstr(index as u32))
         } else {
-            Value::lstr(key)
+            crate::value::string_key_value(key)
         };
         Some(self.proxy_get(
             target,
@@ -9289,7 +9367,9 @@ impl Interp {
                     return self
                         .proxy_forward(|me| me.get_member_recv(&target, key, receiver.clone()));
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
+                let key_value = self
+                    .sym_from_key(key)
+                    .unwrap_or_else(|| crate::value::string_key_value(key));
                 let res = self.proxy_call_trap(
                     PROXY_TRAP_GET,
                     &trap,
@@ -9535,6 +9615,13 @@ impl Interp {
     pub(crate) fn mapped_arg_value(&self, ptr: usize, key: &str) -> Option<Value> {
         let name = self.mapped_arg_name(ptr, key)?;
         let (env, _) = self.mapped_arguments.get(&ptr)?;
+        if let Some(value) = self
+            .borrowed_parameters
+            .as_ref()
+            .and_then(|registry| registry.read(env, &name))
+        {
+            return Some(value);
+        }
         env.borrow()
             .vars
             .get(name.as_str())
@@ -9542,15 +9629,22 @@ impl Interp {
     }
 
     /// Write through a mapped `arguments[key]` alias into its parameter binding.
-    pub(crate) fn mapped_arg_write(&mut self, ptr: usize, key: &str, v: Value) -> bool {
+    pub(crate) fn mapped_arg_write(&mut self, ptr: usize, key: &str, v: &Value) -> bool {
         let Some(name) = self.mapped_arg_name(ptr, key) else {
             return false;
         };
         let Some((env, _)) = self.mapped_arguments.get(&ptr) else {
             return false;
         };
+        if self
+            .borrowed_parameters
+            .as_ref()
+            .is_some_and(|registry| registry.write(env, &name, v))
+        {
+            return true;
+        }
         if let Some(b) = env.borrow_mut().vars.get_mut(&name) {
-            b.value = v;
+            b.value = v.clone();
             return true;
         }
         false
@@ -9584,7 +9678,18 @@ impl Interp {
         Ok(())
     }
 
+    /// Write an author String key; see [`Self::get_member`] for its key boundary.
     pub fn set_member(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Abrupt> {
+        self.set_member_key(base, &crate::value::encode_string_key(key), value)
+    }
+
+    /// Engine [[Set]] for an already encoded String-or-Symbol property key.
+    pub(crate) fn set_member_key(
+        &mut self,
+        base: &Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Abrupt> {
         let strict = self.strict;
         let success = self.set_member_recv(base, key, value, base.clone())?;
         self.finish_assignment_set(key, strict, success)
@@ -9600,7 +9705,13 @@ impl Interp {
         success: bool,
     ) -> Result<(), Abrupt> {
         if !success && strict {
-            Err(self.throw("TypeError", format!("Cannot assign to property '{key}'")))
+            Err(self.throw(
+                "TypeError",
+                format!(
+                    "Cannot assign to property '{}'",
+                    crate::value::decode_string_key(key)
+                ),
+            ))
         } else {
             Ok(())
         }
@@ -9621,7 +9732,7 @@ impl Interp {
         self.finish_assignment_set(key, strict, success)
     }
 
-    /// [[Set]](P, V, Receiver): like [`set_member`] but with an explicit `receiver` and returning the
+    /// [[Set]](P, V, Receiver): like [`Self::set_member_key`] but with an explicit `receiver` and returning the
     /// [[Set]] success boolean. The receiver is the object a setter is invoked on, the proxy `set`
     /// trap's Receiver argument, and what a forwarded `[[Set]]` carries through a proxy target chain.
     pub(crate) fn set_member_recv(
@@ -9647,31 +9758,25 @@ impl Interp {
         if !self.mapped_arguments.is_empty() {
             if let Value::Obj(o) = base {
                 let ptr = Rc::as_ptr(o) as usize;
-                if let Some(name) = self.mapped_arg_name(ptr, key) {
-                    if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
-                        let env = env.clone();
-                        if let Some(b) = env.borrow_mut().vars.get_mut(&name) {
-                            b.value = value.clone();
-                        }
-                        // Update the own property's value in place — its attributes (e.g. a
-                        // configurable:false from defineProperty) must survive.
-                        let mut b = o.borrow_mut();
-                        if let Some(p) = b.props.get_mut(key) {
-                            p.set_value(value);
-                        } else {
-                            b.props
-                                .insert(key, crate::value::Property::data(value, true, true, true));
-                        }
-                        if let Some(trace) = trace.as_deref_mut() {
-                            trace.record(
-                                crate::feedback::PropertyOutcome::Exotic,
-                                Some(b.props.shape()),
-                                0,
-                                None,
-                            );
-                        }
-                        return Ok(true);
+                if self.mapped_arg_write(ptr, key, &value) {
+                    // Update the own property's value in place — its attributes (e.g. a
+                    // configurable:false from defineProperty) must survive.
+                    let mut b = o.borrow_mut();
+                    if let Some(p) = b.props.get_mut(key) {
+                        p.set_value(value);
+                    } else {
+                        b.props
+                            .insert(key, crate::value::Property::data(value, true, true, true));
                     }
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(b.props.shape()),
+                            0,
+                            None,
+                        );
+                    }
+                    return Ok(true);
                 }
             }
         }
@@ -9683,7 +9788,11 @@ impl Interp {
                 }
                 return Err(self.throw(
                     "TypeError",
-                    format!("cannot set property '{key}' of {}", type_name(base)),
+                    format!(
+                        "cannot set property '{}' of {}",
+                        crate::value::decode_string_key(key),
+                        type_name(base)
+                    ),
                 ));
             }
             // Setting a property on a primitive: an accessor (or proxy) on the wrapper
@@ -9733,7 +9842,10 @@ impl Interp {
                                     if self.strict {
                                         Err(self.throw(
                                             "TypeError",
-                                            format!("cannot set getter-only property '{key}'"),
+                                            format!(
+                                                "cannot set getter-only property '{}'",
+                                                crate::value::decode_string_key(key)
+                                            ),
                                         ))
                                     } else {
                                         Ok(false)
@@ -9808,7 +9920,9 @@ impl Interp {
                     return self
                         .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
+                let key_value = self
+                    .sym_from_key(key)
+                    .unwrap_or_else(|| crate::value::string_key_value(key));
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,
@@ -9877,7 +9991,9 @@ impl Interp {
                     return self
                         .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
                 };
-                let key_value = self.sym_from_key(key).unwrap_or_else(|| Value::lstr(key));
+                let key_value = self
+                    .sym_from_key(key)
+                    .unwrap_or_else(|| crate::value::string_key_value(key));
                 let ok = self.proxy_call_trap(
                     PROXY_TRAP_SET,
                     &trap,
@@ -9953,7 +10069,10 @@ impl Interp {
                 if self.strict {
                     return Err(self.throw(
                         "TypeError",
-                        format!("cannot assign to read-only indexed property '{key}'"),
+                        format!(
+                            "cannot assign to read-only indexed property '{}'",
+                            crate::value::decode_string_key(key)
+                        ),
                     ));
                 }
                 return Ok(false);
@@ -9978,7 +10097,10 @@ impl Interp {
                             if self.strict {
                                 Err(self.throw(
                                     "TypeError",
-                                    format!("cannot set getter-only property '{key}'"),
+                                    format!(
+                                        "cannot set getter-only property '{}'",
+                                        crate::value::decode_string_key(key)
+                                    ),
                                 ))
                             } else {
                                 Ok(false)
@@ -9999,7 +10121,10 @@ impl Interp {
                         if self.strict {
                             return Err(self.throw(
                                 "TypeError",
-                                format!("cannot assign to read-only property '{key}'"),
+                                format!(
+                                    "cannot assign to read-only property '{}'",
+                                    crate::value::decode_string_key(key)
+                                ),
                             ));
                         }
                         return Ok(false);
@@ -10018,7 +10143,10 @@ impl Interp {
                     if self.strict {
                         return Err(self.throw(
                             "TypeError",
-                            format!("cannot assign to read-only property '{key}'"),
+                            format!(
+                                "cannot assign to read-only property '{}'",
+                                crate::value::decode_string_key(key)
+                            ),
                         ));
                     }
                     return Ok(false);
@@ -10073,7 +10201,10 @@ impl Interp {
                     ) {
                         Ok(false) if self.strict => Err(self.throw(
                             "TypeError",
-                            format!("cannot create property '{key}' on the receiver"),
+                            format!(
+                                "cannot create property '{}' on the receiver",
+                                crate::value::decode_string_key(key)
+                            ),
                         )),
                         Ok(b) => Ok(b),
                         Err(v) => Err(Abrupt::Throw(v)),
@@ -10094,7 +10225,10 @@ impl Interp {
                     if self.strict {
                         return Err(self.throw(
                             "TypeError",
-                            format!("cannot assign to read-only property '{key}'"),
+                            format!(
+                                "cannot assign to read-only property '{}'",
+                                crate::value::decode_string_key(key)
+                            ),
                         ));
                     }
                     return Ok(false);
@@ -10118,7 +10252,10 @@ impl Interp {
             if self.strict {
                 return Err(self.throw(
                     "TypeError",
-                    format!("cannot define indexed property '{key}'"),
+                    format!(
+                        "cannot define indexed property '{}'",
+                        crate::value::decode_string_key(key)
+                    ),
                 ));
             }
             return Ok(false);
@@ -10157,7 +10294,10 @@ impl Interp {
                     if self.strict {
                         return Err(self.throw(
                             "TypeError",
-                            format!("cannot assign to read only property '{key}'"),
+                            format!(
+                                "cannot assign to read only property '{}'",
+                                crate::value::decode_string_key(key)
+                            ),
                         ));
                     }
                     return Ok(false);
@@ -10292,8 +10432,13 @@ impl Interp {
     /// The Shared Data Block id of the SharedArrayBuffer at `ptr`; `None` for an ArrayBuffer,
     /// attached or detached, and any other object.
     pub(crate) fn shared_block_id(&self, ptr: usize) -> Option<u64> {
+        self.shared_block(ptr).map(|block| block.id())
+    }
+
+    /// An owning Shared Data Block reference that can outlive a JavaScript buffer wrapper.
+    pub(crate) fn shared_block(&self, ptr: usize) -> Option<&SharedMem> {
         match self.array_buffers.get(&ptr)? {
-            BufferData::Shared(id) => Some(*id),
+            BufferData::Shared(block) => Some(block),
             BufferData::Local(_) => None,
         }
     }
@@ -10475,7 +10620,7 @@ impl Interp {
     /// ToLength of an array-like's `length` property (coercing string/object lengths), clamped to
     /// the 2^53-1 spec maximum.
     pub(crate) fn to_length(&mut self, obj: &Gc) -> Result<usize, Abrupt> {
-        let v = self.get_member(&Value::Obj(obj.clone()), "length")?;
+        let v = self.get_member_key(&Value::Obj(obj.clone()), "length")?;
         let n = self.to_number(&v)?;
         Ok(if n.is_nan() || n <= 0.0 {
             0
@@ -10945,7 +11090,7 @@ impl Interp {
             if let Some(p) = &b.proto {
                 sink.object(p);
             }
-            for prop in b.props.values() {
+            for prop in b.props.values().chain(b.internal_slots().values()) {
                 prop.with_object_edge(|p| sink.object(p));
                 if let Some(Value::Obj(p)) = prop.getter() {
                     sink.object(p);
@@ -11264,8 +11409,8 @@ impl Interp {
                 }
                 // A surviving SharedArrayBuffer retains its Shared Data Block. Count each block
                 // once, however many buffers alias it.
-                BufferData::Shared(id) => {
-                    blocks.insert(*id);
+                BufferData::Shared(block) => {
+                    blocks.insert(block.id());
                 }
             }
         }
@@ -12257,7 +12402,6 @@ impl Interp {
         let body = target.borrow();
         body.ic_plain.get()
             && matches!(body.exotic, Exotic::None | Exotic::Array)
-            && !Self::is_private_key(key)
             && body.props.get(key).is_none_or(Property::configurable)
     }
 
@@ -12571,7 +12715,7 @@ impl Interp {
                 if matches!(obj.borrow().call, Callable::None) {
                     return Err(self.throw("TypeError", "value is not a function"));
                 }
-                let trap = self.get_member(&handler, "apply")?;
+                let trap = self.get_member_key(&handler, "apply")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     return self.call(target, this, args);
                 }
@@ -12589,7 +12733,7 @@ impl Interp {
         if self.multi_realm() && self.eval_realm_fns.contains(&(Rc::as_ptr(&obj) as usize)) {
             let realm_g = obj
                 .borrow()
-                .props
+                .internal_slots()
                 .get("#\u{0}eval_realm")
                 .map(|p| p.value());
             if let Some(realm_g @ Value::Obj(_)) = realm_g {
@@ -12750,12 +12894,23 @@ impl Interp {
             // Decorator `context.access` get/set: read/write a named property on the first argument.
             Callable::PropGet(key) => {
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
-                self.get_member(&recv, &key)
+                self.get_member_key(&recv, &key)
             }
             Callable::PropSet(key) => {
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 let val = args.get(1).cloned().unwrap_or(Value::Undefined);
-                self.set_member(&recv, &key, val).map(|_| Value::Undefined)
+                self.set_member_key(&recv, &key, val)
+                    .map(|_| Value::Undefined)
+            }
+            Callable::PrivatePropGet(key) => {
+                let recv = args.first().cloned().unwrap_or(Value::Undefined);
+                self.get_private_member(&recv, &key)
+            }
+            Callable::PrivatePropSet(key) => {
+                let recv = args.first().cloned().unwrap_or(Value::Undefined);
+                let val = args.get(1).cloned().unwrap_or(Value::Undefined);
+                self.set_private_member(&recv, &key, val)
+                    .map(|_| Value::Undefined)
             }
         };
         self.constructing = saved_ctor;
@@ -12766,9 +12921,12 @@ impl Interp {
     /// Read an auto-accessor's backing field off `this`, throwing if `this` lacks the slot.
     fn accessor_load(&mut self, this: &Value, key: &str) -> Result<Value, Abrupt> {
         match this {
-            Value::Obj(o) if o.borrow().props.contains(key) => {
-                Ok(o.borrow().props.get(key).map(|p| p.value()).unwrap())
-            }
+            Value::Obj(o) if o.borrow().internal_slots().contains(key) => Ok(o
+                .borrow()
+                .internal_slots()
+                .get(key)
+                .map(|p| p.value())
+                .unwrap()),
             _ => Err(self.throw(
                 "TypeError",
                 "cannot read auto-accessor backing field from an unrelated object",
@@ -12779,8 +12937,8 @@ impl Interp {
     /// Write an auto-accessor's backing field on `this`, throwing if `this` lacks the slot.
     fn accessor_store(&mut self, this: &Value, key: &str, value: Value) -> Result<Value, Abrupt> {
         match this {
-            Value::Obj(o) if o.borrow().props.contains(key) => {
-                if let Some(p) = o.borrow_mut().props.get_mut(key) {
+            Value::Obj(o) if o.borrow().internal_slots().contains(key) => {
+                if let Some(p) = o.borrow_mut().internal_slots_mut().get_mut(key) {
                     p.set_value(value);
                 }
                 Ok(Value::Undefined)
@@ -12844,19 +13002,19 @@ impl Interp {
                     let l = match crate::builtins::has_own_property_trapped(
                         &mut sub, &target, "length",
                     ) {
-                        Ok(true) => sub.get_member(&target, "length"),
+                        Ok(true) => sub.get_member_key(&target, "length"),
                         Ok(false) => Ok(Value::Num(0.0)),
                         Err(e) => Err(Abrupt::Throw(e)),
                     };
-                    let n = sub.get_member(&target, "name");
+                    let n = sub.get_member_key(&target, "name");
                     (l, n)
                 };
                 self.shadow_realms.insert(realm, sub);
                 (l, n)
             }
             None => (
-                self.get_member(&target, "length"),
-                self.get_member(&target, "name"),
+                self.get_member_key(&target, "length"),
+                self.get_member_key(&target, "name"),
             ),
         };
         let length = match length_r {
@@ -13268,7 +13426,20 @@ impl Interp {
             }
         }
         let r = match jit_code {
-            Some(code) => crate::jit::run(self, chunk, &code, closure, this_val, args),
+            Some(code) => {
+                // A tree-walker caller can repeatedly enter a hot ordinary native callee
+                // before its own frame tiers up. These are real machine-code runs too:
+                // ignoring them delays the callee's inline checkpoint until a cached native
+                // caller appears. The selected chunk/code lease stays pinned for this call;
+                // publication changes only later dispatch, never a live borrowed frame.
+                self.note_native_entry(
+                    Rc::as_ptr(func),
+                    chunk,
+                    Rc::as_ptr(&self.global) as usize,
+                    Rc::as_ptr(&self.global_env) as usize,
+                );
+                crate::jit::run(self, chunk, &code, closure, this_val, args)
+            }
             None => crate::bytecode::run(self, chunk, closure, this_val, args),
         };
         self.strict = saved_strict;
@@ -13607,11 +13778,25 @@ impl Interp {
     /// `bytecode::plan_inlines`).
     #[inline]
     fn note_compiled_call(&mut self, ic: &crate::bytecode::CallIc) {
-        let chunk_ref = unsafe { &**ic.chunk };
-        let runs = chunk_ref.jit_runs.get().saturating_add(1);
-        chunk_ref.jit_runs.set(runs);
-        if chunk_ref.inline_retry_due(runs) {
-            self.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
+        self.note_native_entry(ic.func, unsafe { &*ic.chunk }, ic.realm, ic.global_env);
+    }
+
+    /// Account a committed, leased native entry regardless of how its caller dispatched it.
+    /// The selected chunk/code remain pinned for this call if a splice is published here.
+    #[inline]
+    fn note_native_entry(
+        &mut self,
+        func: *const crate::ast::Function,
+        chunk: &crate::bytecode::Chunk,
+        realm: usize,
+        global_env: usize,
+    ) {
+        let runs = chunk.jit_runs.get().saturating_add(1);
+        chunk.jit_runs.set(runs);
+        // Prepared bodies currently dispatch their original chunk after FDI, rather than
+        // Function::code2; do not publish a second stage they cannot consume.
+        if chunk.inline_retry_due(runs) && !chunk.prepared_entry {
+            self.try_inline_recompile(func, chunk, realm, global_env);
         }
     }
 
@@ -15044,6 +15229,14 @@ impl Interp {
             unsafe { this_slot.read() }.into_value(),
             false,
         );
+        // A successful cache fill is a native entry just like the next cache hit. Its
+        // original code lease stays live even if the checkpoint invalidates the fresh IC.
+        self.note_native_entry(
+            Rc::as_ptr(&func),
+            chunk,
+            realm,
+            Rc::as_ptr(&self.global_env) as usize,
+        );
         let mut r = with_execution_stack(self.depth, || {
             if needs_env {
                 unsafe {
@@ -15138,14 +15331,11 @@ impl Interp {
             if func.code.get().is_none() {
                 let n = func.calls.get().saturating_add(1);
                 func.calls.set(n);
-                // A body with a loop compiles on its first call: one call can run a million
-                // iterations, so the call-count threshold would leave it on the tree-walker.
-                // So does a self-hosted built-in: engine code gathers no useful warm-up. A huge
-                // run-once bootstrap body waits for the threshold instead (see
-                // `RUN_ONCE_INTERPRETED_STATEMENTS`).
-                let loop_compiles = func.scan_flags() & crate::ast::SCAN_HAS_LOOP != 0
-                    && !(func.run_once && func.body.len() > RUN_ONCE_INTERPRETED_STATEMENTS);
-                if n > self.tier_threshold || loop_compiles || func.self_hosted {
+                // Cold loop-containing functions obey the same call threshold as other
+                // bodies. A long-running first invocation transfers its already-instantiated
+                // function frame at a settled hot backedge instead of replaying its prologue.
+                // Self-hosted built-ins still compile immediately.
+                if n > self.tier_threshold || func.self_hosted {
                     let compiled = if derived_class_construct {
                         crate::bytecode::compile_derived_constructor(func)
                     } else {
@@ -15929,7 +16119,7 @@ impl Interp {
     pub(crate) fn promise_resolve_checked(&mut self, v: Value) -> Result<Value, Value> {
         if let Value::Obj(o) = &v {
             if self.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
-                return match self.get_member(&v, "constructor") {
+                return match self.get_member_key(&v, "constructor") {
                     Ok(_) => Ok(v),
                     Err(Abrupt::Throw(e)) => Err(e),
                     Err(_) => Err(Value::Undefined),
@@ -16120,7 +16310,7 @@ impl Interp {
         if !self.proxies.is_empty() {
             if let Some((target, handler)) = self.proxies.get(&(Rc::as_ptr(&obj) as usize)).cloned()
             {
-                let trap = self.get_member(&handler, "construct")?;
+                let trap = self.get_member_key(&handler, "construct")?;
                 if matches!(trap, Value::Undefined | Value::Null) {
                     // Forward to the target's [[Construct]] with the original new.target.
                     return self.construct_inner(target, args, new_target);
@@ -16191,7 +16381,7 @@ impl Interp {
                 // OrdinaryCreateFromConstructor: the new instance's prototype comes from
                 // new.target; a non-object `prototype` falls back to new.target's realm's
                 // %Object.prototype% (GetFunctionRealm).
-                let proto = match self.get_member(&new_target, "prototype")? {
+                let proto = match self.get_member_key(&new_target, "prototype")? {
                     Value::Obj(p) => Some(p),
                     _ => {
                         let realm = match &new_target {
@@ -16255,7 +16445,11 @@ impl Interp {
             | Callable::AccessorGet(_)
             | Callable::AccessorSet(_)
             | Callable::PropGet(_)
-            | Callable::PropSet(_) => Err(self.throw("TypeError", "value is not a constructor")),
+            | Callable::PropSet(_)
+            | Callable::PrivatePropGet(_)
+            | Callable::PrivatePropSet(_) => {
+                Err(self.throw("TypeError", "value is not a constructor"))
+            }
         }
     }
 

@@ -761,8 +761,8 @@ pub struct Function {
     /// snapshot's top-level code, or the body of another such function, calls immediately and
     /// outside any loop or class (`(function () { … })()`), so it runs once in each Realm that
     /// evaluates the snapshot. Its bytecode runs on the VM and never gets native code (see
-    /// `Interp::run_compiled_chunk`), and a huge one is interpreted until the call-count
-    /// threshold compiles it (`RUN_ONCE_INTERPRETED_STATEMENTS`). Never set for parsed source or
+    /// `Interp::run_compiled_chunk`). Compilation waits for call-count or executed-backedge
+    /// hotness, as with ordinary functions. Never set for parsed source or
     /// other snapshots.
     pub(crate) run_once: bool,
     /// The source text this function was parsed from, for `Function.prototype.toString`.
@@ -1336,10 +1336,8 @@ pub const SCAN_DONE: u8 = 1;
 pub const SCAN_ARGUMENTS: u8 = 2;
 pub const SCAN_NEW_TARGET: u8 = 4;
 pub const SCAN_THIS: u8 = 8;
-/// The body itself contains a loop statement (not counting nested functions): the bytecode tier
-/// compiles such functions on their *first* call — a single call can run a million iterations
-/// (a benchmark driver's `while (elapsed < 1000)`), so waiting for a call-count threshold leaves
-/// the hottest code on the tree-walker.
+/// The body itself contains a loop statement (not counting nested functions). Native admission
+/// can use this fact after call-count or executed-backedge hotness admits the bytecode body.
 pub const SCAN_HAS_LOOP: u8 = 16;
 const SCAN_SELF_DONE: u8 = 32;
 const SCAN_SELF_NEEDED: u8 = 64;

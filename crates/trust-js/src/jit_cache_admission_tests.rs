@@ -602,7 +602,7 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
     let generator = call(&mut e, "generator");
     let next = e
         .interp
-        .get_member(&generator, "next")
+        .get_member_key(&generator, "next")
         .ok()
         .expect("next method");
     let item = e
@@ -611,7 +611,7 @@ fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() 
         .ok()
         .expect("continuation fallback");
     assert!(matches!(
-        e.interp.get_member(&item, "value"),
+        e.interp.get_member_key(&item, "value"),
         Ok(Value::Num(7.0))
     ));
     e.set_tier_threshold(32);

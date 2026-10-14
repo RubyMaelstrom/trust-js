@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Hard ceiling for one-shot codec output. The JavaScript engine uses the same 256 MiB backing-
-/// store ceiling, so decoding beyond this point could never be exposed as a Uint8Array and would
-/// only let compressed input consume unbounded native memory first.
+/// Hard ceiling for one-shot codec output. Keep decompression bounded independently of the
+/// JavaScript engine's larger ArrayBuffer limit: compressed input must not consume unbounded
+/// native memory before its output can be handed to JavaScript.
 pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) fn checked_decompressed_len(

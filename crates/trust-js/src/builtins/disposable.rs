@@ -15,22 +15,26 @@ fn ds_brand(i: &mut Interp, this: &Value, async_kind: bool) -> Result<Gc, Value>
     };
     let o = this_obj(this)
         .ok_or_else(|| i.make_error("TypeError", format!("receiver is not a {name}")))?;
-    let kind = o.borrow().props.get("#\u{0}ds_kind").map(|p| p.value());
+    let kind = o
+        .borrow()
+        .internal_slots()
+        .get("#\u{0}ds_kind")
+        .map(|p| p.value());
     match kind {
         Some(Value::Str(k)) if &*k == want => Ok(o),
         _ => Err(i.make_error("TypeError", format!("receiver is not a {name}"))),
     }
 }
 fn ds_list(i: &mut Interp, this: &Value) -> Result<Value, Value> {
-    ab(i.get_member(this, "#\u{0}ds"))
+    ab(i.get_internal_slot(this, "#\u{0}ds"))
 }
 fn ds_disposed(i: &mut Interp, this: &Value) -> Result<bool, Value> {
-    let v = ab(i.get_member(this, "#\u{0}ds_disposed"))?;
+    let v = ab(i.get_internal_slot(this, "#\u{0}ds_disposed"))?;
     Ok(i.to_boolean(&v))
 }
 fn ds_push(i: &mut Interp, this: &Value, entry: Value) -> Result<(), Value> {
     let list = ds_list(i, this)?;
-    let push = ab(i.get_member(&list, "push"))?;
+    let push = ab(i.get_member_key(&list, "push"))?;
     ab(i.call(push, list, &[entry]))?;
     Ok(())
 }
@@ -54,15 +58,15 @@ fn ds_combine_error(i: &mut Interp, pending: Option<Value>, new: Value) -> Value
 
 /// One `[fn, thisArg(, adopted)]` entry's call. `Ok(None)` marks the async await-only sentinel.
 fn ds_call_entry(i: &mut Interp, list: &Value, idx: i64) -> Result<Option<Value>, Value> {
-    let entry = ab(i.get_member(list, &idx.to_string()))?;
-    let f = ab(i.get_member(&entry, "0"))?;
+    let entry = ab(i.get_member_key(list, &idx.to_string()))?;
+    let f = ab(i.get_member_key(&entry, "0"))?;
     if !f.is_callable() {
         return Ok(None);
     }
-    let t = ab(i.get_member(&entry, "1"))?;
-    let len = ab(i.get_member(&entry, "length"))?;
+    let t = ab(i.get_member_key(&entry, "1"))?;
+    let len = ab(i.get_member_key(&entry, "length"))?;
     let args = if ab(i.to_number(&len))? >= 3.0 {
-        vec![ab(i.get_member(&entry, "2"))?]
+        vec![ab(i.get_member_key(&entry, "2"))?]
     } else {
         Vec::new()
     };
@@ -175,7 +179,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
         let v = arg(a, 0);
         if !matches!(v, Value::Undefined | Value::Null) {
             let key = well_known_key(i, "dispose").unwrap_or_default();
-            let disp = ab(i.get_member(&v, &key))?;
+            let disp = ab(i.get_member_key(&v, &key))?;
             if !disp.is_callable() {
                 return Err(i.make_error("TypeError", "value is not disposable"));
             }
@@ -222,7 +226,7 @@ pub(super) fn install_disposable_stack(it: &mut Interp) {
             Value::Bool(true),
         );
         let list = ds_list(i, &this)?;
-        let len = ab(i.get_member(&list, "length"))?;
+        let len = ab(i.get_member_key(&list, "length"))?;
         let n = ab(i.to_number(&len))? as i64;
         // Every disposer runs; a later error suppresses the pending one (SuppressedError).
         let mut err: Option<Value> = None;
@@ -317,11 +321,11 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         }
         // Prefer @@asyncDispose, falling back to @@dispose.
         let akey = well_known_key(i, "asyncDispose").unwrap_or_default();
-        let mut disp = ab(i.get_member(&v, &akey))?;
+        let mut disp = ab(i.get_member_key(&v, &akey))?;
         let from_async = disp.is_callable();
         if !from_async {
             let dkey = well_known_key(i, "dispose").unwrap_or_default();
-            disp = ab(i.get_member(&v, &dkey))?;
+            disp = ab(i.get_member_key(&v, &dkey))?;
         }
         if !disp.is_callable() {
             return Err(i.make_error("TypeError", "value is not async-disposable"));
@@ -384,7 +388,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
             Value::Bool(true),
         );
         let list = ds_list(i, &this)?;
-        let len = ab(i.get_member(&list, "length"))?;
+        let len = ab(i.get_member_key(&list, "length"))?;
         let n = ab(i.to_number(&len))? as i64;
         adisp_run(i, list, n - 1, result.clone(), None);
         Ok(result)

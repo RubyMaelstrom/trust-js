@@ -1,23 +1,27 @@
 //! Bytecode tier v0: a per-function stack VM behind the tree-walking interpreter.
 //!
 //! The tree-walker is the reference oracle: compiled tiers are expected to match its observable
-//! semantics and are checked against it by the differential test harness. A function is either
-//! compiled *whole* (its body contains only
-//! constructs this compiler fully understands) or it runs in the tree-walker. The experimental
-//! optimizing backend can transfer an ordinary frame into the VM at a verified before-effect
-//! boundary without restarting that invocation. Every operation with observable semantics (property access,
-//! calls, coercions, name resolution outside the function) delegates to the interpreter's own
-//! helpers, so behavior differences can only come from the local-variable and dispatch layers.
+//! semantics and are checked against it by the differential test harness. Eligible bodies compile
+//! as whole functions; unsupported bodies retain tree-walker execution and can compile supported
+//! loop fragments. A long-running ordinary synchronous invocation can transfer its live frame at
+//! an eligible loop boundary without repeating parameter binding, hoisting or prefix effects.
+//! Outer cleanup and unsupported activation projections retain the fragment path. The optional
+//! optimizing backend can also resume in the VM at a verified before-effect boundary.
+//! Guarded fast paths preserve the runtime algorithms' required behavior; observable or
+//! unsupported slow paths retain checked interpreter helpers. Differential tests check tier
+//! agreement against the tree-walker; the language specification resolves semantic questions.
 //!
 //! Locals normally live in a flat slot vector. Bindings observable through closures, direct eval,
-//! mapped arguments, or other dynamic environments are instead homed in a retained activation;
-//! uncommon non-suspending syntax can share the normative evaluator through a projected frame.
+//! mapped arguments, or other dynamic environments retain their live activation; scoped aliases
+//! connect arguments maps to shared slot homes during live transfer. Uncommon non-suspending
+//! syntax can share the normative evaluator through a projected frame.
 //! TDZ is represented by `Value::Empty` in a slot — reads check it and throw the same
 //! ReferenceError the tree-walker would.
 //!
 //! Tier selection (see `Interp::tier`): `jit` (default), `bytecode`, or `interp` (this module is
-//! never entered — the tree-walker runs). Compiled tiers kick in at `tier_threshold` calls (0 =
-//! immediately). Selectable via the `TRUST_JS_TIER` / `TRUST_JS_TIER_THRESHOLD` env vars, the CLI's
+//! never entered — the tree-walker runs). Ordinary synchronous author functions compile at
+//! `tier_threshold` calls (0 = immediately) or an eligible hot loop boundary. Selectable via the
+//! `TRUST_JS_TIER` / `TRUST_JS_TIER_THRESHOLD` env vars, the CLI's
 //! `--tier`, or `Engine::set_tier`.
 
 use std::rc::Rc;
@@ -887,6 +891,11 @@ pub const INTRINSIC_NUMERIC_ONLY: u8 = 17;
 /// `Reflect.apply(target, thisArg, list)`: an operand-only native target with a dense, ordinary
 /// argument list is called directly (see `jit_call_hit`).
 pub const INTRINSIC_REFLECT_APPLY: u8 = 18;
+/// DataView GetViewValue/SetViewValue: a primitive offset (and primitive stored value) makes
+/// coercion inert. Endianness and unused extra arguments may be objects: ToBoolean runs no JS.
+/// Object offsets/values retain the complete native-call boundary before their conversions.
+pub const INTRINSIC_DATAVIEW_GET: u8 = 19;
+pub const INTRINSIC_DATAVIEW_SET: u8 = 20;
 
 /// Math numeric functions the call template finishes inline (a Number argument list, no
 /// coercion): ECMA-262 §21.3.2.16 floor, .10 ceil, .35 trunc, .1 abs, .17 fround, .11 clz32
@@ -1032,7 +1041,7 @@ impl PrivateSite {
 
     /// The `entries` slot of `key` in `props`, via the cached hint (validated by key text).
     #[inline]
-    pub(crate) fn find(&self, props: &crate::value::Props, key: &str) -> Option<usize> {
+    pub(crate) fn find(&self, props: &crate::value::InternalSlots, key: &str) -> Option<usize> {
         let hint = self.slot.get() as usize;
         if let Some((k, _)) = props.entry_at(hint) {
             let same = self
@@ -2159,6 +2168,7 @@ impl CallNames {
 /// innermost call, `new`, property-access, tagged-template or assignment node it was compiled
 /// for, or [`NO_POSITION`]. Stored as runs of operations sharing a position, in increasing
 /// operation order; read only when a call records its position or an operation throws.
+/// Inlined chunks separately cache their implicit positions by PC for checked-operation entry.
 #[derive(Default)]
 pub(crate) struct SourcePositions {
     /// (first operation, position): each run lasts until the next one starts.
@@ -2188,6 +2198,23 @@ impl SourcePositions {
 
     fn retained_bytes(&self) -> usize {
         self.runs.capacity() * std::mem::size_of::<(u32, u32)>()
+    }
+
+    /// Expand only inline runs after final identity registration. Checked helpers must not
+    /// binary-search source runs while executing ordinary data accesses with no observer.
+    fn implicit_positions(&self, op_count: usize) -> Box<[u32]> {
+        let mut positions = vec![NO_POSITION; op_count].into_boxed_slice();
+        for (index, &(first, position)) in self.runs.iter().enumerate() {
+            if crate::stack_trace::is_inline_position(position) {
+                let end = self
+                    .runs
+                    .get(index + 1)
+                    .map_or(op_count, |&(next, _)| next as usize);
+                positions[first as usize..end]
+                    .fill(crate::stack_trace::implicit_inline_position(position));
+            }
+        }
+        positions
     }
 }
 
@@ -2225,6 +2252,11 @@ pub struct Chunk {
     n_slots: usize,
     /// Slot names, for TDZ ReferenceError messages.
     slot_names: Vec<Rc<str>>,
+    /// Borrowed entries publish these normally private homes around author observations.
+    borrowed_parameter_aliases: bool,
+    /// Exact settled AST phases from which a live ordinary function may enter its whole
+    /// bytecode body. The syntax address is compared only while its owning Function is live.
+    function_osr_entries: Vec<FunctionOsrEntry>,
     /// Number of opaque prepared-Reference homes needed by this chunk.
     n_refs: usize,
     /// Parameter positions map onto slots [0, n_params).
@@ -2416,6 +2448,13 @@ pub struct Chunk {
 #[cfg(feature = "optimizing-jit")]
 pub(crate) const SPECIALIZATION_MISS_LIMIT: u8 = 8;
 
+struct FunctionOsrEntry {
+    site: usize,
+    pc: usize,
+    bindings: Vec<(Rc<str>, u16, u16)>,
+    environment_handlers: Vec<usize>,
+}
+
 pub(crate) struct RecordGetterPlan {
     fields: [(u32, u32); 8],
     count: usize,
@@ -2478,7 +2517,7 @@ impl Chunk {
         let mut values = [0.; 8];
         for (slot, (name, cache)) in plan.fields[..plan.count].iter().enumerate() {
             let name = &self.names[*name as usize];
-            if Interp::is_sym_key(name) || Interp::is_private_key(name) {
+            if Interp::is_sym_key(name) {
                 return None;
             }
             let ic = self.caches[*cache as usize].get();
@@ -2711,6 +2750,20 @@ impl Chunk {
                 | CapInit::Lexical(name, _) => name,
             };
             visitor.rc_str(name);
+        }
+        bytes = bytes.saturating_add(
+            self.function_osr_entries.capacity() * std::mem::size_of::<FunctionOsrEntry>(),
+        );
+        for entry in &self.function_osr_entries {
+            bytes = bytes.saturating_add(
+                entry.bindings.capacity() * std::mem::size_of::<(Rc<str>, u16, u16)>(),
+            );
+            bytes = bytes.saturating_add(
+                entry.environment_handlers.capacity() * std::mem::size_of::<usize>(),
+            );
+            for (name, _, _) in &entry.bindings {
+                visitor.rc_str(name);
+            }
         }
         for map in &self.obj_maps {
             if let Some(map) = map.get() {
@@ -5947,7 +6000,7 @@ mod feedback_layout_tests {
             .is_ok());
         assert_eq!(set_trace.outcome, Some(PropertyOutcome::Exotic));
         assert!(matches!(
-            interp.get_member(&proxy, "value"),
+            interp.get_member_key(&proxy, "value"),
             Ok(Value::Num(4.0))
         ));
     }
@@ -6003,7 +6056,7 @@ mod feedback_layout_tests {
 
         assert_eq!(trace.outcome, Some(PropertyOutcome::Rejected));
         assert!(matches!(
-            interp.get_member(&object, "value"),
+            interp.get_member_key(&object, "value"),
             Ok(Value::Num(1.0))
         ));
     }
@@ -6098,7 +6151,7 @@ mod feedback_layout_tests {
             Ok(Value::Num(1.))
         ));
         assert!(matches!(
-            interp.get_member(&object, "x"),
+            interp.get_member_key(&object, "x"),
             Ok(Value::Num(7.))
         ));
     }
@@ -6182,6 +6235,16 @@ mod feedback_layout_tests {
 }
 
 /// Compile `func` whole, or `None` if it uses anything outside the v0 subset.
+fn function_osr_site(statement: &Stmt) -> Option<usize> {
+    match statement {
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+            Some(&body.site as *const _ as usize)
+        }
+        Stmt::Labeled { body, .. } => function_osr_site(body),
+        _ => None,
+    }
+}
+
 pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
     let result =
@@ -6294,6 +6357,9 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+#[path = "function_tiering_tests.rs"]
+mod function_tiering_tests;
 #[cfg(test)]
 #[path = "bytecode_osr_tests.rs"]
 mod osr_tests;
@@ -6578,12 +6644,25 @@ fn compile_inner(
         lexical_this: func.is_arrow && !script_body,
         derived_constructor,
         strict: func.is_strict,
+        borrowed_parameter_aliases: !func.is_strict
+            && !func.is_arrow
+            && !func.params.is_empty()
+            && func.params.iter().all(|parameter| {
+                !parameter.rest
+                    && parameter.default.is_none()
+                    && matches!(parameter.pattern, Pattern::Ident(_))
+            }),
         is_coroutine,
         module_body: module_bindings.is_some(),
         script_body,
         direct_eval,
         runtime_lexicals,
         reuse_activation: has_mapped_parameter_aliases || prepared_entry,
+        function_osr_sites: if !script_body && !is_coroutine && hot.is_none() {
+            func.body.iter().filter_map(function_osr_site).collect()
+        } else {
+            Vec::new()
+        },
         plan_stack: vec![(plan.clone(), 0)],
         cache_seed_stack: hot
             .map(|chunk| vec![(property_cache_seeds(chunk), 0)])
@@ -7156,6 +7235,8 @@ fn finish_chunk(
         names: c.names,
         n_slots: c.slot_names.len(),
         slot_names: c.slot_names,
+        borrowed_parameter_aliases: c.borrowed_parameter_aliases,
+        function_osr_entries: c.function_osr_entries,
         n_refs: c.n_refs,
         n_params: c.n_params,
         arguments_slot: c.arguments_slot,
@@ -7273,7 +7354,8 @@ pub(crate) fn direct_shared_context_enabled() -> bool {
 /// emission order).
 /// Register the inline sites a finished compile's positions name, and rewrite those positions
 /// from the compiler's local site list to the registered ones. Sites of discarded or unused
-/// splices are left out.
+/// splices are left out. Cache implicit positions by final PC only after that identity rewrite;
+/// ordinary chunks allocate no lookup, and error/explicit-call positions retain the run table.
 fn register_inline_sites(c: &mut Compiler) -> crate::stack_trace::InlineSites {
     use crate::stack_trace::{inline_index, inline_position, is_inline_position, InlineSite};
     let count = c.inline_sites.len();
@@ -7309,11 +7391,14 @@ fn register_inline_sites(c: &mut Compiler) -> crate::stack_trace::InlineSites {
             outer,
         });
     }
-    let (owned, registered) = crate::stack_trace::InlineSites::register(sites);
+    let (mut owned, registered) = crate::stack_trace::InlineSites::register(sites);
     for run in &mut c.positions.runs {
         if is_inline_position(run.1) {
             run.1 = registered[listed[inline_index(run.1)] as usize];
         }
+    }
+    if !owned.is_empty() {
+        owned.set_implicit_positions(c.positions.implicit_positions(c.ops.len()));
     }
     owned
 }
@@ -7874,11 +7959,16 @@ struct Compiler {
     arguments_length_only: bool,
     /// Borrow the already-instantiated AST environment and return exact source completions.
     fragment_entry: bool,
+    borrowed_parameter_aliases: bool,
     fragment_async_generator: bool,
     fragment_tail_calls: bool,
     fragment_root: Option<loop_fragment::RootKind>,
     fragment_seed_slots: Vec<u16>,
     fragment_exits: Vec<(usize, FragmentExitKind)>,
+    function_osr_sites: Vec<usize>,
+    function_osr_entries: Vec<FunctionOsrEntry>,
+    pending_function_osr_site: Option<usize>,
+    function_osr_environment_handlers: Vec<usize>,
     /// The compiled function's strictness (carried into ops whose runtime behavior forks on it).
     strict: bool,
     /// Generator/async chunks use the VM as their resumable execution context, not merely as an
@@ -8437,6 +8527,47 @@ fn no_assign_to(e: &Expr, name: &str) -> bool {
 }
 
 impl Compiler {
+    fn record_function_osr(&mut self, site: &LoopSite, pc: usize) {
+        self.record_function_osr_address(site as *const _ as usize, pc);
+    }
+
+    fn record_function_osr_address(&mut self, site: usize, pc: usize) {
+        // The enclosing AST frame is parked at a body-level loop, with no active cleanup or
+        // runtime lexical cursor to reconstruct. Captured function homes can reuse the exact
+        // parked Function Environment Record; mapped arguments retain the prepared entry.
+        if self.inline_depth != 0
+            || self.try_depth as usize != self.function_osr_environment_handlers.len()
+            || self.env_arguments
+            || self.arguments_slot.is_some()
+            || !self.function_osr_sites.contains(&site)
+        {
+            return;
+        }
+        let mut bindings = Vec::new();
+        let mut shadow_counts = crate::fasthash::FastMap::<&str, u16>::default();
+        for (scope, environment) in self.scopes.iter().zip(&self.lexical_env_names).rev() {
+            let mut seen = crate::fasthash::FastSet::default();
+            for (name, slot, _) in scope.iter().rev() {
+                if seen.insert(name.as_str()) {
+                    let depth = shadow_counts.entry(name.as_str()).or_default();
+                    bindings.push((Rc::from(name.as_str()), *slot, *depth));
+                    *depth += 1;
+                }
+            }
+            for name in environment.keys() {
+                if seen.insert(name.as_str()) {
+                    *shadow_counts.entry(name.as_str()).or_default() += 1;
+                }
+            }
+        }
+        self.function_osr_entries.push(FunctionOsrEntry {
+            site,
+            pc,
+            bindings,
+            environment_handlers: self.function_osr_environment_handlers.clone(),
+        });
+    }
+
     fn emit(&mut self, op: Op) -> usize {
         let op = match self.inline_env_targets.last() {
             Some(&target) => self.inline_env_op(op, target),
@@ -9025,7 +9156,7 @@ impl Compiler {
                         PropKey::Str(k) => k.to_string(),
                         _ => return Err(Bail),
                     };
-                    let ki = self.name_idx(&key);
+                    let ki = self.property_name_idx(&key);
                     let reference = self.prepare_binding_reference(&prop.value, kind)?;
                     self.emit(Op::Dup);
                     let c = self.new_cache(ki);
@@ -9505,7 +9636,7 @@ impl Compiler {
                 if *optional {
                     self.opt_link(1, shorts);
                 }
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 if prop.starts_with('#') {
                     let site = self.new_private_site();
                     self.emit(Op::GetPrivateMethod(name, site));
@@ -9596,7 +9727,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
-                let n = self.name_idx(prop);
+                let n = self.property_name_idx(prop);
                 self.emit(Op::DeleteProp(n, self.strict));
                 Ok(())
             }
@@ -9636,7 +9767,7 @@ impl Compiler {
                 if *optional {
                     self.opt_link(1, &mut shorts);
                 }
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 self.emit(Op::DeleteProp(name, self.strict));
             }
             Expr::Index {
@@ -9723,7 +9854,7 @@ impl Compiler {
                 if *optional {
                     self.opt_link(1, shorts);
                 }
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 let c = self.new_cache(i);
                 self.emit(Op::GetProp(i, c));
                 Ok(())
@@ -9738,7 +9869,7 @@ impl Compiler {
                 if *optional {
                     self.opt_link(1, shorts);
                 }
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 let site = self.new_private_site();
                 self.emit(Op::GetPrivate(name, site));
                 Ok(())
@@ -9934,6 +10065,9 @@ impl Compiler {
     fn const_idx(&mut self, v: Value) -> u32 {
         self.consts.push(v);
         (self.consts.len() - 1) as u32
+    }
+    fn property_name_idx(&mut self, name: &str) -> u32 {
+        self.name_idx(&crate::value::encode_string_key(name))
     }
     fn name_idx(&mut self, name: &str) -> u32 {
         // Large bundles repeatedly searched the complete pool for every emitted name. Keep
@@ -10596,6 +10730,7 @@ impl Compiler {
                 self.fragment_root.take();
                 let labels = std::mem::take(&mut self.pending_labels);
                 let start = self.ops.len();
+                self.record_function_osr(&body.site, start);
                 self.expr(test)?;
                 let jf = self.emit(Op::JumpIfFalse(0));
                 self.loops.push(LoopCtx {
@@ -10620,6 +10755,7 @@ impl Compiler {
                 self.fragment_root.take();
                 let labels = std::mem::take(&mut self.pending_labels);
                 let start = self.ops.len();
+                self.record_function_osr(&body.site, start);
                 self.loops.push(LoopCtx {
                     labels,
                     entry_try_depth: self.try_depth,
@@ -10655,9 +10791,13 @@ impl Compiler {
                 body,
                 ..
             } => {
+                let saved_site = self
+                    .pending_function_osr_site
+                    .replace(&body.site as *const _ as usize);
                 self.push_compile_scope();
                 let r = self.for_loop(init.as_deref(), test.as_ref(), update.as_ref(), body);
                 self.pop_compile_scope();
+                self.pending_function_osr_site = saved_site;
                 r
             }
             Stmt::Break(None) => {
@@ -11458,7 +11598,7 @@ impl Compiler {
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
                 self.emit(Op::LoadLocal(value_slot));
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 let cache = self.new_cache(name);
                 self.emit(Op::SetPropDrop(name, cache));
                 Ok(())
@@ -11611,7 +11751,7 @@ impl Compiler {
                 self.expr(obj)?;
                 let base = self.fresh_slot("%assignment-private-base%");
                 self.emit(Op::StoreLocal(base));
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 Ok(PreparedAssignmentRef::Private { base, name })
             }
             Expr::Ident(name, _) => self.prepare_identifier_reference(name),
@@ -11624,7 +11764,7 @@ impl Compiler {
                 self.expr(obj)?;
                 let base = self.fresh_slot("%assignment-base%");
                 self.emit(Op::StoreLocal(base));
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 let cache = self.new_cache(name);
                 Ok(PreparedAssignmentRef::Property { base, name, cache })
             }
@@ -12316,8 +12456,10 @@ impl Compiler {
         let push = self.emit(Op::PushFinally(0, 0, 0, 0, 0));
         self.try_depth += 1;
         self.finally_depths.push(self.try_depth);
+        self.function_osr_environment_handlers.push(push);
 
         compile_body(self)?;
+        self.function_osr_environment_handlers.pop();
 
         self.emit(Op::PopHandler);
         self.try_depth -= 1;
@@ -12649,6 +12791,9 @@ impl Compiler {
             self.emit(Op::CloneLex(scope));
         }
         let start = self.ops.len();
+        if let Some(site) = self.pending_function_osr_site.take() {
+            self.record_function_osr_address(site, start);
+        }
         let jf = match test {
             Some(t) => {
                 self.expr(t)?;
@@ -12828,7 +12973,7 @@ impl Compiler {
                 } =>
             {
                 self.expr(value)?;
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 let c = self.new_cache(i);
                 match &**mobj {
                     Expr::This => {
@@ -12861,7 +13006,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 if op == "+=" {
                     // Fused append: same evaluation order (read before RHS), and the op itself
                     // falls back to the generic Add + store when anything isn't plain strings.
@@ -13086,7 +13231,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) => {
                 self.expr(obj)?;
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 if prop.starts_with('#') {
                     let site = self.new_private_site();
                     self.emit(Op::GetPrivateMethod(name, site));
@@ -13302,7 +13447,7 @@ impl Compiler {
             self.at_position(position, |c| {
                 match link {
                     Expr::Member { prop, .. } => {
-                        let i = c.name_idx(prop);
+                        let i = c.property_name_idx(prop);
                         let cache = c.new_cache(i);
                         c.emit(Op::GetProp(i, cache));
                     }
@@ -13346,7 +13491,7 @@ impl Compiler {
             self.at_position(*pos, |c| {
                 let (with_this, allow_inline) = match &**callee {
                     Expr::Member { prop, .. } => {
-                        let name = c.name_idx(prop);
+                        let name = c.property_name_idx(prop);
                         if prop.starts_with('#') {
                             let site = c.new_private_site();
                             c.emit(Op::GetPrivateMethod(name, site));
@@ -13489,7 +13634,7 @@ impl Compiler {
                     // Inside a splice `this` is the receiver slot; otherwise the frame binding.
                     Expr::This if self.inline_depth > 0 => {
                         if let Some(slot) = self.inline_this {
-                            let i = self.name_idx(prop);
+                            let i = self.property_name_idx(prop);
                             let c = self.new_cache(i);
                             self.emit(Op::GetPropLocal(slot, i, c));
                             return Ok(());
@@ -13497,14 +13642,14 @@ impl Compiler {
                     }
                     Expr::This if !self.lexical_this && !self.derived_constructor => {
                         self.uses_this = true;
-                        let i = self.name_idx(prop);
+                        let i = self.property_name_idx(prop);
                         let c = self.new_cache(i);
                         self.emit(Op::GetPropThis(i, c));
                         return Ok(());
                     }
                     Expr::Ident(name, _) => {
                         if let Some(Home::Slot(slot, _)) = self.home(name) {
-                            let i = self.name_idx(prop);
+                            let i = self.property_name_idx(prop);
                             let c = self.new_cache(i);
                             self.emit(Op::GetPropLocal(slot, i, c));
                             return Ok(());
@@ -13513,7 +13658,7 @@ impl Compiler {
                     _ => {}
                 }
                 self.expr(obj)?;
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 let c = self.new_cache(i);
                 self.emit(Op::GetProp(i, c));
                 Ok(())
@@ -13535,7 +13680,7 @@ impl Compiler {
                 ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 let site = self.new_private_site();
                 self.emit(Op::GetPrivate(name, site));
                 Ok(())
@@ -13959,7 +14104,7 @@ impl Compiler {
                                 let anonymous = crate::eval::is_anonymous_fn(value);
                                 if let Some(name) = static_name(key) {
                                     self.expr(value)?;
-                                    let name = self.name_idx(&name);
+                                    let name = self.property_name_idx(&name);
                                     self.emit(Op::ObjectDataName(name, anonymous));
                                 } else {
                                     self.object_literal_key(key)?;
@@ -13978,7 +14123,7 @@ impl Compiler {
                                 let function = self.funcs.len() as u32;
                                 self.funcs.push(func.clone());
                                 if let Some(name) = static_name(key) {
-                                    let name = self.name_idx(&name);
+                                    let name = self.property_name_idx(&name);
                                     self.emit(Op::ObjectMethodName(function, kind, name));
                                 } else {
                                     self.object_literal_key(key)?;
@@ -14028,7 +14173,7 @@ impl Compiler {
                 // add names of their own, and the key range must stay contiguous.
                 let start = self.names.len() as u32;
                 for k in &keys {
-                    self.append_name(k);
+                    self.append_name(&crate::value::encode_string_key(k));
                 }
                 // Distinct keys → a pre-shaped template site ({a:1, a:2} keeps the insert path:
                 // the template's slot-indexed value writes assume one slot per key).
@@ -14113,7 +14258,7 @@ impl Compiler {
                 ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 self.emit(Op::UpdatePrivate(name, kind));
                 Ok(())
             }
@@ -14124,7 +14269,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 let c = self.new_cache(i);
                 self.emit(Op::UpdateProp(i, c, kind));
                 Ok(())
@@ -14265,7 +14410,7 @@ impl Compiler {
                 ..
             } if prop.starts_with('#') => {
                 self.expr(obj)?;
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 if op == "=" {
                     self.expr(value)?;
                 } else {
@@ -14285,7 +14430,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 self.expr(obj)?;
-                let i = self.name_idx(prop);
+                let i = self.property_name_idx(prop);
                 if op == "=" {
                     self.expr(value)?;
                 } else {
@@ -14478,7 +14623,7 @@ impl Compiler {
                 let base = self.fresh_slot("%logical-private-base%");
                 self.expr(obj)?;
                 self.emit(Op::StoreLocal(base));
-                let name = self.name_idx(prop);
+                let name = self.property_name_idx(prop);
                 self.emit(Op::LoadLocal(base));
                 let site = self.new_private_site();
                 self.emit(Op::GetPrivate(name, site));
@@ -14500,7 +14645,7 @@ impl Compiler {
                 let base_slot = self.fresh_slot("%logical-base%");
                 self.expr(obj)?;
                 self.emit(Op::StoreLocal(base_slot));
-                let name_index = self.name_idx(prop);
+                let name_index = self.property_name_idx(prop);
                 let get_cache = self.new_cache(name_index);
                 self.emit(Op::GetPropLocal(base_slot, name_index, get_cache));
                 let done = short_jump(self, op)?;
@@ -14632,6 +14777,242 @@ pub fn run(
     run_inner(i, chunk, env, this_val, args, None)
 }
 
+/// Move a cold ordinary function's already-instantiated AST activation into its whole
+/// bytecode continuation. Only body-level settled loops are admitted: their outer parameter
+/// binding, hoisting, prefix effects and lexical initialization must never run a second time.
+pub(crate) fn try_function_osr(
+    i: &mut Interp,
+    site: &LoopSite,
+    live_env: &Env,
+) -> Result<Option<crate::interpreter::Completion>, Abrupt> {
+    let Some(frame) = i.fn_frames.last() else {
+        return Ok(None);
+    };
+    let construct = frame.construct;
+    let callee = frame.callee();
+    let (function, closure) = match &callee.borrow().call {
+        crate::value::Callable::User(user) => (user.func.clone(), user.env.clone()),
+        _ => return Ok(None),
+    };
+    let address = site as *const _ as usize;
+    if function.is_async
+        || function.is_generator
+        || (construct
+            && i.class_info
+                .get(&(Rc::as_ptr(&callee) as usize))
+                .is_some_and(|class| class.derived))
+        || !function
+            .body
+            .iter()
+            .any(|statement| function_osr_site(statement) == Some(address))
+        || live_env.borrow().under_with
+    {
+        return Ok(None);
+    }
+    if function.code.get().is_none() {
+        let _ = function.code.set(compile(&function));
+    }
+    let Some(baseline) = function.code.get().and_then(Option::as_ref) else {
+        return Ok(None);
+    };
+    let legacy_mapped_parameters = !function.is_strict
+        && !function.is_arrow
+        && !function.params.is_empty()
+        && function.params.iter().all(|parameter| {
+            !parameter.rest
+                && parameter.default.is_none()
+                && matches!(parameter.pattern, Pattern::Ident(_))
+        });
+    let chunk = baseline;
+    if construct && chunk.has_tail_calls() {
+        return Ok(None);
+    }
+    let Some(entry) = chunk
+        .function_osr_entries
+        .iter()
+        .find(|entry| entry.site == address)
+    else {
+        return Ok(None);
+    };
+    let activation = crate::interpreter::nearest_var_env(live_env);
+    let aliased_homes = if legacy_mapped_parameters && !chunk.prepared_entry {
+        let formals = crate::interpreter::param_bound_names(&function.params);
+        entry
+            .bindings
+            .iter()
+            .filter(|(name, slot, _)| {
+                (*slot as usize) < chunk.n_params
+                    && formals.iter().any(|formal| formal == name.as_ref())
+            })
+            .map(|(name, slot, _)| (activation.clone(), name.clone(), *slot))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    // Retained AST expression/pattern evaluators copy local homes into a temporary record.
+    // They cannot currently share a slot alias with legacy ParameterMap writes. Preserve the
+    // established environment-backed loop fragment path for these uncommon projections.
+    if chunk.eval_exprs.iter().any(|plan| {
+        plan.locals
+            .iter()
+            .any(|local| aliased_homes.iter().any(|(_, _, slot)| *slot == local.slot))
+    }) || chunk.assignment_targets.iter().any(|plan| {
+        plan.locals
+            .iter()
+            .any(|local| aliased_homes.iter().any(|(_, _, slot)| *slot == local.slot))
+    }) {
+        return Ok(None);
+    }
+    if chunk.makes_env() {
+        // Defaults can split parameter/body Environment Records. A capture that was homed
+        // into a nested AST block likewise cannot be redirected into the function record.
+        // Verify every compiled capture against this exact live record before transferring.
+        if crate::interpreter::params_have_expr(&function.params) {
+            return Ok(None);
+        }
+        let scope = activation.borrow();
+        if chunk.cap_inits.iter().any(|init| {
+            let name = match init {
+                CapInit::Param(_, name)
+                | CapInit::Rest(_, name)
+                | CapInit::Var(name)
+                | CapInit::Fn(_, name)
+                | CapInit::Lexical(name, _) => name,
+            };
+            !scope.vars.contains_key(name)
+        }) || (chunk.env_this && !scope.vars.contains_key("this"))
+        {
+            return Ok(None);
+        }
+    }
+    // Seed by binding identity through the parked lexical chain, including TDZ cells. This
+    // inspects only engine-owned bindings and performs no author property read or conversion.
+    let mut initial = Vec::with_capacity(entry.bindings.len());
+    let mut private_homes = Vec::with_capacity(entry.bindings.len());
+    for (name, slot, shadow_depth) in &entry.bindings {
+        let mut cursor = Some(live_env.clone());
+        let mut value = None;
+        let mut shadow_depth = *shadow_depth;
+        while let Some(environment) = cursor {
+            let scope = environment.borrow();
+            if let Some(binding) = scope.vars.get(name) {
+                if shadow_depth == 0 {
+                    value = Some(if binding.initialized {
+                        binding.value.clone()
+                    } else {
+                        Value::Empty
+                    });
+                    private_homes.push((environment.clone(), name.clone(), *slot));
+                    break;
+                }
+                shadow_depth -= 1;
+            }
+            cursor = scope.parent.clone();
+        }
+        let Some(value) = value else { return Ok(None) };
+        initial.push((*slot, value));
+    }
+    let this_val = if chunk.needs_frame_this() {
+        i.get_var("this", live_env)?
+    } else {
+        Value::Undefined
+    };
+    let (mut slots, mut stack) = i.vm_pool.pop().unwrap_or_default();
+    slots.resize_with(chunk.n_slots, || PackedValue::pack(Value::Undefined));
+    for (slot, value) in initial {
+        slots.write_value(slot as usize, value);
+    }
+    let cap_env = if chunk.makes_env() || chunk.prepared_entry {
+        activation.clone()
+    } else {
+        closure.clone()
+    };
+    let mut env = if !entry.environment_handlers.is_empty() {
+        live_env.clone()
+    } else {
+        cap_env.clone()
+    };
+    let mut pc = entry.pc;
+    let mut handlers = entry
+        .environment_handlers
+        .iter()
+        .map(|&pc| {
+            let Op::PushFinally(throw_pc, return_pc, bare_return_pc, resume_return_pc, jump_pc) =
+                chunk.ops[pc]
+            else {
+                unreachable!("function OSR environment handler must name its cleanup pad")
+            };
+            Handler {
+                stack_depth: 0,
+                target: HandlerTarget::Finally {
+                    throw_pc: throw_pc as usize,
+                    return_pc: return_pc as usize,
+                    bare_return_pc: bare_return_pc as usize,
+                    resume_return_pc: resume_return_pc as usize,
+                    jump_pc: jump_pc as usize,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut disposal_frames = Vec::new();
+    let mut class_states = (0..chunk.class_plans.len())
+        .map(|_| None)
+        .collect::<Vec<_>>();
+    let mut references = (0..chunk.n_refs)
+        .map(|_| crate::eval::PreparedReferenceSlot::default())
+        .collect::<Vec<_>>();
+    let mut tiering = crate::tiering::VmTiering::hot();
+    // Transfer all uncaptured binding owners, including non-formal locals, into canonical
+    // shared slot Cells. Their parked records must not retain overwritten objects. Captured
+    // homes remain in their original environments and are absent from entry.bindings.
+    // The scope restores even on unwind and drops before recycling any slot owner.
+    let aliases = if private_homes.is_empty() {
+        None
+    } else {
+        let registry = i.borrowed_parameters.get_or_insert_with(Default::default);
+        Some(unsafe { registry.enter(&private_homes, &slots) })
+    };
+    #[cfg(test)]
+    TEST_FUNCTION_OSR_ENTRIES.with(|entries| entries.set(entries.get() + 1));
+    let result = drive_vm(
+        i,
+        chunk,
+        &mut env,
+        &cap_env,
+        &mut references,
+        &slots,
+        &mut stack,
+        &mut pc,
+        &this_val,
+        &mut handlers,
+        &mut disposal_frames,
+        &mut class_states,
+        None,
+        false,
+        (matches!(i.tier, Tier::Jit) && !function.run_once).then_some(&mut tiering),
+    );
+    drop(aliases);
+    slots.clear();
+    stack.clear();
+    if i.vm_pool.len() < 64 {
+        i.vm_pool.push((slots, stack));
+    }
+    let completion = match result {
+        Ok(VmStep::Done(value) | VmStep::Return(value) | VmStep::ResumeReturn(value)) => {
+            Err(Abrupt::Return(value))
+        }
+        Ok(VmStep::BareReturn) => Err(Abrupt::Return(Value::Undefined)),
+        Err(error) => Err(error),
+        _ => unreachable!("ordinary function OSR cannot suspend or escape a loop completion"),
+    };
+    Ok(Some(completion))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_FUNCTION_OSR_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Enter baseline Script bytecode and tier only this already-live activation.
 /// The caller pins the exact Chunk for the entire run; no Script/GDI replay occurs.
 #[cfg(test)]
@@ -14683,7 +15064,7 @@ fn run_inner(
         &mut env,
         &cap_env,
         &mut references,
-        &mut slots,
+        &slots,
         &mut stack,
         &mut pc,
         &this_val,
@@ -14725,7 +15106,7 @@ fn drive_vm(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &mut [PackedValue],
+    slots: &[PackedValue],
     stack: &mut ValueStack<PackedValue>,
     pc: &mut usize,
     this_val: &Value,
@@ -14994,7 +15375,7 @@ fn script_osr_code(
 
 fn for_in_step<S: StoredValue>(
     i: &mut Interp,
-    slots: &mut [S],
+    slots: &[S],
     keys_slot: u16,
     index_slot: u16,
     source_slot: u16,
@@ -15039,7 +15420,14 @@ fn for_in_next(
                 continue;
             }
         }
-        return Ok(Some(key));
+        // Reuse ordinary candidates: fresh strings would discard their computed-read cache
+        // identity on every iteration. Only escaped leading-NUL keys need decoding.
+        return Ok(Some(match key {
+            Value::Str(name) if name.as_str().starts_with("\0\0") => {
+                crate::value::string_key_value(name)
+            }
+            other => other,
+        }));
     }
 }
 
@@ -15052,7 +15440,7 @@ fn assign_target_with_slots<S: StoredValue>(
     plan: &AssignmentTargetPlan,
     value: Value,
     env: &Env,
-    slots: &mut [S],
+    slots: &[S],
 ) -> Result<(), Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
@@ -15098,7 +15486,7 @@ fn eval_expr_with_slots<S: StoredValue>(
     i: &mut Interp,
     plan: &EvalExprPlan,
     env: &Env,
-    slots: &mut [S],
+    slots: &[S],
 ) -> Result<Value, Abrupt> {
     let projected = crate::interpreter::new_scope(Some(env.clone()));
     {
@@ -15303,7 +15691,7 @@ fn run_vm<S: StoredValue>(
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &mut [S],
+    slots: &[S],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
     this_val: &Value,
@@ -15371,12 +15759,12 @@ impl VmRunExit {
 
 #[allow(clippy::too_many_arguments)]
 fn run_vm_inner<S: StoredValue>(
-    i: &mut Interp,
+    interpreter: &mut Interp,
     chunk: &Chunk,
     env: &mut Env,
     cap_env: &Env,
     references: &mut [crate::eval::PreparedReferenceSlot],
-    slots: &mut [S],
+    slots: &[S],
     stack: &mut ValueStack<S>,
     pc: &mut usize,
     this_val: &Value,
@@ -15403,6 +15791,9 @@ fn run_vm_inner<S: StoredValue>(
             stack.pop().expect("vm stack underflow")
         };
     }
+    // Reborrow from this live activation pointer per operation. The position guard restores
+    // its field only after the operation's mutable borrow has finished.
+    let interpreter = interpreter as *mut Interp;
     loop {
         if stop_at == Some(*pc) {
             return Ok(VmStep::Done(Value::Undefined));
@@ -15410,6 +15801,10 @@ fn run_vm_inner<S: StoredValue>(
         let op_pc = *pc;
         let op = chunk.ops[op_pc];
         *pc += 1;
+        // A checked operation can enter author code implicitly (getter, coercion, trap).
+        // Its logical spliced callers must remain visible throughout that callback.
+        let _inline_position = unsafe { ImplicitCallPosition::enter(interpreter, chunk, op_pc) };
+        let i = unsafe { &mut *interpreter };
         match op {
             Op::Const(k) => stack.push(chunk.consts[k as usize].clone()),
             Op::Undef => stack.push(Value::Undefined),
@@ -15434,7 +15829,7 @@ fn run_vm_inner<S: StoredValue>(
                 stack.push_stored(v.clone());
             }
             Op::StoreLocal(s) => {
-                slots[s as usize] = stack.pop_stored().expect("vm stack underflow")
+                slots[s as usize].replace_stored(stack.pop_stored().expect("vm stack underflow"))
             }
             Op::UpdateLocal(s, kind) => {
                 let idx = s as usize;
@@ -16047,7 +16442,9 @@ fn run_vm_inner<S: StoredValue>(
                 let mut excluded = Vec::with_capacity(excluded_values.len());
                 for key in excluded_values {
                     match key {
-                        Value::Str(key) => excluded.push(key.to_string()),
+                        Value::Str(key) => {
+                            excluded.push(crate::value::encode_owned_string_key(key.to_string()))
+                        }
                         other => excluded.push(i.to_property_key(&other)?.into_string()),
                     }
                 }
@@ -16060,7 +16457,10 @@ fn run_vm_inner<S: StoredValue>(
                 if matches!(base, Value::Undefined | Value::Null) {
                     return Err(i.throw(
                         "TypeError",
-                        format!("cannot delete property '{prop}' of null or undefined"),
+                        format!(
+                            "cannot delete property '{}' of null or undefined",
+                            crate::value::decode_string_key(prop)
+                        ),
                     ));
                 }
                 let v = i.delete_prop_with(base, prop, strict)?;
@@ -16073,7 +16473,10 @@ fn run_vm_inner<S: StoredValue>(
                 if matches!(base, Value::Undefined | Value::Null) {
                     return Err(i.throw(
                         "TypeError",
-                        format!("cannot delete property '{key}' of null or undefined"),
+                        format!(
+                            "cannot delete property '{}' of null or undefined",
+                            crate::value::decode_string_key(&key)
+                        ),
                     ));
                 }
                 let v = i.delete_prop_with(base, &key, strict)?;
@@ -16318,9 +16721,9 @@ fn run_vm_inner<S: StoredValue>(
                     return Err(i.throw("TypeError", "cannot read property of null or undefined"));
                 }
                 let k = i.to_property_key(&key)?;
-                let old = i.get_member(&obj, &k)?;
+                let old = i.get_member_key(&obj, &k)?;
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
-                    i.set_member(&obj, &k, v)
+                    i.set_member_key(&obj, &k, v)
                 })?;
             }
             Op::ToPropKeyLocal(s) => {
@@ -17216,14 +17619,14 @@ fn run_vm_inner<S: StoredValue>(
                     let error = i.make_error("TypeError", "iterator result is not an object");
                     return Ok(VmStep::Await(rejected_intrinsic_promise(i, error)));
                 }
-                let done = match i.get_member(&result, "done") {
+                let done = match i.get_member_key(&result, "done") {
                     Ok(done) => done,
                     Err(error) => {
                         return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
                     }
                 };
                 let done = i.to_boolean(&done);
-                let value = match i.get_member(&result, "value") {
+                let value = match i.get_member_key(&result, "value") {
                     Ok(value) => value,
                     Err(error) => {
                         return Ok(VmStep::Await(async_from_sync_abrupt_promise(i, error)?));
@@ -17266,12 +17669,12 @@ fn run_vm_inner<S: StoredValue>(
                     if !matches!(settled, Value::Obj(_)) {
                         return Err(i.throw("TypeError", "iterator result is not an object"));
                     }
-                    let done = i.get_member(&settled, "done")?;
+                    let done = i.get_member_key(&settled, "done")?;
                     let done = i.to_boolean(&done);
                     let value = if done {
                         Value::Undefined
                     } else {
-                        i.get_member(&settled, "value")?
+                        i.get_member_key(&settled, "value")?
                     };
                     (done, value)
                 };
@@ -17612,7 +18015,7 @@ impl VmAsyncClose {
             return Self::start_from_sync(i, iterator, swallow_error);
         }
 
-        let ret = match i.get_member(&iterator, "return") {
+        let ret = match i.get_member_key(&iterator, "return") {
             Ok(ret) => ret,
             Err(error) => return (None, Self::failure(swallow_error, error)),
         };
@@ -17675,7 +18078,7 @@ impl VmAsyncClose {
         iterator: Value,
         swallow_error: bool,
     ) -> (Option<VmAsyncClose>, AsyncCloseAction) {
-        let ret = match i.get_member(&iterator, "return") {
+        let ret = match i.get_member_key(&iterator, "return") {
             Ok(ret) => ret,
             Err(error) => {
                 return Self::reject_from_sync(i, iterator, swallow_error, error);
@@ -17710,10 +18113,10 @@ impl VmAsyncClose {
         }
         // AsyncFromSyncIteratorContinuation observes `done` before `value`, even though
         // AsyncIteratorClose only uses the repackaged result's object-ness.
-        if let Err(error) = i.get_member(&result, "done") {
+        if let Err(error) = i.get_member_key(&result, "done") {
             return Self::reject_from_sync(i, iterator, swallow_error, error);
         }
-        let value = match i.get_member(&result, "value") {
+        let value = match i.get_member_key(&result, "value") {
             Ok(value) => value,
             Err(error) => {
                 return Self::reject_from_sync(i, iterator, swallow_error, error);
@@ -17761,7 +18164,7 @@ impl VmDelegate {
         let (iterator, next, from_sync) = if async_mode {
             let key = crate::builtins::async_iterator_key(i);
             let method = match key {
-                Some(key) => i.get_member(&value, &key)?,
+                Some(key) => i.get_member_key(&value, &key)?,
                 None => Value::Undefined,
             };
             if !matches!(method, Value::Undefined | Value::Null) && !method.is_callable() {
@@ -17772,7 +18175,7 @@ impl VmDelegate {
                 if !matches!(iterator, Value::Obj(_)) {
                     return Err(i.throw("TypeError", "@@asyncIterator did not return an object"));
                 }
-                let next = i.get_member(&iterator, "next")?;
+                let next = i.get_member_key(&iterator, "next")?;
                 (iterator, next, false)
             } else {
                 let (iterator, next) = i.get_iterator(&value)?;
@@ -17813,7 +18216,7 @@ impl VmDelegate {
                 let (method, argument, completion) = match signal {
                     Resume::Next(value) => (self.next.clone(), value, DelegateCompletion::Normal),
                     Resume::Throw(error) => {
-                        let method = match i.get_member(&self.iterator, "throw") {
+                        let method = match i.get_member_key(&self.iterator, "throw") {
                             Ok(method) => method,
                             Err(error) => return Self::abrupt(error),
                         };
@@ -17829,7 +18232,7 @@ impl VmDelegate {
                             }
                             // AsyncIteratorClose(iteratorRecord, NormalCompletion(empty)) before
                             // the mandated protocol TypeError.
-                            let ret = match i.get_member(&self.iterator, "return") {
+                            let ret = match i.get_member_key(&self.iterator, "return") {
                                 Ok(ret) => ret,
                                 Err(error) => return Self::abrupt(error),
                             };
@@ -17855,7 +18258,7 @@ impl VmDelegate {
                         (method, error, DelegateCompletion::Normal)
                     }
                     Resume::Return(value) => {
-                        let method = match i.get_member(&self.iterator, "return") {
+                        let method = match i.get_member_key(&self.iterator, "return") {
                             Ok(method) => method,
                             Err(error) => return Self::abrupt(error),
                         };
@@ -17907,7 +18310,7 @@ impl VmDelegate {
                         return Self::type_error(i, "iterator 'return' must return an object");
                     }
                     if self.from_sync {
-                        let value = match i.get_member(&result, "value") {
+                        let value = match i.get_member_key(&result, "value") {
                             Ok(value) => value,
                             Err(error) => return Self::abrupt(error),
                         };
@@ -17948,7 +18351,7 @@ impl VmDelegate {
         if !matches!(result, Value::Obj(_)) {
             return Self::type_error(i, "iterator result is not an object");
         }
-        let done = match i.get_member(&result, "done") {
+        let done = match i.get_member_key(&result, "done") {
             Ok(done) => i.to_boolean(&done),
             Err(error) => return Self::abrupt(error),
         };
@@ -17960,7 +18363,7 @@ impl VmDelegate {
             i.yield_raw_result = true;
             return DelegateAction::Suspend(Suspend::Yield(result));
         }
-        let value = match i.get_member(&result, "value") {
+        let value = match i.get_member_key(&result, "value") {
             Ok(value) => value,
             Err(error) => return Self::abrupt(error),
         };
@@ -18263,7 +18666,7 @@ impl VmCoro {
         let references = (0..chunk.n_refs)
             .map(|_| crate::eval::PreparedReferenceSlot::default())
             .collect();
-        let mut slots: Vec<PackedValue> = (0..chunk.n_slots)
+        let slots: Vec<PackedValue> = (0..chunk.n_slots)
             .map(|_| PackedValue::pack(Value::Undefined))
             .collect();
         for (k, a) in params.iter().take(chunk.n_params).enumerate() {
@@ -18542,7 +18945,7 @@ impl VmCoro {
                 &mut self.env,
                 &self.cap_env,
                 &mut self.references,
-                &mut self.slots,
+                &self.slots,
                 &mut self.stack,
                 &mut self.pc,
                 &self.this_val,
@@ -19153,6 +19556,11 @@ fn bin_cmp<S: StoredValue>(
 impl Chunk {
     pub(crate) fn jit_ops(&self) -> &[Op] {
         &self.ops
+    }
+    /// A borrowed sloppy ordinary activation may expose slot-backed formals through its
+    /// parked legacy arguments map. Fresh compiled entries keep their established contract.
+    pub(crate) fn jit_borrowed_parameter_aliases(&self) -> bool {
+        self.borrowed_parameter_aliases
     }
     pub(crate) fn jit_detailed_feedback_enabled(&self) -> bool {
         self.feedback.detailed_enabled()
@@ -20582,7 +20990,7 @@ unsafe fn jit_continuation_operation(
             &mut *state.env,
             &*state.cap_env,
             &mut *state.references,
-            std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots),
+            std::slice::from_raw_parts(ctx.slots, ctx.n_slots),
             stack,
             &mut next,
             &ctx.this_val,
@@ -20922,7 +21330,7 @@ unsafe fn jit_vm_operation(
         &mut activation.env,
         &activation.cap_env,
         &mut activation.references,
-        std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots),
+        std::slice::from_raw_parts(ctx.slots, ctx.n_slots),
         &mut activation.stack,
         &mut next,
         &ctx.this_val,
@@ -21034,6 +21442,7 @@ pub(crate) unsafe extern "C" fn jit_exec(
     mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let chunk = &*(*ctx).chunk;
+    let _inline_position = ImplicitCallPosition::enter((*ctx).interp, chunk, pc as usize);
     if matches!(
         chunk.ops[pc as usize],
         Op::PrivateIn(..)
@@ -21448,9 +21857,13 @@ unsafe fn jit_intrinsic_inner(
                         let Value::Str(key) = &(*base.add(3)).unpack() else {
                             unreachable!("hasOwn intrinsic key guard")
                         };
-                        crate::builtins::has_own_property_trapped(i, object, key.as_str())
-                            .map(Value::Bool)
-                            .map_err(Abrupt::Throw)
+                        crate::builtins::has_own_property_trapped(
+                            i,
+                            object,
+                            &crate::value::encode_string_key(key),
+                        )
+                        .map(Value::Bool)
+                        .map_err(Abrupt::Throw)
                     }
                     INTRINSIC_FUNCTION_CALL => {
                         // `target.call(thisArg, arg)`: transfer thisArg + the single forwarded argument
@@ -21986,6 +22399,14 @@ unsafe fn jit_call_hit_native(
         INTRINSIC_NUMERIC_ONLY | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
             (0..argc).all(|k| (*sp.sub(argc).add(k)).number().is_some())
         }
+        INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
+            let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
+                2
+            } else {
+                1
+            };
+            (0..argc.min(checked)).all(|k| (*sp.sub(argc).add(k)).is_primitive())
+        }
         _ => false,
     };
     if intrinsic == INTRINSIC_REFLECT_APPLY && argc == 3 {
@@ -22133,6 +22554,7 @@ pub(crate) unsafe extern "C" fn jit_object_literal(
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
+    let _inline_position = ImplicitCallPosition::enter(ctx.interp, &*ctx.chunk, pc as usize);
     match jit_object_literal_inner(ctx, pc, &mut sp) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
@@ -22210,7 +22632,7 @@ unsafe fn jit_object_literal_inner(
         Op::ObjectMethod(function, kind) | Op::ObjectMethodName(function, kind, _) => {
             let key = match chunk.ops[pc as usize] {
                 Op::ObjectMethodName(_, _, name) => {
-                    crate::value::PropertyKey::string(chunk.names[name as usize].to_string())
+                    crate::value::PropertyKey::stored(chunk.names[name as usize].to_string())
                 }
                 _ => {
                     let key = pop!();
@@ -22339,7 +22761,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
 /// the closed Array prefix applies.
 fn open_array_binding<S: StoredValue>(
     i: &mut Interp,
-    slots: &mut [S],
+    slots: &[S],
     source: Value,
     iterator: u16,
     next: u16,
@@ -22367,6 +22789,7 @@ pub(crate) unsafe extern "C" fn jit_iteration(
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
     let chunk = unsafe { &*ctx.chunk };
+    let _inline_position = unsafe { ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize) };
     let i = unsafe { &mut *ctx.interp };
     let push = |sp: &mut *mut PackedValue, value: Value| unsafe {
         sp.write(PackedValue::pack(value));
@@ -22387,7 +22810,7 @@ pub(crate) unsafe extern "C" fn jit_iteration(
             }
         }
         Op::TryArrayBinding(iterator, next, count) => {
-            let slots = unsafe { std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots) };
+            let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
             let source = unsafe { &*sp.sub(1) }.clone_value();
             open_array_binding(i, slots, source, iterator, next, count).map(|matched| {
                 #[cfg(test)]
@@ -22482,6 +22905,7 @@ pub(crate) unsafe extern "C" fn jit_set_elem(
     jit_opstat(ctx, pc);
     let i = unsafe { &mut *ctx.interp };
     let chunk = unsafe { &*ctx.chunk };
+    let _inline_position = unsafe { ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize) };
     let result: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetElem | Op::SetElemDrop => {
             let keep = matches!(chunk.ops[pc as usize], Op::SetElem);
@@ -22533,6 +22957,7 @@ pub(crate) unsafe extern "C" fn jit_abstract_operation(
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
+    let _inline_position = ImplicitCallPosition::enter(ctx.interp, &*ctx.chunk, pc as usize);
     let chunk = &*ctx.chunk;
     let Op::Abstract(operation) = chunk.ops[pc as usize] else {
         unreachable!("jit_abstract_operation emitted only for Op::Abstract");
@@ -22699,6 +23124,7 @@ pub(crate) unsafe extern "C" fn jit_instanceof(
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
     let chunk = unsafe { &*ctx.chunk };
+    let _inline_position = unsafe { ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize) };
     let Op::InstanceOf(cache) = chunk.ops[pc as usize] else {
         unreachable!("jit_instanceof emitted only for InstanceOf");
     };
@@ -22797,6 +23223,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    let _inline_position = ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize);
     let r: Result<(), Abrupt> = (|| match chunk.ops[pc as usize] {
         Op::SetProp(n, c) => {
             sp = sp.sub(1);
@@ -22929,13 +23356,13 @@ fn get_computed_element(
                 return result;
             }
         }
-        return i.get_member(obj, text.as_str());
+        return i.get_member_key(obj, text.as_str());
     }
     if let Value::Sym(symbol) = key {
-        return i.get_member(obj, crate::value::KeyText::symbol(symbol.id).as_str());
+        return i.get_member_key(obj, crate::value::KeyText::symbol(symbol.id).as_str());
     }
     let key = i.to_property_key(key)?;
-    i.get_member(obj, &key)
+    i.get_member_key(obj, &key)
 }
 
 /// PutValue for a computed property Reference. The caller has evaluated the RHS;
@@ -22972,13 +23399,13 @@ fn set_computed_element(
     // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
     // them without building an owned key string.
     if let Value::Str(key) = key {
-        return i.set_member(object, key.as_str(), value);
+        return i.set_member_key(object, &crate::value::encode_string_key(key), value);
     }
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
-        return i.set_member(object, text.as_str(), value);
+        return i.set_member_key(object, text.as_str(), value);
     }
     let key = i.to_property_key(key)?;
-    i.set_member(object, &key, value)
+    i.set_member_key(object, &key, value)
 }
 
 /// Compact computed-read boundary for the three receiver/operand shapes. Move consumed
@@ -22997,6 +23424,7 @@ pub(crate) unsafe extern "C" fn jit_get_element(
     let ctx = unsafe { &mut *ctx };
     unsafe { jit_opstat(ctx, pc) };
     let chunk = unsafe { &*ctx.chunk };
+    let _inline_position = unsafe { ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize) };
     #[cfg(test)]
     TEST_JIT_GET_ELEM_HELPERS.with(|count| {
         let mut counts = count.get();
@@ -23090,6 +23518,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    let _inline_position = ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize);
     let r: Result<(), Abrupt> = (|| {
         match chunk.ops[pc as usize] {
             Op::GetProp(n, c) => {
@@ -23396,6 +23825,9 @@ unsafe fn jit_call_inner(
                                         }
                                         _ if crate::builtins::math_intrinsic(nf) != 0 => {
                                             crate::builtins::math_intrinsic(nf)
+                                        }
+                                        _ if crate::builtins::dataview_intrinsic(nf) != 0 => {
+                                            crate::builtins::dataview_intrinsic(nf)
                                         }
                                         _ if crate::builtins::is_operand_only_native(nf) => {
                                             INTRINSIC_OPERAND_ONLY
@@ -23802,6 +24234,38 @@ impl crate::jit::JitCtx {
     }
 }
 
+/// The logical spliced context while a checked operation can enter author code implicitly.
+/// The callee consumes `call_site` into its FnFrame as usual; after its return the position is
+/// restored here, including when the operation throws or a VM driver returns a continuation.
+/// Native fast paths run no author code and need no position publication. Checked helpers read
+/// an inline-only PC table in O(1); they never search the compact source-position runs here.
+struct ImplicitCallPosition {
+    interpreter: *mut Interp,
+    saved: u32,
+}
+
+impl ImplicitCallPosition {
+    /// # Safety
+    /// The interpreter must remain live until the returned guard is dropped. Every caller
+    /// keeps it within one synchronous checked operation or one VM loop iteration.
+    #[inline]
+    unsafe fn enter(interpreter: *mut Interp, chunk: &Chunk, pc: usize) -> Option<Self> {
+        let position = chunk.inline_sites.implicit_position(pc);
+        if position == NO_POSITION {
+            return None;
+        }
+        let saved = std::mem::replace(&mut (*interpreter).call_site, position);
+        Some(Self { interpreter, saved })
+    }
+}
+
+impl Drop for ImplicitCallPosition {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { (*self.interpreter).call_site = self.saved };
+    }
+}
+
 /// Run `call`, the explicit call (or `new`) at source `position` of the running context: the
 /// callee's frame records it as its caller's location (see `crate::stack_trace`).
 #[inline(always)]
@@ -23936,7 +24400,7 @@ unsafe fn jit_exec_inner(
     });
     let env: &Env = &env_h;
     let cap_env = jit_cap_env(ctx, env);
-    let slots = std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots);
+    let slots = std::slice::from_raw_parts(ctx.slots, ctx.n_slots);
     macro_rules! pop {
         () => {{
             *sp = sp.sub(1);
@@ -23984,7 +24448,7 @@ unsafe fn jit_exec_inner(
         }
         Op::StoreLocal(s) => {
             *sp = sp.sub(1);
-            slots[s as usize] = sp.read();
+            slots[s as usize].replace_stored(sp.read());
         }
         Op::UpdateLocal(s, kind) => {
             let idx = s as usize;
@@ -24265,7 +24729,10 @@ unsafe fn jit_exec_inner(
             if matches!(base, Value::Undefined | Value::Null) {
                 return Err(i.throw(
                     "TypeError",
-                    format!("cannot delete property '{prop}' of null or undefined"),
+                    format!(
+                        "cannot delete property '{}' of null or undefined",
+                        crate::value::decode_string_key(prop)
+                    ),
                 ));
             }
             let v = i.delete_prop_with(base, prop, strict)?;
@@ -24278,7 +24745,10 @@ unsafe fn jit_exec_inner(
             if matches!(base, Value::Undefined | Value::Null) {
                 return Err(i.throw(
                     "TypeError",
-                    format!("cannot delete property '{key}' of null or undefined"),
+                    format!(
+                        "cannot delete property '{}' of null or undefined",
+                        crate::value::decode_string_key(&key)
+                    ),
                 ));
             }
             let v = i.delete_prop_with(base, &key, strict)?;
@@ -24471,9 +24941,9 @@ unsafe fn jit_exec_inner(
                 return Err(i.throw("TypeError", "cannot read property of null or undefined"));
             }
             let k = i.to_property_key(&key)?;
-            let old = i.get_member(&obj, &k)?;
+            let old = i.get_member_key(&obj, &k)?;
             if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.set_member(&obj, &k, v)
+                i.set_member_key(&obj, &k, v)
             })? {
                 push!(v);
             }

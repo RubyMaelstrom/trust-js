@@ -61,7 +61,7 @@ fn object_literal_builders_have_real_native_entries() {
         let global = Value::Obj(engine.interp.global.clone());
         let function = engine
             .interp
-            .get_member(&global, name)
+            .get_member_key(&global, name)
             .unwrap_or_else(|_| panic!("{name}"));
         // The hot-call counter is updated at compiled call sites, not direct Rust calls.
         let calls = format!("(function() {{ for (var n=0;n<16;n++) {name}(n); return true; }})()");

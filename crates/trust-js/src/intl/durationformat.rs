@@ -9,7 +9,7 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 /// (plural, singular, index): years..nanoseconds.
 const UNITS: &[(&str, &str)] = &[
@@ -65,10 +65,10 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.DurationFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}df", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}df_locale", Value::lstr(resolved_locale));
-    set_builtin(&obj, "#\u{0}df_style", Value::lstr(base_style.clone()));
-    set_builtin(&obj, "#\u{0}df_nu", Value::lstr(numbering));
+    set_internal_slot(&obj, "#\u{0}df", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}df_locale", Value::lstr(resolved_locale));
+    set_internal_slot(&obj, "#\u{0}df_style", Value::lstr(base_style.clone()));
+    set_internal_slot(&obj, "#\u{0}df_nu", Value::lstr(numbering));
 
     // GetDurationUnitOptions for each unit, threading `prev_style`.
     let mut prev_style: Option<String> = None;
@@ -150,12 +150,12 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
             }
         }
 
-        set_builtin(
+        set_internal_slot(
             &obj,
             &format!("#\u{0}df_u_{plural}"),
             Value::lstr(style.clone()),
         );
-        set_builtin(&obj, &format!("#\u{0}df_d_{plural}"), Value::lstr(display));
+        set_internal_slot(&obj, &format!("#\u{0}df_d_{plural}"), Value::lstr(display));
         // prevStyle is updated only for hours..microseconds (nanoseconds and the calendar units do
         // not propagate).
         if matches!(
@@ -168,7 +168,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
 
     // fractionalDigits (0..9).
     let frac = {
-        let v = ab(i.get_member(&options, "fractionalDigits"))?;
+        let v = ab(i.get_member_key(&options, "fractionalDigits"))?;
         if matches!(v, Value::Undefined) {
             None
         } else {
@@ -180,7 +180,7 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         }
     };
     if let Some(f) = frac {
-        set_builtin(&obj, "#\u{0}df_frac", Value::Num(f as f64));
+        set_internal_slot(&obj, "#\u{0}df_frac", Value::Num(f as f64));
     }
     Ok(Value::Obj(obj))
 }
@@ -305,7 +305,7 @@ fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
     let mut vals = [0f64; 10];
     let mut any_present = false;
     for (k, (plural, _s)) in UNITS.iter().enumerate() {
-        let fv = ab(i.get_member(v, plural))?;
+        let fv = ab(i.get_member_key(v, plural))?;
         if matches!(fv, Value::Undefined) {
             continue;
         }
@@ -356,7 +356,7 @@ fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
 }
 
 fn get_str(o: &Gc, k: &str) -> String {
-    match o.borrow().props.get(k).map(|p| p.value()) {
+    match o.borrow().internal_slots().get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     }
@@ -383,7 +383,7 @@ fn format_string(i: &mut Interp, this: &Value, dur: &Value) -> Result<String, Va
     set_data(&lf_opts, "style", Value::lstr(list_style));
     let lf = new_service(i, "ListFormat", &locale, lf_opts)?;
     let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
-    let fmt = ab(i.get_member(&lf, "format"))?;
+    let fmt = ab(i.get_member_key(&lf, "format"))?;
     let out = ab(i.call(fmt, lf, &[arr]))?;
     Ok(if let Value::Str(s) = out {
         s.to_string()
@@ -404,7 +404,12 @@ fn partition(
     let locale = get_str(&o, "#\u{0}df_locale");
     let base_style = get_str(&o, "#\u{0}df_style");
     let numbering = get_str(&o, "#\u{0}df_nu");
-    let frac_digits = match o.borrow().props.get("#\u{0}df_frac").map(|p| p.value()) {
+    let frac_digits = match o
+        .borrow()
+        .internal_slots()
+        .get("#\u{0}df_frac")
+        .map(|p| p.value())
+    {
         Some(Value::Num(n)) => Some(n as u32),
         _ => None,
     };
@@ -494,7 +499,7 @@ fn partition(
             }
 
             let nf = new_service(i, "NumberFormat", &locale, nf_opts)?;
-            let ftp = ab(i.get_member(&nf, "formatToParts"))?;
+            let ftp = ab(i.get_member_key(&nf, "formatToParts"))?;
             let nf_arg = match &exact_arg {
                 // A negative-zero fold still needs its sign for the display rules.
                 Some(sd) if !(value == 0.0 && value.is_sign_negative()) => Value::lstr(sd.clone()),
@@ -502,7 +507,7 @@ fn partition(
             };
             let parts_arr = ab(i.call(ftp, nf.clone(), &[nf_arg]))?;
             // Read the {type,value} objects into (type,value,unit=singular) parts.
-            let len = ab(i.get_member(&parts_arr, "length"))?;
+            let len = ab(i.get_member_key(&parts_arr, "length"))?;
             let len = if let Value::Num(n) = len {
                 n as usize
             } else {
@@ -510,12 +515,12 @@ fn partition(
             };
             let mut parts: Vec<DurPart> = Vec::with_capacity(len);
             for k in 0..len {
-                let el = ab(i.get_member(&parts_arr, &k.to_string()))?;
-                let ty = match ab(i.get_member(&el, "type"))? {
+                let el = ab(i.get_member_key(&parts_arr, &k.to_string()))?;
+                let ty = match ab(i.get_member_key(&el, "type"))? {
                     Value::Str(s) => s.to_string(),
                     _ => String::new(),
                 };
-                let va = match ab(i.get_member(&el, "value"))? {
+                let va = match ab(i.get_member_key(&el, "value"))? {
                     Value::Str(s) => s.to_string(),
                     _ => String::new(),
                 };
@@ -577,17 +582,17 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
     set_data(&lf_opts, "style", Value::lstr(list_style));
     let lf = new_service(i, "ListFormat", &locale, lf_opts)?;
     let arr = i.make_array(strings.into_iter().map(Value::lstr).collect());
-    let ftp = ab(i.get_member(&lf, "formatToParts"))?;
+    let ftp = ab(i.get_member_key(&lf, "formatToParts"))?;
     let list_parts = ab(i.call(ftp, lf, &[arr]))?;
-    let len = match ab(i.get_member(&list_parts, "length"))? {
+    let len = match ab(i.get_member_key(&list_parts, "length"))? {
         Value::Num(n) => n as usize,
         _ => 0,
     };
     let mut out: Vec<Value> = Vec::new();
     let mut giter = groups.drain(..);
     for k in 0..len {
-        let el = ab(i.get_member(&list_parts, &k.to_string()))?;
-        let ty = match ab(i.get_member(&el, "type"))? {
+        let el = ab(i.get_member_key(&list_parts, &k.to_string()))?;
+        let ty = match ab(i.get_member_key(&el, "type"))? {
             Value::Str(s) => s.to_string(),
             _ => String::new(),
         };
@@ -604,7 +609,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
                 }
             }
         } else {
-            let va = ab(i.get_member(&el, "value"))?;
+            let va = ab(i.get_member_key(&el, "value"))?;
             let ob = i.new_object();
             set_data(&ob, "type", Value::lstr(ty));
             set_data(&ob, "value", va);
@@ -666,7 +671,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = brand_slot(i, &this, "#\u{0}df")?;
     let get = |k: &str| {
         o.borrow()
-            .props
+            .internal_slots()
             .get(k)
             .map(|p| p.value())
             .unwrap_or(Value::Undefined)
@@ -683,7 +688,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
             get(&format!("#\u{0}df_d_{plural}")),
         );
     }
-    if o.borrow().props.contains("#\u{0}df_frac") {
+    if o.borrow().internal_slots().contains("#\u{0}df_frac") {
         set_data(&res, "fractionalDigits", get("#\u{0}df_frac"));
     }
     Ok(Value::Obj(res))

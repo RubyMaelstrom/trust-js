@@ -347,7 +347,7 @@ impl Interp {
                     // KeyedBindingInitialization order for a var-mode identifier target:
                     // ResolveBinding *before* GetV (observable through a `with` env's has trap).
                     let reference = self.prepare_binding_reference(&prop.value, env, mode)?;
-                    let mut v = self.get_member(&value, &key)?;
+                    let mut v = self.get_member_key(&value, &key)?;
                     if matches!(v, Value::Undefined) {
                         if let Some(d) = &prop.default {
                             v = self.eval(d, env)?;
@@ -535,13 +535,13 @@ impl Interp {
         let mut from_async = false;
         if is_async {
             if let Some(k) = crate::builtins::well_known_key(self, "asyncDispose") {
-                m = self.get_member(value, &k)?;
+                m = self.get_member_key(value, &k)?;
                 from_async = m.is_callable();
             }
         }
         if matches!(m, Value::Undefined | Value::Null) {
             if let Some(k) = crate::builtins::well_known_key(self, "dispose") {
-                m = self.get_member(value, &k)?;
+                m = self.get_member_key(value, &k)?;
             }
         }
         if !m.is_callable() {
@@ -1520,7 +1520,7 @@ impl Interp {
             // each value, closing the sync iterator when that await rejects.
             let akey = crate::builtins::async_iterator_key(self);
             let method = match &akey {
-                Some(k) => self.get_member(&rhs, k)?,
+                Some(k) => self.get_member_key(&rhs, k)?,
                 None => Value::Undefined,
             };
             // GetMethod: a non-callable, non-nullish @@asyncIterator is a TypeError.
@@ -1536,7 +1536,7 @@ impl Interp {
             } else {
                 (self.get_iterator(&rhs)?.0, true)
             };
-            let next = self.get_member(&iter, "next")?;
+            let next = self.get_member_key(&iter, "next")?;
             let iter_close = iter.clone();
             // A failure in the iteration step itself marks the iterator done — only abrupt
             // completions from the loop body (or an early break/return) close it afterwards.
@@ -1549,10 +1549,10 @@ impl Interp {
                 if !matches!(res, Value::Obj(_)) {
                     return Err(me.throw("TypeError", "iterator result is not an object"));
                 }
-                let done = me.get_member(&res, "done")?;
+                let done = me.get_member_key(&res, "done")?;
                 let done = me.to_boolean(&done);
                 let v = if from_sync {
-                    let raw = me.get_member(&res, "value")?;
+                    let raw = me.get_member_key(&res, "value")?;
                     // AsyncFromSyncIteratorContinuation: PromiseResolve(%Promise%, value) reads
                     // the value's constructor observably; an abrupt read rejects the wrapper
                     // promise, so the throw lands a tick later at the await. A rejection closes
@@ -1581,7 +1581,7 @@ impl Interp {
                 } else if done {
                     Value::Undefined
                 } else {
-                    me.get_member(&res, "value")?
+                    me.get_member_key(&res, "value")?
                 };
                 if done {
                     exhausted = true;
@@ -1681,7 +1681,13 @@ impl Interp {
                         continue;
                     }
                 }
-                break v;
+                // Keep ordinary candidate strings and decode only escaped leading-NUL keys.
+                break match v {
+                    Value::Str(key) if key.as_str().starts_with("\0\0") => {
+                        crate::value::string_key_value(key)
+                    }
+                    other => other,
+                };
             };
             let iter_env = new_scope(Some(env.clone()));
             me.bind_pattern(left, v, &iter_env, mode)?;
@@ -1744,7 +1750,7 @@ impl Interp {
                     // GetMethod(iterator, "throw"): a non-callable non-nullish value throws; an
                     // absent method is a protocol violation — close the inner iterator (close
                     // errors propagate) and then throw TypeError.
-                    let throw = self.get_member(&iterator, "throw")?;
+                    let throw = self.get_member_key(&iterator, "throw")?;
                     if matches!(throw, Value::Undefined | Value::Null) {
                         self.iterator_close_normal(&iterator)?;
                         return Err(
@@ -1757,7 +1763,7 @@ impl Interp {
                     (self.call(throw, iterator.clone(), &[e])?, false)
                 }
                 Resume::Return(v) => {
-                    let ret = self.get_member(&iterator, "return")?;
+                    let ret = self.get_member_key(&iterator, "return")?;
                     if matches!(ret, Value::Undefined | Value::Null) {
                         return Err(Abrupt::Return(v));
                     }
@@ -1773,9 +1779,9 @@ impl Interp {
             if !matches!(result, Value::Obj(_)) {
                 return Err(self.throw("TypeError", "iterator result is not an object"));
             }
-            let done = self.get_member(&result, "done")?;
+            let done = self.get_member_key(&result, "done")?;
             if self.to_boolean(&done) {
-                let v = self.get_member(&result, "value")?;
+                let v = self.get_member_key(&result, "value")?;
                 return if returning {
                     Err(Abrupt::Return(v))
                 } else {
@@ -1792,7 +1798,7 @@ impl Interp {
     /// AsyncIteratorClose for the inlined `for await` loop: fetch `return`, call it with no
     /// argument, and (per the async-from-sync wrapper) validate/unwrap its result.
     fn async_for_await_close(&mut self, iter: &Value, from_sync: bool) -> Result<(), Abrupt> {
-        let ret = self.get_member(iter, "return")?;
+        let ret = self.get_member_key(iter, "return")?;
         if matches!(ret, Value::Undefined | Value::Null) {
             return Ok(());
         }
@@ -1805,7 +1811,7 @@ impl Interp {
             return Err(self.throw("TypeError", "iterator result is not an object"));
         }
         if from_sync {
-            let raw = self.get_member(&r, "value")?;
+            let raw = self.get_member_key(&r, "value")?;
             self.await_value(raw)?;
         }
         Ok(())
@@ -1854,7 +1860,7 @@ impl Interp {
         // awaited (CreateAsyncFromSyncIterator).
         let akey = crate::builtins::async_iterator_key(self);
         let amethod = match &akey {
-            Some(k) => self.get_member(value, k)?,
+            Some(k) => self.get_member_key(value, k)?,
             None => Value::Undefined,
         };
         // GetMethod: a non-callable, non-nullish @@asyncIterator is a TypeError (no sync fallback).
@@ -1866,7 +1872,7 @@ impl Interp {
             if !matches!(it, Value::Obj(_)) {
                 return Err(self.throw("TypeError", "@@asyncIterator did not return an object"));
             }
-            let n = self.get_member(&it, "next")?;
+            let n = self.get_member_key(&it, "next")?;
             (it, n, false)
         } else {
             let (it, n) = self.get_iterator(value)?;
@@ -1880,9 +1886,9 @@ impl Interp {
                 if !matches!(r, Value::Obj(_)) {
                     return Err(self.throw("TypeError", "iterator result is not an object"));
                 }
-                let done = self.get_member(&r, "done")?;
+                let done = self.get_member_key(&r, "done")?;
                 let done = self.to_boolean(&done);
-                let mut v = self.get_member(&r, "value")?;
+                let mut v = self.get_member_key(&r, "value")?;
                 if from_sync {
                     // AsyncFromSyncIteratorContinuation with closeOnRejection: an abrupt unwrap of
                     // a live (not-done) step closes the sync iterator before rethrowing.
@@ -1911,10 +1917,10 @@ impl Interp {
                     received = self.async_gen_yield_resume(inner)?;
                 }
                 Resume::Throw(e) => {
-                    let throw = self.get_member(&iterator, "throw")?;
+                    let throw = self.get_member_key(&iterator, "throw")?;
                     if !throw.is_callable() {
                         // No `throw` method: close the iterator (awaiting the close) then TypeError.
-                        let ret = self.get_member(&iterator, "return")?;
+                        let ret = self.get_member_key(&iterator, "return")?;
                         if ret.is_callable() {
                             if let Ok(r) = self.call(ret, iterator.clone(), &[]) {
                                 let _ = self.coro_await(r);
@@ -1932,7 +1938,7 @@ impl Interp {
                     received = self.async_gen_yield_resume(inner)?;
                 }
                 Resume::Return(v) => {
-                    let ret = self.get_member(&iterator, "return")?;
+                    let ret = self.get_member_key(&iterator, "return")?;
                     if !ret.is_callable() {
                         return Err(Abrupt::Return(self.coro_await(v)?));
                     }
@@ -1966,7 +1972,7 @@ impl Interp {
             let Some(key) = crate::builtins::well_known_key(self, "iterator") else {
                 return Err(self.throw("TypeError", "no iterator symbol"));
             };
-            let itfn = self.get_member(v, &key)?;
+            let itfn = self.get_member_key(v, &key)?;
             if !itfn.is_callable() {
                 return Err(self.throw("TypeError", "value is not iterable"));
             }
@@ -1977,7 +1983,7 @@ impl Interp {
             }
             // GetIterator only *reads* `next`; it is validated as callable when actually called
             // (IteratorNext), so a missing/non-callable `next` doesn't fail at open time.
-            let next = self.get_member(&iter, "next")?;
+            let next = self.get_member_key(&iter, "next")?;
             Ok((iter, next))
         })();
         crate::jit::perf_iterator_get_end(perf_started, result.is_ok());
@@ -2007,11 +2013,11 @@ impl Interp {
         if !matches!(result, Value::Obj(_)) {
             return Err(self.throw("TypeError", "iterator result is not an object"));
         }
-        let done = self.get_member(&result, "done")?;
+        let done = self.get_member_key(&result, "done")?;
         if self.to_boolean(&done) {
             Ok(None)
         } else {
-            Ok(Some(self.get_member(&result, "value")?))
+            Ok(Some(self.get_member_key(&result, "value")?))
         }
     }
     /// IteratorClose: call `return()` if present (swallowing its result/most errors).
@@ -2020,7 +2026,7 @@ impl Interp {
             return;
         }
         let perf_started = crate::jit::perf_stage_start();
-        if let Ok(ret) = self.get_member(iter, "return") {
+        if let Ok(ret) = self.get_member_key(iter, "return") {
             if ret.is_callable() {
                 let _ = self.call(ret, iter.clone(), &[]);
             }
@@ -2036,7 +2042,7 @@ impl Interp {
         }
         let perf_started = crate::jit::perf_stage_start();
         let result: Result<(), Abrupt> = (|| {
-            let ret = self.get_member(iter, "return")?;
+            let ret = self.get_member_key(iter, "return")?;
             if !matches!(ret, Value::Undefined | Value::Null) {
                 if !ret.is_callable() {
                     return Err(self.throw("TypeError", "iterator 'return' is not callable"));
@@ -2100,7 +2106,7 @@ impl Interp {
                     let len = self.checked_array_len(o)?;
                     let mut out = Vec::with_capacity(len.min(1024));
                     for i in 0..len {
-                        out.push(self.get_member(v, &i.to_string())?);
+                        out.push(self.get_member_key(v, &i.to_string())?);
                     }
                     Ok(out)
                 })();
@@ -2111,7 +2117,7 @@ impl Interp {
         }
         // General iterator protocol.
         if let Some(key) = crate::builtins::well_known_key(self, "iterator") {
-            let itfn = self.get_member(v, &key)?;
+            let itfn = self.get_member_key(v, &key)?;
             if itfn.is_callable() {
                 return self.iterate_with(v, itfn);
             }
@@ -2130,7 +2136,7 @@ impl Interp {
             if !matches!(iter, Value::Obj(_)) {
                 return Err(self.throw("TypeError", "@@iterator returned a non-object"));
             }
-            let next = self.get_member(&iter, "next")?;
+            let next = self.get_member_key(&iter, "next")?;
             if !next.is_callable() {
                 // GetIteratorDirect stores a non-callable next method in the record and the
                 // subsequent IteratorStep call closes that record on its abrupt completion.
@@ -2272,8 +2278,9 @@ impl Interp {
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
                     if let Value::Str(ks) = k {
-                        if seen.insert(ks.to_string()) {
-                            out.push(ks.to_string());
+                        let key = crate::value::encode_owned_string_key(ks.to_string());
+                        if seen.insert(key.clone()) {
+                            out.push(key);
                         }
                     }
                 }
@@ -2291,7 +2298,7 @@ impl Interp {
                 let keys =
                     crate::builtins::ordinary_own_keys_ordered(self, &o).map_err(Abrupt::Throw)?;
                 for key in keys {
-                    if Self::is_sym_key(&key) || Self::is_private_key(&key) {
+                    if Self::is_sym_key(&key) {
                         continue;
                     }
                     let enumerable = self
@@ -2318,7 +2325,7 @@ impl Interp {
                 .props
                 .ordered_keys()
                 .into_iter()
-                .filter(|key| !Interp::is_sym_key(key) && !Interp::is_private_key(key))
+                .filter(|key| !Interp::is_sym_key(key))
                 .map(|key| key.to_string())
                 .collect();
             if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(&o) as usize)).copied() {
@@ -2508,9 +2515,9 @@ impl Interp {
             return Ok(false);
         }
         if let Some(k) = crate::builtins::well_known_key(self, "unscopables") {
-            let uns = self.get_member(obj, &k)?;
+            let uns = self.get_member_key(obj, &k)?;
             if matches!(uns, Value::Obj(_)) {
-                let blocked = self.get_member(&uns, name)?;
+                let blocked = self.get_member_key(&uns, name)?;
                 if self.to_boolean(&blocked) {
                     return Ok(false);
                 }
@@ -2590,7 +2597,7 @@ impl Interp {
                         }
                         return Ok((Value::Undefined, Some(obj)));
                     }
-                    return Ok((self.get_member(&obj, name)?, Some(obj)));
+                    return Ok((self.get_member_key(&obj, name)?, Some(obj)));
                 }
                 // `with_has_binding` said no — continue up the chain. Re-borrow to read `parent`.
                 let b = unsafe { (*cur).borrow() };
@@ -2623,7 +2630,7 @@ impl Interp {
         // full trap-aware [[HasProperty]]: the global's prototype may be (or contain) a proxy.
         let g = Value::Obj(self.global.clone());
         if self.js_has_property(&g, name)? {
-            return Ok((self.get_member(&g, name)?, None));
+            return Ok((self.get_member_key(&g, name)?, None));
         }
         if ALLOW_UNRESOLVED {
             Ok((Value::Undefined, None))
@@ -2710,7 +2717,7 @@ impl Interp {
         if !matches!(o, Value::Obj(_)) {
             return Err(self.throw("TypeError", "import options must be an object"));
         }
-        let with = self.get_member(o, "with")?;
+        let with = self.get_member_key(o, "with")?;
         if matches!(with, Value::Undefined) {
             return Ok(None);
         }
@@ -2733,11 +2740,11 @@ impl Interp {
                 if matches!(desc, Value::Undefined) {
                     continue;
                 }
-                let e = self.get_member(&desc, "enumerable")?;
+                let e = self.get_member_key(&desc, "enumerable")?;
                 if !self.to_boolean(&e) {
                     continue;
                 }
-                let v = self.get_member(&with, &pk)?;
+                let v = self.get_member_key(&with, &pk)?;
                 let Value::Str(sv) = v else {
                     return Err(self.throw("TypeError", "import attribute values must be strings"));
                 };
@@ -2751,7 +2758,7 @@ impl Interp {
         let keys =
             crate::builtins::ordinary_own_keys_ordered(self, &object).map_err(Abrupt::Throw)?;
         for k in keys {
-            if Self::is_sym_key(&k) || Self::is_private_key(&k) {
+            if Self::is_sym_key(&k) {
                 continue;
             }
             let enumerable = self
@@ -2766,7 +2773,7 @@ impl Interp {
             if !enumerable {
                 continue;
             }
-            let v = self.get_member(&with, &k)?;
+            let v = self.get_member_key(&with, &k)?;
             let Value::Str(sv) = v else {
                 return Err(self.throw("TypeError", "import attribute values must be strings"));
             };
@@ -2838,9 +2845,9 @@ impl Interp {
 
     /// PrivateGet: read a private field/method after a brand check. An object that was not
     /// constructed with this private name in scope (`#x` absent) is a TypeError, not `undefined`.
-    fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
+    pub(crate) fn get_private_member(&mut self, base: &Value, name: &str) -> Completion {
         let prop = match base {
-            Value::Obj(o) => o.borrow().props.get(name).cloned(),
+            Value::Obj(o) => o.borrow().internal_slots().get(name).cloned(),
             _ => None,
         };
         match prop {
@@ -2868,10 +2875,15 @@ impl Interp {
     /// PrivateSet: write a private field (or invoke a private setter) after a brand check. A
     /// private *method* (non-writable) or a getter-only private accessor is a TypeError — never a
     /// silent sloppy-mode no-op.
-    fn set_private_member(&mut self, base: &Value, name: &str, value: Value) -> Result<(), Abrupt> {
+    pub(crate) fn set_private_member(
+        &mut self,
+        base: &Value,
+        name: &str,
+        value: Value,
+    ) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
         let (o, prop) = match base {
-            Value::Obj(o) => (o.clone(), o.borrow().props.get(name).cloned()),
+            Value::Obj(o) => (o.clone(), o.borrow().internal_slots().get(name).cloned()),
             _ => {
                 return Err(self.throw(
                     "TypeError",
@@ -2897,7 +2909,7 @@ impl Interp {
                         format!("private method {shown} is not writable"),
                     ));
                 }
-                if let Some(p) = o.borrow_mut().props.get_mut(name) {
+                if let Some(p) = o.borrow_mut().internal_slots_mut().get_mut(name) {
                     p.set_value(value);
                 }
                 Ok(())
@@ -2965,7 +2977,7 @@ impl Interp {
                     if !self.js_has_property(obj, name)? && self.strict {
                         return Err(self.throw("ReferenceError", format!("{name} is not defined")));
                     }
-                    return self.set_member(obj, name, value);
+                    return self.set_member_key(obj, name, value);
                 }
             }
             cur = parent;
@@ -2973,20 +2985,20 @@ impl Interp {
         // A declared global `var`/`function` lives as a property of the global object (the check
         // is the trap-aware [[HasProperty]] — the global's proto chain may contain a proxy).
         if self.js_has_property(&Value::Obj(self.global.clone()), name)? {
-            return self.set_member(&Value::Obj(self.global.clone()), name, value);
+            return self.set_member_key(&Value::Obj(self.global.clone()), name, value);
         }
         // Truly undeclared: strict → ReferenceError; sloppy → create a global property.
         if self.strict {
             return Err(self.throw("ReferenceError", format!("{name} is not defined")));
         }
         let g = Value::Obj(self.global.clone());
-        self.set_member(&g, name, value)
+        self.set_member_key(&g, name, value)
     }
 
     /// CreateListFromArrayLike: read `obj.length` then elements `0..length` into a Vec (used by the
     /// Proxy `ownKeys` trap, which returns an array-like, not an iterable).
     pub(crate) fn create_list_from_arraylike(&mut self, obj: &Value) -> Result<Vec<Value>, Abrupt> {
-        let len_v = self.get_member(obj, "length")?;
+        let len_v = self.get_member_key(obj, "length")?;
         let len = self.to_number(&len_v)?;
         let len = if len.is_nan() || len < 0.0 {
             0
@@ -2999,7 +3011,7 @@ impl Interp {
         }
         let mut out = Vec::with_capacity(len.min(1024));
         for k in 0..len {
-            out.push(self.get_member(obj, &k.to_string())?);
+            out.push(self.get_member_key(obj, &k.to_string())?);
         }
         Ok(out)
     }
@@ -3030,7 +3042,9 @@ impl Interp {
             }
         }
         if let Value::Str(name) = key {
-            if let Some(present) = Self::ordinary_chain_has_property(target, name) {
+            if let Some(present) =
+                Self::ordinary_chain_has_property(target, &crate::value::encode_string_key(name))
+            {
                 return Ok(present);
             }
         }
@@ -3153,7 +3167,7 @@ impl Interp {
             // The trap receives the original property key — a symbol stays a symbol.
             let key_val = self
                 .sym_from_key(key)
-                .unwrap_or_else(|| Value::lstr(key.to_string()));
+                .unwrap_or_else(|| crate::value::string_key_value(key));
             let res = self.proxy_call_trap(
                 crate::interpreter::PROXY_TRAP_HAS,
                 &trap,
@@ -3485,7 +3499,7 @@ impl Interp {
                 .get_private_member(&base, &k)
                 .map_err(|error| self.placed_error(error, position));
         }
-        self.get_member(&base, prop)
+        self.get_member_key(&base, prop)
             .map_err(|error| self.placed_error(error, position))
     }
 
@@ -3540,7 +3554,7 @@ impl Interp {
                 let k = self.resolve_private(prop, env);
                 self.get_private_member(&base, &k)
             }
-            Expr::Member { prop, .. } => self.get_member(&base, prop),
+            Expr::Member { prop, .. } => self.get_member_key(&base, prop),
             Expr::Index { index, .. } => {
                 let idx = self.eval(index, env)?;
                 // GetValue: ToObject(base) throws before ToPropertyKey coerces the key.
@@ -3556,7 +3570,7 @@ impl Interp {
                     }
                 }
                 let key = self.to_property_key(&idx)?;
-                self.get_member(&base, &key)
+                self.get_member_key(&base, &key)
             }
             _ => unreachable!("member chain links are property reads"),
         }
@@ -3603,11 +3617,11 @@ impl Interp {
                 let k = self.resolve_private(prop, env);
                 (self.get_private_member(&below, &k)?, below)
             }
-            Expr::Member { prop, .. } => (self.get_member(&below, prop)?, below),
+            Expr::Member { prop, .. } => (self.get_member_key(&below, prop)?, below),
             Expr::Index { index, .. } => {
                 let idx = self.eval(index, env)?;
                 let key = self.ref_prop_key(&below, &mut RefKey::Raw(idx))?;
-                (self.get_member(&below, &key)?, below)
+                (self.get_member_key(&below, &key)?, below)
             }
             _ => (below, Value::Undefined),
         };
@@ -3690,7 +3704,7 @@ impl Interp {
         let key = self
             .to_property_key(&idx)
             .map_err(|error| self.placed_error(error, position))?;
-        self.get_member(&base, &key)
+        self.get_member_key(&base, &key)
             .map_err(|error| self.placed_error(error, position))
     }
 
@@ -3704,7 +3718,10 @@ impl Interp {
         if matches!(home, Value::Undefined | Value::Null) {
             return Err(self.throw(
                 "TypeError",
-                format!("cannot read property '{key}' of a null super base"),
+                format!(
+                    "cannot read property '{}' of a null super base",
+                    crate::value::decode_string_key(&key)
+                ),
             ));
         }
         crate::builtins::reflect_ordinary_get(self, &home, &key, &this).map_err(Abrupt::Throw)
@@ -3848,12 +3865,12 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         let key = self.private_key_vm(name, env, site);
         match value {
-            // Private fields, methods and accessors are all own properties.
+            // Private fields, methods and accessors are own internal state, never inherited.
             Value::Obj(object) => {
                 let object = object.borrow();
                 Ok(Value::Bool(match site {
-                    Some(site) => site.find(&object.props, &key).is_some(),
-                    None => object.props.contains(&key),
+                    Some(site) => site.find(object.internal_slots(), &key).is_some(),
+                    None => object.internal_slots().contains(&key),
                 }))
             }
             _ => Err(self.throw("TypeError", "the right-hand side of 'in' must be an object")),
@@ -3873,8 +3890,8 @@ impl Interp {
         if let (Some(site), Value::Obj(object)) = (site, value) {
             let object = object.borrow();
             if let Some(property) = site
-                .find(&object.props, &key)
-                .and_then(|slot| object.props.property_at(slot))
+                .find(object.internal_slots(), &key)
+                .and_then(|slot| object.internal_slots().property_at(slot))
             {
                 if !property.accessor() {
                     return Ok(property.value());
@@ -3897,8 +3914,8 @@ impl Interp {
         // and a missing element take the general path with its TypeErrors and setter call.
         if let (Some(site), Value::Obj(object)) = (site, base) {
             let mut object = object.borrow_mut();
-            if let Some(slot) = site.find(&object.props, &key) {
-                if let Some((_, property)) = object.props.entry_at_mut(slot) {
+            if let Some(slot) = site.find(object.internal_slots(), &key) {
+                if let Some((_, property)) = object.internal_slots_mut().entry_at_mut(slot) {
                     if !property.accessor() && property.writable() {
                         property.set_value(value);
                         return Ok(());
@@ -3978,7 +3995,7 @@ impl Interp {
                 _ => String::new(),
             }
         } else {
-            key.to_string()
+            crate::value::decode_string_key(key).to_string()
         }
     }
 
@@ -4593,7 +4610,7 @@ impl Interp {
                     let k = self.resolve_private(prop, env);
                     self.get_private_member(&base, &k)?
                 } else {
-                    self.get_member(&base, prop)?
+                    self.get_member_key(&base, prop)?
                 };
                 (f, base)
             }
@@ -4627,7 +4644,7 @@ impl Interp {
                 // just as it does for a non-call property read. Optional access already
                 // short-circuited above; the key expression still evaluates for ordinary null.
                 let key = self.ref_prop_key(&base, &mut RefKey::Raw(idx))?;
-                let f = self.get_member(&base, &key)?;
+                let f = self.get_member_key(&base, &key)?;
                 (f, base)
             }
             _ => {
@@ -4652,7 +4669,7 @@ impl Interp {
             Value::Obj(_) => {
                 // Await of a plain object goes through the promise resolution procedure: a
                 // thenable is adopted (its `then` called once), anything else settles as-is.
-                let then = self.get_member(&v, "then")?;
+                let then = self.get_member_key(&v, "then")?;
                 if then.is_callable() {
                     let p = self.new_promise();
                     let (res, rej) = self.make_resolver_pair(&p);
@@ -4667,7 +4684,7 @@ impl Interp {
         };
         // Await → PromiseResolve(%Promise%, v): the `constructor` read on a native promise is
         // observable, and its abrupt completion is the await's.
-        self.get_member(&v, "constructor")?;
+        self.get_member_key(&v, "constructor")?;
         self.drain_microtasks();
         match self.promises.get(&ptr) {
             Some(s) if s.status == 1 => Ok(s.value.clone()),
@@ -4788,7 +4805,7 @@ impl Interp {
         // Adopt a thenable's eventual state; a throwing `then` getter rejects. The `then` CALL
         // itself happens in a microtask (PromiseResolveThenableJob).
         if matches!(value, Value::Obj(_)) {
-            match self.get_member(&value, "then") {
+            match self.get_member_key(&value, "then") {
                 Ok(then) if then.is_callable() => {
                     // HostEnqueuePromiseJob(job, GetFunctionRealm(then)); embedder platform
                     // steps pass a null Realm instead (null job settings).
@@ -5413,7 +5430,7 @@ impl Interp {
     pub(crate) fn regexp_alloc_proto(&mut self) -> Result<Option<crate::value::Gc>, Abrupt> {
         Ok(if self.constructing {
             match &self.new_target.clone() {
-                nt @ Value::Obj(_) => match self.get_member(nt, "prototype")? {
+                nt @ Value::Obj(_) => match self.get_member_key(nt, "prototype")? {
                     Value::Obj(p) => Some(p),
                     _ => crate::builtins::regexp_realm_proto(self, nt)
                         .map_err(Abrupt::Throw)?
@@ -6035,7 +6052,7 @@ impl Interp {
                     let key = self.resolve_private(prop, env);
                     self.get_private_member(&this_value, &key)?
                 } else {
-                    self.get_member(&this_value, prop)?
+                    self.get_member_key(&this_value, prop)?
                 };
                 Ok(PreparedDecoratorValue {
                     callback,
@@ -6062,7 +6079,7 @@ impl Interp {
             None => (Some(self.object_proto.clone()), None),
             Some(Value::Null) => (None, None),
             Some(v @ Value::Obj(pc)) if self.value_is_constructor(v) => {
-                let pp = self.get_member(v, "prototype")?;
+                let pp = self.get_member_key(v, "prototype")?;
                 let pp = match pp {
                     Value::Obj(o) => Some(o),
                     Value::Null => None,
@@ -6250,7 +6267,7 @@ impl Interp {
             // evaluates to a "#..." string is an ordinary property name.
             let is_private = matches!(&m.key, PropKey::Ident(n) if n.starts_with('#'));
             let key = if is_private {
-                crate::value::PropertyKey::string(self.resolve_private(&key, &class_env))
+                crate::value::PropertyKey::private(self.resolve_private(&key, &class_env))
             } else {
                 key
             };
@@ -6268,8 +6285,13 @@ impl Interp {
                     self.accessor_seq += 1;
                     let backing: Rc<str> =
                         Rc::from(format!("#\u{0}acc{}", self.accessor_seq).as_str());
-                    let mut getter = self.make_accessor_fn(&key, &backing, true);
-                    let mut setter = self.make_accessor_fn(&key, &backing, false);
+                    let display = self.fn_name_for_key(if key.is_private() {
+                        private_display(&key)
+                    } else {
+                        &key
+                    });
+                    let mut getter = self.make_accessor_fn(&display, &backing, true);
+                    let mut setter = self.make_accessor_fn(&display, &backing, false);
                     let mut transforms = Vec::new();
                     if !m.decorators.is_empty() {
                         let decorators = &prepared
@@ -6305,13 +6327,13 @@ impl Interp {
                     if m.is_static {
                         static_els.push((
                             None,
-                            crate::value::PropertyKey::string(backing.to_string()),
+                            crate::value::PropertyKey::private(backing.to_string()),
                             m.value.clone(),
                             transforms,
                         ));
                     } else {
                         inst_fields.push(FieldInit {
-                            key: crate::value::PropertyKey::string(backing.to_string()),
+                            key: crate::value::PropertyKey::private(backing.to_string()),
                             init: m.value.clone(),
                             transforms,
                         });
@@ -6320,7 +6342,11 @@ impl Interp {
                 MemberKind::Method => {
                     let mut f = self.make_function(m.func.clone().unwrap(), menv.clone());
                     if let Value::Obj(fo) = &f {
-                        let name = self.fn_name_for_key(private_display(&key));
+                        let name = self.fn_name_for_key(if key.is_private() {
+                            private_display(&key)
+                        } else {
+                            &key
+                        });
                         fo.borrow_mut().props.insert(
                             "name",
                             Property::data(Value::lstr(name), false, false, true),
@@ -6355,6 +6381,11 @@ impl Interp {
                     };
                     if is_private && !m.is_static {
                         priv_members.push((key.into_string(), prop));
+                    } else if is_private {
+                        target
+                            .borrow_mut()
+                            .internal_slots_mut()
+                            .insert(key.as_str(), prop);
                     } else {
                         target.borrow_mut().props.insert(key.as_str(), prop);
                     }
@@ -6364,7 +6395,11 @@ impl Interp {
                     let is_get = m.kind == MemberKind::Get;
                     if let Value::Obj(fo) = &f {
                         let prefix = if is_get { "get " } else { "set " };
-                        let name = self.fn_name_for_key(private_display(&key));
+                        let name = self.fn_name_for_key(if key.is_private() {
+                            private_display(&key)
+                        } else {
+                            &key
+                        });
                         fo.borrow_mut().props.insert(
                             "name",
                             Property::data(
@@ -6528,7 +6563,12 @@ impl Interp {
                 Some(e) => {
                     let v = self.eval(e, &scope);
                     if let (Ok(v), true) = (&v, is_anonymous_fn(e)) {
-                        self.set_fn_name(v, private_display(&key));
+                        let name = self.fn_name_for_key(if key.is_private() {
+                            private_display(&key)
+                        } else {
+                            &key
+                        });
+                        self.set_fn_name(v, &name);
                     }
                     v
                 }
@@ -6540,20 +6580,34 @@ impl Interp {
             for tr in &transforms {
                 v = self.call(tr.clone(), ctor_val.clone(), &[v])?;
             }
-            // Static PrivateFieldAdd: a non-extensible constructor (the initializer may have
-            // sealed it) or a duplicate is a TypeError.
-            if Interp::is_private_key(&key)
-                && (ctor_obj.borrow().props.contains(key.as_str()) || !ctor_obj.borrow().extensible)
+            // The supported nonextensible-applies-to-private proposal checks IsExtensible
+            // before adding a new Private Name. Existing private state remains writable
+            // after freeze; this check does not make it an ordinary property.
+            if key.is_private()
+                && !crate::builtins::js_is_extensible(self, &ctor_val).map_err(Abrupt::Throw)?
             {
                 return Err(self.throw(
                     "TypeError",
                     "cannot add a private field to a non-extensible object",
                 ));
             }
-            ctor_obj
-                .borrow_mut()
-                .props
-                .insert(key.as_str(), Property::plain(v));
+            if key.is_private() && ctor_obj.borrow().internal_slots().contains(key.as_str()) {
+                return Err(self.throw(
+                    "TypeError",
+                    "cannot initialize the same private field twice",
+                ));
+            }
+            if key.is_private() {
+                ctor_obj
+                    .borrow_mut()
+                    .internal_slots_mut()
+                    .insert(key.as_str(), Property::plain(v));
+            } else {
+                ctor_obj
+                    .borrow_mut()
+                    .props
+                    .insert(key.as_str(), Property::plain(v));
+            }
         }
 
         // Class decorators apply after the body is built; a callable return replaces the class.
@@ -6614,12 +6668,17 @@ impl Interp {
     fn define_class_accessor(
         &self,
         target: &Gc,
-        key: &str,
+        key: &crate::value::PropertyKey,
         get: Option<Value>,
         set: Option<Value>,
     ) {
         let mut b = target.borrow_mut();
-        if let Some(p) = b.props.get_mut(key) {
+        let existing = if key.is_private() {
+            b.internal_slots_mut().get_mut(key)
+        } else {
+            b.props.get_mut(key)
+        };
+        if let Some(p) = existing {
             if p.accessor() {
                 if get.is_some() {
                     p.set_getter(get);
@@ -6630,8 +6689,12 @@ impl Interp {
                 return;
             }
         }
-        b.props
-            .insert(key, Property::accessor_prop(get, set, false, true));
+        let property = Property::accessor_prop(get, set, false, true);
+        if key.is_private() {
+            b.internal_slots_mut().insert(key.as_str(), property);
+        } else {
+            b.props.insert(key.as_str(), property);
+        }
     }
 
     /// A function object wrapping an internal [`Callable`] (used for accessor get/set and decorator
@@ -6667,17 +6730,29 @@ impl Interp {
         let key_rc: Rc<str> = Rc::from(key);
         let name = if !is_private && Self::is_sym_key(key) {
             self.sym_from_key(key).unwrap_or(Value::Undefined)
-        } else {
+        } else if is_private {
             // A private member's context name is its source spelling, not the runtime key.
             Value::lstr(private_display(key).to_string())
+        } else {
+            crate::value::string_key_value(key)
         };
         let access = self.new_object();
         if matches!(kind, "method" | "getter" | "field" | "accessor") {
-            let g = self.make_callable(Callable::PropGet(Rc::new(key_rc.clone())), "get", 1.0);
+            let call = if is_private {
+                Callable::PrivatePropGet(Rc::new(key_rc.clone()))
+            } else {
+                Callable::PropGet(Rc::new(key_rc.clone()))
+            };
+            let g = self.make_callable(call, "get", 1.0);
             access.borrow_mut().props.insert("get", Property::plain(g));
         }
         if matches!(kind, "setter" | "field" | "accessor") {
-            let s = self.make_callable(Callable::PropSet(Rc::new(key_rc.clone())), "set", 2.0);
+            let call = if is_private {
+                Callable::PrivatePropSet(Rc::new(key_rc.clone()))
+            } else {
+                Callable::PropSet(Rc::new(key_rc.clone()))
+            };
+            let s = self.make_callable(call, "set", 2.0);
             access.borrow_mut().props.insert("set", Property::plain(s));
         }
         let add_init = self.make_native("addInitializer", 1, dec_add_initializer);
@@ -6775,13 +6850,13 @@ impl Interp {
     fn decorate_accessor(
         &mut self,
         decorators: &[PreparedDecoratorValue],
-        key: &str,
+        key: &crate::value::PropertyKey,
         is_static: bool,
         mut get: Value,
         mut set: Value,
         inits: &mut Vec<Value>,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
-        let is_private = Interp::is_private_key(key);
+        let is_private = key.is_private();
         let mut transforms = Vec::new();
         for decorator in decorators.iter().rev() {
             if !decorator.callback.is_callable() {
@@ -6804,15 +6879,15 @@ impl Interp {
             match r {
                 Value::Undefined => {}
                 Value::Obj(_) => {
-                    let ng = self.get_member(&r, "get")?;
+                    let ng = self.get_member_key(&r, "get")?;
                     if ng.is_callable() {
                         get = ng;
                     }
-                    let ns = self.get_member(&r, "set")?;
+                    let ns = self.get_member_key(&r, "set")?;
                     if ns.is_callable() {
                         set = ns;
                     }
-                    let init = self.get_member(&r, "init")?;
+                    let init = self.get_member_key(&r, "init")?;
                     if init.is_callable() {
                         transforms.push(init);
                     }
@@ -6890,6 +6965,11 @@ impl Interp {
                         for k in src.borrow().props.keys() {
                             let p = src.borrow().props.get(&k).cloned().unwrap();
                             dst.borrow_mut().props.insert(k, p);
+                        }
+                        for (key, slot) in src.borrow().internal_slots().iter() {
+                            dst.borrow_mut()
+                                .internal_slots_mut()
+                                .insert(key.clone(), slot.clone());
                         }
                         // A Function (or GeneratorFunction/AsyncFunction) subclass instance is
                         // itself callable: carry the built-in's [[Call]] behavior onto `this`.
@@ -7027,9 +7107,9 @@ impl Interp {
                 if matches!(desc, Value::Undefined) {
                     continue;
                 }
-                let e = self.get_member(&desc, "enumerable")?;
+                let e = self.get_member_key(&desc, "enumerable")?;
                 if self.to_boolean(&e) {
-                    let v = self.get_member(value, &pk)?;
+                    let v = self.get_member_key(value, &pk)?;
                     rest.borrow_mut()
                         .props
                         .insert(pk.as_str(), crate::value::Property::plain(v));
@@ -7046,7 +7126,7 @@ impl Interp {
                     let keys = crate::builtins::ordinary_own_keys_ordered(self, src)
                         .map_err(Abrupt::Throw)?;
                     for key in keys {
-                        if is_excluded(&key) || Self::is_private_key(&key) {
+                        if is_excluded(&key) {
                             continue;
                         }
                         let enumerable =
@@ -7058,7 +7138,7 @@ impl Interp {
                                         .is_some_and(|property| property.enumerable())
                                 });
                         if enumerable {
-                            let value = self.get_member(value, &key)?;
+                            let value = self.get_member_key(value, &key)?;
                             rest.borrow_mut()
                                 .props
                                 .insert(key, crate::value::Property::plain(value));
@@ -7078,7 +7158,7 @@ impl Interp {
                         .map(|p| p.enumerable())
                         .unwrap_or(false);
                     if enumerable {
-                        let v = self.get_member(value, &k)?;
+                        let v = self.get_member_key(value, &k)?;
                         rest.borrow_mut()
                             .props
                             .insert(k, crate::value::Property::plain(v));
@@ -7132,23 +7212,28 @@ impl Interp {
         // before any field initializer runs; a second initialization (return-override tricks
         // constructing over the same object twice) is a TypeError.
         if let Value::Obj(o) = this {
+            // InitializeInstanceElements checks extensibility once for the complete
+            // private-method/accessor group (Stage 3 nonextensible-applies-to-private).
+            if !priv_members.is_empty()
+                && !crate::builtins::js_is_extensible(self, this).map_err(Abrupt::Throw)?
+            {
+                return Err(self.throw(
+                    "TypeError",
+                    "cannot add private members to a non-extensible object",
+                ));
+            }
             if let Some((k, _)) = priv_members.first() {
-                if o.borrow().props.contains(k.as_str()) {
+                if o.borrow().internal_slots().contains(k.as_str()) {
                     return Err(self.throw(
                         "TypeError",
                         "cannot initialize private methods of a class twice on the same object",
                     ));
                 }
             }
-            // Extensibility applies to every private element, methods and accessors included.
-            if !priv_members.is_empty() && !o.borrow().extensible {
-                return Err(self.throw(
-                    "TypeError",
-                    "cannot add private members to a non-extensible object",
-                ));
-            }
             for (k, p) in &priv_members {
-                o.borrow_mut().props.insert(k.as_str(), p.clone());
+                o.borrow_mut()
+                    .internal_slots_mut()
+                    .insert(k.as_str(), p.clone());
             }
         }
         // A field initializer is not a constructor: a `super(...)` reached from here (e.g. through a
@@ -7175,7 +7260,12 @@ impl Interp {
                         bind_shared_name(&scope, field_init_name(1), Value::Bool(true));
                         let v = me.eval(e, &scope)?;
                         if is_anonymous_fn(e) {
-                            me.set_fn_name(&v, private_display(key));
+                            let name = me.fn_name_for_key(if key.is_private() {
+                                private_display(key)
+                            } else {
+                                key
+                            });
+                            me.set_fn_name(&v, &name);
                         }
                         v
                     }
@@ -7185,25 +7275,26 @@ impl Interp {
                 for t in &field.transforms {
                     v = me.call(t.clone(), this.clone(), &[v])?;
                 }
-                if Interp::is_private_key(key) {
+                if key.is_private() {
                     // PrivateFieldAdd: stamped directly on the object (bypassing proxy traps);
-                    // a second add or a non-extensible receiver is a TypeError.
+                    // the supported proposal first performs IsExtensible, whose Proxy trap
+                    // is observable, then checks for a duplicate Private Name.
                     let Value::Obj(o) = this else {
                         return Err(me.throw("TypeError", "cannot add a private field"));
                     };
-                    if o.borrow().props.contains(key.as_str()) {
-                        return Err(me.throw(
-                            "TypeError",
-                            "cannot initialize the same private field twice",
-                        ));
-                    }
-                    if !o.borrow().extensible {
+                    if !crate::builtins::js_is_extensible(me, this).map_err(Abrupt::Throw)? {
                         return Err(me.throw(
                             "TypeError",
                             "cannot add a private field to a non-extensible object",
                         ));
                     }
-                    o.borrow_mut().props.insert(
+                    if o.borrow().internal_slots().contains(key.as_str()) {
+                        return Err(me.throw(
+                            "TypeError",
+                            "cannot initialize the same private field twice",
+                        ));
+                    }
+                    o.borrow_mut().internal_slots_mut().insert(
                         key.as_str(),
                         crate::value::Property::data(v, true, false, false),
                     );
@@ -7479,7 +7570,10 @@ impl Interp {
                 if matches!(base, Value::Undefined | Value::Null) {
                     return Err(self.throw(
                         "TypeError",
-                        format!("cannot delete property '{key}' of null or undefined"),
+                        format!(
+                            "cannot delete property '{}' of null or undefined",
+                            crate::value::decode_string_key(&key)
+                        ),
                     ));
                 }
                 self.delete_prop_on(base, &key)
@@ -7517,9 +7611,13 @@ impl Interp {
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {
-                            return Err(
-                                self.throw("TypeError", format!("cannot delete property '{prop}'"))
-                            );
+                            return Err(self.throw(
+                                "TypeError",
+                                format!(
+                                    "cannot delete property '{}'",
+                                    crate::value::decode_string_key(prop)
+                                ),
+                            ));
                         }
                         return Ok(Value::Bool(ok));
                     }
@@ -7547,7 +7645,10 @@ impl Interp {
                         if !ok && strict {
                             return Err(self.throw(
                                 "TypeError",
-                                format!("cannot delete indexed property '{prop}'"),
+                                format!(
+                                    "cannot delete indexed property '{}'",
+                                    crate::value::decode_string_key(prop)
+                                ),
                             ));
                         }
                         return Ok(Value::Bool(ok));
@@ -7573,7 +7674,10 @@ impl Interp {
                     if strict {
                         return Err(self.throw(
                             "TypeError",
-                            format!("cannot delete non-configurable property '{prop}'"),
+                            format!(
+                                "cannot delete non-configurable property '{}'",
+                                crate::value::decode_string_key(prop)
+                            ),
                         ));
                     }
                     return Ok(Value::Bool(false));
@@ -7585,7 +7689,10 @@ impl Interp {
                         if strict {
                             return Err(self.throw(
                                 "TypeError",
-                                format!("cannot delete non-configurable property '{prop}'"),
+                                format!(
+                                    "cannot delete non-configurable property '{}'",
+                                    crate::value::decode_string_key(prop)
+                                ),
                             ));
                         }
                         return Ok(Value::Bool(false));
@@ -7683,7 +7790,7 @@ impl Interp {
         };
         let kv = self
             .sym_from_key(key)
-            .unwrap_or_else(|| Value::lstr(key.to_string()));
+            .unwrap_or_else(|| crate::value::string_key_value(key));
         let res = self.proxy_call_trap(
             crate::interpreter::PROXY_TRAP_DELETE,
             &trap,
@@ -7930,14 +8037,14 @@ impl Interp {
                 if matches!(**obj, Expr::Super) {
                     self.super_base(env)?;
                     let this = self.get_var("this", env)?;
-                    return self.set_member(&this, prop, value);
+                    return self.set_member_key(&this, prop, value);
                 }
                 let base = self.eval(obj, env)?;
                 if prop.starts_with('#') {
                     let k = self.resolve_private(prop, env);
                     return self.set_private_member(&base, &k, value);
                 }
-                self.set_member(&base, prop, value)
+                self.set_member_key(&base, prop, value)
             }
             Expr::Index { obj, index, .. } => {
                 if matches!(**obj, Expr::Super) {
@@ -7945,12 +8052,12 @@ impl Interp {
                     let idx = self.eval(index, env)?;
                     let key = self.to_property_key(&idx)?;
                     let this = self.get_var("this", env)?;
-                    return self.set_member(&this, &key, value);
+                    return self.set_member_key(&this, &key, value);
                 }
                 let base = self.eval(obj, env)?;
                 let idx = self.eval(index, env)?;
                 let key = self.to_property_key(&idx)?;
-                self.set_member(&base, &key, value)
+                self.set_member_key(&base, &key, value)
             }
             // Destructuring assignment: an array/object literal reinterpreted as a target.
             Expr::Array(elems) => {
@@ -8105,7 +8212,7 @@ impl Interp {
                                 _ => (t, None),
                             };
                             if matches!(core, Expr::Array(_) | Expr::Object(_)) {
-                                let mut v = self.get_member(&value, &k)?;
+                                let mut v = self.get_member_key(&value, &k)?;
                                 if matches!(v, Value::Undefined) {
                                     if let Some(d) = default {
                                         v = self.eval(d, env)?;
@@ -8114,7 +8221,7 @@ impl Interp {
                                 self.assign_to_target(core, v, env)?;
                             } else {
                                 let mut lref = self.resolve_reference(core, env)?;
-                                let mut v = self.get_member(&value, &k)?;
+                                let mut v = self.get_member_key(&value, &k)?;
                                 if matches!(v, Value::Undefined) {
                                     if let Some(d) = default {
                                         v = self.eval(d, env)?;
@@ -8149,8 +8256,8 @@ impl Interp {
 
     fn propkey_to_string(&mut self, key: &PropKey, env: &Env) -> Result<String, Abrupt> {
         Ok(match key {
-            PropKey::Ident(s) => s.clone(),
-            PropKey::Str(s) => s.to_string(),
+            PropKey::Ident(s) => crate::value::encode_owned_string_key(s.clone()),
+            PropKey::Str(s) => crate::value::encode_owned_string_key(s.to_string()),
             PropKey::Num(n) => self.num_to_str(*n),
             PropKey::Computed(e) => {
                 let kv = self.eval(e, env)?;
@@ -8547,7 +8654,7 @@ impl Interp {
             if inherits_default {
                 return Ok(Value::Bool(self.ordinary_has_instance(r, l)?));
             }
-            let handler = self.get_member(r, &key)?;
+            let handler = self.get_member_key(r, &key)?;
             if handler.is_callable() {
                 // The overwhelmingly common handler is the immutable intrinsic inherited from
                 // Function.prototype. Calling that native would only turn around and invoke this
@@ -8705,7 +8812,7 @@ impl Interp {
             Value::Obj(x) => x.clone(),
             _ => return Ok(false),
         };
-        let proto = match self.get_member(c, "prototype")? {
+        let proto = match self.get_member_key(c, "prototype")? {
             Value::Obj(p) => p,
             _ => return Err(self.throw("TypeError", "prototype property is not an object")),
         };
@@ -8871,7 +8978,7 @@ impl Interp {
         let result: Result<Value, Abrupt> = (|| {
             // A `@@toPrimitive` method takes precedence over valueOf/toString.
             if let Some(key) = crate::builtins::well_known_key(self, "toPrimitive") {
-                let f = self.get_member(&Value::Obj(obj.clone()), &key)?;
+                let f = self.get_member_key(&Value::Obj(obj.clone()), &key)?;
                 // GetMethod: a present-but-non-callable @@toPrimitive (not undefined/null) is a TypeError.
                 if !matches!(f, Value::Undefined | Value::Null) && !f.is_callable() {
                     return Err(self.throw("TypeError", "@@toPrimitive is not callable"));
@@ -8896,7 +9003,7 @@ impl Interp {
                 _ => ["valueOf", "toString"],
             };
             for method in order {
-                let f = self.get_member(&Value::Obj(obj.clone()), method)?;
+                let f = self.get_member_key(&Value::Obj(obj.clone()), method)?;
                 if f.is_callable() {
                     let r = self.call(f, v.clone(), &[])?;
                     if !matches!(r, Value::Obj(_)) {
@@ -9586,11 +9693,11 @@ fn dec_add_initializer(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
 /// The resolver pair's shared [[AlreadyResolved]] cell (`args[0]`): true (and mark) on first use.
 fn promise_mark_already(flag: &Value) -> bool {
     if let Value::Obj(o) = flag {
-        let used = o.borrow().props.contains("#\u{0}called");
+        let used = o.borrow().internal_slots().contains("#\u{0}called");
         if used {
             return false;
         }
-        o.borrow_mut().props.insert(
+        o.borrow_mut().internal_slots_mut().insert(
             "#\u{0}called",
             crate::value::Property::data(Value::Bool(true), true, false, true),
         );
@@ -9858,6 +9965,7 @@ pub(crate) use prepared_reference::{PreparedReference, PreparedReferenceSlot};
 /// A member reference's key is coerced once, at GetValue/PutValue, after its base check.
 enum RefKey {
     Static(String),
+    Private(String),
     Coerced(crate::value::PropertyKey),
     Raw(Value),
 }
@@ -9891,11 +9999,11 @@ impl Interp {
                 }
                 let base = self.eval(obj, env)?;
                 let key = if prop.starts_with('#') {
-                    self.resolve_private(prop, env)
+                    RefKey::Private(self.resolve_private(prop, env))
                 } else {
-                    prop.clone()
+                    RefKey::Static(prop.clone())
                 };
-                Ok(Reference::Prop(base, RefKey::Static(key)))
+                Ok(Reference::Prop(base, key))
             }
             Expr::Index { obj, index, .. } => {
                 if matches!(**obj, Expr::Super) {
@@ -9928,6 +10036,7 @@ impl Interp {
     fn coerce_ref_key(&mut self, key: &mut RefKey) -> Result<crate::value::PropertyKey, Abrupt> {
         match key {
             RefKey::Static(s) => Ok(crate::value::PropertyKey::string(s.clone())),
+            RefKey::Private(s) => Ok(crate::value::PropertyKey::private(s.clone())),
             RefKey::Coerced(key) => Ok(key.clone()),
             RefKey::Raw(v) => {
                 let v = v.clone();
@@ -9963,10 +10072,10 @@ impl Interp {
                     }
                 }
                 let k = self.ref_prop_key(&base.clone(), key)?;
-                if Interp::is_private_key(&k) {
+                if k.is_private() {
                     return self.get_private_member(&base.clone(), &k);
                 }
-                self.get_member(base, &k)
+                self.get_member_key(base, &k)
             }
             Reference::Super {
                 proto,
@@ -10000,10 +10109,10 @@ impl Interp {
                     }
                 }
                 let k = self.ref_prop_key(&base.clone(), key)?;
-                if Interp::is_private_key(&k) {
+                if k.is_private() {
                     return self.set_private_member(&base.clone(), &k, value);
                 }
-                self.set_member(base, &k, value)
+                self.set_member_key(base, &k, value)
             }
             Reference::Super {
                 proto,

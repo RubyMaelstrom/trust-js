@@ -195,7 +195,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
                 .get_prop_ic(&source, "state", &cache[0])
                 .unwrap_or_else(|_| panic!("maintenance getter"));
             assert!(matches!(
-                engine.interp.get_member(&value, "index"),
+                engine.interp.get_member_key(&value, "index"),
                 Ok(Value::Num(7.))
             ));
             assert_eq!(
@@ -312,7 +312,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
     let prototype = read.data().unwrap();
     let constructor = engine
         .interp
-        .get_member(&prototype, "constructor")
+        .get_member_key(&prototype, "constructor")
         .ok()
         .unwrap();
     assert!(Rc::ptr_eq(
@@ -462,13 +462,17 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
     "#,
     );
     let global = Value::Obj(engine.interp.global.clone());
-    let arrays = engine.interp.get_member(&global, "arrays").ok().unwrap();
+    let arrays = engine
+        .interp
+        .get_member_key(&global, "arrays")
+        .ok()
+        .unwrap();
     let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
     let key = crate::lstr::LStr::from("cached");
     for n in (0..24).chain((0..24).rev()) {
         let array = engine
             .interp
-            .get_member(&arrays, &n.to_string())
+            .get_member_key(&arrays, &n.to_string())
             .ok()
             .unwrap();
         assert!(
@@ -682,8 +686,16 @@ fn getter_cache_legacy_poison_stays_generic_and_getter_exceptions_propagate() {
         "function sloppy(){}; var strict=function(){'use strict';};",
     );
     let global = Value::Obj(engine.interp.global.clone());
-    let sloppy = engine.interp.get_member(&global, "sloppy").ok().unwrap();
-    let strict = engine.interp.get_member(&global, "strict").ok().unwrap();
+    let sloppy = engine
+        .interp
+        .get_member_key(&global, "sloppy")
+        .ok()
+        .unwrap();
+    let strict = engine
+        .interp
+        .get_member_key(&global, "strict")
+        .ok()
+        .unwrap();
     for key in ["arguments", "caller"] {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         for _ in 0..3 {

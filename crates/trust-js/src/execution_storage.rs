@@ -1,11 +1,14 @@
 //! Owned execution storage. JavaScript abstract operations and host APIs still consume `Value`;
-//! persistent local/operand owners use `PackedValue` in both the VM and native backends. Only
-//! actual argument lists cross the public wide-Value API; whole activations are never widened.
+//! persistent local/operand owners use `PackedValue` in both the VM and native backends. Local
+//! cells are shared during execution so scoped parameter aliases can replace their owning
+//! words through Cell, without an overlapping exclusive slice borrow. Only actual argument
+//! lists cross the public wide-Value API; whole activations are never widened.
 
 use crate::value::{PackedValue, Value};
 
 pub(crate) trait StoredValue: Sized + Clone {
     fn from_value(value: Value) -> Self;
+    fn replace_stored(&self, value: Self);
     fn into_value(self) -> Value;
     fn clone_value(&self) -> Value;
     fn is_empty(&self) -> bool;
@@ -16,6 +19,10 @@ impl StoredValue for PackedValue {
     #[inline]
     fn from_value(value: Value) -> Self {
         Self::pack(value)
+    }
+    #[inline]
+    fn replace_stored(&self, value: Self) {
+        PackedValue::replace_stored(self, value);
     }
     #[inline]
     fn into_value(self) -> Value {
@@ -73,7 +80,7 @@ pub(crate) unsafe fn with_moved_values<R>(
 
 pub(crate) trait SlotAccess {
     fn read_value(&self, index: usize) -> Value;
-    fn write_value(&mut self, index: usize, value: Value);
+    fn write_value(&self, index: usize, value: Value);
 }
 
 impl<S: StoredValue> SlotAccess for [S] {
@@ -82,8 +89,8 @@ impl<S: StoredValue> SlotAccess for [S] {
         self[index].clone_value()
     }
     #[inline]
-    fn write_value(&mut self, index: usize, value: Value) {
-        self[index] = S::from_value(value);
+    fn write_value(&self, index: usize, value: Value) {
+        self[index].replace_stored(S::from_value(value));
     }
 }
 
@@ -394,7 +401,7 @@ mod tests {
         drop(moved);
         assert_eq!(Rc::strong_count(&object), baseline);
 
-        let mut slots = [PackedValue::pack(Value::Obj(object.clone()))];
+        let slots = [PackedValue::pack(Value::Obj(object.clone()))];
         slots.write_value(0, Value::Empty);
         assert_eq!(Rc::strong_count(&object), baseline);
         assert!(matches!(slots.read_value(0), Value::Empty));
@@ -575,7 +582,7 @@ mod tests {
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
         let object = crate::value::Object::new(None);
         let weak = Rc::downgrade(&object);
-        let mut slots = [
+        let slots = [
             PackedValue::pack(Value::Obj(object)),
             PackedValue::pack(Value::Empty),
         ];
@@ -585,7 +592,7 @@ mod tests {
         assert_eq!(weak.strong_count(), 2);
         stack.push_stored(stack.last_stored().unwrap().clone());
         assert_eq!(weak.strong_count(), 3);
-        slots[1] = stack.pop_stored().unwrap();
+        slots[1].replace_stored(stack.pop_stored().unwrap());
         assert_eq!(
             weak.strong_count(),
             3,
@@ -593,10 +600,35 @@ mod tests {
         );
         drop(stack.pop_stored());
         assert_eq!(weak.strong_count(), 2);
-        slots[0] = PackedValue::pack(Value::Undefined);
+        slots[0].replace_stored(PackedValue::pack(Value::Undefined));
         assert_eq!(weak.strong_count(), 1);
         drop(slots);
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[test]
+    fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
+        let first = crate::value::Object::new(None);
+        let first_weak = Rc::downgrade(&first);
+        let second = crate::value::Object::new(None);
+        let second_weak = Rc::downgrade(&second);
+        let slots = [PackedValue::pack(Value::Obj(first))];
+        let shared = &slots[..];
+        let alias = &shared[0];
+        shared.write_value(0, Value::Obj(second));
+        assert_eq!(first_weak.strong_count(), 0);
+        assert_eq!(second_weak.strong_count(), 1);
+        let seen = alias.unpack();
+        assert!(Rc::ptr_eq(
+            seen.as_obj().unwrap(),
+            &second_weak.upgrade().unwrap()
+        ));
+        assert_eq!(second_weak.strong_count(), 2);
+        alias.replace_value(Value::Empty);
+        assert!(shared[0].is_empty());
+        assert_eq!(second_weak.strong_count(), 1);
+        drop(seen);
+        assert_eq!(second_weak.strong_count(), 0);
     }
 
     #[test]

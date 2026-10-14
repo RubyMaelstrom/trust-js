@@ -162,7 +162,7 @@ pub fn default_numbering_system(base: &str) -> &'static str {
 /// GetOption(options, "localeMatcher", string, «"lookup","best fit"», "best fit"). Validated then
 /// discarded (both matchers behave identically here).
 pub fn read_locale_matcher(i: &mut Interp, options: &Value) -> Result<(), Value> {
-    let v = ab(i.get_member(options, "localeMatcher"))?;
+    let v = ab(i.get_member_key(options, "localeMatcher"))?;
     if matches!(v, Value::Undefined) {
         return Ok(());
     }
@@ -181,7 +181,7 @@ pub fn get_option(
     values: &[&str],
     fallback: Option<&str>,
 ) -> Result<Option<String>, Value> {
-    let v = ab(i.get_member(options, prop))?;
+    let v = ab(i.get_member_key(options, prop))?;
     if matches!(v, Value::Undefined) {
         return Ok(fallback.map(|s| s.to_string()));
     }
@@ -217,7 +217,7 @@ pub fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
 /// Brand-check helper: fetch the internal slot object of a service instance, or throw TypeError.
 pub fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Value> {
     match this.as_obj() {
-        Some(o) if o.borrow().props.contains(marker) => Ok(o.clone()),
+        Some(o) if o.borrow().internal_slots().contains(marker) => Ok(o.clone()),
         _ => Err(i.make_error("TypeError", "method called on an incompatible receiver")),
     }
 }
@@ -229,7 +229,7 @@ pub fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Valu
 pub fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
     if let Value::Obj(nt) = &i.new_target {
         let nt = nt.clone();
-        match i.get_member(&Value::Obj(nt.clone()), "prototype") {
+        match i.get_member_key(&Value::Obj(nt.clone()), "prototype") {
             Ok(Value::Obj(p)) => return Ok(Some(p)),
             // GetPrototypeFromConstructor: when newTarget.prototype is not an object, use the
             // *newTarget's realm* intrinsic (found by matching its prototype chain's Function.prototype

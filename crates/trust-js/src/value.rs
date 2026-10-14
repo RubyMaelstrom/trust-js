@@ -6,6 +6,9 @@ use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+#[path = "dense_deque.rs"]
+mod dense_deque;
+pub(crate) use dense_deque::DenseDeque;
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "allocation_diagnostics.rs"]
 mod allocation_diagnostics;
@@ -225,6 +228,12 @@ impl PackedValue {
         self.0.get() == PACK_UNDEFINED
     }
 
+    /// Inspect a primitive without cloning an owner or materializing a deferred object.
+    #[inline]
+    pub(crate) fn is_primitive(&self) -> bool {
+        !matches!(self.tag(), PACK_OBJ | PACK_LAZY_PROTO)
+    }
+
     /// Lend an already materialized object without creating another owner. The
     /// callback must finish its borrowed inspection before an observer can change
     /// the source slot; property lookup uses this only to take an owned snapshot.
@@ -349,6 +358,21 @@ impl PackedValue {
         PackedValue(Cell::new(bits))
     }
 
+    /// Move an owner into this shared frame cell, releasing its previous owner. A live
+    /// activation may expose this cell through a scoped arguments alias; neither path takes
+    /// an exclusive reference to the cell or changes its address. Install the new word before
+    /// dropping the old owner so a destructor cannot observe a moved-out slot.
+    #[inline]
+    pub(crate) fn replace_stored(&self, value: PackedValue) {
+        let value = std::mem::ManuallyDrop::new(value);
+        drop(PackedValue(Cell::new(self.0.replace(value.0.get()))));
+    }
+
+    #[inline]
+    pub(crate) fn replace_value(&self, value: Value) {
+        self.replace_stored(Self::pack(value));
+    }
+
     #[inline]
     pub(crate) fn unpack(&self) -> Value {
         match self.tag() {
@@ -430,8 +454,7 @@ impl PackedValue {
 
     /// Replace one packed owner with a moved wide value and drop the previous owner.
     pub(crate) unsafe fn replace_raw(word: *mut u64, value: Value) {
-        let old = unsafe { std::ptr::replace(word as *mut PackedValue, PackedValue::pack(value)) };
-        drop(old);
+        unsafe { &*(word as *const PackedValue) }.replace_value(value);
     }
 }
 
@@ -861,17 +884,47 @@ impl Drop for SymbolData {
 pub(crate) struct PropertyKey {
     text: String,
     symbol: Option<Rc<SymbolData>>,
+    private: bool,
 }
 
 impl PropertyKey {
     pub(crate) fn string(text: String) -> Self {
-        Self { text, symbol: None }
+        let text = encode_owned_string_key(text);
+        Self {
+            text,
+            symbol: None,
+            private: false,
+        }
+    }
+
+    /// A runtime Private Name, supplied only by class evaluation, never by ToPropertyKey.
+    pub(crate) fn private(text: String) -> Self {
+        Self {
+            text,
+            symbol: None,
+            private: true,
+        }
+    }
+
+    pub(crate) fn is_private(&self) -> bool {
+        self.private
+    }
+
+    /// A key already encoded in an ordinary property map or compiled property-name table.
+    pub(crate) fn stored(text: String) -> Self {
+        let symbol = encoded_symbol_id(&text).and_then(active_symbol);
+        Self {
+            text,
+            symbol,
+            private: false,
+        }
     }
 
     pub(crate) fn symbol(symbol: Rc<SymbolData>) -> Self {
         Self {
             text: Interp::sym_key(&symbol),
             symbol: Some(symbol),
+            private: false,
         }
     }
 
@@ -893,7 +946,7 @@ impl PropertyKey {
     pub(crate) fn into_value(self) -> Value {
         match self.symbol {
             Some(symbol) => Value::Sym(symbol),
-            None => Value::lstr(self.text),
+            None => string_key_value(self.text),
         }
     }
 }
@@ -922,6 +975,42 @@ impl PartialEq<&str> for PropertyKey {
     fn eq(&self, other: &&str) -> bool {
         self.text == *other
     }
+}
+
+/// Ordinary property maps encode leading-NUL String keys with one extra NUL. A single
+/// NUL followed by a decimal identity is reserved for Symbol keys. This is injective for
+/// every ECMAScript String, including strings containing arbitrary numbers of NULs.
+#[inline]
+pub(crate) fn encode_string_key(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.starts_with('\0') {
+        let mut encoded = String::with_capacity(text.len() + 1);
+        encoded.push('\0');
+        encoded.push_str(text);
+        std::borrow::Cow::Owned(encoded)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+#[inline]
+pub(crate) fn encode_owned_string_key(mut text: String) -> String {
+    if text.starts_with('\0') {
+        text.insert(0, '\0');
+    }
+    text
+}
+
+#[inline]
+pub(crate) fn decode_string_key(key: &str) -> &str {
+    if key.starts_with("\0\0") {
+        &key[1..]
+    } else {
+        key
+    }
+}
+
+pub(crate) fn string_key_value(key: impl AsRef<str>) -> Value {
+    Value::lstr(decode_string_key(key.as_ref()))
 }
 
 /// Symbol state owned by one ECMAScript Agent. ECMA-262 §9.9.2 and §20.4 put the global symbol
@@ -1011,10 +1100,10 @@ pub struct JitLayout {
     pub props_elems: usize,
     /// The `elems` Vec header within the shared dense-buffer allocation.
     pub dense_elems: usize,
-    /// The `mirror` Vec header within the shared dense-buffer allocation.
+    /// The `mirror` deque's admitted Vec-compatible header within the dense sidecar.
     pub dense_mirror: usize,
-    /// Nullable `Box<Vec<Property>>` within the dense sidecar. When non-null the box points at
-    /// the Vec header; packed element slots use [`Value::Empty`] for holes and have no key Rc.
+    /// Nullable boxed property deque within the dense sidecar. The box points at its admitted
+    /// Vec-compatible header; slots use [`Value::Empty`] for holes and have no key Rc.
     pub dense_packed: usize,
     /// Inline small-array storage within DenseBuffers (used before an indexed mutation
     /// needs to grow it into the optional Vec). Offsets are measured from the live types.
@@ -1036,7 +1125,7 @@ pub struct JitLayout {
     pub property_size: usize,
     pub property_value: usize,
     pub property_meta: usize,
-    /// The `Option<Box<Vec<Property>>>` niche and Vec header words matched the live probes.
+    /// The boxed property-deque niche and header words matched the live Vec probes.
     pub packed_elems_valid: bool,
     /// `Exotic::None`'s discriminant byte (the inline path requires an ordinary object).
     pub exotic_none_tag: u8,
@@ -1222,32 +1311,35 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
     let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
 
-    // Keyless packed-element sidecar: probe both Option<Box<_>>'s null niche and Vec<Property>'s
-    // header words independently. The JIT follows the Box pointer, then uses the same located
-    // Vec word offsets as the classic entry/element vectors.
-    let mut pv = Vec::with_capacity(3);
+    // Deque headers deliberately preserve the admitted Vec word order, while their
+    // allocation owner retains the original base. Validate both deque element types
+    // against the live Vec probes before any backend reads or writes these headers.
+    let mut pv = DenseDeque::with_capacity(3);
     pv.push(Property::plain(Value::Num(1.0)));
-    let pv_ptr = pv.as_ptr() as usize;
-    let pv_words = unsafe {
-        std::slice::from_raw_parts(
-            &pv as *const Vec<Property> as *const usize,
-            std::mem::size_of::<Vec<Property>>() / 8,
-        )
-    };
-    let pv_header_ok = vec_ptr_off.is_some_and(|o| pv_words[o / 8] == pv_ptr)
-        && vec_len_off.is_some_and(|o| pv_words[o / 8] == 1)
-        && vec_cap_off.is_some_and(|o| pv_words[o / 8] == 3);
-    let packed_some: Option<Box<Vec<Property>>> = Some(Box::new(pv));
-    let packed_word =
-        unsafe { *(&packed_some as *const Option<Box<Vec<Property>>> as *const usize) };
+    let mut mv = DenseDeque::with_capacity(3);
+    mv.push(1.0_f64);
+    let deque_header_ok = vec_ptr_off == Some(offset_of!(DenseDeque<Property>, ptr))
+        && vec_len_off == Some(offset_of!(DenseDeque<Property>, len))
+        && vec_cap_off == Some(offset_of!(DenseDeque<Property>, cap))
+        && vec_ptr_off == Some(offset_of!(DenseDeque<f64>, ptr))
+        && vec_len_off == Some(offset_of!(DenseDeque<f64>, len))
+        && vec_cap_off == Some(offset_of!(DenseDeque<f64>, cap))
+        && pv.len() == 1
+        && pv.capacity() == 3
+        && mv.len() == 1
+        && mv.capacity() == 3;
+    let packed_some: Option<PackedProperties> = Some(Box::new(pv));
+    let packed_word = unsafe { *(&packed_some as *const Option<PackedProperties> as *const usize) };
     let packed_expected = packed_some
         .as_deref()
-        .map_or(0, |v| v as *const Vec<Property> as usize);
-    let packed_none: Option<Box<Vec<Property>>> = None;
+        .map_or(0, |v| v as *const DenseDeque<Property> as usize);
+    let packed_none: Option<PackedProperties> = None;
     let packed_none_word =
-        unsafe { *(&packed_none as *const Option<Box<Vec<Property>>> as *const usize) };
-    let packed_elems_valid =
-        pv_header_ok && packed_word == packed_expected && packed_word != 0 && packed_none_word == 0;
+        unsafe { *(&packed_none as *const Option<PackedProperties> as *const usize) };
+    let packed_elems_valid = deque_header_ok
+        && packed_word == packed_expected
+        && packed_word != 0
+        && packed_none_word == 0;
 
     // Exotic::None / Exotic::Array discriminants (Exotic is repr(Rust); probe to be certain).
     let none = Exotic::None;
@@ -1326,6 +1418,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && vec_len_off.is_some()
         && vec_cap_off.is_some()
         && vec32_ok
+        && deque_header_ok
         && thin_vec_ok
         && key_vec_ok
         && layout_ok
@@ -1591,6 +1684,9 @@ pub enum Callable {
     PropGet(Rc<Rc<str>>) = 9,
     /// A decorator `context.access.set`: performs `args[0][name] = args[1]`.
     PropSet(Rc<Rc<str>>) = 10,
+    /// A decorator's private access functions use PrivateGet/PrivateSet, not [[Get]]/[[Set]].
+    PrivatePropGet(Rc<Rc<str>>) = 11,
+    PrivatePropSet(Rc<Rc<str>>) = 12,
 }
 
 /// The discriminant of [`Callable::User`] (see the enum's layout note).
@@ -1786,6 +1882,39 @@ pub struct Object {
 }
 
 impl Object {
+    /// Engine state shares the existing lazy storage allocation but remains separate from
+    /// ECMAScript properties. Author strings, reflection, proxies and integrity levels cannot
+    /// address this map (ECMA-262 6.1.7.2). Ordinary objects retain their compact body layout.
+    pub(crate) fn internal_slots(&self) -> &InternalSlots {
+        &self.props.elems.internal_slots
+    }
+
+    pub(crate) fn internal_slots_mut(&mut self) -> &mut InternalSlots {
+        &mut self.props.elems.buffers_mut().internal_slots
+    }
+
+    fn take_internal_slots(&mut self) -> InternalSlots {
+        self.props
+            .elems
+            .0
+            .as_deref_mut()
+            .map_or_else(InternalSlots::default, |buffers| {
+                std::mem::take(&mut buffers.internal_slots)
+            })
+    }
+
+    /// Replace only the receiver's ordinary property payload. Engine state belongs to this
+    /// receiver, even when an Array.fill fast path materializes fresh dense storage around it.
+    pub(crate) fn replace_properties(&mut self, mut properties: Props) {
+        let slots = self.take_internal_slots();
+        if let Some(buffers) = properties.elems.0.as_deref_mut() {
+            buffers.internal_slots = slots;
+        } else if slots.0.is_some() {
+            properties.elems.buffers_mut().internal_slots = slots;
+        }
+        self.props = properties;
+    }
+
     // Objects exist only behind their collected handle; `Gc` is that handle.
     #[allow(clippy::new_ret_no_self)]
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
@@ -1853,6 +1982,78 @@ impl Object {
             reg.publish(slot, Rc::as_ptr(&obj));
             obj
         }
+    }
+}
+
+/// A lazy internal-slot map inside the existing property-storage sidecar. Built-in instances
+/// keep their state without adding property keys, descriptors or shape transitions; ordinary
+/// objects allocate neither a separate map nor an extra pointer in their object body.
+#[derive(Clone, Default)]
+pub(crate) struct InternalSlots(Option<Box<Vec<(Rc<str>, Property)>>>);
+
+impl InternalSlots {
+    pub(crate) fn get(&self, key: &str) -> Option<&Property> {
+        self.0
+            .as_ref()?
+            .iter()
+            .find(|(name, _)| &**name == key)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Property> {
+        self.0
+            .as_mut()?
+            .iter_mut()
+            .find(|(name, _)| &**name == key)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn entry_at(&self, slot: usize) -> Option<&(Rc<str>, Property)> {
+        self.0.as_ref()?.get(slot)
+    }
+
+    pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<&mut (Rc<str>, Property)> {
+        self.0.as_mut()?.get_mut(slot)
+    }
+
+    pub(crate) fn slot_of(&self, key: &str) -> Option<usize> {
+        self.0.as_ref()?.iter().position(|(name, _)| &**name == key)
+    }
+
+    pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
+        self.entry_at(slot).map(|(_, property)| property)
+    }
+
+    pub(crate) fn insert(&mut self, key: impl IntoPropKey, value: Property) {
+        let key = key.into_prop_key();
+        let entries = self.0.get_or_insert_with(|| Box::new(Vec::new()));
+        if let Some((_, previous)) = entries.iter_mut().find(|(name, _)| **name == *key) {
+            *previous = value;
+        } else {
+            entries.push((key, value));
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Property)> {
+        self.0
+            .iter()
+            .flat_map(|entries| entries.iter())
+            .map(|(key, value)| (key, value))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Property> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    pub(crate) fn retained_storage_bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |entries| {
+            std::mem::size_of_val(&**entries)
+                + entries.capacity() * std::mem::size_of::<(Rc<str>, Property)>()
+        })
     }
 }
 
@@ -3137,14 +3338,21 @@ const INLINE_PACKED_CAPACITY: usize = 10;
 
 struct InlinePacked {
     len: u8,
+    /// Proof for either packed representation, including when `len` is zero and
+    /// the live elements use the heap deque. This byte fits beside the inline length.
+    /// Foreign descriptor escapes invalidate it; value-only writes preserve it.
+    packed_plain: Cell<bool>,
     slots: [std::mem::MaybeUninit<Property>; INLINE_PACKED_CAPACITY],
 }
 
 impl InlinePacked {
-    const EMPTY: InlinePacked = InlinePacked {
-        len: 0,
-        slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
-    };
+    const fn new() -> InlinePacked {
+        InlinePacked {
+            len: 0,
+            packed_plain: Cell::new(false),
+            slots: [const { std::mem::MaybeUninit::uninit() }; INLINE_PACKED_CAPACITY],
+        }
+    }
 
     fn from_properties(items: impl ExactSizeIterator<Item = Property>) -> InlinePacked {
         debug_assert!(items.len() <= INLINE_PACKED_CAPACITY);
@@ -3178,11 +3386,26 @@ impl InlinePacked {
         self.len = 0;
         values
     }
+
+    fn prepend(&mut self, items: &[Value]) {
+        debug_assert!(self.len as usize + items.len() <= INLINE_PACKED_CAPACITY);
+        for item in items.iter().rev() {
+            // Create the new owner before moving existing slots. Each committed
+            // step leaves a completely initialized prefix for cleanup.
+            let property = Property::plain(item.clone());
+            let ptr = self.slots.as_mut_ptr().cast::<Property>();
+            unsafe {
+                std::ptr::copy(ptr, ptr.add(1), self.len as usize);
+                ptr.write(property);
+            }
+            self.len += 1;
+        }
+    }
 }
 
 impl Default for InlinePacked {
     fn default() -> Self {
-        InlinePacked::EMPTY
+        InlinePacked::new()
     }
 }
 
@@ -3193,6 +3416,7 @@ impl Clone for InlinePacked {
             clone.slots[index].write(property.clone());
         }
         clone.len = self.len;
+        clone.packed_plain.set(self.packed_plain.get());
         clone
     }
 }
@@ -3205,36 +3429,54 @@ impl Drop for InlinePacked {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct DenseBuffers {
     index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
     packed: Option<PackedProperties>,
     inline_packed: InlinePacked,
     elems: Vec<u32>,
-    mirror: Vec<f64>,
+    mirror: DenseDeque<f64>,
     /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
     /// this cold sidecar exists only for objects that actually acquire a Symbol key.
     symbols: Option<Box<crate::fasthash::FastMap<u64, Rc<SymbolData>>>>,
+    internal_slots: InternalSlots,
+}
+
+impl Clone for DenseBuffers {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index.clone(),
+            packed: self.packed.clone(),
+            inline_packed: self.inline_packed.clone(),
+            elems: self.elems.clone(),
+            mirror: self.mirror.clone(),
+            symbols: self.symbols.clone(),
+            // Ordinary property templates and array copies never duplicate private brands or
+            // built-in internal state. Receiver transplantation copies slots explicitly.
+            internal_slots: InternalSlots::default(),
+        }
+    }
 }
 
 // DenseBuffers exists for every object that leaves the inline-property representation. The
 // extra indirection keeps this optional field pointer-sized instead of adding two words to each
 // allocation; the compact representation is more valuable here than Clippy's generic Vec advice.
 #[allow(clippy::box_collection)]
-type PackedProperties = Box<Vec<Property>>;
+type PackedProperties = Box<DenseDeque<Property>>;
 
 struct EmptyDenseBuffers(DenseBuffers);
-// This one value contains only `None` and empty Vec dangling sentinels and is never mutated; no
-// non-Sync payload is reachable through it. Live DenseBuffers remain thread-local as before.
+// This value's empty buffers and cached-proof cell are never mutated. Every writer first
+// acquires an owned allocation through DenseStorage::buffers_mut; live buffers stay thread-local.
 unsafe impl Sync for EmptyDenseBuffers {}
 
 static EMPTY_DENSE_BUFFERS: EmptyDenseBuffers = EmptyDenseBuffers(DenseBuffers {
     index: None,
     packed: None,
-    inline_packed: InlinePacked::EMPTY,
+    inline_packed: InlinePacked::new(),
     elems: Vec::new(),
-    mirror: Vec::new(),
+    mirror: DenseDeque::new(),
     symbols: None,
+    internal_slots: InternalSlots(None),
 });
 
 #[derive(Clone, Default)]
@@ -3280,14 +3522,20 @@ impl DenseStorage {
     fn index_mut(&mut self) -> Option<&mut crate::fasthash::FastMap<Rc<str>, usize>> {
         self.0.as_deref_mut()?.index.as_deref_mut()
     }
-    fn packed_mut(&mut self) -> Option<&mut Vec<Property>> {
+    fn packed_mut(&mut self) -> Option<&mut DenseDeque<Property>> {
         let dense = self.0.as_deref_mut()?;
+        dense.inline_packed.packed_plain.set(false);
         if dense.packed.is_none() && dense.inline_packed.len != 0 {
-            dense.packed = Some(Box::new(dense.inline_packed.into_vec()));
+            dense.packed = Some(Box::new(dense.inline_packed.into_vec().into()));
         }
         dense.packed.as_deref_mut()
     }
     fn packed_slice_mut(&mut self) -> Option<&mut [Property]> {
+        self.0.as_deref()?.inline_packed.packed_plain.set(false);
+        self.packed_values_mut()
+    }
+    // Value-only writes leave descriptor attributes and occupancy unchanged.
+    fn packed_values_mut(&mut self) -> Option<&mut [Property]> {
         let dense = self.0.as_deref_mut()?;
         match dense.packed.as_deref_mut() {
             Some(packed) => Some(packed.as_mut_slice()),
@@ -3304,6 +3552,9 @@ impl DenseStorage {
     }
     fn push_packed(&mut self, property: Property) {
         let dense = self.buffers_mut();
+        if !property.is_plain_element() {
+            dense.inline_packed.packed_plain.set(false);
+        }
         if let Some(packed) = dense.packed.as_deref_mut() {
             packed.push(property);
         } else if (dense.inline_packed.len as usize) < INLINE_PACKED_CAPACITY {
@@ -3312,19 +3563,32 @@ impl DenseStorage {
         } else {
             let mut packed = dense.inline_packed.into_vec();
             packed.push(property);
-            dense.packed = Some(Box::new(packed));
+            dense.packed = Some(Box::new(packed.into()));
         }
     }
     fn packed_ref(&self) -> Option<&[Property]> {
         let dense = self.0.as_deref()?;
         match dense.packed.as_deref() {
-            Some(packed) => Some(packed),
+            Some(packed) => Some(packed.as_slice()),
             None if dense.inline_packed.len != 0 => Some(dense.inline_packed.as_slice()),
             None => None,
         }
     }
     fn packed_is_some(&self) -> bool {
         self.packed_ref().is_some()
+    }
+    fn packed_all_plain(&self) -> bool {
+        let Some(buffers) = self.0.as_deref() else {
+            return false;
+        };
+        if buffers.inline_packed.packed_plain.get() {
+            return true;
+        }
+        let plain = self
+            .packed_ref()
+            .is_some_and(|packed| packed.iter().all(Property::is_plain_element));
+        buffers.inline_packed.packed_plain.set(plain);
+        plain
     }
     fn set_index(&mut self, index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>) {
         if index.is_some() {
@@ -3337,6 +3601,13 @@ impl DenseStorage {
         if packed.is_some() {
             let dense = self.buffers_mut();
             dense.inline_packed = InlinePacked::default();
+            dense.inline_packed.packed_plain.set(
+                packed
+                    .as_deref()
+                    .unwrap()
+                    .iter()
+                    .all(Property::is_plain_element),
+            );
             dense.packed = packed;
         } else if let Some(d) = self.0.as_deref_mut() {
             d.packed = None;
@@ -3709,10 +3980,14 @@ pub(crate) const MIRROR_PACKED_FAILED: u8 = 16;
 /// never stored as data, which is what makes reading it back as "absent" sound.
 pub(crate) const MIRROR_HOLE: u64 = 0x7FF8_DEAD_0000_0001;
 
-/// Decode TRust JS's internal representation of a Symbol-valued property key. Internal NUL-prefixed
-/// markers deliberately do not parse as integers and therefore never enter Symbol ownership.
+/// Decode a Symbol-valued property key. Escaped String keys begin with two NULs and
+/// therefore never enter Symbol ownership, even when their author text spells a Symbol id.
 fn encoded_symbol_id(key: &str) -> Option<u64> {
-    key.strip_prefix('\0')?.parse().ok()
+    let digits = key.strip_prefix('\0')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Exact-i32 (and not -0.0): the value survives an i32 round trip bit-identically.
@@ -4229,7 +4504,6 @@ impl Props {
             || self.entries.iter().any(|(key, property)| {
                 !property.enumerable()
                     || property.accessor()
-                    || crate::interpreter::Interp::is_private_key(key)
                     || crate::interpreter::Interp::is_sym_key(key)
             })
         {
@@ -4314,7 +4588,7 @@ impl Props {
                     .saturating_mul(std::mem::size_of::<f64>()),
             );
             if let Some(packed) = dense.packed.as_deref() {
-                bytes = bytes.saturating_add(std::mem::size_of::<Vec<Property>>());
+                bytes = bytes.saturating_add(std::mem::size_of::<DenseDeque<Property>>());
                 bytes = bytes.saturating_add(
                     packed
                         .capacity()
@@ -4385,12 +4659,15 @@ impl Props {
 
     fn packed_array_properties(items: impl ExactSizeIterator<Item = Property>) -> Props {
         let len = items.len();
+        let mut all_plain = true;
+        let items = items.inspect(|property| all_plain &= property.is_plain_element());
         let inline = len <= INLINE_PACKED_CAPACITY;
         let (inline_packed, packed) = if inline {
             (InlinePacked::from_properties(items), None)
         } else {
             (InlinePacked::default(), Some(Box::new(items.collect())))
         };
+        inline_packed.packed_plain.set(all_plain);
         let length_key = fn_key(0);
         let shape = array_length_shape(&length_key);
         let mut props = Props {
@@ -4410,8 +4687,9 @@ impl Props {
                     packed,
                     inline_packed,
                     elems: Vec::new(),
-                    mirror: Vec::new(),
+                    mirror: DenseDeque::new(),
                     symbols: None,
+                    internal_slots: InternalSlots::default(),
                 })))
             },
             mirror_flags: if len == 0 {
@@ -4496,7 +4774,7 @@ impl Props {
         if (1..=32).contains(&len) || (len != 0 && dense_elements_enabled()) {
             self.entries.reserve_exact(1); // own `length`
             self.elems
-                .set_packed(Some(Box::new(Vec::with_capacity(len))));
+                .set_packed(Some(Box::new(DenseDeque::with_capacity(len))));
             self.mirror_flags = if numeric && dense_elements_enabled() {
                 MIRROR_OK | MIRROR_PACKED | MIRROR_ALL_I32 | MIRROR_NO_HOLES
             } else {
@@ -4532,7 +4810,7 @@ impl Props {
         debug_assert_eq!(self.elems.len(), 0);
         let mut packed = Vec::with_capacity(len);
         packed.resize_with(len, || Property::plain(Value::Empty));
-        self.elems.set_packed(Some(Box::new(packed)));
+        self.elems.set_packed(Some(Box::new(packed.into())));
         // The raw-f64 mirror describes classic `elems` slots, not keyless packed properties.
         self.mirror_flags = 0;
     }
@@ -4583,7 +4861,7 @@ impl Props {
         let packed = buffers
             .packed
             .as_deref()
-            .map(Vec::as_slice)
+            .map(DenseDeque::as_slice)
             .unwrap_or_else(|| buffers.inline_packed.as_slice());
         mirror.extend(
             packed
@@ -4878,7 +5156,7 @@ impl Props {
             if self.mirror_flags & MIRROR_PACKED_FAILED != 0 {
                 self.mirror_invalidate();
             }
-            let packed = self.elems.packed_slice_mut().unwrap();
+            let packed = self.elems.packed_values_mut().unwrap();
             let Some(p) = packed.get_mut(n as usize) else {
                 return Err(v);
             };
@@ -5123,13 +5401,23 @@ impl Props {
                 return None;
             }
             self.note_structural();
-            self.mirror_invalidate();
-            return self
-                .elems
-                .packed_mut()
-                .unwrap()
-                .pop()
-                .map(Property::into_value);
+            if self.mirror_flags & (MIRROR_OK | MIRROR_PACKED) == (MIRROR_OK | MIRROR_PACKED)
+                && self.elems.mirror_len() == n as usize + 1
+            {
+                self.elems.mirror_pop();
+            } else {
+                self.mirror_invalidate();
+            }
+            // Removing a tail cannot invalidate the proof about remaining plain
+            // descriptors. Avoid a mutable-descriptor escape, which would force
+            // every following unshift in a prepend/pop stack to scan the list.
+            let buffers = self.elems.buffers_mut();
+            let last = if let Some(packed) = buffers.packed.as_deref_mut() {
+                packed.pop()
+            } else {
+                buffers.inline_packed.pop()
+            };
+            return last.map(Property::into_value);
         }
         if n as usize + 1 != self.elems.len() {
             return None;
@@ -5170,7 +5458,7 @@ impl Props {
     /// indexed properties): its effect is then exactly the edited list. The numeric mirror is
     /// dropped and rebuilt on demand. The caller records the new length with
     /// [`Self::set_array_length_value`]. `None` changes nothing.
-    pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut Vec<Property>> {
+    pub(crate) fn plain_elements_mut(&mut self, len: usize) -> Option<&mut DenseDeque<Property>> {
         if len == 0 || len > u32::MAX as usize || !self.elem_mode.get() || self.has_far.get() {
             return None;
         }
@@ -5199,6 +5487,37 @@ impl Props {
         let length = self.length_property()?;
         if !length.writable() || length.number_value() != Some(len as f64) {
             return None;
+        }
+        if self
+            .elems
+            .packed_ref()
+            .is_some_and(|packed| packed.len() == len)
+            && self.elems.packed_all_plain()
+        {
+            self.note_structural();
+            if self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
+                self.elems.buffers_mut().mirror.pop_front();
+            } else {
+                self.mirror_invalidate();
+            }
+            let buffers = self.elems.buffers_mut();
+            let first = if let Some(packed) = buffers.packed.as_deref_mut() {
+                packed.pop_front().unwrap()
+            } else {
+                // Inline arrays have at most ten slots. Retain their allocation-free
+                // representation; larger arrays advance their logical data pointer.
+                let properties = buffers.inline_packed.as_slice();
+                for pair in properties.windows(2) {
+                    pair[0].packed.0.swap(&pair[1].packed.0);
+                }
+                buffers.inline_packed.pop().unwrap()
+            };
+            self.set_array_length_value((len - 1) as f64);
+            if len == 1 && !self.elems.packed_is_some() {
+                self.mirror_flags = MIRROR_OK | MIRROR_NO_HOLES | MIRROR_ALL_I32;
+                self.mirror_holes = 0;
+            }
+            return Some(first.into_value());
         }
         let safe = |index: usize, property: &Property| {
             !property.is_empty()
@@ -5296,6 +5615,81 @@ impl Props {
         self.entries.fields[slot].set_value(Value::Num((len - 1) as f64));
         self.len_slot.set(slot as u32);
         Some(first)
+    }
+
+    /// ECMA-262 #sec-array.prototype.unshift (e28783d5): a plain contiguous own
+    /// element list may prepend owners after the caller proves extensibility and
+    /// absence of indexed prototype properties. Shifted destinations retain plain
+    /// attributes; cached proof avoids rescanning the list on each prepend.
+    pub(crate) fn unshift_dense_array(&mut self, len: usize, items: &[Value]) -> bool {
+        let Some(next) = len
+            .checked_add(items.len())
+            .filter(|&n| n <= u32::MAX as usize)
+        else {
+            return false;
+        };
+        if !self.elem_mode.get() || self.has_far.get() {
+            return false;
+        }
+        let Some(length) = self.length_property() else {
+            return false;
+        };
+        if !length.writable() || length.number_value() != Some(len as f64) {
+            return false;
+        }
+        if len == 0 && !self.elems.packed_is_some() {
+            if self.elems.len() != 0 {
+                return false;
+            }
+        } else if !self.elems.packed_ref().is_some_and(|p| p.len() == len)
+            || !self.elems.packed_all_plain()
+        {
+            return false;
+        }
+        self.note_structural();
+        let mirror = self.mirror_flags & MIRROR_OK != 0
+            && self.elems.mirror_len() == len
+            && (len == 0 || self.mirror_flags & MIRROR_PACKED != 0)
+            && items
+                .iter()
+                .all(|value| matches!(value, Value::Num(n) if n.to_bits() != MIRROR_HOLE));
+        if mirror {
+            let buffers = self.elems.buffers_mut();
+            buffers
+                .mirror
+                .prepend(items.iter().map(|value| match value {
+                    Value::Num(n) => *n,
+                    _ => unreachable!(),
+                }));
+            self.mirror_flags |= MIRROR_PACKED;
+            if items
+                .iter()
+                .any(|value| matches!(value, Value::Num(n) if !f64_exact_i32(*n)))
+            {
+                self.mirror_flags &= !MIRROR_ALL_I32;
+            }
+        } else {
+            self.mirror_invalidate();
+        }
+        let buffers = self.elems.buffers_mut();
+        if buffers.packed.is_none() && next <= INLINE_PACKED_CAPACITY {
+            buffers.inline_packed.prepend(items);
+        } else {
+            if buffers.packed.is_none() {
+                buffers.packed = Some(Box::new(buffers.inline_packed.into_vec().into()));
+            }
+            buffers
+                .packed
+                .as_deref_mut()
+                .unwrap()
+                .prepend(items.iter().map(|item| Property::plain(item.clone())));
+        }
+        buffers
+            .inline_packed
+            .packed_plain
+            .set(items.iter().all(|value| !matches!(value, Value::Empty)));
+        self.set_array_length_value(next as f64);
+        true
     }
 
     /// The entry slot for `key`. Small maps (≤ [`INDEX_THRESHOLD`] entries — most objects) have
@@ -5823,8 +6217,8 @@ impl Props {
         self.elems.release_symbol_key(key);
         true
     }
-    /// Keys in insertion order. Private-name slots (`#x`) are never enumerable/observable, so they
-    /// are excluded here (and from [`ordered_keys`]); private access reads them via [`get`] directly.
+    /// Ordinary property keys in insertion order. Engine state and private elements live in a
+    /// separate slot map and never participate in ordinary key, descriptor or lookup operations.
     pub(crate) fn keys(&self) -> Vec<Rc<str>> {
         self.elems
             .packed_ref()
@@ -5833,7 +6227,6 @@ impl Props {
             .filter(|(_, p)| !p.is_empty())
             .map(|(n, _)| index_key(n))
             .chain(self.entries.iter().map(|(k, _)| k.clone()))
-            .filter(|k| !crate::interpreter::Interp::is_private_key(k))
             .collect()
     }
     /// Keys in spec [[OwnPropertyKeys]] order: array-index keys ascending, then other string keys
@@ -5852,9 +6245,6 @@ impl Props {
             );
         }
         for k in self.entries.keys() {
-            if crate::interpreter::Interp::is_private_key(k) {
-                continue; // private-element slot — not an observable own key
-            }
             if crate::interpreter::Interp::is_sym_key(k) {
                 syms.push(k.clone());
             } else if let Some(n) = canonical_index(k) {
@@ -5929,10 +6319,7 @@ impl Props {
             .flat_map(|p| p.iter())
             .filter(|p| !p.is_empty())
             .all(valid)
-            && self
-                .entries
-                .iter()
-                .all(|(k, p)| crate::interpreter::Interp::is_private_key(k) || valid(p))
+            && self.entries.iter().all(|(_, p)| valid(p))
     }
 }
 
@@ -5978,6 +6365,13 @@ pub fn set_data(obj: &Gc, key: &str, value: Value) {
 /// Convenience: define a non-enumerable builtin property by key/value.
 pub fn set_builtin(obj: &Gc, key: &str, value: Value) {
     obj.borrow_mut().props.insert(key, Property::builtin(value));
+}
+
+/// Set engine-only state without exposing an ECMAScript property.
+pub(crate) fn set_internal_slot(obj: &Gc, key: &str, value: Value) {
+    obj.borrow_mut()
+        .internal_slots_mut()
+        .insert(key, Property::plain(value));
 }
 
 /// IEEE-754 half-precision (binary16) to single-precision conversion.

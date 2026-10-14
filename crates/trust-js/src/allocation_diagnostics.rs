@@ -498,7 +498,7 @@ impl PropertyInventory {
                 result.dense_eligibility.heap_vectors = 1;
                 result.dense_heap_packed_vectors = 1;
                 result.dense_heap_packed_vector_header_bytes =
-                    std::mem::size_of::<Vec<Property>>() as u64;
+                    std::mem::size_of::<super::DenseDeque<Property>>() as u64;
                 result.dense_heap_packed_capacity = packed.capacity() as u64;
                 result.dense_heap_packed_unused_capacity =
                     packed.capacity().saturating_sub(packed.len()) as u64;

@@ -15,7 +15,7 @@ fn array(engine: &mut Engine, name: &str) -> crate::value::Gc {
     let global = crate::value::Value::Obj(engine.interp.global.clone());
     engine
         .interp
-        .get_member(&global, name)
+        .get_member_key(&global, name)
         .unwrap_or_else(|_| panic!("{name}"))
         .as_obj()
         .unwrap()
@@ -82,6 +82,50 @@ fn numeric_array_shift_keeps_warm_native_views_coherent_across_gc_and_append() {
                 (total + 96).to_string()
             );
             entered(tier);
+        }
+    }
+}
+
+#[test]
+fn numeric_front_edits_reload_native_views_within_the_same_activation() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            var frontValues=[];
+            for(var k=1;k<=64;k++)frontValues.push(k);
+            function editFront(a,n){
+                var total=0;
+                for(var k=0;k<n;k++){
+                    total+=a[0];
+                    var first=a.shift();
+                    total+=a[0];
+                    a.unshift(first);
+                    total+=a[0];
+                    a.push(first+20);
+                    total+=a.pop();
+                }
+                return total;
+            }
+        "#,
+        );
+        for _ in 0..8 {
+            reset_entries();
+            assert_eq!(eval(&mut engine, "editFront(frontValues,80)"), "2000");
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "frontValues.length+':'+frontValues[0]+':'+frontValues[63]"
+                ),
+                "64:1:64"
+            );
+            engine
+                .interp
+                .gc_collect_young(crate::value::GcCause::Explicit);
+            engine.interp.gc_collect();
         }
     }
 }

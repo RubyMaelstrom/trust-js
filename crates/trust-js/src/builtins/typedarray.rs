@@ -28,7 +28,11 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         require_shared_buffer(i, &this)?;
         let p = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))?;
         Ok(Value::Num(i.array_buffer_byte_length(p).unwrap_or(0) as f64))
@@ -38,7 +42,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         this.as_obj()
             .and_then(|o| {
                 o.borrow()
-                    .props
+                    .internal_slots()
                     .get("#\u{0}abMaxByteLength")
                     .map(|p| p.value())
             })
@@ -47,7 +51,12 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     sab_getter(it, &proto, "growable", |i, this, _| {
         require_shared_buffer(i, &this)?;
         this.as_obj()
-            .and_then(|o| o.borrow().props.get("#\u{0}abResizable").map(|p| p.value()))
+            .and_then(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .get("#\u{0}abResizable")
+                    .map(|p| p.value())
+            })
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))
     });
     // grow(newLength): only allowed for a growable buffer and only to a larger size.
@@ -167,7 +176,7 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let mut max: Option<f64> = None;
         if let Value::Obj(_) = arg(a, 1) {
-            let mbl = ab(i.get_member(&arg(a, 1), "maxByteLength"))?;
+            let mbl = ab(i.get_member_key(&arg(a, 1), "maxByteLength"))?;
             if !matches!(mbl, Value::Undefined) {
                 let m = ab(i.to_number(&mbl))?;
                 let m = if m.is_nan() { 0.0 } else { m.trunc() };
@@ -189,12 +198,19 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         // The Shared Data Block holds the bytes (zeroed, allocated fallibly); it counts toward
         // the collector's buffer pressure like an ArrayBuffer's block.
         i.note_buffer_allocation(len);
-        let Some(id) = crate::interpreter::alloc_shared_mem(len) else {
-            return Err(i.make_error("RangeError", "Array buffer allocation failed"));
+        let capacity = max.unwrap_or(n) as usize;
+        let block = match crate::interpreter::alloc_shared_mem_with_capacity(len, capacity) {
+            Some(block) => block,
+            None => {
+                i.collect_for_failed_allocation();
+                crate::interpreter::alloc_shared_mem_with_capacity(len, capacity)
+                    .ok_or_else(|| i.make_error("RangeError", "Array buffer allocation failed"))?
+            }
         };
+        let id = block.id();
         let bp = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, BufferData::Shared(id));
+        i.array_buffers.insert(bp, BufferData::Shared(block));
         set_internal(&obj, "#\u{0}abMaxByteLength", Value::Num(max.unwrap_or(n)));
         set_internal(&obj, "#\u{0}abResizable", Value::Bool(max.is_some()));
         set_internal(&obj, "#\u{0}sab_id", Value::Num(id as f64));
@@ -226,7 +242,11 @@ fn ab_transfer_fixed(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, 
 fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Result<Value, Value> {
     let o = this
         .as_obj()
-        .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+        .filter(|o| {
+            o.borrow()
+                .internal_slots()
+                .contains("#\u{0}abMaxByteLength")
+        })
         .cloned()
         .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
     let ptr = Rc::as_ptr(&o) as usize;
@@ -259,6 +279,9 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
     // ArrayBufferCopyAndDetach: transfer() preserves the source's resizability (its
     // [[ArrayBufferMaxByteLength]] slot); transferToFixedLength() is always fixed.
     let src_max = resizable_max_byte_length(&this);
+    if !fixed && src_max.is_some_and(|max| new_len > max) {
+        return Err(i.make_error("RangeError", "ArrayBuffer transfer exceeds maxByteLength"));
+    }
     // The new buffer takes over the source's block rather than a copy: this is the engine
     // primitive behind HTML structured transfer, and same-length transfers must remain O(1) in
     // backing-store bytes. AllocateArrayBuffer precedes DetachArrayBuffer, so the block grows
@@ -298,12 +321,18 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
 fn resizable_max_byte_length(this: &Value) -> Option<usize> {
     let o = this.as_obj()?.borrow();
     if !matches!(
-        o.props.get("#\u{0}abResizable").map(|p| p.value()),
+        o.internal_slots()
+            .get("#\u{0}abResizable")
+            .map(|p| p.value()),
         Some(Value::Bool(true))
     ) {
         return None;
     }
-    match o.props.get("#\u{0}abMaxByteLength").map(|p| p.value()) {
+    match o
+        .internal_slots()
+        .get("#\u{0}abMaxByteLength")
+        .map(|p| p.value())
+    {
         Some(Value::Num(max)) => Some(max as usize),
         _ => None,
     }
@@ -323,13 +352,21 @@ fn to_index(i: &mut Interp, value: &Value) -> Result<usize, Value> {
 /// specification requires when they cannot be allocated, where an infallible allocation would
 /// abort the process.
 pub(crate) fn create_byte_data_block(i: &mut Interp, len: usize) -> Result<Vec<u8>, Value> {
+    create_byte_data_block_with_capacity(i, len, len)
+}
+
+fn create_byte_data_block_with_capacity(
+    i: &mut Interp,
+    len: usize,
+    capacity: usize,
+) -> Result<Vec<u8>, Value> {
     i.note_buffer_allocation(len);
-    if let Some(block) = crate::interpreter::try_zeroed_bytes(len) {
+    if let Some(block) = crate::interpreter::try_zeroed_bytes_with_capacity(len, capacity) {
         return Ok(block);
     }
     // Unreachable buffers still hold their data until a collection finds them.
     i.collect_for_failed_allocation();
-    crate::interpreter::try_zeroed_bytes(len)
+    crate::interpreter::try_zeroed_bytes_with_capacity(len, capacity)
         .ok_or_else(|| i.make_error("RangeError", "Array buffer allocation failed"))
 }
 
@@ -387,7 +424,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         let p = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         // Detached (absent from the side table) → 0.
@@ -397,7 +438,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         match this.as_obj().and_then(|o| {
             o.borrow()
-                .props
+                .internal_slots()
                 .get("#\u{0}abMaxByteLength")
                 .map(|pr| pr.value())
         }) {
@@ -416,7 +457,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         match this.as_obj().and_then(|o| {
             o.borrow()
-                .props
+                .internal_slots()
                 .get("#\u{0}abResizable")
                 .map(|pr| pr.value())
         }) {
@@ -428,7 +469,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         let o = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         Ok(Value::Bool(!i.buffer_attached(Rc::as_ptr(o) as usize)))
     });
@@ -436,7 +481,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         let o = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         Ok(Value::Bool(
             i.immutable_buffers.contains(&(Rc::as_ptr(o) as usize)),
@@ -447,7 +496,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         let o = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .ok_or_else(|| {
                 i.make_error(
                     "TypeError",
@@ -476,7 +529,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let ctor = species_constructor(i, &this, &ab_ctor)?;
         let new_buf = ab(i.construct(ctor, &[Value::Num(new_len as f64)]))?;
         let nptr = match &new_buf {
-            Value::Obj(no) if no.borrow().props.contains("#\u{0}abMaxByteLength") => {
+            Value::Obj(no)
+                if no
+                    .borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength") =>
+            {
                 Rc::as_ptr(no) as usize
             }
             _ => {
@@ -533,7 +591,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         // [[ArrayBufferMaxByteLength]]) — a fixed-length buffer lacks it — before any coercion.
         let o = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .cloned()
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         let ptr = Rc::as_ptr(&o) as usize;
@@ -570,7 +632,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         reject_shared_buffer(i, &this)?;
         let ptr = this
             .as_obj()
-            .filter(|o| o.borrow().props.contains("#\u{0}abMaxByteLength"))
+            .filter(|o| {
+                o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength")
+            })
             .map(|o| Rc::as_ptr(o) as usize)
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
         // A SharedArrayBuffer was rejected above: an ArrayBuffer without its own bytes is detached.
@@ -615,18 +681,18 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         // ToIndex(length): NaN → 0, truncate; negative or non-finite is a RangeError.
         let n = ab(i.to_number(&arg(a, 0)))?;
         let n = if n.is_nan() { 0.0 } else { n.trunc() };
-        if n < 0.0 || !n.is_finite() {
+        if !(0.0..=9007199254740991.0).contains(&n) {
             return Err(i.make_error("RangeError", "Invalid ArrayBuffer length"));
         }
         // GetArrayBufferMaxByteLengthOption: coerced before the object is created.
         let max: Option<f64> = if let Value::Obj(_) = arg(a, 1) {
-            let mbl = ab(i.get_member(&arg(a, 1), "maxByteLength"))?;
+            let mbl = ab(i.get_member_key(&arg(a, 1), "maxByteLength"))?;
             if matches!(mbl, Value::Undefined) {
                 None
             } else {
                 let m = ab(i.to_number(&mbl))?;
                 let m = if m.is_nan() { 0.0 } else { m.trunc() };
-                if m < 0.0 || !m.is_finite() {
+                if !(0.0..=9007199254740991.0).contains(&m) {
                     return Err(i.make_error("RangeError", "Invalid maxByteLength"));
                 }
                 Some(m)
@@ -645,7 +711,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if n as usize > MAX_BUFFER_BYTES || max.is_some_and(|m| m as usize > MAX_BUFFER_BYTES) {
             return Err(i.make_error("RangeError", "ArrayBuffer allocation too large"));
         }
-        let block = create_byte_data_block(i, n as usize)?;
+        let block = create_byte_data_block_with_capacity(i, n as usize, max.unwrap_or(n) as usize)?;
         let p = Rc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.array_buffers
@@ -667,7 +733,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let is_view = match arg(a, 0) {
             Value::Obj(o) => {
                 i.typed_arrays.contains_key(&(Rc::as_ptr(&o) as usize))
-                    || o.borrow().props.contains("#\u{0}dv_buffer")
+                    || o.borrow().internal_slots().contains("#\u{0}dv_buffer")
             }
             _ => false,
         };
@@ -761,7 +827,7 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
         method,
         "map" | "filter" | "slice" | "toReversed" | "toSorted" | "with"
     ) {
-        let len = ab(i.get_member(&result, "length"))?;
+        let len = ab(i.get_member_key(&result, "length"))?;
         let len = ab(i.to_number(&len))? as usize;
         let new_ta = ta_species_create(i, this, info.kind, &[Value::Num(len as f64)], true)?;
         // SpeciesConstructor access can run user code that detaches the source — re-validate.
@@ -772,8 +838,8 @@ fn ta_delegate(i: &mut Interp, this: &Value, method: &str, args: &[Value]) -> Re
             ));
         }
         for k in 0..len {
-            let v = ab(i.get_member(&result, &k.to_string()))?;
-            ab(i.set_member(&new_ta, &k.to_string(), v))?;
+            let v = ab(i.get_member_key(&result, &k.to_string()))?;
+            ab(i.set_member_key(&new_ta, &k.to_string(), v))?;
         }
         return Ok(new_ta);
     }
@@ -1577,13 +1643,13 @@ fn ta_species_create(
     args: &[Value],
     write: bool,
 ) -> Result<Value, Value> {
-    let default_ctor = ab(i.get_member(&Value::Obj(i.global.clone()), kind.name()))?;
-    let ctor = ab(i.get_member(this, "constructor"))?;
+    let default_ctor = ab(i.get_member_key(&Value::Obj(i.global.clone()), kind.name()))?;
+    let ctor = ab(i.get_member_key(this, "constructor"))?;
     let chosen = if matches!(ctor, Value::Undefined) {
         default_ctor
     } else if matches!(ctor, Value::Obj(_)) {
         let species_key = well_known_key(i, "species").unwrap_or_default();
-        let species = ab(i.get_member(&ctor, &species_key))?;
+        let species = ab(i.get_member_key(&ctor, &species_key))?;
         if matches!(species, Value::Undefined | Value::Null) {
             default_ctor
         } else {
@@ -1682,7 +1748,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         _ => None,
     };
     let proto = match &i.new_target.clone() {
-        nt @ Value::Obj(_) => match ab(i.get_member(nt, "prototype"))? {
+        nt @ Value::Obj(_) => match ab(i.get_member_key(nt, "prototype"))? {
             Value::Obj(p) => Some(p),
             _ => ctor_realm_proto(i, nt, kind.name())?
                 .or_else(|| i.extra_protos.get(kind.name()).cloned()),
@@ -1752,7 +1818,9 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
         // fall through to the array-like path — using a detached buffer is a TypeError).
         Some(Value::Obj(o))
             if i.buffer_attached(Rc::as_ptr(o) as usize)
-                || o.borrow().props.contains("#\u{0}abMaxByteLength") =>
+                || o.borrow()
+                    .internal_slots()
+                    .contains("#\u{0}abMaxByteLength") =>
         {
             let bp = Rc::as_ptr(o) as usize;
             let bv = Value::Obj(o.clone());
@@ -1780,7 +1848,10 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             // A resizable ArrayBuffer or a growable SharedArrayBuffer makes an auto-length view
             // length-tracking.
             let resizable = matches!(
-                o.borrow().props.get("#\u{0}abResizable").map(|p| p.value()),
+                o.borrow()
+                    .internal_slots()
+                    .get("#\u{0}abResizable")
+                    .map(|p| p.value()),
                 Some(Value::Bool(true))
             );
             let len = match len_arg {
@@ -1821,7 +1892,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             // callable one is used (so a patched Array.prototype[@@iterator] is honored).
             let iter_key = well_known_key(i, "iterator");
             let iter_method = match &iter_key {
-                Some(k) => ab(i.get_member(other, k))?,
+                Some(k) => ab(i.get_member_key(other, k))?,
                 None => Value::Undefined,
             };
             if !matches!(iter_method, Value::Undefined | Value::Null) && !iter_method.is_callable()
@@ -1876,7 +1947,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                         .and_then(|object| i.fast_get_elem(object, k as f64));
                     let value = match own {
                         Some(value) => value,
-                        None => ab(i.get_member(other, &k.to_string()))?,
+                        None => ab(i.get_member_key(other, &k.to_string()))?,
                     };
                     ab(i.ta_store(&info, k, &value))?;
                 }
@@ -2068,7 +2139,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     }
     let src = Value::Obj(src);
     for k in 0..src_len {
-        let item = ab(i.get_member(&src, &k.to_string()))?;
+        let item = ab(i.get_member_key(&src, &k.to_string()))?;
         ab(i.ta_store(&info, offset + k, &item))?;
     }
     Ok(Value::Undefined)
@@ -2087,7 +2158,7 @@ fn ta_subarray(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Val
     let len = i.ta_len(&info).unwrap_or(0);
     let begin = rel_index(ab(i.to_number(&arg(args, 0)))?, len);
     let new_offset = info.offset + begin * es;
-    let buf_val = ab(i.get_member(&this, "buffer"))?;
+    let buf_val = ab(i.get_member_key(&this, "buffer"))?;
     // A length-tracking source subarrayed with no explicit end stays length-tracking: pass only
     // «buffer, byteOffset» so the result auto-sizes to the buffer (TypedArraySpeciesCreate honors
     // a subclass `@@species`).
@@ -2186,7 +2257,7 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
             if matches!(v, Value::Undefined | Value::Null) {
                 continue;
             }
-            let tls = ab(i.get_member(&v, "toLocaleString"))?;
+            let tls = ab(i.get_member_key(&v, "toLocaleString"))?;
             if !tls.is_callable() {
                 return Err(i.make_error("TypeError", "toLocaleString is not a function"));
             }
@@ -2527,7 +2598,7 @@ fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
 }
 fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
     if let Value::Obj(_) = opts {
-        let a = ab(i.get_member(opts, "alphabet"))?;
+        let a = ab(i.get_member_key(opts, "alphabet"))?;
         match a {
             Value::Undefined => Ok(false),
             Value::Str(s) if &*s == "base64" => Ok(false),
@@ -2545,7 +2616,7 @@ fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
 fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), Value> {
     let url = b64_option_url(i, opts)?;
     let handling = if let Value::Obj(_) = opts {
-        match ab(i.get_member(opts, "lastChunkHandling"))? {
+        match ab(i.get_member_key(opts, "lastChunkHandling"))? {
             Value::Undefined => crate::lstr::LStr::from("loose"),
             Value::Str(s) if matches!(&*s, "loose" | "strict" | "stop-before-partial") => s,
             _ => {
@@ -2588,7 +2659,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
         u8_validate(i, &this)?;
         let url = b64_option_url(i, &arg(a, 0))?;
         let omit_padding = if let Value::Obj(_) = arg(a, 0) {
-            let op = ab(i.get_member(&arg(a, 0), "omitPadding"))?;
+            let op = ab(i.get_member_key(&arg(a, 0), "omitPadding"))?;
             i.to_boolean(&op)
         } else {
             false
@@ -2706,7 +2777,7 @@ fn ta_of(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let ta = ab(i.construct(this, &len_args))?;
     let ta = ta_validate_created(i, ta, &len_args, true)?;
     for (k, v) in args.iter().enumerate() {
-        ab(i.set_member(&ta, &k.to_string(), v.clone()))?;
+        ab(i.set_member_key(&ta, &k.to_string(), v.clone()))?;
     }
     Ok(ta)
 }
@@ -2730,7 +2801,7 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     // getter propagates. A callable result means the source is iterated; otherwise it is array-like.
     let iter_key = well_known_key(i, "iterator");
     let using_iter = match &iter_key {
-        Some(k) => ab(i.get_member(&source, k))?,
+        Some(k) => ab(i.get_member_key(&source, k))?,
         None => Value::Undefined,
     };
     if !matches!(using_iter, Value::Undefined | Value::Null) && !using_iter.is_callable() {
@@ -2749,7 +2820,7 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
             } else {
                 v
             };
-            ab(i.set_member(&ta, &k.to_string(), val))?;
+            ab(i.set_member_key(&ta, &k.to_string(), val))?;
         }
         return Ok(ta);
     }
@@ -2761,13 +2832,13 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
     let ta = ab(i.construct(this, &len_args))?;
     let ta = ta_validate_created(i, ta, &len_args, true)?;
     for k in 0..len {
-        let v = ab(i.get_member(&src, &k.to_string()))?;
+        let v = ab(i.get_member_key(&src, &k.to_string()))?;
         let val = if let Some(mapfn) = &mapfn {
             ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
         } else {
             v
         };
-        ab(i.set_member(&ta, &k.to_string(), val))?;
+        ab(i.set_member_key(&ta, &k.to_string(), val))?;
     }
     Ok(ta)
 }

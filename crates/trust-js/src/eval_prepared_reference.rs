@@ -364,7 +364,7 @@ impl Interp {
                         Ok(Value::Undefined)
                     };
                 }
-                self.get_member(&object, name)
+                self.get_member_key(&object, name)
             }
             REFERENCE_UNRESOLVABLE => {
                 let name = &reference.name;
@@ -479,7 +479,7 @@ impl Interp {
         strict: bool,
     ) -> Result<(), Abrupt> {
         let saved = std::mem::replace(&mut self.strict, strict);
-        let result = self.set_member(object, name, value);
+        let result = self.set_member_key(object, name, value);
         self.strict = saved;
         result
     }

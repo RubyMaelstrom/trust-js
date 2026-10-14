@@ -218,3 +218,74 @@ fn array_shift_warm_calls_keep_named_symbols_owners_and_old_to_young_edges() {
         "4950",
     );
 }
+
+#[test]
+fn array_end_edits_keep_logical_indices_descriptors_and_gc_roots_after_relocation() {
+    check(
+        r#"
+        function prepend(a,v){return a.unshift(v);}
+        function append(a,v){return a.push(v);}
+        function take(a){return a.shift();}
+        function scan(a){var sum=0;for(var k=0;k<a.length;k++)sum+=a[k].id;return sum;}
+        var a=[],key=Symbol('tail'),named={id:987};a.named=named;a[key]=named;
+        for(var k=0;k<48;k++)append(a,{id:k});
+        collectShiftTest();
+        for(var k=0;k<160;k++){
+            if(take(a).id!==k)throw 'FIFO';
+            append(a,{id:k+48});
+            if(scan(a)!==48*k+1176)throw 'logical read';
+            if(k%17===0)collectShiftTest();
+        }
+        for(var k=0;k<160;k++){
+            var item={id:-k-1};prepend(a,item);
+            if(a[0]!==item||a.length!==49)throw 'prepend';
+            if(a.pop().id!==(k<48?207-k:47-k))throw 'pop';
+            if(k%13===0)collectShiftYoungTest();
+        }
+        if(a.named!==named||a[key]!==named)throw 'named owner';
+        for(var k=0;k<80;k++){
+            var object={id:k};prepend(a,object);
+            if(take(a)!==object||a.length!==48)throw 'both ends';
+        }
+        // A descriptor escape after the cached plain-list proof must restore the
+        // ordered generic algorithm, including its partial writes before throwing.
+        Object.defineProperty(a,'1',{writable:false});
+        var first=a[0],second=a[1],caught=false;
+        try{take(a)}catch(e){caught=e instanceof TypeError}
+        if(!caught||a[0]!==second||a[1]!==second||a.length!==48)throw 'cached descriptor proof';
+        Object.defineProperty(a,'1',{writable:true});
+        delete a[2];
+        a.reverse();var removed=a.splice(2,3,{id:700},{id:701});
+        if(removed.length!==3||a.length!==47||a[2].id!==700||a[3].id!==701)throw 'general edits';
+        a.length=3;collectShiftTest();
+        if(a.length!==3||Object.hasOwn(a,3)||a.named!==named||a[key]!==named)throw 'truncation';
+        'ok'
+        "#,
+        "ok",
+    );
+}
+
+#[test]
+fn unshift_revalidates_changed_prototypes_and_failing_tail_descriptors() {
+    check(
+        r#"
+        var a=[];for(var n=0;n<32;n++)a.push(n);
+        a.unshift(-1);a.shift();
+        var seen=[],proto=Object.create(Array.prototype);
+        Object.defineProperty(proto,'32',{configurable:true,set(v){seen.push(v)}});
+        Object.setPrototypeOf(a,proto);
+        if(a.unshift(-2)!==33||seen.join(',')!=='31'||Object.hasOwn(a,32)||a[0]!==-2)throw 'prototype guard';
+        var b=[];for(var n=0;n<32;n++)b.push(n);
+        b.unshift(-1);b.shift();
+        Object.defineProperty(b,'31',{writable:false});
+        var caught=false;try{b.unshift(-2)}catch(e){caught=e instanceof TypeError}
+        if(!caught||b.length!==33||b[32]!==31||b[31]!==31||b[0]!==0)throw 'partial write';
+        var c=[];for(var n=0;n<16;n++)c.push(n);
+        c.shift();Object.preventExtensions(c);caught=false;
+        try{c.unshift(-2)}catch(e){caught=e instanceof TypeError}
+        if(!caught||c.length!==15||c[0]!==1)throw 'nonextensible';
+        'ok'
+        "#,
+        "ok",
+    );
+}

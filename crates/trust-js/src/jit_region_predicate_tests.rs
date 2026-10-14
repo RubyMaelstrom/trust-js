@@ -256,7 +256,7 @@ fn region_predicates_native_peeks_do_not_call_condition_helper() {
         Ok(Completion::Value(_))
     ));
     let global = Value::Obj(engine.interp.global.clone());
-    let function = engine.interp.get_member(&global, "f").ok().unwrap();
+    let function = engine.interp.get_member_key(&global, "f").ok().unwrap();
     let regions = EXECUTED_REGIONS.with(std::cell::Cell::get);
     let helpers = crate::bytecode::TEST_JIT_COND_HELPERS.with(std::cell::Cell::get);
     for (x, y, want) in [(1.0, 1.0, 1.0), (1.0, 2.0, 2.0), (0.0, 0.0, 0.0)] {

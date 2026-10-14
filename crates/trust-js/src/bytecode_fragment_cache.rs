@@ -269,7 +269,8 @@ impl Cache {
         let bytes = crate::memory::fragment_plan_charge(&plan.chunk)
             .saturating_add(plan.source_bytes)
             .saturating_add(std::mem::size_of::<Plan>())
-            .saturating_add(plan.seed_slots.capacity() * std::mem::size_of::<u16>());
+            .saturating_add(plan.seed_slots.capacity() * std::mem::size_of::<u16>())
+            .saturating_add(plan.private_slots.capacity() * std::mem::size_of::<(Rc<str>, u16)>());
         if bytes > PLAN_BYTES {
             if let Some(storage) = &mut self.storage {
                 for entry in &mut storage.entries {
@@ -362,7 +363,11 @@ impl Cache {
                 // Full memory reporting includes the shared source/callee graph, independently
                 // of the deliberately plan-only eviction charge above.
                 bytes += std::mem::size_of::<Plan>()
-                    + plan.seed_slots.capacity() * std::mem::size_of::<u16>();
+                    + plan.seed_slots.capacity() * std::mem::size_of::<u16>()
+                    + plan.private_slots.capacity() * std::mem::size_of::<(Rc<str>, u16)>();
+                for (name, _) in &plan.private_slots {
+                    visitor.rc_str(name);
+                }
                 visitor.chunk(&plan.chunk);
             }
         }
@@ -390,6 +395,7 @@ mod tests {
             chunk,
             completion_slot: 0,
             seed_slots: Vec::new(),
+            private_slots: Vec::new(),
             active: Cell::new(0),
         })
     }

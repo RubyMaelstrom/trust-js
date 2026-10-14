@@ -9,7 +9,7 @@ use super::{
     make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Value};
+use crate::value::{set_data, set_internal_slot, Value};
 
 pub fn install(it: &mut Interp, ns: &crate::value::Gc) {
     let (ctor, proto) = make_service(it, ns, "ListFormat", 0, construct);
@@ -54,10 +54,10 @@ fn construct(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     if let Some(proto) = instance_proto(i, "Intl.ListFormat")? {
         obj.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&obj, "#\u{0}lf", Value::Bool(true));
-    set_builtin(&obj, "#\u{0}lf_locale", Value::lstr(resolved.locale));
-    set_builtin(&obj, "#\u{0}lf_type", Value::lstr(kind));
-    set_builtin(&obj, "#\u{0}lf_style", Value::lstr(style));
+    set_internal_slot(&obj, "#\u{0}lf", Value::Bool(true));
+    set_internal_slot(&obj, "#\u{0}lf_locale", Value::lstr(resolved.locale));
+    set_internal_slot(&obj, "#\u{0}lf_type", Value::lstr(kind));
+    set_internal_slot(&obj, "#\u{0}lf_style", Value::lstr(style));
     Ok(Value::Obj(obj))
 }
 
@@ -185,7 +185,7 @@ fn assemble_segments(parts: &[String], patterns: [&'static str; 4], lang: &str) 
 
 fn format(i: &mut Interp, this: &Value, list: &Value, to_parts: bool) -> Result<Value, Value> {
     let o = brand_slot(i, this, "#\u{0}lf")?;
-    let get = |k: &str| match o.borrow().props.get(k).map(|p| p.value()) {
+    let get = |k: &str| match o.borrow().internal_slots().get(k).map(|p| p.value()) {
         Some(Value::Str(s)) => s.to_string(),
         _ => String::new(),
     };
@@ -220,7 +220,7 @@ fn resolved_options(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, 
     let o = brand_slot(i, &this, "#\u{0}lf")?;
     let get = |k: &str| {
         o.borrow()
-            .props
+            .internal_slots()
             .get(k)
             .map(|p| p.value())
             .unwrap_or(Value::Undefined)

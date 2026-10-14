@@ -306,7 +306,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             .async_wait_inbox
             .get_or_insert_with(Default::default)
             .clone();
-        let waiter = (timeout != Some(Duration::ZERO)).then(|| Waiter::Async(inbox, token));
+        let waiter = (timeout != Some(Duration::ZERO)).then_some(Waiter::Async(inbox, token));
         if let Err(value) = enqueue_waiter(&info, byte_index, id, expected, waiter) {
             set_data(&result, "async", Value::Bool(false));
             set_data(&result, "value", Value::lstr(value));
@@ -316,10 +316,12 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // A notify resolves the promise (this agent's at once, another agent's through this
         // agent's inbox), or this agent's job checkpoints time it out (settle_async_waits).
         let promise = i.new_promise();
+        let block = i.shared_block(info.buffer).unwrap().clone();
         i.pending_async_waits.push(AsyncWait {
             promise: promise.clone(),
             token,
             id,
+            block,
             index: byte_index,
             // A timeout too far away to represent never elapses.
             deadline: timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout)),

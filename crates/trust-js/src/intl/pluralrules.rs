@@ -9,7 +9,7 @@ use super::{
     ab, arg, canonicalize_locale_list, get_options_object as coerce_options, make_service,
 };
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "PluralRules", 0, construct);
@@ -59,7 +59,7 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
 
     let raw_digits = super::numberformat::read_raw_digits(i, &options)?;
     let rounding_increment = {
-        let value = ab(i.get_member(&options, "roundingIncrement"))?;
+        let value = ab(i.get_member_key(&options, "roundingIncrement"))?;
         if matches!(value, Value::Undefined) {
             1
         } else {
@@ -136,53 +136,53 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     if let Some(proto) = instance_proto(i, "Intl.PluralRules")? {
         object.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&object, "#\u{0}pr", Value::Bool(true));
-    set_builtin(&object, "#\u{0}pr_locale", Value::lstr(resolved.locale));
-    set_builtin(&object, "#\u{0}pr_type", Value::lstr(kind));
-    set_builtin(&object, "#\u{0}pr_notation", Value::lstr(notation));
-    set_builtin(
+    set_internal_slot(&object, "#\u{0}pr", Value::Bool(true));
+    set_internal_slot(&object, "#\u{0}pr_locale", Value::lstr(resolved.locale));
+    set_internal_slot(&object, "#\u{0}pr_type", Value::lstr(kind));
+    set_internal_slot(&object, "#\u{0}pr_notation", Value::lstr(notation));
+    set_internal_slot(
         &object,
         "#\u{0}pr_compactdisplay",
         Value::lstr(compact_display),
     );
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_minint",
         Value::Num(digits.min_int as f64),
     );
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_minfrac",
         Value::Num(digits.min_frac as f64),
     );
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_maxfrac",
         Value::Num(digits.max_frac as f64),
     );
     if let Some(value) = digits.min_sig {
-        set_builtin(&object, "#\u{0}pr_minsig", Value::Num(value as f64));
+        set_internal_slot(&object, "#\u{0}pr_minsig", Value::Num(value as f64));
     }
     if let Some(value) = digits.max_sig {
-        set_builtin(&object, "#\u{0}pr_maxsig", Value::Num(value as f64));
+        set_internal_slot(&object, "#\u{0}pr_maxsig", Value::Num(value as f64));
     }
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_roundingincrement",
         Value::Num(rounding_increment as f64),
     );
-    set_builtin(&object, "#\u{0}pr_roundingmode", Value::lstr(rounding_mode));
-    set_builtin(
+    set_internal_slot(&object, "#\u{0}pr_roundingmode", Value::lstr(rounding_mode));
+    set_internal_slot(
         &object,
         "#\u{0}pr_roundingpriority",
         Value::lstr(rounding_priority),
     );
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_roundingtype",
         Value::lstr(digits.rounding_type),
     );
-    set_builtin(
+    set_internal_slot(
         &object,
         "#\u{0}pr_trailingzero",
         Value::lstr(trailing_zero_display),
@@ -193,7 +193,7 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
 fn string_slot(object: &Gc, key: &str) -> String {
     match object
         .borrow()
-        .props
+        .internal_slots()
         .get(key)
         .map(|property| property.value())
     {
@@ -205,7 +205,7 @@ fn string_slot(object: &Gc, key: &str) -> String {
 fn number_slot(object: &Gc, key: &str) -> Option<u32> {
     match object
         .borrow()
-        .props
+        .internal_slots()
         .get(key)
         .map(|property| property.value())
     {
@@ -319,7 +319,7 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
     let get = |key: &str| {
         object
             .borrow()
-            .props
+            .internal_slots()
             .get(key)
             .map(|property| property.value())
             .unwrap_or(Value::Undefined)

@@ -178,7 +178,7 @@ fn unab(a: crate::interpreter::Abrupt) -> Value {
     }
 }
 fn getm(i: &mut Interp, o: &Value, k: &str) -> Result<Value, Value> {
-    i.get_member(o, k).map_err(unab)
+    i.get_member_key(o, k).map_err(unab)
 }
 fn def_getter(it: &Interp, proto: &Gc, name: &str, f: NativeFn) {
     let g = it.make_native(name, 0, f);
@@ -2577,8 +2577,8 @@ pub fn install(it: &mut Interp) {
                     }
                 };
                 if matches!(options, Value::Obj(_)) {
-                    let ds = i.get_member(&options, "dateStyle").map_err(unab)?;
-                    let ts = i.get_member(&options, "timeStyle").map_err(unab)?;
+                    let ds = i.get_member_key(&options, "dateStyle").map_err(unab)?;
+                    let ts = i.get_member_key(&options, "timeStyle").map_err(unab)?;
                     if required == "date" && !matches!(ts, Value::Undefined) {
                         return Err(i.make_error(
                             "TypeError",
@@ -2594,7 +2594,7 @@ pub fn install(it: &mut Interp) {
                 }
                 let ctor = crate::builtins::intl_service(i, "DateTimeFormat")?;
                 let dtf = i.construct(ctor, &[locales, options]).map_err(unab)?;
-                let fmt = i.get_member(&dtf, "format").map_err(unab)?;
+                let fmt = i.get_member_key(&dtf, "format").map_err(unab)?;
                 i.call(fmt, dtf, &[this]).map_err(unab)
             });
         }
@@ -2649,7 +2649,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
     if let Some(uo) = &user_obj {
         // A timeZone option is disallowed (the instance's zone always wins).
         if !matches!(
-            i.get_member(&user_opts, "timeZone").map_err(unab)?,
+            i.get_member_key(&user_opts, "timeZone").map_err(unab)?,
             Value::Undefined
         ) {
             return Err(i.make_error(
@@ -2672,7 +2672,10 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
             "dateStyle",
             "timeStyle",
         ] {
-            if !matches!(i.get_member(&user_opts, k).map_err(unab)?, Value::Undefined) {
+            if !matches!(
+                i.get_member_key(&user_opts, k).map_err(unab)?,
+                Value::Undefined
+            ) {
                 any_comp = true;
                 break;
             }
@@ -2692,7 +2695,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
             set_data(&opts, k, Value::lstr(v));
         }
         let user_tzname = match &user_obj {
-            Some(_) => i.get_member(&user_opts, "timeZoneName").map_err(unab)?,
+            Some(_) => i.get_member_key(&user_opts, "timeZoneName").map_err(unab)?,
             None => Value::Undefined,
         };
         if matches!(user_tzname, Value::Undefined) {
@@ -2712,9 +2715,9 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
         .map_err(unab)?;
 
     // A non-ISO instance calendar must match the formatter's resolved calendar.
-    let ropts_fn = i.get_member(&dtf, "resolvedOptions").map_err(unab)?;
+    let ropts_fn = i.get_member_key(&dtf, "resolvedOptions").map_err(unab)?;
     let ropts = i.call(ropts_fn, dtf.clone(), &[]).map_err(unab)?;
-    let dcal = match i.get_member(&ropts, "calendar").map_err(unab)? {
+    let dcal = match i.get_member_key(&ropts, "calendar").map_err(unab)? {
         Value::Str(s) => s.to_string(),
         _ => "iso8601".to_string(),
     };
@@ -2723,7 +2726,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
     }
 
     let ms = (epoch_ns / 1_000_000) as f64;
-    let fmt = i.get_member(&dtf, "format").map_err(unab)?;
+    let fmt = i.get_member_key(&dtf, "format").map_err(unab)?;
     i.call(fmt, dtf, &[Value::Num(ms)]).map_err(unab)
 }
 
@@ -2764,7 +2767,7 @@ fn sub_proto(i: &mut Interp, v: &Value) -> Result<(), Value> {
     if !matches!(nt, Value::Obj(_)) {
         return Ok(());
     }
-    let p = i.get_member(&nt, "prototype").map_err(unab)?;
+    let p = i.get_member_key(&nt, "prototype").map_err(unab)?;
     if let (Value::Obj(o), Value::Obj(po)) = (v, &p) {
         o.borrow_mut().proto = Some(po.clone());
     }

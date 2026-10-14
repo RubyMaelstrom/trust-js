@@ -141,7 +141,7 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
             sub.drain_microtasks();
             let ns = sub.module_namespace(&key);
             let value = match (&r, &ns) {
-                (Ok(_), Some(ns)) => Some(sub.get_member(ns, &name)),
+                (Ok(_), Some(ns)) => Some(sub.get_member_key(ns, &name)),
                 _ => None,
             };
             (r, ns, value)

@@ -502,10 +502,10 @@ fn parts_to_ms(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ml: i64) -> f6
 fn date_ms(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisTimeValue: the receiver must be a Date (carry the internal time slot), else TypeError.
     match this {
-        Value::Obj(o) if o.borrow().props.contains("#\u{0}date_ms") => {}
+        Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {}
         _ => return Err(i.make_error("TypeError", "this is not a Date object")),
     }
-    Ok(match ab(i.get_member(this, "#\u{0}date_ms"))? {
+    Ok(match ab(i.get_internal_slot(this, "#\u{0}date_ms"))? {
         Value::Num(n) => n,
         _ => f64::NAN,
     })
@@ -914,8 +914,13 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
         0 => now_ms(i),
         1 => match &args[0] {
             // A Date argument clones its time value directly (no valueOf call).
-            Value::Obj(o) if o.borrow().props.contains("#\u{0}date_ms") => {
-                match o.borrow().props.get("#\u{0}date_ms").map(|p| p.value()) {
+            Value::Obj(o) if o.borrow().internal_slots().contains("#\u{0}date_ms") => {
+                match o
+                    .borrow()
+                    .internal_slots()
+                    .get("#\u{0}date_ms")
+                    .map(|p| p.value())
+                {
                     Some(Value::Num(n)) => n,
                     _ => f64::NAN,
                 }
@@ -1047,7 +1052,7 @@ pub(super) fn install_date(it: &mut Interp) {
     });
     // Annex B legacy getYear/setYear (years offset from 1900).
     it.def_method(&proto, "getYear", 0, |i, this, _| {
-        let f = ab(i.get_member(&this, "getFullYear"))?;
+        let f = ab(i.get_member_key(&this, "getFullYear"))?;
         let yv = ab(i.call(f, this.clone(), &[]))?;
         let y = ab(i.to_number(&yv))?;
         Ok(Value::Num(if y.is_nan() { f64::NAN } else { y - 1900.0 }))
@@ -1124,7 +1129,7 @@ pub(super) fn install_date(it: &mut Interp) {
                 return Ok(Value::Null);
             }
         }
-        let iso = ab(i.get_member(&ov, "toISOString"))?;
+        let iso = ab(i.get_member_key(&ov, "toISOString"))?;
         if !iso.is_callable() {
             return Err(i.make_error("TypeError", "toISOString is not callable"));
         }
@@ -1264,7 +1269,7 @@ pub(super) fn install_date(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "invalid Symbol.toPrimitive hint")),
         };
         for m in methods {
-            let f = ab(i.get_member(&this, m))?;
+            let f = ab(i.get_member_key(&this, m))?;
             if f.is_callable() {
                 let r = ab(i.call(f, this.clone(), &[]))?;
                 if !matches!(r, Value::Obj(_)) {

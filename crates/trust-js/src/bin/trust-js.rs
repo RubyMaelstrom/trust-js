@@ -171,6 +171,8 @@ Options:
                           JIT is unavailable)
       --tier-threshold=N  Calls before an eligible function tiers up to a
                           compiled tier; 0 = immediately (default: 8)
+                          Long-running loops can tier up during the current call
+                          after 128 executed backedges.
 
 Environment:
   TRUST_JS_TIER=TIER         Default execution tier (--tier overrides it)

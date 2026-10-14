@@ -80,11 +80,21 @@ fn dense_shift_storage_drains_inline_packed_and_classic_without_losing_views() {
                     assert_eq!(props.shape(), shape);
                     assert!(props.get_index((len - 1) as u32).is_none());
                     assert_eq!(props.elems.mirror_len(), len - 1);
-                    assert_eq!(props.elems.mirror.as_ptr(), mirror_pointer);
+                    let mirror_front = if packed { removed + 1 } else { 0 };
+                    assert_eq!(props.elems.mirror.as_ptr(), unsafe {
+                        mirror_pointer.add(mirror_front)
+                    });
                     assert_eq!(props.mirror_holes, 0);
                     assert_ne!(props.mirror_flags & MIRROR_NO_HOLES, 0);
                     if packed && len > 1 {
-                        assert_eq!(props.elems.packed_ref().map(|p| p.as_ptr()), pointer);
+                        let expected = pointer.map(|p| {
+                            if inline {
+                                p
+                            } else {
+                                unsafe { p.add(removed + 1) }
+                            }
+                        });
+                        assert_eq!(props.elems.packed_ref().map(|p| p.as_ptr()), expected);
                     }
                     if inline {
                         assert!(
@@ -300,5 +310,95 @@ fn dense_shift_storage_preserves_numeric_bits_and_invalidates_prototype_creation
                 );
             }
         }
+    }
+}
+
+#[test]
+fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
+    let mut properties = Props::packed_array_properties(
+        [
+            Property::plain(Value::Num(1.0)),
+            Property::plain(Value::Empty),
+            Property::plain(Value::Num(3.0)),
+        ]
+        .into_iter(),
+    );
+    assert!(!properties.elems.inline_packed.packed_plain.get());
+    assert!(properties.shift_dense_array(3).is_none());
+    assert!(!properties.unshift_dense_array(3, &[Value::Num(0.0)]));
+    properties.insert("1", Property::plain(Value::Num(2.0)));
+    assert!(properties.unshift_dense_array(3, &[Value::Empty]));
+    assert!(!properties.elems.inline_packed.packed_plain.get());
+    assert!(properties.shift_dense_array(4).is_none());
+    let mut descriptor = Props::packed_array_properties(
+        [
+            Property::plain(Value::Num(1.0)),
+            Property::data(Value::Num(2.0), false, true, true),
+            Property::plain(Value::Num(3.0)),
+        ]
+        .into_iter(),
+    );
+    assert!(!descriptor.elems.inline_packed.packed_plain.get());
+    assert!(descriptor.shift_dense_array(3).is_none());
+}
+
+#[test]
+fn tiny_prepends_retain_inline_owners_before_promoting_once() {
+    let owners: Vec<_> = (0..12).map(|_| Object::new(None)).collect();
+    let mut properties = Props::packed_array_from_values(Vec::new());
+    for (index, owner) in owners.iter().enumerate() {
+        assert!(properties.unshift_dense_array(index, &[Value::Obj(owner.clone())]));
+        assert_eq!(
+            properties.elems.packed.is_none(),
+            index < INLINE_PACKED_CAPACITY
+        );
+        assert_eq!(Rc::strong_count(owner), 2);
+        for n in 0..=index {
+            assert!(
+                matches!(properties.get_index(n as u32).unwrap().value(), Value::Obj(value)
+                if Rc::ptr_eq(&value, &owners[index-n]))
+            );
+        }
+    }
+    for index in (0..12).rev() {
+        let first = properties.shift_dense_array(index + 1).unwrap();
+        assert!(matches!(&first, Value::Obj(value) if Rc::ptr_eq(value, &owners[index])));
+        drop(first);
+        assert_eq!(Rc::strong_count(&owners[index]), 1);
+    }
+    drop(properties);
+    assert!(owners.iter().all(|owner| Rc::strong_count(owner) == 1));
+}
+
+#[test]
+fn packed_plain_proof_uses_existing_inline_padding_and_clones_independently() {
+    #[allow(dead_code)]
+    struct PreviousInlinePacked {
+        len: u8,
+        slots: [std::mem::MaybeUninit<Property>; INLINE_PACKED_CAPACITY],
+    }
+    assert_eq!(
+        std::mem::size_of::<InlinePacked>(),
+        std::mem::size_of::<PreviousInlinePacked>()
+    );
+    assert_eq!(
+        std::mem::offset_of!(InlinePacked, len),
+        std::mem::offset_of!(PreviousInlinePacked, len)
+    );
+    assert_eq!(
+        std::mem::offset_of!(InlinePacked, slots),
+        std::mem::offset_of!(PreviousInlinePacked, slots)
+    );
+    for length in [3, 16] {
+        let original = numbers(length, true, false, false);
+        let mut clone = original.clone();
+        assert!(original.elems.inline_packed.packed_plain.get());
+        assert!(clone.elems.inline_packed.packed_plain.get());
+        clone.elems.packed_slice_mut().unwrap()[0] =
+            Property::data(Value::Num(0.0), false, true, true);
+        assert!(!clone.elems.inline_packed.packed_plain.get());
+        assert!(clone.shift_dense_array(length).is_none());
+        assert!(original.elems.inline_packed.packed_plain.get());
+        assert!(original.get_index(0).unwrap().writable());
     }
 }

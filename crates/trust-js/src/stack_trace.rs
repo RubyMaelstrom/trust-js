@@ -5,24 +5,31 @@
 //!
 //! Positions are byte offsets into the text of a [`ScriptSource`]. The parser records them on
 //! call, `new`, property-access, tagged-template and assignment nodes, and each compiled chunk
-//! keeps an operation-to-position table (see `bytecode::SourcePositions`). Nothing is tracked
-//! while code runs normally; only these events record a position:
+//! keeps compact operation-to-position runs (see `bytecode::SourcePositions`). Positions are
+//! published only for these events:
 //!
 //! - An explicit call (`f()`, `new C()`, `super()`, a tagged template) stores its position in
 //!   [`Interp::call_site`] for the duration of the call. Pushing a function frame moves it into
 //!   [`crate::interpreter::FnFrame::call_site`] (the native template JIT's direct calls write the
 //!   compile-time position there instead), and popping restores it, so every frame records where
-//!   its caller was. Outside an explicit call the field holds [`NO_POSITION`].
+//!   its caller was. Outside an explicit call or a checked operation in a spliced body, the field
+//!   holds [`NO_POSITION`].
+//! - A checked operation in a spliced body publishes an implicit inline marker through O(1)
+//!   inline-only PC metadata. The marker preserves the logical callee chain through getters,
+//!   setters, coercions and other callbacks; a scoped guard restores the previous position on
+//!   return, throw or continuation. Native fast paths that cannot enter author code do not publish
+//!   it.
 //! - An error the engine creates while an operation runs (a TypeError for `null.f`, a
-//!   ReferenceError, …) is captured with an unknown top position. The innermost operation with
-//!   a recorded position that the error propagates through places it ([`Interp::place_thrown`]):
+//!   ReferenceError, …) uses a published inline position when present; otherwise its top position
+//!   starts unknown. The innermost positioned operation the error propagates through places any
+//!   pending frame ([`Interp::place_thrown`]):
 //!   the tree-walker at the AST node, the bytecode VM and the JIT helpers at the operation that
 //!   failed. Every tier attributes an operation to the same node, so they agree.
 //!
 //! Line and column are computed only when a stack is formatted: columns count UTF-16 code units
 //! like V8, from a line table built on first use. Frames that were entered through an implicit
-//! call (a getter, `valueOf`, an iterator step, a Proxy trap) record no call position for their
-//! caller; that caller reports its function's start instead.
+//! call (a getter, `valueOf`, an iterator step, a Proxy trap) record no explicit call offset within
+//! the logical function that triggered them; that function reports its start instead.
 //!
 //! Captured frames hold names, positions and shared [`ScriptSource`]s, never JavaScript objects,
 //! and nothing here is Realm-specific: compiled code and its position tables serve every Realm.
@@ -41,6 +48,11 @@ pub(crate) const NO_POSITION: u32 = u32::MAX;
 /// the callee's frame (or frames, for nested splices). Byte offsets stay below this bit: a
 /// script's text is far smaller than 2 GiB.
 const INLINE_POSITION: u32 = 1 << 31;
+
+/// An implicit callback from a splice still needs its logical callee chain, but has no
+/// explicit call offset within its innermost callee (getters and coercions report its start).
+const IMPLICIT_INLINE_POSITION: u32 = 1 << 30;
+const INLINE_INDEX_MASK: u32 = IMPLICIT_INLINE_POSITION - 1;
 
 /// Whether `position` names an inline site rather than a byte offset.
 #[inline]
@@ -73,8 +85,16 @@ thread_local! {
 /// The inline sites one chunk registered, released when the chunk is dropped. A chunk's inline
 /// positions are only read while it runs (as the call position of a frame above it or of an
 /// error it raises), and captured frames keep resolved byte offsets, so none outlives it.
+/// Only inlined chunks allocate metadata; ordinary chunks retain one nullable pointer.
 #[derive(Default)]
-pub(crate) struct InlineSites(Box<[u32]>);
+pub(crate) struct InlineSites(Option<Box<InlineMetadata>>);
+
+/// Registered identities and the checked-operation lookup are distinct: only identities are
+/// unregistered on drop. Positions contain no JavaScript owners and serve every running Realm.
+struct InlineMetadata {
+    ids: Box<[u32]>,
+    implicit_positions: Box<[u32]>,
+}
 
 impl InlineSites {
     /// Register `sites` in order and return the inline position of each. An `outer` that is an
@@ -88,7 +108,7 @@ impl InlineSites {
             let mut positions: Vec<u32> = Vec::with_capacity(sites.len());
             for mut site in sites {
                 if is_inline_position(site.outer) {
-                    site.outer = positions[(site.outer & !INLINE_POSITION) as usize];
+                    site.outer = positions[inline_index(site.outer)];
                 }
                 let index = match table.free.pop() {
                     Some(index) => {
@@ -98,7 +118,7 @@ impl InlineSites {
                     None => {
                         let index = table.sites.len() as u32;
                         assert!(
-                            index < !INLINE_POSITION,
+                            index < INLINE_INDEX_MASK,
                             "inline site table exhausted its position space"
                         );
                         table.sites.push(Some(site));
@@ -107,25 +127,58 @@ impl InlineSites {
                 };
                 positions.push(index | INLINE_POSITION);
             }
-            let ids = positions.iter().map(|&p| p & !INLINE_POSITION).collect();
-            (InlineSites(ids), positions)
+            let ids = positions.iter().map(|&p| p & INLINE_INDEX_MASK).collect();
+            (
+                InlineSites(Some(Box::new(InlineMetadata {
+                    ids,
+                    implicit_positions: Box::default(),
+                }))),
+                positions,
+            )
         })
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.0.len() * std::mem::size_of::<u32>()
+        self.0.as_ref().map_or(0, |metadata| {
+            std::mem::size_of::<InlineMetadata>()
+                + (metadata.ids.len() + metadata.implicit_positions.len())
+                    * std::mem::size_of::<u32>()
+        })
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Install the dense lookup after the compiler has remapped every final inline identity.
+    pub(crate) fn set_implicit_positions(&mut self, positions: Box<[u32]>) {
+        let metadata = self.0.as_mut().expect("only inlined chunks own positions");
+        debug_assert!(metadata.implicit_positions.is_empty());
+        metadata.implicit_positions = positions;
+    }
+
+    /// O(1) checked-operation lookup. Ordinary operations and out-of-range PCs need no marker.
+    /// The compact run table remains the source of error and explicit-call positions.
+    #[inline(always)]
+    pub(crate) fn implicit_position(&self, pc: usize) -> u32 {
+        self.0
+            .as_ref()
+            .and_then(|metadata| metadata.implicit_positions.get(pc))
+            .copied()
+            .unwrap_or(NO_POSITION)
     }
 }
 
 impl Drop for InlineSites {
     fn drop(&mut self) {
-        if self.0.is_empty() {
+        let Some(metadata) = &self.0 else {
             return;
-        }
+        };
         // During thread teardown the table may already be gone; nothing can read it then.
         let _ = INLINE_SITES.try_with(|table| {
             let mut table = table.borrow_mut();
-            for &index in self.0.iter() {
+            for &index in metadata.ids.iter() {
                 table.sites[index as usize] = None;
                 table.free.push(index);
             }
@@ -137,14 +190,22 @@ impl Drop for InlineSites {
 /// [`InlineSites::register`]).
 #[inline]
 pub(crate) fn inline_position(index: u32) -> u32 {
-    debug_assert!(index < !INLINE_POSITION);
+    debug_assert!(index < INLINE_INDEX_MASK);
     index | INLINE_POSITION
+}
+
+/// Carry a splice's identity across an implicit author-code call without attributing that
+/// call to the property's or conversion's source offset.
+#[inline]
+pub(crate) fn implicit_inline_position(position: u32) -> u32 {
+    debug_assert!(is_inline_position(position));
+    position | IMPLICIT_INLINE_POSITION
 }
 
 /// The list index an inline position carries.
 #[inline]
 pub(crate) fn inline_index(position: u32) -> usize {
-    (position & !INLINE_POSITION) as usize
+    (position & INLINE_INDEX_MASK) as usize
 }
 
 /// The site an inline position names (None for a byte offset, or a site already released).
@@ -156,7 +217,7 @@ pub(crate) fn inline_site(position: u32) -> Option<InlineSite> {
         table
             .borrow()
             .sites
-            .get((position & !INLINE_POSITION) as usize)
+            .get(inline_index(position))
             .cloned()
             .flatten()
     })
@@ -168,7 +229,12 @@ pub(crate) fn inline_chain(mut position: u32) -> (Vec<(crate::value::Gc, u32)>, 
     let mut chain = Vec::new();
     while let Some(site) = inline_site(position) {
         if let Some(callee) = site.callee.upgrade() {
-            chain.push((crate::value::Gc::from(callee), site.inner));
+            let inner = if position & IMPLICIT_INLINE_POSITION != 0 {
+                NO_POSITION
+            } else {
+                site.inner
+            };
+            chain.push((crate::value::Gc::from(callee), inner));
         }
         position = site.outer;
     }
@@ -181,6 +247,10 @@ pub(crate) fn inline_chain(mut position: u32) -> (Vec<(crate::value::Gc, u32)>, 
 
 /// The depth of a frame no operation places any more (see [`Frame::depth`]).
 const PLACED_DEPTH: u32 = u32::MAX;
+
+/// A logical inline frame captured before an implicit callback's error propagates. Its
+/// innermost operation can still place it, without inserting the same splice chain again.
+const INLINE_FRAME_DEPTH: u32 = 1 << 31;
 
 /// The location V8 prints for code without a URL and for built-in frames.
 const ANONYMOUS: &str = "<anonymous>";
@@ -420,7 +490,8 @@ pub(crate) struct Frame {
     /// What an unknown position reports: the start of the function (or of the source).
     start: u32,
     /// The frame's execution-context depth ([`Interp::context_depth`] while it runs): only an
-    /// operation of that context can place its position.
+    /// operation of that context can place its position. [`INLINE_FRAME_DEPTH`] marks an
+    /// already-expanded logical splice whose innermost position still needs placement.
     depth: u32,
 }
 
@@ -753,7 +824,14 @@ impl Interp {
         let mut skipping = matches!(skip, Skip::UntilSeen(_));
         // The position of the context being visited: the innermost runs at `call_site`, each
         // outer one where it called the context above it.
-        let mut position = self.call_site;
+        // Here the checked operation is still running: an error it creates directly belongs
+        // at its source offset. The implicit marker suppresses that offset only after a
+        // callback has consumed it into its own FnFrame and we visit that frame's caller.
+        let mut position = if is_inline_position(self.call_site) {
+            self.call_site & !IMPLICIT_INLINE_POSITION
+        } else {
+            self.call_site
+        };
         let mut function = self.fn_frames.len();
         let mut code = self.code_frames.len();
         while frames.len() < limit && (function > 0 || code > 0) {
@@ -769,7 +847,12 @@ impl Interp {
                         }
                     }
                     if frames.len() < limit {
-                        frames.extend(function_frame(&callee, false, inner, PLACED_DEPTH));
+                        let inline_depth = if inner == NO_POSITION {
+                            depth | INLINE_FRAME_DEPTH
+                        } else {
+                            PLACED_DEPTH
+                        };
+                        frames.extend(function_frame(&callee, false, inner, inline_depth));
                     }
                 }
                 position = outer;
@@ -837,6 +920,14 @@ impl Interp {
             if is_inline_position(position) {
                 // The operation belongs to spliced callees: their frames come first.
                 let (chain, outer) = inline_chain(position);
+                if trace.frames[index].depth == (self.context_depth() | INLINE_FRAME_DEPTH) {
+                    // The callback's capture already expanded the logical splice chain.
+                    // Place just its pending innermost frame instead of expanding it twice.
+                    trace.frames[index].position = chain.first().map_or(NO_POSITION, |(_, p)| *p);
+                    trace.frames[index].depth = PLACED_DEPTH;
+                    trace.lines = None;
+                    return;
+                }
                 trace.frames[index].position = outer;
                 let inline = chain.iter().filter_map(|(callee, inner)| {
                     function_frame(callee, false, *inner, PLACED_DEPTH)
@@ -879,10 +970,10 @@ impl Interp {
             _ => None,
         })
         .ok()?;
-        let index = trace
-            .frames
-            .iter()
-            .position(|frame| frame.depth == depth && frame.position == NO_POSITION)?;
+        let index = trace.frames.iter().position(|frame| {
+            (frame.depth == depth || frame.depth == (depth | INLINE_FRAME_DEPTH))
+                && frame.position == NO_POSITION
+        })?;
         Some((trace, index))
     }
 }

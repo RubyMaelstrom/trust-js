@@ -106,7 +106,7 @@ pub(crate) unsafe extern "C" fn resume_before(
         &mut state.env,
         &state.cap_env,
         &mut state.references,
-        std::slice::from_raw_parts_mut(ctx.slots, ctx.n_slots),
+        std::slice::from_raw_parts(ctx.slots, ctx.n_slots),
         &mut state.stack,
         &mut next,
         &ctx.this_val,

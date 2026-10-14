@@ -450,7 +450,7 @@ fn array_buffer_mirror_api_rejects_shared_array_buffers() {
     assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(1));
     assert_eq!(
         engine.interp.take_array_buffer_dirty_ranges(&ordinary),
-        Some(vec![2..3])
+        Some(std::iter::once(2..3).collect())
     );
 }
 
@@ -4220,7 +4220,7 @@ fn embedder_realms_isolate_intrinsics_and_native_globals() {
 
     assert!(
         matches!(
-            engine.ctx().get_member(&main, "realmMarker"),
+            engine.ctx().get_member_key(&main, "realmMarker"),
             Ok(Value::Undefined)
         ),
         "native global stays out of the main realm"
@@ -18923,7 +18923,8 @@ fn atomics_wait_timeout_defers_to_a_notify_that_took_the_waiter() {
         Waiter,
     };
     use std::time::Duration;
-    let id = alloc_shared_mem(8).expect("an 8-byte shared block");
+    let block = alloc_shared_mem(8).expect("an 8-byte shared block");
+    let id = block.id();
     let taken = BlockedAgent::default();
     with_waiter_list(id, 0, |list| list.push(Waiter::Blocked(taken.clone())));
     // A notify's removal, before it sets the waiter's flag.
@@ -27424,8 +27425,10 @@ fn arrow_inherits_lexical_new_target() {
 
 #[test]
 fn private_elements_on_non_extensible_receivers() {
-    // PrivateFieldAdd / PrivateMethodOrAccessorAdd throw when the receiver was made
-    // non-extensible before the elements are stamped (instance and static alike).
+    // TRust JS supports the Stage 3 nonextensible-applies-to-private proposal:
+    // https://tc39.es/proposal-nonextensible-applies-to-private/
+    // It rejects new private elements on non-extensible receivers. Node v24.21
+    // still uses the base ECMA-262 behavior, so this is an intentional divergence.
     assert_eq!(
         run("'use strict';
              class Base { constructor(seal) { if (seal) Object.preventExtensions(this); } }
@@ -29616,7 +29619,11 @@ fn compiled_iteration_records_share_one_published_layout() {
         let fs = engine.interp.get_var("fs", &env).ok().unwrap();
         let layouts: Vec<u32> = (0..3)
             .map(|k| {
-                let f = engine.interp.get_member(&fs, &k.to_string()).ok().unwrap();
+                let f = engine
+                    .interp
+                    .get_member_key(&fs, &k.to_string())
+                    .ok()
+                    .unwrap();
                 let object = f.as_obj().unwrap().borrow();
                 let crate::value::Callable::User(user) = &object.call else {
                     panic!("closure")
@@ -31526,3 +31533,6 @@ fn embedding_helpers_follow_their_documented_semantics() {
         ))
     ));
 }
+
+#[path = "property_key_security_tests.rs"]
+mod property_key_security;

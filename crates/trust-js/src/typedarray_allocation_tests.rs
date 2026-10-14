@@ -38,7 +38,7 @@ fn typedarray_image_buffers_use_byte_ceiling_not_array_list_ceiling() {
             const a = new TA(1048577);
             assert(a.length === 1048577 && a.byteLength === 1048577*TA.BYTES_PER_ELEMENT);
             let limited = false;
-            try { new TA(268435456/TA.BYTES_PER_ELEMENT+1); } catch(e) { limited = e instanceof RangeError; }
+            try { new TA(Number.MAX_SAFE_INTEGER+1); } catch(e) { limited = e instanceof RangeError; }
             assert(limited);
         }
         'ok'
@@ -108,8 +108,144 @@ fn typedarray_constructor_observes_prototype_once_and_interleaves_arraylike_read
         try { Reflect.construct(Float64Array,[Number.MAX_SAFE_INTEGER],target); } catch(e) { limited = e instanceof RangeError; }
         assert(limited && reads === 1);
         let indexRead = false;
-        try { new Float64Array({length:268435456/8+1,get 0(){indexRead=true;return 0;}}); } catch(e) { assert(e instanceof RangeError); }
+        try { new Float64Array({length:Number.MAX_SAFE_INTEGER,get 0(){indexRead=true;return 0;}}); } catch(e) { assert(e instanceof RangeError); }
         assert(!indexRead);
+        'ok'
+    "#,
+    );
+}
+
+#[test]
+fn array_buffer_ceiling_matches_node_and_invalid_indices_precede_object_creation() {
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(crate::interpreter::MAX_BUFFER_BYTES, (1usize << 53) - 1);
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(crate::interpreter::MAX_BUFFER_BYTES, i32::MAX as usize);
+    check(
+        r#"
+        function assert(x) { if (!x) throw Error('buffer ceiling invariant'); }
+        for (const C of [ArrayBuffer, SharedArrayBuffer]) {
+            let reads = 0;
+            const target = new Proxy(function(){}, {get(t,k) {
+                if (k === 'prototype') reads++;
+                return Reflect.get(t,k);
+            }});
+            let invalid = false;
+            try { Reflect.construct(C,[Number.MAX_SAFE_INTEGER+1, {get maxByteLength(){reads++;return 0;}}],target); }
+            catch(e) { invalid = e instanceof RangeError; }
+            assert(invalid && reads === 0);
+            invalid = false;
+            try { Reflect.construct(C,[0, {maxByteLength:Number.MAX_SAFE_INTEGER+1}],target); }
+            catch(e) { invalid = e instanceof RangeError; }
+            assert(invalid && reads === 0);
+            const growable = new C(0, {maxByteLength:268435464});
+            assert(growable.byteLength === 0 && growable.maxByteLength === 268435464);
+        }
+        'ok'
+    "#,
+    );
+}
+
+#[test]
+fn resizable_buffer_maximum_must_be_allocatable_even_when_initial_length_is_zero() {
+    check(
+        r#"
+        function assert(x) { if (!x) throw Error('maximum reservation invariant'); }
+        for (const C of [ArrayBuffer, SharedArrayBuffer]) {
+            for (const maxByteLength of [7*1125899906842624, Number.MAX_SAFE_INTEGER]) {
+                let order = [], limited = false;
+                const target = new Proxy(function(){}, {get(t,k) {
+                    if (k === 'prototype') order.push('prototype');
+                    return Reflect.get(t,k);
+                }});
+                const options = {get maxByteLength(){order.push('maximum');return maxByteLength;}};
+                try { Reflect.construct(C,[0,options],target); }
+                catch(e) { limited = e instanceof RangeError; }
+                assert(limited && order.join(',') === 'maximum,prototype');
+            }
+        }
+        const buffer = new ArrayBuffer(4,{maxByteLength:16});
+        let limited = false;
+        try { buffer.transfer(17); } catch(e) { limited = e instanceof RangeError; }
+        assert(limited && !buffer.detached && buffer.byteLength === 4);
+        assert(buffer.transferToFixedLength(17).byteLength === 17);
+        'ok'
+    "#,
+    );
+}
+
+#[test]
+fn resizable_backing_retains_its_maximum_capacity_through_growth_and_transfer() {
+    use crate::interpreter::BufferData;
+
+    fn backing(engine: &Engine) -> (usize, usize, usize) {
+        assert_eq!(engine.interp.array_buffers.len(), 1);
+        match engine.interp.array_buffers.values().next().unwrap() {
+            BufferData::Local(bytes) => {
+                let bytes = bytes.borrow();
+                (bytes.as_ptr() as usize, bytes.len(), bytes.capacity())
+            }
+            BufferData::Shared(block) => {
+                let bytes = block.lock().unwrap();
+                (bytes.as_ptr() as usize, bytes.len(), bytes.capacity())
+            }
+        }
+    }
+
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for constructor in ["ArrayBuffer", "SharedArrayBuffer"] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let result = engine.eval(&format!(
+                "var buffer=new {constructor}(4,{{maxByteLength:1024}});var bytes=new Uint8Array(buffer);bytes[0]=31;"
+            ), false).unwrap();
+            assert!(matches!(result, Completion::Value(_)));
+            let (address, len, capacity) = backing(&engine);
+            assert_eq!((len, capacity), (4, 1024));
+            let operation = if constructor == "ArrayBuffer" {
+                "resize"
+            } else {
+                "grow"
+            };
+            let result = engine.eval(&format!(
+                "buffer.{operation}(128);if(bytes[0]!==31||bytes[127]!==0)throw Error('growth bytes');bytes[127]=83;"
+            ), false).unwrap();
+            assert!(matches!(result, Completion::Value(_)));
+            assert_eq!(backing(&engine), (address, 128, capacity));
+            if constructor == "ArrayBuffer" {
+                let result = engine.eval(
+                    "buffer.resize(4);buffer.resize(128);if(bytes[127]!==0)throw Error('shrink regrowth');var moved=buffer.transfer(64);if(!buffer.detached||moved.maxByteLength!==1024||new Uint8Array(moved)[0]!==31)throw Error('transfer reservation');",
+                    false,
+                ).unwrap();
+                assert!(matches!(result, Completion::Value(_)));
+                assert_eq!(backing(&engine), (address, 64, capacity));
+            }
+        }
+    }
+}
+
+/// Node v24.21.0 accepts both constructors at 4 GiB on this 64-bit host. Fresh pages remain
+/// uncommitted except for the endpoint writes, so this covers the old cap and 32-bit boundary
+/// without consuming four GiB of resident memory.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn array_buffers_support_four_gibibytes_and_zeroed_endpoint_access_across_tiers() {
+    check(
+        r#"
+        function assert(x) { if (!x) throw Error('large buffer invariant'); }
+        for (const C of [ArrayBuffer, SharedArrayBuffer]) {
+            const length = 4294967296;
+            const buffer = new C(length), bytes = new Uint8Array(buffer), view = new DataView(buffer);
+            assert(buffer.byteLength === length && bytes.length === length);
+            assert(bytes[0] === 0 && bytes[length-1] === 0);
+            bytes[0] = 31; bytes[length-1] = 71;
+            assert(view.getUint8(0) === 31 && view.getUint8(length-1) === 71);
+            view.setUint8(length-1, 83);
+            assert(bytes[length-1] === 83);
+        }
+        const moved = new ArrayBuffer(4).transfer(268435464);
+        assert(moved.byteLength === 268435464 && new Uint8Array(moved)[268435463] === 0);
         'ok'
     "#,
     );

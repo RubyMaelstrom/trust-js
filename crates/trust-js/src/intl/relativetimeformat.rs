@@ -6,7 +6,7 @@ use super::service::{
 };
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, set_data, Gc, Value};
+use crate::value::{set_data, set_internal_slot, Gc, Value};
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "RelativeTimeFormat", 0, construct);
@@ -54,11 +54,11 @@ fn construct(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Valu
     if let Some(proto) = instance_proto(i, "Intl.RelativeTimeFormat")? {
         object.borrow_mut().proto = Some(proto);
     }
-    set_builtin(&object, "#\u{0}rtf", Value::Bool(true));
-    set_builtin(&object, "#\u{0}rtf_locale", Value::lstr(locale));
-    set_builtin(&object, "#\u{0}rtf_numeric", Value::lstr(numeric));
-    set_builtin(&object, "#\u{0}rtf_style", Value::lstr(style));
-    set_builtin(&object, "#\u{0}rtf_nu", Value::lstr(numbering));
+    set_internal_slot(&object, "#\u{0}rtf", Value::Bool(true));
+    set_internal_slot(&object, "#\u{0}rtf_locale", Value::lstr(locale));
+    set_internal_slot(&object, "#\u{0}rtf_numeric", Value::lstr(numeric));
+    set_internal_slot(&object, "#\u{0}rtf_style", Value::lstr(style));
+    set_internal_slot(&object, "#\u{0}rtf_nu", Value::lstr(numbering));
     Ok(Value::Obj(object))
 }
 
@@ -79,7 +79,7 @@ fn singular(unit: &str) -> Option<&'static str> {
 fn string_slot(object: &Gc, key: &str, fallback: &str) -> String {
     match object
         .borrow()
-        .props
+        .internal_slots()
         .get(key)
         .map(|property| property.value())
     {
@@ -150,7 +150,7 @@ fn format(
     set_data(&nf_options, "numberingSystem", Value::lstr(numbering));
     set_data(&nf_options, "signDisplay", Value::lstr("never"));
     let number_format = new_service(i, "NumberFormat", &locale, nf_options)?;
-    let format = ab(i.get_member(&number_format, "format"))?;
+    let format = ab(i.get_member_key(&number_format, "format"))?;
     let formatted = match ab(i.call(format, number_format.clone(), &[Value::Num(number)]))? {
         Value::Str(value) => value.to_string(),
         _ => magnitude.to_string(),
@@ -175,17 +175,17 @@ fn format(
         output.push(Value::Obj(part));
     };
     push_literal(i, &mut output, &pattern[..marker]);
-    let format_to_parts = ab(i.get_member(&number_format, "formatToParts"))?;
+    let format_to_parts = ab(i.get_member_key(&number_format, "formatToParts"))?;
     let number_parts = ab(i.call(format_to_parts, number_format, &[Value::Num(number)]))?;
-    let length = match ab(i.get_member(&number_parts, "length"))? {
+    let length = match ab(i.get_member_key(&number_parts, "length"))? {
         Value::Num(value) => value as usize,
         _ => 0,
     };
     for index in 0..length {
-        let source = ab(i.get_member(&number_parts, &index.to_string()))?;
+        let source = ab(i.get_member_key(&number_parts, &index.to_string()))?;
         let part = i.new_object();
-        set_data(&part, "type", ab(i.get_member(&source, "type"))?);
-        set_data(&part, "value", ab(i.get_member(&source, "value"))?);
+        set_data(&part, "type", ab(i.get_member_key(&source, "type"))?);
+        set_data(&part, "value", ab(i.get_member_key(&source, "value"))?);
         set_data(&part, "unit", Value::lstr(unit));
         output.push(Value::Obj(part));
     }
@@ -206,7 +206,7 @@ fn resolved_options(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
     let get = |key: &str| {
         object
             .borrow()
-            .props
+            .internal_slots()
             .get(key)
             .map(|property| property.value())
             .unwrap_or(Value::Undefined)

@@ -52,11 +52,27 @@ fall back to bytecode. Backend coverage differs; check both `jit.rs` and
 The default tier is JIT. Useful diagnostic controls:
 
 - `TRUST_JS_TIER=interp|bytecode|jit` selects the tier.
-- `TRUST_JS_TIER_THRESHOLD=N` changes the call threshold for tiering up; loop-containing
-  bodies can tier up immediately.
+- `TRUST_JS_TIER_THRESHOLD=N` changes the call threshold for tiering up. Cold ordinary
+  synchronous author functions with loops obey it too; async/generator coroutine bytecode
+  remains eager, and self-hosted methods compile on their first call. A long-running
+  synchronous invocation can tier up after 128 executed
+  backedges without repeating its parameter binding, hoisting or prefix effects. Eligible
+  body-level loops transfer their whole function frame. Captures, mapped arguments and eval
+  retain their live environments; unsupported activation projections or active outer author
+  cleanup use the existing loop-fragment path. Ordinary/base constructor frames can transfer
+  after `this` is initialized; derived constructors retain their contextual fragment path.
+  Sloppy slot-backed formals preserve legacy argument maps through scoped shared slot Cells;
+  borrowed native observer boundaries publish and reload those homes. Function-owned fragments
+  can project uncaptured bindings, publishing every completion before parked AST cleanup runs.
+  Every projected binding transfers its Value owner to its slot while the AST record is parked;
+  scoped teardown restores its current value before unregistering or recycling frame storage.
+  Retained AST evaluator plans that copy a projected alias keep environment-backed fragments.
 - `TRUST_JS_JIT_ADMIT_RUNS=N` sets how many bytecode VM runs a loop-free function makes before
   it is compiled to native code (default 0: the first VM run compiles it). A body with a loop
-  is compiled on its first run. `TRUST_JS_TIER_LOG=1` reports each native compile.
+  skips that delay once admitted to bytecode: "first run" means its first VM/native-admission
+  invocation, after the call threshold or live-frame transfer, not its first JavaScript call.
+  Borrowed Script/loop-fragment entries use their own executed-backedge/work admission policy.
+  `TRUST_JS_TIER_LOG=1` reports each native compile.
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
 - `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls (the inline call sequence
@@ -231,9 +247,8 @@ test builds check each summary against the walk. Memory accounting reads only
 materialized bodies. The encoder marks a snapshot's run-once bootstrap functions
 (`Function::run_once`: immediately invoked from top-level code or another such function,
 outside loops and classes); after a static decode their bytecode stays on the VM and never
-gets native code, since they run once per Realm, and a body of more than
-`RUN_ONCE_INTERPRETED_STATEMENTS` statements is interpreted until the call-count threshold
-compiles it.
+gets native code, since they run once per Realm. Its bytecode waits for call-count or
+executed-backedge hotness, as with ordinary functions.
 
 Engine strings store a lone surrogate as the scalar U+10F800 + (unit − 0xD800) and a
 character in U+10F800..=U+10FFFF as its pair of such scalars (`jstr.rs`). Rust text
@@ -259,13 +274,15 @@ and `at name (<anonymous>)` for self-hosted built-ins; host-snapshot platform fu
 left out. Columns count UTF-16 units. Embedders name scripts with `SourceOrigin`
 (`*_with_origin` entry points; module keys name modules); code without one reports
 `<anonymous>`. Positions are byte offsets on call, `new`, property-access, tagged-template
-and assignment nodes; compiled chunks map operations to them (`SourcePositions`). Nothing is
-recorded on fast paths: an explicit call stores its position in `Interp::call_site` only for
-the duration of the call (the JIT's direct call writes it into the callee's `FnFrame`), a
-frame push moves it into `FnFrame::call_site` and the pop restores it, and an error the engine
-creates is positioned by the innermost positioned node or operation it propagates through
-(`Interp::place_thrown`). A new call path must keep that discipline, and a compiler change
-must attribute operations to the same nodes the tree-walker positions, or tiers diverge.
+and assignment nodes; compiled chunks map operations to them (`SourcePositions`). An explicit
+call stores its position in `Interp::call_site` for the duration of the call (the JIT's direct
+call writes it into the callee's `FnFrame`); a frame push moves it into `FnFrame::call_site`,
+and the pop restores it. Checked operations in a spliced body also publish an implicit inline
+marker before getters, setters or conversions can enter author code. The guard restores the
+previous marker on return, throw or continuation; inline-only PC metadata makes this lookup
+O(1). Native fast paths that invoke no author code need no marker publication. Errors use the
+innermost positioned node or propagating operation (`Interp::place_thrown`). New call/effect
+paths must preserve this discipline, and compiler positions must match the tree-walker.
 `Error.stackTraceLimit` (default 10) and `Error.captureStackTrace` follow V8.
 
 The default-on `intl` feature supplies ECMA-402 and CLDR data. For the engine,
