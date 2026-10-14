@@ -1,0 +1,1306 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-14T18:44:30.092093+00:00",
+  "status": "completed_descriptive_current_foundation_screen_no_performance_acceptance",
+  "performance_acceptance": false,
+  "finding": "The three optimizer-off/hot pairs have small median changes on this fixed real React SSR lifecycle. The native Node reference shows a large gap on the same host. No meaningful application gain, equivalence, overall engine comparison, native adoption or compilation repayment is established.",
+  "foundation": {
+    "revision": "2d1f169dda36da4fed95ce8dcb696854626a21ae",
+    "artifact": {
+      "path": "/home/ruby/Programs/trust-js-tier-current-20261014-2d1f169d/artifacts/trust-js-cli",
+      "sha256": "db10f9ddde36bdbd964077f84c1929fcc908cdfa6160d3bd5ce984df8fbb0c53",
+      "bytes": 34531288
+    },
+    "native_target": "x86_64-unknown-linux-gnu",
+    "source_files": 792,
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-2d1f169d/source-inventory.json",
+      "sha256": "cad0081cf90fcff7bb11edd343fb8861d6c3bc9bc861954d2cdfa8a27d16c605",
+      "bytes": 139359
+    },
+    "release_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-2d1f169d/native-release/release-manifest.json",
+      "sha256": "f97e8a5d70f078b6b1a518a2f396532929d236ece0aaea94eb45e688bae7b897",
+      "bytes": 8567
+    },
+    "engine_features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "profile": {
+      "optimization": 3,
+      "LTO": "fat",
+      "codegen_units": 1,
+      "panic": "abort",
+      "debug": 0,
+      "strip": "none",
+      "incremental": false
+    },
+    "scope": "One exact committed release binary launched in both modes; no private region/coverage/admission experiments, old-v3a source comparison, architecture diagnostics or ARM/x64 ratio."
+  },
+  "machine": {
+    "hostname": "zombie",
+    "CPU": "Intel Core i7-6700HQ, 4 physical cores/8 SMT threads",
+    "OS": "Linux zombie 7.2.9-2-cachyos #1 SMP PREEMPT_DYNAMIC Fri, 09 Oct 2026 15:36:46 +0000 x86_64 GNU/Linux",
+    "Rust": "Rust 1.98.0, LLVM 22.1.8",
+    "CPU_assignment": {
+      "controller": 4,
+      "controller_physical_core": 0,
+      "JavaScript": 5,
+      "JavaScript_physical_core": 1,
+      "JavaScript_SMT_sibling": 1
+    },
+    "governor": "intel_pstate powersave, 800\u20133500 MHz, unchanged",
+    "barrier": "The benchmark controller held the exclusive Zombie lease. Every other agent and root held remote SSH, audits, version and metadata probes, builds, tests and Wine operations. Crystal source and compiler work continued. The strict guard recorded zero recognized workers; every owned process group was empty after completion."
+  },
+  "fixture": {
+    "manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/runtime-react-phased-v2/manifest.json",
+      "sha256": "7b0a18b3723e06a581469e8cfddfc8795570d82ff7b148655b684619dda5000a",
+      "bytes": 6517
+    },
+    "renderer": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/runtime-react-phased-v2/fixture/render-phased.cjs",
+      "sha256": "98004f529cdd3be467ccf514bbf5ec9bc19bc30190eb09b9a81ba552256b6954",
+      "bytes": 5132
+    },
+    "packages": "React/react-dom 19.2.7 and scheduler 0.27.0; all 85 package source files and the package lock were pinned. The isolated CommonJS fixture used a node_modules symlink. No dependencies were installed.",
+    "transferred_regular_files": 109,
+    "transfer_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-real-application-portability-v1/transfer-inventory.json",
+      "sha256": "9994ee3106816db3a99c876a8d8c7304c83bd5209d787f94595cf16a53b2dd3f",
+      "bytes": 36905
+    },
+    "scope": "An authored deterministic dashboard uses actual React renderToString/renderToStaticMarkup: six cases with 8 or 32 orders and an escaping variant. This complementary SSR workload is a closed loop; it does not represent a deployed page, Speedometer, browser presentation or the whole engine."
+  },
+  "protocol": {
+    "renders_per_process": 768,
+    "case_order": [
+      "small-string",
+      "small-static",
+      "dashboard-string",
+      "dashboard-static",
+      "escaped-string",
+      "escaped-static"
+    ],
+    "warmup_per_case": 32,
+    "cold_first_render_in_warmup": 1,
+    "additional_warmup": 31,
+    "post_warmup_batches": 3,
+    "renders_per_batch_per_case": 32,
+    "cold_scope": "The first render of each case follows shared imports; only small-string/cold is the first process render.",
+    "lifetime": "At most 32 complete HTML outputs are retained per batch until validation, reporting and release. There is no HTTP server, timer, artificial drain, forced collection or extra render.",
+    "clocks": "import_and_input includes renderer imports, data and oracle preparation. render_and_collection includes real rendering, loop overhead and result stores; full HTML validation is timed separately afterward. Serialization, transport and release remain in complete process costs. Launch-to-READY and the clock residual are not isolated engine startup.",
+    "controller": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-paired-controller-v1/manifest.json",
+      "sha256": "7ec19c08cf64709c0585df2ac7948dc4e2fe88f8c5a51a5f1084bef76206e358",
+      "bytes": 6393
+    },
+    "inputs": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/input-bindings-v1.json",
+      "sha256": "b8acdabab0eb01e5671991ac8cb8cbac4c95a92eeb40ceed6e97cdc45969f6ef",
+      "bytes": 25502
+    },
+    "screen_plan": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/screen-plan-v1.json",
+      "sha256": "c2f7a98e3c4410996c548e7034faafe8ec4412cc7cc4f1a49a7af311cc46f630",
+      "bytes": 4898
+    },
+    "controls": {
+      "hot": {
+        "NODE_ENV": "production",
+        "TRUST_JS_TIER": "jit",
+        "TRUST_JS_OPT_JIT": "hot",
+        "TRUST_JS_OPT_JIT_BACKGROUND": "0",
+        "TRUST_JS_OPT_JIT_GENERIC_OWN": "1",
+        "TRUST_JS_OPT_JIT_SHARED_OWNERS": "1",
+        "TRUST_JS_OPT_JIT_SHARED_RECOVERY": "1",
+        "TRUST_JS_OPT_JIT_SPARSE_RELOADS": "1",
+        "TRUST_JS_OPT_JIT_LOCAL_EFFECTS": "1",
+        "TRUST_JS_OPT_JIT_VALUE_FACTS": "1",
+        "TRUST_JS_OPT_JIT_OSR": "0"
+      },
+      "off": {
+        "NODE_ENV": "production",
+        "TRUST_JS_TIER": "jit",
+        "TRUST_JS_OPT_JIT": "0",
+        "TRUST_JS_OPT_JIT_BACKGROUND": "0",
+        "TRUST_JS_OPT_JIT_GENERIC_OWN": "1",
+        "TRUST_JS_OPT_JIT_SHARED_OWNERS": "1",
+        "TRUST_JS_OPT_JIT_SHARED_RECOVERY": "1",
+        "TRUST_JS_OPT_JIT_SPARSE_RELOADS": "1",
+        "TRUST_JS_OPT_JIT_LOCAL_EFFECTS": "1",
+        "TRUST_JS_OPT_JIT_VALUE_FACTS": "1",
+        "TRUST_JS_OPT_JIT_OSR": "0"
+      }
+    },
+    "mode_difference_only": "TRUST_JS_OPT_JIT=0 versus hot is the sole difference between the two TRust modes.",
+    "diagnostics": "All diagnostics, logging, PERF/admission counters, function profiles, JIT maps, profilers, detailed feedback, deoptimization and OSR probes were disabled. HOT_AT, inline and call threshold overrides were absent.",
+    "sampling": "RSS was sampled every 20 ms after verifying the executed PID and executable identity. Aggregate CPU, load, pressure, frequency and SMT sibling CPU 1 activity were observed every second. Complete wait4 process CPU was retained. Each process launched a fresh temporary artifact copy with its hash verified."
+  },
+  "statistics": {
+    "independent_unit": "A fresh process is the independent unit; its three batches are not independent replicates.",
+    "phase0_processes": 5,
+    "interleaved_pairs": [
+      [
+        "off",
+        "hot"
+      ],
+      [
+        "hot",
+        "off"
+      ],
+      [
+        "off",
+        "hot"
+      ]
+    ],
+    "confirmation_policy": "N=3 is descriptive only, without a confidence interval, equivalence or acceptance claim. Seven pairs are required before promotion. Root requested no seven-pair follow-up for this foundation absent a concrete concern. The next candidate must first demonstrate actual entries and recoveries in the intended framework code under normal admission policy.",
+    "baseline_stability_rule": "Fixed before candidate measurements: relative MAD \u22641% and relative range \u22646% flag a component as stable for the 3% screen concern. 49 of 81 components were stable. All samples, noisy components and tiny durations were retained.",
+    "phase0": {
+      "all_measured_render_and_collection_ms": {
+        "values": [
+          14036.772581999998,
+          13900.15872800001,
+          13783.218092,
+          13964.193019999999,
+          14096.461812999994
+        ],
+        "median": 13964.193019999999,
+        "median_absolute_deviation": 72.57956199999899,
+        "relative_mad": 0.005197547892387912,
+        "min": 13783.218092,
+        "max": 14096.461812999994,
+        "relative_range": 0.022431924318960416,
+        "stable_for_fixed3percent_screen_flag": true
+      },
+      "process_wall_s": {
+        "values": [
+          18.96921478600416,
+          18.7692969560012,
+          18.615277771001274,
+          18.86839407200023,
+          19.045684929995332
+        ],
+        "median": 18.86839407200023,
+        "median_absolute_deviation": 0.10082071400393033,
+        "relative_mad": 0.005343364868213312,
+        "min": 18.615277771001274,
+        "max": 19.045684929995332,
+        "relative_range": 0.022811011756043446,
+        "stable_for_fixed3percent_screen_flag": true
+      },
+      "process_cpu_s": {
+        "values": [
+          18.896386999999997,
+          18.698752,
+          18.552719,
+          18.790943,
+          18.974312
+        ],
+        "median": 18.790943,
+        "median_absolute_deviation": 0.10544399999999854,
+        "relative_mad": 0.005611426738934738,
+        "min": 18.552719,
+        "max": 18.974312,
+        "relative_range": 0.02243596822149913,
+        "stable_for_fixed3percent_screen_flag": true
+      },
+      "post_exec_sampled_peak_RSS_kib": {
+        "values": [
+          176440,
+          176460,
+          176224,
+          176492,
+          176152
+        ],
+        "median": 176440,
+        "median_absolute_deviation": 52,
+        "relative_mad": 0.00029471775107685333,
+        "min": 176152,
+        "max": 176492,
+        "relative_range": 0.001927000680117887,
+        "stable_for_fixed3percent_screen_flag": true
+      },
+      "launch_to_import_READY_receipt_s": {
+        "values": [
+          0.1025972420029575,
+          0.10242640600336017,
+          0.10185740499582607,
+          0.10239830899809022,
+          0.102699869996286
+        ],
+        "median": 0.10242640600336017,
+        "median_absolute_deviation": 0.00017083599959732965,
+        "relative_mad": 0.001667890207840791,
+        "min": 0.10185740499582607,
+        "max": 0.102699869996286,
+        "relative_range": 0.008225076260435093,
+        "stable_for_fixed3percent_screen_flag": true
+      },
+      "import_and_input_ms": {
+        "values": [
+          34.24759400000001,
+          34.720811000000005,
+          33.769419,
+          34.637627,
+          34.601165
+        ],
+        "median": 34.601165,
+        "median_absolute_deviation": 0.11964600000000303,
+        "relative_mad": 0.0034578604506525436,
+        "min": 33.769419,
+        "max": 34.720811000000005,
+        "relative_range": 0.02749595280968157,
+        "stable_for_fixed3percent_screen_flag": true
+      }
+    },
+    "node_reference": "Three fresh Node processes ran sequentially after the TRust cohort, separately from the optimizer pairs. Ratios of medians are descriptive only; there was no Node/TRust interleaving or confidence interval."
+  },
+  "Node": {
+    "version": "v24.21.0",
+    "V8": "13.6.233.17-node.53",
+    "platform": "Native Linux x64 on the same host.",
+    "artifact": {
+      "path": "/home/ruby/Programs/trust-js-node-reference-v24.21.0-20261014/artifacts/node",
+      "bytes": 126595440,
+      "sha256": "7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c"
+    },
+    "native_preflight": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-node-v24.21.0-reference/native-preflight.json",
+      "sha256": "cbb652ea9d7100ae30ea655596345c014edbd8e57eea5f0f1e607eed97026014",
+      "bytes": 2349
+    },
+    "private_installation_only": true,
+    "npm_invoked": false,
+    "controller": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/run-node-reference-v2.py",
+      "sha256": "aa728e2cd558a5ca9b16c99afe7e6f75abb95f551d76b00a425d672d97c62587",
+      "bytes": 25710
+    },
+    "source_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/node-source-manifest-v2.json",
+      "sha256": "96744254cf95bdd6470f14eb6669c4cf09f075af319aa29e1f6c5c590b640671",
+      "bytes": 1666
+    },
+    "reference_plan": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/node-reference-plan-v1.json",
+      "sha256": "7486aec63d85d982d26246c1f85a8a23197e32f434f9cd5c5cdc57a082f5b894",
+      "bytes": 4009
+    },
+    "affinity_limit": "The one-second outer thread sampler missed the short Node processes. The 20 ms post-exec samples confirmed CPU 5 for the main PID. Worker thread masks were not sampled directly; taskset inheritance was recorded."
+  },
+  "results": {
+    "headline_components": {
+      "all_measured_render_and_collection_ms": {
+        "off_values": [
+          14019.663121999994,
+          13899.390983000001,
+          13975.330139999995
+        ],
+        "hot_values": [
+          13957.972508000004,
+          13697.353898000005,
+          13971.762637999998
+        ],
+        "node_values": [
+          230.03606899999994,
+          238.30541600000004,
+          238.2516750000001
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9955997078201413,
+          0.9854643210449219,
+          0.9997447286064617
+        ],
+        "paired_median_loss_percent": -0.44002921798587113,
+        "medians": {
+          "off": 13975.330139999995,
+          "hot": 13957.972508000004,
+          "node": 238.2516750000001
+        },
+        "sequential_off_over_node_medians_descriptive_only": 58.65784632993657
+      },
+      "all_phase_render_and_collection_ms": {
+        "off_values": [
+          18712.407558999996,
+          18564.954712,
+          18663.104510999994
+        ],
+        "hot_values": [
+          18644.783186000004,
+          18310.776694000004,
+          18682.956333
+        ],
+        "node_values": [
+          422.7474659999999,
+          413.589978,
+          432.75198500000005
+        ],
+        "paired_hot_over_off_ratios": [
+          0.996386121198634,
+          0.9863087186614197,
+          1.0010636934486599
+        ],
+        "paired_median_loss_percent": -0.36138788013659884,
+        "medians": {
+          "off": 18663.104510999994,
+          "hot": 18644.783186000004,
+          "node": 422.7474659999999
+        },
+        "sequential_off_over_node_medians_descriptive_only": 44.14717062076961
+      },
+      "process_wall_s": {
+        "off_values": [
+          18.942745555999863,
+          18.79880411100021,
+          18.892130409993115
+        ],
+        "hot_values": [
+          18.867772155004786,
+          18.54530938300013,
+          18.909864642002503
+        ],
+        "node_values": [
+          0.5624355280015152,
+          0.5825270839995937,
+          0.563048912998056
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9960421048377894,
+          0.986515380100602,
+          1.0009387100144094
+        ],
+        "paired_median_loss_percent": -0.39578951622105674,
+        "medians": {
+          "off": 18.892130409993115,
+          "hot": 18.867772155004786,
+          "node": 0.563048912998056
+        },
+        "sequential_off_over_node_medians_descriptive_only": 33.55326681903805
+      },
+      "process_cpu_s": {
+        "off_values": [
+          18.876488,
+          18.717425000000002,
+          18.823285
+        ],
+        "hot_values": [
+          18.806131,
+          18.464659,
+          18.833084
+        ],
+        "node_values": [
+          0.5504049999999999,
+          0.56248,
+          0.558563
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9962727706552195,
+          0.9864956851703692,
+          1.0005205786343883
+        ],
+        "paired_median_loss_percent": -0.3727229344780536,
+        "medians": {
+          "off": 18.823285,
+          "hot": 18.806131,
+          "node": 0.558563
+        },
+        "sequential_off_over_node_medians_descriptive_only": 33.699484212165856
+      },
+      "post_exec_sampled_peak_RSS_kib": {
+        "off_values": [
+          176404,
+          176712,
+          176320
+        ],
+        "hot_values": [
+          179808,
+          180200,
+          179636
+        ],
+        "node_values": [
+          141268,
+          145724,
+          147052
+        ],
+        "paired_hot_over_off_ratios": [
+          1.0192966145892384,
+          1.0197383312961203,
+          1.018806715063521
+        ],
+        "paired_median_loss_percent": 1.929661458923837,
+        "medians": {
+          "off": 176404,
+          "hot": 179808,
+          "node": 145724
+        },
+        "sequential_off_over_node_medians_descriptive_only": 1.210534983942247
+      },
+      "wait4_peak_RSS_kib_includes_preexec": {
+        "off_values": [
+          176260,
+          176736,
+          176320
+        ],
+        "hot_values": [
+          179808,
+          180200,
+          179636
+        ],
+        "node_values": [
+          153936,
+          155648,
+          156108
+        ],
+        "paired_hot_over_off_ratios": [
+          1.020129354362873,
+          1.019599855151186,
+          1.018806715063521
+        ],
+        "paired_median_loss_percent": 1.9599855151186008,
+        "medians": {
+          "off": 176320,
+          "hot": 179808,
+          "node": 155648
+        },
+        "sequential_off_over_node_medians_descriptive_only": 1.1328125
+      },
+      "post_exec_sampled_peak_RssAnon_kib": {
+        "off_values": [
+          159604,
+          159952,
+          159392
+        ],
+        "hot_values": [
+          160012,
+          160328,
+          159984
+        ],
+        "node_values": [
+          92608,
+          97260,
+          98908
+        ],
+        "paired_hot_over_off_ratios": [
+          1.0025563269091,
+          1.0023507052115634,
+          1.0037141136318009
+        ],
+        "paired_median_loss_percent": 0.2556326909100015,
+        "medians": {
+          "off": 159604,
+          "hot": 160012,
+          "node": 97260
+        },
+        "sequential_off_over_node_medians_descriptive_only": 1.6410034957844952
+      },
+      "post_exec_sampled_peak_RssFile_kib": {
+        "off_values": [
+          2540,
+          2460,
+          2504
+        ],
+        "hot_values": [
+          2496,
+          2504,
+          2512
+        ],
+        "node_values": [
+          4740,
+          4848,
+          4736
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9826771653543307,
+          1.0178861788617886,
+          1.0031948881789137
+        ],
+        "paired_median_loss_percent": 0.31948881789136685,
+        "medians": {
+          "off": 2504,
+          "hot": 2504,
+          "node": 4740
+        },
+        "sequential_off_over_node_medians_descriptive_only": 0.5282700421940928
+      },
+      "post_exec_sampled_peak_RssShmem_kib": {
+        "off_values": [
+          14324,
+          14300,
+          14416
+        ],
+        "hot_values": [
+          17140,
+          17132,
+          17088
+        ],
+        "node_values": [
+          43276,
+          43404,
+          43276
+        ],
+        "paired_hot_over_off_ratios": [
+          1.1965931304104998,
+          1.1980419580419581,
+          1.1853496115427302
+        ],
+        "paired_median_loss_percent": 19.659313041049977,
+        "medians": {
+          "off": 14324,
+          "hot": 17132,
+          "node": 43276
+        },
+        "sequential_off_over_node_medians_descriptive_only": 0.3309917737313985
+      },
+      "launch_to_import_READY_receipt_s": {
+        "off_values": [
+          0.10296093599754386,
+          0.10272185399662703,
+          0.10272777099453378
+        ],
+        "hot_values": [
+          0.1031978360042558,
+          0.10310954399756156,
+          0.1040734420021181
+        ],
+        "node_values": [
+          0.051246748997073155,
+          0.05444748899753904,
+          0.05364331499731634
+        ],
+        "paired_hot_over_off_ratios": [
+          1.0023008726991138,
+          1.0037741725431402,
+          1.0130993887490845
+        ],
+        "paired_median_loss_percent": 0.3774172543140164,
+        "medians": {
+          "off": 0.10272777099453378,
+          "hot": 0.1031978360042558,
+          "node": 0.05364331499731634
+        },
+        "sequential_off_over_node_medians_descriptive_only": 1.9150153378789703
+      },
+      "import_and_input_ms": {
+        "off_values": [
+          34.998962,
+          34.533945,
+          34.542301
+        ],
+        "hot_values": [
+          35.080127000000005,
+          34.047225,
+          35.076361
+        ],
+        "node_values": [
+          22.660984,
+          20.690615,
+          21.517809
+        ],
+        "paired_hot_over_off_ratios": [
+          1.002319068776954,
+          0.985906041142997,
+          1.0154610429687356
+        ],
+        "paired_median_loss_percent": 0.23190687769540919,
+        "medians": {
+          "off": 34.542301,
+          "hot": 35.076361,
+          "node": 21.517809
+        },
+        "sequential_off_over_node_medians_descriptive_only": 1.605288949260587
+      },
+      "all_validation_ms": {
+        "off_values": [
+          1.030236999999488,
+          1.0683259999928225,
+          1.0157890000076648
+        ],
+        "hot_values": [
+          1.0233609999943099,
+          1.0176840000009335,
+          1.0093879999980118
+        ],
+        "node_values": [
+          64.72944300000009,
+          80.11204799999993,
+          58.44494200000004
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9933258075518724,
+          0.9525968665068254,
+          0.9936984944613451
+        ],
+        "paired_median_loss_percent": -0.6674192448127614,
+        "medians": {
+          "off": 1.030236999999488,
+          "hot": 1.0176840000009335,
+          "node": 64.72944300000009
+        },
+        "sequential_off_over_node_medians_descriptive_only": 0.0159160492080781
+      },
+      "process_wall_minus_script_clocks_s": {
+        "off_values": [
+          0.19430879799986656,
+          0.1982471280002187,
+          0.19346780899311256
+        ],
+        "hot_values": [
+          0.1868854810047864,
+          0.199467780000127,
+          0.19082256000250553
+        ],
+        "node_values": [
+          0.052297635001515186,
+          0.06813444299959381,
+          0.05033417699805587
+        ],
+        "paired_hot_over_off_ratios": [
+          0.9617962898669918,
+          1.0061572241283967,
+          0.9863271879473179
+        ],
+        "paired_median_loss_percent": -1.3672812052682115,
+        "medians": {
+          "off": 0.19430879799986656,
+          "hot": 0.19082256000250553,
+          "node": 0.052297635001515186
+        },
+        "sequential_off_over_node_medians_descriptive_only": 3.7154413960447155
+      }
+    },
+    "case_components": {
+      "small-string": {
+        "orders": 8,
+        "mode": "renderToString",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            300.0973049999993,
+            297.5582379999996,
+            299.2005310000004
+          ],
+          "hot": [
+            298.95417199999974,
+            293.83711500000027,
+            299.9454539999997
+          ],
+          "node": [
+            8.191958999999997,
+            8.066497999999967,
+            3.960926000000029
+          ]
+        },
+        "paired_median_loss_percent": -0.38092078167765164,
+        "sequential_off_over_node_medians_descriptive_only": 37.09175047213817,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              300.0973049999993,
+              299.2260299999998,
+              300.2671450000016
+            ],
+            [
+              297.6327620000002,
+              297.5582379999996,
+              297.5018689999997
+            ],
+            [
+              299.3798340000003,
+              299.2005310000004,
+              296.26850899999954
+            ]
+          ],
+          "hot": [
+            [
+              298.39326699999947,
+              298.95417199999974,
+              300.61343300000044
+            ],
+            [
+              293.83711500000027,
+              295.09918599999946,
+              293.78987400000005
+            ],
+            [
+              299.9454539999997,
+              300.23956499999986,
+              299.90368299999864
+            ]
+          ],
+          "node": [
+            [
+              8.191958999999997,
+              8.35584799999998,
+              3.353523999999993
+            ],
+            [
+              8.066497999999967,
+              9.875619000000029,
+              3.312445999999966
+            ],
+            [
+              3.960926000000029,
+              12.467647,
+              3.3089160000000106
+            ]
+          ]
+        },
+        "variant": 0
+      },
+      "small-static": {
+        "orders": 8,
+        "mode": "renderToStaticMarkup",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            300.6318489999994,
+            297.76299299999846,
+            299.51890900000035
+          ],
+          "hot": [
+            299.78012900000067,
+            294.6289709999983,
+            301.40949100000034
+          ],
+          "node": [
+            5.910596999999996,
+            6.72175900000002,
+            4.38817499999999
+          ]
+        },
+        "paired_median_loss_percent": -0.2833099695963237,
+        "sequential_off_over_node_medians_descriptive_only": 50.674899506767346,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              300.7818379999999,
+              300.6318489999994,
+              300.1063189999986
+            ],
+            [
+              298.15023999999994,
+              297.76299299999846,
+              295.53347700000086
+            ],
+            [
+              301.0026939999998,
+              299.51890900000035,
+              296.3820649999998
+            ]
+          ],
+          "hot": [
+            [
+              299.4323629999999,
+              300.4829549999995,
+              299.78012900000067
+            ],
+            [
+              294.98152500000015,
+              294.6289709999983,
+              291.8483120000001
+            ],
+            [
+              298.83777700000064,
+              303.1440420000017,
+              301.40949100000034
+            ]
+          ],
+          "node": [
+            [
+              5.910596999999996,
+              7.088617999999997,
+              5.5696459999999774
+            ],
+            [
+              6.72175900000002,
+              6.925362000000007,
+              3.432089000000019
+            ],
+            [
+              11.698367000000019,
+              4.38817499999999,
+              3.2812269999999444
+            ]
+          ]
+        },
+        "variant": 0
+      },
+      "dashboard-string": {
+        "orders": 32,
+        "mode": "renderToString",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            1017.9045150000002,
+            1010.7750139999998,
+            1017.6506210000007
+          ],
+          "hot": [
+            1020.2545080000018,
+            1001.296413,
+            1019.2948639999995
+          ],
+          "node": [
+            15.958724999999959,
+            16.47016400000001,
+            19.598641000000043
+          ]
+        },
+        "paired_median_loss_percent": 0.16157244599164233,
+        "sequential_off_over_node_medians_descriptive_only": 61.78752203074602,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              1016.6321709999993,
+              1018.5657120000014,
+              1017.9045150000002
+            ],
+            [
+              1010.7750139999998,
+              1013.1988200000014,
+              1005.2564160000002
+            ],
+            [
+              1017.8571550000006,
+              1017.6506210000007,
+              1008.9943409999996
+            ]
+          ],
+          "hot": [
+            [
+              1016.8074509999997,
+              1020.2545080000018,
+              1020.6644429999997
+            ],
+            [
+              1001.296413,
+              1003.9622760000002,
+              1000.0237600000019
+            ],
+            [
+              1017.5162119999995,
+              1021.0512970000018,
+              1019.2948639999995
+            ]
+          ],
+          "node": [
+            [
+              15.958724999999959,
+              24.389308000000028,
+              10.586341000000004
+            ],
+            [
+              16.47016400000001,
+              25.378262000000007,
+              11.080059000000006
+            ],
+            [
+              35.68187999999998,
+              19.598641000000043,
+              11.380147000000022
+            ]
+          ]
+        },
+        "variant": 0
+      },
+      "dashboard-static": {
+        "orders": 32,
+        "mode": "renderToStaticMarkup",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            1017.6544359999971,
+            1009.8322100000005,
+            1016.6663509999998
+          ],
+          "hot": [
+            1014.9863070000001,
+            992.2514249999986,
+            1016.45543
+          ],
+          "node": [
+            17.06275800000003,
+            17.052718000000027,
+            16.01476200000002
+          ]
+        },
+        "paired_median_loss_percent": -0.2621841860665719,
+        "sequential_off_over_node_medians_descriptive_only": 59.61902090915936,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              1015.6612589999995,
+              1018.640453,
+              1017.6544359999971
+            ],
+            [
+              1009.8322100000005,
+              1012.793658999999,
+              1004.7913559999979
+            ],
+            [
+              1016.6663509999998,
+              1018.3751789999988,
+              1006.7006639999981
+            ]
+          ],
+          "hot": [
+            [
+              1014.9863070000001,
+              1018.6262150000002,
+              995.5175960000015
+            ],
+            [
+              1001.5215309999994,
+              992.2514249999986,
+              978.9288970000034
+            ],
+            [
+              1016.45543,
+              1018.858076999999,
+              994.2120809999979
+            ]
+          ],
+          "node": [
+            [
+              28.01610199999999,
+              17.06275800000003,
+              13.665935999999988
+            ],
+            [
+              37.02179699999999,
+              17.052718000000027,
+              14.528769999999952
+            ],
+            [
+              16.01476200000002,
+              19.763308999999992,
+              14.373426000000052
+            ]
+          ]
+        },
+        "variant": 0
+      },
+      "escaped-string": {
+        "orders": 32,
+        "mode": "renderToString",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            1018.0503089999984,
+            1011.5973689999973,
+            1017.6040439999997
+          ],
+          "hot": [
+            1018.1731370000016,
+            994.4316340000005,
+            1021.7894389999983
+          ],
+          "node": [
+            15.787195999999994,
+            11.488512000000014,
+            11.544757000000004
+          ]
+        },
+        "paired_median_loss_percent": 0.012065022614038412,
+        "sequential_off_over_node_medians_descriptive_only": 88.1442583849967,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              1017.5038170000016,
+              1019.2872569999981,
+              1018.0503089999984
+            ],
+            [
+              1013.991023999999,
+              1011.5973689999973,
+              1007.6901180000023
+            ],
+            [
+              1017.6040439999997,
+              1020.8578429999998,
+              1008.6730900000002
+            ]
+          ],
+          "hot": [
+            [
+              1018.1731370000016,
+              1021.0731800000012,
+              997.4649830000017
+            ],
+            [
+              1002.9528410000003,
+              994.4316340000005,
+              980.109027999999
+            ],
+            [
+              1023.1522380000006,
+              1021.7894389999983,
+              997.0735950000017
+            ]
+          ],
+          "node": [
+            [
+              15.787195999999994,
+              11.401084999999966,
+              16.487495000000024
+            ],
+            [
+              14.902239000000009,
+              11.488512000000014,
+              10.533251000000064
+            ],
+            [
+              15.157002999999975,
+              11.544757000000004,
+              10.394327999999973
+            ]
+          ]
+        },
+        "variant": 1
+      },
+      "escaped-static": {
+        "orders": 32,
+        "mode": "renderToStaticMarkup",
+        "post_warmup_batch_median_values_ms": {
+          "off": [
+            1018.6156730000002,
+            1007.0861500000028,
+            1020.3166600000004
+          ],
+          "hot": [
+            1018.7459299999991,
+            994.117096,
+            1020.4872510000005
+          ],
+          "node": [
+            11.202897000000007,
+            11.65834000000001,
+            11.931281000000013
+          ]
+        },
+        "paired_median_loss_percent": 0.012787649302037352,
+        "sequential_off_over_node_medians_descriptive_only": 87.3722736684639,
+        "three_batches_per_process_ms": {
+          "off": [
+            [
+              1021.7909249999993,
+              1018.2461089999997,
+              1018.6156730000002
+            ],
+            [
+              1012.8682630000003,
+              1005.3710050000009,
+              1007.0861500000028
+            ],
+            [
+              1020.5049919999983,
+              1020.3166600000004,
+              1009.3766579999974
+            ]
+          ],
+          "hot": [
+            [
+              1018.7459299999991,
+              1019.5409879999988,
+              998.4614509999992
+            ],
+            [
+              1004.8833439999999,
+              994.117096,
+              978.6906700000036
+            ],
+            [
+              1021.2744199999997,
+              1020.4872510000005,
+              997.117721999999
+            ]
+          ],
+          "node": [
+            [
+              16.303293000000053,
+              10.704740999999956,
+              11.202897000000007
+            ],
+            [
+              19.31397899999996,
+              11.65834000000001,
+              10.543551999999977
+            ],
+            [
+              22.726827000000014,
+              11.931281000000013,
+              10.580056000000013
+            ]
+          ]
+        },
+        "variant": 1
+      }
+    },
+    "render_plus_validation_ms": {
+      "measured": {
+        "render_plus_separate_full_validation_ms": {
+          "off": [
+            14020.378870999994,
+            13900.101506999992,
+            13976.042469
+          ],
+          "hot": [
+            13958.683055999998,
+            13698.067822000005,
+            13972.473658999996
+          ],
+          "node": [
+            276.64985400000006,
+            285.31663299999997,
+            281.12456400000013
+          ]
+        },
+        "sequential_off_over_node_medians_descriptive_only": 49.71476796670103
+      },
+      "all_phases": {
+        "render_plus_separate_full_validation_ms": {
+          "off": [
+            18713.437795999995,
+            18566.023037999992,
+            18664.120300000002
+          ],
+          "hot": [
+            18645.806546999996,
+            18311.794378000006,
+            18683.965720999997
+          ],
+          "node": [
+            487.47690900000003,
+            493.70202599999993,
+            491.1969270000001
+          ]
+        },
+        "sequential_off_over_node_medians_descriptive_only": 37.997225296159066
+      }
+    },
+    "paired_hot_vs_off_interpretation": "The measured 576-render aggregate changed by \u22120.440%, complete process wall time by \u22120.396%, and process CPU by \u22120.373%. No meaningful gain is established. Case batch medians changed by less than \u00b10.4%.",
+    "Node_gap_interpretation": "The separate N=3 reference gives baseline/Node median ratios of 58.66 for the render aggregate after warmup, 49.71 for rendering plus validation, and 33.55 for complete process wall time. All clocks are retained. These workload-specific gaps do not attribute cost solely to the compiler or characterize the whole engine. Node batch times evolve within each process, so the fixed phase after warmup is not proven steady state.",
+    "independent_resource_flags": [
+      {
+        "component": "post_exec_sampled_peak_RssShmem_kib",
+        "paired_median_loss_percent": 19.659313041049977,
+        "paired_absolute_deltas": [
+          2816,
+          2832,
+          2672
+        ],
+        "baseline_phase0_stable": true
+      },
+      {
+        "component": "small-static/cold/0/validation_ms",
+        "paired_median_loss_percent": 3.7967456465339833,
+        "paired_absolute_deltas": [
+          0.00026599999999632473,
+          0.0006750000000010914,
+          4.500000000007276e-05
+        ],
+        "baseline_phase0_stable": false
+      },
+      {
+        "component": "dashboard-string/cold/0/validation_ms",
+        "paired_median_loss_percent": 5.178601948176631,
+        "paired_absolute_deltas": [
+          5.099999999913507e-05,
+          0.00032700000002705565,
+          0.00030299999998817384
+        ],
+        "baseline_phase0_stable": true
+      },
+      {
+        "component": "small-string/warmup/0/validation_ms",
+        "paired_median_loss_percent": 4.3666483882516705,
+        "paired_absolute_deltas": [
+          0.00544999999999618,
+          -0.05253299999998262,
+          0.0015130000000453947
+        ],
+        "baseline_phase0_stable": false
+      },
+      {
+        "component": "small-string/measured/3/validation_ms",
+        "paired_median_loss_percent": 3.4125269917609113,
+        "paired_absolute_deltas": [
+          0.000232000000323751,
+          0.00119500000255357,
+          0.0007109999987733318
+        ],
+        "baseline_phase0_stable": false
+      }
+    ],
+    "memory_interpretation": "Hot sampled peak RSS changed by +1.93%, RssAnon by +0.256%, and RssShmem by +19.66% (paired median +2816 KiB). The Shmem flag is retained independently. These peaks do not establish managed heap growth or executable coverage. Pages from the temporary executable on tmpfs may contribute, but attribution is unavailable and no waiver is applied. Four validation flags are also retained, including one with stable Phase 0. Their median absolute deltas are 0.266, 0.303, 1.513 and 0.711 microseconds; without confidence intervals these observations do not establish a meaningful regression."
+  },
+  "validation": {
+    "functional_processes": {
+      "TRust": 2,
+      "Node": 1
+    },
+    "timing_processes": {
+      "baseline_variance": 5,
+      "TRust_paired": 6,
+      "Node_reference": 3
+    },
+    "all_processes": 17,
+    "normal_exit_zero": 17,
+    "unexpected_stderr": 0,
+    "remaining_owned_processes": 0,
+    "guard_observations": 0,
+    "root_independent_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/root-independent-audit.json",
+      "sha256": "68604be80486526decc988c5610d5b56c57ae4dd4bc08a2513b173c7ef6d9d37",
+      "bytes": 3458
+    },
+    "postanalysis_verified_raw_hashes": 85,
+    "recomputed_components": 81,
+    "final_remote_worker_scan": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/remote-final-worker-scan.json",
+      "sha256": "469b09dc62b9b2fc9305759b669c26015308603922fd856a2e6202aea781f9dd",
+      "bytes": 182
+    },
+    "reports": [
+      {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/functional-prerequisite-v1/report.json",
+        "sha256": "ef31c4ca77d3c2094923ac7df6ca38b800ef1fd39f070f96bdefdd31bcdd5ca1",
+        "bytes": 299388
+      },
+      {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/cohort-screen-v1/report.json",
+        "sha256": "3c5962d805dabd9c31ea4250bb11afc117b755ffcb4ee7543ddf74197f8dfe14",
+        "bytes": 932115
+      },
+      {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/node-functional-prerequisite-v1/report.json",
+        "sha256": "4114f009e2f26c4a2996e68f0652bed670b6540a33aec50b0bc1fc35453d51b0",
+        "bytes": 232932
+      },
+      {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/node-reference-v1/report.json",
+        "sha256": "e7e05fa6c734932d370dc647539b22f6841c010077bc0bfcfe3c6629fa356c34",
+        "bytes": 368283
+      }
+    ],
+    "full_component_analysis": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/analysis-v1.json",
+      "sha256": "1917027c5209ec161bee65fe27fcc526ed24c33ec7fdd12a76f261066dc13528",
+      "bytes": 182680
+    },
+    "analysis_source": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/zombie-current-tier-screen-v1/analyze-screen-v1.py",
+      "sha256": "9baa475721332c1026095ddfa92df64fa40734c57e93196e7e174a77ee335726",
+      "bytes": 7919
+    },
+    "per_process_full_internal_HTML_equalities": 768,
+    "per_process_external_complete_phase_edge_checks": 60
+  },
+  "limits": [
+    "Compilation time, generated native code bytes, actual optimizer entries, admissions and recoveries, natural GC, and post-GC managed memory are unavailable with diagnostics disabled. Earlier instrumented ARM artifacts or source versions cannot establish current x64 adoption.",
+    "String representations, materialization or GC can shift cost between rendering, validation and reporting. No cause is inferred from clock differences. Median Node validation cost of 64.73 ms versus TRust 1.03 ms is retained.",
+    "VmHWM sampling can miss peaks; wait4 RSS includes pre-exec activity. The sampled RssAnon, RssFile and RssShmem maxima need not sum to peak RSS. There is no memory promotion or waiver.",
+    "Frozen inputs, releases and raw reports are preserved locally with hashes. Ignored raw files and controllers are not guaranteed in a fresh clone. This tracked record keeps headline and case arrays with explicit qualifications.",
+    "The earlier excluded Crystal cohort remains unchanged, ineligible and unpooled. This native foundation is separate from browser/Speedometer 3.1 acceptance. No overall Node or Ladybird catch-up claim is made."
+  ]
+}
