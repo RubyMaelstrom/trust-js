@@ -81,8 +81,8 @@ impl Plan {
         let mut opportunities = Vec::new();
         let mut removed = 0u32;
         for (pc, op) in chunk.jit_ops().iter().enumerate() {
-            let before = tests(op, generic.at[pc]);
-            let after = tests(op, values.at[pc]);
+            let before = tests(op, Some(generic.at[pc]), stack.at[pc].known());
+            let after = tests(op, Some(values.at[pc]), stack.at[pc].known());
             let count = before.saturating_sub(after)
                 + u32::from(properties.iter().any(|&(site, _)| site as usize == pc));
             if count != 0 {
@@ -121,7 +121,19 @@ impl Plan {
     }
 }
 
-pub(super) fn tests(op: &Op, inputs: Inputs) -> u32 {
+pub(super) fn tests(op: &Op, facts: Option<Inputs>, known_suffix: usize) -> u32 {
+    // The exact-Null path compares packed words and consumes only the peer owner.
+    // Its comparison is present in both plans and earns no benefit credit. A
+    // guarded Number/Boolean peer removes the existing dynamic owner-class test.
+    if let Some((_, peer)) = super::strict_null::selected_peer(op, facts, known_suffix) {
+        return u32::from(!peer.is_copyable());
+    }
+    if matches!(op, Op::StrictEq | Op::StrictNotEq) && known_suffix < 2 {
+        // An opaque suffix uses the same checked comparison in both versions;
+        // neither native Number guards nor a Null owner guard are emitted.
+        return 0;
+    }
+    let inputs = facts.unwrap_or_default();
     let number = |ty: Types| u32::from(!ty.is_number());
     let owner = |ty: Types| u32::from(!ty.is_copyable());
     match op {

@@ -3226,6 +3226,12 @@ impl Property {
             self.packed.number()
         }
     }
+    /// A class observation of an already materialized own data value. This neither
+    /// retains an object nor materializes a deferred function prototype.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) fn is_object_value(&self) -> bool {
+        !self.accessor() && self.packed.tag() == PACK_OBJ
+    }
     /// Collector-only owning edge, lent without a reference-count round trip. A deferred
     /// prototype owns its realm parent until first observation; afterward it owns the
     /// materialized prototype instead. Do not allocate or change the reference graph during

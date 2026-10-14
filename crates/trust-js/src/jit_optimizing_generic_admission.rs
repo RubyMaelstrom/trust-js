@@ -133,6 +133,16 @@ impl Plan {
         stack: &stack::StackPlan,
         selected: &[(u32, IcState)],
     ) -> Option<Self> {
+        Self::with_objects(chunk, cfg, stack, selected, None)
+    }
+
+    pub(super) fn with_objects(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        stack: &stack::StackPlan,
+        selected: &[(u32, IcState)],
+        objects: Option<&super::object_facts::Plan>,
+    ) -> Option<Self> {
         if !enabled()
             || chunk.jit_ops().len() > 256
             || selected.is_empty()
@@ -159,7 +169,8 @@ impl Plan {
             weights[block] = weights[block].checked_add(credit)?;
             per_pc[pc as usize] = Some(credit);
         }
-        let minimum_tests = minimum_path(cfg, chunk, &weights, &per_pc)?;
+        let minimum_tests = minimum_path(cfg, chunk, &weights, &per_pc, objects)?
+            .saturating_sub(objects.map_or(0, |plan| plan.guard_cost));
         (minimum_tests != 0).then(|| Self {
             selected: selected.to_vec(),
             minimum_tests,
@@ -177,7 +188,13 @@ fn removed_tests(removed: heap_proofs::ReadElisions) -> u32 {
         + u32::from(removed.data)
 }
 
-fn minimum_path(cfg: &Cfg, chunk: &Chunk, weights: &[u32], per_pc: &[Option<u32>]) -> Option<u32> {
+fn minimum_path(
+    cfg: &Cfg,
+    chunk: &Chunk,
+    weights: &[u32],
+    per_pc: &[Option<u32>],
+    objects: Option<&super::object_facts::Plan>,
+) -> Option<u32> {
     let ops = chunk.jit_ops();
     let blocks = cfg.blocks();
     if blocks.is_empty()
@@ -204,6 +221,11 @@ fn minimum_path(cfg: &Cfg, chunk: &Chunk, weights: &[u32], per_pc: &[Option<u32>
         settled[next] = true;
         for target in &blocks[next].successors {
             let target = target.0 as usize;
+            if objects.is_some_and(|plan| {
+                !plan.accepts(chunk, blocks[next].end - 1, blocks[target].start)
+            }) {
+                continue;
+            }
             let total = distance[next].checked_add(*weights.get(target)?)?;
             distance[target] = distance[target].min(total);
         }
@@ -238,7 +260,7 @@ fn minimum_path(cfg: &Cfg, chunk: &Chunk, weights: &[u32], per_pc: &[Option<u32>
         for pc in block.start..block.end {
             if let Some(credit) = per_pc[pc] {
                 prefix = prefix.checked_add(credit)?;
-            } else if may_throw(chunk, &ops[pc]) {
+            } else if may_throw(chunk, pc, objects) {
                 // A checked call/getter/conversion may exit before the block's
                 // final opcode. Later field savings cannot pay that entry.
                 minimum = minimum.min(prefix);
@@ -248,7 +270,15 @@ fn minimum_path(cfg: &Cfg, chunk: &Chunk, weights: &[u32], per_pc: &[Option<u32>
     Some(minimum)
 }
 
-fn may_throw(chunk: &Chunk, op: &Op) -> bool {
+fn may_throw(chunk: &Chunk, pc: usize, objects: Option<&super::object_facts::Plan>) -> bool {
+    let op = &chunk.jit_ops()[pc];
+    // Use the IDENTICAL settled normal-edge initialization fact consumed by
+    // ownership::LoadLocal. Object remains an owner: only its TDZ test disappears.
+    if matches!(op, Op::LoadLocal(_))
+        && objects.is_some_and(|plan| plan.values.at[pc].local.initialized())
+    {
+        return false;
+    }
     !matches!(
         op,
         Op::Const(_)

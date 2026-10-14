@@ -2456,6 +2456,9 @@ pub struct Chunk {
     /// Frozen exact own-data sites selected by bounded structural hot admission.
     #[cfg(feature = "optimizing-jit")]
     pub(crate) optimizing_structural: Box<[(u32, IcState)]>,
+    /// Selected Object result guards are a subset of the exact frozen own-data sites.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) optimizing_objects: Box<[(u32, IcState)]>,
     #[cfg(feature = "optimizing-jit")]
     pub(crate) optimizing_loop: std::cell::OnceCell<Box<crate::tiering::OptimizingLoopState>>,
     /// Separate native entry kind borrowing a live Script VM activation.
@@ -2670,6 +2673,9 @@ impl Chunk {
                 )
                 .saturating_add(
                     self.optimizing_structural.len() * std::mem::size_of::<(u32, IcState)>(),
+                )
+                .saturating_add(
+                    self.optimizing_objects.len() * std::mem::size_of::<(u32, IcState)>(),
                 )
                 .saturating_add(self.optimizing_samples.get().map_or(0, |samples| {
                     std::mem::size_of::<crate::feedback::EntrySamples>()
@@ -6430,6 +6436,18 @@ pub(crate) fn compile_for_optimizer_with_structural(
     properties: &[(u32, u32)],
     structural: &[(u32, IcState)],
 ) -> Option<Rc<Chunk>> {
+    compile_for_optimizer_with_objects(func, hot, inputs, properties, structural, &[])
+}
+
+#[cfg(feature = "optimizing-jit")]
+pub(crate) fn compile_for_optimizer_with_objects(
+    func: &Function,
+    hot: &Chunk,
+    inputs: &[(u16, u32)],
+    properties: &[(u32, u32)],
+    structural: &[(u32, IcState)],
+    objects: &[(u32, IcState)],
+) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
     // The caller selects this Function's warmed baseline, which may already contain inline
     // splices. Regenerating the AST loses their canonical PCs and hidden frame slots.
@@ -6445,9 +6463,9 @@ pub(crate) fn compile_for_optimizer_with_structural(
     {
         None
     } else {
-        Some(Rc::new(
-            hot.clone_for_optimizer(inputs, properties, structural),
-        ))
+        Some(Rc::new(hot.clone_for_optimizer(
+            inputs, properties, structural, objects,
+        )))
     };
     crate::jit::perf_bytecode_compile_end(started, next.is_some());
     next
@@ -6462,6 +6480,7 @@ impl Chunk {
         inputs: &[(u16, u32)],
         properties: &[(u32, u32)],
         structural: &[(u32, IcState)],
+        objects: &[(u32, IcState)],
     ) -> Self {
         let (layout, bindings) = feedback_layout_for_ops(&self.ops, &self.names);
         let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -6647,6 +6666,7 @@ impl Chunk {
             optimizing_inputs: inputs.into(),
             optimizing_properties: properties.into(),
             optimizing_structural: structural.into(),
+            optimizing_objects: objects.into(),
             optimizing_loop: std::cell::OnceCell::new(),
             osr: std::cell::OnceCell::new(),
         }
@@ -7762,6 +7782,8 @@ fn finish_chunk(
         optimizing_properties: Box::default(),
         #[cfg(feature = "optimizing-jit")]
         optimizing_structural: Box::default(),
+        #[cfg(feature = "optimizing-jit")]
+        optimizing_objects: Box::default(),
         #[cfg(feature = "optimizing-jit")]
         optimizing_loop: std::cell::OnceCell::new(),
         osr: std::cell::OnceCell::new(),

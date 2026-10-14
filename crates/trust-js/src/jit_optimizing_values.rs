@@ -28,13 +28,13 @@ impl Types {
     const NONE: Self = Self(0);
     const UNDEFINED: Self = Self(1 << 0);
     const EMPTY: Self = Self(1 << 1);
-    const NULL: Self = Self(1 << 2);
+    pub(super) const NULL: Self = Self(1 << 2);
     const BOOLEAN: Self = Self(1 << 3);
     pub(super) const NUMBER: Self = Self(1 << 4);
     const BIGINT: Self = Self(1 << 5);
     const STRING: Self = Self(1 << 6);
     const SYMBOL: Self = Self(1 << 7);
-    const OBJECT: Self = Self(1 << 8);
+    pub(super) const OBJECT: Self = Self(1 << 8);
     // Internal packed representations, e.g. a lazy prototype, are never plain owners.
     const INTERNAL: Self = Self(1 << 9);
     pub(super) const ANY: Self = Self((1 << 10) - 1);
@@ -74,6 +74,14 @@ impl Types {
 
     pub(super) fn is_boolean(self) -> bool {
         self == Self::BOOLEAN
+    }
+
+    pub(super) fn is_object(self) -> bool {
+        self == Self::OBJECT
+    }
+
+    pub(super) fn is_null(self) -> bool {
+        self == Self::NULL
     }
 
     pub(super) fn is_nullish(self) -> bool {

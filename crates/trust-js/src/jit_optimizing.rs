@@ -83,6 +83,11 @@ mod names;
 #[cfg(test)]
 #[path = "jit_optimizing_names_tests.rs"]
 mod names_tests;
+#[cfg(test)]
+#[path = "jit_optimizing_object_fact_tests.rs"]
+mod object_fact_tests;
+#[path = "jit_optimizing_object_facts.rs"]
+mod object_facts;
 #[path = "jit_optimizing_owner_leaf.rs"]
 mod owner_leaf;
 #[cfg(test)]
@@ -119,6 +124,8 @@ mod stack_tests;
 mod store_tests;
 #[path = "jit_optimizing_stores.rs"]
 mod stores;
+#[path = "jit_optimizing_strict_null.rs"]
+mod strict_null;
 #[path = "jit_optimizing_values.rs"]
 mod value_facts;
 
@@ -328,9 +335,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         observed.set(observed.get() | sampled_class(&*ctx.slots.add(slot)));
     }
     for (pc, observed) in &samples.properties {
-        observed.set(
-            observed.get() | sampled_property(ctx, *pc as usize).map_or(u32::MAX, sampled_number),
-        );
+        observed.set(observed.get() | sampled_property(ctx, *pc as usize).unwrap_or(u32::MAX));
     }
     generic_admission::observe(chunk, &samples.structural);
     if count == 0 && samples.properties.is_empty() && samples.structural.is_empty() {
@@ -364,12 +369,29 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
         .then(|| specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties))
         .flatten();
-    let structural = generic_admission::Plan::build(
+    let selected_structural = generic_admission::selected(&samples.structural);
+    let selected_objects = object_facts::selected(&properties, &selected_structural);
+    let object_plan = object_facts::Plan::build(
         chunk,
         &cfg,
         &stack,
-        &generic_admission::selected(&samples.structural),
+        &selected_objects,
+        &selected_structural,
+        numeric.as_ref().map_or(&[], |plan| plan.inputs.as_slice()),
+        numeric
+            .as_ref()
+            .map_or(&[], |plan| plan.properties.as_slice()),
     );
+    let structural = match object_plan.as_ref() {
+        Some(plan) => generic_admission::Plan::with_objects(
+            chunk,
+            &cfg,
+            &stack,
+            &selected_structural,
+            Some(plan),
+        ),
+        None => generic_admission::Plan::build(chunk, &cfg, &stack, &selected_structural),
+    };
     let estimated_entries = if let Some(structural) = &structural {
         generic_admission::admission_entries(
             chunk,
@@ -433,12 +455,17 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         None
     };
     let next = if let Some(structural) = &structural {
-        bytecode::compile_for_optimizer_with_structural(
+        bytecode::compile_for_optimizer_with_objects(
             &function,
             chunk,
             &inputs,
             &properties,
             &structural.selected,
+            if object_plan.is_some() {
+                &selected_objects
+            } else {
+                &[]
+            },
         )
     } else {
         bytecode::compile_for_optimizer(&function, chunk, &inputs, &properties)
@@ -542,7 +569,7 @@ fn sampled_number(number: f64) -> u32 {
 
 /// Inspect only an already cached own data descriptor. No [[Get]], getter, proxy,
 /// conversion or deferred-value materialization occurs at a sampling checkpoint.
-unsafe fn sampled_property(ctx: &JitCtx, pc: usize) -> Option<f64> {
+unsafe fn sampled_property(ctx: &JitCtx, pc: usize) -> Option<u32> {
     let chunk = &*ctx.chunk;
     let (receiver, name, cache) = match *chunk.jit_ops().get(pc)? {
         Op::GetPropLocal(slot, name, cache) if usize::from(slot) < ctx.n_slots => (
@@ -567,7 +594,13 @@ unsafe fn sampled_property(ctx: &JitCtx, pc: usize) -> Option<f64> {
     if key.as_ref() != chunk.jit_name(name) {
         return None;
     }
-    property.number_value()
+    if let Some(number) = property.number_value() {
+        Some(sampled_number(number))
+    } else if object_facts::enabled() && property.is_object_value() {
+        Some(crate::feedback::ValueClass::Object.bit())
+    } else {
+        None
+    }
 }
 
 fn isa() -> Option<&'static Arc<dyn TargetIsa>> {
@@ -687,6 +720,9 @@ unsafe extern "C" fn exec(ctx: *mut JitCtx, pc: u32, sp: *mut PackedValue) -> u6
     #[cfg(test)]
     {
         let op = &(&*(*ctx).chunk).jit_ops()[pc as usize];
+        if matches!(op, Op::StrictEq | Op::StrictNotEq) {
+            strict_null::record_checked(ctx, pc, sp);
+        }
         if matches!(
             op,
             Op::LoadName(..) | Op::LoadNameForCall(..) | Op::LoadCap(_)
@@ -787,6 +823,7 @@ struct Lowering<'a, 'b> {
     numeric_plan: Option<&'b ranges::NumericPlan>,
     heap_metadata_plan: Option<&'b heap_proofs::MetadataPlan>,
     generic_own_plan: Option<&'b generic_own::Plan>,
+    object_plan: Option<&'b object_facts::Plan>,
     property_results: &'b [(u32, value_facts::Types)],
     loop_facts: Option<&'b loop_facts::Plan>,
     loop_field_addresses: Vec<Variable>,
@@ -1400,6 +1437,16 @@ impl Lowering<'_, '_> {
         };
         let yes = self.loop_exit(yes);
         let no = self.loop_exit(no);
+        if let Some(truth) = self.object_plan.and_then(|plan| plan.branch(self.pc)) {
+            if matches!(op, Op::JumpIfFalse(_)) {
+                self.change_top(-8);
+            }
+            self.finish_normal();
+            self.b.ins().jump(if truth { yes } else { no }, &[]);
+            #[cfg(test)]
+            object_facts::record(2);
+            return;
+        }
         if self.stack_state.known() > 0 {
             if let Some(integer) = self.stack_integer(1) {
                 #[cfg(test)]
@@ -1500,6 +1547,13 @@ impl Lowering<'_, '_> {
 
     fn lower(&mut self, pc: usize, op: &Op) {
         let next = self.pcs[pc + 1];
+        if self.object_comparison(pc, next) {
+            return;
+        }
+        // Guarded Object/Null certificates precede this general exact-Null peer path.
+        if self.strict_null_comparison(pc, op, next) {
+            return;
+        }
         if self.integer_scalar(op, next) {
             return;
         }
@@ -1964,6 +2018,30 @@ fn prepare_entry_with_limits(
             )
         })
         .flatten();
+    let object_plan = (continuation.is_none() && !chunk.optimizing_objects.is_empty())
+        .then(|| {
+            object_facts::Plan::build(
+                chunk,
+                &cfg,
+                &stack_plan,
+                &chunk.optimizing_objects,
+                &chunk.optimizing_structural,
+                specialization
+                    .as_ref()
+                    .map_or(&[], |plan| plan.inputs.as_slice()),
+                specialization
+                    .as_ref()
+                    .map_or(&[], |plan| plan.properties.as_slice()),
+            )
+        })
+        .flatten();
+    if !chunk.optimizing_objects.is_empty()
+        && (object_plan.is_none()
+            || !property::supported(values)
+            || !crate::value::jit_packed_owners_supported(values))
+    {
+        return Err(CompileError::Unsupported);
+    }
     let generic_values = (use_facts && specialization.is_none() && continuation.is_none())
         .then(|| value_facts::ValuePlan::build(chunk, &cfg, &stack_plan))
         .flatten();
@@ -1985,12 +2063,14 @@ fn prepare_entry_with_limits(
     {
         return Err(CompileError::Unsupported);
     }
-    let value_plan = loop_facts
-        .as_ref()
-        .map(|plan| &plan.values)
-        .or_else(|| specialization.as_ref().map(|plan| &plan.values))
-        .or(generic_values.as_ref())
-        .or(continuation_values.as_ref());
+    let value_plan = object_plan.as_ref().map(|plan| &plan.values).or_else(|| {
+        loop_facts
+            .as_ref()
+            .map(|plan| &plan.values)
+            .or_else(|| specialization.as_ref().map(|plan| &plan.values))
+            .or(generic_values.as_ref())
+            .or(continuation_values.as_ref())
+    });
     // Entry samples are category guards only; this plan deliberately derives
     // ranges from language operations instead of treating an Int32 sample as a
     // runtime range proof. Borrowed loop entries need their own guarded roots.
@@ -2036,8 +2116,20 @@ fn prepare_entry_with_limits(
         })
         .flatten();
     let structural_admission = (!chunk.optimizing_structural.is_empty() && continuation.is_none())
-        .then(|| {
-            generic_admission::Plan::build(chunk, &cfg, &stack_plan, &chunk.optimizing_structural)
+        .then(|| match object_plan.as_ref() {
+            Some(plan) => generic_admission::Plan::with_objects(
+                chunk,
+                &cfg,
+                &stack_plan,
+                &chunk.optimizing_structural,
+                Some(plan),
+            ),
+            None => generic_admission::Plan::build(
+                chunk,
+                &cfg,
+                &stack_plan,
+                &chunk.optimizing_structural,
+            ),
         })
         .flatten();
     if !chunk.optimizing_structural.is_empty() && structural_admission.is_none() {
@@ -2239,9 +2331,15 @@ fn prepare_entry_with_limits(
             numeric_plan: numeric_plan.as_ref(),
             heap_metadata_plan: heap_metadata_plan.as_ref(),
             generic_own_plan: generic_own_plan.as_ref(),
-            property_results: specialization
+            object_plan: object_plan.as_ref(),
+            property_results: object_plan
                 .as_ref()
-                .map_or(&[], |plan| plan.properties.as_slice()),
+                .map(|plan| plan.properties.as_slice())
+                .unwrap_or_else(|| {
+                    specialization
+                        .as_ref()
+                        .map_or(&[], |plan| plan.properties.as_slice())
+                }),
             loop_facts: loop_facts.as_ref(),
             loop_field_addresses: Vec::new(),
             loop_field_values: Vec::new(),
@@ -2342,7 +2440,9 @@ fn prepare_entry_with_limits(
                 return Err(CompileError::LoweringBudget);
             }
             lower.b.switch_to_block(lower.pcs[pc]);
-            if !stack_plan.reachable[pc] {
+            if !stack_plan.reachable[pc]
+                || object_plan.as_ref().is_some_and(|plan| !plan.reachable[pc])
+            {
                 // No invented operands in dead bytecode. In particular, no unchecked reads
                 // from zero-depth synthetic stack states to satisfy the SSA builder.
                 lower.b.ins().jump(error, &[]);

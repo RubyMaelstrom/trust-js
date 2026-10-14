@@ -93,9 +93,13 @@ impl Lowering<'_, '_> {
             .property_results
             .iter()
             .any(|&(site, ty)| site as usize == pc && ty.is_number());
+        let object_result = self
+            .property_results
+            .iter()
+            .any(|&(site, ty)| site as usize == pc && ty.is_object());
         let generic_own = self.generic_own_plan.and_then(|plan| plan.read(pc));
         if !supported(self.values) {
-            if numeric_result || generic_own.is_some() {
+            if numeric_result || object_result || generic_own.is_some() {
                 self.specialization_bailout(pc);
             } else {
                 self.checked(get_property, pc as u32, next);
@@ -380,6 +384,16 @@ impl Lowering<'_, '_> {
             let number = self.number(value);
             self.property_guard(number, slow);
         } else {
+            if object_result {
+                let tag = self.b.ins().ushr_imm_u(value, 48);
+                let object = self
+                    .b
+                    .ins()
+                    .icmp_imm_s(IntCC::Equal, tag, (PACK_OBJ >> 48) as i64);
+                self.property_guard(object, slow);
+                #[cfg(test)]
+                super::object_facts::record(0);
+            }
             self.retain_word(value, slow);
         }
         // Commit: from here no guard, helper, safepoint or other observer may intervene.
@@ -398,7 +412,7 @@ impl Lowering<'_, '_> {
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
         self.stack_state = self.stack_plan.at[pc];
-        if numeric_result || generic_own.is_some() {
+        if numeric_result || object_result || generic_own.is_some() {
             // The complete frame is still before this access. In particular an accessor
             // miss must execute its getter once in the VM, never replay an observed call.
             self.specialization_bailout(pc);

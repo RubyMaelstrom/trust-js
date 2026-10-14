@@ -1021,3 +1021,57 @@ included in retained metadata; the bounded directory keeps weak references, not 
 owners. Full-mode shared-owner counters occupy separate slots from the eight execution sites.
 All runtime diagnostic modes perturb emission and may change compiler-budget admission, so
 their runs are not performance acceptance measurements.
+
+Object-valued fields and exact Null comparisons
+------------------------------------------------
+TRUST_JS_OPT_JIT_OBJECT_FIELDS=1 extends the experimental GENERIC_OWN selection
+with at most 16 Object-valued own-data read sites, drawn from its existing bounded
+stable-cache observations. Both switches remain off by default. Selection requires
+an exact Object mask across four property checkpoints, a stable monomorphic
+own-data cache, and enabled value facts and heap/compact-store operations.
+Every selected Object native read checks the live value's exact Object tag before
+retaining its owner. The proof describes that copied value, not an immutable
+property or prototype. A changed receiver, descriptor or category recovers before
+that read with all completed effects and owners preserved. Effects invalidate heap
+metadata proofs; copied Object values may remain proved when private-slot effects
+permit it.
+
+Object and Null are different ECMAScript types even for callable, revoked-Proxy
+and IsHTMLDDA objects. Strict comparisons can therefore establish a Boolean and
+prune an adjacent dependent conditional within the same block under the guarded
+Object proof. Type facts are computed on the original CFG with both edges; native
+reachability and structural benefit then use the same feasibility certificate.
+Independent handler and resumption roots, unsupported joins and cyclic selected
+guard blocks remain conservative. The proof does not eliminate required
+retain/release operations or invoke a getter, Proxy trap or conversion while
+collecting feedback. Generic strict comparisons remain available after recovery.
+
+Inside the optional optimizer, a settled exact-Null operand also selects a
+compact strict-equality/inequality operation for an arbitrary peer. It compares
+canonical packed identity, consumes the peer's owner, and produces a canonical
+Boolean without conversion, getters or Proxy traps. A last owner or unsupported
+layout takes the original checked operation once, before changing its operands.
+TRUST_JS_OPT_JIT_STRICT_NULL=0 retains the previous lowering. Whole-function
+VALUE_FACTS=0 supplies no exact-Null proof; a loop continuation may still have its
+own independently guarded entry facts.
+
+Lowering and benefit estimation share the same exact-Null and known-stack-suffix
+selection. The generic peer has one dynamic owner-classification check; a proved
+copyable peer removes it. The comparison itself earns no added credit, and an
+opaque stack suffix earns none for an unchanged checked operation. Entry-guard
+costs, the 256-op hot bound, the 4096-entry floor and the compiler IR caps remain
+unchanged. Fitting within a cap does not establish publication, native execution
+on a framework, or repayment of compilation work.
+
+These rules implement IsStrictlyEqual and SameValueNonNumber in the local
+ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202:
+https://tc39.es/ecma262/#sec-isstrictlyequal
+https://tc39.es/ecma262/#sec-samevaluenonnumber
+
+The structural estimate still excludes specialization misses and host interruption
+or resource termination. It estimates work, not future calls or profitability.
+Synthetic fixtures demonstrate default-hot publication and inlining followed by
+independent optimizer publication. The pinned strict React Qu diagnostic fits the
+unchanged IR budget, but its constructed fixture produced no native Qu entries or
+normal-policy publication. The actual prepared browser body and compilation cost
+repayment remain separate application gates.

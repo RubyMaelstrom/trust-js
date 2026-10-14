@@ -188,6 +188,16 @@ included in retained memory, and the directory holds weak references.
 overwrites with arbitrary owned values. Hot admission freezes at most 32 stable scalar IC
 states from four checkpoints and credits only conservative structural-check removal; actual
 values, descriptors and owner transactions remain live and guarded. It is off by default.
+`TRUST_JS_OPT_JIT_OBJECT_FIELDS=1` extends that selection with at most 16 stable Object-valued
+own-data reads. It also requires value facts and native heap/compact-store operations. Each
+read guards the live Object tag before retaining its owner. Copied Object facts can simplify
+strict comparisons with Null and adjacent branches; they do not freeze heap contents or remove
+owner transfers. Handler/resumption roots and cyclic selected guard blocks decline this experiment.
+`TRUST_JS_OPT_JIT_STRICT_NULL=0` disables the optimizer's exact-Null strict-comparison lowering.
+Its packed comparison consumes the arbitrary peer's owner, with last-owner destruction checked
+at the original operation. Lowering and benefit estimation use the same known-stack/type proof;
+opaque suffixes receive no credit. These changes retain the hot floor, body bound and IR caps.
+Neither compiler eligibility nor forced fixture execution establishes real-framework repayment.
 `TRUST_JS_OPT_JIT_SHARED_OWNERS=1` separately moves single-owner retain/release checks into
 validated scalar native leaves with no allocation, GC, callbacks or final destruction.
 It is off by default; alias-aware multi-owner transactions retain their existing guarded implementation.

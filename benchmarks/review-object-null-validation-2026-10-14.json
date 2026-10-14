@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-10-14",
+  "base_revision": "4860ed0321acd55d1ba49d8f3a4968c171e8e868",
+  "scope": "Guarded Object own-data result facts and exact Null strict comparisons within the optional optimizing JIT. No default tier or budget changes.",
+  "source_hashes": {
+    "crates/trust-js/src/bytecode.rs": "b89af140f97f335bc40526810e4292a6cb90b18e664d36005eb1483c87af3452",
+    "crates/trust-js/src/jit_optimizing.rs": "d055e78249beb0bc78f8f27fe26ef6310bfcaa51f92ee41fd5d45468ac1d6920",
+    "crates/trust-js/src/jit_optimizing_generic_admission.rs": "2110d6971e5e63623c6ba08a827239574c437a986df218674fa6e201c723c57b",
+    "crates/trust-js/src/jit_optimizing_generic_own_tests.rs": "9b3a68eaadaf6638380ec4e97baf6d58a5cc1b44c86598d3f47740e65b25132e",
+    "crates/trust-js/src/jit_optimizing_loop.rs": "6f86ea910cebc3749b1fd37268d62bbdf49d3bad74063b7a25e7ae704bea245f",
+    "crates/trust-js/src/jit_optimizing_object_fact_tests.rs": "3ee50cd5840ca2e25f9329885404d6e5ea7046bff485b0a1070d4c039013ae49",
+    "crates/trust-js/src/jit_optimizing_object_facts.rs": "af8a59afaf44954ff62f5e34846509875e8526058c8e9f603aed242aea0a8787",
+    "crates/trust-js/src/jit_optimizing_property.rs": "c2e7e96f13b2f8b190235f7c0d41bf321399a0a81490b567f2b429ee9c30bfa4",
+    "crates/trust-js/src/jit_optimizing_specialization.rs": "34489089584959e4f24145a9eadf40c7994faf20c564bf2cde5fcb496cf5df95",
+    "crates/trust-js/src/jit_optimizing_strict_null.rs": "7beb3709156d77fe9994c017a7644a494d9cd09216d2449d2c8ac42eda047ac0",
+    "crates/trust-js/src/jit_optimizing_strict_null_tests.rs": "54f1bdee63c5cf8b0651469523207f183428a9a98a7126629c843729d97c3211",
+    "crates/trust-js/src/jit_optimizing_values.rs": "f630e453286f6154db482fdf95464fbaa2e4395ce56bc48941d96fecd3ed9db5",
+    "crates/trust-js/src/value.rs": "0722b7411fa986a477b733484ad86617b9cc2116d747e6ed6f24bf4c5a60f4f6"
+  },
+  "source_manifest": {
+    "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/manifest-frozen-final.json",
+    "sha256": "272817dbe6d8d13a595379e825e417a03ee377f95ddcfc5064ad4f23ff6dd9fd"
+  },
+  "source_inventory": {
+    "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/source-inventory-final.json",
+    "sha256": "fd726ed6a75b3de236536229c090d3db9801124826a536c807d3af99712bba68"
+  },
+  "reviewed_patch": {
+    "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/object-null-on-v3a-final.patch",
+    "sha256": "7fea30a8422da260d7908867cf624e60bb73da845eab096122efd6e0a7371268",
+    "relative_to": "exact frozen v3a ac04e9c4 anchor"
+  },
+  "documentation_qualification": "AGENTS.md and docs/optimizing-tier.txt were updated after the frozen executable source; all 13 changed Rust files match the validated source exactly.",
+  "standards": {
+    "specification": "ECMA-262",
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "clauses": [
+      "https://tc39.es/ecma262/#sec-isstrictlyequal",
+      "https://tc39.es/ecma262/#sec-samevaluenonnumber"
+    ]
+  },
+  "arm64": {
+    "machine": "crystal, Linux aarch64, 20 CPUs (Cortex-X925/A725)",
+    "features": [
+      "default intl",
+      "embed",
+      "optimizing-jit"
+    ],
+    "binary": {
+      "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/frozen/trust-js-unit-tests",
+      "sha256": "3ed2f950150aadfe8519c0cc7e3bd0bbef76992d018f84536064d105e24d93c5",
+      "profile": "Cargo test unoptimized+debug, not performance eligible",
+      "features": [
+        "default intl",
+        "embed",
+        "optimizing-jit"
+      ],
+      "target": "aarch64 GNU/Linux",
+      "cpu_affinity": "6-9",
+      "separate_target": "/big/Code/trust-js/target/object-strict-null-v2-composed-v3a-build-20261014"
+    },
+    "full_unit_suite": {
+      "passed": 2394,
+      "failed": 0,
+      "ignored": 3,
+      "log": {
+        "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/root-independent-final/full-suite.log",
+        "sha256": "22468eebfeb036b8fdc4ea18d55e0d6d052b9415c0b7b3b1fc1164369f3bbe24"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/frozen/trust-js-unit-tests",
+        "--test-threads=2"
+      ]
+    },
+    "focused": {
+      "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/composed-focused-results-final.json",
+      "sha256": "61ff6d7e666e6058d09773676d8cd8ddc416edf0623eacdc1c5b406b2b628bdc",
+      "top_level_passes": 41,
+      "failures": 0,
+      "ignored": 0,
+      "selection": "15Object owners0 +same15owners1 +8StrictNull +2integration (six asserted nested variants) +1Qu (compile/execution children)",
+      "children": "Successful integration/StrictNull child outputs hidden by original source; their harness checks exact1pass/exit0. Object/Qu child raw streams retained."
+    },
+    "strict_all_target_clippy": {
+      "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/clippy-final-result.json",
+      "sha256": "7936a1871efb6eafa25b793f439d5fbae780b430d3d83c2dfdf9b87e477ec403",
+      "exit": 0,
+      "scope": "all-targets trust-js embed+optimizing-jit -Dwarnings"
+    },
+    "root_audit": {
+      "path": "/big/Code/trust-js/target/object-strict-null-v2-composition-v3a-review-20261014/root-independent-final/audit.json",
+      "sha256": "6669be035fe9f0ebcf68443eda5ef768804d4550280f634aef88c302cfbc1e7e"
+    }
+  },
+  "test262": {
+    "suite_revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
+    "unique_files": 111,
+    "executions": 555,
+    "failed": 0,
+    "skipped": 0,
+    "scopes": {
+      "language/expressions/strict-equals": 30,
+      "language/expressions/strict-does-not-equals": 30,
+      "language/expressions/property-accessors": 21,
+      "built-ins/Proxy/get": 19,
+      "built-ins/Reflect/get": 11
+    },
+    "modes": [
+      "interpreter",
+      "bytecode",
+      "template JIT",
+      "forced optimizer, Object fields enabled, shared owners off",
+      "forced optimizer, Object fields enabled, shared owners on"
+    ],
+    "artifact_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation-object-null-v2-release/release-artifacts.json",
+      "sha256": "a2ff8f04b99ba0fb07f74d9a5589ea049e970f48311945463df81ab017340724"
+    },
+    "raw_results": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation-object-null-v2-release/test262-affected-results.json",
+      "sha256": "e2cadc76e65a6599acec199e7621405bc55d38c723c97793020c5a7e4f1a3538"
+    },
+    "root_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation-object-null-v2-release/root-independent-audit.json",
+      "sha256": "9539cb992832eacfd69031928a00ca4df9b1075d663fd6e2fe89e94c16a6a9cb"
+    }
+  },
+  "x86_64": {
+    "execution": "QEMU 7.2.22 Linux-user -cpu max, static x86_64-musl debug binary on ARM64; not native hardware",
+    "exact_successful_cases": 80,
+    "unique_selectors": 46,
+    "guest_wx_checks": 2,
+    "guest_rx_transitions": 28,
+    "guest_rwx_requests": 0,
+    "historical_attempts": "One incorrect HOT_AT adapter failure and one 180-second timeout retained; corrected environment/default-policy tests passed with unchanged source and binary.",
+    "report": {
+      "path": "/tmp/trust-js-cross-validation-20261014/object-strict-null-v2/report.json",
+      "sha256": "d6e1cb69fb722cd652617f60ce639c70345c605976672f3fdb2c295051828c90"
+    },
+    "root_audit": {
+      "path": "/tmp/trust-js-cross-validation-20261014/object-strict-null-v2/root-independent-audit.json",
+      "sha256": "9a1bd0625fe1a313152ac43de0cd34355713ca34a15a41dcf634a00555d4a3fe"
+    }
+  },
+  "wasm32": {
+    "successful_compile_checks": 3,
+    "scopes": [
+      "default engine",
+      "no-default-features embed engine",
+      "default engine and bindings"
+    ],
+    "runtime_tested": false
+  },
+  "performance_acceptance": false,
+  "limits": [
+    "Test262 selections are focused, not a full conformance result.",
+    "Pinned React Qu fixture remains unpublished under normal hot policy; static compilation within budget does not establish application uptake or speedup.",
+    "Elapsed test times and instrumented diagnostics are not performance evidence.",
+    "Windows and physical x86 validation are separate follow-up work.",
+    "Evidence files under target and /tmp are local records; builds and tests require no untracked reports."
+  ]
+}

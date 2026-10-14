@@ -866,7 +866,7 @@ fn pinned_react_qu_copy_body_inherits_the_real_bundle_strict_context() {
     pinned_react_qu_copy_body(true);
 }
 
-fn pinned_react_qu_copy_body(strict: bool) {
+fn pinned_react_qu_source() -> &'static str {
     // Exact original Qu bytes107479..108041 from the pinned official React
     // complex-DOM bundle (SHA bfaa94e2...): synthetic fibers validate this
     // emission's eligibility, not actual application entry/admission or speed.
@@ -900,10 +900,15 @@ var subject=Qu,held={tag:1},fiber=Wu(0,null,null,0);
 fiber.child=held;fiber.memoizedProps=held;fiber.memoizedState=held;fiber.updateQueue=held;
 fiber.sibling=held;fiber.ref=held;fiber.childLanes=3;fiber.lanes=5;fiber.index=7;
 "#;
+    SOURCE
+}
+
+fn pinned_react_qu_copy_body(strict: bool) {
+    let pinned = pinned_react_qu_source();
     let source = if strict {
-        format!("'use strict';{SOURCE}")
+        format!("'use strict';{pinned}")
     } else {
-        SOURCE.to_owned()
+        pinned.to_owned()
     };
     let (mut engine, function, chunk) = warmed(&source, "subject(fiber,held);subject(fiber,held)");
     assert_eq!(
@@ -953,4 +958,210 @@ fiber.sibling=held;fiber.ref=held;fiber.childLanes=3;fiber.lanes=5;fiber.index=7
     assert_eq!(chunk.optimizing_misses.get(), 0);
     bytecode::native_deopt::ENTRIES.with(|entries| assert!(entries.borrow().is_empty()));
     finished(&mut engine, &code);
+}
+
+/// Compile/admission diagnostics for the exact upstream function, using explicitly
+/// constructed Fiber feedback. These calls are not Speedometer phase observations.
+/// No diagnostic override reduces the production entry distance or IR bound.
+#[test]
+fn pinned_strict_react_qu_reports_observed_object_admission_and_native_coverage() {
+    const CHILD: &str = "TRUST_JS_TEST_PINNED_QU_DIAGNOSTIC";
+    if std::env::var_os(CHILD).is_none() {
+        for mode in ["compile", "execution"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("TRUST_JS") {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
+                .args([
+                    "--exact",
+                    "jit::optimizing::generic_own_tests::pinned_strict_react_qu_reports_observed_object_admission_and_native_coverage",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .env("TRUST_JS_OPT_JIT", "hot")
+                .env("TRUST_JS_OPT_JIT_BACKGROUND", "0")
+                .env("TRUST_JS_OPT_JIT_DIAGNOSTICS", mode)
+                .env("TRUST_JS_OPT_JIT_GENERIC_OWN", "1")
+                .env("TRUST_JS_OPT_JIT_OBJECT_FIELDS", "1")
+                .env("TRUST_JS_OPT_JIT_SHARED_OWNERS", "1")
+                .env("TRUST_JS_OPT_JIT_SHARED_RECOVERY", "1")
+                .output()
+                .unwrap();
+            eprintln!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "Qu diagnostic mode={mode}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        return;
+    }
+    assert!(std::env::var_os("TRUST_JS_OPT_JIT_HOT_AT").is_none());
+    assert!(std::env::var_os("TRUST_JS_INLINE_AT").is_none());
+    assert!(object_facts::enabled());
+    let source = format!("'use strict';{}", pinned_react_qu_source());
+    // Prepare the body in the VM, then execute the creation arm once on the template
+    // tier so the real Wu call cache can feed the ordinary inliner. This happens before
+    // the first entry checkpoint; observed Object masks remain live template samples.
+    let (mut engine, function, primary) =
+        warmed(&source, "subject(fiber,held);subject(fiber,held)");
+    assert!(function.is_strict);
+    engine.set_tier(Tier::Jit);
+    eval(
+        &mut engine,
+        "fiber.alternate=null;subject(fiber,held);void 0",
+    );
+    eval(
+        &mut engine,
+        "for(var q=0;q<499;q++)subject(fiber,held);void 0",
+    );
+    let flattened = function.code2.get().and_then(Option::as_ref).cloned();
+    report_qu_observations(&mut engine, &function, &primary, "primary_after_500");
+    if let Some(flattened) = &flattened {
+        report_qu_observations(&mut engine, &function, flattened, "prepared_after_500");
+    }
+    eval(
+        &mut engine,
+        "for(var q=0;q<200000;q++)subject(fiber,held);void 0",
+    );
+    let canonical = flattened.as_ref().unwrap_or(&primary);
+    report_qu_observations(&mut engine, &function, canonical, "after_fixture_200500");
+    assert_eq!(
+        eval(
+            &mut engine,
+            r#"var result=subject(fiber,held);
+        [result===fiber.alternate,result.child===held,result.memoizedProps===held,
+        result.memoizedState===held,result.updateQueue===held,result.ref===held,
+        result.pendingProps===held,result.childLanes,result.lanes,result.index].join('|')"#
+        ),
+        "true|true|true|true|true|true|true|3|5|7"
+    );
+    if let Some(next) = function.optimizing_code.get().and_then(Option::as_ref) {
+        let code = next.jit.get().flatten().unwrap();
+        let record = code.optimizing_diagnostics.as_ref().unwrap();
+        eprintln!("[pinned-qu-published] {}", record.json());
+        if std::env::var(CHILD).as_deref() == Ok("execution") {
+            assert!(
+                record.counters[0].get() > 0,
+                "actual native entries are counted"
+            );
+            assert!(record.counters[diagnostics::NORMAL_EXIT].get() > 0);
+        }
+        assert_eq!(next.optimizing_misses.get(), 0);
+    }
+    // The null path is still part of the exact source and may allocate a new Fiber.
+    // A selected Object version must recover before reading this changed alternate.
+    assert_eq!(eval(&mut engine, "fiber.alternate=null;var result=subject(fiber,held);result===fiber.alternate && result.child===held && result.ref===held"), "true");
+    if let Some(next) = function.optimizing_code.get().and_then(Option::as_ref) {
+        if next.optimizing_objects.iter().any(|&(pc, _)| {
+            matches!(next.jit_ops()[pc as usize], Op::GetPropLocal(_, name, _) if next.jit_name(name) == "alternate")
+        }) {
+            assert_eq!(next.optimizing_misses.get(), 1);
+        }
+        let code = next.jit.get().flatten().unwrap();
+        eprintln!(
+            "[pinned-qu-after-null] {}",
+            code.optimizing_diagnostics.as_ref().unwrap().json()
+        );
+    }
+    assert!(engine.interp.fn_frames.is_empty());
+}
+
+fn report_qu_observations(
+    engine: &mut Engine,
+    function: &crate::ast::Function,
+    chunk: &Rc<Chunk>,
+    stage: &str,
+) {
+    let inline_guards = chunk
+        .jit_ops()
+        .iter()
+        .filter(|op| matches!(op, Op::InlineGuard(..)))
+        .count();
+    let Some(samples) = chunk.optimizing_samples.get() else {
+        eprintln!(
+            "[pinned-qu-plan] stage={stage} ops={} inline_guards={inline_guards} samples=absent",
+            chunk.jit_ops().len()
+        );
+        return;
+    };
+    let inputs: Vec<_> = samples.classes[..chunk.jit_frame().0.min(16)]
+        .iter()
+        .enumerate()
+        .map(|(slot, bits)| (slot as u16, bits.get()))
+        .collect();
+    let properties: Vec<_> = samples
+        .properties
+        .iter()
+        .map(|(pc, bits)| (*pc, bits.get()))
+        .collect();
+    let cfg = Cfg::build(chunk).unwrap();
+    let stack = stack::StackPlan::build(chunk, &cfg).unwrap();
+    let selected = generic_admission::selected(&samples.structural);
+    let numeric = specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties);
+    let objects = object_facts::selected(&properties, &selected);
+    let object = object_facts::Plan::build(
+        chunk,
+        &cfg,
+        &stack,
+        &objects,
+        &selected,
+        numeric.as_ref().map_or(&[], |plan| plan.inputs.as_slice()),
+        numeric
+            .as_ref()
+            .map_or(&[], |plan| plan.properties.as_slice()),
+    );
+    let structural =
+        generic_admission::Plan::with_objects(chunk, &cfg, &stack, &selected, object.as_ref());
+    let estimated_entries = if let Some(plan) = &structural {
+        generic_admission::admission_entries(
+            chunk,
+            numeric.as_ref().map_or(0, |p| p.saved_tests),
+            plan.minimum_tests,
+        )
+    } else {
+        numeric.as_ref().map(|plan| plan.admission_entries(chunk))
+    };
+    let target = estimated_entries.map(|entries| entries.max(4096));
+    let limit = (chunk.jit_ops().len() * 40 + names::instruction_allowance(chunk)).min(16384);
+    eprintln!("[pinned-qu-plan] stage={stage} ops={} inline_guards={inline_guards} samples={} sampled_entry_prefix={} countdown={} inputs={inputs:?} properties={properties:?} structural_sites={} object_pcs={:?} object_plan={} pruned={} structural_minimum={:?} numeric_saved={} target={target:?} IR_limit={limit} published={}",
+        chunk.jit_ops().len(), samples.samples.get(), samples.entries.get(), chunk.optimizing_remaining.get(), selected.len(), objects.iter().map(|&(pc,_)|pc).collect::<Vec<_>>(), object.is_some(),object.as_ref().map_or(0,|plan|plan.reachable.iter().filter(|&&yes|!yes).count()),structural.as_ref().map(|plan|plan.minimum_tests),numeric.as_ref().map_or(0,|plan|plan.saved_tests),function.optimizing_code.get().and_then(Option::as_ref).is_some());
+    if samples.samples.get() < 4 {
+        return;
+    }
+    let candidate = if let Some(structural) = &structural {
+        bytecode::compile_for_optimizer_with_objects(
+            function,
+            chunk,
+            &inputs,
+            &properties,
+            &structural.selected,
+            if object.is_some() { &objects } else { &[] },
+        )
+    } else {
+        bytecode::compile_for_optimizer(function, chunk, &inputs, &properties)
+    };
+    let Some(candidate) = candidate else {
+        eprintln!("[pinned-qu-compile] stage={stage} exact_clone=declined");
+        return;
+    };
+    assert_eq!(candidate.jit_ops(), chunk.jit_ops());
+    assert_eq!(candidate.jit_frame(), chunk.jit_frame());
+    let values = crate::value::jit_layout(&engine.interp.object_proto);
+    let layout = crate::interpreter::interp_layout(&mut engine.interp);
+    match compile_with_deopt(&candidate, &values, &layout, None) {
+        Ok(code) => {
+            let record = code.optimizing_diagnostics.as_ref().unwrap();
+            assert!(record.ir_instructions.get() <= limit);
+            eprintln!("[pinned-qu-compile] stage={stage} strict_budget=passed manual_publication=false {}", record.json());
+        }
+        Err(error) => {
+            eprintln!("[pinned-qu-compile] stage={stage} strict_budget=declined error={error:?}");
+        }
+    }
 }

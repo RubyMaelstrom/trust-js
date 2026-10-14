@@ -175,9 +175,16 @@ pub(in crate::jit) unsafe fn enter(raw: *mut JitCtx, pc: u32, sp: *mut PackedVal
             .map(|block| &cfg.blocks()[block.0 as usize])
             .flat_map(|block| block.start..block.end)
             .map(|at| {
-                specialization::tests(&chunk.jit_ops()[at], generic.at[at]).saturating_sub(
-                    specialization::tests(&chunk.jit_ops()[at], specialized.at[at]),
+                specialization::tests(
+                    &chunk.jit_ops()[at],
+                    Some(generic.at[at]),
+                    stack.at[at].known(),
                 )
+                .saturating_sub(specialization::tests(
+                    &chunk.jit_ops()[at],
+                    Some(specialized.at[at]),
+                    stack.at[at].known(),
+                ))
             })
             .sum();
         if log {
