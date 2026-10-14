@@ -1,0 +1,192 @@
+{
+  "date": "2026-10-14",
+  "session_date": "2026-10-13",
+  "purpose": "Read-only attribution check for integrated typed-array-set regression: compare the immutable DataView-only isolated binary to original baseline, excluding deque/internal-slot/function-tiering changes.",
+  "baseline": {
+    "revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "artifact": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+    "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+  },
+  "candidate": {
+    "scope": "DataView-only isolated changes on same base revision",
+    "artifact": "/tmp/trust-js-dataview-target-20261013/release/trust-js",
+    "sha256": "1a05964a7617c05728e3e3843c311ec099fac8a425592b2393bd8019411cd5a2"
+  },
+  "machine": {
+    "architecture": "aarch64",
+    "affinity_cpu": 5,
+    "cpu": "Cortex-X925",
+    "max_frequency_khz": 3900000,
+    "governor": "schedutil"
+  },
+  "execution": {
+    "tier": "jit",
+    "other_trust_js_overrides": "cleared",
+    "process_pairs": 3,
+    "samples_per_process": 5,
+    "source": "Focused extraction of benchmarks/webgl-engine-kernels.js typed-array-set fixture",
+    "fixture": "'use strict';\nconst source=[1.25,2.25,3.25,4.25,5.25,6.25,7.25,8.25,9.25,10.25,11.25,12.25,13.25,14.25,15.25,16.25];\nconst typed=new Float32Array(16);\nfunction typedCopy(n){for(let i=0;i!==n;++i)typed.set(source);return typed[0]+typed[15];}\nfor(let i=0;i<200;i++)typedCopy(100);\nconst samples=[],checksums=[];\nfor(let i=0;i<5;i++){const start=Date.now();checksums.push(typedCopy(500000));samples.push(Date.now()-start);}\nconsole.log(JSON.stringify({name:'typed-array-set',count:500000,samples_ms:samples,checksums}));\n",
+    "comparison": "Median per process, paired time ratios; 50000 bootstrap resamples of three pairs, seed 20261014"
+  },
+  "runs": [
+    {
+      "pair": 0,
+      "variant": "baseline",
+      "wall_s": 1.3425145639994298,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          265,
+          264,
+          264,
+          264,
+          263
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "pair": 0,
+      "variant": "candidate",
+      "wall_s": 1.362466313999903,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          268,
+          268,
+          268,
+          267,
+          268
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "wall_s": 1.3691842080006609,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          269,
+          270,
+          269,
+          269,
+          269
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "wall_s": 1.3451960159945884,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          265,
+          265,
+          264,
+          265,
+          265
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "wall_s": 1.3586908619981841,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          267,
+          267,
+          267,
+          267,
+          268
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "wall_s": 1.4249428719995194,
+      "record": {
+        "name": "typed-array-set",
+        "count": 500000,
+        "samples_ms": [
+          280,
+          281,
+          280,
+          281,
+          281
+        ],
+        "checksums": [
+          17.5,
+          17.5,
+          17.5,
+          17.5,
+          17.5
+        ]
+      }
+    }
+  ],
+  "summary": {
+    "baseline_process_medians_ms": [
+      264,
+      265,
+      267
+    ],
+    "candidate_process_medians_ms": [
+      268,
+      269,
+      281
+    ],
+    "paired_median_ratio": 1.0151515151515151,
+    "bootstrap_95_ratio_interval": [
+      1.0150943396226415,
+      1.0524344569288389
+    ]
+  },
+  "limitations": [
+    "Three-pair attribution check, not the full integrated acceptance comparison.",
+    "The candidate contains only DataView changes and retains original storage and tiering."
+  ]
+}

@@ -1,0 +1,3051 @@
+{
+  "date": "2026-10-14",
+  "session_date": "2026-10-13",
+  "machine": {
+    "hostname": "crystal",
+    "uname": "Linux crystal 7.2.10-crystal #1 SMP PREEMPT_DYNAMIC @1791725354 aarch64 GNU/Linux",
+    "architecture": "aarch64",
+    "cpu": "Cortex-X925",
+    "affinity_cpu": 5,
+    "cpu_part": "0xd85",
+    "governor": "schedutil",
+    "max_frequency_khz": 3900000,
+    "frequency_boost": "disabled"
+  },
+  "baseline": {
+    "revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "artifact": "/tmp/trust-js-dataview-final-release-v7-20261014-olaf6edu/baseline/trust-js",
+    "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492",
+    "artifact_bytes": 20170648,
+    "source_artifact": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+    "source_sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+  },
+  "candidate": {
+    "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "scope": "Integrated session candidate: DataView access/call changes, inaccessible internal slots, owned shared backing stores, deferred function-loop compilation and other completed session changes",
+    "artifact": "/tmp/trust-js-dataview-final-release-v7-20261014-olaf6edu/candidate/trust-js",
+    "sha256": "9386652ddf21e7d5a5dcdf1e721c039f9fa19373ec12fa305ad4ce521216b59b",
+    "frozen_manifest": {
+      "timestamp_utc": "2026-10-13T23:34:24.974869+00:00",
+      "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+      "machine": "Linux crystal 7.2.10-crystal #1 SMP PREEMPT_DYNAMIC @1791725354 aarch64 GNU/Linux",
+      "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+      "build_command": "cargo build --release -p trust-js -p test262-runner -p trust-js-difftest --bins --target-dir /tmp/trust-js-session-candidate-target-20261013",
+      "features": [
+        "intl"
+      ],
+      "tier_default": "jit",
+      "profile": {
+        "opt_level": 3,
+        "lto": "fat",
+        "codegen_units": 1,
+        "panic": "abort"
+      },
+      "artifacts": {
+        "trust-js": {
+          "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v7/trust-js",
+          "sha256": "9386652ddf21e7d5a5dcdf1e721c039f9fa19373ec12fa305ad4ce521216b59b",
+          "bytes": 20205168
+        },
+        "test262-runner": {
+          "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v7/test262-runner",
+          "sha256": "c5e2d0f556d9167f82f6d793ea4d71c887ce9c04139c3c86a77cb402d85581de",
+          "bytes": 19586440
+        },
+        "trust-js-difftest": {
+          "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v7/trust-js-difftest",
+          "sha256": "0284f01c99334399f8d907bcb0d3484240cca3f798f98c059f1d611501efc356",
+          "bytes": 19469512
+        }
+      },
+      "source_patch_sha256": "d936f153c0e97a040314aba247f0973349872d9ff2bc385ce8cbdb6a6e01be98",
+      "source_files_sha256": "f4cf3a8fa3efcf53c7c8d3895fa6c8d6d07c6743800ab9ee77e0fc18bfd90aa6",
+      "predecessor": "../final-release-v6/manifest.json",
+      "change_since_predecessor": "Check the pure inline retry threshold before reading prepared-entry eligibility, retaining equivalent native-entry accounting while removing an unconditional guard from cached native calls."
+    },
+    "artifact_bytes": 20205168,
+    "version": "final-release-v7",
+    "promoted": false,
+    "source_artifact": "/big/Code/trust-js/target/session-validation-20261013/final-release-v7/trust-js",
+    "source_sha256": "9386652ddf21e7d5a5dcdf1e721c039f9fa19373ec12fa305ad4ce521216b59b"
+  },
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+  "build": {
+    "command": "cargo build --release -p trust-js --bin trust-js",
+    "features": "default (intl)",
+    "opt_level": 3,
+    "lto": "fat",
+    "codegen_units": 1,
+    "panic": "abort"
+  },
+  "execution": {
+    "tier": "jit",
+    "flags": [],
+    "environment_overrides": {
+      "TRUST_JS_TIER": "jit"
+    },
+    "fixture": "benchmarks/dataview-access.js",
+    "fixture_sha256": "686a6850347b973fc5e600586903d7bf6008ea4f0c4756acf9a1bc2d6581c879",
+    "process_pairs": 7,
+    "samples_per_kernel_per_process": 5,
+    "timing": "Date.now(), milliseconds",
+    "order": "baseline/candidate on even pairs; candidate/baseline on odd pairs",
+    "comparison": "median per process, paired candidate/baseline ratios; percentile bootstrap with50000 resamples, seed20261014",
+    "other_trust_js_overrides": "cleared",
+    "command": "taskset -c 5 <per-variant immutable copied artifact> --tier=jit benchmarks/dataview-access.js",
+    "quiet_window": {
+      "start_utc": "2026-10-13 23:38:35 UTC",
+      "build_test_conformance_jobs": "finished before measurements",
+      "concurrent_measurements": "Pinned independent streams CPU6/7/8 may overlap; this runner used CPU5.",
+      "production_edits_during_measurement": "Source may be drafted concurrently after immutable v7 freeze; measured artifacts/hash remained unchanged and no build/test process overlapped."
+    }
+  },
+  "limitations": [
+    "Component measurements do not establish application-level benefit.",
+    "Integrated artifact incorporates all session changes; this comparison does not attribute their separate contributions.",
+    "The numeric control executes 32 million iterations to reduce Date.now quantization. The sloppy loop functions are called eight times per process and exercise function-frame on-stack tiering.",
+    "Peak RSS is an OS high-water observation; no post-GC heap or pause measurement is inferred from it.",
+    "Peak RSS is an OS high-water observation; no post-GC heap or pause measurement is inferred from it."
+  ],
+  "validation": {
+    "checksums": "all baseline/candidate samples agree",
+    "primitive_and_coercion_fixture_oracle": "Node v24.21.0",
+    "normative_source": "ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202, GetViewValue/SetViewValue spec.html lines 46615/46645",
+    "all_checksum_samples_match": true
+  },
+  "summary": [
+    {
+      "kernel": "getUint8",
+      "checksum": 4375000,
+      "baseline_process_medians_ms": [
+        142,
+        142,
+        140,
+        142,
+        143,
+        142,
+        142
+      ],
+      "candidate_process_medians_ms": [
+        89,
+        90,
+        90,
+        88,
+        88,
+        89,
+        88
+      ],
+      "baseline_median_ms": 142,
+      "candidate_median_ms": 89,
+      "paired_median_time_ratio": 0.6267605633802817,
+      "paired_time_change_percent": -37.323943661971825,
+      "bootstrap_95_time_ratio_interval": [
+        0.6197183098591549,
+        0.6338028169014085
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "getUint32_le",
+      "checksum": 16909067500000,
+      "baseline_process_medians_ms": [
+        144,
+        144,
+        144,
+        144,
+        145,
+        144,
+        144
+      ],
+      "candidate_process_medians_ms": [
+        92,
+        95,
+        94,
+        92,
+        93,
+        92,
+        92
+      ],
+      "baseline_median_ms": 144,
+      "candidate_median_ms": 92,
+      "paired_median_time_ratio": 0.6388888888888888,
+      "paired_time_change_percent": -36.111111111111114,
+      "bootstrap_95_time_ratio_interval": [
+        0.6388888888888888,
+        0.6527777777777778
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "getUint32_be",
+      "checksum": 193135105000000,
+      "baseline_process_medians_ms": [
+        146,
+        146,
+        145,
+        147,
+        149,
+        147,
+        147
+      ],
+      "candidate_process_medians_ms": [
+        94,
+        96,
+        96,
+        94,
+        94,
+        94,
+        94
+      ],
+      "baseline_median_ms": 147,
+      "candidate_median_ms": 94,
+      "paired_median_time_ratio": 0.6394557823129252,
+      "paired_time_change_percent": -36.05442176870748,
+      "bootstrap_95_time_ratio_interval": [
+        0.6394557823129252,
+        0.6575342465753424
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "getFloat64_le",
+      "checksum": 4000000,
+      "baseline_process_medians_ms": [
+        149,
+        147,
+        149,
+        148,
+        148,
+        148,
+        148
+      ],
+      "candidate_process_medians_ms": [
+        95,
+        97,
+        96,
+        96,
+        95,
+        95,
+        95
+      ],
+      "baseline_median_ms": 148,
+      "candidate_median_ms": 95,
+      "paired_median_time_ratio": 0.6418918918918919,
+      "paired_time_change_percent": -35.810810810810814,
+      "bootstrap_95_time_ratio_interval": [
+        0.6418918918918919,
+        0.6486486486486487
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "shared_getUint32_le",
+      "checksum": 16909067500000,
+      "baseline_process_medians_ms": [
+        342,
+        342,
+        348,
+        343,
+        346,
+        343,
+        342
+      ],
+      "candidate_process_medians_ms": [
+        108,
+        108,
+        109,
+        108,
+        108,
+        108,
+        108
+      ],
+      "baseline_median_ms": 343,
+      "candidate_median_ms": 108,
+      "paired_median_time_ratio": 0.31486880466472306,
+      "paired_time_change_percent": -68.5131195335277,
+      "bootstrap_95_time_ratio_interval": [
+        0.3132183908045977,
+        0.3157894736842105
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "setUint32_le",
+      "checksum": 999999,
+      "baseline_process_medians_ms": [
+        143,
+        142,
+        144,
+        142,
+        145,
+        144,
+        142
+      ],
+      "candidate_process_medians_ms": [
+        98,
+        101,
+        100,
+        99,
+        99,
+        99,
+        98
+      ],
+      "baseline_median_ms": 143,
+      "candidate_median_ms": 99,
+      "paired_median_time_ratio": 0.6901408450704225,
+      "paired_time_change_percent": -30.98591549295775,
+      "bootstrap_95_time_ratio_interval": [
+        0.6853146853146853,
+        0.6971830985915493
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "setFloat64_be",
+      "checksum": 124999.875,
+      "baseline_process_medians_ms": [
+        149,
+        147,
+        149,
+        146,
+        146,
+        147,
+        146
+      ],
+      "candidate_process_medians_ms": [
+        100,
+        103,
+        101,
+        101,
+        100,
+        101,
+        100
+      ],
+      "baseline_median_ms": 147,
+      "candidate_median_ms": 101,
+      "paired_median_time_ratio": 0.684931506849315,
+      "paired_time_change_percent": -31.506849315068497,
+      "bootstrap_95_time_ratio_interval": [
+        0.6778523489932886,
+        0.6917808219178082
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "shared_setUint32_le",
+      "checksum": 999999,
+      "baseline_process_medians_ms": [
+        341,
+        340,
+        351,
+        342,
+        345,
+        341,
+        341
+      ],
+      "candidate_process_medians_ms": [
+        100,
+        100,
+        101,
+        101,
+        100,
+        100,
+        100
+      ],
+      "baseline_median_ms": 341,
+      "candidate_median_ms": 100,
+      "paired_median_time_ratio": 0.2932551319648094,
+      "paired_time_change_percent": -70.67448680351906,
+      "bootstrap_95_time_ratio_interval": [
+        0.2898550724637681,
+        0.29411764705882354
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "kernel": "numeric_control",
+      "checksum": 960000000,
+      "baseline_process_medians_ms": [
+        126,
+        126,
+        127,
+        126,
+        126,
+        126,
+        127
+      ],
+      "candidate_process_medians_ms": [
+        126,
+        126,
+        126,
+        126,
+        127,
+        126,
+        126
+      ],
+      "baseline_median_ms": 126,
+      "candidate_median_ms": 126,
+      "paired_median_time_ratio": 1.0,
+      "paired_time_change_percent": 0.0,
+      "bootstrap_95_time_ratio_interval": [
+        0.9921259842519685,
+        1.0
+      ],
+      "provisionally_regressed": false
+    }
+  ],
+  "runs": [
+    {
+      "pair": 0,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            142,
+            143,
+            142,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            143,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            146,
+            147,
+            146,
+            146
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            149,
+            149,
+            149,
+            149
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            342,
+            342,
+            342,
+            342,
+            342
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            143,
+            144,
+            143
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            149,
+            149,
+            149,
+            148,
+            149
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            341,
+            341,
+            341,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            126,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.66896344700217,
+      "user_s": 8.652753,
+      "sys_s": 0.014001,
+      "peak_rss_kib": 13636,
+      "engine_post_exec_peak_rss_kib": 13636,
+      "wait4_peak_rss_kib": 24216,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[142,142,143,142,142],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[144,143,144,144,144],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[147,146,147,146,146],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[148,149,149,149,149],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[342,342,342,342,342],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[143,144,143,144,143],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[149,149,149,148,149],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[341,341,341,341,341],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,126,126,127,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 0,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            88,
+            89,
+            88,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            92,
+            92,
+            92,
+            92,
+            92
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            94,
+            94,
+            94,
+            94
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            94,
+            95,
+            95,
+            94
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            108,
+            109,
+            108,
+            108,
+            108
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            99,
+            98,
+            98,
+            99
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            100,
+            100,
+            99,
+            100
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            100,
+            100,
+            101,
+            100,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.645510340000328,
+      "user_s": 4.63267,
+      "sys_s": 0.009999,
+      "peak_rss_kib": 14716,
+      "engine_post_exec_peak_rss_kib": 14716,
+      "wait4_peak_rss_kib": 24220,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[89,88,89,88,89],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[92,92,92,92,92],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[94,94,94,94,94],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[95,94,95,95,94],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[108,109,108,108,108],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[98,99,98,98,99],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[99,100,100,99,100],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[100,100,101,100,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,127,126,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            90,
+            90,
+            89,
+            90,
+            90
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            95,
+            95,
+            95,
+            95
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            96,
+            96,
+            96,
+            96
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            97,
+            96,
+            97,
+            96,
+            97
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            107,
+            108,
+            108,
+            107,
+            108
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            101,
+            101,
+            102,
+            101
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            103,
+            103,
+            103,
+            102,
+            102
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            100,
+            100,
+            101,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.706833325995831,
+      "user_s": 4.700735,
+      "sys_s": 0.003999,
+      "peak_rss_kib": 14416,
+      "engine_post_exec_peak_rss_kib": 14416,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[90,90,89,90,90],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[95,95,95,95,95],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[96,96,96,96,96],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[97,96,97,96,97],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[107,108,108,107,108],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[102,101,101,102,101],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[103,103,103,102,102],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[101,100,100,101,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,127,126,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            141,
+            142,
+            142,
+            142,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            146,
+            146,
+            146,
+            147,
+            146
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            147,
+            147,
+            148,
+            147
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            342,
+            343,
+            342,
+            342,
+            342
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            143,
+            142,
+            143,
+            142
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            146,
+            147,
+            147,
+            147,
+            146
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            340,
+            339,
+            340,
+            339,
+            340
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.629174103996775,
+      "user_s": 8.619769,
+      "sys_s": 0.004999,
+      "peak_rss_kib": 14608,
+      "engine_post_exec_peak_rss_kib": 14608,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[141,142,142,142,142],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[143,144,144,143,144],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[146,146,146,147,146],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[148,147,147,148,147],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[342,343,342,342,342],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[142,143,142,143,142],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[146,147,147,147,146],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[340,339,340,339,340],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,126,127,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            140,
+            140,
+            141,
+            140,
+            140
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            145,
+            146,
+            145,
+            145,
+            146
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            149,
+            150,
+            149,
+            149,
+            149
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            348,
+            348,
+            348,
+            348,
+            348
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            143,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            149,
+            148,
+            149,
+            149,
+            149
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            352,
+            351,
+            351,
+            351,
+            351
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.733985577004205,
+      "user_s": 8.723104,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 14136,
+      "engine_post_exec_peak_rss_kib": 14136,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[140,140,141,140,140],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[144,144,144,144,144],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[145,146,145,145,146],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[149,150,149,149,149],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[348,348,348,348,348],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[144,143,144,143,144],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[149,148,149,149,149],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[352,351,351,351,351],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,127,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            90,
+            90,
+            89,
+            90,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            94,
+            93,
+            94,
+            94
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            96,
+            96,
+            96,
+            96
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            96,
+            96,
+            97,
+            96
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            109,
+            108,
+            109,
+            108,
+            109
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            100,
+            99,
+            100,
+            100,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            102,
+            101,
+            101,
+            101
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            101,
+            100,
+            101,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.693266585003585,
+      "user_s": 4.684676,
+      "sys_s": 0.005999,
+      "peak_rss_kib": 14520,
+      "engine_post_exec_peak_rss_kib": 14520,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[90,90,89,90,89],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[94,94,93,94,94],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[95,96,96,96,96],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[96,96,96,97,96],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[109,108,109,108,109],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[100,99,100,100,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[101,102,101,101,101],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[101,101,100,101,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,126,127,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            88,
+            89,
+            88,
+            89,
+            88
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            92,
+            92,
+            93,
+            92,
+            92
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            95,
+            94,
+            95,
+            94
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            97,
+            96,
+            97,
+            96,
+            96
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            108,
+            108,
+            108,
+            108,
+            108
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            99,
+            100,
+            99,
+            99
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            101,
+            100,
+            101,
+            101
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            101,
+            101,
+            101,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.668674300999555,
+      "user_s": 4.658999,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 14136,
+      "engine_post_exec_peak_rss_kib": 14136,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[88,89,88,89,88],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[92,92,93,92,92],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[94,95,94,95,94],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[97,96,97,96,96],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[108,108,108,108,108],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[99,99,100,99,99],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[101,101,100,101,101],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[101,101,101,101,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,126,127,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            142,
+            142,
+            141,
+            143
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            148,
+            148,
+            148,
+            147
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            343,
+            343,
+            343,
+            343,
+            342
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            143,
+            143,
+            142,
+            142
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            145,
+            147,
+            146,
+            146,
+            146
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            342,
+            342,
+            342,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.652714037001715,
+      "user_s": 8.641411,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 13632,
+      "engine_post_exec_peak_rss_kib": 13632,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[142,142,142,141,143],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[144,144,144,144,144],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[147,147,147,147,148],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[148,148,148,148,147],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[343,343,343,343,342],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[142,143,143,142,142],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[145,147,146,146,146],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[341,342,342,342,341],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,126,127,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            145,
+            146,
+            145,
+            146
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            148,
+            149,
+            149,
+            149
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            147,
+            148,
+            148,
+            148
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            346,
+            346,
+            345,
+            346,
+            346
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            145,
+            145,
+            145,
+            146
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            146,
+            146,
+            146,
+            146,
+            146
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            345,
+            346,
+            345,
+            346,
+            345
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.714647505999892,
+      "user_s": 8.706241,
+      "sys_s": 0.003999,
+      "peak_rss_kib": 14736,
+      "engine_post_exec_peak_rss_kib": 14736,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[143,143,144,143,144],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[144,145,146,145,146],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[147,148,149,149,149],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[148,147,148,148,148],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[346,346,345,346,346],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[142,145,145,145,146],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[146,146,146,146,146],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[345,346,345,346,345],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,127,126,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 4,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            88,
+            88,
+            88,
+            88
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            93,
+            92,
+            93,
+            92,
+            93
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            94,
+            94,
+            94,
+            94
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            95,
+            95,
+            95,
+            95
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            108,
+            108,
+            108,
+            108,
+            109
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            99,
+            99,
+            98,
+            99
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            99,
+            100,
+            100,
+            99
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            100,
+            101,
+            100,
+            100,
+            101
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.646445681995829,
+      "user_s": 4.638652,
+      "sys_s": 0.005,
+      "peak_rss_kib": 13388,
+      "engine_post_exec_peak_rss_kib": 13388,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[89,88,88,88,88],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[93,92,93,92,93],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[94,94,94,94,94],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[95,95,95,95,95],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[108,108,108,108,109],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[98,99,99,98,99],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[101,99,100,100,99],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[100,101,100,100,101],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,127,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 5,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            89,
+            88,
+            89,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            92,
+            93,
+            92,
+            92,
+            92
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            93,
+            95,
+            94,
+            94,
+            94
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            96,
+            95,
+            95,
+            96
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            108,
+            108,
+            108,
+            109,
+            108
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            99,
+            98,
+            99,
+            99
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            101,
+            102,
+            101,
+            101
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            101,
+            100,
+            100,
+            101,
+            100
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.6601984160006396,
+      "user_s": 4.650549,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 15192,
+      "engine_post_exec_peak_rss_kib": 15192,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[89,89,88,89,89],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[92,93,92,92,92],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[93,95,94,94,94],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[95,96,95,95,96],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[108,108,108,109,108],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[99,99,98,99,99],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[102,101,102,101,101],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[101,100,100,101,100],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,127,126,127,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            142,
+            143,
+            142,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            144,
+            144,
+            143
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            146,
+            147,
+            146,
+            147
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            147,
+            148,
+            148,
+            147
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            343,
+            343,
+            342,
+            344,
+            343
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            143,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            342,
+            341,
+            342,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.657604651998554,
+      "user_s": 8.643034,
+      "sys_s": 0.008997,
+      "peak_rss_kib": 14284,
+      "engine_post_exec_peak_rss_kib": 14284,
+      "wait4_peak_rss_kib": 24412,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[142,142,143,142,142],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[143,144,144,144,143],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[147,146,147,146,147],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[148,147,148,148,147],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[343,343,342,344,343],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[144,143,144,143,144],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[147,147,147,147,148],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[341,342,341,342,341],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,127,126,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 6,
+      "variant": "baseline",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            142,
+            142,
+            141,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            148,
+            148,
+            148,
+            147
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            342,
+            342,
+            342,
+            343,
+            342
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            142,
+            142,
+            143,
+            142,
+            142
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            146,
+            146,
+            146,
+            146
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            341,
+            341,
+            341,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.64114263800002,
+      "user_s": 8.63331,
+      "sys_s": 0.004999,
+      "peak_rss_kib": 14420,
+      "engine_post_exec_peak_rss_kib": 14420,
+      "wait4_peak_rss_kib": 24584,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[142,142,142,141,142],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[144,144,144,144,144],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[147,147,147,147,148],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[147,148,148,148,147],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[342,342,342,343,342],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[142,142,143,142,142],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[147,146,146,146,146],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[341,341,341,341,341],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[127,126,127,126,127],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    },
+    {
+      "pair": 6,
+      "variant": "candidate",
+      "valid": true,
+      "exit_code": 0,
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            88,
+            89,
+            88,
+            88
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            92,
+            92,
+            93,
+            92,
+            93
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            94,
+            94,
+            94,
+            95
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            96,
+            95,
+            95,
+            95
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            108,
+            108,
+            108,
+            108,
+            108
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            99,
+            98,
+            99,
+            98
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            100,
+            100,
+            99,
+            100
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            100,
+            101,
+            100,
+            100,
+            101
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            126,
+            127,
+            126,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 4.644350727998244,
+      "user_s": 4.636937,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 15220,
+      "engine_post_exec_peak_rss_kib": 15220,
+      "wait4_peak_rss_kib": 24964,
+      "raw_output": "{\"kernel\":\"getUint8\",\"count\":1000000,\"samples_ms\":[89,88,89,88,88],\"checksums\":[4375000,4375000,4375000,4375000,4375000]}\n{\"kernel\":\"getUint32_le\",\"count\":1000000,\"samples_ms\":[92,92,93,92,93],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"getUint32_be\",\"count\":1000000,\"samples_ms\":[94,94,94,94,95],\"checksums\":[193135105000000,193135105000000,193135105000000,193135105000000,193135105000000]}\n{\"kernel\":\"getFloat64_le\",\"count\":1000000,\"samples_ms\":[95,96,95,95,95],\"checksums\":[4000000,4000000,4000000,4000000,4000000]}\n{\"kernel\":\"shared_getUint32_le\",\"count\":1000000,\"samples_ms\":[108,108,108,108,108],\"checksums\":[16909067500000,16909067500000,16909067500000,16909067500000,16909067500000]}\n{\"kernel\":\"setUint32_le\",\"count\":1000000,\"samples_ms\":[98,99,98,99,98],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"setFloat64_be\",\"count\":1000000,\"samples_ms\":[99,100,100,99,100],\"checksums\":[124999.875,124999.875,124999.875,124999.875,124999.875]}\n{\"kernel\":\"shared_setUint32_le\",\"count\":1000000,\"samples_ms\":[100,101,100,100,101],\"checksums\":[999999,999999,999999,999999,999999]}\n{\"kernel\":\"numeric_control\",\"count\":32000000,\"samples_ms\":[126,126,127,126,126],\"checksums\":[960000000,960000000,960000000,960000000,960000000]}\n"
+    }
+  ],
+  "inherited_constructor_behavior": {
+    "fixture": "benchmarks/dataview-constructor-order-existing.js",
+    "description": "Invalid byteOffset and an already detached buffer still cause a supplied byteLength object to coerce before the constructor throws. This behavior predates the DataView access optimization and is unchanged by the isolated candidate. Production constructor ordering is outside this optimization.",
+    "node_v24_21_0_output": "RangeError|0|TypeError|0",
+    "baseline_and_isolated_candidate_output": "RangeError|1|TypeError|1",
+    "specification": "https://tc39.es/ecma262/multipage/structured-data.html#sec-dataview-buffer-byteoffset-bytelength",
+    "local_source": "/big/web-standards/repositories/tc39/ecma262/spec.html:46690",
+    "introduced_by_change": false
+  },
+  "provisional_regressions": [],
+  "resource_summary": {
+    "baseline": {
+      "wall_s": 8.657604651998554,
+      "user_s": 8.643034,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 14284
+    },
+    "candidate": {
+      "wall_s": 4.6601984160006396,
+      "user_s": 4.650549,
+      "sys_s": 0.005998,
+      "peak_rss_kib": 14520
+    }
+  },
+  "artifact_preparation": {
+    "method": "shutil.copy2 of BOTH source executables into new files in the same fresh /tmp directory before execution",
+    "reason": "Normalize executable fault-around/page-cache residency; original linker output and copied executable had different resident page coverage despite matching bytes",
+    "filesystem": "tmpfs (/tmp)",
+    "source_and_run_hashes_unchanged": true,
+    "baseline_source_stat": {
+      "device": 50,
+      "inode": 62963
+    },
+    "baseline_run_stat": {
+      "device": 50,
+      "inode": 87685
+    },
+    "candidate_source_stat": {
+      "device": 2049,
+      "inode": 15670739675
+    },
+    "candidate_run_stat": {
+      "device": 50,
+      "inode": 87686
+    }
+  },
+  "rss_method": "Engine post-exec /proc VmHWM sampled every3ms; wait4 ru_maxrss retained separately because it may include inherited pre-exec parent RSS.",
+  "hash_method": "SHA-256 streamed in1MiB chunks; executable bytes are never retained in parent memory.",
+  "resource_comparison": [
+    {
+      "metric": "wall_s",
+      "baseline_values": [
+        8.66896344700217,
+        8.629174103996775,
+        8.733985577004205,
+        8.652714037001715,
+        8.714647505999892,
+        8.657604651998554,
+        8.64114263800002
+      ],
+      "candidate_values": [
+        4.645510340000328,
+        4.706833325995831,
+        4.693266585003585,
+        4.668674300999555,
+        4.646445681995829,
+        4.6601984160006396,
+        4.644350727998244
+      ],
+      "paired_median_ratio": 0.5374695132995945,
+      "bootstrap_95_ratio_interval": [
+        0.5358784090394106,
+        0.5395618393298152
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "metric": "user_s",
+      "baseline_values": [
+        8.652753,
+        8.619769,
+        8.723104,
+        8.641411,
+        8.706241,
+        8.643034,
+        8.63331
+      ],
+      "candidate_values": [
+        4.63267,
+        4.700735,
+        4.684676,
+        4.658999,
+        4.638652,
+        4.650549,
+        4.636937
+      ],
+      "paired_median_ratio": 0.5370984014242509,
+      "bootstrap_95_ratio_interval": [
+        0.5353983870798115,
+        0.5391479470193005
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "metric": "sys_s",
+      "baseline_values": [
+        0.014001,
+        0.004999,
+        0.005998,
+        0.005998,
+        0.003999,
+        0.008997,
+        0.004999
+      ],
+      "candidate_values": [
+        0.009999,
+        0.003999,
+        0.005999,
+        0.005998,
+        0.005,
+        0.005998,
+        0.005998
+      ],
+      "paired_median_ratio": 1.0,
+      "bootstrap_95_ratio_interval": [
+        0.7141632740518534,
+        1.1998399679935987
+      ],
+      "provisionally_regressed": false
+    },
+    {
+      "metric": "peak_rss_kib",
+      "baseline_values": [
+        13636,
+        14608,
+        14136,
+        13632,
+        14736,
+        14284,
+        14420
+      ],
+      "candidate_values": [
+        14716,
+        14416,
+        14520,
+        14136,
+        13388,
+        15192,
+        15220
+      ],
+      "paired_median_ratio": 1.0369718309859155,
+      "bootstrap_95_ratio_interval": [
+        0.9868565169769989,
+        1.0635676281153739
+      ],
+      "provisionally_regressed": false
+    }
+  ],
+  "regression_policy": {
+    "threshold_median_loss": 0.03,
+    "interval": 0.95,
+    "rule": "A stable timing component is provisionally regressed when median time increase exceeds3% and the paired95% interval lies above parity."
+  },
+  "all_runs_valid": true,
+  "replacement_pair": {
+    "pair": 6,
+    "reason": "An unintended --help invocation started a DeltaBlue diagnostic during the final candidate process; last pair is excluded and replaced by a clean baseline/candidate pair on the same originally matched-copy artifacts.",
+    "excluded_original_report": "target/session-validation-20261013/diagnostics/dataview-integrated-v7-contaminated-last-pair-2026-10-14.json",
+    "clean_first_six_pairs_retained": true,
+    "interference_start_utc": "2026-10-13T23:44:20.909066471Z",
+    "contaminated_report_finish_utc": "2026-10-13T23:44:24.073520Z",
+    "clean_replacement_complete": true,
+    "ablation_restarted_only_after_replacement": true
+  }
+}

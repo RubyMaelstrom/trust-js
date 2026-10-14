@@ -1,0 +1,305 @@
+TRust / trust-js improvements, session 2026-10-13; validation 2026-10-14
+
+Engine base: 447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a.
+TRust host base: faab706d1f67818a257f8111dfcc670e462bfc2b.
+No installed binary or production artifact has been promoted.
+
+Implementation contracts
+
+* TRust schedules checkpoints at Engine::next_atomics_wait_deadline() for resident
+  pages, parser waits, workers and suspended audio worklets. Finite waits keep the
+  owning event loop alive until settlement, followed by the usual microtask
+  checkpoint. Timer and ordinary-task ordering are preserved. Cross-origin
+  isolation is enabled only in the test host for these browser regressions.
+* Cold ordinary synchronous author functions containing loops obey the call
+  threshold. Self-hosted methods still compile on their first call; async/generator
+  coroutine paths retain their eager bytecode policy. Whole-frame transfer excludes
+  suspending frames. After 128 executed AST backedges, supported body-level loops
+  transfer the existing function activation to its whole bytecode continuation;
+  other supported loops
+  use checked fragments while enclosing environments, handlers and cleanup stay
+  parked. Parameters, declarations and prefix effects are not replayed. The
+  interpreter tier stays interpreted; bytecode stops at the VM; the JIT tier can
+  enter a borrowed native continuation in that same invocation. VM admission uses
+  128 edges and 4,096 weighted work units, with at most eight bounded retries.
+  Unsupported entries retain their prior path. Loops owned by static snapshot
+  run_once functions retain the VM-only bootstrap policy; separately owned nested
+  or eval code is not suppressed merely because it runs below such a frame.
+* Ordinary native invocations advance existing inlining hotness consistently
+  across generic/AST dispatch and checked call-cache fills. Guarded cache hits
+  retain their existing accounting; borrowed-frame admission remains separate.
+  This lets warmed callers reach the established feedback/inlining thresholds
+  when loop compilation is deferred.
+* All uncaptured homes transferred from the AST move their current Value ownership
+  into pinned PackedValue Cells; parked bindings retain identity and attributes
+  without retaining stale values. Captured/eval-homed bindings keep their original
+  environments. Scoped aliases give mapped arguments the canonical slot. Shared
+  VM/native slices avoid overlapping exclusive borrows. Native register homes
+  publish before author callbacks and reload afterwards. Scope teardown restores
+  every parked binding before unregistering aliases and clearing/recycling slots,
+  including abrupt exit and host interruption. Unsupported projected evaluators
+  use an environment-backed fallback. Borrowed code is excluded from ordinary call
+  caches, shared-context direct calls and optional optimizing admission hooks.
+* Guarded ordinary dense arrays use contiguous storage with spare space at both
+  ends: shift is O(1), and unshift is amortized O(1) per inserted item. Geometric
+  growth occasionally moves the live range. Descriptors, holes, prototypes and
+  proxies retain the general algorithms. Numeric mirrors and native accesses
+  follow the logical start; runtime layout probes fail closed on incompatible
+  headers. The deque retains NonNull's storage proof. A cached descriptor proof
+  uses InlinePacked padding, preserving its length/data layout and avoiding a
+  separate flag word. x64 array operations retain checked helpers. The inherited
+  concat species/proxy snapshot failure is also fixed.
+* DataView converts arguments in specified order before taking one backing-store
+  witness and access borrow or shared-buffer lock. Primitive arguments avoid
+  redundant conversion and native activation setup. Object conversions retain the
+  checked path, including detachment, resize and exception identity.
+* Built-in slots, private elements and auto-accessor backing state use an
+  inaccessible map within the existing lazy property-storage sidecar. Ordinary
+  object bodies retain their baseline size/allocation class. This map is separate
+  from ordinary keys, descriptors and lookup; strings such as "#\0co_locale" remain
+  author properties and cannot read, replace or forge engine state. Internal reads
+  invoke no getter or Proxy trap. Property copies omit slots/private brands;
+  replacing Array.fill's ordinary payload preserves the receiver's slots. GC,
+  cycle breaking, teardown and retained-memory accounting include slot owners.
+  Private writes remain valid after freeze. The supported Stage 3
+  nonextensible-applies-to-private proposal still rejects new private additions
+  with Proxy-aware extensibility checks. Node v24.21.0 lacks that proposal and is
+  explicitly not the oracle for its permissive private-stamping behavior.
+* Ordinary strings beginning with NUL cannot forge Symbol identities or internal
+  markers. Key encoding/decoding covers JavaScript and public host boundaries;
+  observable names retain source spelling. JSON.rawJSON's marker uses slot storage.
+* The 256 MiB buffer cap becomes Node/V8's non-sandbox validation limit: 2^53 - 1
+  bytes on 64-bit and 2^31 - 1 on 32-bit. Allocation remains fallible. Resizable and
+  growable buffers reserve maxByteLength; only their initial logical length is
+  explicitly initialized, and growth zeroes newly exposed bytes. Transfer validates
+  and reserves before detaching, moves the backing owner and invalidates the source
+  native witness. Preserving resizability rejects lengths above maxByteLength;
+  fixed transfer may grow beyond it.
+* Shared buffers own reference-counted backing blocks through a weak identity
+  registry. Views, queued broadcasts and pending waits retain ownership. The last
+  owner frees storage/removes its identity; agent teardown unregisters waiters.
+* Getters, setters and conversions invoked by checked operations retain their
+  logical inlined activation for caller reflection, strictness and stack positions,
+  including reentrant throws and GC. Inline-only metadata caches the logical
+  position for each checked operation, so implicit marker publication is O(1);
+  guards restore the prior marker on return, throw or continuation. Native paths
+  that invoke no author code require no implicit marker publication.
+
+Artifact and platform identity
+
+Machine: crystal, aarch64 Linux 7.2.10, Cortex-X925/Cortex-A725, 20 CPUs.
+Compiler: rustc 1.99.0 (b940084d7 2026-09-28), LLVM 23.1.1. Release: opt-level 3,
+fat LTO, one codegen unit, panic=abort; default engine features (intl), JIT tier.
+Oracle: Node v24.21.0, with the proposal exception above.
+ECMA-262: e28783d5fc9dc12b3de905961e2c71410b38a202.
+Test262: d86b2294eb0a17eaa281ff12c73c473ec864c72f.
+Scheduler references: HTML e5071a20c8569d8a3ec02ed27dd01b948773f850;
+Web Audio 2047f16022da8d63d5a232ea397d29266ec9c603.
+
+Frozen v8, final controlled performance gates passed:
+target/session-validation-20261013/final-release-v8/manifest.json.
+The adjacent source.patch, source-files.json and untracked-source/ inventory
+preserve the tested source; predecessor manifests preserve earlier artifacts.
+SHA-256 identities:
+
+  shell: e7367ab202872c640b4e460856b578bc8da7e25fcb749916afb09887abdb1cfc
+  runner: 5d6b33bffef16cf0b4567bfb1f5ccaeb337c6f9195cc3c9500ddb5c20c959c42
+  difftest: b4605f9e108fc48b09cb264d7dee95907bc05e0ad49091b6bbc7d39cf28e372b
+  patch: fdb1743cf11b9cc5fcb3244d4620af520b3eb103c9a5e0c9683781273b7f610e
+  inventory: c6c6294f0d7e50bdc9d3c49811efc489a76a017d4452a8fe5a0340b14dd0400c
+
+V8 retains consistent native-entry accounting and caches implicit inline positions
+rather than repeatedly searching compressed source-position metadata. Earlier
+blocked candidates retain their exact source, validation and timing records in
+final-release-v6/ and final-release-v7/; those results are not relabeled as v8.
+The comparison baseline is preserved in baseline-release/manifest.json, shell
+SHA-256 876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492.
+
+V8's exact-source release, full engine, conformance and differential checks are
+complete. All final controlled performance gates pass, with the fixed-work
+retained-storage diagnostic also recorded. A separately recorded
+comment-only follow-up updates the opening module documentation in bytecode.rs
+and stack_trace.rs. Before/after copies and suffix-equality verification in
+final-release-v8/comment-only-followup/verification.json establish that all Rust
+items remain byte-for-byte unchanged; the original binaries and source inventory
+retain their frozen identities. AGENTS.md's guidance is also clarified.
+
+Native execution coverage is ARM64. Both template backends and optimizing
+ownership/element paths were reviewed; the portable x64 slot encoder test passes
+on ARM64. Actual x64 compilation/execution is unverified because installed rustc
+cannot create an x86_64 LLVM TargetMachine. No wasm32 execution is claimed.
+The optional optimizing backend remains opt-in.
+
+Completed validation
+
+The final-release-v8/validation/ directory beside the frozen artifacts archives
+the commands/results manifest and engine.log, clippy.log, format.log,
+release-build.log, conformance.log and difftest.log. Earlier host library evidence
+remains in final-release-v6/validation/host-runtime-libraries.log.
+
+* Full v8 engine library suite: 2,040 passed, zero failed, three ignored (258.34s),
+  cargo test -p trust-js --lib --features embed -- --test-threads=8.
+  Archived log: final-release-v8/validation/engine.log. This fresh full run
+  includes slots/teardown, canonical ownership, snapshot admission, native-entry
+  accounting and inline-position metadata regressions.
+* Workspace/all-targets/all-features Clippy with -D warnings passed:
+  final-release-v8/validation/clippy.log. Exact-source formatting and release
+  builds passed before the v8 freeze: format.log and release-build.log there.
+* V6 Host/runtime/Node/web library tests: 245 passed, zero failed, two ignored:
+  final-release-v6/validation/host-runtime-libraries.log. The earlier broader run,
+  including runtime integration tests, passed 317 with two ignored; its prior
+  source scope is preserved in /tmp/trust-js-session-host-tests-final-20261013.log.
+* V6 optional optimizing checks passed: hot admission 3, retirement 9 and call
+  stubs 3; logs /tmp/trust-js-array-v6-*-tests-20261013.log.
+  Earlier v4 selected checks passed: array storage 52, array builtins 25,
+  numeric native arrays 11, keys 5, for-in 10, optional optimizing heap 17,
+  allocation diagnostics 5 and optional value/array checks 57. Logs:
+  /tmp/trust-js-array-v4-*-tests-20261013.log. These overlap the full suite and
+  are not added to its total. Earlier wider optimizing tests passed 147/147,
+  preserved in /tmp/trust-js-session-optimizing-final-20261013.log.
+* TRust v6 scheduler checks: five deadline regressions passed, and all-targets
+  host API integration check passed. Record:
+  /big/Code/TRust/target/atomics-checkpoint-validation/v6-validation.json.
+  Host source stayed unchanged. These v6 test executables preceded the equivalent
+  &**ic.chunk -> &*ic.chunk auto-deref cleanup; behavior, layout and API are
+  unchanged, and the v6 release contains that exact cleaned source. Subsequent
+  native-entry policy and inline-position changes do not alter the host API/layout.
+  Earlier validation.json and
+  final-validation.json preserve debug/release backend 745-pass/10-ignore and
+  Web Audio 28-pass results per profile, focused deadline 5/5 per profile,
+  all-bin release build and headless ordering smoke. Their exact manifests
+  remain adjacent; earlier checks are not relabeled as fresh v6 runs.
+
+Frozen v8 full default-JIT Test262 passed 53,575 tests with zero failures and
+three skips; all_executed_passed=true (238.050859s, six workers, 60-second chunk
+timeout). Configuration/artifact identity is final-v8-jit/run.json, and uncapped
+failures/skips are final-v8-jit/test262-report/summary.json under
+target/session-validation-20261013/. The root test262-report summary was restored
+to this full default-JIT result. The three skips remain upstream issues:
+
+  annexB/language/function-code/block-decl-func-skip-arguments.js
+    predates the current Annex B arguments rule
+  built-ins/Promise/allSettledKeyed/result-property-descriptors.js
+    destructive verifyProperty before entry reads
+  built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js
+    missing immutable exclusion
+
+Frozen v8 differential testing processed 2,000 seeds (reported as 1..2001):
+1,859 agree, 141 execution-budget skips, zero divergences. Budget skips are not
+successful comparisons. Archived log: final-release-v8/validation/difftest.log.
+
+The complete earlier forced-JIT suite (call threshold zero) had 53,573 passes,
+two failures and three skips under candidate-forced-jit/. The two failures
+reproduce on the baseline and remain unchanged in v8's targeted forced-threshold
+zero rerun (zero passes, two failures; 26.6ms):
+
+  staging/sm/extensions/arguments-property-access-in-function.js
+    Test262Error: Expected SameValue(false, true) to be true
+  staging/sm/extensions/function-properties.js
+    TypeError: cannot read property 'length' of null
+
+They concern inherited fresh compiled-function.arguments behavior, separate from
+the fixed inlined getter/caller reflection and transferred-frame arguments bridge.
+The v8 targeted record is target/session-validation-20261013/
+final-v8-forced-jit-legacy-arguments/. It is not a complete forced-JIT rerun; no full-suite success in every
+tier or at forced threshold zero is claimed.
+
+Performance record
+
+V8 final measurements began at 2026-10-13 23:59:09 UTC, using matched fresh copy2
+placements of both immutable artifacts and interleaved baseline/candidate pairs.
+Streams use dedicated Cortex-X925 cores: 5 for DataView/selected Octane, 6 for
+arrays, 7 for loop tiering and 8 for WebGL/resource controls. The four streams may
+overlap; these are controlled dedicated-core comparisons, not exclusive use of
+the whole machine. Build, conformance and test processes stopped before timing.
+All final component, startup and RSS gates pass. Selected workloads do not
+establish whole-suite or cross-platform performance. Exact commands, fixtures,
+checksums and pair intervals remain in the linked records.
+
+* V8 function tiering: all nine controls pass. Cold-function median 98 -> 30ms;
+  hot first-call 124 -> 123ms. Compile attempts fall from 2,001 to 1; native code
+  falls from 4,706,692 to 10,692 bytes, and combined bytecode/native compilation
+  from 64.047 to 0.372ms. Record: benchmarks/function-tiering-2026-10-13.json.
+* V8 transferred-home retention: checksums remain 4, and successive touched 64MiB
+  buffers no longer overlap. Peak RSS medians in KiB: interp 78,380 -> 78,276;
+  bytecode 79,348 -> 77,556; JIT 79,032 -> 79,116. Record:
+  benchmarks/function-tiering-owner-retention-2026-10-14.json, corrected_* fields.
+  Small process-residency differences are not attributed solely to tiering.
+* V8 array endpoints: fourteen processes, 168 timing records and 840 checksums
+  pass. At 16K elements, FIFO 1,331 -> 9ms, prepend 712 -> 10ms and alternating
+  endpoints 1,932 -> 13ms (about 148x, 71x and 149x). Fixed-work candidate medians
+  stay flat over 64x array lengths. Whole-process paired speedup is 43.94x
+  (candidate/baseline ratio interval 0.02182..0.02322); RSS is launch-floor
+  censored. Record: benchmarks/array-end-operations-v8-2026-10-13.json.
+* V8 WebGL controls: all eleven gates pass. Paired time changes are array copy
+  +0.386% (95% interval -2.985..+0.386%), typed-array set +0.382%, computed reads
+  -3.937%, enumeration -1.370% and indexed numeric arrays +0.427%; remaining
+  medians are parity. Record: target/session-validation-20261013/webgl-v8/report.json.
+  Higher-resolution call kernels (seven pairs) retain parity: exact arguments
+  318 -> 318ms, paired +0.314% (95% interval 0..+0.315%); surplus arguments
+  332 -> 332ms, paired parity (interval 0..+0.301%). Record:
+  final-release-v8/call-kernel-resolution.json.
+* V8 DataView: local reads take 35.14..37.59% less time, local writes
+  30.77..31.51% less, shared reads/writes 68.42%/70.76% less. The numeric control
+  stays at 126ms; all 630 checksums pass, with no component/resource gate failure.
+  Whole-process wall time falls 45.97%. Peak RSS paired change is -7.73%
+  (95% interval -10.14..+0.22%); no stable memory gain is claimed. Record:
+  benchmarks/dataview-integrated-v8-2026-10-14.json.
+* V8 selected Octane: fourteen processes are valid and all 3% component gates
+  pass. Paired score changes: Richards -0.454%, DeltaBlue -2.321% (95% interval
+  -2.529..-2.006%), Crypto -0.501%, RayTrace -0.763%; selected composite -0.916%.
+  DeltaBlue retains a small measured loss. Peak RSS paired change is -0.292%
+  (interval -1.055..-0.167%); wall/user time retain parity. Record:
+  benchmarks/octane-selected-v8-2026-10-14.json. Four workloads are a selected
+  result, not a full Octane score; timed populations are not fixed allocation work.
+* V8 resources: startup medians 7.925 -> 7.662ms, paired ratio 0.98067
+  (95% interval 0.9358..1.0081), with no stable gain or loss. Startup RSS is
+  censored by the 22,124KiB launch floor. Shared-buffer churn peak RSS falls
+  538,296 -> 30,656KiB (94.3%); wall time 144.404 -> 63.090ms, paired ratio
+  0.43818 (interval 0.4250..0.4469). All checksums pass. Record:
+  benchmarks/session-resources-2026-10-13.json.
+
+Earlier v6/v7 candidates were blocked by measured component regressions; their
+complete records remain in final-release-v6/measurements/ and
+final-release-v7/measurements/, including DeltaBlue losses of 3.372% and 3.571%,
+respectively, and v7's 4.615% array-copy increase. Their successful component
+measurements are historical evidence, not v8 acceptance.
+
+V8 fixed-work retention, three pairs: planned invocation counts match, with
+102,585 peak objects, 1,475 final objects and five collections in every run.
+Managed lower-bound bytes rise from 11,603,370/11,600,675/11,600,782 to
+12,224,642/12,229,134/12,229,304 (about 0.59..0.60MiB more); live native code
+falls from 8,924,808/8,894,108/8,894,760 to 8,128,228/8,111,664/8,111,680
+(about 0.75..0.76MiB less). Their combined retained-storage lower bound decreases
+0.854%, 0.751% and 0.754%. Native attempts are 283 -> 285, bytecode compilations
+284 -> 303 and inlined sites 76 -> 95; smaller code coexists with more bytecode
+metadata. Record: target/session-validation-20261013/diagnostics/
+octane-selected-v8-fixed-work-retention-2026-10-14.json. This lower-bound sum is
+not OS RSS. Planned invocation/GC populations do not establish identical internal
+allocation work, and diagnostic runs support no wall-time acceptance claim.
+
+Earlier RSS comparisons mixed linker-created baseline files with copied candidate
+files. Equal copy2/tmpfs controls resolve that apparent executable-page residency
+and selected-Octane RSS loss. Fourteen raw diagnostic JSON records and an index
+are preserved under target/session-validation-20261013/diagnostics/. Final RSS
+comparisons use equally copied artifacts. Separately, allocator inspection
+confirmed the intermediate Object class increase, now removed by sidecar storage;
+a fixed-work buffer fixture exposed and fixed stale parked-Env retention. These
+source corrections are warranted independently of the artifact confound.
+Isolated DataView results remain benchmarks/dataview-2026-10-13.json and describe
+only access changes; earlier array/constructor triage is diagnostic evidence.
+
+Inherited issues outside this patch
+
+The Test262 agent broadcast path loses growable-SAB wrapper metadata:
+builtins/host.rs agent_make_shared (line 145) sets maxByteLength to received length
+and growability to false (151-152); broadcast sends only block and length (203).
+The block remains shared. Broadcasting new SharedArrayBuffer(4, {maxByteLength: 8})
+reports "false,4" instead of "true,8"; reproduction:
+/tmp/trust-js-gsab-broadcast-metadata.js. This predates the ownership changes.
+
+DataView's inherited constructor ordering coerces a supplied byteLength before
+throwing for invalid byteOffset or an already detached buffer. The baseline and
+DataView-only candidate yield "RangeError|1|TypeError|1" versus Node's
+"RangeError|0|TypeError|0" in benchmarks/dataview-constructor-order-existing.js.
+This remains outside the GetViewValue/SetViewValue access optimization.

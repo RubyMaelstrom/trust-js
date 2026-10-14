@@ -1,0 +1,3271 @@
+{
+  "date": "2026-10-13",
+  "machine": {
+    "hostname": "crystal",
+    "uname": "Linux crystal 7.2.10-crystal #1 SMP PREEMPT_DYNAMIC @1791725354 aarch64 GNU/Linux",
+    "architecture": "aarch64",
+    "cpu": "Cortex-X925",
+    "affinity_cpu": 5,
+    "cpu_part": "0xd85",
+    "governor": "schedutil",
+    "max_frequency_khz": 3900000,
+    "frequency_boost": "disabled"
+  },
+  "baseline": {
+    "revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "artifact": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+    "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492",
+    "artifact_bytes": 20170648
+  },
+  "candidate": {
+    "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "scope": "DataView-only isolated checkout: one witness/access borrow, primitive argument dispatch, specialized Number argument conversions; other session changes excluded",
+    "artifact": "/tmp/trust-js-dataview-target-20261013/release/trust-js",
+    "sha256": "1a05964a7617c05728e3e3843c311ec099fac8a425592b2393bd8019411cd5a2",
+    "artifact_bytes": 20172016
+  },
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+  "build": {
+    "command": "cargo build --release -p trust-js --bin trust-js",
+    "features": "default (intl)",
+    "opt_level": 3,
+    "lto": "fat",
+    "codegen_units": 1,
+    "panic": "abort"
+  },
+  "execution": {
+    "tier": "jit",
+    "flags": [],
+    "environment_overrides": {},
+    "fixture": "benchmarks/dataview-access.js",
+    "fixture_sha256": "686a6850347b973fc5e600586903d7bf6008ea4f0c4756acf9a1bc2d6581c879",
+    "process_pairs": 7,
+    "samples_per_kernel_per_process": 5,
+    "timing": "Date.now(), milliseconds",
+    "order": "baseline/candidate on even pairs; candidate/baseline on odd pairs",
+    "comparison": "median per process, paired ratios; percentile bootstrap with 50000 resamples of seven paired ratios, seed 20261013"
+  },
+  "limitations": [
+    "Component measurements do not establish application-level benefit.",
+    "Isolated candidate intentionally retains the original SharedArrayBuffer registry and internal-slot representation.",
+    "Date.now resolution limits the short numeric control; use integrated application controls for regression conclusions."
+  ],
+  "validation": {
+    "checksums": "all baseline/candidate samples agree",
+    "primitive_and_coercion_fixture_oracle": "Node v24.21.0",
+    "normative_source": "ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202, GetViewValue/SetViewValue spec.html lines 46615/46645",
+    "release_fixtures": "All three final DataView regression fixtures passed in isolated release interpreter, bytecode and JIT with tier threshold 0.",
+    "integrated_focused_tests": "cargo test -p trust-js dataview -- --nocapture: seven passed, zero failed, final source including MAX_SAFE_INTEGER constructor range and marker exception identity cases.",
+    "specification": {
+      "commit": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+      "local_source": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+      "get_view_value_line": 46615,
+      "get_view_value_url": "https://tc39.es/ecma262/multipage/structured-data.html#sec-getviewvalue",
+      "set_view_value_line": 46645,
+      "set_view_value_url": "https://tc39.es/ecma262/multipage/structured-data.html#sec-setviewvalue"
+    }
+  },
+  "summary": [
+    {
+      "kernel": "getUint8",
+      "checksum": 4375000,
+      "baseline_process_medians_ms": [
+        143,
+        142,
+        142,
+        143,
+        141,
+        142,
+        144
+      ],
+      "candidate_process_medians_ms": [
+        90,
+        92,
+        92,
+        89,
+        89,
+        89,
+        91
+      ],
+      "baseline_median_ms": 142,
+      "candidate_median_ms": 90,
+      "paired_median_ratio": 0.6312056737588653,
+      "bootstrap_95_ratio_interval": [
+        0.6267605633802817,
+        0.647887323943662
+      ]
+    },
+    {
+      "kernel": "getUint32_le",
+      "checksum": 16909067500000,
+      "baseline_process_medians_ms": [
+        143,
+        144,
+        144,
+        144,
+        150,
+        144,
+        145
+      ],
+      "candidate_process_medians_ms": [
+        96,
+        96,
+        98,
+        94,
+        94,
+        94,
+        96
+      ],
+      "baseline_median_ms": 144,
+      "candidate_median_ms": 96,
+      "paired_median_ratio": 0.6620689655172414,
+      "bootstrap_95_ratio_interval": [
+        0.6527777777777778,
+        0.6713286713286714
+      ]
+    },
+    {
+      "kernel": "getUint32_be",
+      "checksum": 193135105000000,
+      "baseline_process_medians_ms": [
+        147,
+        147,
+        147,
+        147,
+        147,
+        147,
+        147
+      ],
+      "candidate_process_medians_ms": [
+        96,
+        97,
+        97,
+        95,
+        95,
+        95,
+        97
+      ],
+      "baseline_median_ms": 147,
+      "candidate_median_ms": 96,
+      "paired_median_ratio": 0.6530612244897959,
+      "bootstrap_95_ratio_interval": [
+        0.6462585034013606,
+        0.6598639455782312
+      ]
+    },
+    {
+      "kernel": "getFloat64_le",
+      "checksum": 4000000,
+      "baseline_process_medians_ms": [
+        149,
+        148,
+        148,
+        148,
+        150,
+        148,
+        148
+      ],
+      "candidate_process_medians_ms": [
+        98,
+        98,
+        99,
+        98,
+        97,
+        97,
+        99
+      ],
+      "baseline_median_ms": 148,
+      "candidate_median_ms": 98,
+      "paired_median_ratio": 0.6621621621621622,
+      "bootstrap_95_ratio_interval": [
+        0.6554054054054054,
+        0.668918918918919
+      ]
+    },
+    {
+      "kernel": "shared_getUint32_le",
+      "checksum": 16909067500000,
+      "baseline_process_medians_ms": [
+        342,
+        365,
+        358,
+        352,
+        353,
+        348,
+        343
+      ],
+      "candidate_process_medians_ms": [
+        194,
+        194,
+        194,
+        194,
+        222,
+        217,
+        194
+      ],
+      "baseline_median_ms": 352,
+      "candidate_median_ms": 194,
+      "paired_median_ratio": 0.565597667638484,
+      "bootstrap_95_ratio_interval": [
+        0.5418994413407822,
+        0.6235632183908046
+      ]
+    },
+    {
+      "kernel": "setUint32_le",
+      "checksum": 999999,
+      "baseline_process_medians_ms": [
+        143,
+        143,
+        143,
+        143,
+        145,
+        143,
+        143
+      ],
+      "candidate_process_medians_ms": [
+        102,
+        102,
+        103,
+        102,
+        101,
+        101,
+        103
+      ],
+      "baseline_median_ms": 143,
+      "candidate_median_ms": 102,
+      "paired_median_ratio": 0.7132867132867133,
+      "bootstrap_95_ratio_interval": [
+        0.7062937062937062,
+        0.7202797202797203
+      ]
+    },
+    {
+      "kernel": "setFloat64_be",
+      "checksum": 124999.875,
+      "baseline_process_medians_ms": [
+        149,
+        147,
+        147,
+        147,
+        150,
+        147,
+        147
+      ],
+      "candidate_process_medians_ms": [
+        102,
+        104,
+        105,
+        106,
+        103,
+        105,
+        104
+      ],
+      "baseline_median_ms": 147,
+      "candidate_median_ms": 104,
+      "paired_median_ratio": 0.7074829931972789,
+      "bootstrap_95_ratio_interval": [
+        0.6866666666666666,
+        0.7142857142857143
+      ]
+    },
+    {
+      "kernel": "shared_setUint32_le",
+      "checksum": 999999,
+      "baseline_process_medians_ms": [
+        341,
+        374,
+        359,
+        346,
+        349,
+        344,
+        341
+      ],
+      "candidate_process_medians_ms": [
+        188,
+        189,
+        190,
+        190,
+        209,
+        189,
+        190
+      ],
+      "baseline_median_ms": 346,
+      "candidate_median_ms": 190,
+      "paired_median_ratio": 0.5494186046511628,
+      "bootstrap_95_ratio_interval": [
+        0.5292479108635098,
+        0.5571847507331378
+      ]
+    },
+    {
+      "kernel": "numeric_control",
+      "checksum": 960000000,
+      "baseline_process_medians_ms": [
+        126,
+        127,
+        127,
+        127,
+        127,
+        127,
+        127
+      ],
+      "candidate_process_medians_ms": [
+        127,
+        127,
+        127,
+        127,
+        127,
+        127,
+        126
+      ],
+      "baseline_median_ms": 127,
+      "candidate_median_ms": 127,
+      "paired_median_ratio": 1.0,
+      "bootstrap_95_ratio_interval": [
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "pair": 0,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            143,
+            143,
+            143
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            143,
+            143,
+            143
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            147
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            149,
+            149,
+            149,
+            149,
+            149
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            342,
+            342,
+            341,
+            342,
+            342
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            143,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            150,
+            149,
+            149,
+            148,
+            149
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            340,
+            341,
+            340,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            131,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.689504611997108,
+      "user_s": 8.654464,
+      "sys_s": 0.004998,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 0,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            90,
+            90,
+            90,
+            90
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            96,
+            95,
+            95,
+            96
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            95,
+            96,
+            95,
+            96
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            98,
+            98,
+            98,
+            98
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            194,
+            194,
+            194,
+            194,
+            194
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            101,
+            102,
+            102,
+            102
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            102,
+            103,
+            102,
+            102
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            188,
+            189,
+            188,
+            189,
+            188
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            127,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.6518527299995185,
+      "user_s": 5.61166,
+      "sys_s": 0.003,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            94,
+            92,
+            91,
+            90
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            96,
+            95,
+            96,
+            96
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            97,
+            98,
+            97,
+            97,
+            97
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            98,
+            99,
+            98,
+            98
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            194,
+            194,
+            194,
+            194,
+            193
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            103,
+            102,
+            102,
+            103,
+            102
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            103,
+            104,
+            103,
+            104,
+            104
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            189,
+            189,
+            190,
+            189,
+            189
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            127,
+            127,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.657829281000886,
+      "user_s": 5.638952,
+      "sys_s": 0.003999,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            165,
+            140,
+            140,
+            143,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            143,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            147
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            148,
+            148,
+            147,
+            148
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            365,
+            364,
+            365,
+            365,
+            365
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            143,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            147
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            374,
+            374,
+            373,
+            374,
+            373
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            136,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.971597315998224,
+      "user_s": 8.917096,
+      "sys_s": 0.010001,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            142,
+            142,
+            142,
+            141
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            144,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            152,
+            175,
+            146
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            148,
+            148,
+            149,
+            194
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            358,
+            352,
+            364,
+            358,
+            353
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            156,
+            150
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            407,
+            371,
+            348,
+            352,
+            359
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.959034324005188,
+      "user_s": 8.721955,
+      "sys_s": 0.015961,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            93,
+            92,
+            92,
+            92
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            99,
+            97,
+            97,
+            98
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            97,
+            97,
+            98,
+            97
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            100,
+            99,
+            99,
+            100
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            194,
+            195,
+            194,
+            195,
+            194
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            103,
+            103,
+            103,
+            103,
+            105
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            104,
+            104,
+            105,
+            105,
+            121
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            193,
+            189,
+            189,
+            190,
+            190
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.70932973500021,
+      "user_s": 5.652763,
+      "sys_s": 0.013047,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            92,
+            88,
+            89,
+            90,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            95,
+            94,
+            98,
+            94
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            95,
+            95,
+            95,
+            95
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            98,
+            98,
+            99,
+            98,
+            98
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            194,
+            196,
+            194,
+            194,
+            194
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            101,
+            109,
+            102,
+            102
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            106,
+            106,
+            108,
+            107,
+            105
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            199,
+            190,
+            189,
+            190,
+            189
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.658754333999241,
+      "user_s": 5.606868,
+      "sys_s": 0.007994,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            141,
+            143,
+            143,
+            143,
+            143
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            144,
+            144,
+            144,
+            143
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            149,
+            148,
+            148,
+            173
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            352,
+            343,
+            428,
+            366,
+            343
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            143,
+            144,
+            143,
+            143
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            146,
+            147
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            342,
+            346,
+            341,
+            352,
+            347
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            127,
+            129,
+            126,
+            140
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.867178788001183,
+      "user_s": 8.642731,
+      "sys_s": 0.012981,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 4,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            174,
+            142,
+            141,
+            141,
+            141
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            227,
+            152,
+            150,
+            145,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            146,
+            150,
+            146,
+            147
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            150,
+            151,
+            150,
+            149,
+            149
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            353,
+            353,
+            353,
+            353,
+            353
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            145,
+            145,
+            144,
+            145,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            150,
+            150,
+            150,
+            150,
+            150
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            350,
+            349,
+            349,
+            349,
+            349
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.936879154003691,
+      "user_s": 8.765735,
+      "sys_s": 0.008997,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 4,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            89,
+            89,
+            89,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            93,
+            94,
+            94,
+            94
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            95,
+            95,
+            96,
+            95
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            97,
+            97,
+            96,
+            97
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            222,
+            221,
+            222,
+            222,
+            221
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            100,
+            101,
+            101,
+            102,
+            101
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            104,
+            102,
+            103,
+            104
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            209,
+            209,
+            208,
+            209,
+            209
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            127,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.842019258001528,
+      "user_s": 5.831901,
+      "sys_s": 0.008997999999999999,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 5,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            89,
+            89,
+            88,
+            90,
+            89
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            94,
+            94,
+            93,
+            94,
+            94
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            95,
+            95,
+            95,
+            96,
+            95
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            97,
+            98,
+            97,
+            98,
+            97
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            217,
+            217,
+            217,
+            217,
+            218
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            102,
+            101,
+            101,
+            102,
+            101
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            105,
+            105,
+            105,
+            104,
+            104
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            189,
+            213,
+            189,
+            189,
+            189
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            126,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.75954916599585,
+      "user_s": 5.7206969999999995,
+      "sys_s": 0.007018,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 5,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            142,
+            141,
+            141,
+            142
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            145,
+            144,
+            144,
+            144
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            148,
+            147
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            148,
+            148,
+            147,
+            148
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            345,
+            360,
+            348,
+            349,
+            343
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            143,
+            143,
+            144,
+            143
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            155,
+            147,
+            147,
+            147,
+            147
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            344,
+            344,
+            344,
+            343,
+            344
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            127,
+            126,
+            127,
+            127
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.718952372000786,
+      "user_s": 8.671409,
+      "sys_s": 0.006992,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 6,
+      "variant": "baseline",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            144,
+            143,
+            144
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            144,
+            145,
+            145,
+            145,
+            145
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            148,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            148,
+            148,
+            148,
+            149,
+            149
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            343,
+            343,
+            343,
+            342,
+            343
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            143,
+            144,
+            143,
+            143,
+            144
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            147,
+            147,
+            147,
+            147,
+            148
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            341,
+            341,
+            341,
+            341,
+            341
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            127,
+            126,
+            127,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 8.674591634000535,
+      "user_s": 8.661484,
+      "sys_s": 0.006999,
+      "peak_rss_kib": 20320
+    },
+    {
+      "pair": 6,
+      "variant": "candidate",
+      "kernels": [
+        {
+          "kernel": "getUint8",
+          "count": 1000000,
+          "samples_ms": [
+            90,
+            91,
+            91,
+            91,
+            91
+          ],
+          "checksums": [
+            4375000,
+            4375000,
+            4375000,
+            4375000,
+            4375000
+          ]
+        },
+        {
+          "kernel": "getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            96,
+            96,
+            96,
+            97,
+            96
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "getUint32_be",
+          "count": 1000000,
+          "samples_ms": [
+            97,
+            97,
+            97,
+            97,
+            97
+          ],
+          "checksums": [
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000,
+            193135105000000
+          ]
+        },
+        {
+          "kernel": "getFloat64_le",
+          "count": 1000000,
+          "samples_ms": [
+            99,
+            98,
+            99,
+            99,
+            98
+          ],
+          "checksums": [
+            4000000,
+            4000000,
+            4000000,
+            4000000,
+            4000000
+          ]
+        },
+        {
+          "kernel": "shared_getUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            194,
+            194,
+            194,
+            194,
+            194
+          ],
+          "checksums": [
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000,
+            16909067500000
+          ]
+        },
+        {
+          "kernel": "setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            104,
+            103,
+            103,
+            103,
+            103
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "setFloat64_be",
+          "count": 1000000,
+          "samples_ms": [
+            105,
+            104,
+            104,
+            105,
+            104
+          ],
+          "checksums": [
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875,
+            124999.875
+          ]
+        },
+        {
+          "kernel": "shared_setUint32_le",
+          "count": 1000000,
+          "samples_ms": [
+            189,
+            190,
+            189,
+            190,
+            190
+          ],
+          "checksums": [
+            999999,
+            999999,
+            999999,
+            999999,
+            999999
+          ]
+        },
+        {
+          "kernel": "numeric_control",
+          "count": 32000000,
+          "samples_ms": [
+            126,
+            127,
+            126,
+            127,
+            126
+          ],
+          "checksums": [
+            960000000,
+            960000000,
+            960000000,
+            960000000,
+            960000000
+          ]
+        }
+      ],
+      "wall_s": 5.669221899996046,
+      "user_s": 5.655958,
+      "sys_s": 0.002999,
+      "peak_rss_kib": 20320
+    }
+  ],
+  "resource_summary": {
+    "baseline": {
+      "wall_s": 8.867178788001183,
+      "user_s": 8.671409,
+      "sys_s": 0.008997,
+      "peak_rss_kib": 20320
+    },
+    "candidate": {
+      "wall_s": 5.669221899996046,
+      "user_s": 5.652763,
+      "sys_s": 0.007018,
+      "peak_rss_kib": 20320
+    }
+  },
+  "profiling": {
+    "description": "Diagnostic perf cycle samples; separate runs excluded from acceptance timings. Ten million unaligned getUint32 followed by ten million setUint32 accesses.",
+    "affinity_cpu": 0,
+    "cpu": "Cortex-A725",
+    "fixture": "var d=new DataView(new ArrayBuffer(64));\nd.setUint32(0,123456,true);\nfunction read(d,n){var sum=0;for(var k=0;k<n;k++)sum+=d.getUint32(k&7,true);return sum;}\nfunction write(d,n){for(var k=0;k<n;k++)d.setUint32(k&7,k,true);return d.getUint32(0,true);}\nconsole.log(read(d,10000000));\nconsole.log(write(d,10000000));\n",
+    "baseline_report": "# To display the perf.data header info, please use --header/--header-only options.\n#\n#\n# Total Lost Samples: 0\n#\n# Samples: 26K of event 'armv8_pmuv3_0/cycles/Pu'\n# Event count (approx.): 6449816549\n#\n# Overhead  Command   Shared Object          Symbol                                                                                                                                                                                                          \n# ........  ........  .....................  ................................................................................................................................................................................................................\n#\n    10.26%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::array_buffer_byte_length\n     9.49%  trust-js  trust-js               [.] trust_js::bytecode::jit_call_hit\n     7.94%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_set\n     7.60%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::call_native_committed::{closure#1}\n     7.39%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_get\n     5.57%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::mark_array_buffer_dirty_range\n     5.17%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::call_native_committed\n     4.71%  trust-js  trust-js               [.] trust_js::builtins::to_index\n     3.99%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_bytes\n     3.10%  trust-js  trust-js               [.] <trust_js::value::PackedValue>::unpack\n     3.00%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_put\n     2.76%  trust-js  trust-js               [.] core::ptr::drop_glue::<trust_js::value::Value>\n     2.73%  trust-js  trust-js               [.] <trust_js::builtins::dataview::install_dataview::{closure#15} as core::ops::function::FnOnce<(&mut trust_js::interpreter::Interp, trust_js::value::Value, &[trust_js::value::Value])>>::call_once\n     2.71%  trust-js  trust-js               [.] <trust_js::builtins::dataview::install_dataview::{closure#16} as core::ops::function::FnOnce<(&mut trust_js::interpreter::Interp, trust_js::value::Value, &[trust_js::value::Value])>>::call_once\n     2.38%  trust-js  trust-js               [.] <trust_js::interrupt::RuntimeInterrupt>::current_reason\n     1.91%  trust-js  trust-js               [.] trust_js::builtins::arg\n     1.88%  trust-js  trust-js               [.] <trust_js::value::PackedValue>::pack\n     1.86%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::to_number\n     1.73%  trust-js  trust-js               [.] <trust_js::value::TaKind>::read\n     1.04%  trust-js  [JIT] tid 1956394      [.] 0x0000f2236a9adb98\n\n\n# Samples: 9  of event 'armv8_pmuv3_1/cycles/Pu'\n# Event count (approx.): 116405\n#\n# Overhead  Command   Shared Object          Symbol                          \n# ........  ........  .....................  ................................\n#\n    49.92%  taskset   ld-linux-aarch64.so.1  [.] strcmp\n    39.56%  taskset   ld-linux-aarch64.so.1  [.] _dl_relocate_object_no_relro\n     9.80%  taskset   ld-linux-aarch64.so.1  [.] _dl_next_ld_env_entry\n\n\n#\n# (Tip: To only collect call graph on one event use perf record -e cpu/cpu-cycles,callgraph=1/,branches ; perf report --show-ref-call-graph)\n#\n",
+    "candidate_report": "# To display the perf.data header info, please use --header/--header-only options.\n#\n#\n# Total Lost Samples: 0\n#\n# Samples: 15K of event 'armv8_pmuv3_0/cycles/Pu'\n# Event count (approx.): 3799860458\n#\n# Overhead  Command   Shared Object          Symbol                                                                                                                                                                                                                    \n# ........  ........  .....................  ..........................................................................................................................................................................................................................\n#\n    17.84%  trust-js  trust-js               [.] trust_js::bytecode::jit_call_hit\n    12.65%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_bytes\n    11.52%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_get\n    10.68%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_set\n     9.24%  trust-js  trust-js               [.] trust_js::builtins::dataview::dv_put\n     6.92%  trust-js  trust-js               [.] <trust_js::interpreter::Interp>::mark_array_buffer_dirty_range\n     3.21%  trust-js  trust-js               [.] <trust_js::value::TaKind>::read\n     3.12%  trust-js  trust-js               [.] <trust_js::builtins::dataview::install_dataview::{closure#16} as core::ops::function::FnOnce<(&mut trust_js::interpreter::Interp, trust_js::value::Value, &[trust_js::value::Value])>>::call_once\n     3.02%  trust-js  trust-js               [.] <trust_js::value::PackedValue>::pack\n     1.73%  trust-js  [JIT] tid 1957907      [.] 0x0000e928078edb98\n     1.51%  trust-js  trust-js               [.] core::ptr::drop_glue::<trust_js::value::Value>\n     1.46%  trust-js  libc.so.6              [.] __memcpy_sve\n     1.30%  trust-js  trust-js               [.] <trust_js::builtins::dataview::install_dataview::{closure#15} as core::ops::function::FnOnce<(&mut trust_js::interpreter::Interp, trust_js::value::Value, &[trust_js::value::Value])>>::call_once\n\n\n#\n# (Tip: To show IPC for sampling periods use perf record -e '{cycles,instructions}:S' and then browse context)\n#\n"
+  },
+  "startup": {
+    "description": "Fresh release process evaluating an empty script; Engine/Realm installation and process overhead, no JavaScript tier compilation. Separate thirty interleaved process pairs pinned CPU 5.",
+    "baseline_median_wall_ms": 8.482756002194947,
+    "candidate_median_wall_ms": 8.258108002337394,
+    "paired_median_ratio": 0.9721212779993658,
+    "bootstrap_95_ratio_interval": [
+      0.9341173621440484,
+      1.011596467331496
+    ],
+    "runs": [
+      {
+        "pair": 0,
+        "variant": "baseline",
+        "wall_ms": 9.156002997769974,
+        "user_ms": 5.2589999999999995,
+        "sys_ms": 3.155,
+        "peak_rss_kib": 16280
+      },
+      {
+        "pair": 0,
+        "variant": "candidate",
+        "wall_ms": 8.088340997346677,
+        "user_ms": 3.905,
+        "sys_ms": 3.905,
+        "peak_rss_kib": 16280
+      },
+      {
+        "pair": 1,
+        "variant": "candidate",
+        "wall_ms": 8.007668999198359,
+        "user_ms": 3.8829999999999996,
+        "sys_ms": 3.8829999999999996,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 1,
+        "variant": "baseline",
+        "wall_ms": 7.413637998979539,
+        "user_ms": 4.109,
+        "sys_ms": 3.081,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 2,
+        "variant": "baseline",
+        "wall_ms": 8.721539001271594,
+        "user_ms": 5.626,
+        "sys_ms": 2.813,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 2,
+        "variant": "candidate",
+        "wall_ms": 7.834133997675963,
+        "user_ms": 2.817,
+        "sys_ms": 4.694999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 3,
+        "variant": "candidate",
+        "wall_ms": 8.38753999414621,
+        "user_ms": 3.077,
+        "sys_ms": 5.128,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 3,
+        "variant": "baseline",
+        "wall_ms": 7.919716998003423,
+        "user_ms": 3.831,
+        "sys_ms": 3.831,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 4,
+        "variant": "baseline",
+        "wall_ms": 8.274564002931584,
+        "user_ms": 5.034999999999999,
+        "sys_ms": 3.021,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 4,
+        "variant": "candidate",
+        "wall_ms": 8.111732997349463,
+        "user_ms": 4.513999999999999,
+        "sys_ms": 3.385,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 5,
+        "variant": "candidate",
+        "wall_ms": 8.10216499667149,
+        "user_ms": 3.9429999999999996,
+        "sys_ms": 3.9429999999999996,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 5,
+        "variant": "baseline",
+        "wall_ms": 8.465268001600634,
+        "user_ms": 3.0869999999999997,
+        "sys_ms": 5.145,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 6,
+        "variant": "baseline",
+        "wall_ms": 8.202228003938217,
+        "user_ms": 5.77,
+        "sys_ms": 1.923,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 6,
+        "variant": "candidate",
+        "wall_ms": 8.509972001775168,
+        "user_ms": 4.999,
+        "sys_ms": 2.999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 7,
+        "variant": "candidate",
+        "wall_ms": 8.400916995014995,
+        "user_ms": 3.343,
+        "sys_ms": 4.457,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 7,
+        "variant": "baseline",
+        "wall_ms": 8.73699600197142,
+        "user_ms": 5.111999999999999,
+        "sys_ms": 3.0669999999999997,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 8,
+        "variant": "baseline",
+        "wall_ms": 8.40465999499429,
+        "user_ms": 2.956,
+        "sys_ms": 4.928,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 8,
+        "variant": "candidate",
+        "wall_ms": 8.65627600433072,
+        "user_ms": 2.9589999999999996,
+        "sys_ms": 4.9319999999999995,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 9,
+        "variant": "candidate",
+        "wall_ms": 8.192403998691589,
+        "user_ms": 1.939,
+        "sys_ms": 5.819,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 9,
+        "variant": "baseline",
+        "wall_ms": 8.154948998708278,
+        "user_ms": 4.393,
+        "sys_ms": 3.295,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 10,
+        "variant": "baseline",
+        "wall_ms": 8.500244002789259,
+        "user_ms": 2.993,
+        "sys_ms": 4.9879999999999995,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 10,
+        "variant": "candidate",
+        "wall_ms": 7.815589000529144,
+        "user_ms": 3.65,
+        "sys_ms": 3.65,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 11,
+        "variant": "candidate",
+        "wall_ms": 7.823877000191715,
+        "user_ms": 2.78,
+        "sys_ms": 4.634,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 11,
+        "variant": "baseline",
+        "wall_ms": 8.574915998906363,
+        "user_ms": 4.065,
+        "sys_ms": 4.065,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 12,
+        "variant": "baseline",
+        "wall_ms": 8.131925002089702,
+        "user_ms": 3.283,
+        "sys_ms": 4.378,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 12,
+        "variant": "candidate",
+        "wall_ms": 7.9152370017254725,
+        "user_ms": 4.212,
+        "sys_ms": 3.159,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 13,
+        "variant": "candidate",
+        "wall_ms": 7.829316993593238,
+        "user_ms": 4.209,
+        "sys_ms": 3.1569999999999996,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 13,
+        "variant": "baseline",
+        "wall_ms": 8.064068999374285,
+        "user_ms": 1.893,
+        "sys_ms": 5.680999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 14,
+        "variant": "baseline",
+        "wall_ms": 8.422356004302856,
+        "user_ms": 2.242,
+        "sys_ms": 5.606,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 14,
+        "variant": "candidate",
+        "wall_ms": 8.242180003435351,
+        "user_ms": 4.857,
+        "sys_ms": 2.9139999999999997,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 15,
+        "variant": "candidate",
+        "wall_ms": 7.954597000207286,
+        "user_ms": 2.815,
+        "sys_ms": 4.692,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 15,
+        "variant": "baseline",
+        "wall_ms": 8.431556001596618,
+        "user_ms": 3.0509999999999997,
+        "sys_ms": 5.085999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 16,
+        "variant": "baseline",
+        "wall_ms": 8.122949002427049,
+        "user_ms": 2.2039999999999997,
+        "sys_ms": 5.510999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 16,
+        "variant": "candidate",
+        "wall_ms": 8.274036001239438,
+        "user_ms": 2.9779999999999998,
+        "sys_ms": 4.962999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 17,
+        "variant": "candidate",
+        "wall_ms": 7.716293999692425,
+        "user_ms": 4.2620000000000005,
+        "sys_ms": 3.1969999999999996,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 17,
+        "variant": "baseline",
+        "wall_ms": 8.343715999217238,
+        "user_ms": 1.9940000000000002,
+        "sys_ms": 5.981999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 18,
+        "variant": "baseline",
+        "wall_ms": 7.9416689986828715,
+        "user_ms": 2.8859999999999997,
+        "sys_ms": 4.81,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 18,
+        "variant": "candidate",
+        "wall_ms": 7.577924996439833,
+        "user_ms": 1.042,
+        "sys_ms": 6.253,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 19,
+        "variant": "candidate",
+        "wall_ms": 8.393509000597987,
+        "user_ms": 3.0669999999999997,
+        "sys_ms": 5.111999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 19,
+        "variant": "baseline",
+        "wall_ms": 8.07721999444766,
+        "user_ms": 2.9319999999999995,
+        "sys_ms": 4.887,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 20,
+        "variant": "baseline",
+        "wall_ms": 8.70230799773708,
+        "user_ms": 4.984999999999999,
+        "sys_ms": 2.9909999999999997,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 20,
+        "variant": "candidate",
+        "wall_ms": 8.565251999243628,
+        "user_ms": 1.034,
+        "sys_ms": 7.242999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 21,
+        "variant": "candidate",
+        "wall_ms": 8.094917000562418,
+        "user_ms": 2.951,
+        "sys_ms": 4.919,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 21,
+        "variant": "baseline",
+        "wall_ms": 9.003699000459164,
+        "user_ms": 2.819,
+        "sys_ms": 5.638,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 22,
+        "variant": "baseline",
+        "wall_ms": 10.281729999405798,
+        "user_ms": 2.638,
+        "sys_ms": 5.276999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 22,
+        "variant": "candidate",
+        "wall_ms": 9.186739000142552,
+        "user_ms": 4.128,
+        "sys_ms": 3.303,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 23,
+        "variant": "candidate",
+        "wall_ms": 8.933651995903347,
+        "user_ms": 2.012,
+        "sys_ms": 6.036,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 23,
+        "variant": "baseline",
+        "wall_ms": 11.243919994740281,
+        "user_ms": 3.597,
+        "sys_ms": 4.496,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 24,
+        "variant": "baseline",
+        "wall_ms": 19.626692999736406,
+        "user_ms": 3.068,
+        "sys_ms": 5.114,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 24,
+        "variant": "candidate",
+        "wall_ms": 62.86104799801251,
+        "user_ms": 3.898,
+        "sys_ms": 5.196999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 25,
+        "variant": "candidate",
+        "wall_ms": 24.201405998610426,
+        "user_ms": 2.799,
+        "sys_ms": 5.598,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 25,
+        "variant": "baseline",
+        "wall_ms": 20.814162999158725,
+        "user_ms": 4.83,
+        "sys_ms": 3.622,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 26,
+        "variant": "baseline",
+        "wall_ms": 24.164782000298146,
+        "user_ms": 2.539,
+        "sys_ms": 6.3469999999999995,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 26,
+        "variant": "candidate",
+        "wall_ms": 22.328705003019422,
+        "user_ms": 3.261,
+        "sys_ms": 5.436,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 27,
+        "variant": "candidate",
+        "wall_ms": 20.314611996582244,
+        "user_ms": 0.0,
+        "sys_ms": 8.348999999999998,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 27,
+        "variant": "baseline",
+        "wall_ms": 10.779665004520211,
+        "user_ms": 2.037,
+        "sys_ms": 6.111999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 28,
+        "variant": "baseline",
+        "wall_ms": 9.845105996646453,
+        "user_ms": 4.114999999999999,
+        "sys_ms": 4.114999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 28,
+        "variant": "candidate",
+        "wall_ms": 13.46329299849458,
+        "user_ms": 5.321999999999999,
+        "sys_ms": 3.1929999999999996,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 29,
+        "variant": "candidate",
+        "wall_ms": 10.812544998771045,
+        "user_ms": 1.9789999999999999,
+        "sys_ms": 5.936999999999999,
+        "peak_rss_kib": 16488
+      },
+      {
+        "pair": 29,
+        "variant": "baseline",
+        "wall_ms": 12.11523100209888,
+        "user_ms": 2.395,
+        "sys_ms": 5.9879999999999995,
+        "peak_rss_kib": 16488
+      }
+    ],
+    "comparison": "Median of paired process wall-time ratios; percentile bootstrap, 50000 resamples of thirty pairs, seed 20261013."
+  },
+  "compilation_and_size": {
+    "native_template_changes": false,
+    "description": "DataView classification is consumed by the existing call-hit helper; the ARM64 and x86-64 template emitters are unchanged by this isolated candidate. No additional per-JavaScript-function native compilation policy is introduced.",
+    "release_artifact_size_delta_bytes": 1368,
+    "compilation_timing": "Not compared: release builds ran under different compilation load. The shared session separately evaluates function tiering and application compilation volume."
+  },
+  "inherited_constructor_behavior": {
+    "fixture": "benchmarks/dataview-constructor-order-existing.js",
+    "description": "Invalid byteOffset and an already detached buffer still cause a supplied byteLength object to coerce before the constructor throws. This behavior predates the DataView access optimization and is unchanged by the isolated candidate. Production constructor ordering is outside this optimization.",
+    "node_v24_21_0_output": "RangeError|0|TypeError|0",
+    "baseline_and_isolated_candidate_output": "RangeError|1|TypeError|1",
+    "specification": "https://tc39.es/ecma262/multipage/structured-data.html#sec-dataview-buffer-byteoffset-bytelength",
+    "local_source": "/big/web-standards/repositories/tc39/ecma262/spec.html:46690",
+    "introduced_by_change": false
+  }
+}

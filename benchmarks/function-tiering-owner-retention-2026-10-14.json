@@ -1,0 +1,1357 @@
+{
+  "description": "Parked AST Value owner retention during function-frame continuation; explicit collection after replacing the first touched 64MiB view, before allocating/touching the next. Retained owner and backing-store unit assertions supplement process RSS. This record includes immutable pre-fix evidence; corrected artifact measurements are appended separately.",
+  "timestamp_utc": "2026-10-13T22:31:17.254157+00:00",
+  "machine": {
+    "hostname": "crystal",
+    "kernel": "7.2.10-crystal",
+    "architecture": "aarch64",
+    "cpu_affinity": 7,
+    "cpuinfo": "processor\t: 0\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 1\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 2\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 3\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 4\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 5\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 6\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 7\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 8\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 9\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 10\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 11\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 12\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 13\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 14\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd87\nCPU revision\t: 1\n\nprocessor\t: 15\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 16\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 17\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 18\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\nprocessor\t: 19\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16 dgh bti ecv afp wfxt\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0xd85\nCPU revision\t: 1\n\n"
+  },
+  "baseline_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+  "artifacts": {
+    "baseline": {
+      "path": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+      "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+    },
+    "pre_fix_v3": {
+      "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v3/trust-js",
+      "sha256": "c25a026e7141194ea6dd8916762616ae53b0aae67963b7b81b7ecbdd700680b0"
+    }
+  },
+  "pre_fix_build_manifest": {
+    "timestamp_utc": "2026-10-13T22:15:06.338007+00:00",
+    "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "machine": "Linux crystal 7.2.10-crystal #1 SMP PREEMPT_DYNAMIC @1791725354 aarch64 GNU/Linux",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+    "build_command": "cargo build --release -p trust-js -p test262-runner -p trust-js-difftest --bins --target-dir /tmp/trust-js-session-candidate-target-20261013",
+    "features": [
+      "intl"
+    ],
+    "tier_default": "jit",
+    "profile": {
+      "opt_level": 3,
+      "lto": "fat",
+      "codegen_units": 1,
+      "panic": "abort"
+    },
+    "artifacts": {
+      "trust-js": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v3/trust-js",
+        "sha256": "c25a026e7141194ea6dd8916762616ae53b0aae67963b7b81b7ecbdd700680b0",
+        "bytes": 20206624
+      },
+      "test262-runner": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v3/test262-runner",
+        "sha256": "cb6ec9ef280ba2f9d2510cca6b4ca9f00f729ef24d26fd61299dd2adc547fc04",
+        "bytes": 19586168
+      },
+      "trust-js-difftest": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v3/trust-js-difftest",
+        "sha256": "08bcdf9bedecf27ca7bb5e94b89b85d104ab5ee0dff1414efaf3366c638459ec",
+        "bytes": 19469272
+      }
+    },
+    "source_patch_sha256": "940d4b0993604934dbb10b00e5f59ed9967a9568c7b9c696c781697967f5de4e",
+    "source_files_sha256": "7c82df3411bf59ffd2626c89398b531eceadb481d9ed4663a53d44609b079695",
+    "predecessor": "../final-release-v2/manifest.json",
+    "change_since_predecessor": "Reuse ordinary for-in key identities; compact dense deque allocation bookkeeping from 48 to 32 bytes on 64-bit targets."
+  },
+  "fixture": "benchmarks/function-tiering-owner-retention.js",
+  "fixture_sha256": "cc1667c345bf616edce25b121fd96aa0c4f110362a7f3c29ee4e8352ee1b6d72",
+  "fixture_source": "// A parked AST binding must transfer its owner to the live compiled frame. Once\n// the slot is overwritten and GC runs, two touched 64 MiB buffers must not overlap.\n\"use strict\";\nconst size = 64 * 1024 * 1024;\nfunction run() {\n    let old = new Uint8Array(size);\n    for (let page = 0; page < size; page += 4096) old[page] = 1;\n    for (let index = 0; index < 3000; index++) {\n        if (index === 200) { old = null; $262.gc(); }\n        if (index === 500) {\n            let next = new Uint8Array(size);\n            for (let page = 0; page < size; page += 4096) next[page] = 2;\n            return next[0] + next[size - 4096];\n        }\n    }\n}\nconst checksum = run();\nif (checksum !== 4) throw new Error(\"owner retirement checksum \" + checksum);\nconsole.log(checksum);\n",
+  "flags": {
+    "tiers": [
+      "interp",
+      "jit"
+    ],
+    "other_TRUST_JS_variables": "removed",
+    "command": "taskset -c 7 BINARY --tier=TIER benchmarks/function-tiering-owner-retention.js",
+    "metrics": "os.wait4, streaming hashes; no child diagnostic instrumentation"
+  },
+  "preliminary_untracked_fixture_measurements": [
+    {
+      "round": 0,
+      "engine": "baseline",
+      "tier": "interp",
+      "peak_rss_kib": 74248,
+      "output": "4"
+    },
+    {
+      "round": 0,
+      "engine": "baseline",
+      "tier": "jit",
+      "peak_rss_kib": 75212,
+      "output": "4"
+    },
+    {
+      "round": 0,
+      "engine": "candidate",
+      "tier": "interp",
+      "peak_rss_kib": 77356,
+      "output": "4"
+    },
+    {
+      "round": 0,
+      "engine": "candidate",
+      "tier": "jit",
+      "peak_rss_kib": 144092,
+      "output": "4"
+    },
+    {
+      "round": 1,
+      "engine": "baseline",
+      "tier": "interp",
+      "peak_rss_kib": 74184,
+      "output": "4"
+    },
+    {
+      "round": 1,
+      "engine": "baseline",
+      "tier": "jit",
+      "peak_rss_kib": 76928,
+      "output": "4"
+    },
+    {
+      "round": 1,
+      "engine": "candidate",
+      "tier": "interp",
+      "peak_rss_kib": 79300,
+      "output": "4"
+    },
+    {
+      "round": 1,
+      "engine": "candidate",
+      "tier": "jit",
+      "peak_rss_kib": 145040,
+      "output": "4"
+    },
+    {
+      "round": 2,
+      "engine": "baseline",
+      "tier": "interp",
+      "peak_rss_kib": 74184,
+      "output": "4"
+    },
+    {
+      "round": 2,
+      "engine": "baseline",
+      "tier": "jit",
+      "peak_rss_kib": 75116,
+      "output": "4"
+    },
+    {
+      "round": 2,
+      "engine": "candidate",
+      "tier": "interp",
+      "peak_rss_kib": 78816,
+      "output": "4"
+    },
+    {
+      "round": 2,
+      "engine": "candidate",
+      "tier": "jit",
+      "peak_rss_kib": 144116,
+      "output": "4"
+    }
+  ],
+  "pre_fix_pairs": [
+    {
+      "round": 0,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75416,
+          "user_seconds": 0.026971,
+          "system_seconds": 0.007991,
+          "wall_seconds": 0.03629538300447166
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78560,
+          "user_seconds": 0.023521,
+          "system_seconds": 0.008180999999999999,
+          "wall_seconds": 0.03216895600053249
+        }
+      ]
+    },
+    {
+      "round": 0,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75144,
+          "user_seconds": 0.00308,
+          "system_seconds": 0.015403,
+          "wall_seconds": 0.01904725899657933
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 145692,
+          "user_seconds": 0.00296,
+          "system_seconds": 0.013816,
+          "wall_seconds": 0.017449085004045628
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "tier": "interp",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78508,
+          "user_seconds": 0.025639,
+          "system_seconds": 0.006153,
+          "wall_seconds": 0.03239868400123669
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 74940,
+          "user_seconds": 0.024741,
+          "system_seconds": 0.008905999999999999,
+          "wall_seconds": 0.0341923290034174
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "tier": "jit",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 145676,
+          "user_seconds": 0.004089,
+          "system_seconds": 0.012268,
+          "wall_seconds": 0.016889165999600664
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75212,
+          "user_seconds": 0.006114,
+          "system_seconds": 0.012228,
+          "wall_seconds": 0.018943626004329417
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75708,
+          "user_seconds": 0.017071,
+          "system_seconds": 0.016066,
+          "wall_seconds": 0.033690266995108686
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78448,
+          "user_seconds": 0.022514,
+          "system_seconds": 0.007163,
+          "wall_seconds": 0.030296749995613936
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 76732,
+          "user_seconds": 0.0020139999999999997,
+          "system_seconds": 0.016111999999999998,
+          "wall_seconds": 0.01873327499924926
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 144216,
+          "user_seconds": 0.004027,
+          "system_seconds": 0.012083,
+          "wall_seconds": 0.016668045995174907
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "tier": "interp",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77260,
+          "user_seconds": 0.021596,
+          "system_seconds": 0.011312,
+          "wall_seconds": 0.033512617999804206
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75876,
+          "user_seconds": 0.019989,
+          "system_seconds": 0.013992,
+          "wall_seconds": 0.034766314005537424
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "tier": "jit",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 145464,
+          "user_seconds": 0.006004,
+          "system_seconds": 0.010007,
+          "wall_seconds": 0.016460508995805867
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 76688,
+          "user_seconds": 0.010820999999999999,
+          "system_seconds": 0.00787,
+          "wall_seconds": 0.01894652299961308
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75840,
+          "user_seconds": 0.023858999999999998,
+          "system_seconds": 0.009941,
+          "wall_seconds": 0.03405349799868418
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78176,
+          "user_seconds": 0.021727,
+          "system_seconds": 0.009876,
+          "wall_seconds": 0.0319569240018609
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 76068,
+          "user_seconds": 0.0058579999999999995,
+          "system_seconds": 0.012693,
+          "wall_seconds": 0.01887535500281956
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 144092,
+          "user_seconds": 0.0060349999999999996,
+          "system_seconds": 0.011065,
+          "wall_seconds": 0.017425661004381254
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "tier": "interp",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78908,
+          "user_seconds": 0.022054,
+          "system_seconds": 0.010024,
+          "wall_seconds": 0.032599915997707285
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75136,
+          "user_seconds": 0.021547999999999998,
+          "system_seconds": 0.012313,
+          "wall_seconds": 0.034469273006834555
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "tier": "jit",
+      "order": [
+        "pre_fix_v3",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 145252,
+          "user_seconds": 0.005076,
+          "system_seconds": 0.011167,
+          "wall_seconds": 0.016654382001433987
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75208,
+          "user_seconds": 0.006026,
+          "system_seconds": 0.013056,
+          "wall_seconds": 0.019358170000487007
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75880,
+          "user_seconds": 0.01852,
+          "system_seconds": 0.015595999999999999,
+          "wall_seconds": 0.03440009000041755
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77264,
+          "user_seconds": 0.018047,
+          "system_seconds": 0.014036,
+          "wall_seconds": 0.03261230000498472
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "pre_fix_v3"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 75184,
+          "user_seconds": 0.006977,
+          "system_seconds": 0.01196,
+          "wall_seconds": 0.01941799400083255
+        },
+        {
+          "engine": "pre_fix_v3",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 145756,
+          "user_seconds": 0.008812,
+          "system_seconds": 0.007832,
+          "wall_seconds": 0.016980909000267275
+        }
+      ]
+    }
+  ],
+  "pre_fix_summary": {
+    "interp": {
+      "baseline": {
+        "peak_rss_median_kib": 75708
+      },
+      "pre_fix_v3": {
+        "peak_rss_median_kib": 78448
+      }
+    },
+    "jit": {
+      "baseline": {
+        "peak_rss_median_kib": 75212
+      },
+      "pre_fix_v3": {
+        "peak_rss_median_kib": 145464
+      }
+    }
+  },
+  "pre_fix_limitations": "Pre-fix evidence ran the immutable original linker-output baseline and copied v3 artifact paths. Subsequent investigation found these inode histories can differ by a few MiB in executable-backed residency. The roughly64MiB anonymous backing-store retention is independently established by source and weak-owner/backing-store lifecycle tests; corrected measurements freshly copy both shells symmetrically.",
+  "corrected_measurement_timestamp_utc": "2026-10-13T23:59:50.826830+00:00",
+  "corrected_machine": {
+    "hostname": "crystal",
+    "kernel": "7.2.10-crystal",
+    "architecture": "aarch64",
+    "cpu_affinity": 7,
+    "cpu_governor": "schedutil"
+  },
+  "corrected_artifacts": {
+    "baseline": {
+      "original_path": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+      "run_path": "/tmp/trust-js-function-owner-v8-artifacts-20261014-wh0eft13/baseline-trust-js",
+      "path": "/tmp/trust-js-function-owner-v8-artifacts-20261014-wh0eft13/baseline-trust-js",
+      "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492",
+      "original_sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+    },
+    "candidate": {
+      "original_path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v8/trust-js",
+      "run_path": "/tmp/trust-js-function-owner-v8-artifacts-20261014-wh0eft13/candidate-trust-js",
+      "path": "/tmp/trust-js-function-owner-v8-artifacts-20261014-wh0eft13/candidate-trust-js",
+      "sha256": "e7367ab202872c640b4e460856b578bc8da7e25fcb749916afb09887abdb1cfc",
+      "original_sha256": "e7367ab202872c640b4e460856b578bc8da7e25fcb749916afb09887abdb1cfc"
+    }
+  },
+  "corrected_artifact_copy_policy": "Both immutable original releases are freshly shutil.copy2 copied into the same new /tmp directory; hashes must match originals. Both copies are retained to control linker-output/copied-inode residency differences.",
+  "corrected_build_manifest": {
+    "timestamp_utc": "2026-10-13T23:54:46.746867+00:00",
+    "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+    "machine": "Linux crystal 7.2.10-crystal #1 SMP PREEMPT_DYNAMIC @1791725354 aarch64 GNU/Linux",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+    "build_command": "cargo build --release -p trust-js -p test262-runner -p trust-js-difftest --bins --target-dir /tmp/trust-js-session-candidate-target-20261013",
+    "features": [
+      "intl"
+    ],
+    "tier_default": "jit",
+    "profile": {
+      "opt_level": 3,
+      "lto": "fat",
+      "codegen_units": 1,
+      "panic": "abort"
+    },
+    "artifacts": {
+      "trust-js": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v8/trust-js",
+        "sha256": "e7367ab202872c640b4e460856b578bc8da7e25fcb749916afb09887abdb1cfc",
+        "bytes": 20207248
+      },
+      "test262-runner": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v8/test262-runner",
+        "sha256": "5d6b33bffef16cf0b4567bfb1f5ccaeb337c6f9195cc3c9500ddb5c20c959c42",
+        "bytes": 19584672
+      },
+      "trust-js-difftest": {
+        "path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v8/trust-js-difftest",
+        "sha256": "b4605f9e108fc48b09cb264d7dee95907bc05e0ad49091b6bbc7d39cf28e372b",
+        "bytes": 19467680
+      }
+    },
+    "source_patch_sha256": "fdb1743cf11b9cc5fcb3244d4620af520b3eb103c9a5e0c9683781273b7f610e",
+    "source_files_sha256": "c6c6294f0d7e50bdc9d3c49811efc489a76a017d4452a8fe5a0340b14dd0400c",
+    "predecessor": "../final-release-v7/manifest.json",
+    "change_since_predecessor": "Cache per-operation implicit inline positions in inline-only metadata, replacing repeated compressed-position searches while retaining the existing caller, error-position and ownership behavior."
+  },
+  "corrected_fixture_sha256": "cc1667c345bf616edce25b121fd96aa0c4f110362a7f3c29ee4e8352ee1b6d72",
+  "corrected_flags": {
+    "tiers": [
+      "interp",
+      "bytecode",
+      "jit"
+    ],
+    "other_TRUST_JS_variables": "removed",
+    "cpu_affinity": 7,
+    "metrics": "os.wait4 with one reaper and file-backed stdout/stderr; streaming artifact hashes; no child diagnostic instrumentation",
+    "command": "taskset -c CPU BINARY --tier=TIER benchmarks/function-tiering-owner-retention.js"
+  },
+  "corrected_pairs": [
+    {
+      "round": 0,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78368,
+          "user_seconds": 0.012872999999999999,
+          "system_seconds": 0.022775,
+          "wall_seconds": 0.03737002800335176
+        },
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79160,
+          "user_seconds": 0.023688999999999998,
+          "system_seconds": 0.012832,
+          "wall_seconds": 0.03696623699943302
+        }
+      ]
+    },
+    {
+      "round": 0,
+      "tier": "bytecode",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77744,
+          "user_seconds": 0.014201,
+          "system_seconds": 0.009129,
+          "wall_seconds": 0.023652253003092483
+        },
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77456,
+          "user_seconds": 0.008133999999999999,
+          "system_seconds": 0.015250999999999999,
+          "wall_seconds": 0.023691022004641127
+        }
+      ]
+    },
+    {
+      "round": 0,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79740,
+          "user_seconds": 0.0030429999999999997,
+          "system_seconds": 0.015219,
+          "wall_seconds": 0.018630941995070316
+        },
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78432,
+          "user_seconds": 0.004187,
+          "system_seconds": 0.013607999999999999,
+          "wall_seconds": 0.01837972700013779
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "tier": "interp",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77308,
+          "user_seconds": 0.022976999999999997,
+          "system_seconds": 0.009989999999999999,
+          "wall_seconds": 0.03338354800507659
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77540,
+          "user_seconds": 0.025297999999999998,
+          "system_seconds": 0.008095,
+          "wall_seconds": 0.03381410899601178
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "tier": "bytecode",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77460,
+          "user_seconds": 0.011778,
+          "system_seconds": 0.010796,
+          "wall_seconds": 0.02292351800133474
+        },
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79744,
+          "user_seconds": 0.011162,
+          "system_seconds": 0.012176,
+          "wall_seconds": 0.023637533995497506
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "tier": "jit",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 80132,
+          "user_seconds": 0.004052,
+          "system_seconds": 0.013170999999999999,
+          "wall_seconds": 0.017514702005428262
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79688,
+          "user_seconds": 0.007248999999999999,
+          "system_seconds": 0.010355999999999999,
+          "wall_seconds": 0.017945966006664094
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78380,
+          "user_seconds": 0.014889999999999999,
+          "system_seconds": 0.017868,
+          "wall_seconds": 0.03303692500048783
+        },
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77308,
+          "user_seconds": 0.022661999999999998,
+          "system_seconds": 0.010837999999999999,
+          "wall_seconds": 0.03381714900024235
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "tier": "bytecode",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79328,
+          "user_seconds": 0.006979,
+          "system_seconds": 0.015952,
+          "wall_seconds": 0.02328457399562467
+        },
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77556,
+          "user_seconds": 0.011318,
+          "system_seconds": 0.011318,
+          "wall_seconds": 0.02313377300015418
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79032,
+          "user_seconds": 0.003021,
+          "system_seconds": 0.0141,
+          "wall_seconds": 0.01737327899900265
+        },
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79236,
+          "user_seconds": 0.0039109999999999995,
+          "system_seconds": 0.012712,
+          "wall_seconds": 0.01693107000028249
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "tier": "interp",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77244,
+          "user_seconds": 0.018257,
+          "system_seconds": 0.014199999999999999,
+          "wall_seconds": 0.03273463700315915
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78968,
+          "user_seconds": 0.020543,
+          "system_seconds": 0.012717,
+          "wall_seconds": 0.033533005000208504
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "tier": "bytecode",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79548,
+          "user_seconds": 0.011630999999999999,
+          "system_seconds": 0.011630999999999999,
+          "wall_seconds": 0.023601918001077138
+        },
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79348,
+          "user_seconds": 0.011064,
+          "system_seconds": 0.012069999999999999,
+          "wall_seconds": 0.02348063699901104
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "tier": "jit",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78336,
+          "user_seconds": 0.005170999999999999,
+          "system_seconds": 0.012411,
+          "wall_seconds": 0.017915839001943823
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78372,
+          "user_seconds": 0.005216,
+          "system_seconds": 0.012518,
+          "wall_seconds": 0.018024238001089543
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77444,
+          "user_seconds": 0.018012,
+          "system_seconds": 0.015009999999999999,
+          "wall_seconds": 0.0333666849983274
+        },
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78636,
+          "user_seconds": 0.024627,
+          "system_seconds": 0.008209,
+          "wall_seconds": 0.033222507998289075
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "tier": "bytecode",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79652,
+          "user_seconds": 0.013176,
+          "system_seconds": 0.010136,
+          "wall_seconds": 0.02367676599533297
+        },
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78580,
+          "user_seconds": 0.011259,
+          "system_seconds": 0.011259,
+          "wall_seconds": 0.022820222002337687
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 80284,
+          "user_seconds": 0.002977,
+          "system_seconds": 0.014886,
+          "wall_seconds": 0.018138878003810532
+        },
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79068,
+          "user_seconds": 0.002938,
+          "system_seconds": 0.013711,
+          "wall_seconds": 0.01694545499776723
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "tier": "interp",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78276,
+          "user_seconds": 0.020436,
+          "system_seconds": 0.012261999999999999,
+          "wall_seconds": 0.033025611999619287
+        },
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78756,
+          "user_seconds": 0.023091999999999998,
+          "system_seconds": 0.01004,
+          "wall_seconds": 0.033527853003761265
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "tier": "bytecode",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77492,
+          "user_seconds": 0.012204,
+          "system_seconds": 0.011186999999999999,
+          "wall_seconds": 0.023785757999576163
+        },
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79564,
+          "user_seconds": 0.015064999999999999,
+          "system_seconds": 0.008034,
+          "wall_seconds": 0.023584333997860085
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "tier": "jit",
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "measurements": [
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79116,
+          "user_seconds": 0.005153,
+          "system_seconds": 0.011337,
+          "wall_seconds": 0.01690391800366342
+        },
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78360,
+          "user_seconds": 0.009126,
+          "system_seconds": 0.009126,
+          "wall_seconds": 0.018646254000486806
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "tier": "interp",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78380,
+          "user_seconds": 0.024078,
+          "system_seconds": 0.008026,
+          "wall_seconds": 0.03249185299500823
+        },
+        {
+          "engine": "candidate",
+          "tier": "interp",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78312,
+          "user_seconds": 0.021813,
+          "system_seconds": 0.010905999999999999,
+          "wall_seconds": 0.033133581004221924
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "tier": "bytecode",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 77764,
+          "user_seconds": 0.009274,
+          "system_seconds": 0.011335,
+          "wall_seconds": 0.021009709998907056
+        },
+        {
+          "engine": "candidate",
+          "tier": "bytecode",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78704,
+          "user_seconds": 0.010836,
+          "system_seconds": 0.011821,
+          "wall_seconds": 0.02305227000033483
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "tier": "jit",
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "measurements": [
+        {
+          "engine": "baseline",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 78420,
+          "user_seconds": 0.006781,
+          "system_seconds": 0.010655999999999999,
+          "wall_seconds": 0.017759294001734816
+        },
+        {
+          "engine": "candidate",
+          "tier": "jit",
+          "stdout": "4\n",
+          "stderr": "",
+          "peak_rss_kib": 79376,
+          "user_seconds": 0.004804,
+          "system_seconds": 0.01153,
+          "wall_seconds": 0.016830077998747583
+        }
+      ]
+    }
+  ],
+  "corrected_summary": {
+    "interp": {
+      "baseline": {
+        "peak_rss_median_kib": 78380,
+        "peak_rss_range_kib": [
+          77444,
+          78968
+        ]
+      },
+      "candidate": {
+        "peak_rss_median_kib": 78276,
+        "peak_rss_range_kib": [
+          77244,
+          79160
+        ]
+      }
+    },
+    "bytecode": {
+      "baseline": {
+        "peak_rss_median_kib": 79348,
+        "peak_rss_range_kib": [
+          77744,
+          79744
+        ]
+      },
+      "candidate": {
+        "peak_rss_median_kib": 77556,
+        "peak_rss_range_kib": [
+          77456,
+          79548
+        ]
+      }
+    },
+    "jit": {
+      "baseline": {
+        "peak_rss_median_kib": 79032,
+        "peak_rss_range_kib": [
+          78360,
+          80284
+        ]
+      },
+      "candidate": {
+        "peak_rss_median_kib": 79116,
+        "peak_rss_range_kib": [
+          78336,
+          80132
+        ]
+      }
+    }
+  },
+  "interpretation": "Explicit post-GC weak-owner/backing-store assertions establish retirement during the live continuation; these peak RSS samples independently check that successive touched buffers no longer overlap. Integrated executable/runtime layout changes also affect the small process-residency floor, so baseline/candidate RSS differences below the retained buffer size are not attributed solely to tiering."
+}

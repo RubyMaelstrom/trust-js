@@ -1,0 +1,797 @@
+{
+  "status": "preliminary; final candidate measurements pending",
+  "date_utc": "2026-10-13T20:44:55.232336+00:00",
+  "purpose": "Ordinary dense Array shift/unshift scaling, ownership and native-header changes",
+  "machine": {
+    "hostname": "crystal",
+    "system": "Linux-7.2.10-crystal-aarch64-with-glibc2.44",
+    "architecture": "aarch64",
+    "cpu_affinity": [
+      6
+    ],
+    "cpu_model": "ARM Cortex-X925",
+    "cpu_max_mhz": 3900,
+    "frequency_boost": false
+  },
+  "build": {
+    "profile": "release",
+    "cargo_features": "default (intl); engine shell only; no embed",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)",
+    "command": "cargo build --release -p trust-js --bin trust-js",
+    "optimization_level": 3,
+    "lto": "fat",
+    "codegen_units": 1,
+    "panic": "abort"
+  },
+  "run": {
+    "tier": "jit",
+    "arguments": [
+      "--tier=jit",
+      "benchmarks/array-end-operations.js"
+    ],
+    "environment_overrides": {},
+    "fixture_sha256": "1212c6c05851fca5a5f978f91b61675eb53c86b64ca7221c81a70b81c5108637",
+    "rounds": 32768,
+    "inner_samples": 5,
+    "sizes": [
+      256,
+      2048,
+      16384
+    ],
+    "clock": "Date.now() (integer milliseconds)"
+  },
+  "artifacts": {
+    "baseline": {
+      "revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+      "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+    },
+    "preliminary_candidate": {
+      "base_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+      "sha256": "5f8fb5ec589a7ba410cc1d7c65d0803d204250f678c2de40a48420c2ee15730b",
+      "description": "Integrated first session snapshot; partial loop handler work and old JSON replacer issue; diagnostic only"
+    }
+  },
+  "measurements": [
+    {
+      "sequence": 1,
+      "artifact": "baseline",
+      "outer_run": 1,
+      "completion_marker": true,
+      "records": [
+        {
+          "workload": "shift-push",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            30,
+            31,
+            30,
+            44,
+            30
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            172,
+            173,
+            179,
+            172,
+            172
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            1339,
+            1361,
+            1342,
+            1335,
+            1333
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            21,
+            22,
+            21,
+            21,
+            21
+          ],
+          "checksums": [
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            90,
+            91,
+            90,
+            90,
+            91
+          ],
+          "checksums": [
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            715,
+            715,
+            716,
+            714,
+            715
+          ],
+          "checksums": [
+            -16384,
+            -16384,
+            -16384,
+            -16384,
+            -16384
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            43,
+            43,
+            43,
+            43,
+            43
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            240,
+            240,
+            240,
+            240,
+            241
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            1905,
+            1913,
+            1909,
+            1998,
+            2063
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 256,
+          "operations": 256,
+          "milliseconds": [
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "checksums": [
+            32640,
+            32640,
+            32640,
+            32640,
+            32640
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 2048,
+          "operations": 2048,
+          "milliseconds": [
+            5,
+            6,
+            5,
+            5,
+            6
+          ],
+          "checksums": [
+            2096128,
+            2096128,
+            2096128,
+            2096128,
+            2096128
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 16384,
+          "operations": 16384,
+          "milliseconds": [
+            334,
+            334,
+            334,
+            335,
+            336
+          ],
+          "checksums": [
+            134209536,
+            134209536,
+            134209536,
+            134209536,
+            134209536
+          ]
+        }
+      ]
+    },
+    {
+      "sequence": 2,
+      "artifact": "preliminary_candidate",
+      "outer_run": 1,
+      "completion_marker": true,
+      "records": [
+        {
+          "workload": "shift-push",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            9,
+            9,
+            9,
+            9,
+            9
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            9,
+            9,
+            9,
+            9,
+            9
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            9,
+            9,
+            9,
+            9,
+            9
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "checksums": [
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "checksums": [
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "checksums": [
+            -16384,
+            -16384,
+            -16384,
+            -16384,
+            -16384
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            13,
+            13,
+            13,
+            13,
+            12
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            13,
+            13,
+            13,
+            13,
+            13
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            13,
+            13,
+            13,
+            13,
+            14
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 256,
+          "operations": 256,
+          "milliseconds": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "checksums": [
+            32640,
+            32640,
+            32640,
+            32640,
+            32640
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 2048,
+          "operations": 2048,
+          "milliseconds": [
+            1,
+            0,
+            1,
+            0,
+            1
+          ],
+          "checksums": [
+            2096128,
+            2096128,
+            2096128,
+            2096128,
+            2096128
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 16384,
+          "operations": 16384,
+          "milliseconds": [
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "checksums": [
+            134209536,
+            134209536,
+            134209536,
+            134209536,
+            134209536
+          ]
+        }
+      ]
+    },
+    {
+      "sequence": 3,
+      "artifact": "baseline",
+      "outer_run": 2,
+      "completion_marker": true,
+      "records": [
+        {
+          "workload": "shift-push",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            30,
+            30,
+            29,
+            30,
+            30
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            171,
+            172,
+            171,
+            172,
+            171
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "shift-push",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            1333,
+            1332,
+            1333,
+            1332,
+            1332
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            21,
+            20,
+            21,
+            21,
+            20
+          ],
+          "checksums": [
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688,
+            -528498688
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            89,
+            90,
+            90,
+            90,
+            90
+          ],
+          "checksums": [
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432,
+            -469778432
+          ]
+        },
+        {
+          "workload": "unshift-pop",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            713,
+            712,
+            720,
+            719,
+            713
+          ],
+          "checksums": [
+            -16384,
+            -16384,
+            -16384,
+            -16384,
+            -16384
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 256,
+          "operations": 32768,
+          "milliseconds": [
+            43,
+            43,
+            43,
+            42,
+            43
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 2048,
+          "operations": 32768,
+          "milliseconds": [
+            241,
+            241,
+            241,
+            242,
+            241
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "unshift-shift",
+          "size": 16384,
+          "operations": 32768,
+          "milliseconds": [
+            1895,
+            1893,
+            1894,
+            1895,
+            1895
+          ],
+          "checksums": [
+            536854528,
+            536854528,
+            536854528,
+            536854528,
+            536854528
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 256,
+          "operations": 256,
+          "milliseconds": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "checksums": [
+            32640,
+            32640,
+            32640,
+            32640,
+            32640
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 2048,
+          "operations": 2048,
+          "milliseconds": [
+            5,
+            6,
+            5,
+            6,
+            5
+          ],
+          "checksums": [
+            2096128,
+            2096128,
+            2096128,
+            2096128,
+            2096128
+          ]
+        },
+        {
+          "workload": "drain",
+          "size": 16384,
+          "operations": 16384,
+          "milliseconds": [
+            334,
+            334,
+            334,
+            334,
+            334
+          ],
+          "checksums": [
+            134209536,
+            134209536,
+            134209536,
+            134209536,
+            134209536
+          ]
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "all_recorded_checksums_verified_by_fixture": true,
+    "standards_snapshot": "ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202 (2026-09-06)",
+    "clauses": [
+      "https://tc39.es/ecma262/multipage/indexed-collections.html#sec-array.prototype.shift",
+      "https://tc39.es/ecma262/multipage/indexed-collections.html#sec-array.prototype.unshift",
+      "https://tc39.es/ecma262/multipage/indexed-collections.html#sec-array.prototype.concat"
+    ],
+    "focused_default_tests": {
+      "builtins_array_edits_lengths_shift_unshift": 25,
+      "template_numeric_arrays": 11,
+      "value_and_property_storage_suite_latest": 49
+    },
+    "optional_features": [
+      "embed",
+      "optimizing-jit",
+      "architecture-diagnostics"
+    ],
+    "optional_tests": {
+      "optimizing_heap_and_reentrant_gc_suite": 17,
+      "allocation_diagnostics_inventory_lifetime": 5,
+      "shifted_heap_representations_exercised": true,
+      "tiny_inline_owners_exercised": true
+    },
+    "node_oracle_version": "v24.21.0"
+  },
+  "limitations": [
+    "Candidate measurements include all session engine changes; component scaling is not an isolated whole-engine attribution.",
+    "Integer-millisecond timings cannot resolve the smallest drain workloads.",
+    "Host may also run repository validation on other cores.",
+    "This component fixture does not establish application performance, total memory, startup or compilation acceptance.",
+    "Unshift is amortized O(items.length) on ordinary plain dense arrays; observable holes, custom descriptors, proxies and prototype writes retain the specified algorithm."
+  ]
+}

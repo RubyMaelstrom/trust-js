@@ -1,0 +1,3360 @@
+{
+  "machine": {
+    "uname": [
+      "Linux",
+      "crystal",
+      "7.2.10-crystal",
+      "#1 SMP PREEMPT_DYNAMIC @1791725354",
+      "aarch64"
+    ],
+    "cpu": 8,
+    "model": "Cortex-X925",
+    "max_mhz": 3900
+  },
+  "baseline_revision": "447a60fb673e3bd46e8f1fbae43ac9c1d7db7b4a",
+  "tier": "jit",
+  "features": [
+    "intl"
+  ],
+  "profile": "release",
+  "diagnostic_flags": {},
+  "fixture": "benchmarks/webgl-engine-kernels.js",
+  "fixture_sha256": "777f79a62cb399f00835087ed1ff28247485c2dfaa8ef91ee316f6ef32c316b3",
+  "artifacts": {
+    "baseline": {
+      "path": "/tmp/trust-js-matched-artifacts-d0_e3q09/baseline",
+      "source_path": "/tmp/trust-js-session-baseline-target-20261013/release/trust-js",
+      "sha256": "876fd00596871d29ea79bbe3f384803846d7b26d51a3422c6d61c7b3eb601492"
+    },
+    "candidate": {
+      "path": "/tmp/trust-js-matched-artifacts-d0_e3q09/candidate",
+      "source_path": "/big/Code/trust-js/target/session-validation-20261013/final-release-v8/trust-js",
+      "sha256": "e7367ab202872c640b4e460856b578bc8da7e25fcb749916afb09887abdb1cfc"
+    }
+  },
+  "artifact_placement": "Both artifacts fresh copy2 into the same tmpfs directory; equal file-fault-around protocol.",
+  "comparison": "7 interleaved fresh-process pairs, five samples per kernel; median paired ratios, percentile bootstrap of paired medians.",
+  "records": [
+    {
+      "pair": 0,
+      "artifact": "baseline",
+      "wall_s": 7.878440312997554,
+      "user_s": 7.863383,
+      "system_s": 0.012998,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            259,
+            259,
+            260,
+            259,
+            259
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            167,
+            166,
+            167,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            270,
+            272,
+            272,
+            271,
+            272
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            32,
+            32,
+            31
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            34,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            127,
+            127,
+            127,
+            127
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            73,
+            72,
+            73,
+            72,
+            73
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            139,
+            140,
+            140,
+            140,
+            139
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            102,
+            102,
+            102,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            234,
+            234,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            125,
+            124,
+            125,
+            124,
+            125
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 0,
+      "artifact": "candidate",
+      "wall_s": 7.891179692000151,
+      "user_s": 7.882192,
+      "system_s": 0.008,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            261,
+            260,
+            261,
+            260,
+            261
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            166,
+            167,
+            166,
+            167
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            264,
+            276,
+            276,
+            276,
+            277
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            34,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            123,
+            122,
+            123,
+            122,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            72,
+            71,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            141,
+            141,
+            141,
+            140,
+            141
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            103,
+            102,
+            103,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            125,
+            125,
+            124,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "artifact": "candidate",
+      "wall_s": 7.83047909400193,
+      "user_s": 7.821846,
+      "system_s": 0.006999999999999999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            260,
+            261,
+            260,
+            261,
+            261
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            167,
+            166,
+            167,
+            167,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            264,
+            263,
+            263,
+            264,
+            263
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            32,
+            31,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            34,
+            33,
+            33,
+            33,
+            34
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            122,
+            122,
+            123,
+            122,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            72,
+            71,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            139,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            102,
+            103,
+            103,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            124,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 1,
+      "artifact": "baseline",
+      "wall_s": 7.857931259000907,
+      "user_s": 7.850593,
+      "system_s": 0.006,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            267,
+            267,
+            267,
+            268,
+            267
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            167,
+            166,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            262,
+            262,
+            262,
+            262,
+            262
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            34
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            126,
+            125,
+            126,
+            125,
+            126
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            72,
+            72,
+            72,
+            71
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            141,
+            140,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            102,
+            103,
+            103,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            234,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            125,
+            124,
+            124,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "artifact": "baseline",
+      "wall_s": 7.874122451998119,
+      "user_s": 7.867045,
+      "system_s": 0.005999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            260,
+            259,
+            259,
+            259,
+            259
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            167,
+            166,
+            166,
+            167,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            287,
+            265,
+            265,
+            265,
+            265
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            31
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            127,
+            127,
+            127,
+            127
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            75,
+            75,
+            75,
+            75,
+            76
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            102,
+            102,
+            103,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            235,
+            234,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            125,
+            124,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 2,
+      "artifact": "candidate",
+      "wall_s": 7.8681860319993575,
+      "user_s": 7.864039,
+      "system_s": 0.003,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            260,
+            261,
+            260,
+            260,
+            261
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            167,
+            166,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            277,
+            269,
+            270,
+            269,
+            270
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            123,
+            122,
+            122,
+            123,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            73,
+            72,
+            73,
+            73,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            139,
+            140,
+            139
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            102,
+            102,
+            103,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            234,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            125,
+            124,
+            125,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "artifact": "candidate",
+      "wall_s": 7.810819831000117,
+      "user_s": 7.800249,
+      "system_s": 0.008999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            261,
+            260,
+            261,
+            260,
+            260
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            166,
+            166,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            262,
+            261,
+            260,
+            261,
+            260
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            34
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            122,
+            123,
+            122,
+            123,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            73,
+            72,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            139,
+            140,
+            139,
+            139,
+            139
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            102,
+            103,
+            102,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            124,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 3,
+      "artifact": "baseline",
+      "wall_s": 7.915915573998063,
+      "user_s": 7.908708,
+      "system_s": 0.005000999999999999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            260,
+            259,
+            259,
+            259,
+            260
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            167,
+            166,
+            167,
+            166,
+            167
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            270,
+            271,
+            271,
+            272,
+            271
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            31,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            34
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            134,
+            133,
+            134,
+            134
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            73,
+            74,
+            73,
+            74
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            103,
+            102,
+            103,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            234,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            129,
+            129,
+            127,
+            125,
+            125
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 4,
+      "artifact": "baseline",
+      "wall_s": 7.845057475999056,
+      "user_s": 7.834585,
+      "system_s": 0.008999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            259,
+            260,
+            259,
+            259,
+            259
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            166,
+            167,
+            167,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            268,
+            264,
+            265,
+            265,
+            265
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            31,
+            32,
+            32,
+            32,
+            31
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            127,
+            126,
+            127,
+            127
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            73,
+            72,
+            73,
+            72,
+            73
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            103,
+            103,
+            102,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            234,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            124,
+            125,
+            125
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 4,
+      "artifact": "candidate",
+      "wall_s": 7.837816664999991,
+      "user_s": 7.830122,
+      "system_s": 0.006,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            261,
+            260,
+            260,
+            261,
+            260
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            167,
+            167,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            262,
+            265,
+            264,
+            265,
+            265
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            34,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            123,
+            123,
+            122,
+            122,
+            123
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            73,
+            72,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            141,
+            140,
+            141,
+            140,
+            141
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            103,
+            103,
+            103,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            123,
+            124,
+            123,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 5,
+      "artifact": "candidate",
+      "wall_s": 7.856309404000058,
+      "user_s": 7.84694,
+      "system_s": 0.007999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            260,
+            261,
+            260,
+            260,
+            261
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            167,
+            166,
+            167,
+            166,
+            167
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            262,
+            269,
+            270,
+            270,
+            270
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            34,
+            33,
+            33,
+            34
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            122,
+            122,
+            123,
+            122,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            73,
+            72,
+            73,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            103,
+            103,
+            103,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            123,
+            124,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 5,
+      "artifact": "baseline",
+      "wall_s": 7.909774454994476,
+      "user_s": 7.900475,
+      "system_s": 0.007999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            268,
+            268,
+            268,
+            269,
+            268
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            166,
+            166,
+            166,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            272,
+            271,
+            270,
+            270,
+            270
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            31,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            34,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            127,
+            127,
+            127,
+            127
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            72,
+            72,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            139,
+            140,
+            140,
+            139,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            103,
+            103,
+            102,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            234,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            125,
+            125,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 6,
+      "artifact": "baseline",
+      "wall_s": 7.860511835002399,
+      "user_s": 7.850038,
+      "system_s": 0.008997999999999999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            268,
+            267,
+            268,
+            268,
+            267
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            167,
+            167,
+            167,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            265,
+            261,
+            260,
+            261,
+            261
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            32,
+            32,
+            31,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            33,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            127,
+            127,
+            127,
+            127,
+            127
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            72,
+            72,
+            73,
+            72,
+            72
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            139,
+            140,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            102,
+            102,
+            103,
+            102,
+            102
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            234,
+            234,
+            235,
+            234,
+            234
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            125,
+            124,
+            124,
+            123,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    },
+    {
+      "pair": 6,
+      "artifact": "candidate",
+      "wall_s": 7.841276059996744,
+      "user_s": 7.833096,
+      "system_s": 0.006999,
+      "peak_rss_kib": 21088,
+      "kernels": [
+        {
+          "name": "array-copy-compare",
+          "count": 500000,
+          "samples_ms": [
+            261,
+            260,
+            261,
+            260,
+            260
+          ],
+          "checksums": [
+            500000,
+            500000,
+            500000,
+            500000,
+            500000
+          ]
+        },
+        {
+          "name": "small-array",
+          "count": 3000000,
+          "samples_ms": [
+            166,
+            167,
+            166,
+            167,
+            166
+          ],
+          "checksums": [
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000,
+            4500016500000
+          ]
+        },
+        {
+          "name": "typed-array-set",
+          "count": 500000,
+          "samples_ms": [
+            262,
+            265,
+            265,
+            264,
+            265
+          ],
+          "checksums": [
+            17.5,
+            17.5,
+            17.5,
+            17.5,
+            17.5
+          ]
+        },
+        {
+          "name": "exact-arguments",
+          "count": 300000,
+          "samples_ms": [
+            32,
+            31,
+            32,
+            32,
+            32
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "surplus-arguments",
+          "count": 300000,
+          "samples_ms": [
+            33,
+            34,
+            33,
+            33,
+            33
+          ],
+          "checksums": [
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000,
+            45000000000
+          ]
+        },
+        {
+          "name": "computed-reads",
+          "count": 2000000,
+          "samples_ms": [
+            123,
+            122,
+            122,
+            123,
+            122
+          ],
+          "checksums": [
+            5000000,
+            5000000,
+            5000000,
+            5000000,
+            5000000
+          ]
+        },
+        {
+          "name": "enumeration",
+          "count": 100000,
+          "samples_ms": [
+            73,
+            73,
+            73,
+            73,
+            73
+          ],
+          "checksums": [
+            1000000,
+            1000000,
+            1000000,
+            1000000,
+            1000000
+          ]
+        },
+        {
+          "name": "absent-properties",
+          "count": 3000000,
+          "samples_ms": [
+            140,
+            140,
+            141,
+            140,
+            140
+          ],
+          "checksums": [
+            6000000,
+            6000000,
+            6000000,
+            6000000,
+            6000000
+          ]
+        },
+        {
+          "name": "arithmetic",
+          "count": 10000000,
+          "samples_ms": [
+            103,
+            103,
+            102,
+            103,
+            103
+          ],
+          "checksums": [
+            236447232,
+            236447232,
+            236447232,
+            236447232,
+            236447232
+          ]
+        },
+        {
+          "name": "indexed-numeric-array",
+          "count": 100000,
+          "samples_ms": [
+            235,
+            235,
+            235,
+            235,
+            235
+          ],
+          "checksums": [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5
+          ]
+        },
+        {
+          "name": "fibonacci",
+          "count": 30,
+          "samples_ms": [
+            124,
+            124,
+            124,
+            123,
+            124
+          ],
+          "checksums": [
+            832040,
+            832040,
+            832040,
+            832040,
+            832040
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "array-copy-compare": {
+      "process_medians_ms": {
+        "baseline": [
+          259,
+          267,
+          259,
+          259,
+          259,
+          268,
+          268
+        ],
+        "candidate": [
+          261,
+          261,
+          260,
+          260,
+          260,
+          260,
+          260
+        ]
+      },
+      "paired_ratios": [
+        1.0077220077220077,
+        0.9775280898876404,
+        1.0038610038610039,
+        1.0038610038610039,
+        1.0038610038610039,
+        0.9701492537313433,
+        0.9701492537313433
+      ],
+      "median_ratio": 1.0038610038610039,
+      "bootstrap_95_interval": [
+        0.9701492537313433,
+        1.0038610038610039
+      ],
+      "regression": false
+    },
+    "small-array": {
+      "process_medians_ms": {
+        "baseline": [
+          166,
+          166,
+          166,
+          167,
+          166,
+          166,
+          167
+        ],
+        "candidate": [
+          166,
+          167,
+          166,
+          166,
+          166,
+          167,
+          166
+        ]
+      },
+      "paired_ratios": [
+        1.0,
+        1.0060240963855422,
+        1.0,
+        0.9940119760479041,
+        1.0,
+        1.0060240963855422,
+        0.9940119760479041
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        0.9940119760479041,
+        1.0060240963855422
+      ],
+      "regression": false
+    },
+    "typed-array-set": {
+      "process_medians_ms": {
+        "baseline": [
+          272,
+          262,
+          265,
+          271,
+          265,
+          270,
+          261
+        ],
+        "candidate": [
+          276,
+          263,
+          270,
+          261,
+          265,
+          270,
+          265
+        ]
+      },
+      "paired_ratios": [
+        1.0147058823529411,
+        1.0038167938931297,
+        1.0188679245283019,
+        0.9630996309963099,
+        1.0,
+        1.0,
+        1.0153256704980842
+      ],
+      "median_ratio": 1.0038167938931297,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0153256704980842
+      ],
+      "regression": false
+    },
+    "exact-arguments": {
+      "process_medians_ms": {
+        "baseline": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "candidate": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      },
+      "paired_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0
+      ],
+      "regression": false
+    },
+    "surplus-arguments": {
+      "process_medians_ms": {
+        "baseline": [
+          33,
+          33,
+          33,
+          33,
+          33,
+          33,
+          33
+        ],
+        "candidate": [
+          33,
+          33,
+          33,
+          33,
+          33,
+          33,
+          33
+        ]
+      },
+      "paired_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0
+      ],
+      "regression": false
+    },
+    "computed-reads": {
+      "process_medians_ms": {
+        "baseline": [
+          127,
+          126,
+          127,
+          134,
+          127,
+          127,
+          127
+        ],
+        "candidate": [
+          122,
+          122,
+          122,
+          122,
+          123,
+          122,
+          122
+        ]
+      },
+      "paired_ratios": [
+        0.9606299212598425,
+        0.9682539682539683,
+        0.9606299212598425,
+        0.9104477611940298,
+        0.968503937007874,
+        0.9606299212598425,
+        0.9606299212598425
+      ],
+      "median_ratio": 0.9606299212598425,
+      "bootstrap_95_interval": [
+        0.9606299212598425,
+        0.9682539682539683
+      ],
+      "regression": false
+    },
+    "enumeration": {
+      "process_medians_ms": {
+        "baseline": [
+          73,
+          72,
+          75,
+          73,
+          73,
+          72,
+          72
+        ],
+        "candidate": [
+          72,
+          72,
+          73,
+          72,
+          72,
+          72,
+          73
+        ]
+      },
+      "paired_ratios": [
+        0.9863013698630136,
+        1.0,
+        0.9733333333333334,
+        0.9863013698630136,
+        0.9863013698630136,
+        1.0,
+        1.0138888888888888
+      ],
+      "median_ratio": 0.9863013698630136,
+      "bootstrap_95_interval": [
+        0.9863013698630136,
+        1.0
+      ],
+      "regression": false
+    },
+    "absent-properties": {
+      "process_medians_ms": {
+        "baseline": [
+          140,
+          140,
+          140,
+          140,
+          140,
+          140,
+          140
+        ],
+        "candidate": [
+          141,
+          140,
+          140,
+          139,
+          141,
+          140,
+          140
+        ]
+      },
+      "paired_ratios": [
+        1.0071428571428571,
+        1.0,
+        1.0,
+        0.9928571428571429,
+        1.0071428571428571,
+        1.0,
+        1.0
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0071428571428571
+      ],
+      "regression": false
+    },
+    "arithmetic": {
+      "process_medians_ms": {
+        "baseline": [
+          102,
+          103,
+          102,
+          102,
+          103,
+          103,
+          102
+        ],
+        "candidate": [
+          103,
+          103,
+          102,
+          102,
+          103,
+          103,
+          103
+        ]
+      },
+      "paired_ratios": [
+        1.0098039215686274,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0098039215686274
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0098039215686274
+      ],
+      "regression": false
+    },
+    "indexed-numeric-array": {
+      "process_medians_ms": {
+        "baseline": [
+          234,
+          234,
+          234,
+          234,
+          234,
+          234,
+          234
+        ],
+        "candidate": [
+          235,
+          235,
+          235,
+          235,
+          235,
+          235,
+          235
+        ]
+      },
+      "paired_ratios": [
+        1.0042735042735043,
+        1.0042735042735043,
+        1.0042735042735043,
+        1.0042735042735043,
+        1.0042735042735043,
+        1.0042735042735043,
+        1.0042735042735043
+      ],
+      "median_ratio": 1.0042735042735043,
+      "bootstrap_95_interval": [
+        1.0042735042735043,
+        1.0042735042735043
+      ],
+      "regression": false
+    },
+    "fibonacci": {
+      "process_medians_ms": {
+        "baseline": [
+          125,
+          124,
+          124,
+          127,
+          124,
+          124,
+          124
+        ],
+        "candidate": [
+          124,
+          124,
+          124,
+          124,
+          124,
+          124,
+          124
+        ]
+      },
+      "paired_ratios": [
+        0.992,
+        1.0,
+        1.0,
+        0.9763779527559056,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median_ratio": 1.0,
+      "bootstrap_95_interval": [
+        0.992,
+        1.0
+      ],
+      "regression": false
+    }
+  }
+}
