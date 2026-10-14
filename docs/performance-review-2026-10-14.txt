@@ -1,0 +1,230 @@
+TRust JS performance and correctness review, 2026-10-14
+COMPLETED BUILTIN CHECKPOINT; subsequent compiler work is separate.
+
+Baseline revision: ca7f4688ca293d4b0418ef1b4f7cc0450195ae6c.
+Final engine source: e62c6f0d (five implementation commits after the baseline).
+Candidate v3 release shell SHA-256
+c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba.
+Machine: crystal, aarch64 Linux, Cortex-X925 CPU 5; Rust 1.99.0, release,
+opt-level 3, fat LTO, one codegen unit, default intl feature, template JIT.
+No optional optimizing tier or architecture diagnostics was enabled.
+
+Validated commit checkpoints
+
+ad92ce15: ARM64 intrinsic alias ownership and final-owner regressions.
+3a2b7d94: literal replacement, bounded split and string regressions/fixture.
+9c8cdef4: JSON.stringify UTF-16 indentation and surrogate-boundary regressions.
+158781d8: bounded dense-array recovery, regressions and scaling fixture.
+e62c6f0d: streaming/hash-indexed GroupBy, cached calls and collision-chain storage.
+Implementation changes and the builtin checkpoint are complete. The exact
+frozen artifacts, final control records and all rejected/preliminary evidence
+are retained; current compiler source edits are outside this checkpoint.
+
+Implemented changes
+
+Object.groupBy now indexes groups by key instead of rescanning every existing
+group. Object/Map.groupBy consume the iterator and call the callback in the
+specified order, including live changes to the input. Errors from callbacks
+and property-key conversion close the iterator; opening/stepping errors do not.
+Map uses one hash-table probe and offset links between groups, avoiding a
+separate collision-bucket allocation per distinct hash. A deliberately colliding
+undefined/Number pair exercises both head and older-group lookup.
+Invocation-local guarded Callback entries amortize repeated callback/next calls
+without losing proxy, bound-function, Realm, GC or exception behavior. Temporary
+indexes are released before building the result. Object key ordering and Map
+SameValueZero semantics are retained.
+
+Literal replacement callbacks retain the original LStr rather than copying the
+entire input for every match. ASCII callback offsets no longer rescan prefixes.
+Unicode empty-pattern replacement no longer panics on a zero-width Rust window.
+ASCII substring-view patterns receive a real ASCII check when a conservative
+hint alone cannot decide whether they match.
+
+Empty-separator split decodes only the requested UTF-16 prefix. Proven ASCII
+strings and ASCII-owned views use an exact-length byte iterator, retaining full
+split allocation efficiency. Surrogate halves, coercion order and split limits
+are unchanged.
+
+ARM64 numeric Math and isNaN call paths decline aliased receiver/callee owners
+before mutation, allowing the checked path to release them correctly. Tests
+cover repeated references and final-owner destruction with a separate sentinel.
+The x86-64 call path already uses the checked helper.
+
+Arrays can recover packed append/pop and numeric-read eligibility after a
+transient far-index property is removed. Individual deletion scans at most 256
+remaining named entries; larger maps stay conservative until a truncation
+rebuild. All remaining canonical named indices keep packed growth disabled.
+Failed numeric-mirror preparation is retried through its complete validator.
+Descriptor, hole, prototype, partial-length-failure and cyclic-owner tests cover
+the storage transition. No object/Props/JIT layout was changed.
+
+JSON.stringify truncates string indentation to ten UTF-16 code units rather
+than Unicode scalar values. It preserves a lone surrogate at that boundary
+and canonicalizes output only when repeated indentation can join surrogate
+halves. The ordinary no-gap serializer takes the existing path.
+
+Correctness evidence
+
+benchmarks/review-validation-v3-2026-10-14.json identifies the exact binaries,
+commands, scope and full local log paths. The engine unit suite passed 1,988
+tests with zero failures and three ignored. Test262 revision
+ d86b2294eb0a17eaa281ff12c73c473ec864c72f
+passed 4,887 focused cases in each of interp, bytecode and JIT, with zero failures
+or skips. Scope includes all Array tests and affected GroupBy, string, Math,
+JSON.stringify and property operations; it is not the entire Test262 suite.
+The 2,000-case differential run produced 1,859 agreements, zero divergences and
+141 inconclusive execution-budget skips. Four baseline bug reproductions match
+Node v24.21.0 in all three tiers after the fixes. Additional focused JS fixtures
+were also Node-verified. Native execution was tested on ARM64, not x86-64/wasm32.
+Changed Rust files pass rustfmt checks and git diff --check. A separate source
+review found no unresolved issue before the final build.
+
+Measurement method and status
+
+The final builtin comparison and control sequence is complete. Grouping,
+application and selected Octane seven-pair comparisons pass all component,
+wall/CPU and peak-RSS gates. Exact v2 seven-pair string/array/Math evidence is
+retained for the unchanged source, with explicitly identified v3 controls.
+The runner alternates fresh baseline/candidate processes on CPU 5, with seven
+process pairs and seven Node v24.21.0 processes per final suite. Both TRust
+executables are copied into the same fresh tmpfs directory. Raw samples,
+checksums/completion markers, wall/CPU time, sampled post-exec peak RSS, exact
+binary/fixture hashes, configuration and paired bootstrap 95% intervals are
+retained in versioned benchmarks/review-*-2026-10-14.json records.
+
+The string/array/Math implementations are unchanged between v2 and v3. Their
+seven-pair component records use v2 (ede664f876154cc44843d7de243480011d6bb7de94a2182f78ec693a24b84dde);
+v3 changes only Map.groupBy temporary indexing. Final grouping/application
+acceptance uses v3, with shorter v3 controls for the unchanged components. Each
+record identifies the artifact actually timed; measurements are not relabeled.
+
+Completed v3 grouping evidence, medians in milliseconds:
+  Object/array, 65,536 distinct keys:        7,901 -> 81 (Node 98).
+  Map/generator, 16,384 distinct keys:          21 -> 19.
+  Map/generator, 65,536 distinct keys:          75 -> 68.
+All 32 grouping components and process wall/CPU/peak-RSS measures pass the
+regression gate in seven paired runs. Object grouping is about 98x faster in
+that particular distinct-key case; it does not imply an overall engine lead.
+
+Completed v2 component evidence, medians in milliseconds:
+  ASCII replacement, 65,536 callbacks:        563 -> 21 (Node 3).
+  Unicode replacement, 65,536 callbacks:    2,811 -> 28 (Node 7).
+    The Unicode receiver has 262,144 UTF-16 code units.
+  Restored array push/pop, 4,096 elements:     742 -> 20 (Node 6).
+    Each sample executes 131,072 push/pop pairs.
+  Full ASCII split, 65,536-unit source:         15 -> 15 (Node 5).
+    Sixteen repetitions produce 1,048,576 elements per sample.
+The full-output and pristine-array controls have no regression gate failures.
+The string suite peak RSS falls from 78,104 to 39,988 KiB; this is a process
+high-water measurement, not a retained-heap claim. Numeric Math kernels show
+paired changes from -1.24% to +2.08% for the ownership checks, below the 3% gate.
+Node remains faster on those numeric and replacement-callback components.
+
+Final v3 application controls, medians in milliseconds:
+  React: 72 -> 72 (Node 19).
+  Djot: 186 -> 188 (Node 50).
+  Vue: 571 -> 573 (Node 104).
+All 63 fresh processes completed with matching output. Component, process
+wall/CPU and peak-RSS comparisons have no regression gate failures. These
+results do not show an application-wide speedup from the bounded fixes.
+
+Selected Octane v3 scores (higher is better):
+  Richards: 1,096 -> 1,110; DeltaBlue: 923 -> 918.
+  Crypto: 6,151 -> 6,161; RayTrace: 1,824 -> 1,824.
+  Selected composite: 1,837 -> 1,839; Node: 31,991.
+All 21 runs completed; no component/wall/CPU/RSS regression gate failed.
+This four-workload selection is not the official full-suite Octane score.
+It remains about 17.4x below Node, so an overall Node performance lead is
+not established by this session. The source revision and exact inputs are
+recorded in review-octane-v3-2026-10-14.json.
+
+Samples below ten integer milliseconds do not establish a precise component
+speedup. Peak RSS does not measure post-GC retained heap or GC pauses. Application
+wall times include startup and compilation but do not isolate their individual
+costs. The project gate is a median loss above 3% with a 95% interval excluding
+parity; aggregate gains do not waive component regressions.
+
+Final artifact memory and startup controls
+
+The initial three-pair Math control had a peak-RSS gate (+9.87%); a seven-pair
+repeat using the same executable-file pair retained that gate (+8.29%, nominal
+95% ratio interval 1.0029..1.1350). These records were not discarded. The short
+full-split control initially flagged +3.018% RSS; its seven-pair confirmation was
++2.020%, below the project median-loss threshold. Latency gates passed.
+
+A separate seven-pair Math cohort created independent baseline/candidate tmpfs
+files per pair, alternated creation order and verified every hash. Its RSS ratio
+was 0.9975 (nominal 95% interval 0.9301..1.0111), with no gate. Controlled post-exec
+RssAnon/RssFile/RssShmem and smaps measurements locate the large swings in anonymous
+heap residency: the same v3 executable used 1,544 and 3,324 KiB of resident heap.
+Executable tmpfs mappings were stable at 9,908 KiB baseline and 10,040 KiB v2/v3.
+An ASLR-disabled diagnostic gave 1,544 KiB resident heap for all three artifacts,
+256 KiB anonymous executable code and 1,484 KiB shared libraries. This supports
+address/allocator-layout sensitivity; it does not identify an allocator mechanism.
+
+Math PERF diagnostics report post-GC managed requested lower bounds of 931,200,
+931,196 and 931,210 bytes for baseline/v2/v3; all have 1,030 live objects and two
+scopes. Native generated code is 208,656 vs 209,616 bytes. Opaque storage is still
+excluded, so these observations are not an exact retained-heap proof. All original
+RSS gates, independent-copy repeats and diagnostic reports are included in the
+validation JSON. This is a measurement reproducibility investigation, not an RSS
+waiver. The three-pair bootstrap intervals are descriptive controls and provide
+less evidence than the seven-pair confirmations.
+
+A checked empty script completed in every seven-pair startup process. Wall-time
+medians were 11.40 vs 11.46 ms (Node 41.47 ms), with no wall/CPU/RSS gate. Sampling
+very short process RSS is imprecise; no precise startup memory ratio is claimed.
+
+Separate compilation and GC diagnostics
+
+PERF_METRICS runs are excluded from acceptance timing. Complete application output
+still matches the timing runs. Candidate native compile times and generated code:
+React 1.41 ms / 110,448 bytes; Djot 34.68 ms / 4,882,480 bytes; Vue 6.77 ms /
+773,488 bytes. Candidate post-GC requested lower bounds are about 0.99, 8.90 and
+7.76 MB respectively. Counts match or closely track the frozen baseline.
+
+Separate selected Octane diagnostics show 79.03 ms native compilation, 7,661,488
+bytes generated code and 117.49 ms aggregate GC pauses. Per-component candidate
+observations: Richards 10.34 ms compile / 818,420 bytes / 5.08 ms GC; DeltaBlue
+39.14 ms / 2,841,208 bytes / 109.88 ms GC; RayTrace 11.35 ms / 1,488,212 bytes /
+0.49 ms GC. These are diagnostic observations, not acceptance timings; upcoming
+compiler builds may overlap their pinned CPU5 stream. Native-call seconds are
+inclusive and cannot be interpreted as an exclusive CPU profile. Timed upstream
+Octane loops perform different amounts of work across diagnostic runs.
+
+These small compilation/GC totals do not explain the selected Octane gap by
+themselves. Frozen-v3 live-JIT sampling is a separate follow-up for native body,
+helper, frame, ownership and property attribution. Larger compiler work is now
+explicitly requested and remains ongoing outside this builtin checkpoint.
+
+The earlier review-groupby/review-strings/review-math-2026-10-14.json records
+remain as preliminary investigation evidence. The initial GroupBy implementation
+regressed repeated-key workloads, and lazy split alone regressed full ASCII
+splitting. Both were reworked before v2. Math controls were lengthened fourfold
+to resolve the earlier near-threshold integer-clock quantization. No historical
+accepted-production manifest was promoted or overwritten.
+
+Ladybird comparison and remaining work
+
+An agent cloned official Ladybird revision
+ d8afe7ddba448c54ee9ded2c808c1a77d3791ca1
+and audited its runtime/compiler, storage/GC, strings, regex, JSON and caching.
+docs/ladybird-comparison-2026-10-14.txt retains the pinned source evidence and
+standards references. The array-recovery and JSON-gap fixes came from this audit.
+Ladybird was not built or timed: the normal shell build still needs additional
+checkout trees and system dependencies. No measured Ladybird speed ratio is
+claimed in this review.
+
+The current Ladybird has a default optimizing Rust JIT and a generated native
+bytecode interpreter. TRust already has numeric regions, direct calls, typed-array
+fusion, caches, packed storage and an experimental whole-function optimizer.
+Larger gaps are cross-control-flow guard reuse, range/bounds proofs, loop motion,
+allocation elimination, optimizing inlining with multiple recovery frames,
+cheap feedback and background compilation. Its embedded GC-cell assumptions
+cannot be copied into TRust's Realm-independent shared code contract.
+
+More bounded follow-up candidates are required-literal regexp rejection,
+repeated JSON key/layout reuse, ordered-key caching with descriptor validation,
+and efficient worst-case UTF-16 literal search. These remain unimplemented and
+unmeasured; this session does not establish general superiority over Node or
+Ladybird. See the detailed comparison for evidence and semantic constraints.

@@ -1,0 +1,3388 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate compilation/GC/managed-memory observations",
+  "excluded_from_acceptance_timings": true,
+  "started_utc": "2026-10-14T07:42:40.207883+00:00",
+  "application_timing_report": "/big/Code/trust-js/benchmarks/review-applications-v3-2026-10-14.json",
+  "application_timing_report_sha256": "446c8d5f5238feb26356f129649e33dd0056d1fc2f511f69a28e90f9fe1aff6c",
+  "artifacts": {
+    "baseline": {
+      "path": "/tmp/trust-js-review-controls-wnym0ybo/baseline",
+      "sha256": "c1104d944cf95f9b3136ca0e077960e5bc174a0b2163bee753d219018f1f6340"
+    },
+    "candidate": {
+      "path": "/tmp/trust-js-review-controls-wnym0ybo/candidate",
+      "sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba"
+    }
+  },
+  "fixtures": {
+    "react": {
+      "path": "/tmp/trust-js-review-controls-wnym0ybo/react.js",
+      "sha256": "1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc"
+    },
+    "djot": {
+      "path": "/tmp/trust-js-review-controls-wnym0ybo/djot.js",
+      "sha256": "c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682"
+    },
+    "vue": {
+      "path": "/tmp/trust-js-review-controls-wnym0ybo/vue.js",
+      "sha256": "38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc"
+    }
+  },
+  "cpu_affinity": [
+    5
+  ],
+  "environment_overrides": {
+    "TRUST_JS_PERF_METRICS": "1"
+  },
+  "limitations": [
+    "Instrumented diagnostic runs are excluded from acceptance timings.",
+    "Native-call/GC observations are engine counters; managed_requested_bytes is a lower bound when marked as such.",
+    "Post-GC managed memory is distinct from process peak RSS, external system allocations and mapped executable text.",
+    "Octane timed loops execute different amounts of work in diagnostic runs; raw counts are not normalized performance comparisons."
+  ],
+  "status": "complete",
+  "runs": [
+    {
+      "workload": "react",
+      "variant": "baseline",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/baseline",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/react.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/react-baseline.stdout",
+        "sha256": "61c1eb6a1025ed8502599d059d3da8e14266d8ef69454eb801e25539cd28c1ee"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/react-baseline.stderr",
+        "sha256": "57c963ab878b32ceb7922b1a3f5257ed944c0dae1affca78830c8ba88c65d1be"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 9,
+        "jit_compile_successes": 9,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.001575166,
+        "jit_generated_code_bytes": 110448,
+        "jit_largest_code_bytes": 42148,
+        "jit_inline_attempts": 7,
+        "jit_inline_empty_plans": 6,
+        "jit_inline_plan_sites": 2,
+        "jit_inline_successes": 1,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 13,
+        "lex_calls": 3,
+        "lex_seconds": 0.000343823,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000392767,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 9,
+        "bytecode_compile_successes": 9,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.000239696,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.096e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.3024e-05,
+        "native_calls": 2204,
+        "native_failures": 0,
+        "native_seconds": 0.000385487,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 0,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.0,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.000368992,
+        "gc_max_pause_seconds": 0.000222128,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 2040,
+        "gc_objects_reclaimed": 0,
+        "gc_peak_objects_before": 1020,
+        "gc_last_objects_after": 1020,
+        "gc_scopes_seen": 4,
+        "gc_scopes_reclaimed": 0,
+        "gc_peak_scopes_before": 2,
+        "gc_last_scopes_after": 2,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 1020,
+        "gc_minor_scopes_seen": 2,
+        "executable_code_live_bytes": 120464,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 1,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 9,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 288,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 2,
+          "method": 11,
+          "arrow": 4489,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 2,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 989384,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 146880,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 255376,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 208,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 983,
+              "quality": "exact"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 44099,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 186356,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 3588,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 203668,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 147706,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.432e-06
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 7.52e-07
+          },
+          {
+            "operation": "push",
+            "calls": 2200,
+            "failures": 0,
+            "seconds": 0.000359583
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.672e-05
+          }
+        ]
+      },
+      "output_sha256": "0921058a8fd910b1c987322f629aedb6428b488df6e4acd1d88ed690b1837358",
+      "valid": true
+    },
+    {
+      "workload": "react",
+      "variant": "candidate",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/candidate",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/react.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/react-candidate.stdout",
+        "sha256": "d6b74bc916b577a577cb4cf00b8a95933506fd90403297fa2e63ba6740a8a599"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/react-candidate.stderr",
+        "sha256": "57d6a6ae029179c40116ad83aeb195c622c309432b8f84ff99c24490408adb16"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 9,
+        "jit_compile_successes": 9,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.001412573,
+        "jit_generated_code_bytes": 110448,
+        "jit_largest_code_bytes": 42148,
+        "jit_inline_attempts": 7,
+        "jit_inline_empty_plans": 6,
+        "jit_inline_plan_sites": 2,
+        "jit_inline_successes": 1,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 13,
+        "lex_calls": 3,
+        "lex_seconds": 0.000292351,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000377936,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 9,
+        "bytecode_compile_successes": 9,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.000234175,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1904e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.3775e-05,
+        "native_calls": 2204,
+        "native_failures": 0,
+        "native_seconds": 0.000390448,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 0,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.0,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.000383903,
+        "gc_max_pause_seconds": 0.000216207,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 2040,
+        "gc_objects_reclaimed": 0,
+        "gc_peak_objects_before": 1020,
+        "gc_last_objects_after": 1020,
+        "gc_scopes_seen": 4,
+        "gc_scopes_reclaimed": 0,
+        "gc_peak_scopes_before": 2,
+        "gc_last_scopes_after": 2,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 1020,
+        "gc_minor_scopes_seen": 2,
+        "executable_code_live_bytes": 120488,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 1,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 9,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 288,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 2,
+          "method": 11,
+          "arrow": 4489,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 2,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 989381,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 146880,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 255376,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 208,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 983,
+              "quality": "exact"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 44096,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 186356,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 3588,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 203668,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 147706,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.3344e-05
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 6.24e-07
+          },
+          {
+            "operation": "push",
+            "calls": 2200,
+            "failures": 0,
+            "seconds": 0.000368384
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.096e-06
+          }
+        ]
+      },
+      "output_sha256": "0921058a8fd910b1c987322f629aedb6428b488df6e4acd1d88ed690b1837358",
+      "valid": true
+    },
+    {
+      "workload": "djot",
+      "variant": "baseline",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/baseline",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/djot.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/djot-baseline.stdout",
+        "sha256": "3766eaa7f52c85ef9242563ed0793dcaa1e13d323ee1e94aae03418cf5f1ed62"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/djot-baseline.stderr",
+        "sha256": "6362b35a00c7321daab961122a21d3e55a68f12dea64a56d576e2cea6c13250e"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 160,
+        "jit_compile_successes": 160,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.03553535,
+        "jit_generated_code_bytes": 4880108,
+        "jit_largest_code_bytes": 254244,
+        "jit_inline_attempts": 107,
+        "jit_inline_empty_plans": 71,
+        "jit_inline_plan_sites": 62,
+        "jit_inline_successes": 36,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 37,
+        "lex_calls": 53,
+        "lex_seconds": 0.004585801,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.004752327,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 160,
+        "bytecode_compile_successes": 160,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.006559857,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1344e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 9.3536e-05,
+        "native_calls": 67663,
+        "native_failures": 0,
+        "native_seconds": 0.039797927,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 11,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.00015552,
+        "iterator_step_calls": 45628,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.167648994,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 0,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.0,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.008843201,
+        "gc_max_pause_seconds": 0.008483505,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 30098,
+        "gc_objects_reclaimed": 27488,
+        "gc_peak_objects_before": 28793,
+        "gc_last_objects_after": 1305,
+        "gc_scopes_seen": 176,
+        "gc_scopes_reclaimed": 68,
+        "gc_peak_scopes_before": 122,
+        "gc_last_scopes_after": 54,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 28793,
+        "gc_minor_scopes_seen": 122,
+        "executable_code_live_bytes": 4910216,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 36,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 160,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 5120,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 277,
+          "method": 87,
+          "arrow": 2556,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 277,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 8896914,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 187920,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 405344,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 5616,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 14290,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 671214,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 5992,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 5566021,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 98744,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 188680,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 346064,
+              "quality": "lower_bound",
+              "reason": "opaque callback HashMap bucket and Weak allocation storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1407029,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "RegExp",
+            "calls": 66,
+            "failures": 0,
+            "seconds": 0.000406992
+          },
+          {
+            "operation": "[Symbol.replace]",
+            "calls": 2266,
+            "failures": 0,
+            "seconds": 0.001939007
+          },
+          {
+            "operation": "assign",
+            "calls": 1408,
+            "failures": 0,
+            "seconds": 0.000137328
+          },
+          {
+            "operation": "charAt",
+            "calls": 76,
+            "failures": 0,
+            "seconds": 3.1504e-05
+          },
+          {
+            "operation": "codePointAt",
+            "calls": 750,
+            "failures": 0,
+            "seconds": 9.1344e-05
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 29,
+            "failures": 0,
+            "seconds": 2.9536e-05
+          },
+          {
+            "operation": "exec",
+            "calls": 27412,
+            "failures": 0,
+            "seconds": 0.02422913
+          },
+          {
+            "operation": "includes",
+            "calls": 13057,
+            "failures": 0,
+            "seconds": 0.001981578
+          },
+          {
+            "operation": "join",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 7.712e-05
+          },
+          {
+            "operation": "keys",
+            "calls": 2541,
+            "failures": 0,
+            "seconds": 0.000611504
+          },
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.7744e-05
+          },
+          {
+            "operation": "min",
+            "calls": 204,
+            "failures": 0,
+            "seconds": 1.8272e-05
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.008e-06
+          },
+          {
+            "operation": "pop",
+            "calls": 177,
+            "failures": 0,
+            "seconds": 4.8208e-05
+          },
+          {
+            "operation": "push",
+            "calls": 478,
+            "failures": 0,
+            "seconds": 0.00014952
+          },
+          {
+            "operation": "replace",
+            "calls": 2266,
+            "failures": 0,
+            "seconds": 0.003107391
+          },
+          {
+            "operation": "slice",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 5.4208e-05
+          },
+          {
+            "operation": "splice",
+            "calls": 176,
+            "failures": 0,
+            "seconds": 0.000154912
+          },
+          {
+            "operation": "split",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 6.4736e-05
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 0.000129583
+          },
+          {
+            "operation": "substring",
+            "calls": 11231,
+            "failures": 0,
+            "seconds": 0.002370702
+          },
+          {
+            "operation": "test",
+            "calls": 5060,
+            "failures": 0,
+            "seconds": 0.004121864
+          },
+          {
+            "operation": "trim",
+            "calls": 231,
+            "failures": 0,
+            "seconds": 2.4736e-05
+          }
+        ]
+      },
+      "output_sha256": "5203f5527aac464ea52e3b839ce220658ed16b814cbe0849e454b40844763c7b",
+      "valid": true
+    },
+    {
+      "workload": "djot",
+      "variant": "candidate",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/candidate",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/djot.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/djot-candidate.stdout",
+        "sha256": "417debf3d2c09f4c29a77cd9742aafffd63763841d098d9f89d5c30e314262d2"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/djot-candidate.stderr",
+        "sha256": "f7f1c226e98c5c56c787b6efb515b7a89fbf153121603fef64a209818b9b2b04"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 160,
+        "jit_compile_successes": 160,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.034679261,
+        "jit_generated_code_bytes": 4882480,
+        "jit_largest_code_bytes": 254372,
+        "jit_inline_attempts": 107,
+        "jit_inline_empty_plans": 71,
+        "jit_inline_plan_sites": 62,
+        "jit_inline_successes": 36,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 37,
+        "lex_calls": 53,
+        "lex_seconds": 0.004603768,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.004494009,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 160,
+        "bytecode_compile_successes": 160,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.006548068,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.3488e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.672e-05,
+        "native_calls": 67663,
+        "native_failures": 0,
+        "native_seconds": 0.040236652,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 11,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.000167024,
+        "iterator_step_calls": 45628,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.168252714,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 0,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.0,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.008794993,
+        "gc_max_pause_seconds": 0.008435874,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 30098,
+        "gc_objects_reclaimed": 27488,
+        "gc_peak_objects_before": 28793,
+        "gc_last_objects_after": 1305,
+        "gc_scopes_seen": 176,
+        "gc_scopes_reclaimed": 68,
+        "gc_peak_scopes_before": 122,
+        "gc_last_scopes_after": 54,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 28793,
+        "gc_minor_scopes_seen": 122,
+        "executable_code_live_bytes": 4912652,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 36,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 160,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 5120,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 277,
+          "method": 87,
+          "arrow": 2556,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 277,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 8895957,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 187920,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 405344,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 5616,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 14290,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 670257,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 5992,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 5566021,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 98744,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 188680,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 346064,
+              "quality": "lower_bound",
+              "reason": "opaque callback HashMap bucket and Weak allocation storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1407029,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "RegExp",
+            "calls": 66,
+            "failures": 0,
+            "seconds": 0.000409056
+          },
+          {
+            "operation": "[Symbol.replace]",
+            "calls": 2266,
+            "failures": 0,
+            "seconds": 0.001956845
+          },
+          {
+            "operation": "assign",
+            "calls": 1408,
+            "failures": 0,
+            "seconds": 0.00014112
+          },
+          {
+            "operation": "charAt",
+            "calls": 76,
+            "failures": 0,
+            "seconds": 3.344e-05
+          },
+          {
+            "operation": "codePointAt",
+            "calls": 750,
+            "failures": 0,
+            "seconds": 9.024e-05
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 29,
+            "failures": 0,
+            "seconds": 3.0368e-05
+          },
+          {
+            "operation": "exec",
+            "calls": 27412,
+            "failures": 0,
+            "seconds": 0.024613271
+          },
+          {
+            "operation": "includes",
+            "calls": 13057,
+            "failures": 0,
+            "seconds": 0.001985772
+          },
+          {
+            "operation": "join",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 8.1072e-05
+          },
+          {
+            "operation": "keys",
+            "calls": 2541,
+            "failures": 0,
+            "seconds": 0.000659324
+          },
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 2.3856e-05
+          },
+          {
+            "operation": "min",
+            "calls": 204,
+            "failures": 0,
+            "seconds": 1.7904e-05
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 8.48e-07
+          },
+          {
+            "operation": "pop",
+            "calls": 177,
+            "failures": 0,
+            "seconds": 5.232e-05
+          },
+          {
+            "operation": "push",
+            "calls": 478,
+            "failures": 0,
+            "seconds": 0.000154992
+          },
+          {
+            "operation": "replace",
+            "calls": 2266,
+            "failures": 0,
+            "seconds": 0.003105533
+          },
+          {
+            "operation": "slice",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 5.5024e-05
+          },
+          {
+            "operation": "splice",
+            "calls": 176,
+            "failures": 0,
+            "seconds": 0.000158191
+          },
+          {
+            "operation": "split",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 6.5776e-05
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 0.000136048
+          },
+          {
+            "operation": "substring",
+            "calls": 11231,
+            "failures": 0,
+            "seconds": 0.002357452
+          },
+          {
+            "operation": "test",
+            "calls": 5060,
+            "failures": 0,
+            "seconds": 0.004082696
+          },
+          {
+            "operation": "trim",
+            "calls": 231,
+            "failures": 0,
+            "seconds": 2.5504e-05
+          }
+        ]
+      },
+      "output_sha256": "5203f5527aac464ea52e3b839ce220658ed16b814cbe0849e454b40844763c7b",
+      "valid": true
+    },
+    {
+      "workload": "vue",
+      "variant": "baseline",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/baseline",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/vue.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/vue-baseline.stdout",
+        "sha256": "d834c4fedb0247774f081e3d668d82a26b1bdccfd494ee445167e40c4cccb71e"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/vue-baseline.stderr",
+        "sha256": "8b9790a97a9c61fbe2062eef69ccb9d883b6a07d6f236846ca51b2692f907688"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 55,
+        "jit_compile_successes": 55,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.00688991,
+        "jit_generated_code_bytes": 773116,
+        "jit_largest_code_bytes": 58244,
+        "jit_inline_attempts": 38,
+        "jit_inline_empty_plans": 29,
+        "jit_inline_plan_sites": 22,
+        "jit_inline_successes": 9,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 28,
+        "lex_calls": 37,
+        "lex_seconds": 0.006199989,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.006482886,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 54,
+        "bytecode_compile_successes": 54,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001238285,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1488e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 9.6096e-05,
+        "native_calls": 384766,
+        "native_failures": 1,
+        "native_seconds": 0.368558705,
+        "error_constructions": 2,
+        "error_caught": 2,
+        "error_escaped": 0,
+        "error_object_seconds": 1.92e-07,
+        "error_message_seconds": 1.28e-07,
+        "error_stack_capture_calls": 2,
+        "error_stack_capture_seconds": 3.088e-06,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 13045,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.012394376,
+        "iterator_step_calls": 78974,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.010596655,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 2,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 5.376e-06,
+        "to_string_object_calls": 2,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 5.856e-06,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.006366325,
+        "gc_max_pause_seconds": 0.005215879,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 19677,
+        "gc_objects_reclaimed": 15081,
+        "gc_peak_objects_before": 16708,
+        "gc_last_objects_after": 1627,
+        "gc_scopes_seen": 248,
+        "gc_scopes_reclaimed": 4,
+        "gc_peak_scopes_before": 126,
+        "gc_last_scopes_after": 122,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 16708,
+        "gc_minor_scopes_seen": 126,
+        "executable_code_live_bytes": 798948,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 9,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 55,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1760,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 1000,
+          "method": 34,
+          "arrow": 25446,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 1000,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 7762595,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 234288,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 456320,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 12688,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 38846,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 473979,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 13688,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 4941967,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 23508,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 11942,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 231900,
+              "quality": "lower_bound",
+              "reason": "opaque callback HashMap bucket and Weak allocation storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1323469,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Map",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.648e-06
+          },
+          {
+            "operation": "Number",
+            "calls": 12094,
+            "failures": 0,
+            "seconds": 0.000949934
+          },
+          {
+            "operation": "Object",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 9.248e-06
+          },
+          {
+            "operation": "Proxy",
+            "calls": 690,
+            "failures": 0,
+            "seconds": 0.000171728
+          },
+          {
+            "operation": "Set",
+            "calls": 693,
+            "failures": 0,
+            "seconds": 0.001137551
+          },
+          {
+            "operation": "String",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 1.4848e-05
+          },
+          {
+            "operation": "Symbol",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 9.6e-07
+          },
+          {
+            "operation": "WeakMap",
+            "calls": 6,
+            "failures": 0,
+            "seconds": 1.3152e-05
+          },
+          {
+            "operation": "[Symbol.replace]",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.928e-06
+          },
+          {
+            "operation": "add",
+            "calls": 708,
+            "failures": 0,
+            "seconds": 0.000147616
+          },
+          {
+            "operation": "apply",
+            "calls": 11,
+            "failures": 0,
+            "seconds": 0.002049834
+          },
+          {
+            "operation": "assign",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 3.424e-06
+          },
+          {
+            "operation": "bind",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 2.376e-05
+          },
+          {
+            "operation": "call",
+            "calls": 99,
+            "failures": 0,
+            "seconds": 7.28e-05
+          },
+          {
+            "operation": "concat",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 6.896e-06
+          },
+          {
+            "operation": "create",
+            "calls": 9,
+            "failures": 0,
+            "seconds": 2.032e-06
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 68,
+            "failures": 0,
+            "seconds": 6.0352e-05
+          },
+          {
+            "operation": "delete",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.728e-06
+          },
+          {
+            "operation": "deleteProperty",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.0001624
+          },
+          {
+            "operation": "forEach",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.000931184
+          },
+          {
+            "operation": "get",
+            "calls": 78747,
+            "failures": 0,
+            "seconds": 0.018389618
+          },
+          {
+            "operation": "getOwnPropertyDescriptor",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 3.072e-06
+          },
+          {
+            "operation": "getOwnPropertyNames",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.976e-06
+          },
+          {
+            "operation": "has",
+            "calls": 10738,
+            "failures": 0,
+            "seconds": 0.001894506
+          },
+          {
+            "operation": "hasOwn",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 1.808e-06
+          },
+          {
+            "operation": "hasOwnProperty",
+            "calls": 40261,
+            "failures": 0,
+            "seconds": 0.004727943
+          },
+          {
+            "operation": "is",
+            "calls": 23094,
+            "failures": 0,
+            "seconds": 0.001832715
+          },
+          {
+            "operation": "isArray",
+            "calls": 140601,
+            "failures": 0,
+            "seconds": 0.011600713
+          },
+          {
+            "operation": "isExtensible",
+            "calls": 690,
+            "failures": 0,
+            "seconds": 7.0078e-05
+          },
+          {
+            "operation": "join",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 2.112e-06
+          },
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.904e-06
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.568e-06
+          },
+          {
+            "operation": "parseInt",
+            "calls": 13468,
+            "failures": 0,
+            "seconds": 0.001427424
+          },
+          {
+            "operation": "pop",
+            "calls": 11,
+            "failures": 0,
+            "seconds": 4.288e-06
+          },
+          {
+            "operation": "propertyIsEnumerable",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.744e-06
+          },
+          {
+            "operation": "push",
+            "calls": 1425,
+            "failures": 1,
+            "seconds": 0.042590569
+          },
+          {
+            "operation": "random",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.76e-07
+          },
+          {
+            "operation": "replace",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.896e-05
+          },
+          {
+            "operation": "set",
+            "calls": 23796,
+            "failures": 0,
+            "seconds": 0.034818033
+          },
+          {
+            "operation": "shift",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.234179838
+          },
+          {
+            "operation": "slice",
+            "calls": 12,
+            "failures": 0,
+            "seconds": 5.152e-06
+          },
+          {
+            "operation": "split",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 2.2192e-05
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 9.024e-06
+          },
+          {
+            "operation": "test",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 2.2128e-05
+          },
+          {
+            "operation": "toLowerCase",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 6.08e-07
+          },
+          {
+            "operation": "toString",
+            "calls": 22428,
+            "failures": 0,
+            "seconds": 0.006962068
+          },
+          {
+            "operation": "values",
+            "calls": 13045,
+            "failures": 0,
+            "seconds": 0.004193065
+          }
+        ]
+      },
+      "output_sha256": "d466a7c68aa8c64cfbf3771af117c2b0cd2c23b353b59d14023b9914db7cab10",
+      "valid": true
+    },
+    {
+      "workload": "vue",
+      "variant": "candidate",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-controls-wnym0ybo/candidate",
+        "--tier=jit",
+        "/tmp/trust-js-review-controls-wnym0ybo/vue.js"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/vue-candidate.stdout",
+        "sha256": "3313d8ab4ed57681376dd65af7dfe6076f22afad6b12e5cd6de76c963bd31c2e"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/vue-candidate.stderr",
+        "sha256": "d564a1fc71586139bf500bfe267dab37c481b3dd05eb710ebc1fae34c44559dc"
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 55,
+        "jit_compile_successes": 55,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.006765794,
+        "jit_generated_code_bytes": 773488,
+        "jit_largest_code_bytes": 58244,
+        "jit_inline_attempts": 38,
+        "jit_inline_empty_plans": 29,
+        "jit_inline_plan_sites": 22,
+        "jit_inline_successes": 9,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 28,
+        "lex_calls": 37,
+        "lex_seconds": 0.005703911,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.006509605,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 54,
+        "bytecode_compile_successes": 54,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001260557,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1488e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.5503e-05,
+        "native_calls": 384766,
+        "native_failures": 1,
+        "native_seconds": 0.37106365,
+        "error_constructions": 2,
+        "error_caught": 2,
+        "error_escaped": 0,
+        "error_object_seconds": 2.56e-07,
+        "error_message_seconds": 1.12e-07,
+        "error_stack_capture_calls": 2,
+        "error_stack_capture_seconds": 2.56e-06,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 13045,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.012175156,
+        "iterator_step_calls": 78974,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.010584823,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 2,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 1.2672e-05,
+        "to_string_object_calls": 2,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 1.3072e-05,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.006331397,
+        "gc_max_pause_seconds": 0.005183575,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 19677,
+        "gc_objects_reclaimed": 15081,
+        "gc_peak_objects_before": 16708,
+        "gc_last_objects_after": 1627,
+        "gc_scopes_seen": 248,
+        "gc_scopes_reclaimed": 4,
+        "gc_peak_scopes_before": 126,
+        "gc_last_scopes_after": 122,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 16708,
+        "gc_minor_scopes_seen": 126,
+        "executable_code_live_bytes": 799384,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 9,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 55,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1760,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 1000,
+          "method": 34,
+          "arrow": 25446,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 1000,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 7764316,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 234288,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 456320,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 12688,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 38846,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 476252,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 13688,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 4941967,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 23508,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 11942,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 231900,
+              "quality": "lower_bound",
+              "reason": "opaque callback HashMap bucket and Weak allocation storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1322917,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Map",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.536e-06
+          },
+          {
+            "operation": "Number",
+            "calls": 12094,
+            "failures": 0,
+            "seconds": 0.00094891
+          },
+          {
+            "operation": "Object",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 9.056e-06
+          },
+          {
+            "operation": "Proxy",
+            "calls": 690,
+            "failures": 0,
+            "seconds": 0.000157024
+          },
+          {
+            "operation": "Set",
+            "calls": 693,
+            "failures": 0,
+            "seconds": 0.001228078
+          },
+          {
+            "operation": "String",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 2.2272e-05
+          },
+          {
+            "operation": "Symbol",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 9.92e-07
+          },
+          {
+            "operation": "WeakMap",
+            "calls": 6,
+            "failures": 0,
+            "seconds": 1.2944e-05
+          },
+          {
+            "operation": "[Symbol.replace]",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.848e-06
+          },
+          {
+            "operation": "add",
+            "calls": 708,
+            "failures": 0,
+            "seconds": 0.000159552
+          },
+          {
+            "operation": "apply",
+            "calls": 11,
+            "failures": 0,
+            "seconds": 0.002030797
+          },
+          {
+            "operation": "assign",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 3.552e-06
+          },
+          {
+            "operation": "bind",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 2.2624e-05
+          },
+          {
+            "operation": "call",
+            "calls": 99,
+            "failures": 0,
+            "seconds": 7.7472e-05
+          },
+          {
+            "operation": "concat",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 6.608e-06
+          },
+          {
+            "operation": "create",
+            "calls": 9,
+            "failures": 0,
+            "seconds": 2.096e-06
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 68,
+            "failures": 0,
+            "seconds": 5.8176e-05
+          },
+          {
+            "operation": "delete",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 4.096e-06
+          },
+          {
+            "operation": "deleteProperty",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.00018792
+          },
+          {
+            "operation": "forEach",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.001002173
+          },
+          {
+            "operation": "get",
+            "calls": 78747,
+            "failures": 0,
+            "seconds": 0.019190844
+          },
+          {
+            "operation": "getOwnPropertyDescriptor",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 3.359e-06
+          },
+          {
+            "operation": "getOwnPropertyNames",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.896e-06
+          },
+          {
+            "operation": "has",
+            "calls": 10738,
+            "failures": 0,
+            "seconds": 0.001855836
+          },
+          {
+            "operation": "hasOwn",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 1.888e-06
+          },
+          {
+            "operation": "hasOwnProperty",
+            "calls": 40261,
+            "failures": 0,
+            "seconds": 0.004833045
+          },
+          {
+            "operation": "is",
+            "calls": 23094,
+            "failures": 0,
+            "seconds": 0.001864028
+          },
+          {
+            "operation": "isArray",
+            "calls": 140601,
+            "failures": 0,
+            "seconds": 0.011865908
+          },
+          {
+            "operation": "isExtensible",
+            "calls": 690,
+            "failures": 0,
+            "seconds": 7.0384e-05
+          },
+          {
+            "operation": "join",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 2.304e-06
+          },
+          {
+            "operation": "log",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.904e-06
+          },
+          {
+            "operation": "now",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.312e-06
+          },
+          {
+            "operation": "parseInt",
+            "calls": 13468,
+            "failures": 0,
+            "seconds": 0.001434971
+          },
+          {
+            "operation": "pop",
+            "calls": 11,
+            "failures": 0,
+            "seconds": 5.344e-06
+          },
+          {
+            "operation": "propertyIsEnumerable",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.648e-06
+          },
+          {
+            "operation": "push",
+            "calls": 1425,
+            "failures": 1,
+            "seconds": 0.042639194
+          },
+          {
+            "operation": "random",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.8e-07
+          },
+          {
+            "operation": "replace",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.944e-05
+          },
+          {
+            "operation": "set",
+            "calls": 23796,
+            "failures": 0,
+            "seconds": 0.036580103
+          },
+          {
+            "operation": "shift",
+            "calls": 671,
+            "failures": 0,
+            "seconds": 0.233537242
+          },
+          {
+            "operation": "slice",
+            "calls": 12,
+            "failures": 0,
+            "seconds": 5.44e-06
+          },
+          {
+            "operation": "split",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 1.1024e-05
+          },
+          {
+            "operation": "stringify",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.928e-06
+          },
+          {
+            "operation": "test",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 1.9808e-05
+          },
+          {
+            "operation": "toLowerCase",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 6.4e-07
+          },
+          {
+            "operation": "toString",
+            "calls": 22428,
+            "failures": 0,
+            "seconds": 0.006985685
+          },
+          {
+            "operation": "values",
+            "calls": 13045,
+            "failures": 0,
+            "seconds": 0.004173269
+          }
+        ]
+      },
+      "output_sha256": "d466a7c68aa8c64cfbf3771af117c2b0cd2c23b353b59d14023b9914db7cab10",
+      "valid": true
+    },
+    {
+      "workload": "octane-selected",
+      "variant": "baseline",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "--tier=jit",
+        "/tmp/trust-js-review-octane-0o_eep6g/octane-selected.js"
+      ],
+      "exit_code": 0,
+      "scores": {
+        "Richards": 1097.0,
+        "DeltaBlue": 894.0,
+        "Crypto": 6127.0,
+        "RayTrace": 1815.0
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 279,
+        "jit_compile_successes": 279,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.079447737,
+        "jit_generated_code_bytes": 7654128,
+        "jit_largest_code_bytes": 270584,
+        "jit_inline_attempts": 184,
+        "jit_inline_empty_plans": 92,
+        "jit_inline_plan_sites": 237,
+        "jit_inline_successes": 92,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 179,
+        "lex_calls": 2,
+        "lex_seconds": 0.004009226,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.002663819,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 300,
+        "bytecode_compile_successes": 300,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.009922007,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1808e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.472e-05,
+        "native_calls": 461005,
+        "native_failures": 0,
+        "native_seconds": 0.114561636,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 5948,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.006896585,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 5,
+        "gc_causes": {
+          "allocation_threshold": 3,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.115951243,
+        "gc_max_pause_seconds": 0.034619189,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 347626,
+        "gc_objects_reclaimed": 342250,
+        "gc_peak_objects_before": 102284,
+        "gc_last_objects_after": 1468,
+        "gc_scopes_seen": 62,
+        "gc_scopes_reclaimed": 19,
+        "gc_peak_scopes_before": 31,
+        "gc_last_scopes_after": 17,
+        "gc_minor_collections": 4,
+        "gc_minor_objects_seen": 343732,
+        "gc_minor_scopes_seen": 41,
+        "executable_code_live_bytes": 7680088,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 92,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 8400,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 8336,
+          "allocated_pages": 2,
+          "registered_entries": 279,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 8928,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 388,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 388,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 12109361,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 211392,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 495824,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 1768,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 3024,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 320159,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 11552,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 6228658,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 143540,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 243564,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 4449880,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 269313,
+            "failures": 0,
+            "seconds": 0.070951187
+          },
+          {
+            "operation": "Date",
+            "calls": 2985,
+            "failures": 0,
+            "seconds": 0.00127889
+          },
+          {
+            "operation": "Object",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.44e-07
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 5948,
+            "failures": 0,
+            "seconds": 0.003816062
+          },
+          {
+            "operation": "apply",
+            "calls": 18,
+            "failures": 0,
+            "seconds": 0.000422575
+          },
+          {
+            "operation": "call",
+            "calls": 136,
+            "failures": 0,
+            "seconds": 0.016972067
+          },
+          {
+            "operation": "charAt",
+            "calls": 16,
+            "failures": 0,
+            "seconds": 2.5344e-05
+          },
+          {
+            "operation": "charCodeAt",
+            "calls": 919,
+            "failures": 0,
+            "seconds": 9.6928e-05
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.08e-06
+          },
+          {
+            "operation": "floor",
+            "calls": 512,
+            "failures": 0,
+            "seconds": 3.856e-05
+          },
+          {
+            "operation": "fromCharCode",
+            "calls": 893,
+            "failures": 0,
+            "seconds": 7.6816e-05
+          },
+          {
+            "operation": "getTime",
+            "calls": 5948,
+            "failures": 0,
+            "seconds": 0.000743264
+          },
+          {
+            "operation": "indexOf",
+            "calls": 4,
+            "failures": 0,
+            "seconds": 2.064e-06
+          },
+          {
+            "operation": "log",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 3.1056e-05
+          },
+          {
+            "operation": "max",
+            "calls": 52,
+            "failures": 0,
+            "seconds": 6.976e-06
+          },
+          {
+            "operation": "min",
+            "calls": 32,
+            "failures": 0,
+            "seconds": 5.216e-06
+          },
+          {
+            "operation": "parseInt",
+            "calls": 4086,
+            "failures": 0,
+            "seconds": 0.000564734
+          },
+          {
+            "operation": "pop",
+            "calls": 69,
+            "failures": 0,
+            "seconds": 1.8256e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 169614,
+            "failures": 0,
+            "seconds": 0.019301002
+          },
+          {
+            "operation": "push",
+            "calls": 198,
+            "failures": 0,
+            "seconds": 9.1039e-05
+          },
+          {
+            "operation": "random",
+            "calls": 128,
+            "failures": 0,
+            "seconds": 1.6384e-05
+          },
+          {
+            "operation": "split",
+            "calls": 74,
+            "failures": 0,
+            "seconds": 5.3744e-05
+          },
+          {
+            "operation": "sqrt",
+            "calls": 38,
+            "failures": 0,
+            "seconds": 3.44e-06
+          },
+          {
+            "operation": "toFixed",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.7408e-05
+          }
+        ]
+      },
+      "valid": true,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/octane-baseline.stdout",
+        "sha256": "5b7cdcee305b32b5b7a2d3bfe34af9f82ded8c6a83b0ae749b8d5458de16b981"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/octane-baseline.stderr",
+        "sha256": "beade607dffb06b56224b63beda63e1d14c6e3e9268e988ac8aa53a3023f559e"
+      }
+    },
+    {
+      "workload": "octane-selected",
+      "variant": "candidate",
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "--tier=jit",
+        "/tmp/trust-js-review-octane-0o_eep6g/octane-selected.js"
+      ],
+      "exit_code": 0,
+      "scores": {
+        "Richards": 1107.0,
+        "DeltaBlue": 885.0,
+        "Crypto": 6139.0,
+        "RayTrace": 1786.0
+      },
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 279,
+        "jit_compile_successes": 279,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.079026279,
+        "jit_generated_code_bytes": 7661488,
+        "jit_largest_code_bytes": 271124,
+        "jit_inline_attempts": 184,
+        "jit_inline_empty_plans": 92,
+        "jit_inline_plan_sites": 237,
+        "jit_inline_successes": 92,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 179,
+        "lex_calls": 2,
+        "lex_seconds": 0.00408724,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.00267126,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 300,
+        "bytecode_compile_successes": 300,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.009936501,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.216e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.5696e-05,
+        "native_calls": 459680,
+        "native_failures": 0,
+        "native_seconds": 0.114520986,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 5978,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.006868999,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 5,
+        "gc_causes": {
+          "allocation_threshold": 3,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.117494167,
+        "gc_max_pause_seconds": 0.034997188,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 344981,
+        "gc_objects_reclaimed": 340008,
+        "gc_peak_objects_before": 102508,
+        "gc_last_objects_after": 1468,
+        "gc_scopes_seen": 62,
+        "gc_scopes_reclaimed": 19,
+        "gc_peak_scopes_before": 31,
+        "gc_last_scopes_after": 17,
+        "gc_minor_collections": 4,
+        "gc_minor_objects_seen": 341488,
+        "gc_minor_scopes_seen": 41,
+        "executable_code_live_bytes": 7687512,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 92,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 8400,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 8336,
+          "allocated_pages": 2,
+          "registered_entries": 279,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 8928,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 388,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 388,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 12109457,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 211392,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 495824,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 1768,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 3024,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 320255,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 11552,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 6228658,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 143540,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 243564,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 4449880,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 267886,
+            "failures": 0,
+            "seconds": 0.070958532
+          },
+          {
+            "operation": "Date",
+            "calls": 3000,
+            "failures": 0,
+            "seconds": 0.001284396
+          },
+          {
+            "operation": "Object",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.8e-07
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 5978,
+            "failures": 0,
+            "seconds": 0.003785195
+          },
+          {
+            "operation": "apply",
+            "calls": 18,
+            "failures": 0,
+            "seconds": 0.000445343
+          },
+          {
+            "operation": "call",
+            "calls": 136,
+            "failures": 0,
+            "seconds": 0.01690106
+          },
+          {
+            "operation": "charAt",
+            "calls": 17,
+            "failures": 0,
+            "seconds": 2.6159e-05
+          },
+          {
+            "operation": "charCodeAt",
+            "calls": 919,
+            "failures": 0,
+            "seconds": 9.7343e-05
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.32e-06
+          },
+          {
+            "operation": "floor",
+            "calls": 514,
+            "failures": 0,
+            "seconds": 3.7456e-05
+          },
+          {
+            "operation": "fromCharCode",
+            "calls": 893,
+            "failures": 0,
+            "seconds": 8.2447e-05
+          },
+          {
+            "operation": "getTime",
+            "calls": 5978,
+            "failures": 0,
+            "seconds": 0.000791776
+          },
+          {
+            "operation": "indexOf",
+            "calls": 4,
+            "failures": 0,
+            "seconds": 2.048e-06
+          },
+          {
+            "operation": "log",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 2.8319e-05
+          },
+          {
+            "operation": "max",
+            "calls": 53,
+            "failures": 0,
+            "seconds": 7.2e-06
+          },
+          {
+            "operation": "min",
+            "calls": 33,
+            "failures": 0,
+            "seconds": 5.168e-06
+          },
+          {
+            "operation": "parseInt",
+            "calls": 4108,
+            "failures": 0,
+            "seconds": 0.000556062
+          },
+          {
+            "operation": "pop",
+            "calls": 69,
+            "failures": 0,
+            "seconds": 1.9552e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 169614,
+            "failures": 0,
+            "seconds": 0.019274626
+          },
+          {
+            "operation": "push",
+            "calls": 198,
+            "failures": 0,
+            "seconds": 8.6992e-05
+          },
+          {
+            "operation": "random",
+            "calls": 128,
+            "failures": 0,
+            "seconds": 1.6e-05
+          },
+          {
+            "operation": "split",
+            "calls": 74,
+            "failures": 0,
+            "seconds": 6.6864e-05
+          },
+          {
+            "operation": "sqrt",
+            "calls": 38,
+            "failures": 0,
+            "seconds": 3.664e-06
+          },
+          {
+            "operation": "toFixed",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.5984e-05
+          }
+        ]
+      },
+      "valid": true,
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/octane-candidate.stdout",
+        "sha256": "2dbeb9ea8814fbafa06106172f505d786938cca17ef14e7b6562a5d62c1f509a"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/diagnostics-v3/octane-candidate.stderr",
+        "sha256": "f74807d960e3c38db69e7daa934685f7a4fdbefe1df7369c689c45d4189c9c2e"
+      }
+    }
+  ],
+  "octane_timing_report": {
+    "path": "/big/Code/trust-js/benchmarks/review-octane-v3-2026-10-14.json",
+    "sha256": "613fc4068bb407f289ce0641c26c9d3234ac8e4abf085370612adf1e25e60967"
+  },
+  "finished_utc": "2026-10-14T07:43:04.920221+00:00"
+}

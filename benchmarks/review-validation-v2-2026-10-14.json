@@ -1,0 +1,105 @@
+{
+  "date": "2026-10-14",
+  "base_revision": "ca7f4688ca293d4b0418ef1b4f7cc0450195ae6c",
+  "candidate_manifest": "target/performance-review-20261014/candidate-v2-manifest.json",
+  "candidate_artifacts": {
+    "trust-js": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v2/trust-js",
+      "sha256": "ede664f876154cc44843d7de243480011d6bb7de94a2182f78ec693a24b84dde",
+      "bytes": 20214760
+    },
+    "test262-runner": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v2/test262-runner",
+      "sha256": "e7cbc62f77d607808f54ba6b5b190adeed4d582db18f4e6d5598ff185aeb8832",
+      "bytes": 19591488
+    },
+    "trust-js-difftest": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v2/trust-js-difftest",
+      "sha256": "2eee4075d25f0c721b6d09e26c65f57fba4173750b9f4406ba66f52ca68075dd",
+      "bytes": 19474208
+    }
+  },
+  "host": "aarch64 Linux crystal, Cortex-X925",
+  "build": "cargo build --release -p trust-js -p test262-runner -p trust-js-difftest --bins",
+  "features": [
+    "intl"
+  ],
+  "production_source_unchanged_after_freeze": true,
+  "engine_tests": {
+    "command": "cargo test -p trust-js --lib",
+    "passed": 1987,
+    "failed": 0,
+    "ignored": 3,
+    "seconds": 259.56,
+    "log": "target/performance-review-20261014/validation-v2/engine-tests.log"
+  },
+  "test262": {
+    "revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
+    "tier_threshold": 0,
+    "workers": 4,
+    "scope": [
+      "built-ins/Object/groupBy",
+      "built-ins/Map/groupBy",
+      "built-ins/String/prototype/replace",
+      "built-ins/String/prototype/replaceAll",
+      "built-ins/String/prototype/split",
+      "built-ins/Math",
+      "built-ins/isNaN",
+      "built-ins/Number/isNaN",
+      "built-ins/Array",
+      "built-ins/JSON/stringify",
+      "built-ins/Object/defineProperty",
+      "built-ins/Reflect/deleteProperty"
+    ],
+    "tiers": [
+      {
+        "tier": "interp",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v2/test262-interp/test262-report/summary.json"
+      },
+      {
+        "tier": "bytecode",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v2/test262-bytecode/test262-report/summary.json"
+      },
+      {
+        "tier": "jit",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v2/test262-jit/test262-report/summary.json"
+      }
+    ]
+  },
+  "differential": {
+    "command": "target/performance-review-20261014/candidate-v2/trust-js-difftest --count 2000",
+    "seeds": "1..2001",
+    "agree": 1859,
+    "budget_skips": 141,
+    "divergences": 0,
+    "log": "target/performance-review-20261014/validation-v2/difftest.log"
+  },
+  "node": "v24.21.0",
+  "baseline_regression_reproductions": {
+    "cases": 4,
+    "tier_comparisons": 12,
+    "all_match_node": true,
+    "report": "target/performance-review-20261014/baseline-reproductions/candidate-v2-results.json"
+  },
+  "formatting": "rustfmt --check --edition 2021 --config skip_children=true on changed Rust files; git diff --check",
+  "independent_review": "Source reviewed by separate agent; no actionable findings remained before v2 build.",
+  "limitations": [
+    "Focused Test262 scope, not full current-suite conformance.",
+    "Budget-skipped differential cases are inconclusive.",
+    "Native validation is ARM64; x86-64 and wasm32 were not executed.",
+    "Default production template JIT; optional optimizing-jit feature was not enabled."
+  ],
+  "performance_status": "Component evidence retained for unchanged string/array/Math sources; GroupBy indexing refined and revalidated in v3."
+}

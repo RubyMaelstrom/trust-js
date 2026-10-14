@@ -1,0 +1,165 @@
+Node/V8 compiler comparison, 2026-10-14
+=====================================
+
+Provenance and scope
+--------------------
+Official source: nodejs/node tag v24.21.0, including its vendored deps/v8 tree.
+The version header identifies V8 13.6.233.17; retained local benchmark reports
+identify Node v24.21.0 / V8 13.6.233.17-node.53. Sources were read directly from
+official GitHub URLs on 2026-10-14. This is a pinned source comparison, without
+Node builds, new timings, or attribution of the entire reported performance gap.
+TRust comparison state: e62c6f0d99d5fa842f0ecd884b099866083a0034, before the
+concurrent compiler refinements of this session. File/line references describe
+that audited state; the subsequent working changes may resolve these gaps.
+Language reference: local ECMA-262 snapshot e28783d5fc9dc12b3de905961e2c71410b38a202
+(downloaded 2026-09-06), especially ToInt32, CanonicalNumericIndexString,
+IsValidIntegerIndex, execution contexts, completions and iterator closing.
+
+Do not infer Chrome's complete tier/configuration from the V8 version alone.
+Node tools/v8_gypfiles/features.gypi:320-324 defaults TurboFan on and Maglev off.
+common.gypi:72-73 defaults pointer compression and forced 31-bit Smis off.
+Vendored flag-definitions.h:1564 defaults Turbolev off. Consequently the ordinary
+default pipeline builds a TurboFan graph, inlines and performs semantic typing,
+then converts to Turboshaft for backend optimization/code generation. The exact
+installed benchmark binary's build overrides were not queried in this review.
+
+Pinned source URLs below use this prefix:
+https://github.com/nodejs/node/blob/v24.21.0/
+  deps/v8/include/v8-version.h#L9
+  tools/v8_gypfiles/features.gypi#L320
+  common.gypi#L72
+  deps/v8/src/flags/flag-definitions.h#L1564
+  deps/v8/src/compiler/pipeline.cc#L757
+  deps/v8/src/compiler/pipeline.cc#L1940
+  deps/v8/src/compiler/turboshaft/pipelines.h#L168
+
+Concrete compiler differences
+------------------------------
+1. Inlining precedes typing/lowering in V8. The combined graph exposes arithmetic,
+   property accesses and control flow across call boundaries to optimization.
+   js-inlining.cc:99 connects callee control/effects and frame states; :166 wires
+   escaping inlinee exceptions into the caller; :929 models sloppy receiver
+   conversion using the callee's context. Constructors have additional artificial
+   frame states (:843), and excess arguments can require their own state (:959).
+
+   TRust already has useful nested, polymorphic, guarded bytecode splicing. Its
+   bytecode.rs:8897 emission puts inlined parameters, receiver and the callee owner
+   in hidden caller slots, and redirected free-name reads use that retained
+   callee. However jit_optimizing.rs:1362 selects InlineGuard's original-call
+   fallback, while bytecode_native_deopt.rs:143 rejects all inline-target chunks.
+   bytecode.rs:7303 describes baseline inlining and hot optimizing compilation as
+   competing publishers of one second-stage slot. This is a concrete missing
+   composition, not absence of inlining or native code in TRust.
+
+   First implementation: optimize the selected, immutable flattened Chunk and
+   resume its exact flattened VM bytecode. Existing inline restrictions make
+   this smaller than V8's general multi-frame reconstruction. Verify both guard
+   outcomes, incoming stack/lexical state, hidden callee/receiver owners, inline
+   source markers and caller-relative exception floors together. Preserve the
+   selected Chunk's identity and decouple bytecode selection from native-backend
+   publication. Removing only an inline guard or recovery exclusion is unsound.
+
+2. V8 frame states describe logical unoptimized state independently of machine
+   representation. Turboshaft operations.h:3729 keeps an outer state for inlined
+   frames and per-value machine types. backend/code-generator.cc:1240 serializes
+   outermost frames first; :1383 distinguishes signed/unsigned integers, tagged
+   values and floating-point registers/spills. deoptimizer/deoptimizer.cc:1490
+   constructs the resulting unoptimized frames at exact continuation positions.
+
+   TRust's current executable recovery publishes canonical owning packed words
+   and continues the same invocation, an important existing strength. Its
+   jit_ir.rs:1000 conservative metadata copies baseline slots; broader recipes
+   in tagged.rs:489 are scaffolding and do not establish executable multi-frame
+   reconstruction. Initial flattened recovery should retain canonical owners.
+   Later representation changes need exact signedness/zero/NaN materialization
+   and an owner for every logical alias, independently of SSA common values.
+
+3. V8 separates semantic types, feedback types, output representation and use
+   truncation. simplified-lowering.cc:297 tracks those fields through fixpoints;
+   :1689 selects admissible Word32 add/sub or checked overflow; :1365 records
+   signedness for recovery. operation-typer.cc:546 refines NumberToInt32 without
+   confusing a mathematical Number with an already truncated integer.
+   turbofan-typer.cc:940 derives induction ranges and :1055 checks a fixed point.
+   simplified-lowering.cc:1969 uses index and length ranges for bounds lowering.
+   These mechanisms already occur before the Turboshaft backend. The additional
+   Turboshaft typed-optimization phase is experimental in this pinned version;
+   it must not be treated as Node's default source of numerical range analysis.
+
+   TRust jit_optimizing_values.rs:1 deliberately supplies categories, not ranges;
+   integer/double input observations become Number. Production jit_regions.rs
+   already retains bitwise results in integer registers and eliminates some
+   repeated conversions. Missing refinement: carry category, interval, special
+   Number flags and machine representation through joins/loops and into index,
+   conversion, arithmetic, comparison and publication lowering. Begin with
+   constants, masks/shifts, guarded facts and bounded induction variables. Do not
+   seed intervals from a few sampled values without corresponding runtime guards.
+
+   Boundaries: -0, NaN, infinities, integer overflow, unsigned >>> results above
+   INT32_MAX, and binary64 rounding remain observable. General multiplication
+   followed by |0 cannot automatically become Math.imul. Number type feedback
+   alone does not prove integrality. Ordinary numeric -0 keys and the canonical
+   numeric index string "-0" also have different property semantics. A numerical
+   bounds fact cannot substitute for valid live buffer/storage/descriptor state.
+
+4. V8 propagates heap facts along effect edges. load-elimination.cc:782 removes
+   repeated map checks; :1258 merges predecessor facts and accounts for loops;
+   :1303 invalidates mutable facts on uncontrolled writing effects. Alias checks
+   (:41) are conservative. Turboshaft late-load-elimination-reducer.h:43 explains
+   address-based load reuse, unescaped fresh-object proofs and revisiting loop
+   headers when a backedge invalidates earlier knowledge.
+
+   TRust jit_regions.rs:1331 OwnReadFacts covers only an effect-free part of one
+   block. jit_optimizing_effects.rs correctly distinguishes preserved private
+   frame words from mutable heap/environment state. First improvement: dominance
+   and predecessor-intersection reuse of guarded receiver/descriptor/storage
+   metadata. Different SSA values may alias. Reusing metadata is distinct from
+   reusing a mutable property value. TRust shapes encode key layout rather than
+   all descriptor attributes, so shape equality cannot alone replace live
+   accessor/data/writable checks. Keep unknown effects conservative.
+
+5. V8 dependencies permit some assumptions to survive observers, with runtime
+   invalidation. compilation-dependencies.cc:284 registers stable-map groups;
+   :1459 revalidates dependencies immediately before installation. This is more
+   than removing duplicate guards. TRust needs Realm-scoped dependency records
+   compatible with shared ASTs and code that owns no JavaScript objects. Future
+   dispatch retirement alone cannot protect an active body after a callback:
+   active execution must leave/revalidate invalid assumptions before using them.
+
+6. Tiering is feedback-sensitive. execution/tiering-manager.cc:448 delays
+   optimization when inline caches change; :63 requests concurrent optimizing
+   work. flag-definitions.h:991 sets the ordinary TurboFan invocation scale, but
+   budgets are multiplied by bytecode length and include backedge/OSR behavior,
+   so the number is not an exact call-count contract. TRust currently takes four
+   bounded entry samples and retires one specialization after eight misses.
+   Cheap per-site feedback and explicit miss/rejection reasons should accompany
+   the compiler work. Background compilation later requires immutable snapshots
+   and installation revalidation; sending current Rc/RefCell heap state to worker
+   threads is not an implementation of that architecture.
+
+Pinned supporting source URLs (same prefix)
+-------------------------------------------
+  deps/v8/src/compiler/js-inlining.cc#L99
+  deps/v8/src/compiler/turboshaft/operations.h#L3729
+  deps/v8/src/compiler/backend/code-generator.cc#L1240
+  deps/v8/src/deoptimizer/deoptimizer.cc#L1490
+  deps/v8/src/compiler/simplified-lowering.cc#L297
+  deps/v8/src/compiler/simplified-lowering.cc#L1689
+  deps/v8/src/compiler/simplified-lowering.cc#L1969
+  deps/v8/src/compiler/operation-typer.cc#L546
+  deps/v8/src/compiler/turbofan-typer.cc#L940
+  deps/v8/src/compiler/load-elimination.cc#L782
+  deps/v8/src/compiler/load-elimination.cc#L1258
+  deps/v8/src/compiler/turboshaft/late-load-elimination-reducer.h#L43
+  deps/v8/src/compiler/compilation-dependencies.cc#L1459
+  deps/v8/src/execution/tiering-manager.cc#L448
+
+Resulting implementation order
+-------------------------------
+Flattened inline-body native optimization with exact VM recovery, followed by
+interval/representation facts consumed by conversion/index lowerings, followed
+by conservative cross-CFG heap-metadata proofs. Add feedback and effect contracts
+alongside these steps rather than after all three. General logical-frame recovery,
+dependency invalidation, escape analysis and background compilation extend the
+architecture later. Each change needs semantic recovery stress, differential
+coverage, and measured application repayment; introducing a compiler pass does
+not establish either correctness or performance acceptance.

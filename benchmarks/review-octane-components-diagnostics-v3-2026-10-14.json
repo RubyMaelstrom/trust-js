@@ -1,0 +1,2146 @@
+{
+  "schema_version": 1,
+  "purpose": "Separate per-component compilation/native/GC diagnostic counters",
+  "excluded_from_acceptance_timings": true,
+  "cpu_affinity": [
+    5
+  ],
+  "environment": {
+    "TRUST_JS_PERF_METRICS": "1"
+  },
+  "suite_revision": "570ad1ccfe86e3eecba0636c8f932ac08edec517",
+  "reference_timing_report": "/big/Code/trust-js/benchmarks/review-octane-v3-2026-10-14.json",
+  "limitations": [
+    "Diagnostic compile/GC durations may overlap root optional-compiler builds pinned away from CPU5; not acceptance timings.",
+    "Native_seconds is inclusive native-call timing, not an exclusive sampled CPU category.",
+    "Each upstream timed workload executes different amounts of work; counts are not normalized throughput comparisons."
+  ],
+  "status": "complete",
+  "started_utc": "2026-10-14T07:44:39.423002+00:00",
+  "runs": [
+    {
+      "workload": "richards",
+      "variant": "baseline",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "sha256": "c1104d944cf95f9b3136ca0e077960e5bc174a0b2163bee753d219018f1f6340"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 1096.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 46,
+        "jit_compile_successes": 46,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.010568477,
+        "jit_generated_code_bytes": 818260,
+        "jit_largest_code_bytes": 138536,
+        "jit_inline_attempts": 24,
+        "jit_inline_empty_plans": 8,
+        "jit_inline_plan_sites": 28,
+        "jit_inline_successes": 16,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 19,
+        "lex_calls": 2,
+        "lex_seconds": 0.000755727,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000783934,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 49,
+        "bytecode_compile_successes": 49,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001201758,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1088e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.3776e-05,
+        "native_calls": 8264,
+        "native_failures": 0,
+        "native_seconds": 0.004082696,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 1178,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.001307693,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.004950872,
+        "gc_max_pause_seconds": 0.004669944,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 19876,
+        "gc_objects_reclaimed": 17678,
+        "gc_peak_objects_before": 18777,
+        "gc_last_objects_after": 1099,
+        "gc_scopes_seen": 14,
+        "gc_scopes_reclaimed": 4,
+        "gc_peak_scopes_before": 9,
+        "gc_last_scopes_after": 5,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 18777,
+        "gc_minor_scopes_seen": 9,
+        "executable_code_live_bytes": 835520,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 16,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 46,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1472,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 71,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 71,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 2790076,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 158256,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 294768,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 92725,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 2368,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 853273,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 20636,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 212452,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1153974,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 5301,
+            "failures": 0,
+            "seconds": 0.002831385
+          },
+          {
+            "operation": "Date",
+            "calls": 591,
+            "failures": 0,
+            "seconds": 0.000300016
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 1178,
+            "failures": 0,
+            "seconds": 0.000730351
+          },
+          {
+            "operation": "apply",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.8352e-05
+          },
+          {
+            "operation": "getTime",
+            "calls": 1178,
+            "failures": 0,
+            "seconds": 0.000140448
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.4176e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 9.92e-07
+          },
+          {
+            "operation": "push",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.4448e-05
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.2128e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards-baseline.stdout",
+        "sha256": "3fadfbb0a943c653f19e2965795f86b5015d6fb2ba5269078a2ac5c0d6fd53e2"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards-baseline.stderr",
+        "sha256": "fc1d594dc74d453f9d5d7ab01e636a13b11905287939bd2956ad3ee83340c399"
+      }
+    },
+    {
+      "workload": "richards",
+      "variant": "candidate",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 1116.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 46,
+        "jit_compile_successes": 46,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.010337821,
+        "jit_generated_code_bytes": 818420,
+        "jit_largest_code_bytes": 138748,
+        "jit_inline_attempts": 24,
+        "jit_inline_empty_plans": 8,
+        "jit_inline_plan_sites": 28,
+        "jit_inline_successes": 16,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 19,
+        "lex_calls": 2,
+        "lex_seconds": 0.000550383,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000645472,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 49,
+        "bytecode_compile_successes": 49,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001185135,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.0928e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.5024e-05,
+        "native_calls": 8390,
+        "native_failures": 0,
+        "native_seconds": 0.004308057,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 1196,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.001317773,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.005081352,
+        "gc_max_pause_seconds": 0.004807592,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 20146,
+        "gc_objects_reclaimed": 17948,
+        "gc_peak_objects_before": 19047,
+        "gc_last_objects_after": 1099,
+        "gc_scopes_seen": 14,
+        "gc_scopes_reclaimed": 4,
+        "gc_peak_scopes_before": 9,
+        "gc_last_scopes_after": 5,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 19047,
+        "gc_minor_scopes_seen": 9,
+        "executable_code_live_bytes": 835712,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 16,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 46,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1472,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 71,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 71,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 2790047,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 158256,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 294768,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 92696,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 2368,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 853273,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 20636,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 212452,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 1153974,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 5382,
+            "failures": 0,
+            "seconds": 0.003067579
+          },
+          {
+            "operation": "Date",
+            "calls": 600,
+            "failures": 0,
+            "seconds": 0.000283744
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 1196,
+            "failures": 0,
+            "seconds": 0.000741919
+          },
+          {
+            "operation": "apply",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.6e-05
+          },
+          {
+            "operation": "getTime",
+            "calls": 1196,
+            "failures": 0,
+            "seconds": 0.000142656
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.96e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.0544e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.008e-06
+          },
+          {
+            "operation": "push",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.2832e-05
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.1279e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards-candidate.stdout",
+        "sha256": "4b8afc3a2e74798a409670ae2aa9063243f29505d2801c2c84c528a07ba26320"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards-candidate.stderr",
+        "sha256": "c9e879e51b982f82bd3900cf08d6ee9f16aee8bc352d2248e571293a399a0a44"
+      }
+    },
+    {
+      "workload": "deltablue",
+      "variant": "baseline",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "sha256": "c1104d944cf95f9b3136ca0e077960e5bc174a0b2163bee753d219018f1f6340"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 897.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 96,
+        "jit_compile_successes": 96,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.038623712,
+        "jit_generated_code_bytes": 2837016,
+        "jit_largest_code_bytes": 270584,
+        "jit_inline_attempts": 70,
+        "jit_inline_empty_plans": 37,
+        "jit_inline_plan_sites": 96,
+        "jit_inline_successes": 33,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 73,
+        "lex_calls": 2,
+        "lex_seconds": 0.001114318,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000887103,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 102,
+        "bytecode_compile_successes": 102,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.003426699,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.1008e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.4383e-05,
+        "native_calls": 224373,
+        "native_failures": 0,
+        "native_seconds": 0.077232934,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 534,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.000909133,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 5,
+        "gc_causes": {
+          "allocation_threshold": 3,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.111253826,
+        "gc_max_pause_seconds": 0.03393431,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 327686,
+        "gc_objects_reclaimed": 323351,
+        "gc_peak_objects_before": 102199,
+        "gc_last_objects_after": 1148,
+        "gc_scopes_seen": 29,
+        "gc_scopes_reclaimed": 10,
+        "gc_peak_scopes_before": 18,
+        "gc_last_scopes_after": 5,
+        "gc_minor_collections": 4,
+        "gc_minor_objects_seen": 324513,
+        "gc_minor_scopes_seen": 20,
+        "executable_code_live_bytes": 2857608,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 33,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 96,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 3072,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 112,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 112,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 7259461,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 165312,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 315520,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 125176,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 3488,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 2082333,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 43260,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 220884,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 4301864,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 222678,
+            "failures": 0,
+            "seconds": 0.058789238
+          },
+          {
+            "operation": "Date",
+            "calls": 269,
+            "failures": 0,
+            "seconds": 0.000235615
+          },
+          {
+            "operation": "Object",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.12e-07
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 534,
+            "failures": 0,
+            "seconds": 0.000496382
+          },
+          {
+            "operation": "apply",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.8608e-05
+          },
+          {
+            "operation": "call",
+            "calls": 136,
+            "failures": 0,
+            "seconds": 0.017444275
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 8.4e-06
+          },
+          {
+            "operation": "getTime",
+            "calls": 534,
+            "failures": 0,
+            "seconds": 0.000113648
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.44e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.448e-05
+          },
+          {
+            "operation": "pop",
+            "calls": 69,
+            "failures": 0,
+            "seconds": 1.9088e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 8.64e-07
+          },
+          {
+            "operation": "push",
+            "calls": 138,
+            "failures": 0,
+            "seconds": 6.0976e-05
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.0304e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue-baseline.stdout",
+        "sha256": "f942f5640a5e95d07bd554656a48788c52e4cdebf3a46455db36dcdc287e830a"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue-baseline.stderr",
+        "sha256": "251f423549930ad6a2c77c61fbd984935019d66ff58f8babb105eed2e3533eb2"
+      }
+    },
+    {
+      "workload": "deltablue",
+      "variant": "candidate",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 893.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 96,
+        "jit_compile_successes": 96,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.039135135,
+        "jit_generated_code_bytes": 2841208,
+        "jit_largest_code_bytes": 271128,
+        "jit_inline_attempts": 70,
+        "jit_inline_empty_plans": 37,
+        "jit_inline_plan_sites": 96,
+        "jit_inline_successes": 33,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 73,
+        "lex_calls": 2,
+        "lex_seconds": 0.001046303,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000886942,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 102,
+        "bytecode_compile_successes": 102,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.003428252,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.096e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.368e-05,
+        "native_calls": 223534,
+        "native_failures": 0,
+        "native_seconds": 0.078599503,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 532,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.000897071,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 5,
+        "gc_causes": {
+          "allocation_threshold": 3,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.109877556,
+        "gc_max_pause_seconds": 0.03365135,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 326475,
+        "gc_objects_reclaimed": 322140,
+        "gc_peak_objects_before": 102199,
+        "gc_last_objects_after": 1148,
+        "gc_scopes_seen": 29,
+        "gc_scopes_reclaimed": 10,
+        "gc_peak_scopes_before": 18,
+        "gc_last_scopes_after": 5,
+        "gc_minor_collections": 4,
+        "gc_minor_objects_seen": 323302,
+        "gc_minor_scopes_seen": 20,
+        "executable_code_live_bytes": 2861864,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 33,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 96,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 3072,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 112,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 112,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 7259444,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 165312,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 315520,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 520,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 125159,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 3488,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 2082333,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 43260,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 220884,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 4301864,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 221844,
+            "failures": 0,
+            "seconds": 0.059747488
+          },
+          {
+            "operation": "Date",
+            "calls": 268,
+            "failures": 0,
+            "seconds": 0.000213568
+          },
+          {
+            "operation": "Object",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.44e-07
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 532,
+            "failures": 0,
+            "seconds": 0.000475855
+          },
+          {
+            "operation": "apply",
+            "calls": 3,
+            "failures": 0,
+            "seconds": 1.8208e-05
+          },
+          {
+            "operation": "call",
+            "calls": 136,
+            "failures": 0,
+            "seconds": 0.017898241
+          },
+          {
+            "operation": "defineProperty",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 7.744e-06
+          },
+          {
+            "operation": "getTime",
+            "calls": 532,
+            "failures": 0,
+            "seconds": 0.000112047
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 6.08e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 3.464e-05
+          },
+          {
+            "operation": "pop",
+            "calls": 69,
+            "failures": 0,
+            "seconds": 2.0288e-05
+          },
+          {
+            "operation": "pow",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 8.96e-07
+          },
+          {
+            "operation": "push",
+            "calls": 138,
+            "failures": 0,
+            "seconds": 5.8432e-05
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.0944e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue-candidate.stdout",
+        "sha256": "16fb82c9c07cb930967006ea0a17f27fd27dbe524aab48b5fb8381960ba8a0f8"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue-candidate.stderr",
+        "sha256": "715af200a1859dea283a74037985713de6d1a5197d3e46cdae0dc87cf18bb3d9"
+      }
+    },
+    {
+      "workload": "raytrace",
+      "variant": "baseline",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "sha256": "c1104d944cf95f9b3136ca0e077960e5bc174a0b2163bee753d219018f1f6340"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/baseline",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 1800.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 55,
+        "jit_compile_successes": 55,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.01119246,
+        "jit_generated_code_bytes": 1487048,
+        "jit_largest_code_bytes": 237708,
+        "jit_inline_attempts": 31,
+        "jit_inline_empty_plans": 19,
+        "jit_inline_plan_sites": 34,
+        "jit_inline_successes": 12,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 39,
+        "lex_calls": 2,
+        "lex_seconds": 0.000810207,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.000900543,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 55,
+        "bytecode_compile_successes": 55,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001734109,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.0928e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.4592e-05,
+        "native_calls": 170383,
+        "native_failures": 0,
+        "native_seconds": 0.020567308,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 148,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.000197952,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.000487008,
+        "gc_max_pause_seconds": 0.000266288,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 2313,
+        "gc_objects_reclaimed": 9,
+        "gc_peak_objects_before": 1161,
+        "gc_last_objects_after": 1152,
+        "gc_scopes_seen": 31,
+        "gc_scopes_reclaimed": 5,
+        "gc_peak_scopes_before": 18,
+        "gc_last_scopes_after": 13,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 1161,
+        "gc_minor_scopes_seen": 18,
+        "executable_code_live_bytes": 1506416,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 12,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 55,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1760,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 108,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 108,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 2394104,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 165888,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 315024,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 1352,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 123158,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 3520,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 1325360,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 24456,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 222868,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 211374,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 4.8944e-05
+          },
+          {
+            "operation": "Date",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 5.5568e-05
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 0.000110816
+          },
+          {
+            "operation": "apply",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 0.000738688
+          },
+          {
+            "operation": "floor",
+            "calls": 36,
+            "failures": 0,
+            "seconds": 3.376e-06
+          },
+          {
+            "operation": "getTime",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 2.7472e-05
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 5.12e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 2.0352e-05
+          },
+          {
+            "operation": "max",
+            "calls": 28,
+            "failures": 0,
+            "seconds": 3.36e-06
+          },
+          {
+            "operation": "pow",
+            "calls": 169610,
+            "failures": 0,
+            "seconds": 0.019455564
+          },
+          {
+            "operation": "push",
+            "calls": 53,
+            "failures": 0,
+            "seconds": 3.392e-05
+          },
+          {
+            "operation": "split",
+            "calls": 74,
+            "failures": 0,
+            "seconds": 5.3008e-05
+          },
+          {
+            "operation": "sqrt",
+            "calls": 38,
+            "failures": 0,
+            "seconds": 3.44e-06
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.2288e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace-baseline.stdout",
+        "sha256": "7557840ae07fd35ecc2d540dca8c04f2d7a14d1f8c6d0575e0ea03d1601dee8b"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace-baseline.stderr",
+        "sha256": "ec6f259ba7acf0b0c8e3261fadd8a0c30416e285705fb64e3ccc09bdfad05fed"
+      }
+    },
+    {
+      "workload": "raytrace",
+      "variant": "candidate",
+      "artifact": {
+        "path": "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba"
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "5",
+        "/tmp/trust-js-review-octane-0o_eep6g/candidate",
+        "--tier=jit",
+        "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace.js"
+      ],
+      "exit_code": 0,
+      "valid": true,
+      "score": 1802.0,
+      "metrics": {
+        "schema_version": 1,
+        "jit_compile_attempts": 55,
+        "jit_compile_successes": 55,
+        "jit_compile_failures": 0,
+        "jit_compile_seconds": 0.011349724,
+        "jit_generated_code_bytes": 1488212,
+        "jit_largest_code_bytes": 238032,
+        "jit_inline_attempts": 31,
+        "jit_inline_empty_plans": 19,
+        "jit_inline_plan_sites": 34,
+        "jit_inline_successes": 12,
+        "jit_inline_failures": 0,
+        "jit_inline_suppressed": 39,
+        "lex_calls": 2,
+        "lex_seconds": 0.001210399,
+        "lex_failures": 0,
+        "parse_calls": 2,
+        "parse_seconds": 0.001008701,
+        "parse_failures": 0,
+        "bytecode_compile_attempts": 55,
+        "bytecode_compile_successes": 55,
+        "bytecode_compile_failures": 0,
+        "bytecode_compile_seconds": 0.001774975,
+        "snapshot_encode_calls": 1,
+        "snapshot_encode_seconds": 2.0768e-05,
+        "snapshot_decode_attempts": 1,
+        "snapshot_decode_successes": 1,
+        "snapshot_decode_failures": 0,
+        "snapshot_decode_seconds": 8.456e-05,
+        "native_calls": 170383,
+        "native_failures": 0,
+        "native_seconds": 0.020203765,
+        "error_constructions": 0,
+        "error_caught": 0,
+        "error_escaped": 0,
+        "error_object_seconds": 0.0,
+        "error_message_seconds": 0.0,
+        "error_stack_capture_calls": 0,
+        "error_stack_capture_seconds": 0.0,
+        "error_stack_format_calls": 0,
+        "error_stack_format_seconds": 0.0,
+        "iterator_get_calls": 0,
+        "iterator_get_failures": 0,
+        "iterator_get_seconds": 0.0,
+        "iterator_step_calls": 0,
+        "iterator_step_failures": 0,
+        "iterator_step_seconds": 0.0,
+        "iterator_close_calls": 0,
+        "iterator_close_seconds": 0.0,
+        "to_primitive_object_calls": 148,
+        "to_primitive_object_failures": 0,
+        "to_primitive_object_seconds": 0.000210352,
+        "to_string_object_calls": 0,
+        "to_string_object_failures": 0,
+        "to_string_object_seconds": 0.0,
+        "iterate_fast_calls": 0,
+        "iterate_fast_seconds": 0.0,
+        "iterate_protocol_calls": 0,
+        "iterate_protocol_failures": 0,
+        "iterate_protocol_seconds": 0.0,
+        "gc_collections": 2,
+        "gc_causes": {
+          "allocation_threshold": 0,
+          "task_boundary": 1,
+          "explicit": 1
+        },
+        "gc_pause_seconds": 0.000488223,
+        "gc_max_pause_seconds": 0.000267168,
+        "gc_pause_histogram": {
+          "unit": "nanoseconds",
+          "upper_bounds": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2500000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2500000000,
+            null
+          ],
+          "counts": [
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "gc_objects_seen": 2313,
+        "gc_objects_reclaimed": 9,
+        "gc_peak_objects_before": 1161,
+        "gc_last_objects_after": 1152,
+        "gc_scopes_seen": 31,
+        "gc_scopes_reclaimed": 5,
+        "gc_peak_scopes_before": 18,
+        "gc_last_scopes_after": 13,
+        "gc_minor_collections": 1,
+        "gc_minor_objects_seen": 1161,
+        "gc_minor_scopes_seen": 18,
+        "executable_code_live_bytes": 1507644,
+        "executable_code_limit_bytes": 134217728,
+        "executable_code_budget_denials": 0,
+        "call_ic_process_epoch": 12,
+        "native_cache_thread_metadata": {
+          "scope": "current_thread_shared_cache",
+          "quality": "lower_bound",
+          "included_in_managed_memory": false,
+          "known_requested_bytes": 6320,
+          "registry_payload_bytes": 64,
+          "directory_and_page_payload_bytes": 6256,
+          "allocated_pages": 1,
+          "registered_entries": 55,
+          "pending_entries": 0,
+          "evictions": 0,
+          "dead_entries": 0,
+          "dead_slot_value_payload_bytes": 0,
+          "entry_limit": 131072,
+          "live_slot_value_payload_bytes_excluded": 1760,
+          "maximum_directory_and_page_payload_bytes": 1069136,
+          "maximum_dead_slot_value_payload_bytes": 4194304,
+          "excludes": "live SlotState values already attributed to owners; Rc headers; allocator rounding; TLS runtime; in-flight retirement batches"
+        },
+        "optimizing_jit": null,
+        "user_function_creations": {
+          "ordinary": 108,
+          "method": 11,
+          "arrow": 0,
+          "async": 0,
+          "async_method": 0,
+          "async_arrow": 0,
+          "generator": 0,
+          "async_generator": 0
+        },
+        "function_prototype_creations": 108,
+        "function_self_scope_creations": 0,
+        "function_self_scope_elisions": 0,
+        "uncached_name_depth_max": 16,
+        "uncached_name_paths": [],
+        "managed_memory": {
+          "schema_version": 1,
+          "agent_id": 1,
+          "heap_id": 1,
+          "safepoint": "post_gc",
+          "complete": true,
+          "managed_requested_bytes": {
+            "bytes": 2394118,
+            "quality": "lower_bound",
+            "reason": "one or more component categories exclude opaque storage"
+          },
+          "managed_external_bytes": {
+            "bytes": 0,
+            "quality": "exact"
+          },
+          "categories": {
+            "object_bodies": {
+              "bytes": 165888,
+              "quality": "exact"
+            },
+            "property_storage": {
+              "bytes": 315024,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "scope_bodies": {
+              "bytes": 1352,
+              "quality": "exact"
+            },
+            "scope_storage": {
+              "bytes": 1104,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "strings_symbols_bigints": {
+              "bytes": 123172,
+              "quality": "exact"
+            },
+            "callable_metadata": {
+              "bytes": 3520,
+              "quality": "exact"
+            },
+            "function_bytecode_metadata": {
+              "bytes": 1325360,
+              "quality": "lower_bound",
+              "reason": "Chunk call-pin HashMap bucket storage is opaque"
+            },
+            "jit_heap_metadata": {
+              "bytes": 24456,
+              "quality": "exact"
+            },
+            "regexp_metadata": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "engine_caches": {
+              "bytes": 222868,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "interpreter_side_tables": {
+              "bytes": 211374,
+              "quality": "lower_bound",
+              "reason": "opaque standard-library HashMap bucket storage"
+            },
+            "array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "shared_array_buffer_backing": {
+              "bytes": 0,
+              "quality": "exact",
+              "externally_shared": true,
+              "allocations": []
+            },
+            "wasm_backing": {
+              "bytes": 0,
+              "quality": "exact"
+            },
+            "host_resources": {
+              "bytes": 0,
+              "quality": "exact"
+            }
+          }
+        },
+        "native_by_operation": [
+          {
+            "operation": "Array",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 4.0959e-05
+          },
+          {
+            "operation": "Date",
+            "calls": 77,
+            "failures": 0,
+            "seconds": 5.3952e-05
+          },
+          {
+            "operation": "[Symbol.toPrimitive]",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 0.000112496
+          },
+          {
+            "operation": "apply",
+            "calls": 15,
+            "failures": 0,
+            "seconds": 0.000676319
+          },
+          {
+            "operation": "floor",
+            "calls": 36,
+            "failures": 0,
+            "seconds": 3.408e-06
+          },
+          {
+            "operation": "getTime",
+            "calls": 148,
+            "failures": 0,
+            "seconds": 2.1984e-05
+          },
+          {
+            "operation": "indexOf",
+            "calls": 1,
+            "failures": 0,
+            "seconds": 4.64e-07
+          },
+          {
+            "operation": "log",
+            "calls": 5,
+            "failures": 0,
+            "seconds": 1.7968e-05
+          },
+          {
+            "operation": "max",
+            "calls": 28,
+            "failures": 0,
+            "seconds": 3.952e-06
+          },
+          {
+            "operation": "pow",
+            "calls": 169610,
+            "failures": 0,
+            "seconds": 0.019167032
+          },
+          {
+            "operation": "push",
+            "calls": 53,
+            "failures": 0,
+            "seconds": 3.2512e-05
+          },
+          {
+            "operation": "split",
+            "calls": 74,
+            "failures": 0,
+            "seconds": 5.7279e-05
+          },
+          {
+            "operation": "sqrt",
+            "calls": 38,
+            "failures": 0,
+            "seconds": 3.472e-06
+          },
+          {
+            "operation": "toFixed",
+            "calls": 2,
+            "failures": 0,
+            "seconds": 1.1968e-05
+          }
+        ]
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace-candidate.stdout",
+        "sha256": "fd8006213e578b610326fa1830323c273f4171a8d9ccafd72d0dfe489fa70f1d"
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace-candidate.stderr",
+        "sha256": "541d808e74802fbc8435b2b2f3afe2f91fdb5e49d031a2e19a676b27eb451e83"
+      }
+    }
+  ],
+  "fixtures": {
+    "richards": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/richards.js",
+      "sha256": "8129d96689b842f74ab41ddcb5cd1692ca49c19809425ad6e3dc3707254c24d3",
+      "original_sources": {
+        "/tmp/trust-js-session-octane-20261013/base.js": "216612c2e7096a02b3e52b57e9cf9351bbaf180d60938d5c60b85fd756232733",
+        "/tmp/trust-js-session-octane-20261013/richards.js": "1246a64a24b931158bf01c24640343259fa74b0226e73bad630bd1f686aa0fa7",
+        "/tmp/trust-js-session-octane-20261013/run.js": "b4b10b05e3ccefd6f49d57763ec67ef746c3e7c093ed0fdd602c7f126af5c12f"
+      }
+    },
+    "deltablue": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/deltablue.js",
+      "sha256": "2297bc00f4d0b87a996a395f47977916e0d1c3a231c85fe2af7dcc0a10c75e5d",
+      "original_sources": {
+        "/tmp/trust-js-session-octane-20261013/base.js": "216612c2e7096a02b3e52b57e9cf9351bbaf180d60938d5c60b85fd756232733",
+        "/tmp/trust-js-session-octane-20261013/deltablue.js": "6c4784e82f3e8f5c18306d289653d08b17b38838f1bac16b38611d7318fa5a36",
+        "/tmp/trust-js-session-octane-20261013/run.js": "b4b10b05e3ccefd6f49d57763ec67ef746c3e7c093ed0fdd602c7f126af5c12f"
+      }
+    },
+    "raytrace": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/octane-components-diagnostics-v3/raytrace.js",
+      "sha256": "a0349f70a56fd488b92c8a3e31764a90eef2317efbe4e21457115b4b88b55be5",
+      "original_sources": {
+        "/tmp/trust-js-session-octane-20261013/base.js": "216612c2e7096a02b3e52b57e9cf9351bbaf180d60938d5c60b85fd756232733",
+        "/tmp/trust-js-session-octane-20261013/raytrace.js": "64b8ff90969966dd69659100e28754976dfc3e9a4f8ee55b9232f974c66ed08c",
+        "/tmp/trust-js-session-octane-20261013/run.js": "b4b10b05e3ccefd6f49d57763ec67ef746c3e7c093ed0fdd602c7f126af5c12f"
+      }
+    }
+  },
+  "finished_utc": "2026-10-14T07:44:53.896834+00:00"
+}

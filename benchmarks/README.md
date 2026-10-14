@@ -41,3 +41,33 @@ verify every checksum. Kernel speedups do not predict a scene's frame rate.
 samples, real-WebGL browser measurements, validation scope, and remaining limitations. Its
 baseline already includes the preceding browser-call and WebGL optimizations. It is an
 investigation record, not an installed-artifact promotion record.
+
+## Builtin scaling and native calls
+
+`group-by-scaling.js` checks Object/Map grouping with repeated and distinct keys, using arrays
+and generators at increasing sizes. It verifies group order and every member outside the timed
+interval. A preceding script can set `GROUP_BY_CONFIG` to select sizes, input kinds or samples.
+
+`string-replace-split-scaling.js` measures literal replacement callbacks and empty-separator
+splitting, including limited output and full-output controls. `native-math-control.js` exercises
+ordinary Math/isNaN receivers to detect costs from native-call ownership guards.
+`array-sparse-recovery-scaling.js` compares pristine dense arrays with arrays restored after a
+temporary far-index write, measuring push/pop and numeric reads at increasing sizes. Each fixture
+prints every timing and checksums, and runs on the release engine shell or Node:
+
+```sh
+target/release/trust-js --tier=jit benchmarks/group-by-scaling.js
+target/release/trust-js --tier=jit benchmarks/string-replace-split-scaling.js
+target/release/trust-js --tier=jit benchmarks/native-math-control.js
+target/release/trust-js --tier=jit benchmarks/array-sparse-recovery-scaling.js
+```
+
+Use interleaved fresh processes and matching build settings for comparisons. A timing rounded
+to zero milliseconds does not establish an exact speedup; retain process wall/CPU time and
+memory separately. These focused workloads do not establish overall engine or application speed.
+
+The 2026-10-14 investigation is documented in
+[the performance review](../docs/performance-review-2026-10-14.txt) and
+[the pinned Ladybird source comparison](../docs/ladybird-comparison-2026-10-14.txt).
+The `review-*-2026-10-14.json` files retain versioned samples and validation evidence;
+earlier candidates remain in the record when a regression required further work.

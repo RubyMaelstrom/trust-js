@@ -1,0 +1,346 @@
+Ladybird LibJS source comparison, 2026-10-14
+
+Scope and evidence
+
+Official upstream: https://github.com/LadybirdBrowser/ladybird
+Pinned revision: d8afe7ddba448c54ee9ded2c808c1a77d3791ca1
+Commit date: 2026-10-14T07:32:10+02:00
+Local shallow sparse checkout: /tmp/trust-js-ladybird-review-20261014
+The checkout includes AK, all LibJS, LibGC, LibRegex, their relevant tests and Meta.
+The temporary checkout is a local investigation artifact, not a build prerequisite.
+
+TRust source baseline: ca7f4688ca293d4b0418ef1b4f7cc0450195ae6c.
+Implementation work in this review is additional working-tree state. Source line
+references below identify the baseline mechanisms; small nearby line movements
+are expected as the bounded repairs are integrated.
+
+This is a source comparison, not a measured explanation of the user's historical
+performance ratios. Ladybird was not built or timed in this pass. The local host
+is aarch64 Linux. Existing ARM64 optimizations in TRust must not be mistaken for
+features implemented on its x86-64 backend too.
+
+Ladybird source permalinks use this pinned prefix:
+https://github.com/LadybirdBrowser/ladybird/blob/d8afe7ddba448c54ee9ded2c808c1a77d3791ca1/
+For example, the supported-platform JIT build default is:
+https://github.com/LadybirdBrowser/ladybird/blob/d8afe7ddba448c54ee9ded2c808c1a77d3791ca1/Meta/CMake/cmake_options.cmake#L11
+All Ladybird paths below are relative to that checkout/revision.
+
+Standards authority for semantic constraints: local official ECMA-262 editor's
+draft, commit e28783d5fc9dc12b3de905961e2c71410b38a202, fetched 2026-09-06.
+Its source is /big/web-standards/repositories/tc39/ecma262/spec.html.
+Relevant clauses include String Type (line 1232), StringIndexOf (1260),
+OrdinaryOwnPropertyKeys (13533), and JSON.stringify (48161, gap rule 48201).
+Official clause links:
+https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type
+https://tc39.es/ecma262/#sec-stringindexof
+https://tc39.es/ecma262/#sec-ordinaryownpropertykeys
+https://tc39.es/ecma262/#sec-json.stringify
+
+Current Ladybird architecture
+
+This checkout is substantially different from an older C++ interpreter-only
+LibJS. Its active runtime is Rust, the bytecode interpreter is native assembly
+generated from Flap, and an optimizing Rust JIT is built by default on supported
+Linux/macOS ARM64 and x86-64. The C++ LibJS sources predominantly provide the
+embedding API. Evidence: Libraries/LibJS/CMakeLists.txt:1,
+Meta/CMake/cmake_options.cmake:11, Libraries/LibJS/Rust/build.rs:172 and
+Libraries/LibJS/Rust/src/interpreter/run.rs:32. The runtime Cargo default also
+enables jit (Libraries/LibJS/Rust/Cargo.toml:14).
+
+Runtime JIT defaults are enabled=true, threshold=400, warmup=8, synchronous=false,
+call boost=16, inline budget=250, max callee size=30 and inline depth=5
+(Libraries/LibJS/JIT/Rust/src/options.rs:101). Defaults and thresholds identify
+available policies, not proof of their performance on a particular workload.
+Async/generator functions and top-level code are declined for independent
+optimizing compilation (Libraries/LibJS/Rust/src/jit/tier_up.rs:115).
+
+Bounded findings implemented in this review
+
+1. Recovery of array fast paths after a temporary sparse write.
+
+TRust Props.has_far was documented as one-way (value.rs:3939). A far indexed
+write set it (5248, 6052), but structural deletion and remove_indices_from's
+rebuild (6120) did not clear it. It gated packed append/pop and numeric mirror
+preparation (4838, 4928, 5284, 5392) after the far entry no longer existed.
+The representative state is 4096 dense elements, a[1000000]=1, then
+a.length=4096, followed by repeated push/pop and numeric reads. Deleting the far
+element alone leaves the large logical length and is a distinct case.
+
+Ladybird can promote dictionary storage back to holey/packed storage when the
+indexed population becomes at least 75% filled, with default-descriptor checks
+(Libraries/LibJS/Rust/src/runtime/object.rs:3938). This exposed a narrower TRust
+repair: recover eligibility after proven structural removal. It does not imply
+adopting Ladybird's storage representation or density threshold. Regression
+coverage must preserve length, nondefault descriptors, holes, inherited indexed
+properties, numeric mirrors and reference ownership. The exact implementation,
+tests and paired results should be read in this session's validation report;
+the source comparison alone does not accept a performance change.
+
+Final v3 correctness evidence is retained in
+benchmarks/review-validation-v3-2026-10-14.json. It records the exact release
+artifact, 1,988 passing engine tests, 4,887 focused Test262 passes in each tier
+and 1,859 agreeing differential cases (141 budget skips). Performance evidence
+is separate; these counts do not imply full-suite or cross-platform conformance.
+
+2. JSON.stringify space must be truncated by UTF-16 code units.
+
+TRust builtins/json.rs:71 used s.chars().take(10), which counts Unicode scalar
+values. An astral indentation string therefore exceeded the specified ten-unit
+limit. Ladybird uses length_in_code_units and substring_view(0,10)
+(Libraries/LibJS/Rust/src/runtime/json_object.rs:1171). The normative gap rule is
+ECMA-262 sec-json.stringify, local spec.html:48201-48202.
+
+TRust now copies an ASCII prefix directly and decodes at most ten UTF-16 units
+for Unicode indentation. A split high surrogate is retained. A gap that starts
+with a low surrogate and ends with a high surrogate can form a pair when nested
+indentation repeats it; output canonicalization is conditional on that bounded
+gap self-join, preserving the serializer's byte-based rollback state.
+json_stringify_space_tests.rs contains two cross-tier fixtures covering ten
+prefix cases, surrogate boundaries, smuggle-range characters and wrapper
+conversion order. Expected results were verified with Node v24.21.0. Rust
+validation is recorded separately; these are correctness changes, not a claim
+of a measured throughput improvement.
+
+Compiler and execution differences worth investigating
+
+Cross-control-flow proof reuse: Ladybird check_elimination.rs:7 computes
+fixed-point shape, element-kind, prototype, binding, named-value and element
+count facts. It is in the ordinary pass pipeline (passes/mod.rs:71). TRust
+jit_regions.rs:1331 limits OwnReadFacts to an effect-free part of one basic block
+and clears them on every possible heap effect. TRust already reuses receiver
+guards within that scope. A broader alias/effects proof can remove repeated
+work, but author callbacks, getters and aliasing writes must invalidate the
+relevant facts rather than all values being assumed immutable.
+
+Loop invariant code motion: Ladybird passes/licm.rs:7 moves invariant operations
+and reads from locations the loop cannot write. Movable guards have a loop-header
+frame state and remembered exit history (pipeline passes/mod.rs:79). TRust
+numeric SSA regions and opt-in effect-scoped scalar fields are useful foundations,
+but do not constitute a general loop-motion pass. Pure array/typed-array scans
+are representative workloads. Detached/resized buffers, callbacks and prototype
+changes make unchecked hoisting unsound.
+
+Integer intervals and bounds: Ladybird passes/bounds_check_elimination.rs:7
+derives induction, mask, shift and arithmetic intervals, removes proven bounds
+and overflow checks, and simplifies asm.js indices. OSR entries establish range
+guards; the ordinary pipeline invokes this pass (passes/mod.rs:83). TRust's
+jit_optimizing_values.rs:1 explicitly proves categories, not integer/range facts;
+Number includes NaN, infinities and both zero signs. Its production typed-array
+fusion still checks exact indices (jit_regions.rs:1946). Crypto, typed-array
+kernels and asm.js/DOSBox can expose the remaining work. Category proofs alone
+cannot justify integer truncation, overflow or range check elimination.
+
+Allocation elimination: Ladybird passes/escape_analysis.rs:7 scalar-replaces
+suitable temporary objects with SSA fields, including some nested objects;
+passes/mod.rs:103 invokes it normally. Exit translation reconstructs the object
+from recorded fields (Rust/src/jit/translate.rs:144). TRust caches literal shapes
+and templates, but optimizing MakeObject uses a checked helper
+(jit_optimizing.rs:1413), and literal helpers still allocate real objects
+(bytecode.rs:22591). Temporary records/options bags in compiler workloads and
+Richards are candidates. Deopt materialization, identity, WeakRef/GC observation
+and exception recovery must be designed before eliminating allocations.
+
+Optimizing inlining and recovery: Ladybird builder/inlining.rs:10 gives callee
+frames virtual slots and chained states, including forwarded callbacks (582,
+611), bound functions (687), getters/setters (718,738) and selected construction
+(808). Rust/src/jit/translate.rs:7 centralizes recovery/publication/stack views.
+TRust already has bytecode splicing, closures, bounded polymorphic calls and
+nested inlining (bytecode.rs:7648). Its whole-function optimizer falls back at
+InlineGuard (jit_optimizing.rs:1362) and excludes baseline-inlined bodies from its
+single-frame recovery contract (bytecode.rs:7302). Increasing existing inline
+budgets cannot supply missing multi-frame recovery composition.
+
+Dependencies: Ladybird stable shape/global/prototype dependencies let guards
+become AssumeValid and mutations retire dependent code
+(Rust/src/jit/dependencies.rs:208; passes/check_elimination.rs:30). TRust validates
+live shapes/descriptors/prototypes and cache epochs but lacks this general
+optimizing dependency policy. TRust generated code must own no JavaScript
+objects across its shared-AST/multi-Realm use. Ladybird installed code traces and
+pins embedded GC cells (Rust/src/jit/code.rs:117,227), so its mechanisms require
+Realm-specific side tables and adaptation rather than direct transplantation.
+
+Low-cost feedback: Ladybird builds plain/profiling assembly handlers
+(Rust/build.rs:172), selects them per executable
+(Rust/src/interpreter/dispatch_tables.rs:52), records arithmetic with byte ORs
+and result buckets (Interpreter/interpreter.flap:1037), and usually records call
+targets only when they change (1087). TRust detailed numeric feedback routes
+templates/fusions/regions through exact-PC helpers (jit.rs:3750), while its opt-in
+hot optimizer takes four bounded entry/property samples (jit_optimizing.rs:189).
+Cheap observations in native fast paths could improve specialization coverage
+without abandoning their execution benefit.
+
+Background compilation: Ladybird compiles plain-data snapshots without heap
+access (JIT/Rust/src/lib.rs:7), queues worker compilers
+(Rust/src/jit/compile_queue.rs:27), and validates dependencies before installing
+results (tier_up.rs:279). TRust compilation is synchronous, including optional
+hot mode (jit_optimizing.rs:340). Compilation pauses/work should be measured
+separately. Moving Rc/RefCell state to workers is not safe; an owned snapshot and
+installation contract are needed.
+
+Cold interpreter: Ladybird dispatches between generated opcode handlers and
+builds eligible callee frames on a contiguous interpreter stack
+(Interpreter/interpreter.flap:3804,3842,3927). TRust VM uses a Rust match loop
+(bytecode.rs:15797), and ordinary calls enter i.call (17046). TRust already passes
+argument slices without per-call vectors (17042) and production ARM64 has pooled
+shared-frame direct native calls. The remaining comparison is cold/VM-only
+execution and compilation repayment, not a claim that all TRust calls allocate
+or that the reference interpreter is the default steady-state tier.
+
+x86-64 parity is a separate platform gap: jit_x64.rs:1 documents the maturity
+difference; calls (1033), indexed reads (1071) and stores (1072) use helpers,
+while numeric named reads on this/locals have a guarded native path (1039).
+Ladybird shares optimizing IR/codegen through a portable assembler and tests
+both encoders on either host (JIT/Rust/src/asm/mod.rs:7). These differences cannot
+explain measurements made on this ARM64 host.
+
+Objects, ownership and caches
+
+Ladybird small ordinary objects have a 72-byte base cell that includes two inline
+eight-byte named values, with [2,4,6,8,12,16] property size classes
+(Rust/src/layout/object.rs:48; runtime/object.rs:492). TRust objects use
+Rc<RefCell<Object>> and separate Vec<Property> storage (value.rs:1850,3051,3790).
+TRust already packs ordinary heap values, shares ordered key layouts/shapes,
+uses packed/dense elements and numeric mirrors, and has a size-class allocator.
+Reducing allocations, descriptor bytes and pointer indirection is an
+architectural locality target; it is not evidence for replacing a correct
+collector or for an unmeasured size estimate on all exotic families.
+
+Ladybird caches ordered own string keys and enumerability on its shape
+(runtime/shape.rs:786). TRust ordered_keys rebuilds integer/string/symbol buckets
+and sorts indices per request (value.rs:6234). TRust already has a record named
+data key path and for-in caching, so ordinary record enumeration is not wholly
+uncached. A general cache must account for mutable attributes: TRust's shape
+proves key order but checks descriptor state live (value.rs:4046). Addition,
+deletion/re-addition, symbols and numeric key order must follow
+OrdinaryOwnPropertyKeys; a key-layout cache is not an enumerability proof.
+
+Ladybird has chain-local prototype validity with dependent JIT retirement
+(runtime/shape.rs:60). TRust inherited ICs validate chains of up to five hops
+(bytecode.rs:124), and creation invalidation uses a process-global atomic epoch
+(value.rs:4013). More local invalidation can avoid unrelated-object interference,
+but observer and multi-Realm boundaries must retain complete invalidation.
+
+TRust ShapeTable.transitions strongly retains keys and is append-only
+(value.rs:4055,4116); its bounded layout-hint cache is not a transition-table
+budget. Many unique computed object keys can retain metadata after objects die.
+Ladybird has weak transition targets/live-shape parents
+(runtime/shape.rs:153,432), although its source also documents strong transition
+key retention (187). A bounded TRust transition memoization budget with fresh
+fallback identities is a focused candidate. Exhaustion must preserve cache
+identity validity; do not reuse live shape identities.
+
+The collectors are architectural tradeoffs. TRust has a production nonmoving
+nursery cycle collector (gc_generational.rs:1) and explicit reference ownership;
+it is not missing young-generation collection. Ladybird tracing cells can copy
+value words without per-copy Rc ownership traffic, but require correct stack,
+heap, JIT and host roots. TRust's early destruction and mixed native/JS graph
+integration impose a different contract. Measure allocation traffic, lifetimes,
+GC pauses and retained memory before proposing a heap representation migration.
+Ladybird has stop-the-world marking and incremental sweep rather than TRust's
+Rc-based generational root classification (Libraries/LibGC/Heap.cpp:697,1505).
+Byte/live external-memory accounting (Heap.cpp:368) can inform pause and allocation
+pressure analysis; it does not establish an obvious collector throughput win.
+
+Ladybird executes with eight-byte Copy NaN-boxed values and an int32 subtype that
+preserves negative zero/canonical NaN (Rust/src/layout/value.rs:9;
+runtime/value.rs:153). TRust's execution Value is sixteen bytes and Number is
+f64; PackedValue is already eight-byte heap storage (value.rs:114,162,505).
+TRust native register regions retain int32 results and numeric array mirrors
+provide unboxed reads. Uniform compact execution storage plus non-owning traced
+moves is therefore a distinct architectural target, not a claim that TRust
+lacks NaN boxing or integer fast paths. Changing tags/owners affects interpreter,
+VM, both JIT backends, GC, host boundaries and snapshots.
+
+Strings, regex and builtins
+
+Ladybird PrimitiveString caches UTF-16 length, provides ASCII/u16 views, inlines
+up to 32 ASCII bytes, and uses deferred ropes/substrings
+(Rust/src/layout/primitive_string.rs:31; runtime/primitive_string.rs:316,357,427,
+510). TRust LStr already supports spare-capacity copy-on-write append, bounded
+flat-buffer substring views, ASCII hints, UTF-16 unit/index caches and sparse
+UTF-8 substring indices (lstr.rs:1,35,61,232; interpreter.rs:10641,10762). A UTF-16
+or rope system is not universally better: ASCII flat buffers and unique append
+have favorable locality, while shared persistent concatenations and many cold
+Unicode random reads expose copying/conversion costs. Benchmark those cases,
+including retained owner sizes, before changing native string layouts.
+
+Ladybird's Rust string forward search scans candidate first units then verifies
+the remainder (utf16.rs:23,236), using memchr for ASCII. It is not a general
+linear-time UTF-16 substring algorithm; its lastIndexOf still compares backwards
+candidate slices (runtime/string_prototype.rs:121). TRust ASCII uses Rust byte
+search, while Unicode indexOf compares every unit window
+(builtins/mod.rs:11112). A shared efficient UTF-16 search is a TRust refinement,
+but this comparison does not establish Ladybird as a worst-case search model.
+
+Ladybird regex extracts a literal required by every successful alternative
+(LibRegex/Rust/src/regex.rs:650), rejects subjects missing it before VM scanning
+(vm.rs:371,515,541), and has pure literal, word-boundary literal and literal
+alternative paths (regex.rs:28,93). TRust already has first-set scans, pure ASCII
+literal/fold paths, cached prepared subjects, reusable matcher buffers, direct
+replace/split paths, dead-result specializations and a narrow tiered native
+one-byte matcher (regex.rs:254,1087,2435,2626; builtins/regexp.rs).
+The missing required-literal proof is a focused algorithmic target: for example,
+/a.*required/ on long a-rich text without 'required'. Optional quantifiers,
+disjunction, Unicode/i/v folding, lookarounds, zero-length matches, sticky start,
+captures and interruption must be covered. Faster rejection cannot invent a
+mandatory literal. Native regexp coverage is already present and must not be
+described as absent.
+
+Ladybird JSON.parse without a reviver reuses 64 key-cache and 16 weak shape-cache
+entries across texts, gathers values and fills a premade ordinary layout in one
+step (Rust/src/runtime/json_text_parser.rs:103,169,216,455). TRust JSON parser
+creates objects and calls set_data for each parsed member (builtins/json.rs:808),
+although its global shape/key-layout machinery already reuses transition work.
+Repeated API record payloads with the same keys are a representative workload.
+A bounded parser key cache and bulk ordinary creation could reduce strings,
+hashing and growth. Duplicate keys, integer-index keys, __proto__ data behavior,
+Realm separation, reviver source records, roots during nested parsing and
+malformed-text cleanup require checked fallback. Ladybird's simdjson.rs is a
+scalar API-compatible implementation, and ordinary no-reviver JSON.parse uses
+the separate text parser; its name is not proof of a SIMD parsing advantage.
+
+Both engines already have extensive guarded builtin paths: Array push/pop,
+shift/unshift, copies/edits, own-data Object.assign, typed-array bulk operations,
+RegExp replacement/split/test, JSON direct reads and native callable checks.
+Ladybird array_prototype.rs:1863 guards packed paths with descriptor/prototype
+conditions; TRust builtins/mod.rs:5983,6049,6178,6701,4066 and builtins/typedarray.rs
+provide corresponding mechanisms. Callback/getter/proxy/species observations
+remain semantic barriers. GroupBy and literal replacement/split refinements in
+the wider session should be assessed in their own paired runs and are not novel
+discoveries from this Ladybird audit.
+
+Compilation caches and measurement limits
+
+Ladybird offers source-hash/runtime-tagged bytecode blobs for scripts and modules,
+validation/decoding without a VM, and direct execution from aligned immutable
+blob bytes (Rust/src/embedding/bytecode_cache.rs:7,41; bytecode/bytecode_cache.rs:7).
+Its embedder can install a generated blob into a running record while retaining
+applicable caches (bytecode/bytecode_cache.rs:204). TRust already provides static
+AST snapshots, lazy encoded function bodies, capture summaries and Agent-shared
+multi-Realm bootstrap code (lib.rs:449,1045; ast.rs/snapshot.rs). Persisting author
+script/module bytecode is a distinct startup/repeat-navigation opportunity;
+static AST snapshots do not establish absence of compilation caching. Dynamic
+cache keys must cover source, parser goals/version/flags, bytecode version and
+Realm-independent constants, with corruption fallback and source-position tests.
+
+No Ladybird build was started. Existing tools satisfy the basic compiler
+requirements: rustc 1.99.0, clang 23.1.3, CMake 4.4.4, Ninja 1.13.2; upstream pins
+Rust 1.98.0. ICU 78.3 exactly is present. Utilities/CMakeLists.txt's js target
+links LibJSStandalone and LibMain; ENABLE_GUI_TARGETS=OFF avoids browser targets.
+However the standard root configuration still unconditionally checks graphics,
+media, Skia, SDL and other packages (Meta/CMake/check_for_dependencies.cmake).
+libedit/libtommath were not found via pkg-config; simdutf/simdjson were not found
+via pkg-config or the inspected local library/config paths. Sparse checkout also
+omits LibUnicode, RustAllocator, LibCore and other transitive build trees.
+Completing a standard shell build would require broader checkout and dependency
+provisioning. An isolated minimal harness would still need the AK/GC/Unicode C++
+link closure; it is not an existing standalone cargo binary. Browser/system
+setup was deliberately outside this source-review pass.
+
+The next measured investigations should start with bounded array recovery,
+required-literal regexp rejection, parser key/layout reuse and ordered-key
+memoization. General range/guard proofs, cheap feedback and multi-frame recovery
+are the larger compiler work. Allocation elimination, background compilation,
+inline object storage and a generated interpreter require architectural design
+and separate workload/memory/startup/compilation acceptance gates. None of these
+source-proven opportunities is a verified speedup over Ladybird or Node.

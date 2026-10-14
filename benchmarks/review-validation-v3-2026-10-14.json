@@ -1,0 +1,316 @@
+{
+  "date": "2026-10-14",
+  "base_revision": "ca7f4688ca293d4b0418ef1b4f7cc0450195ae6c",
+  "candidate_manifest": "target/performance-review-20261014/candidate-v3-manifest.json",
+  "candidate_artifacts": {
+    "trust-js": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v3/trust-js",
+      "sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "bytes": 20214088
+    },
+    "test262-runner": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v3/test262-runner",
+      "sha256": "c2b583d7013ca34576f1e826bbe647436941d8d89d21ba00fa28492c918de49c",
+      "bytes": 19591104
+    },
+    "trust-js-difftest": {
+      "path": "/big/Code/trust-js/target/performance-review-20261014/candidate-v3/trust-js-difftest",
+      "sha256": "c46e19e7c1da447c766c9e140977c1c0979d13a6aeeceb715ae8241dcbc03165",
+      "bytes": 19473760
+    }
+  },
+  "host": "aarch64 Linux crystal, Cortex-X925",
+  "build": "cargo build --release -p trust-js -p test262-runner -p trust-js-difftest --bins",
+  "features": [
+    "intl"
+  ],
+  "production_source_unchanged_after_freeze": true,
+  "engine_tests": {
+    "command": "cargo test -p trust-js --lib",
+    "passed": 1988,
+    "failed": 0,
+    "ignored": 3,
+    "seconds": 266.0,
+    "log": "target/performance-review-20261014/validation-v3/engine-tests.log"
+  },
+  "test262": {
+    "revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
+    "tier_threshold": 0,
+    "workers": 4,
+    "scope": [
+      "built-ins/Object/groupBy",
+      "built-ins/Map/groupBy",
+      "built-ins/String/prototype/replace",
+      "built-ins/String/prototype/replaceAll",
+      "built-ins/String/prototype/split",
+      "built-ins/Math",
+      "built-ins/isNaN",
+      "built-ins/Number/isNaN",
+      "built-ins/Array",
+      "built-ins/JSON/stringify",
+      "built-ins/Object/defineProperty",
+      "built-ins/Reflect/deleteProperty"
+    ],
+    "tiers": [
+      {
+        "tier": "interp",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v3/test262-interp/test262-report/summary.json"
+      },
+      {
+        "tier": "bytecode",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v3/test262-bytecode/test262-report/summary.json"
+      },
+      {
+        "tier": "jit",
+        "pass": 4887,
+        "fail": 0,
+        "skip": 0,
+        "all_executed_passed": true,
+        "report": "target/performance-review-20261014/validation-v3/test262-jit/test262-report/summary.json"
+      }
+    ]
+  },
+  "differential": {
+    "command": "target/performance-review-20261014/candidate-v3/trust-js-difftest --count 2000",
+    "seeds": "1..2001",
+    "agree": 1859,
+    "budget_skips": 141,
+    "divergences": 0,
+    "log": "target/performance-review-20261014/validation-v3/difftest.log"
+  },
+  "node": "v24.21.0",
+  "baseline_regression_reproductions": {
+    "cases": 4,
+    "tier_comparisons": 12,
+    "all_match_node": true,
+    "report": "target/performance-review-20261014/baseline-reproductions/candidate-v3-results.json"
+  },
+  "formatting": "rustfmt --check --edition 2021 --config skip_children=true on changed Rust files; git diff --check",
+  "independent_review": "Source reviewed by separate agent; no actionable findings remained before v2 build.",
+  "limitations": [
+    "Focused Test262 scope, not full current-suite conformance.",
+    "Budget-skipped differential cases are inconclusive.",
+    "Native validation is ARM64; x86-64 and wasm32 were not executed.",
+    "Default production template JIT; optional optimizing-jit feature was not enabled."
+  ],
+  "performance_status": "Completed builtin checkpoint: final grouping/application/Octane seven-pair gates pass; unchanged-source v2 component evidence retained; final controls and RSS investigations preserved.",
+  "source_revision": "e62c6f0d",
+  "checkpoint_kind": "builtin refinement; subsequent compiler phase is separate",
+  "source_revision_full": "e62c6f0d99d5fa842f0ecd884b099866083a0034",
+  "performance_reports": [
+    {
+      "report": "benchmarks/review-groupby-v3-2026-10-14.json",
+      "sha256": "e36c79b68a3ef9763194d49238f775dad364e1e7b6849ed4ab40a0122b0a8d14",
+      "role": "final v3 grouping seven-pair comparison",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-applications-v3-2026-10-14.json",
+      "sha256": "446c8d5f5238feb26356f129649e33dd0056d1fc2f511f69a28e90f9fe1aff6c",
+      "role": "final v3 React/Djot/Vue seven-pair comparison",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-octane-v3-2026-10-14.json",
+      "sha256": "613fc4068bb407f289ce0641c26c9d3234ac8e4abf085370612adf1e25e60967",
+      "role": "final v3 selected Octane seven-pair comparison",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-strings-v2-2026-10-14.json",
+      "sha256": "6af99e9745ec5cecba201895b1450b1b49bd7d49d1eb4372297a59ced3541622",
+      "role": "unchanged-source string seven-pair component evidence on exact v2 artifact",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "ede664f876154cc44843d7de243480011d6bb7de94a2182f78ec693a24b84dde",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-arrays-v2-2026-10-14.json",
+      "sha256": "3cc12987bd4dc309979bfe4975806d15891fe363e1bca1694778a5b3ca550ad1",
+      "role": "unchanged-source array seven-pair component evidence on exact v2 artifact",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "ede664f876154cc44843d7de243480011d6bb7de94a2182f78ec693a24b84dde",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-math-v2-2026-10-14.json",
+      "sha256": "6c50875590cf7466d31633aaf44b41e31142730516b3d034514b3d95b09a2e10",
+      "role": "unchanged-source Math seven-pair component evidence on exact v2 artifact",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "ede664f876154cc44843d7de243480011d6bb7de94a2182f78ec693a24b84dde",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-math-controls-v3-2026-10-14.json",
+      "sha256": "1a4aac2c398cc31336d4a88d350a60e1470e5993dd3135d2d8a09fc47d36bb5f",
+      "role": "three-pair final artifact control; original RSS gate retained",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 3,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": [
+        "math/peak_rss_kib"
+      ]
+    },
+    {
+      "report": "benchmarks/review-arrays-controls-v3-2026-10-14.json",
+      "sha256": "686996d22d1a33a8f47c9599ef513f3e14017431adeed5f69c9fa565c5681016",
+      "role": "three-pair final artifact control",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 3,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-strings-controls-v3-2026-10-14.json",
+      "sha256": "18bf29ce63b6791c592b9d5e4ff82b182c60edc2e35f6e722dc463ef8909286e",
+      "role": "three-pair final artifact full-split control; original RSS gate retained",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 3,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": [
+        "strings/peak_rss_kib"
+      ]
+    },
+    {
+      "report": "benchmarks/review-startup-v3-2026-10-14.json",
+      "sha256": "a271b2975bc86adfa7554029bcff17f3266df4d9858d61751e9b6cc06ab7faca",
+      "role": "seven-pair checked empty script startup control",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-math-v3-confirmation-2026-10-14.json",
+      "sha256": "38f44b18749441a2287e9175ce11847c5ef0a5ee72ff34387532eae9a6a728be",
+      "role": "seven-pair fixed-placement confirmation; original RSS gate retained",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": [
+        "math/peak_rss_kib"
+      ]
+    },
+    {
+      "report": "benchmarks/review-strings-controls-v3-confirmation-2026-10-14.json",
+      "sha256": "5be00be2fc2477d7f5d558cec9b1cd78f8be6da0da77b4f032052f55856a4692",
+      "role": "seven-pair full-split RSS confirmation",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-math-v3-fresh-cohort-2026-10-14.json",
+      "sha256": "5385304b1d782aeaf1d710ff33cd09ce48629a658f0a8cedf6816d63f81b3851",
+      "role": "seven-pair independent artifact-copy cohort with alternating creation order",
+      "status": "complete",
+      "all_runs_valid": true,
+      "pairs": 7,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-rss-attribution-v3-2026-10-14.json",
+      "sha256": "bca5d56b5b3cfd9f46ebbcc601f625e9fa9f08dac50300c0402bd804e86a5448",
+      "role": "excluded-timing status/smaps and baseline/v2/v3 PERF attribution",
+      "status": "complete",
+      "all_runs_valid": null,
+      "pairs": null,
+      "artifact_sha256": null,
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-rss-aslr-off-v3-2026-10-14.json",
+      "sha256": "4b5b4a742c30c94e1a48856621f0ad366ee761ace491ae500444fb5d25c7225e",
+      "role": "excluded-timing ASLR-disabled attribution",
+      "status": "complete",
+      "all_runs_valid": null,
+      "pairs": null,
+      "artifact_sha256": null,
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-diagnostics-v3-2026-10-14.json",
+      "sha256": "02fdb9fb34bf0777858a1734515b05f543b68f9e1bde98d867a44de91a48d3fc",
+      "role": "excluded-timing application and selected Octane compilation/GC/managed-memory diagnostics",
+      "status": "complete",
+      "all_runs_valid": null,
+      "pairs": null,
+      "artifact_sha256": "c5b0b3d937d31a209435bb88196be0ef4b50aca2a8f316cd5419556bfed170ba",
+      "provisional_regression_gates": []
+    },
+    {
+      "report": "benchmarks/review-octane-components-diagnostics-v3-2026-10-14.json",
+      "sha256": "4630e3cf57c65758518f988847777fb5b7f10b263e327dd481b464990a8dd9ca",
+      "role": "excluded-timing per-component Richards/DeltaBlue/RayTrace diagnostics",
+      "status": "complete",
+      "all_runs_valid": null,
+      "pairs": null,
+      "artifact_sha256": null,
+      "provisional_regression_gates": []
+    }
+  ],
+  "rss_review": {
+    "original_records_retained": true,
+    "math_fixed_placement": {
+      "three_pairs_median_percent": 9.868026394721063,
+      "seven_pairs_median_percent": 8.290451686678102,
+      "seven_pair_95_interval": [
+        1.0029356818788364,
+        1.1349730053989202
+      ]
+    },
+    "math_independent_copy_cohort": {
+      "seven_pairs_median_percent": -0.251959686450165,
+      "95_interval": [
+        0.930052529720763,
+        1.011111111111111
+      ],
+      "regression_gate": false
+    },
+    "full_split": {
+      "original_three_pairs_median_percent": 3.0176026823135027,
+      "seven_pairs_confirmation_median_percent": 2.019650655021832,
+      "confirmation_regression_gate": false
+    },
+    "diagnostic_findings": "Large variations are anonymous heap residency, not mainly executable mappings: same v3 binary observed heap 1544 and 3324 KiB. With ASLR disabled, baseline/v2/v3 heap all1544 KiB, anonymous generated code256 KiB; executable tmpfs mapping baseline9908 vs v2/v3 10040 KiB. Supports address/allocator-layout sensitivity; no allocator mechanism is claimed.",
+    "managed_memory": "Post-GC requested lower bounds baseline931200/v2 931196/v3 931210 bytes, liveobjects1030/scopes2 all. Opaque storage remains excluded; not an exact heap-growth proof.",
+    "policy": "Original gates are preserved; independent process-pair file placements and controlled attribution resolve a reproducibility issue, not an RSS waiver."
+  },
+  "conclusion": "The builtin checkpoint improves selected grouping, replacement, bounded splitting and sparse-array recovery; application/Octane controls do not establish an overall engine catchup or superiority over Node/Ladybird.",
+  "compiler_phase": "Current uncommitted compiler work is outside this checkpoint; every comparison identifies its exact frozen artifact.",
+  "finalized_utc": "2026-10-14T07:47:46.711631+00:00"
+}
