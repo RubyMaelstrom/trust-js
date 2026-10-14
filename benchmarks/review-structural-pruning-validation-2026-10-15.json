@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "status": "Reviewed optional compiler refinement; no performance acceptance",
+  "candidate": {
+    "base_commit": "42b0bdf2ab3eac549cc7ec5244f5eb0247feab6b",
+    "tree": "/tmp/trust-js-pruning-composed-20261014",
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/source-before.json",
+      "sha256": "b364ff9fe9806b932e261197d7a31913812161347811ff9fb87d78af1bd2e5ac",
+      "bytes": 124296
+    },
+    "source_files": 810,
+    "source_patch": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/source.patch",
+      "sha256": "50a24d48dbebd4f7def68cd60f6ed06cec53a8d805c7c9070a16245e45338c68",
+      "bytes": 36326
+    },
+    "test_elf": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/frozen-tests",
+      "sha256": "321aff9bac8879b1df6ca0d10b5c83871a9aefc7e6a12a0ab63b922104ad674e",
+      "bytes": 249243320
+    },
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+    "machine": "crystal",
+    "target": "aarch64",
+    "features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 2,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    }
+  },
+  "change": {
+    "selection": "Validate the full original snapshot, prune whole zero-metadata-reuse spans, preserve complete profitable spans and exact Object-result prerequisites, rebuild and verify retained state/read-write role/all four elisions.",
+    "runtime": "Unselected property accesses retain complete checked Get/Set and normal rejoins. Selected guard/owner misses retain exact before-access VM recovery and existing retirement.",
+    "defaults": "No feature, runtime switch, threshold, compiler cap or native ABI change.",
+    "scope": "Four optimizer source/test files composed on main; existing sparse-PC and diagnostic sources preserved."
+  },
+  "root_validation": {
+    "fresh_build": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/build-result.json",
+      "sha256": "a091a356701a7be011d6b4deb406a3d5f1a1bd780bc78e5e46bc8b08669e36e2",
+      "bytes": 2219
+    },
+    "fresh_build_jsonl": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/build.jsonl",
+      "sha256": "05d85f43dafb4cba8a64ef6926e30eb40ba00636f6ea85c3ec3f5ad1e48c49a9",
+      "bytes": 48972
+    },
+    "source_preflight_correction": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/test-preflight-correction.json",
+      "sha256": "98c62bc754b4af1fef9ad7ad588e2626d2c1494352185522b3907e05886941df",
+      "bytes": 345
+    },
+    "focused_tests": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/test-result.json",
+      "sha256": "b2b2607b367827836543aef888270495cea234870f87f9cd324cd769127c2b8f",
+      "bytes": 57051
+    },
+    "unique_tests": 73,
+    "passed": 73,
+    "failed": 0,
+    "groups": {
+      "generic_admission::pruning_tests::": 7,
+      "generic_admission_tests::": 7,
+      "generic_own::tests::": 2,
+      "generic_own_tests::": 22,
+      "object_fact_tests::": 15,
+      "native_pcs::tests::": 3,
+      "observed_region_tests::": 17
+    },
+    "controls": {
+      "TRUST_JS_OPT_JIT": "hot",
+      "TRUST_JS_OPT_JIT_COVERAGE": "1",
+      "TRUST_JS_OPT_JIT_OBSERVED_REGIONS": "1",
+      "TRUST_JS_OPT_JIT_LARGE_REGIONS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_READ_GUARDS": "1",
+      "TRUST_JS_OPT_JIT_GENERIC_OWN": "1",
+      "TRUST_JS_OPT_JIT_SHARED_OWNERS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_RECOVERY": "1",
+      "TRUST_JS_OPT_JIT_BACKGROUND": "0",
+      "TRUST_JS_OPT_JIT_OSR": "0",
+      "TRUST_JS_OPT_JIT_DIAGNOSTICS": "compile"
+    },
+    "strict_all_target_clippy": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/clippy-result.json",
+      "sha256": "47772ff83ab7ed04c43fac28662c17e2ac598ed60f665ea3b5e7355c8dc6ca3e",
+      "bytes": 535
+    },
+    "clippy_log": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/pruning-composed-v1/clippy.log",
+      "sha256": "7184a18cbbb8eebef1976c5ca0b7a1f93ef9e67214e65b3ebea8fbb4925bc7c5",
+      "bytes": 160
+    },
+    "raw_outputs": "tests/00.stdout through tests/72.stderr, individually hashed in test-result.json. Root rechecked all 73 exact pass records."
+  },
+  "isolated_predecessor": {
+    "manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-runtime-prune-object-v1/manifest-final-v6.json",
+      "sha256": "f9c2a6b35fb660001da1693ca208cc1285449bcae155d7c4d22a710c1e4a057a",
+      "bytes": 3873
+    },
+    "root_independent_source_and_native_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-runtime-prune-object-v1/root-validation-v6/root-independent-audit.json",
+      "sha256": "66bee456773472e6f04a8f54953289e9b583c370179a0b06d5263d0b17ed0283",
+      "bytes": 2982
+    },
+    "scope": "Separate pre-sparse V6 tree: 61 unique ARM native debug tests, two Node oracle cases, three additional root native reruns. Only the four pruning files were composed; historical results are not labeled as current-composition runs."
+  },
+  "standards": {
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "source": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+    "sha256": "4bd9e8f82af11d2ee1d700ab3c3d669da8ec575b83dacaaf4e081e87d8e19e47",
+    "clauses": [
+      {
+        "url": "https://tc39.es/ecma262/#sec-ordinaryget",
+        "line": 13389
+      },
+      {
+        "url": "https://tc39.es/ecma262/#sec-ordinaryset",
+        "line": 13431
+      },
+      {
+        "url": "https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor",
+        "line": 13449
+      }
+    ],
+    "connection": "Complete runtime fallbacks preserve current descriptor/prototype lookup, receiver, accessor invocation, writability and abrupt completion order; no author-visible effect is repeated on recovery."
+  },
+  "limits": [
+    "No release application timing, compilation repayment, Node/Ladybird comparison or performance acceptance.",
+    "Current composition executed natively on ARM64 only; no x86/Windows/wasm conformance claim.",
+    "Focused semantic regressions and affected compiler tests, not full Test262 or whole-workspace testing.",
+    "Final documentation and this evidence ledger were added after engine validation; all four engine files retain the exact compiled hashes.",
+    "Raw local artifacts are preserved for this workspace and are not required build dependencies."
+  ]
+}

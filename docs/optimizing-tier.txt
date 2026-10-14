@@ -969,14 +969,24 @@ The warmed immutable opcode/name/slot/cache graph is cloned together with the ex
 states, and compilation validates the entire selection before using it. Indexed/prototype,
 creation, polymorphic, missing, accessor, environment-homed and stale selections decline.
 
+After validating that full snapshot, admission removes complete spans whose selected accesses
+share no metadata checks. Those operations use the existing complete runtime paths and can
+rejoin native execution after getters, setters, proxies or descriptor changes. Every selected
+producer in a useful span remains, including its first access with no immediate savings.
+Object-result producers required by the same comparison/branch proof also remain, with zero
+structural credit and their existing result-guard cost. If selection changes, admission rebuilds
+the proof and checks every retained state, read/write role and all four metadata elisions before
+using it. Observer, poll and control-flow boundaries still delimit the spans.
+
 Each CFG block begins with no metadata facts. Successful selected native checks can remove
 later ordinary/shape/bounds/data tests for the same unchanged private receiver word. Unselected
 operations, rebindings, helpers, polls and cleanup kill the facts. Reads still load current
 values and retain their actual owners; stores keep their existing alias-aware owner transaction.
 Neither boxes, retain/drop operations, values, pointers nor heap contents are credited as saved.
 Required proof failure declines the candidate; no cheaper admission can silently fall back to
-unproven helper rejoins. A live guard/owner miss resumes before that exact access, preserving any
-earlier completed read's owning RHS, and eight misses retire the version as before.
+unproven helper rejoins. A live guard/owner miss at a retained selected access resumes before
+that exact access, preserving any earlier completed read's owning RHS, and eight misses retire
+the version as before. An omitted selection does not carry metadata facts across its helper.
 
 Structural admission uses the minimum removed checks across reachable normal/explicit-throw
 terminals and possible earlier checked-operation errors. Shortest CFG paths do not assume
@@ -989,6 +999,12 @@ or COMPACT_STORES=0 disables structural selection. The 4096-entry floor, 256-op 
 not prepaid savings or proof of future calls. Publication, actual entries, successful selected
 accesses, VM recovery, compilation cost and workload phase must be reported separately. This
 capability and forced emission fixtures establish no framework adoption or performance gain.
+The 2026-10-15 pruning integration passed 73 focused ARM64 tests against the current sparse-PC
+compiler and strict all-target Clippy with optimizing-jit+embed. The tests cover complete
+accessor/proxy/readonly paths, callback collection, exact abrupt recovery, retained writable
+guards and an Object-producing getter that changes to null before a previously folded branch.
+See benchmarks/review-structural-pruning-validation-2026-10-15.json for exact source and artifact
+bindings. This is correctness evidence; no release timing or cross-platform result is implied.
 
 Compiler size, background work and execution observations
 ----------------------------------------------------------

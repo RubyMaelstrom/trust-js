@@ -111,6 +111,10 @@ pub(super) struct Site {
     pub(super) state: IcState,
     pub(super) removed: heap_proofs::ReadElisions,
     write: bool,
+    /// All guards in this complete observer-free span are retained together when
+    /// any of them supports a real later metadata elision. Zero-reuse spans do
+    /// not justify turning their independent property operations into exits.
+    pub(super) reuse_span_profitable: bool,
 }
 
 pub(super) struct Plan {
@@ -249,7 +253,9 @@ impl Plan {
         };
         let mut sites = Vec::new();
         let mut event_count = 0;
+        let mut span = 0usize;
         for (block_index, block) in cfg.blocks().iter().enumerate() {
+            span = span.checked_add(1)?;
             let mut events = Vec::new();
             for pc in block.start..block.end {
                 if regions.is_some_and(|plan| {
@@ -258,6 +264,7 @@ impl Plan {
                     continue;
                 }
                 if poll[pc] {
+                    span = span.checked_add(1)?;
                     push_event(
                         &mut events,
                         &mut event_count,
@@ -297,7 +304,7 @@ impl Plan {
                             Event::Guard(Proof { receiver, metadata }),
                         )?;
                     }
-                    sites.push((pc, block_index, first, state, write));
+                    sites.push((pc, block_index, first, state, write, span));
                     if write {
                         // This event describes ONLY the selected terminal-miss
                         // path's successful existing-data overwrite. Values and
@@ -314,6 +321,7 @@ impl Plan {
                     // Deliberately do not infer heap purity from checked_writes.
                     // Even an owner operation may take a rejoining destructor
                     // helper; a local rebind changes this span's receiver word.
+                    span = span.checked_add(1)?;
                     push_event(
                         &mut events,
                         &mut event_count,
@@ -341,17 +349,36 @@ impl Plan {
             heap_proofs::analyze(&graph, Budget::default())?
         };
         let mut result = vec![None; ops.len()];
-        for (pc, block, first, state, write) in sites {
-            result[pc] = Some(Site {
-                state,
-                removed: heap_proofs::ReadElisions {
-                    ordinary: solved.redundant(block, first),
-                    shape: solved.redundant(block, first + 1),
-                    bounds: solved.redundant(block, first + 2),
-                    data: solved.redundant(block, first + 3),
-                },
-                write,
-            });
+        // Sites are emitted in PC order, with monotonically increasing span IDs.
+        // Use the exact purity/observer events above rather than a second opcode
+        // whitelist. Retain every producer within a useful span, including its
+        // first guard with zero immediate credit; remove only complete zero spans.
+        let mut first_site = 0;
+        while first_site < sites.len() {
+            let span = sites[first_site].5;
+            let mut end = first_site + 1;
+            while end < sites.len() && sites[end].5 == span {
+                end += 1;
+            }
+            let useful = sites[first_site..end]
+                .iter()
+                .any(|&(_, block, first, _, _, _)| {
+                    (0..4).any(|offset| solved.redundant(block, first + offset))
+                });
+            for &(pc, block, first, state, write, _) in &sites[first_site..end] {
+                result[pc] = Some(Site {
+                    state,
+                    removed: heap_proofs::ReadElisions {
+                        ordinary: solved.redundant(block, first),
+                        shape: solved.redundant(block, first + 1),
+                        bounds: solved.redundant(block, first + 2),
+                        data: solved.redundant(block, first + 3),
+                    },
+                    write,
+                    reuse_span_profitable: useful,
+                });
+            }
+            first_site = end;
         }
         if selected.is_some_and(|selected| {
             selected

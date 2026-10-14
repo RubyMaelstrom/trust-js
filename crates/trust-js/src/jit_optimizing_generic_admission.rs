@@ -198,9 +198,72 @@ impl Plan {
         if selected.is_empty() {
             return None;
         }
-        let proof = generic_own::Plan::build_hot_selection_with_regions(
+        let original_count = selected.len();
+        let original_proof = generic_own::Plan::build_hot_selection_with_regions(
             chunk, cfg, &frame, stack, &selected, regions,
         )?;
+        // Validate the entire initial snapshot before filtering. A stale or
+        // unsupported site is never silently discarded as an unprofitable one.
+        // Existing own-data overwrites preserve metadata only on native success;
+        // all other observer/entry boundaries already delimit these exact spans.
+        // A zero-metadata-reuse Object producer may independently support result
+        // category/comparison/branch proofs in this exact Object Plan. Its copied
+        // state is required to reconstruct that plan; retain it with zero metadata
+        // credit and the existing Object result-guard debit.
+        let selected: Vec<_> = selected
+            .into_iter()
+            .filter(|&(pc, _)| {
+                original_proof
+                    .read(pc as usize)
+                    .or_else(|| original_proof.write(pc as usize))
+                    .is_some_and(|site| site.reuse_span_profitable)
+                    || objects.is_some_and(|plan| {
+                        plan.properties
+                            .iter()
+                            .any(|&(site, ty)| site == pc && ty.is_object())
+                    })
+            })
+            .collect();
+        if selected.is_empty() {
+            return None;
+        }
+        let proof = if selected.len() == original_count {
+            // Common case: no zero-reuse spans. Do not repeat bounded analysis.
+            original_proof
+        } else {
+            let proof = generic_own::Plan::build_hot_selection_with_regions(
+                chunk, cfg, &frame, stack, &selected, regions,
+            )?;
+            // Pruning turns omitted operations back into complete rejoining helpers.
+            // Rebuild the proof and reject any lost elision before computing credit.
+            // Keeping whole profitable spans should preserve these exactly, but this
+            // check is the invariant if event classification evolves in the future.
+            let flags = |site: generic_own::Site| {
+                (
+                    site.removed.ordinary,
+                    site.removed.shape,
+                    site.removed.bounds,
+                    site.removed.data,
+                )
+            };
+            for &(pc, state) in &selected {
+                let first = original_proof
+                    .read(pc as usize)
+                    .or_else(|| original_proof.write(pc as usize))?;
+                let current = proof
+                    .read(pc as usize)
+                    .or_else(|| proof.write(pc as usize))?;
+                if !same(first.state, state)
+                    || !same(current.state, state)
+                    || flags(first) != flags(current)
+                    || original_proof.read(pc as usize).is_some()
+                        != proof.read(pc as usize).is_some()
+                {
+                    return None;
+                }
+            }
+            proof
+        };
         let mut weights = vec![0u32; cfg.blocks().len()];
         let mut per_pc = vec![None; chunk.jit_ops().len()];
         for &(pc, _) in &selected {
@@ -386,3 +449,7 @@ pub(super) fn admission_entries(
             .div_ceil(u64::from(saved))
     })
 }
+
+#[cfg(test)]
+#[path = "jit_optimizing_structural_pruning_tests.rs"]
+mod pruning_tests;
