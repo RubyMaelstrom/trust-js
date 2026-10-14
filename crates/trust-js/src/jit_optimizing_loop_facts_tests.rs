@@ -46,11 +46,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-fn entered(engine: &mut Engine) -> Rc<Chunk> {
-    assert!(
-        loop_facts::TEST_PLANS.with(|count| count.get()) > 0,
-        "must build a complete loop proof"
-    );
+fn subject_chunk(engine: &mut Engine) -> Rc<Chunk> {
     let env = engine.interp.global_env.clone();
     let subject = engine
         .interp
@@ -61,17 +57,224 @@ fn entered(engine: &mut Engine) -> Rc<Chunk> {
     let Callable::User(user) = &object.call else {
         panic!("user function")
     };
-    let chunk = user
-        .func
+    user.func
         .code
         .get()
         .and_then(Option::as_ref)
         .unwrap()
-        .clone();
+        .clone()
+}
+
+fn entered(engine: &mut Engine) -> Rc<Chunk> {
+    assert!(
+        loop_facts::TEST_PLANS.with(|count| count.get()) > 0,
+        "must build a complete loop proof"
+    );
+    let chunk = subject_chunk(engine);
     let state = chunk.optimizing_loop.get().expect("loop metadata");
     assert!(state.entries.get() > 0, "must execute continuation");
     assert!(state.code.get().flatten().is_some(), "live native proof");
     chunk
+}
+
+// Separate children keep process-wide compiler controls independent. Each
+// variant requires a real native entry; scalar-off and ordinary entry are
+// controls for the publication contract, rather than fallback substitutes.
+fn read_publication_children(name: &str) -> bool {
+    const CHILD: &str = "TRUST_JS_TEST_LOOP_READ_PUBLICATION_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    for variant in ["scalar-on", "scalar-off", "ordinary"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("jit::optimizing::loop_facts_tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, variant)
+            .env(
+                "TRUST_JS_OPT_JIT",
+                if variant == "ordinary" { "1" } else { "0" },
+            )
+            .env(
+                "TRUST_JS_OPT_JIT_OSR",
+                if variant == "ordinary" { "0" } else { "1" },
+            )
+            .env("TRUST_JS_OPT_JIT_OSR_AT", "16")
+            .env("TRUST_JS_OPT_JIT_LOOP_FACTS", "1")
+            .env(
+                "TRUST_JS_OPT_JIT_LOOP_SCALARS",
+                if variant == "scalar-off" { "0" } else { "1" },
+            )
+            .env("TRUST_JS_OPT_JIT_DIAGNOSTICS", "execution")
+            .env("TRUST_JS_INLINE_AT", "0")
+            .env_remove("TRUST_JS_OPT_JIT_DEOPT_AT")
+            .output()
+            .unwrap();
+        eprintln!(
+            "{variant}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{variant}");
+    }
+    true
+}
+
+fn read_publication_record(engine: &mut Engine) -> Rc<diagnostics::Code> {
+    let variant = std::env::var("TRUST_JS_TEST_LOOP_READ_PUBLICATION_CHILD").unwrap();
+    let chunk = subject_chunk(engine);
+    let code = if variant == "ordinary" {
+        let code = chunk.jit.get().flatten().expect("ordinary native body");
+        assert!(
+            code.optimizing_diagnostics.is_some(),
+            "ordinary control must use optimizing lowering"
+        );
+        assert_eq!(chunk.optimizing_misses.get(), 0);
+        code
+    } else {
+        if variant == "scalar-on" {
+            entered(engine);
+        }
+        let state = chunk.optimizing_loop.get().expect("continuation metadata");
+        assert!(state.entries.get() > 0);
+        state
+            .code
+            .get()
+            .flatten()
+            .expect("continuation native body")
+    };
+    let record = code.optimizing_diagnostics.as_ref().unwrap().clone();
+    assert!(
+        record.counters[0].get() > 0,
+        "actual instrumented native entry"
+    );
+    record
+}
+
+#[test]
+fn loop_fields_publish_before_unmodeled_name_this_capture_and_element_reads() {
+    if read_publication_children(
+        "loop_fields_publish_before_unmodeled_name_this_capture_and_element_reads",
+    ) {
+        return;
+    }
+    let fixtures = [
+        "globalThis.x=0;function subject(o){var seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=x;}return seen}subject(globalThis)+':'+globalThis.x",
+        "function subject(o){var seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=this.x;}return seen}var o={x:0};subject.call(o,o)+':'+o.x",
+        "function subject(o){var p=o,seen=0;for(var k=0;k<100;k++){o.x=o.x+1;if(k>=80)seen=p.x;}return seen}var o={x:0};subject(o)+':'+o.x",
+        "function factory(obj){return function subject(o){var seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=obj.x;}return seen}}var o={x:0},subject=factory(o);subject(o)+':'+o.x",
+        "function subject(o){var p=o,key='x',seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=p[key];}return seen}var o={x:0};subject(o)+':'+o.x",
+    ];
+    for (fixture, source) in fixtures.into_iter().enumerate() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = engine(tier);
+            assert_eq!(eval(&mut engine, source), "100:100", "{tier:?}: {source}");
+            if matches!(tier, Tier::Jit) {
+                let record = read_publication_record(&mut engine);
+                assert_eq!(
+                    record.counters[diagnostics::VM_RECOVERY].get(),
+                    0,
+                    "no recovery substitutes for the native read"
+                );
+                let sites = record.site_stats();
+                if matches!(fixture, 1 | 2) {
+                    let chunk = subject_chunk(&mut engine);
+                    assert!(
+                        sites.iter().any(|(pc, kind, count)| {
+                            *kind == "data_property_read"
+                                && *count > 0
+                                && match (&chunk.jit_ops()[*pc], fixture) {
+                                    (Op::GetPropThis(name, _), 1) => chunk.jit_name(*name) == "x",
+                                    (Op::GetPropLocal(slot, name, _), 2) => {
+                                        chunk.jit_name(*name) == "x"
+                                            && chunk.jit_slot_names()[*slot as usize].as_ref() == "p"
+                                    }
+                                    _ => false,
+                                }
+                        }),
+                        "must commit the unmodeled alias read through native property lowering: {sites:?}"
+                    );
+                }
+                eprintln!(
+                    "alias fixture={fixture} entries={} sites={sites:?}",
+                    record.counters[0].get()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_read_publication_keeps_getter_throw_effects_and_error_position() {
+    if read_publication_children(
+        "loop_read_publication_keeps_getter_throw_effects_and_error_position",
+    ) {
+        return;
+    }
+    const SOURCE:&str="var reads=0;function subject(o){var seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=this.read;}return seen}var o={x:0,get read(){this.x++;reads++;if(this.x===86)throw Error('stop');return this.x}};var message,trace;try{subject.call(o,o)}catch(error){message=error.message;trace=error.stack};message+':'+reads+':'+o.x";
+    let getter_column = SOURCE.find("Error('stop')").unwrap() + 1;
+    let read_column = SOURCE.find("this.read").unwrap() + "this.".len() + 1;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        assert_eq!(eval(&mut engine, SOURCE), "stop:43:86");
+        if matches!(tier, Tier::Jit) {
+            let record = read_publication_record(&mut engine);
+            assert_eq!(
+                record.counters[diagnostics::VM_RECOVERY].get(),
+                0,
+                "throw keeps the existing checked unwind path"
+            );
+        }
+        let trace = eval(&mut engine, "trace");
+        let frames: Vec<_> = trace.lines().collect();
+        assert_eq!(frames[0], "Error: stop");
+        assert_eq!(
+            frames[1].trim(),
+            format!("at get read (<anonymous>:1:{getter_column})"),
+            "{tier:?}: {trace}"
+        );
+        assert_eq!(
+            frames[2].trim(),
+            format!("at subject (<anonymous>:1:{read_column})"),
+            "{tier:?}: {trace}"
+        );
+        eprintln!(
+            "getter throw {tier:?}: {} | {}",
+            frames[1].trim(),
+            frames[2].trim()
+        );
+    }
+}
+
+#[test]
+fn loop_getter_descriptor_miss_recovers_after_the_single_completed_read() {
+    if read_publication_children(
+        "loop_getter_descriptor_miss_recovers_after_the_single_completed_read",
+    ) {
+        return;
+    }
+    const SOURCE:&str="var reads=0;function subject(o){var seen=0;for(var k=0;k<100;k++){o.x=o.x+1;seen=this.read;}return seen}var o={x:0,get read(){reads++;if(reads===40)Object.defineProperty(this,'x',{value:this.x+100,writable:false,configurable:true});return this.x}};subject.call(o,o)+':'+reads+':'+o.x";
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        assert_eq!(eval(&mut engine, SOURCE), "140:100:140");
+        if matches!(tier, Tier::Jit) {
+            let record = read_publication_record(&mut engine);
+            // Disabling scalar registers retains live field-proof validation.
+            // Both continuation controls recover after the descriptor change;
+            // ordinary lowering has no continuation field proof.
+            let expected = u64::from(
+                std::env::var("TRUST_JS_TEST_LOOP_READ_PUBLICATION_CHILD").as_deref()
+                    != Ok("ordinary"),
+            );
+            assert_eq!(
+                record.counters[diagnostics::VM_RECOVERY].get(),
+                expected,
+                "scalar descriptor change recovers once after its getter result"
+            );
+        }
+    }
 }
 
 #[test]

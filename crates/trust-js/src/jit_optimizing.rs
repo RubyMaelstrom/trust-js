@@ -1560,6 +1560,11 @@ impl Lowering<'_, '_> {
         if self.loop_field_operation(pc, op, next) {
             return;
         }
+        // A pure cache hit still observes canonical heap values. Flush pending
+        // loop Number writes before unmodeled reads through another alias.
+        if effects::canonical_heap_read(op) {
+            self.publish_loop_fields();
+        }
         if self.loop_facts.is_some_and(|plan| plan.native_write(pc)) {
             self.publish_loop_fields();
         }

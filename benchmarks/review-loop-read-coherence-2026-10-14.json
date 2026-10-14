@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-14",
+  "base_revision": "808468c61f71d15f185928b5baad903e2ed84faf",
+  "problem": "Experimental loop scalarization buffered Number field writes but native reads through an unmodeled alias could observe stale canonical storage. Global-name and this.x fixtures returned15:100 instead of100:100 before the fix.",
+  "fix": "Publish buffered Number fields before unmodeled native name/capture/property/element reads. Selected field sites retain register reads. Pure reads do not revalidate; checked callbacks keep existing after-effect validation/recovery.",
+  "production_delta_lines": 25,
+  "source_hashes": {
+    "crates/trust-js/src/jit_optimizing.rs": "c29a38d62bb1e7d79f81cdd16d8fc1ec2bb8561c8013e5532a3456e83dd89a05",
+    "crates/trust-js/src/jit_optimizing_effects.rs": "4749d932026a5f8a439720fd49bd9914119b8f01234e0d25c140f0dc8c81c17d",
+    "crates/trust-js/src/jit_optimizing_loop_facts_tests.rs": "90cf06e70e1158e8d4e6a52c0830200ef0ba2b1ccdbff46d791c7cb9a227f854"
+  },
+  "standards": {
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "clauses": [
+      "https://tc39.es/ecma262/#sec-getvalue",
+      "https://tc39.es/ecma262/#sec-object-environment-records-getbindingvalue-n-s",
+      "https://tc39.es/ecma262/#sec-ordinaryget"
+    ]
+  },
+  "root_reproduction": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/loop-global-alias-reproduction-v1/root-independent-v2/audit.json",
+    "sha256": "bdeaaa43d13888cd470cd5e481371e125c24297857888f4ab09cca3d36f89c31"
+  },
+  "standalone_validation": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/loop-read-coherence-v1/manifest-final.json",
+    "sha256": "cf2b28dac46f1165768bb629dba8768a70a6ed1191365bca38b751677759f4fb"
+  },
+  "independent_node_and_native_validation": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/loop-global-alias-fixed-independent-v1/report.json",
+    "sha256": "6280fce849597d223e16fb73befb7101400f062d238e133b3e519d7b023eca9b"
+  },
+  "composed_validation": {
+    "machine": "crystal Linux aarch64",
+    "features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 2,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "build": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/object-null-alias-composed/build-result.json",
+      "sha256": "44137b38efbc4519946a83cc1bdf3d9f4fa740402f022a946dc72b437a97f98d"
+    },
+    "binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/object-null-alias-composed/trust-js-tests",
+      "sha256": "b237df2da43dab8bd8683e82889b7cbdb0c92b621ee79aec8f260fa3a61707da"
+    },
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/object-null-alias-composed/source-before.json",
+      "sha256": "a6bd5d0145260cfe1b88a5b23901904b7657c0d7633a99a005c6664e0e24f487"
+    },
+    "selected_tests": 27,
+    "failed": 0,
+    "ignored": 0,
+    "scope": [
+      "17 loop-facts/effects/scalar/bitwise cases including three new regression groups",
+      "2 private-effect classification cases",
+      "8 exact-Null cases including loop continuation facts"
+    ],
+    "raw_results": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/object-null-alias-composed/focused-results.json",
+      "sha256": "5bfef57900ae3ac9887e2284140d1139974bd7d6731a2e6bce777938508fb647"
+    },
+    "source_verified_before_after": true,
+    "root_checked_standalone_artifacts": 57
+  },
+  "assertions": [
+    "Five alias forms agree with Node/interpreter/VM under scalar-on, scalar-off and ordinary optimizer controls.",
+    "Each native subject records actual execution; native this.x and late-local-alias reads have successful site counts with zero recovery.",
+    "Getter mutation and throw preserve exactly43 reads, field86, and getter/caller error positions.",
+    "A getter making the field readonly recovers after its single completed read:140:100:140 with one recovery per continuation and none for ordinary entry."
+  ],
+  "strict_clippy": {
+    "source": "Standalone alias source over4860ed0; both component changes separately pass strict lint. Composed main source additionally built and ran affected tests.",
+    "result": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/loop-read-coherence-v1/clippy-final-result.json",
+      "sha256": "9681fd3d75c527a61406e5141747f45718e2020e6fd79efc17c97e0caa50cd0b"
+    },
+    "log": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/loop-read-coherence-v1/clippy-final.log",
+      "sha256": "cce07d8611250d7f1bd042d0a319a981016545da5eb83d842bb4cd3ef6950ffe"
+    }
+  },
+  "performance_acceptance": false,
+  "limits": [
+    "No optimizer default, admission threshold or budget changed.",
+    "This checkpoint executes ARM64; native x86 Linux and Windows/Wine validation are separate follow-up work.",
+    "Source-manifest v4 inherited stale patch/status fields; final manifest preserves and explicitly supersedes them.",
+    "Prior test-assumption failures and rejected shared-target artifact are retained separately.",
+    "Documentation updated after source-hash validation; no executable source changed afterward.",
+    "Local target evidence is not required by contributor builds."
+  ]
+}

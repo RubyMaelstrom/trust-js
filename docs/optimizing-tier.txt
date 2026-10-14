@@ -69,6 +69,12 @@ without replay. General suspension and multi-frame reconstruction remain outside
 this contract. The whole-function policy's no-OSR statements below describe that
 policy, not the separate continuation implementation.
 
+Buffered loop writes are also published before unmodeled native name, capture,
+property and element reads, since these can observe the same field through another
+alias without invoking author code. Selected field sites still read their guarded
+register values. Pure reads require publication only; checked getter/proxy paths
+retain the existing post-effect validation and exact recovery boundary.
+
 The unchanged field-loop kernel runs about 4.52 times faster, but the subsequent
 effect-scoped application screen has a score ratio of 0.978085 versus template
 execution. Neither the feature nor either runtime admission policy is enabled by

@@ -218,6 +218,26 @@ pub(super) fn checked_heap_write(op: &Op) -> bool {
     )
 }
 
+/// Native reads of current canonical heap storage can alias a buffered Number
+/// field even when they invoke no author code. Selected loop-field sites bypass
+/// this barrier and read their own registers. Pure reads need publication, not
+/// post-effect revalidation; their checked fallback retains the observer protocol.
+pub(super) fn canonical_heap_read(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoadName(..)
+            | Op::LoadNameForCall(..)
+            | Op::LoadCap(_)
+            | Op::GetProp(..)
+            | Op::GetPropThis(..)
+            | Op::GetPropLocal(..)
+            | Op::GetMethod(..)
+            | Op::GetElem
+            | Op::GetElemLocal(_)
+            | Op::GetMethodElem
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

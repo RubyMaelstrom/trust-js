@@ -166,6 +166,8 @@ execution. Canonical owners remain live across entry, callbacks and recovery.
 Effect-scoped Number fields can remain in registers between observers; changed
 proofs recover at the correct before- or after-effect bytecode boundary. Eight
 entry misses retire that continuation without replacing the primary body.
+Pending field writes are published before unmodeled native name, capture, property
+or element reads so aliases observe current values, even when no callback runs.
 This experiment is off by default and has not improved measured application
 performance. Its isolated numeric-loop gain does not justify enabling it.
 `TRUST_JS_OPT_JIT_DIAGNOSTICS=1` adds bounded per-native-body compilation, entry,
