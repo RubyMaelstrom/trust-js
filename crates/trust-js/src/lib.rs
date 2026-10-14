@@ -85,6 +85,8 @@ mod gc_generational;
 mod gc_handle;
 mod gc_native;
 mod gc_sweep;
+#[cfg(test)]
+mod group_by_tests;
 mod heap;
 mod host;
 mod host_collections;

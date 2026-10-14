@@ -4109,6 +4109,60 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
     target.props.try_copy_named_data_from(&source.props)
 }
 
+/// GroupBy (ECMA-262 e28783d5, #sec-groupby): each IteratorStepValue precedes its callback
+/// and optional ToPropertyKey. Never snapshot the input: those effects can change later values
+/// or the live length of an Array. IteratorStepValue failures propagate without IteratorClose;
+/// callback/coercion failures close the iterator while preserving the original throw completion.
+fn group_by(
+    i: &mut Interp,
+    items: &Value,
+    callback: &Value,
+    name: &str,
+    mut add: impl FnMut(&mut Interp, Value, Value) -> Result<(), Value>,
+) -> Result<(), Value> {
+    if matches!(items, Value::Null | Value::Undefined) {
+        return Err(i.make_error("TypeError", &format!("{name} called on null or undefined")));
+    }
+    if !callback.is_callable() {
+        return Err(i.make_error("TypeError", &format!("{name} callback is not callable")));
+    }
+    let (iterator, next) = ab(i.get_iterator(items))?;
+    // These callees are fixed by GroupBy/GetIterator. Reuse the guarded callback entries
+    // across steps, retaining their roots and checked fallbacks through every observer.
+    let callback = crate::callback::Callback::new(callback.clone());
+    let next = crate::callback::Callback::new(next);
+    let mut index = 0u64;
+    loop {
+        if index >= 9_007_199_254_740_991 {
+            let error = i.make_error(
+                "TypeError",
+                "groupBy index exceeds the maximum safe integer",
+            );
+            i.iterator_close(&iterator);
+            return Err(error);
+        }
+        let Some(value) = ab(next.iterator_step(i, &iterator))? else {
+            return Ok(());
+        };
+        let key = match ab(callback.call(
+            i,
+            Value::Undefined,
+            [value.clone(), Value::Num(index as f64)],
+        )) {
+            Ok(key) => key,
+            Err(error) => {
+                i.iterator_close(&iterator);
+                return Err(error);
+            }
+        };
+        if let Err(error) = add(i, key, value) {
+            i.iterator_close(&iterator);
+            return Err(error);
+        }
+        index += 1;
+    }
+}
+
 fn install_object(it: &mut Interp) {
     let op = it.object_proto.clone();
     it.def_method(&op, "hasOwnProperty", 1, |i, this, args| {
@@ -4391,24 +4445,27 @@ fn install_object(it: &mut Interp) {
 
     it.def_method(&ctor, "hasOwn", 2, nf_object_has_own);
     it.def_method(&ctor, "groupBy", 2, |i, _this, args| {
-        let cb = arg(args, 1);
-        if !cb.is_callable() {
-            return Err(i.make_error("TypeError", "Object.groupBy callback is not callable"));
-        }
-        let elems = ab(i.iterate(&arg(args, 0)))?;
         let mut groups: Vec<(crate::value::PropertyKey, Vec<Value>)> = Vec::new();
-        for (idx, el) in elems.into_iter().enumerate() {
-            let key_v = ab(i.call(
-                cb.clone(),
-                Value::Undefined,
-                &[el.clone(), Value::Num(idx as f64)],
-            ))?;
-            let key = ab(i.to_property_key(&key_v))?;
-            match groups.iter_mut().find(|(k, _)| k.as_str() == key.as_str()) {
-                Some(g) => g.1.push(el),
-                None => groups.push((key, vec![el])),
-            }
-        }
+        let mut group_index: crate::fasthash::FastMap<String, usize> = Default::default();
+        group_by(
+            i,
+            &arg(args, 0),
+            &arg(args, 1),
+            "Object.groupBy",
+            |i, key_v, el| {
+                let key = ab(i.to_property_key(&key_v))?;
+                if let Some(&offset) = group_index.get(key.as_str()) {
+                    groups[offset].1.push(el);
+                } else {
+                    group_index.insert(key.as_str().to_owned(), groups.len());
+                    // Keep the PropertyKey owner, including a Symbol identity, until the result
+                    // object's property storage takes ownership. Callback/coercion may collect.
+                    groups.push((key, vec![el]));
+                }
+                Ok(())
+            },
+        )?;
+        drop(group_index);
         let result = i.new_object();
         result.borrow_mut().proto = None; // groupBy returns a null-prototype object
         for (k, v) in groups {

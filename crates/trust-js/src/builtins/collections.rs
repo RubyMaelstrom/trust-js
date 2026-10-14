@@ -647,44 +647,51 @@ pub(super) fn install_map_like(
     if !is_set {
         // Map.groupBy(items, cb) -> a Map of key -> [items...].
         it.def_method(&ctor, "groupBy", 2, |i, _t, a| {
-            let cb = arg(a, 1);
-            if !cb.is_callable() {
-                return Err(i.make_error("TypeError", "Map.groupBy callback is not callable"));
+            use std::collections::hash_map::Entry;
+            struct Group {
+                key: Value,
+                values: Vec<Value>,
+                next: usize,
             }
-            let elems = ab(i.iterate(&arg(a, 0)))?;
-            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            const NO_GROUP: usize = usize::MAX;
+            let mut groups: Vec<Group> = Vec::new();
             // GroupBy uses SameValueZero keys, so partition the temporary groups by the same
-            // collision-safe hash used by Map/Set instead of rescanning every prior group.
-            let mut group_index: crate::fasthash::FastMap<u64, Vec<usize>> = Default::default();
-            for (idx, el) in elems.into_iter().enumerate() {
-                let key = ab(i.call(
-                    cb.clone(),
-                    Value::Undefined,
-                    &[el.clone(), Value::Num(idx as f64)],
-                ))?;
-                let hash = collection_key_hash(&key);
-                let existing = group_index.get(&hash).and_then(|bucket| {
-                    bucket
-                        .iter()
-                        .copied()
-                        .find(|&offset| same_value_zero(&groups[offset].0, &key))
-                });
-                if let Some(offset) = existing {
-                    groups[offset].1.push(el);
-                } else {
-                    let offset = groups.len();
-                    groups.push((key, vec![el]));
-                    group_index.entry(hash).or_default().push(offset);
+            // collision-safe hash used by Map/Set. Each group links to the prior group with its
+            // hash, avoiding a separate bucket allocation per distinct key. Only appends occur,
+            // so offsets stay valid and the vector still supplies first-encounter output order.
+            let mut group_index: crate::fasthash::FastMap<u64, usize> = Default::default();
+            group_by(i, &arg(a, 0), &arg(a, 1), "Map.groupBy", |_i, key, el| {
+                let entry = group_index.entry(collection_key_hash(&key));
+                let head = match &entry {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(_) => NO_GROUP,
+                };
+                let mut offset = head;
+                while offset != NO_GROUP {
+                    if same_value_zero(&groups[offset].key, &key) {
+                        groups[offset].values.push(el);
+                        return Ok(());
+                    }
+                    offset = groups[offset].next;
                 }
-            }
+                let offset = groups.len();
+                groups.push(Group {
+                    key,
+                    values: vec![el],
+                    next: head,
+                });
+                *entry.or_insert(offset) = offset;
+                Ok(())
+            })?;
+            drop(group_index);
             let m = Object::new(i.extra_protos.get("Map").cloned());
             let ptr = Rc::as_ptr(&m) as usize;
             i.gc_pin(&m);
             i.map_data
                 .insert(ptr, OrderedCollection::new(CollectionKind::Map));
-            for (key, values) in groups {
-                let values = i.make_array(values);
-                collection_set(i, ptr, key, values);
+            for group in groups {
+                let values = i.make_array(group.values);
+                collection_set(i, ptr, group.key, values);
             }
             Ok(Value::Obj(m))
         });
