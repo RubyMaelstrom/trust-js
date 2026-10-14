@@ -141,6 +141,41 @@ fn compiled_entry_arguments_mapping_and_parameter_body_cells() {
 }
 
 #[test]
+fn missing_last_duplicate_formal_does_not_map_an_earlier_argument() {
+    // ECMA-262 e28783d5 CreateMappedArgumentsObject scans every formal in reverse,
+    // recording a name even when its last index lies beyond the actual argument list.
+    // Check both directions of aliasing and the still-mapped, supplied last occurrence.
+    check(
+        r#"
+        function duplicate(a,a){
+            var original=arguments[0];
+            arguments[0]=7;
+            var afterIndex=a;
+            a=9;
+            return original+':'+afterIndex+':'+arguments[0]+':'+arguments[1]+':'+a;
+        }
+        function interleaved(a,b,a){
+            arguments[0]=6;arguments[1]=8;
+            var before=a;a=9;
+            return before+':'+b+':'+arguments[0]+':'+arguments[1]+':'+(2 in arguments);
+        }
+        function define(a,a){
+            Object.defineProperty(arguments,'0',{value:7,writable:false});
+            var before=a;a=9;
+            return before+':'+arguments[0]+':'+a;
+        }
+        function escaped(a,a){return {args:arguments,set:function(v){a=v},get:function(){return a}}}
+        var e=escaped(3);e.set(9);e.args[0]=8;
+        [duplicate(3),duplicate(3,4),duplicate(),interleaved(3,4),define(3),
+            e.get()+':'+e.args[0]].join('|')
+        "#,
+        "3:undefined:7:undefined:9|3:4:7:9:9|undefined:undefined:7:undefined:9|undefined:8:6:8:false|undefined:7:9|9:8",
+        &[("duplicate", Prepared), ("interleaved", Prepared), ("define", Prepared), ("escaped", Prepared)],
+        true,
+    );
+}
+
+#[test]
 fn compiled_entry_hoists_and_block_capture_identity() {
     check(
         r#"

@@ -13285,22 +13285,18 @@ impl Interp {
             // Mapped: indices alias the parameter bindings (which live in `scope`). With
             // duplicate parameter names only the LAST occurrence is mapped — earlier indices
             // stay plain data properties holding the original argument values.
-            let mut names: Vec<Option<String>> = func
-                .params
-                .iter()
-                .take(args.len())
-                .map(|p| match &p.pattern {
-                    Pattern::Ident(n) => Some(n.clone()),
-                    _ => None,
-                })
-                .collect();
+            let mut names = vec![None; func.params.len().min(args.len())];
             let mut seen: Vec<String> = Vec::new();
-            for slot in names.iter_mut().rev() {
-                if let Some(n) = slot {
-                    if seen.contains(n) {
-                        *slot = None;
-                    } else {
-                        seen.push(n.clone());
+            // CreateMappedArgumentsObject walks ALL formals before checking index < argc.
+            // A missing final duplicate still prevents an earlier supplied index from mapping.
+            for (index, parameter) in func.params.iter().enumerate().rev() {
+                let Pattern::Ident(name) = &parameter.pattern else {
+                    unreachable!("mapped arguments require simple formals")
+                };
+                if !seen.contains(name) {
+                    seen.push(name.clone());
+                    if let Some(slot) = names.get_mut(index) {
+                        *slot = Some(name.clone());
                     }
                 }
             }
