@@ -1650,6 +1650,14 @@ impl Drop for JitCode {
 }
 
 impl JitCode {
+    #[cfg(test)]
+    pub(crate) fn test_residency_marks(&self, reset_reference: bool) -> (u64, u8) {
+        if reset_reference {
+            self.residency.referenced.set(0);
+        }
+        (self.residency.active.get(), self.residency.referenced.get())
+    }
+
     /// Heap-requested metadata only. The executable mapping is intentionally excluded and remains
     /// visible through the independent generated-code byte metric.
     pub(crate) fn retained_heap_metadata_bytes(&self) -> usize {

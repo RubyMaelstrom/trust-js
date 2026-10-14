@@ -6913,6 +6913,22 @@ fn call_cache_seeds(chunk: &Chunk) -> Vec<CallSeed> {
         .collect()
 }
 
+/// Leading pure string expressions have a normal completion discarded by FunctionBody
+/// evaluation. Str includes directives, substitution-free templates and parenthesized
+/// strings; parser strictness and the original source text remain authoritative.
+/// Script/eval/module completion values must never pass through this function-only view.
+fn function_body_statements(body: &[Stmt]) -> &[Stmt] {
+    let prefix = body
+        .iter()
+        .take_while(|statement| matches!(statement, Stmt::Expr(Expr::Str(_))))
+        .count();
+    &body[prefix..]
+}
+
+#[cfg(test)]
+#[path = "bytecode_function_directive_tests.rs"]
+mod function_directive_tests;
+
 fn compile_inner(
     func: &Function,
     plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
@@ -7428,7 +7444,12 @@ fn compile_inner(
             return None;
         }
     }
-    let compile_body = |compiler: &mut Compiler| compiler.statement_list(&func.body);
+    let body = if script_body || module_bindings.is_some() {
+        &func.body[..]
+    } else {
+        function_body_statements(&func.body)
+    };
+    let compile_body = |compiler: &mut Compiler| compiler.statement_list(body);
     let has_body_using = func.body.iter().any(|statement| {
         matches!(
             statement,
@@ -9460,7 +9481,7 @@ impl Compiler {
         }
         let empty = crate::fasthash::FastSet::default();
         self.declare_body_lexicals(&f.body, &empty)?;
-        for stmt in &f.body {
+        for stmt in function_body_statements(&f.body) {
             self.stmt(stmt)?;
         }
         self.emit(Op::Undef); // implicit return value
