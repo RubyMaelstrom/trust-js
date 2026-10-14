@@ -2652,11 +2652,9 @@ pub(crate) fn heap_allocated_objects(heap: &GcHeap) -> u64 {
 
 /// Stable address of this Agent's live-object counter. JIT activations capture it when execution
 /// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
-/// Both native backends capture this pointer in the shared JIT entry paths.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+/// Both native backends capture this pointer in the shared JIT entry paths. Those
+/// wrappers are also type-checked on fallback targets; obtaining this stable Cell
+/// address does not depend on native code generation or a platform ABI.
 pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
 }
