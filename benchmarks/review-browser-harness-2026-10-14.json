@@ -1652,7 +1652,7 @@
       "N3 screen is descriptive, not acceptance, reliable uncertainty or equivalence evidence. Final default comparison requires at least seven retained matched pairs, final conformance and v2 functional evidence.",
       "Phase0 baseline own-CPU tail20.09s versus17.39/17.32s and inside-official outside-actions7.837s versus5.742/5.793s is retained; MAD alone understates variability.",
       "React paired duration changes span -15.7% to +17.4%; one baseline and one candidate paired process also have retained own-CPU/untimed-setup tails.",
-      "Launch before official collector median +20.03% (about0.13\u20130.20s); this is a separate preflight/startup/resource concern, not a claim of isolated startup cost.",
+      "Launch-minus-official paired median residual +20.03% (about0.13\u20130.20s). This mixed clock contains the launch-to-collector-start prefix plus collector-end/report/transport/Node-validation suffix; existing timing records cannot assign the difference to engine startup, browser initialization, fixture preflight or report processing. Raw legacy field and all values are preserved.",
       "All observed browser thread affinities are CPU5; approximate CPU5 busy-minus-sampled-browser counters retain negative/rounded residuals and miss final process CPU. They do not identify a tail cause.",
       "The one-second outer /proc observer does not modify JS/official collector, but it is additional host monitoring onCPU4; own heavy jobs were held and non-owned machine activity was left untouched."
     ]
@@ -1791,5 +1791,53 @@
       "scope": "Later metadata-only root monitor observed16 Cargo processes in180seconds,12 in an unrelated project, allPPID1. Raw journal is retained separately; no arguments/environments collected or processes signalled. Aggregate summary omits unrelated project path. This does not identify already-dead guard PIDs, qualify any previous interrupted sample or change strict exclusion."
     },
     "reserved_window_limitation": "All nine official/control completions valid; strict guard exclusion remains unchanged despite user reservation. No pair4, no supplement joining, no N7 composite, no automatic timing retry."
+  },
+  "launch_minus_official_residual_clock_audit": {
+    "status": "exact_clock_definition_audited_unresolved_phase_attribution",
+    "report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/launch-collector-residual-audit-2026-10-14.json",
+      "sha256": "2165cc30cab0d8ad60855610b077ad1f329a3902530ae75e57a44d3b01c61820"
+    },
+    "script": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/audit-launch-collector-residual.py",
+      "sha256": "60811bebc4386dba13727231cb43a25c56f315db258f01b6535d3f44d20ca950"
+    },
+    "raw_values_unchanged": true,
+    "legacy_resource_field": "launch_before_official_interval_s",
+    "actual_definition": "Node launch-to-validated-report duration minus browser collector start-to-report-payload-clock duration; prefix plus suffix, not isolated startup/preflight.",
+    "scope": "Read-only analysis of57records/eightcohorts and five separate stage diagnostics. Every excluded cohort remains wholly excluded from performance acceptance. Source lines/hashes and all seven observed RAF intervals retained.",
+    "timing_eligible": false,
+    "performance_acceptance": false
+  },
+  "admission_telemetry_diagnostic_v1": {
+    "status": "valid_react_normal_hot_pilot_incomplete_application_chunk_coverage",
+    "report": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/admission-telemetry-react-normalhot-v1-analysis.json",
+      "sha256": "a5d038a05b827485db8fe46519cecf5a84b95e3336ea072bc004c71bf04ffd01"
+    },
+    "script": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/analyze-admission-normalhot-pilot.py",
+      "sha256": "2373be652f4f24dcbaa0d78868f2e507d737a80d1f417d76e51c37150372efdc"
+    },
+    "browser_manifest": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/admission-telemetry-browser-manifest-v1.json",
+      "sha256": "985227ca5824095c1704d022f8ebcea26e87f95bd8fd6b4fe4ab4a22483ba6b6"
+    },
+    "timing_eligible": false,
+    "performance_acceptance": false,
+    "normal_hot_threshold": true,
+    "optimizer_requests": 0,
+    "optimizer_publications": 0,
+    "final_live_records": 603,
+    "expired_unretained_records": 285,
+    "coverage": "Existing sampling-prologue physical entry progress only; logical inline/VM calls/other seams excluded, stopped prefixes lower bounds, null unavailable. No newly emitted native probes.",
+    "limits": "Final weak snapshot loses expired application chunks; absence of Qu fingerprint cannot recover its eligibility/count/decline. Aggregate zero requests/publications independently shows no optimizer publication in this pilot. One React-only iteration with TRACE/PERF forcedGC/postidle timer; no performance or application repayment claim.",
+    "next_source": "New bounded cold-drop ended-record diagnostic source is being tested/reviewed separately; no further browser build launched."
+  },
+  "post_checkpoint_root_audit": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/current-followups-root/audit.json",
+    "sha256": "7e4467eee5246828d689a806ea63e9ecc41035d46168e5c1ec80008eee221f10",
+    "scope": "Independently verified all57 clock records, raw normal-hot admission populations/histograms, zero optimizer requests/publications, referenced source/artifact/report hashes. No new browser timing; excluded cohorts unchanged.",
+    "performance_acceptance": false
   }
 }

@@ -628,5 +628,65 @@
   "root_audit": {
     "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/followups-root-audit.json",
     "sha256": "7093fb53efd548929d448833c7f2b3b2bc5595bc89996318dd9744172753fcbf"
+  },
+  "exact_committed_head_default_feature_validation": {
+    "revision": "e8232cf862595d76a0c083e75d18da82d2f7273f",
+    "affinity": [
+      13,
+      14
+    ],
+    "features": "default intl; optimizing-jit disabled",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--offline",
+      "-p",
+      "trust-js",
+      "--lib",
+      "--no-run",
+      "-j2",
+      "--message-format=json-render-diagnostics"
+    ],
+    "started": 1791981438.93197,
+    "scope": "Exact committed main default-feature build and both new Realm tests.",
+    "build_exit_code": 0,
+    "build_elapsed_seconds": 50.24171185493469,
+    "build_log_sha256": "2d59eda34fe50a47b4743f9ef27e85983267deaf9551bf6ab015381feaadf06d",
+    "binary_sha256": "971343600df9891ceed6911042e69e7cfe91b16252d4c9b2aa9f6d25f2983881",
+    "binary": "/big/Code/trust-js/target/compiler-review-20261014/validation/head-default-followups/trust-js-unit-tests",
+    "results": [
+      {
+        "command": [
+          "/big/Code/trust-js/target/compiler-review-20261014/validation/head-default-followups/trust-js-unit-tests",
+          "tests::cross_realm_nested_constructor_callbacks_restore_caller_errors_across_gc",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 16.455397605895996,
+        "log": "/big/Code/trust-js/target/compiler-review-20261014/validation/head-default-followups/test-0.log",
+        "log_sha256": "41d63562c1137455be259a1676939b2ab20dc8bd9ef349e386b2eba027bbb379"
+      },
+      {
+        "command": [
+          "/big/Code/trust-js/target/compiler-review-20261014/validation/head-default-followups/trust-js-unit-tests",
+          "function_realm_lifetime_tests::old_global_environment_keeps_detached_callables_creation_realm_live",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "elapsed_seconds": 0.34889793395996094,
+        "log": "/big/Code/trust-js/target/compiler-review-20261014/validation/head-default-followups/test-1.log",
+        "log_sha256": "9805fde76dc3f12f2cdd12328d78ff19e4a32bdfdbfef238d01794ec3a9cf8db"
+      }
+    ],
+    "complete": true,
+    "raw_test_logs": {
+      "test-0.log": "\nrunning 1 test\ntest tests::cross_realm_nested_constructor_callbacks_restore_caller_errors_across_gc ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2004 filtered out; finished in 16.44s\n\n",
+      "test-1.log": "\nrunning 1 test\ntest function_realm_lifetime_tests::old_global_environment_keeps_detached_callables_creation_realm_live ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2004 filtered out; finished in 0.34s\n\n"
+    }
   }
 }
