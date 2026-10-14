@@ -1091,6 +1091,14 @@ impl Cfg {
         Self::build_with(ops, |pc| chunk.jit_stack_effect(pc))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_build_with(
+        ops: &[Op],
+        effect: impl Fn(usize) -> Option<(usize, usize)>,
+    ) -> Result<Cfg, BuildError> {
+        Self::build_with(ops, effect)
+    }
+
     pub(crate) fn build_osr(chunk: &Chunk) -> Result<Cfg, BuildError> {
         let mut graph =
             Self::build_with(chunk.jit_ops(), |pc| chunk.jit_borrowed_stack_effect(pc))?;

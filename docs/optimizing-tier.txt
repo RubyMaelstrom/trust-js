@@ -1097,3 +1097,66 @@ independent optimizer publication. The pinned strict React Qu diagnostic fits th
 unchanged IR budget, but its constructed fixture produced no native Qu entries or
 normal-policy publication. The actual prepared browser body and compilation cost
 repayment remain separate application gates.
+
+Bounded literal-string comparison and ordered case dispatch
+-----------------------------------------------------------
+The optional backend now fuses a private-local read, immutable String
+constant, strict equality/inequality and conditional branch when the original CFG
+and owning stack certificate permit it. It borrows the current local and the exact
+Chunk's literal without creating two temporary owners. The first LoadLocal's settled
+initialization proof can omit its Empty test; absent or exhausted proofs retain VM
+recovery before the original start, including reversed Const/load order and TDZ position.
+Non-Strings do not match a String literal and invoke no conversion or author callback.
+Engine text, String views and lone surrogates retain exact code-unit equality.
+
+Consecutive equality cases over the same unchanged local can share one borrowed
+source-order helper and native ordinal dispatch, bounded to 128 cases per group.
+The first duplicate selects its original destination. Original case Jumps, bodies,
+default and fallthrough remain; a matching formerly cold case still recovers before
+its original Jump. External/interior entries, handlers, cleanup roots, polls and stress
+recovery boundaries cannot be consumed. Each outcome uses its own original branch
+stack/dirty state, retaining opaque canonical owners. Longer chains split into ordered
+groups. Generated code adds no JavaScript owners or owning literal tables.
+
+Hot mode can identify literal-only and zero-formal bodies through this complete
+certificate. Conservative credit is one constant-owner work unit after both original
+reads: two retain/release operations less one String tag check per comparison. Grouping
+adds no semantic credit or case-body savings. Full original certificate/group scans,
+attempted value solvers (including exhausted results), and bounded helper/switch/owner
+publication work remain charged. Small normal/abrupt minima combine guards once; large
+observed-region branch unions remain explicitly provisional opportunity heuristics.
+Feature/runtime defaults, threshold overrides and hard IR/block limits are unchanged.
+Execution diagnostics distinguish single comparison sites from one event per executed
+group; that event does not count skipped comparisons or case-body work.
+
+The frozen 2026-10-15 composition on ab7251e8 passed 94 focused ARM64 debug selections,
+four additional direct all-clobber/full-reload cases, strict optimizing-jit+embed
+all-target Clippy and the default all-target compile check. This includes actual
+normal-policy native publication, first/late/missing/duplicate cases, a 128+2 split,
+real 300-byte sole-owned String views, collection, opaque owning floors, TDZ and exact
+cold/stress recovery. Existing pruning tests require their recorded shared-operation
+controls; one default-control budget refusal is independently reproduced on the earlier
+baseline. The unchanged frozen composition also passed 45 selected native GNU x64 tests and
+45 MSVC x64 tests under Wine 11.19, with default/optional all-target checks on both.
+These are selected debug-profile native correctness gates, not a physical Windows
+or full-suite claim. The successor integration retains the committed accumulation
+and duplicate-argument mapping changes. Its fresh ARM64 integration passed 115 unique
+selected tests plus four direct full-reload/all-clobber cases, strict optional all-target
+Clippy and the default all-target compile check. These integration results are separate
+from the earlier component/native-platform checks and establish no application speedup.
+See benchmarks/review-literal-dispatch-validation-2026-10-15.json for exact artifacts.
+
+The separate pinned React emission probe is component evidence, not current application
+execution or performance acceptance. Its grouped renderElement comparison reduced
+12,266 to 12,112 CLIF instructions and 52,760 to 51,780 ARM body bytes; shared Rust helper
+text is outside those byte counts. pushStartInstance still failed the unchanged 16K IR
+cap, so no complete native body or compile repayment is claimed. This is implemented
+native String comparison/dispatch functionality inside an off-default tier, not a
+completed Node-class optimizer.
+
+Normative source: ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+IsStrictlyEqual, SameValueNonNumber, CaseClauseIsSelected and CaseBlockEvaluation:
+https://tc39.es/ecma262/#sec-isstrictlyequal
+https://tc39.es/ecma262/#sec-samevaluenonnumber
+https://tc39.es/ecma262/#sec-runtime-semantics-caseclauseisselected
+https://tc39.es/ecma262/#sec-runtime-semantics-caseblockevaluation

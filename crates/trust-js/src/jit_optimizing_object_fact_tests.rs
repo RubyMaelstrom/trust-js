@@ -926,17 +926,46 @@ fn actual_default_hot_object_branch_executes_and_null_getter_misses_retire() {
         return;
     }
     let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
+    engine.set_tier(Tier::Bytecode);
     engine.set_tier_threshold(0);
     eval(&mut engine, SOURCE);
     assert_eq!(
-        eval(
-            &mut engine,
-            "for(var k=0;k<50000;k++)subject(receiver);subject(receiver)"
-        ),
+        eval(&mut engine, "subject(receiver)"),
         "value|value|value|value|value|value|value"
     );
     let function = author_function(&mut engine);
+    let primary = function.code.get().and_then(Option::as_ref).unwrap();
+    let calls = if object_facts::enabled() {
+        let cfg = Cfg::build(primary).unwrap();
+        let stack = stack::StackPlan::build(primary, &cfg).unwrap();
+        let (selected, _, object) = plans(primary);
+        let object = object.unwrap();
+        let structural =
+            generic_admission::Plan::with_objects(primary, &cfg, &stack, &selected, Some(&object))
+                .unwrap();
+        assert!(string_literals::Plan::build(primary, &cfg, &stack, None, None).is_none());
+        // Use the finalized structural minimum, including its one Object guard
+        // debit, and the exact full-source literal scan/filter price. No fused
+        // comparisons or extra value solver/group attempt exist in this body.
+        let work =
+            string_literals::analysis_work_with_filter(primary.jit_ops().len(), true).unwrap();
+        let target =
+            generic_admission::admission_entries_with_work(primary, structural.minimum_tests, work)
+                .unwrap()
+                .max(4096);
+        assert!(std::env::var_os("TRUST_JS_OPT_JIT_HOT_AT").is_none());
+        target + u64::from(hot_threshold(primary.jit_ops().len())) * 4 + 16
+    } else {
+        50000
+    };
+    engine.set_tier(Tier::Jit);
+    assert_eq!(
+        eval(
+            &mut engine,
+            &format!("for(var k=0;k<{calls};k++)subject(receiver);subject(receiver)")
+        ),
+        "value|value|value|value|value|value|value"
+    );
     if !object_facts::enabled() {
         assert!(function.optimizing_code.get().is_none());
         return;

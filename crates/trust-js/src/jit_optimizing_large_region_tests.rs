@@ -466,6 +466,8 @@ fn large_work_arithmetic_overflow_is_declined_without_wrapping_or_dividing_zero(
         original_frame: 0,
         cold_recovery: 0,
         call_imports: 0,
+        literal_analysis: 0,
+        literal_dispatch_lowering: 0,
     };
     assert!(work.total().is_none());
     assert!(work.admission_entries(1).is_none());
@@ -476,6 +478,8 @@ fn large_work_arithmetic_overflow_is_declined_without_wrapping_or_dividing_zero(
         original_frame: 0,
         cold_recovery: 0,
         call_imports: 0,
+        literal_analysis: 0,
+        literal_dispatch_lowering: 0,
     };
     assert_eq!(work.total(), Some(u64::MAX));
     assert!(work.admission_entries(1).is_none());

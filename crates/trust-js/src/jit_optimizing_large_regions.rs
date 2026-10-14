@@ -78,6 +78,8 @@ pub(super) struct Work {
     pub(super) original_frame: u64,
     pub(super) cold_recovery: u64,
     pub(super) call_imports: u64,
+    pub(super) literal_analysis: u64,
+    pub(super) literal_dispatch_lowering: u64,
 }
 
 impl Work {
@@ -86,7 +88,9 @@ impl Work {
             .checked_add(self.original_labels)?
             .checked_add(self.original_frame)?
             .checked_add(self.cold_recovery)?
-            .checked_add(self.call_imports)
+            .checked_add(self.call_imports)?
+            .checked_add(self.literal_analysis)?
+            .checked_add(self.literal_dispatch_lowering)
     }
 
     pub(super) fn admission_entries(&self, opportunities: u32) -> Option<u64> {
@@ -174,7 +178,22 @@ pub(super) fn work(
         original_frame,
         cold_recovery,
         call_imports,
+        literal_analysis: 0,
+        literal_dispatch_lowering: 0,
     })
+}
+
+pub(super) fn work_with_literals(
+    chunk: &Chunk,
+    cfg: &Cfg,
+    stack: &stack::StackPlan,
+    frame: &frame::FramePlan,
+    regions: &observed_regions::Plan,
+) -> Option<Work> {
+    let mut work = work(chunk, cfg, stack, frame, regions)?;
+    // Even a no-match Plan initializes/scans the original graph, including all VM cuts.
+    work.literal_analysis = super::string_literals::analysis_work(chunk.jit_ops().len())?;
+    Some(work)
 }
 
 /// Normal-edge native reachability stops at every VM cut. Handler roots remain
@@ -187,6 +206,19 @@ pub(super) fn opportunity_tests(
     regions: &observed_regions::Plan,
     numeric: Option<&super::specialization::Plan>,
     structural: Option<&super::generic_admission::Plan>,
+) -> Option<u32> {
+    opportunity_work(chunk, cfg, regions, numeric, structural, None)
+}
+
+/// Adds actual selected literal-owner work to the existing branch-union heuristic.
+/// Handler-only roots and operations after a VM cut provide no credit.
+pub(super) fn opportunity_work(
+    chunk: &Chunk,
+    cfg: &Cfg,
+    regions: &observed_regions::Plan,
+    numeric: Option<&super::specialization::Plan>,
+    structural: Option<&super::generic_admission::Plan>,
+    literals: Option<&super::string_literals::Plan>,
 ) -> Option<u32> {
     if !certificate(chunk, cfg, Some(regions)) {
         return None;
@@ -224,6 +256,7 @@ pub(super) fn opportunity_tests(
                 saved = saved.checked_add(structural.per_pc[pc].unwrap_or(0))?;
             }
             saved = saved.checked_add(numeric_pc[pc])?;
+            saved = saved.checked_add(literals.map_or(0, |plan| plan.credit_at(pc)))?;
         }
     }
     let guards = numeric.map_or(0, |plan| plan.inputs.len() + plan.properties.len());

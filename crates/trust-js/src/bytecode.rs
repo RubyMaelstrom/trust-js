@@ -6301,6 +6301,38 @@ pub fn compile(func: &Function) -> Option<Rc<Chunk>> {
     result
 }
 
+#[cfg(all(test, feature = "optimizing-jit"))]
+thread_local! {
+    static TEST_PARKED_HANDLER_OWNER: std::cell::Cell<Option<(usize, &'static str, usize)>> = const { std::cell::Cell::new(None) };
+    static TEST_PARKED_HANDLER_SITE: std::cell::Cell<Option<(usize, u16)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Complete compiler fixture with one owned temporary parked before an author handler.
+/// All original compiler positions, jump patches, cache/feedback sites and stack metadata
+/// are generated normally. This is not evidence of the current parser/inliner's emission.
+#[cfg(all(test, feature = "optimizing-jit"))]
+pub(crate) fn compile_test_parked_handler_owner(
+    func: &Function,
+    name: &'static str,
+    ordinal: usize,
+) -> Option<(Rc<Chunk>, usize, u16)> {
+    struct Restore(Option<(usize, &'static str, usize)>, Option<(usize, u16)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_PARKED_HANDLER_OWNER.with(|control| control.set(self.0));
+            TEST_PARKED_HANDLER_SITE.with(|site| site.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        TEST_PARKED_HANDLER_OWNER
+            .with(|control| control.replace(Some((func as *const _ as usize, name, ordinal)))),
+        TEST_PARKED_HANDLER_SITE.with(|site| site.replace(None)),
+    );
+    let chunk = compile(func)?;
+    let (pc, slot) = TEST_PARKED_HANDLER_SITE.with(std::cell::Cell::get)?;
+    Some((chunk, pc, slot))
+}
+
 /// Compile a derived class constructor against a retained Function Environment Record.
 ///
 /// Unlike an ordinary lean frame, that environment starts with an uninitialized `this` binding
@@ -7161,6 +7193,15 @@ fn compile_inner(
         }
     }
     let mut c = Compiler {
+        #[cfg(all(test, feature = "optimizing-jit"))]
+        test_handler_park: TEST_PARKED_HANDLER_OWNER.with(|control| {
+            control.get().and_then(|(target, name, ordinal)| {
+                (target == func as *const _ as usize).then(|| {
+                    TEST_PARKED_HANDLER_SITE.with(|site| site.set(None));
+                    (name, ordinal)
+                })
+            })
+        }),
         self_hosted: func.self_hosted,
         lean_new_target,
         rest_slot: None,
@@ -8510,6 +8551,8 @@ impl Default for CompilePosition {
 
 #[derive(Default)]
 struct Compiler {
+    #[cfg(all(test, feature = "optimizing-jit"))]
+    test_handler_park: Option<(&'static str, usize)>,
     /// Compiling a body of the engine's self-hosted built-in source (see `crate::self_hosted`):
     /// calls of its intrinsics' free names compile to operations (see `self_hosted_intrinsic`).
     /// Follows the function being compiled, including a callee spliced by the inliner.
@@ -9138,6 +9181,26 @@ impl Compiler {
     }
 
     fn emit(&mut self, op: Op) -> usize {
+        #[cfg(all(test, feature = "optimizing-jit"))]
+        if matches!(op, Op::PushHandler(_)) && self.inline_depth == 0 {
+            let park = self
+                .test_handler_park
+                .as_mut()
+                .and_then(|(name, remaining)| {
+                    if *remaining == 0 {
+                        return None;
+                    }
+                    *remaining -= 1;
+                    (*remaining == 0).then_some(*name)
+                });
+            if let Some(name) = park {
+                let Some(Home::Slot(slot, _)) = self.home(name) else {
+                    panic!("test handler owner must have a private slot")
+                };
+                let parked = self.emit(Op::LoadLocal(slot));
+                TEST_PARKED_HANDLER_SITE.with(|site| site.set(Some((parked, slot))));
+            }
+        }
         let op = match self.inline_env_targets.last() {
             Some(&target) => self.inline_env_op(op, target),
             None => op,

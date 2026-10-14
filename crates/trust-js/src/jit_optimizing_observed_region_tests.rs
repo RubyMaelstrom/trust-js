@@ -1119,7 +1119,13 @@ fn real_hot_background_publication_uses_frozen_regions_and_keeps_the_256_op_gate
     let saved = regions
         .minimum_saved_tests(&primary, &cfg, numeric.as_ref(), Some(&structural), None)
         .unwrap();
-    let distance = generic_admission::admission_entries(&primary, saved, 0)
+    // Literal certification scans the full original graph even when it finds no
+    // comparisons. Price the possible Object reachability filter conservatively;
+    // this fixture does not inject category samples to force a particular plan.
+    assert!(string_literals::Plan::build(&primary, &cfg, &stack, Some(&regions), None).is_none());
+    let literal_work =
+        string_literals::analysis_work_with_filter(primary.jit_ops().len(), true).unwrap();
+    let distance = generic_admission::admission_entries_with_work(&primary, saved, literal_work)
         .unwrap()
         .max(4096);
     assert!(distance < 200_000 && std::env::var_os("TRUST_JS_OPT_JIT_HOT_AT").is_none());

@@ -347,7 +347,7 @@ impl ValuePlan {
     }
 
     #[cfg(test)]
-    fn with_budget(
+    pub(super) fn with_budget(
         chunk: &Chunk,
         cfg: &Cfg,
         stack_plan: &stack::StackPlan,

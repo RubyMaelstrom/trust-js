@@ -401,6 +401,39 @@ impl PackedValue {
         }
     }
 
+    /// Compare a borrowed execution word with canonical engine text without manufacturing
+    /// a temporary String owner. Other language types are strictly unequal to a String.
+    ///
+    /// # Safety
+    /// If `bits` has the String tag, an owning canonical/SSA word must keep that exact LStr
+    /// allocation live for this call. This routine cannot allocate, poll, collect or call JS.
+    #[cfg(feature = "optimizing-jit")]
+    #[inline]
+    pub(crate) unsafe fn raw_string_equals(bits: u64, literal: &str) -> bool {
+        let word = std::mem::ManuallyDrop::new(Self(Cell::new(bits)));
+        if word.tag() != PACK_STR {
+            return false;
+        }
+        let string = std::mem::ManuallyDrop::new(unsafe { word.read_word::<crate::lstr::LStr>() });
+        string.as_str() == literal
+    }
+
+    /// Borrow canonical engine text once for an observer-free primitive operation. Views
+    /// and lone surrogates retain the existing LStr representation; no temporary owner is made.
+    ///
+    /// # Safety
+    /// An owning canonical or SSA word must pin this allocation throughout `f`. The closure
+    /// must not allocate, poll, collect, call JavaScript, or mutate that owner's storage.
+    #[cfg(feature = "optimizing-jit")]
+    #[inline]
+    pub(crate) unsafe fn with_raw_string_text<R>(
+        bits: u64,
+        f: impl FnOnce(&str) -> R,
+    ) -> Option<R> {
+        let word = std::mem::ManuallyDrop::new(Self(Cell::new(bits)));
+        word.with_string(|string| f(string.as_str()))
+    }
+
     /// Lend the strong object edge this word owns (an object, or a deferred prototype's single
     /// stored edge) without a reference-count round trip. Never materializes a prototype.
     #[inline]

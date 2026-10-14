@@ -140,6 +140,11 @@ mod store_tests;
 mod stores;
 #[path = "jit_optimizing_strict_null.rs"]
 mod strict_null;
+#[path = "jit_optimizing_string_literals.rs"]
+mod string_literals;
+
+#[path = "jit_optimizing_string_dispatch.rs"]
+mod string_dispatch;
 #[path = "jit_optimizing_values.rs"]
 mod value_facts;
 
@@ -286,6 +291,7 @@ fn has_sampling_source(chunk: &Chunk) -> bool {
         Op::GetPropThis(..) => true,
         _ => false,
     }) || generic_admission::has_source(chunk)
+        || string_literals::has_source(chunk)
 }
 
 /// Called at bounded baseline entry checkpoints, before executing any bytecode.
@@ -352,7 +358,11 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         observed.set(observed.get() | sampled_property(ctx, *pc as usize).unwrap_or(u32::MAX));
     }
     generic_admission::observe(chunk, &samples.structural);
-    if count == 0 && samples.properties.is_empty() && samples.structural.is_empty() {
+    if count == 0
+        && samples.properties.is_empty()
+        && samples.structural.is_empty()
+        && !string_literals::has_source(chunk)
+    {
         return;
     }
     let rearm = |distance: u64| {
@@ -427,6 +437,70 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         object_plan.as_ref(),
         regions.as_ref(),
     );
+    let try_literal_values = chunk.jit_ops().len() <= 256
+        && numeric.is_none()
+        && object_plan.is_none()
+        && std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0")
+        && string_literals::has_source(chunk);
+    let literal_values = try_literal_values
+        .then(|| value_facts::ValuePlan::build(chunk, &cfg, &stack))
+        .flatten();
+    let literal_read_values = object_plan
+        .as_ref()
+        .map(|plan| &plan.values)
+        .or_else(|| numeric.as_ref().map(|plan| &plan.values))
+        .or(literal_values.as_ref());
+    let values = *(&*ctx.interp)
+        .jit_layout
+        .get_or_init(|| crate::value::jit_layout(&(&*ctx.interp).object_proto));
+    let literals = crate::value::jit_packed_owners_supported(&values)
+        .then(|| {
+            string_literals::Plan::build(
+                chunk,
+                &cfg,
+                &stack,
+                regions.as_ref(),
+                configured_deopt(chunk),
+            )
+        })
+        .flatten()
+        .and_then(|plan| {
+            plan.restrict_reachable(object_plan.as_ref().map(|plan| plan.reachable.as_slice()))
+        });
+    let dispatch = literals.as_ref().and_then(|literals| {
+        string_dispatch::Plan::build(
+            chunk,
+            &cfg,
+            &stack,
+            regions.as_ref(),
+            object_plan.as_ref().map(|plan| plan.reachable.as_slice()),
+            configured_deopt(chunk),
+            literals,
+        )
+    });
+    // Charge attempts, not just successful groups. A rejected certificate still scans
+    // the original graph. Keep the literal owner's existing conservative net1 credit.
+    let dispatch_analysis = if literals.is_some() {
+        string_dispatch::analysis_work(chunk.jit_ops().len())
+    } else {
+        Some(0)
+    };
+    let dispatch_lowering = dispatch
+        .as_ref()
+        .map_or(Some(0), |plan| plan.lowering_work(&stack));
+    let literal_analysis =
+        string_literals::analysis_work_with_filter(chunk.jit_ops().len(), object_plan.is_some())
+            .and_then(|work| {
+                let extra = string_literals::checkpoint_value_work(
+                    chunk.jit_ops().len(),
+                    chunk.jit_frame().1,
+                    stack.capacity,
+                    try_literal_values,
+                )?;
+                work.checked_add(extra)?.checked_add(dispatch_analysis?)
+            });
+    let literal_compiler_work =
+        literal_analysis.and_then(|work| work.checked_add(dispatch_lowering?));
     let estimated_entries = if large {
         let regions = regions.as_ref().expect("large certificate");
         let frame = frame::FramePlan::build(
@@ -435,12 +509,32 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             std::env::var("TRUST_JS_OPT_JIT_LOCAL_EFFECTS").as_deref() != Ok("0"),
         );
         frame.and_then(|frame| {
-            let work = large_regions::work(chunk, &cfg, &stack, &frame, regions)?;
-            let saved = large_regions::opportunity_tests(chunk, &cfg, regions, numeric.as_ref(), structural.as_ref())?;
+            let mut work = large_regions::work_with_literals(chunk, &cfg, &stack, &frame, regions)?;
+            work.literal_analysis = literal_analysis?;
+            work.literal_dispatch_lowering = dispatch_lowering?;
+            let saved = if literals.is_some() {
+                large_regions::opportunity_work(chunk, &cfg, regions, numeric.as_ref(), structural.as_ref(), literals.as_ref())?
+            } else {
+                large_regions::opportunity_tests(chunk, &cfg, regions, numeric.as_ref(), structural.as_ref())?
+            };
             if std::env::var_os("TRUST_JS_OPT_JIT_LOG").is_some() {
-                eprintln!("[optimizing-large-opportunity] source={} ops={} native_ops={} cuts={} opportunity_tests={} work={} target={}", regions.source_version, chunk.jit_ops().len(), regions.native_ops, regions.cut_blocks, saved, work.total()?, work.admission_entries(saved)?);
+                eprintln!("[optimizing-large-opportunity] source={} ops={} native_ops={} cuts={} semantic_opportunity_work={} work={} target={}", regions.source_version, chunk.jit_ops().len(), regions.native_ops, regions.cut_blocks, saved, work.total()?, work.admission_entries(saved)?);
             }
             work.admission_entries(saved)
+        })
+    } else if literals.is_some() {
+        generic_admission::minimum_saved_work(
+            chunk,
+            &cfg,
+            numeric.as_ref(),
+            structural.as_ref(),
+            object_plan.as_ref().filter(|_| structural.is_some()),
+            regions.as_ref(),
+            literals.as_ref(),
+            literal_read_values,
+        )
+        .and_then(|saved| {
+            generic_admission::admission_entries_with_work(chunk, saved, literal_compiler_work?)
         })
     } else if let Some(regions) = &regions {
         regions
@@ -451,15 +545,28 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
                 structural.as_ref(),
                 object_plan.as_ref().filter(|_| structural.is_some()),
             )
-            .and_then(|saved| generic_admission::admission_entries(chunk, saved, 0))
+            .and_then(|saved| {
+                let old = generic_admission::admission_entries(chunk, saved, 0)?;
+                generic_admission::add_analysis_work(old, saved, literal_compiler_work?)
+            })
     } else if let Some(structural) = &structural {
-        generic_admission::admission_entries(
-            chunk,
-            numeric.as_ref().map_or(0, |plan| plan.saved_tests),
-            structural.minimum_tests,
-        )
+        let numeric_saved = numeric.as_ref().map_or(0, |plan| plan.saved_tests);
+        generic_admission::admission_entries(chunk, numeric_saved, structural.minimum_tests)
+            .and_then(|old| {
+                generic_admission::add_analysis_work(
+                    old,
+                    numeric_saved.checked_add(structural.minimum_tests)?,
+                    literal_compiler_work?,
+                )
+            })
     } else {
-        numeric.as_ref().map(|plan| plan.admission_entries(chunk))
+        numeric.as_ref().and_then(|plan| {
+            generic_admission::add_analysis_work(
+                plan.admission_entries(chunk),
+                plan.saved_tests,
+                literal_compiler_work?,
+            )
+        })
     };
     let Some(estimated_entries) = estimated_entries else {
         return;
@@ -896,6 +1003,8 @@ struct Lowering<'a, 'b> {
     numeric_plan: Option<&'b ranges::NumericPlan>,
     heap_metadata_plan: Option<&'b heap_proofs::MetadataPlan>,
     generic_own_plan: Option<&'b generic_own::Plan>,
+    string_literals: Option<&'b string_literals::Plan>,
+    string_dispatch: Option<&'b string_dispatch::Plan>,
     object_plan: Option<&'b object_facts::Plan>,
     property_results: &'b [(u32, value_facts::Types)],
     loop_facts: Option<&'b loop_facts::Plan>,
@@ -923,6 +1032,8 @@ struct Lowering<'a, 'b> {
     sp: Variable,
     helper_sig: SigRef,
     owner_leaf_sig: Option<SigRef>,
+    string_literal_sig: Option<SigRef>,
+    string_dispatch_sig: Option<SigRef>,
     read_guard_sig: Option<SigRef>,
     read_guard_result: Option<cranelift_codegen::ir::StackSlot>,
     read_guard_layout: Option<&'static crate::value::JitLayout>,
@@ -1839,6 +1950,13 @@ impl Lowering<'_, '_> {
     }
 }
 
+fn configured_deopt(chunk: &Chunk) -> Option<usize> {
+    std::env::var("TRUST_JS_OPT_JIT_DEOPT_AT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&pc| pc <= chunk.jit_ops().len())
+}
+
 fn compile_checked(
     chunk: &Chunk,
     values: &crate::value::JitLayout,
@@ -1846,10 +1964,7 @@ fn compile_checked(
 ) -> Result<JitCode, CompileError> {
     // Explicit diagnostic stress point, not a speculation/profitability policy. There is no
     // extra generated branch or call when unset. Tests select PCs directly, without env races.
-    let deopt_at = std::env::var("TRUST_JS_OPT_JIT_DEOPT_AT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&pc| pc <= chunk.jit_ops().len());
+    let deopt_at = configured_deopt(chunk);
     compile_with_deopt(chunk, values, layout, deopt_at)
 }
 
@@ -2260,8 +2375,29 @@ fn prepare_entry_with_limits(
                 }
             })
             .flatten();
+    let owners_valid = crate::value::jit_packed_owners_supported(values);
+    let string_literals = (owners_valid && continuation.is_none())
+        .then(|| string_literals::Plan::build(chunk, &cfg, &stack_plan, regions.as_ref(), deopt_at))
+        .flatten()
+        .and_then(|plan| {
+            plan.restrict_reachable(object_plan.as_ref().map(|plan| plan.reachable.as_slice()))
+        });
+    let string_dispatch = string_literals.as_ref().and_then(|literals| {
+        string_dispatch::Plan::build(
+            chunk,
+            &cfg,
+            &stack_plan,
+            regions.as_ref(),
+            object_plan.as_ref().map(|plan| plan.reachable.as_slice()),
+            deopt_at,
+            literals,
+        )
+    });
     if !chunk.optimizing_structural.is_empty() && generic_own_plan.is_none()
-        || chunk.optimizing_candidate && specialization.is_none() && structural_admission.is_none()
+        || chunk.optimizing_candidate
+            && specialization.is_none()
+            && structural_admission.is_none()
+            && string_literals.is_none()
     {
         return Err(CompileError::Unsupported);
     }
@@ -2270,15 +2406,30 @@ fn prepare_entry_with_limits(
             .as_ref()
             .filter(|regions| large_regions::certificate(chunk, &cfg, Some(regions)))
             .ok_or(CompileError::Unsupported)?;
-        let saved = large_regions::opportunity_tests(
+        let saved = large_regions::opportunity_work(
             chunk,
             &cfg,
             regions,
             specialization.as_ref(),
             structural_admission.as_ref(),
+            string_literals.as_ref(),
         )
         .ok_or(CompileError::Unsupported)?;
-        let work = large_regions::work(chunk, &cfg, &stack_plan, &frame, regions)
+        let mut work = large_regions::work_with_literals(chunk, &cfg, &stack_plan, &frame, regions)
+            .ok_or(CompileError::Unsupported)?;
+        work.literal_analysis =
+            string_literals::analysis_work_with_filter(ops.len(), object_plan.is_some())
+                .and_then(|work| {
+                    work.checked_add(if string_literals.is_some() {
+                        string_dispatch::analysis_work(ops.len())?
+                    } else {
+                        0
+                    })
+                })
+                .ok_or(CompileError::Unsupported)?;
+        work.literal_dispatch_lowering = string_dispatch
+            .as_ref()
+            .map_or(Some(0), |plan| plan.lowering_work(&stack_plan))
             .ok_or(CompileError::Unsupported)?;
         if let Some(record) = &diagnostic {
             record.set_large_policy(
@@ -2289,12 +2440,64 @@ fn prepare_entry_with_limits(
                     work.original_frame,
                     work.cold_recovery,
                     work.call_imports,
+                    work.literal_analysis,
+                    work.literal_dispatch_lowering,
                 ],
             );
         }
     }
+    if let Some(record) = &diagnostic {
+        record.set_string_dispatch_policy(
+            string_dispatch
+                .as_ref()
+                .map_or(0, |plan| plan.selected_groups()),
+            string_dispatch
+                .as_ref()
+                .map_or(0, |plan| plan.selected_cases()),
+            if string_literals.is_some() {
+                string_dispatch::analysis_work(ops.len()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            string_dispatch
+                .as_ref()
+                .map_or(Some(0), |plan| plan.lowering_work(&stack_plan))
+                .unwrap_or(u64::MAX),
+            string_dispatch
+                .as_ref()
+                .map_or(0, |plan| plan.payload_bytes()),
+        );
+        record.set_literal_policy(
+            string_literals
+                .as_ref()
+                .map_or(0, |plan| plan.selected_sites()),
+            string_literals::analysis_work_with_filter(ops.len(), object_plan.is_some())
+                .unwrap_or(u64::MAX),
+            string_literals
+                .as_ref()
+                .map_or(0, |plan| plan.payload_bytes()),
+        );
+    }
     if chunk.optimizing_candidate
         && ops.len() <= 256
+        && string_literals.is_some()
+        && generic_admission::minimum_saved_work(
+            chunk,
+            &cfg,
+            specialization.as_ref(),
+            structural_admission.as_ref(),
+            object_plan.as_ref(),
+            regions.as_ref(),
+            string_literals.as_ref(),
+            value_plan,
+        )
+        .is_none()
+    {
+        return Err(CompileError::Unsupported);
+    }
+    if chunk.optimizing_candidate
+        && ops.len() <= 256
+        && string_literals.is_none()
         && regions.as_ref().is_some_and(|plan| {
             plan.minimum_saved_tests(
                 chunk,
@@ -2351,7 +2554,25 @@ fn prepare_entry_with_limits(
     call_sig.params.push(AbiParam::new(types::I64));
     let call_sig = context.func.import_signature(call_sig);
     let helper_sig = context.func.import_signature(helper_sig);
-    let owners_valid = crate::value::jit_packed_owners_supported(values);
+    let string_dispatch_sig = string_dispatch.as_ref().map(|_| {
+        let mut signature = Signature::new(convention);
+        signature.params.extend([
+            AbiParam::new(types::I64),
+            AbiParam::new(types::I64),
+            AbiParam::new(types::I32),
+            AbiParam::new(types::I32),
+        ]);
+        signature.returns.push(AbiParam::new(types::I64));
+        context.func.import_signature(signature)
+    });
+    let string_literal_sig = string_literals.as_ref().map(|_| {
+        let mut signature = Signature::new(convention);
+        signature
+            .params
+            .extend([AbiParam::new(types::I64), AbiParam::new(types::I64)]);
+        signature.returns.push(AbiParam::new(types::I64));
+        context.func.import_signature(signature)
+    });
     let owner_leaf_sig = (owners_valid && owner_leaf::requested()).then(|| {
         let mut signature = Signature::new(convention);
         signature.params.push(AbiParam::new(types::I64));
@@ -2501,6 +2722,8 @@ fn prepare_entry_with_limits(
             numeric_plan: numeric_plan.as_ref(),
             heap_metadata_plan: heap_metadata_plan.as_ref(),
             generic_own_plan: generic_own_plan.as_ref(),
+            string_literals: string_literals.as_ref(),
+            string_dispatch: string_dispatch.as_ref(),
             object_plan: object_plan.as_ref(),
             property_results: object_plan
                 .as_ref()
@@ -2537,6 +2760,8 @@ fn prepare_entry_with_limits(
             sp,
             helper_sig,
             owner_leaf_sig,
+            string_literal_sig,
+            string_dispatch_sig,
             read_guard_sig: None,
             read_guard_result: None,
             read_guard_layout,
@@ -2649,12 +2874,26 @@ fn prepare_entry_with_limits(
                 _ if deopt_at == Some(pc) => {
                     lower.deopt_before(pc, error);
                 }
+                _ if lower.string_dispatch.is_some_and(|plan| plan.interior(pc))
+                    || lower.string_literals.is_some_and(|plan| plan.interior(pc)) =>
+                {
+                    // Preserve the original sparse-label certificate. Fusion interiors
+                    // have no semantic entry and are not workload-unseen regions.
+                    lower.b.ins().jump(error, &[]);
+                }
                 _ => {
                     #[cfg(test)]
                     if observed_regions::TEST_CAPTURE.with(std::cell::Cell::get) {
                         observed_regions::TEST_LOWERED.with(|pcs| pcs.borrow_mut().push(pc));
                     }
-                    lower.lower(pc, op);
+                    if let Some(site) = lower.string_dispatch.and_then(|plan| plan.site(pc)) {
+                        lower.string_case_dispatch(pc, site, instruction_limit, block_limit)?;
+                    } else if let Some(site) = lower.string_literals.and_then(|plan| plan.site(pc))
+                    {
+                        lower.string_literal_comparison(pc, site);
+                    } else {
+                        lower.lower(pc, op);
+                    }
                 }
             }
         }

@@ -312,6 +312,29 @@ pub(super) fn minimum_path(
     objects: Option<&super::object_facts::Plan>,
     regions: Option<&observed_regions::Plan>,
 ) -> Option<u32> {
+    minimum_path_with_values(
+        cfg,
+        chunk,
+        weights,
+        per_pc,
+        numeric_per_pc,
+        objects,
+        regions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // All original graph/proof inputs are borrowed together.
+fn minimum_path_with_values(
+    cfg: &Cfg,
+    chunk: &Chunk,
+    weights: &[u32],
+    per_pc: &[Option<u32>],
+    numeric_per_pc: &[u32],
+    objects: Option<&super::object_facts::Plan>,
+    regions: Option<&observed_regions::Plan>,
+    values: Option<&super::value_facts::ValuePlan>,
+) -> Option<u32> {
     let ops = chunk.jit_ops();
     let blocks = cfg.blocks();
     if blocks.is_empty()
@@ -387,7 +410,7 @@ pub(super) fn minimum_path(
         for pc in block.start..block.end {
             if let Some(credit) = per_pc[pc] {
                 prefix = prefix.checked_add(credit)?;
-            } else if may_throw(chunk, pc, objects) {
+            } else if may_throw(chunk, pc, objects, values) {
                 // A checked call/getter/conversion may exit before the block's
                 // final opcode. Later field savings cannot pay that entry.
                 minimum = minimum.min(prefix);
@@ -401,12 +424,18 @@ pub(super) fn minimum_path(
     Some(minimum)
 }
 
-fn may_throw(chunk: &Chunk, pc: usize, objects: Option<&super::object_facts::Plan>) -> bool {
+fn may_throw(
+    chunk: &Chunk,
+    pc: usize,
+    objects: Option<&super::object_facts::Plan>,
+    values: Option<&super::value_facts::ValuePlan>,
+) -> bool {
     let op = &chunk.jit_ops()[pc];
     // Use the IDENTICAL settled normal-edge initialization fact consumed by
     // ownership::LoadLocal. Object remains an owner: only its TDZ test disappears.
     if matches!(op, Op::LoadLocal(_))
-        && objects.is_some_and(|plan| plan.values.at[pc].local.initialized())
+        && (objects.is_some_and(|plan| plan.values.at[pc].local.initialized())
+            || values.is_some_and(|plan| plan.at[pc].local.initialized()))
     {
         return false;
     }
@@ -448,6 +477,96 @@ pub(super) fn admission_entries(
             .saturating_mul(1024)
             .div_ceil(u64::from(saved))
     })
+}
+
+/// Combined native normal/abrupt minimum, including literal-owner work after both reads.
+/// This remains the original <=256-op/no-handler path bound; large bodies use their named
+/// ordinary-reachable branch-union heuristic instead. Every emitted category guard is debited
+/// once. Literal owner work is not an exact count of removed type tests.
+#[allow(clippy::too_many_arguments)] // One combined certificate; no owning proof state.
+pub(super) fn minimum_saved_work(
+    chunk: &Chunk,
+    cfg: &Cfg,
+    numeric: Option<&super::specialization::Plan>,
+    structural: Option<&Plan>,
+    objects: Option<&super::object_facts::Plan>,
+    regions: Option<&observed_regions::Plan>,
+    literals: Option<&super::string_literals::Plan>,
+    values: Option<&super::value_facts::ValuePlan>,
+) -> Option<u32> {
+    if chunk.jit_ops().len() > 256 {
+        return None;
+    }
+    let mut structural_pc = vec![None; chunk.jit_ops().len()];
+    if let Some(plan) = structural {
+        structural_pc.copy_from_slice(&plan.per_pc);
+    }
+    let mut post_pc = vec![0u32; chunk.jit_ops().len()];
+    if let Some(plan) = numeric {
+        for opportunity in &plan.opportunities {
+            let at = post_pc.get_mut(opportunity.pc)?;
+            *at = at.checked_add(opportunity.removed_tests)?;
+        }
+    }
+    let mut weights = vec![0u32; cfg.blocks().len()];
+    for (id, block) in cfg.blocks().iter().enumerate() {
+        for pc in block.start..block.end {
+            if regions.is_none_or(|plan| plan.emission(pc) == observed_regions::Emission::Native)
+                && objects.is_none_or(|plan| plan.reachable[pc])
+            {
+                post_pc[pc] =
+                    post_pc[pc].checked_add(literals.map_or(0, |plan| plan.credit_at(pc)))?;
+                weights[id] = weights[id]
+                    .checked_add(structural_pc[pc].unwrap_or(0))?
+                    .checked_add(post_pc[pc])?;
+            } else {
+                structural_pc[pc] = None;
+                post_pc[pc] = 0;
+            }
+        }
+    }
+    let minimum = minimum_path_with_values(
+        cfg,
+        chunk,
+        &weights,
+        &structural_pc,
+        &post_pc,
+        objects,
+        regions,
+        values,
+    )?;
+    let guards = numeric.map_or(0, |plan| plan.inputs.len() + plan.properties.len());
+    let guards = u32::try_from(guards)
+        .ok()?
+        .checked_add(objects.map_or(0, |plan| plan.guard_cost))?;
+    let saved = minimum.checked_sub(guards)?;
+    (saved != 0).then_some(saved)
+}
+
+/// The same old repayment coefficient, with the additional full-graph literal analysis work.
+pub(super) fn admission_entries_with_work(
+    chunk: &Chunk,
+    saved_work: u32,
+    analysis_work: u64,
+) -> Option<u64> {
+    if saved_work == 0 {
+        return None;
+    }
+    u64::try_from(chunk.jit_ops().len())
+        .ok()?
+        .checked_mul(40)?
+        .checked_add(u64::try_from(super::names::instruction_allowance(chunk)).ok()?)?
+        .checked_add(analysis_work)?
+        .checked_mul(1024)
+        .map(|work| work.div_ceil(u64::from(saved_work)))
+}
+
+/// Retain an existing component estimate while conservatively pricing additional analysis.
+pub(super) fn add_analysis_work(entries: u64, saved: u32, work: u64) -> Option<u64> {
+    if saved == 0 {
+        return None;
+    }
+    entries.checked_add(work.checked_mul(1024)?.div_ceil(u64::from(saved)))
 }
 
 #[cfg(test)]

@@ -1,0 +1,285 @@
+{
+  "schema_version": 1,
+  "status": "Validated optional String compiler work on ARM64/GNU x64/MSVC-Wine; independent current-main ARM64 integration passed; no application/performance acceptance",
+  "candidate": {
+    "base_commit": "ab7251e8c6cd66557d0ad2c5ddf6d5ca5dbbf902",
+    "tree": "/tmp/trust-js-string-compiler-composed-v3-20261015",
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/source-before.json",
+      "bytes": 125151,
+      "sha256": "b1cdbaf97c6c5417bdd35cf97322b56d0d2e58e301002dbe3f5ca05443cfea71"
+    },
+    "source_files": 815,
+    "source_after": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/source-after.json",
+      "bytes": 125151,
+      "sha256": "b1cdbaf97c6c5417bdd35cf97322b56d0d2e58e301002dbe3f5ca05443cfea71"
+    },
+    "source_patch": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/source.patch",
+      "bytes": 170968,
+      "sha256": "49cc23d2803de5273b11e81a543f29fa97f88d529cfa547107c7565e9cb54653"
+    },
+    "test_elf": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/frozen-tests",
+      "bytes": 213863896,
+      "sha256": "893975067bb6b0a3780e8fe7efa8109075513afc54c77701cc3dd04aaf8a1778"
+    },
+    "artifact_binding": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/artifact.json",
+      "bytes": 6821,
+      "sha256": "698437aa3e5bcc0f6bb8641e15909883fad828d81c2c7a5c88b1fe58a665ff56"
+    },
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1",
+    "machine": "crystal",
+    "target": "aarch64-unknown-linux-gnu",
+    "features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 2,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    }
+  },
+  "change": {
+    "comparison": "Borrow current private local and immutable literal for certified strict String comparison/conditional without temporary owners; preserve original initialized/Empty and before-start TDZ contracts.",
+    "grouping": "Bounded2..128 pure source-order cases over same local; first duplicate wins; original fifthJump/default/body/fallthrough and exact per-outcome owner floor remain.",
+    "admission": "Original net1 constant-owner token after both reads; no extra group/body credit. Full original and rejected-analysis work plus helper/switch/publication price; mixed guard debit once.",
+    "defaults": "No feature/runtime default, threshold override, IR/block cap or public host ABI change; hot literal-only selection added within explicitly opted-in tier.",
+    "exclusions": "No context inlining, generic rejoin or reflection tranche imported."
+  },
+  "validation": {
+    "additional_full_reload_all_clobber_executions": 4,
+    "clippy": "strict engine all-target optimizing-jit+embed passed",
+    "default_check": "engine default all-target check passed",
+    "default_control_scope": "34 literal/group selectors; fixture children keep explicit fact/on/off controls",
+    "exact_match_gate": "selectors preflighted from2508-name list; exit0/no timeout; every visible nested/outer exact summary1pass0fail0ignored0measured; multiple visible child+outer summaries accepted",
+    "failed": 0,
+    "focused_passed": 94,
+    "focused_unique_selectors": 94,
+    "groups": {
+      "Object": 14,
+      "frame": 10,
+      "grouped_dispatch": 15,
+      "large_regions": 8,
+      "literal_fusion_credit": 19,
+      "observed_regions": 18,
+      "pruning": 7,
+      "sparse_pc": 3
+    },
+    "matched_control_scope": "60 predecessor regression selectors use explicitly recorded original shared owner/read/recovery+hot/regions/generic/compile diagnostic cohort controls",
+    "native_scope": "selected fixtures assert actual native body/leaf entry, owning300-byte views, GC/floor, TDZ, cold-Jump/stress recovery, first match/default/fallthrough and bounded128+2 groups; counts are test selections, not total application entries",
+    "profile": "native ARM64 debug opt0; compiler Rust1.99/Cranelift0.136.2; not acceptance timing",
+    "total_counted_outer_executions": 98
+  },
+  "fresh_build": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/build-result.json",
+    "bytes": 120,
+    "sha256": "abf1a60f5d98eb1704a542cba02a9ac95f99f0ba4dbef3a3c496c05b32a4e76d"
+  },
+  "focused_tests": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/focused-results.json",
+    "bytes": 135511,
+    "sha256": "044cfbcff5497a55b06e661d496d9aad9a1e6054613f3d35ff8b847ef17131bc"
+  },
+  "full_reload_controls": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/all-reloads-results.json",
+    "bytes": 5473,
+    "sha256": "159bbc1415c1cb56a0ce046edbbc9492bb4a5d776a3c8610f901088bbc955568"
+  },
+  "checks": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/checks-result.json",
+    "bytes": 1594,
+    "sha256": "8f33e79da6b59c4e67937ed69e4731366df9aa6d08d1047e31c35016e93bcac3"
+  },
+  "clippy_log": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/clippy.log",
+    "bytes": 171,
+    "sha256": "59919d3779ebbdc31e8552a86824e8b83112f5e97dc0fe0d237e0616b5c68325"
+  },
+  "default_check_log": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/default-check.log",
+    "bytes": 171,
+    "sha256": "49315923f1ff66c7adeaa0213a281ff45d2124733c718c713d4dfb1f21e97680"
+  },
+  "source_and_artifact_manifest": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/manifest-final.json",
+    "bytes": 5957,
+    "sha256": "944bf42e5ddbe715c6b6c901d62072afbf866a1fcf1110bc228d658ca3b1ccd9"
+  },
+  "raw_artifact_inventory": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/file-inventory.json",
+    "bytes": 105787,
+    "sha256": "391c3b25398b294e44580465005a1da97a58aa2d06d0280a09b2ffc73cba2489"
+  },
+  "root_review": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/root-review-addendum.json",
+    "bytes": 909,
+    "sha256": "f4393055cb974a53127ee17e632f108605b35ba39b4186b10316bd0562fccd83"
+  },
+  "root_independent_audit": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/root-independent-review/audit.json",
+    "bytes": 2941,
+    "sha256": "a9209f403de75669ff91e3549465e7ce7673d7769f9a4d231281a25f5b63395f"
+  },
+  "independent_source_reviews": [
+    {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v1/root-source-review.json",
+      "bytes": 1350,
+      "sha256": "758f341e82c0458d3ab5311c4423abb095813188462c573c6f60336e3c805491"
+    },
+    {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v1/string-independent-credit-review-v1.json",
+      "bytes": 2759,
+      "sha256": "8a239862fc08b64e325df09139bec3307ce0cfd8ca3340d1aa78be39adb4f008"
+    },
+    {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v2/independent-source-review.json",
+      "bytes": 2386,
+      "sha256": "a9332de62ee065a254742f5b6b44979dd136acd4c1d346a9e3d6e07d995d3b11"
+    }
+  ],
+  "failure_history": {
+    "records_preserved": true,
+    "details": [
+      "V2 background test stopped at old admission estimate before newly priced original scan",
+      "V2 Object test fixed50000 calls stopped before newly priced original scan; V3 uses finalized structural minimum and cost + checkpoint margin",
+      "V3 safe callback count observation inherited V2: assertions after eval, not in native-reachable host callback",
+      "existing default pruning native fixture LoweringBudget reproduced on frozen predecessor without original shared controls; no default full-suite claim",
+      "V2 result parser rejected successful visible child+outer summaries; raw logs retained, explicit addendum reparsed; real failures not erased",
+      "no compiler cap, threshold override, production flag or feature default changes; actual hot sampling can now identify literal-only bodies using complete original-graph certificate"
+    ],
+    "V2_history": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v2/remaining-summary-parser-addendum.json",
+      "bytes": 15744,
+      "sha256": "5b59820ad8d82d2ae9306ac7bd2bfa13ca5084f9422e8c1fb62e979701252a61"
+    }
+  },
+  "component_react_emission_evidence": {
+    "limits": "no framework native-entry/throughput/repayment claim; bytes exclude shared Rust helper",
+    "pushStartInstance": "still LoweringBudget atPC1225/16394 with unchanged16384 cap; no complete native body",
+    "ref": {
+      "bytes": 45912,
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-dispatch-react-v1/analysis.json",
+      "sha256": "6dff90ff4b34d6cf0d679cfde991a5912346e0b933525160b1cfe7f22fcfd905"
+    },
+    "renderElement": "12266\u219212112 CLIF /52760\u219251780 ARM body bytes",
+    "root_audit": {
+      "bytes": 1615,
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-dispatch-react-v1/root-independent-probe-audit.json",
+      "sha256": "8ba2514f4e174699dda5d14c5cdfa740ee1dcc43d9dbc9161dfd4739af181442"
+    },
+    "scope": "separate earlier grouped component emission-only probe, not current composition runtime"
+  },
+  "native_x64_plan": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/native-x64-plan.json",
+    "bytes": 10888,
+    "sha256": "91b2a5ce4261cd13005760204c8d11c8ad36e88bd8ec917836eee84f69602d20"
+  },
+  "source_package": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/frozen-source.tar.gz",
+    "bytes": 11764552,
+    "sha256": "e2c55b6476b33cba26a3ac1de62cd7e06091b240aca45229b23e399b3b338935"
+  },
+  "claims": {
+    "application_or_browser_timing_acceptance": false,
+    "compile_repayment_established": false,
+    "current_composition_framework_native_entries": false,
+    "complete_pushStartInstance_native_body": false,
+    "completed_Node_class_optimizer": false,
+    "selected_native_cross_platform_validation_passed": true,
+    "physical_windows_runtime": false
+  },
+  "standards": {
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "local": "/big/web-standards/repositories/tc39/ecma262/spec.html",
+    "clauses": [
+      "https://tc39.es/ecma262/#sec-isstrictlyequal",
+      "https://tc39.es/ecma262/#sec-samevaluenonnumber",
+      "https://tc39.es/ecma262/#sec-runtime-semantics-caseclauseisselected",
+      "https://tc39.es/ecma262/#sec-runtime-semantics-caseblockevaluation"
+    ]
+  },
+  "native_x64_validation": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/native-x64-v1/validation-final.json",
+    "bytes": 5374,
+    "sha256": "c2913ca46b1d790ae8caa1c03a08630cf5573ba365d6b482e5699e06eabab7ff",
+    "linux_selected": 45,
+    "msvc_wine_selected": 45,
+    "unique_selected_per_platform": 41,
+    "scope": "actual native Linux GNU ELF and native MSVC PE under Wine11.19 debug-profile cases; default/optional all-target compilechecks, source unchanged; no physicalWindows/performance/fullsuite claim"
+  },
+  "main_integration": {
+    "base_commit": "ac83b2b0151d1c0cbac5155d5a1de1221cd90483",
+    "tree": "/tmp/trust-js-string-compiler-main-20261015",
+    "status": "Fresh native ARM64 optional+embed integration passed 115 unique selected tests plus four direct full-reload/all-clobber controls, strict all-target Clippy and default all-target compile check",
+    "applied_delta": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-composed-v3/source.patch",
+      "bytes": 170968,
+      "sha256": "49cc23d2803de5273b11e81a543f29fa97f88d529cfa547107c7565e9cb54653"
+    },
+    "preserved": [
+      "46103f81 declarative String accumulation source+tests",
+      "ac83b2b0 omitted duplicate parameter arguments mapping source+regression",
+      "ab7251e8 pruning/Object and d596 sparse-PC machinery"
+    ],
+    "excluded": [
+      "fresh-entry or observer-shapes test-only probes",
+      "context/rejoin/reflection experimental tranches"
+    ],
+    "validation": {
+      "selected_runs": 119,
+      "unique_selectors": 115,
+      "features": [
+        "default",
+        "embed",
+        "intl",
+        "optimizing-jit"
+      ],
+      "profile": "debug opt0; correctness only",
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/trust-js-unit-tests",
+        "bytes": 252159560,
+        "sha256": "8a4924624af89c9dbd06ae0db4c76046328dcf99d56684d33305fe07256d3774"
+      },
+      "build_artifact": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/artifact.json",
+        "bytes": 1310,
+        "sha256": "d63d757c59843bfe53568372cd72061361728554cd9c016de0c54ade2d7938e8"
+      },
+      "commands": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/commands.json",
+        "bytes": 117953,
+        "sha256": "39a11c96a9e81930af441eb949efaaf8261debd86a17d3ebee660bc8db1d9ff5"
+      },
+      "test_results": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/test-results.json",
+        "bytes": 66308,
+        "sha256": "80bc5421e0ef786213d179f98c6a71cb8bd826b03b397856ca29e34d3dc3ad9d"
+      },
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/validation-result.json",
+        "bytes": 304,
+        "sha256": "34e06a376e55c0aa0915fd5fec96ef60ccc10cfb2fff4365d7420afd684f1422"
+      },
+      "root_independent_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/root-final-audit.json",
+        "bytes": 2289,
+        "sha256": "a3599a83f1093b68a7cdf4b93b69d087fbeba4309917fbafe671dca13f6459f1"
+      },
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/string-compiler-main-v1/source-before.json",
+        "bytes": 125980,
+        "sha256": "c9320a7a68707f854a67dea7958a36639f6d0a362fbc211aced7b88980a542d3"
+      },
+      "source_scope": "All 820 source files unchanged through build/tests/checks. Only this evidence JSON and documentation updated afterward.",
+      "cross_platform_scope": "Native x64 evidence above is the unchanged compiler component on ab7251e8, not this current-main integration."
+    }
+  }
+}
