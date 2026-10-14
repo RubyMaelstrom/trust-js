@@ -6537,6 +6537,11 @@ fn emit_math_intrinsic(
     a.b_cond(C_EQ, this_undefined);
     emit_exec_tag_guard(a, 17, crate::value::PACK_OBJ, 16, hit_slow);
     emit_exec_payload(a, 17, 11);
+    // The receiver may be the builtin itself (f.same = f; f.same(x)). The two
+    // independent saved counts below cannot release aliased operand owners,
+    // and their combined release can require the real last-owner destructor.
+    a.cmp_reg_x(11, 10);
+    a.b_cond(C_EQ, hit_slow);
     a.ldur(14, 11, strong);
     a.cmp_imm_x(14, 1);
     a.b_cond(C_LS, hit_slow);
@@ -6811,6 +6816,10 @@ fn emit_call_intrinsics1(
         a.b_cond(C_EQ, receiver_ready);
         emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
         emit_exec_payload(a, 9, 11);
+        // The receiver and callee may be their only two live owners. Their
+        // ordered release then needs the checked last-owner destructor.
+        a.cmp_reg_x(11, 10);
+        a.b_cond(C_EQ, hit_slow);
         a.ldur(14, 11, 0);
         a.cmp_imm_x(14, 1);
         a.b_cond(C_LS, hit_slow);
@@ -6861,6 +6870,9 @@ fn emit_call_intrinsics1(
     emit_exec_number_guard(a, 9, 0, 16, hit_slow);
     emit_exec_word_load(a, 11, 20, -24);
     emit_exec_payload(a, 11, 11);
+    // Two aliased operand owners need ordered drops, including any last owner.
+    a.cmp_reg_x(11, 10);
+    a.b_cond(C_EQ, hit_slow);
     a.ldur(14, 11, 0);
     a.cmp_imm_x(14, 1);
     a.b_cond(C_LS, hit_slow);
