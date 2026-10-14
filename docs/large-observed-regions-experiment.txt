@@ -59,6 +59,42 @@ Those sizes are coverage ranges, not native eligibility/IR or this policy's
 publication evidence. Actual same-graph compiler probes and normal-policy real
 application execution are required after source/semantic validation.
 
+The native x86-64 browser checkpoint used matched release headless builds on
+Zombie (Intel Core i7-6700HQ), browser revision 4ea9b42b and the exact frozen v3a
+and large-sparse engine sources. Both builds used opt3, no LTO, 64 codegen units,
+the same allocator/features, and source checks before and after compilation.
+Three separate functional companions (baseline/off, candidate/off and candidate
+normal hot with coverage/observed/large/shared-read controls enabled) matched all
+twelve ordered Todo states and labels for the pinned Speedometer 3.1 React,
+Angular, Vue and jQuery subset. Controllers exited 0; browsers reached the
+explicitly retained bounded page-session timeout 3 after official completion,
+with zero reported errors/skips and no remaining browser workers.
+
+A separate normal-policy React execution diagnostic joined one unique Ki span
+at byte 111904, 4560 bytes and 1471 original operations to source-map minified
+React DOM 17.0.2 ck. Its 18,848 native entries completed normally, with zero
+terminal VM recoveries, observed-region VM exits or retirement requests and no
+saturated tracked counters. The native body was 60,960 bytes; the aggregate
+optimizer compilation metric was 37.435ms. This process used execution probes
+and periodic forced GC, so it establishes adoption without proving compilation repayment
+or performance benefit. Code-drop records denote lifetime end, not retirement.
+Checked helpers and author calls may execute within native control flow.
+
+The full-cost timing screen then retained three baseline Phase0 runs and
+three alternating pairs, with nine valid processes and no v3 worker-guard event.
+Baseline optimizer-off was compared with candidate normal hot and all four
+controls enabled; candidate coverage cost was included. Paired median losses
+were subset geometric-mean duration 1.111%, React duration 3.540%, Angular 0.550%,
+Vue 1.732% and jQuery -0.633%. React completion Sync was 6.899% slower and peak RSS was
+6.037% higher. The first candidate also retained extra sampled own CPU and about
+1.21s inside the official interval outside action clocks; its cause is unresolved.
+These N3 results are descriptive, with no gain or acceptance claim. They cover
+selected headless JS/DOM/layout/event-loop work, not the full Speedometer score,
+desktop presentation, isolated JS CPU, or a Node/Ladybird comparison. The
+experiment remains off by default. Raw provenance, independent audits and all
+samples are referenced by the native_browser_checkpoint section in
+benchmarks/review-large-sparse-regions-validation-2026-10-14.json.
+
 Specification reference: local ECMA-262 commit e28783d5fc9dc12b3de905961e2c71410b38a202,
 spec.html Execution Contexts, GetValue/PutValue, CatchClauseEvaluation and
 TryStatement Evaluation. Compilation/admission heuristics cannot alter these

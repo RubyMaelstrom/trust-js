@@ -356,7 +356,7 @@
     "Initial isolated test-only E0277 compile failure is retained; production changed only in the reviewed sparse patch.",
     "Historical cold-label parser counts corrected in separate addendum without overwriting the original manifest.",
     "ARM focused40 and x64 focused110 per platform cover the composed source; earlier full-suite evidence belongs to earlier revisions.",
-    "Default-off browser screen and instrumented optimized React entry are different evidence scopes; no compile-cost repayment or enabled-tier performance claim.",
+    "Earlier ARM default-off browser screening and instrumented React adoption are distinct from the later native x64 full-cost screen; no compile-cost repayment or performance acceptance is established.",
     "The exact SSR emission probe is not the React DOM browser function. React SSR19.2.7 and pinned browser React DOM17.0.2 are separate workloads."
   ],
   "recorded_utc": "2026-10-14T20:02:49.777376+00:00",
@@ -593,11 +593,165 @@
         "reason": "Cargo guard during first candidate process; interrupted entire cohort excluded. Worker origin not established."
       }
     ],
-    "next_measurement": "Matched native x86-64 browser artifacts are being built on exclusive Zombie. No new x86 browser timing or optimization gain is asserted here."
+    "next_measurement": "Native x86-64 functional/adoption gates and the descriptive full-cost screen are complete in native_browser_checkpoint; no gain or performance acceptance. No further runs of this frozen pair are planned."
   },
   "publication": {
     "base_commit": "d539f41df8393d262c6f418c0f4300fd19867f83",
-    "code_source_contract": "Exactly the12-file frozen large-sparse source patch; all808 original source inventory entries must match the staged tree. This additional evidence ledger is not part of the compiled candidate.",
-    "commit_identity": "The Git commit containing this ledger records the publication identity; no self-referential hash embedded."
+    "code_source_contract": "The original engine-code publication applied exactly the12-file frozen large-sparse source patch. The compiled808-file candidate remains pinned above; this later native-browser evidence and documentation amendment changes no engine source.",
+    "commit_identity": "The Git commit containing this ledger records the publication identity; no self-referential hash embedded.",
+    "original_engine_code_commit": "d59669db3f52849a544b1a862cd7a15725346fda"
+  },
+  "native_browser_checkpoint": {
+    "status": "native_functional_and_adoption_gates_passed_descriptive_screen_complete_no_performance_acceptance",
+    "performance_acceptance": false,
+    "machine": "Zombie native Linux x86-64, Intel Core i7-6700HQ; browser CPU5, controller/server CPU4 on a distinct physical core, one style thread. Exclusive measurement lease.",
+    "browser_revision": "4ea9b42bf48b29f0298576df527c28bdd5b962d9",
+    "engine_sources": {
+      "baseline": "Exact frozen v3a, 556 source files",
+      "candidate": "Exact frozen large-sparse composition, 808 source files"
+    },
+    "build": {
+      "manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/final-build-manifest.json",
+        "sha256": "6a92504059a1d9c99b261bf6f638bdc441c2196c9bba5b4532af15a1b253298e",
+        "bytes": 14993
+      },
+      "root_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/root-independent-build-audit.json",
+        "sha256": "37979d94fb83f1e986ca147b5de96f2599177f9b8dc901f789f7267f9b5b7953",
+        "bytes": 564676
+      },
+      "artifact_sha256": {
+        "baseline": "e26da9e44f23ef7eccde202b17bcb4940680095df5cdac7010827732d461af0b",
+        "candidate": "822fd5fab6c85fc0aa3f8fbb90bb63876ac52c9259342c94d99543c521e6ab4e"
+      },
+      "matching_profile": "Browser release opt3, no LTO, 64 codegen units; default+mimalloc, engine default+embed+intl+optimizing-jit. Actual engine/browser artifacts freshly compiled; exact sources checked before/after. Same five unused-code warnings retained."
+    },
+    "fixture": {
+      "revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+      "version": "3.1",
+      "manifest_sha256": "8fe295c903426f6292f40e353de0ae89637ac8ee78c98fdf14fcde13aa9de085",
+      "scope": "Official TodoMVC React Complex DOM, Angular Complex DOM, Vue and jQuery; one iteration/three actions per suite in each fresh process. Partial selected headless browser workload."
+    },
+    "functional": {
+      "raw_report": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/prerequisites.json",
+        "sha256": "26f0f1a0b49da8b8b7b63701ac01f0f31783dddb0ba533eefcd0cbf3e759e365",
+        "bytes": 16491
+      },
+      "root_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/root-independent-prerequisites-audit.json",
+        "sha256": "168c62f250dd093acd6d1ba01f23bec8d2899e358d5ea1746c6c1fc7e1860223",
+        "bytes": 9451
+      },
+      "variants": [
+        "baseline/off",
+        "candidate/off",
+        "candidate/normal hot with coverage, observed regions, large regions and shared reads enabled"
+      ],
+      "twelve_exact_ordered_Todo_states_equal_in_all_three_variants": true,
+      "runtime_errors": 0,
+      "browser_workers_remaining": 0,
+      "termination": "Each controller exit 0 is distinct from browser natural bounded page-session timeout 3 after official completion; no forced termination or skipped modules."
+    },
+    "React_native_adoption_diagnostic": {
+      "analysis": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/native-react-adoption-analysis.json",
+        "sha256": "cb319240fb298321189dd80511994343155a6c77e5a91378b2c260a142a429a5",
+        "bytes": 15057
+      },
+      "source_join": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/browser-react-Code1-source-join.json",
+        "sha256": "379e9d7a79eb4445bf55c65ec2ac0893474404421003fb97e1f2e534fc9448ae",
+        "bytes": 29413
+      },
+      "identity": "Unique entire-function span Ki at UTF-8 byte 111904, length 4560, source-mapped to minified React DOM 17.0.2 ck; no unminified semantic name asserted. Eight exact property-site offsets corroborate the join.",
+      "original_bytecodes": 1471,
+      "native_entries": 18848,
+      "native_control_flow_normal_completions": 18848,
+      "error_exits": 0,
+      "terminal_VM_recoveries": 0,
+      "observed_region_VM_exits": 0,
+      "specialization_retirement_requests": 0,
+      "saturated_tracked_counters": [],
+      "native_bytes": 60960,
+      "observed_optimizer_compile_seconds": 0.037434606,
+      "scope": "Separate execution-instrumented React-only process, normal admission without threshold overrides, functional observer absent. Periodic forced GC and execution instrumentation exclude timing/repayment inference; a Code drop event is lifetime end, not specialization retirement. Checked helpers and author calls may execute within native control flow."
+    },
+    "descriptive_full_cost_screen": {
+      "plan": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/screen-full-cost-native-plan-v1.json",
+        "sha256": "df20b6095dd37db0118bedb3492cd73de36b7ae27235a4ce0e57422dea91c682",
+        "bytes": 9353
+      },
+      "report": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/screen-full-cost-v1/report.json",
+        "sha256": "a58eeae92c4a253a8c882012565347c6eef8db0f20984c039ce4e5353722fd4e",
+        "bytes": 416126
+      },
+      "root_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/root-independent-screen-audit.json",
+        "sha256": "c05482296b30bcae2710054ed0c1f28055d5130a6c56760f38cd03eedabf3a83",
+        "bytes": 41880
+      },
+      "started_utc": "2026-10-14T20:47:24.363141+00:00",
+      "finished_utc": "2026-10-14T20:50:58.901783+00:00",
+      "baseline_Phase0_processes": 3,
+      "alternating_pairs": 3,
+      "valid_processes": 9,
+      "guard_events": 0,
+      "controls": "Baseline OPT_JIT=0 versus candidate OPT_JIT=hot with COVERAGE, OBSERVED_REGIONS, LARGE_REGIONS and SHARED_READ_GUARDS=1. No thresholds, runtime trace, functional observer, metrics, GC log, profiler or execution diagnostics; required candidate coverage cost is included. Fresh independently created tmpfs ELF copies verified executable and at launch.",
+      "paired_median_loss_percent": {
+        "Score": 1.1108476326651573,
+        "TodoMVC-React-Complex-DOM": 3.5404649491222573,
+        "TodoMVC-Angular-Complex-DOM": 0.5500998306524174,
+        "TodoMVC-Vue": 1.7324619580886491,
+        "TodoMVC-jQuery": -0.6328504239267563
+      },
+      "components_above_descriptive_three_percent_loss": {
+        "TodoMVC-React-Complex-DOM": 3.5404649491222573,
+        "TodoMVC-React-Complex-DOM/CompletingAllItems": 5.533119995952496,
+        "TodoMVC-React-Complex-DOM/CompletingAllItems/Sync": 6.898985843028571,
+        "TodoMVC-Vue/CompletingAllItems/Sync": 3.6181885992462304
+      },
+      "resource_paired_median_loss_percent": {
+        "observed_browser_peak_rss_kib": 6.03687037695233,
+        "observed_process_cpu_seconds": 0.3582395087001089,
+        "observer_sampled_process_cpu_seconds": 0.3582395087001089,
+        "official_measurement_wall_s": 0.45820355396879453,
+        "official_action_sum_s": 0.48615548908188533,
+        "inside_official_wall_outside_actions_s": 0.3953368708824456,
+        "launch_before_official_interval_s": -0.7972164993564235
+      },
+      "retained_first_candidate_tail": {
+        "baseline_process_CPU_s": 19.36,
+        "candidate_process_CPU_s": 20.66,
+        "baseline_official_wall_s": 18.979199951171875,
+        "candidate_official_wall_s": 20.3245,
+        "baseline_inside_official_outside_actions_s": 5.431999755859375,
+        "candidate_inside_official_outside_actions_s": 6.644698974609375,
+        "attribution": "Extra sampled own CPU and time inside the official collector interval outside action clocks; cause unresolved. This sample is retained, not dropped or called isolated startup."
+      },
+      "phase0_subset_score_relative_MAD": 0.0004956529807611515,
+      "scope": "All 387 raw metric rows, 43 component ratios, Phase0 medians/MAD and sampled resource calculations independently verified. N3 descriptive screen, no confidence interval, speedup or equivalence acceptance. Experimental mode remains off by default.",
+      "root_resource_and_cleanup_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/root-independent-resource-audit.json",
+        "sha256": "7acea24b5d3e95c379832f928c5d286be4f2670c8c66ed56f5e1d977767f44c6",
+        "bytes": 9733
+      },
+      "loss_direction_definition": "Duration/resource loss uses candidate/baseline minus1. Score uses baseline/candidate minus1, equal to the subset geometric-mean duration ratio; it is not the arithmetic percentage decrease of score."
+    },
+    "cleanup": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/zombie-browser-build-v1/post-cleanup.json",
+      "sha256": "1e6999a2f07d9a8f04a1d65f618729413fe77a57c1ce5c3bccb892e5a09d608f",
+      "bytes": 812
+    },
+    "limits": [
+      "Subset score is not an official full Speedometer score. Headless JS/DOM/layout/event-loop work omits continuous desktop presentation and does not isolate engine CPU.",
+      "Exact labels/counts/completion/checkbox states are validated; complete DOM and raster equality are not asserted.",
+      "No Node, Ladybird, cross-architecture ratio or overall catch-up claim follows from this browser checkpoint.",
+      "RSS and CPU are sampled process observations; the RSS increase is unresolved and does not establish heap growth. The launch-minus-official residual includes both prefix and report/transport/validation suffix.",
+      "Actual instrumented native entries establish adoption in this separate lifetime, not uninstrumented per-run entry counts, compilation repayment or a performance gain."
+    ]
   }
 }
