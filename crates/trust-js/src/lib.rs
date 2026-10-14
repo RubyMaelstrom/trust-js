@@ -99,6 +99,8 @@ mod interrupt;
 mod intl;
 mod jit;
 mod jit_ir;
+#[cfg(test)]
+mod json_stringify_space_tests;
 mod jstr;
 #[cfg(test)]
 mod lazy_snapshot_body_tests;

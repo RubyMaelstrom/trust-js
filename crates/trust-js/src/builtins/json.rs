@@ -69,7 +69,13 @@ pub(super) fn install_json(it: &mut Interp) {
                 let n = if n.is_nan() { 0.0 } else { n.trunc() };
                 " ".repeat(n.clamp(0.0, 10.0) as usize)
             }
-            Value::Str(s) => s.chars().take(10).collect(),
+            Value::Str(s) if s.ascii_hint() => s[..s.len().min(10)].to_owned(),
+            // JSON.stringify takes the first ten UTF-16 code units, including a lone
+            // surrogate when that boundary splits an astral character. Decode only
+            // this bounded prefix instead of materializing the full indentation string.
+            Value::Str(s) => {
+                crate::jstr::from_units(&crate::jstr::unit_iter(&s).take(10).collect::<Vec<_>>())
+            }
             _ => String::new(),
         };
         // SerializeJSONProperty starts from a wrapper holder `{ "": value }`; only a replacer
@@ -90,6 +96,14 @@ pub(super) fn install_json(it: &mut Interp) {
             out: String::with_capacity(64),
         };
         if json_serialize_property(i, &mut serializer, &holder, JsonKey::Name(""), value)? {
+            // Repeated indentation can join a trailing high surrogate to the next
+            // gap's leading low surrogate. Keep the serializer's byte-based rollback
+            // intact and canonicalize those pairs only in the completed output.
+            if crate::jstr::needs_join_fixup(&gap, &gap) {
+                if let Some(out) = crate::jstr::canonicalize(&serializer.out) {
+                    return Ok(Value::lstr(out));
+                }
+            }
             Ok(Value::lstr(serializer.out))
         } else {
             Ok(Value::Undefined)
