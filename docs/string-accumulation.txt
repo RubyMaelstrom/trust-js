@@ -1,0 +1,106 @@
+Declarative string accumulation
+===============================
+
+The bytecode VM and ARM64/x86-64 template JIT recognize the complete sequence
+LoadName; LoadLocal; Add; optional Dup; same-name StoreNameCached. This covers the
+React 19.2.7 renderToStringImpl push callback, whose original body has 15 operations
+and whose sequence begins at PC 5. The ordinary interpreter remains the semantic
+reference. The transaction uses the running activation's environment and local
+values; it stores no JavaScript owners in compiled code.
+
+Before the original name read, the transaction proves the actual ordinary mutable
+declarative holder through at most 16 live scope records. The right operand must be
+an already evaluated primitive String in a local slot. Global or object records,
+with, missing bindings, TDZ, imports, immutable cells, non-String values, excessive
+length, and failed proofs retain every original operation. Arbitrary right-hand
+side evaluation and retained StoreRef assignments keep their existing checked
+implementations. Redirected inline name operations are outside this exact pattern.
+Resolving a name after an arbitrary right-hand side, or comparing an old String's
+identity alone, would not prove the original left-hand Reference.
+
+The binding remains populated throughout the transaction. LStr::append_or_replace
+reuses unique flat capacity when its existing ownership and representation checks
+permit it. Actual aliases, views, literals and self-append retain their old value;
+a complete replacement is allocated before assignment when copying is needed.
+Concatenation retains lone-surrogate code units and canonicalizes a high/low
+surrogate boundary through the same jstr join logic as ordinary concatenation.
+The existing length check precedes mutation. Dup receives one clone of the
+committed assignment value, so a retained earlier result cannot change later.
+
+Before a register region enters the fused transaction, it publishes all private
+homes before reading the authoritative running environment or right-hand local.
+Ordinary x86-64 templates already use canonical homes. ARM64 checked numeric-chain
+H_EXEC replay reaches
+the same transaction as an ordinary head. The x86-64 head uses the established
+helper-pair ABI, including the Windows return convention. Successful execution
+branches past the complete store; a miss preserves the original stack and executes
+the original head. Every original interior label remains emitted. VM stop_at at an
+interior boundary declines the transaction, and middle-PC native resumes execute
+the ordinary suffix. No author callback, coercion, GC poll, interruption check or
+recoverable JavaScript error occurs between the proved read and committed store.
+With operation statistics enabled, the transaction declines so the original
+checked operations and their PCs remain observable. Optional execution coverage
+marks a conservative superset of the original entered operations.
+
+The semantic review used local ECMA-262 revision
+ e28783d5fc9dc12b3de905961e2c71410b38a202:
+Assignment Evaluation, GetValue, PutValue, ApplyStringOrNumericBinaryOperator and
+declarative SetMutableBinding. The original Reference is captured before GetValue
+and right-hand evaluation, and the committed assignment value is returned.
+Official sections: https://tc39.es/ecma262/#sec-assignment-operators-runtime-semantics-evaluation
+https://tc39.es/ecma262/#sec-getvalue
+https://tc39.es/ecma262/#sec-putvalue
+
+Validation and performance status
+--------------------------------
+
+Focused cases exercise actual React VM/native hits, ARM64 H_EXEC replay, original
+operation statistics, aliases and views, Unicode boundaries, length errors,
+coercion/reference/with/global fallbacks, shared closures and Realms, every original
+interior stop/resume, pre-entry interruption, GC and live numeric homes. Test262
+addition and compound-assignment/reference scopes pass on the recorded bytecode
+and default-JIT artifact; narrow interpreter reference cases pass too. Four Node
+comparisons agree. A separate direct-eval left-reference case follows the normative
+Reference and the retained Test262 A6 tests where the recorded Node version differs;
+it is not counted as a matching Node oracle.
+
+The V5 candidate based on d539 passed 208 native cases:
+52 each on GNU x86-64 and MSVC/Wine, with default and optional feature builds.
+Wine validates the generated MSVC ABI; it is not physical Windows evidence. Both
+matched x86-64 release CLIs passed 768 React renders, all complete-string checks
+and 12 external complete HTML/UTF-8/SHA checks per artifact with normal exit and
+empty stderr. The separate ab7251 composition passed 35 fresh ARM cases: 19 accumulation checks,
+seven committed pruning checks and nine sparse/observed-recovery checks, plus
+strict optional all-target lint. Its 813 source files and artifact are recorded
+separately; component evidence is not relabelled as final-main x86-64 coverage.
+
+The fixed native Linux x86-64 React SSR experiment completed five baseline
+variance processes and seven alternating pairs, with default template JIT and
+TRUST_JS_OPT_JIT=0. All 19 processes completed 768 renders each; independent review
+checked 1,140 retained full HTML bodies against the pinned Node output oracle.
+All seven pairs improved. The paired median reduction was 5.20% for the 576
+post-warmup renders, 5.16% for full process wall time, 5.11% for process CPU, and
+4.32% for post-exec sampled peak RSS. All six cases improved. The conservative
+98.4375% paired median interval for rendering duration was -6.68% to -4.11%; the
+nominal empirical bootstrap 95% interval was -5.87% to -4.57%. These intervals use
+seven process pairs, not the correlated batches within each process.
+
+No measured stable component met the recorded regression criterion. Two roughly
+0.05 ms validation phases had median increases just above 3%, but both comparison
+intervals crossed parity; their complete samples remain in the evidence. Import
+and input time and launch-to-ready time showed no established regression. Code
+artifact size increased from 32,002,440 to 32,006,424 bytes (0.0125%). This is full
+ELF size, not generated-code size or JavaScript compilation time.
+
+The measured component is exact d539 plus V5, with matched release features and
+flags on Zombie (Intel Core i7-6700HQ). The current ab7251 integration is covered by
+the separate correctness checks above; it has not been substituted into those
+measurements. This result supports committing the transaction for this authored
+React SSR workload. It is not a deployed-page result, official Speedometer score,
+isolated compilation-cost improvement, post-GC retained-memory result or speed
+comparison with Node/Ladybird. True post-GC memory and isolated compilation remain
+unavailable in the unchanged clean runtime. Previously interrupted Crystal timing
+cohorts remain excluded, with no pooling or cross-machine ratios.
+
+See benchmarks/review-string-accumulation-validation-2026-10-15.json for source,
+artifact, suite, platform, raw evidence and independent review identifiers.

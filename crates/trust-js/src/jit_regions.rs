@@ -3449,13 +3449,24 @@ pub(super) fn emit(
                     own_facts.clear();
                     let before = stack.clone();
                     materialize(a, layout, &stack, physical);
-                    let effect = region_frame_effect(&ops[pc], plan, parameter_aliases);
+                    // Unlike an ordinary free-name read, the complete accumulation also
+                    // reads a local RHS and can leave this region after its store. Publish all
+                    // private homes before the helper, retaining exact canonical exit state.
+                    let accumulation = a.string_accumulation(pc as u32).is_some();
+                    let effect = if accumulation {
+                        FrameEffect::Full
+                    } else {
+                        region_frame_effect(&ops[pc], plan, parameter_aliases)
+                    };
                     match effect {
                         FrameEffect::Independent => {}
                         FrameEffect::Read(slot) | FrameEffect::Write(slot) => {
                             plan.flush_local(a, slot)
                         }
                         FrameEffect::Full => plan.flush_locals(a),
+                    }
+                    if accumulation {
+                        emit_string_accumulation(a, pc as u32, false);
                     }
                     #[cfg(test)]
                     if let Op::Tdz(slot) = ops[pc] {

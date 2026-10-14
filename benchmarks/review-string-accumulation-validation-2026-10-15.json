@@ -1,0 +1,923 @@
+{
+  "schema_version": 1,
+  "status": "validated_integration_and_independently_reviewed_component_SSR_gain",
+  "main_integration_base": "ab7251e8c6cd66557d0ad2c5ddf6d5ca5dbbf902",
+  "implementation_scope": "Complete ordinary declarative LoadName+LoadLocal+Add+[Dup]+same-name StoreNameCached transaction; established checked fallbacks retained",
+  "integration_source": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-v1/source-before.json",
+    "sha256": "d3627c3c6f34bfa87173ed8ae956c9dd0348aa4b3967ea4d4458fbb7f893b246",
+    "bytes": 142988
+  },
+  "integration_matrix": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/selector-matrix.json",
+    "sha256": "ba50db0e6585691d0bf78811cdeddfae5cad3e3ecac2350e5535013e7a1e957f",
+    "bytes": 6342
+  },
+  "component_source": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-v5/source-before.json",
+    "sha256": "c0ea8eb3030db38c4709c02a54dcfa9dc38d943e00882ad869bcc51bc7d5292f",
+    "bytes": 141915
+  },
+  "component_runtime_conformance_handoff": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-v5/release-functional-conformance-handoff.json",
+    "sha256": "42de04aafc11f5e4484c74cd8d7033b15794ecbcbc3b2b0be60dcfc566a333e6",
+    "bytes": 2877
+  },
+  "native208_evidence": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-validation-v1/native-correctness-summary.json",
+    "sha256": "b24df0ca8da30d087275ec4a87746a0ef1b580cab6953c5b6e045c3fc08483d3",
+    "bytes": 2301
+  },
+  "native208_root_audit": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-validation-v1/root-independent-audit.json",
+    "sha256": "728ca7e270fc0529de65f76b251133ce0ea987acf2dbc792fee0d37fca869667",
+    "bytes": 1452
+  },
+  "matched_x64_release": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-release-functional-v1/native/matched-build-report.json",
+    "sha256": "b4d75c02f91187f0e3480e02cc7395f46df9fd1324c5b2bb3149f53f04580ff7",
+    "bytes": 13501
+  },
+  "x64_direct768_functional": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-release-functional-v1/ssr/functional-summary.json",
+    "sha256": "cfe3c273601708e7ea31bc2e0cf1e670a656c5f01075e3ee15acafb5d445d868",
+    "bytes": 4863
+  },
+  "test262": {
+    "suite_revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
+    "unique_scope": 504,
+    "bytecode_pass": 504,
+    "jit_pass": 504,
+    "narrow_interp_pass": 2,
+    "failures": 0,
+    "skips": 0,
+    "report": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-test262-v2/focused-report.json",
+      "sha256": "51dbbbadbd7aef43bb0724a2dc5d0cb8a467708860ce47ebcc0cd55c341a3a5c",
+      "bytes": 9562
+    }
+  },
+  "node_comparison": {
+    "matched_cases": 4,
+    "separate_normative_original_reference_deviation": 1,
+    "deviation_not_counted_as_matching_oracle": true
+  },
+  "platform_scope": {
+    "ARM": "Fresh813-file ab7251+accumulation optional integration35 exact passes and strict all-target lint; prior default48 remains original42b proof",
+    "GNU_x64": "Exact component803/805 sources, actual native Linux",
+    "MSVC_x64": "Exact componentV5 sources, actual MSVC PE under Wine; not physical Windows"
+  },
+  "performance": {
+    "status": "fixed_N7_complete_independently_reviewed_component_workload_acceptance",
+    "accepted": true,
+    "matched_source_base": "d539f41df8393d262c6f418c0f4300fd19867f83",
+    "baseline_source_files": 803,
+    "candidate_source_files": 805,
+    "framework": {
+      "react": "19.2.7",
+      "reactDOM": "19.2.7"
+    },
+    "tier": "jit",
+    "optimizer_runtime": "0",
+    "workload": "Unchanged phased768; separate direct768 output gate",
+    "fixed_processes": 19,
+    "baseline_variance_processes": 5,
+    "alternating_pairs": 7,
+    "official_speedometer_score_claimed": false,
+    "throughput_gain_claimed": false,
+    "post_gc_retained_memory_available": false,
+    "isolated_js_compilation_cost_available": false,
+    "comparison_to_node_or_ladybird_claimed": false,
+    "acceptance_scope": "Commit complete string-accumulation implementation; measured isolated d539+V5 component only. Separate ab7251 integration has correctness validation, not a relabelled timing sample. No installed release artifact promotion.",
+    "render_duration_reduction_claimed": true,
+    "machine": {
+      "hostname": "zombie",
+      "uname": [
+        "Linux",
+        "zombie",
+        "7.2.9-2-cachyos",
+        "#1 SMP PREEMPT_DYNAMIC Fri, 09 Oct 2026 15:36:46 +0000",
+        "x86_64"
+      ],
+      "python": "3.14.8 (main, Oct 13 2026, 10:33:10) [GCC 16.2.1 20260810]",
+      "controller_cpu": 4,
+      "JS_cpu": 5,
+      "maximum_frequency_khz": "3500000",
+      "governor": "powersave",
+      "processor": "Intel Core i7-6700HQ,4 cores/8 threads"
+    },
+    "release_flags": {
+      "target": "x86_64-unknown-linux-gnu",
+      "opt_level": 3,
+      "lto": "fat",
+      "codegen_units": 1,
+      "panic": "abort",
+      "features": [
+        "default",
+        "embed",
+        "intl",
+        "optimizing-jit"
+      ],
+      "rustc": "1.98.0",
+      "cargo": "1.98.0"
+    },
+    "artifacts": {
+      "baseline": {
+        "sha256": "0c3253339f33a78408dd3c278c241fbb931571c12b9c9ec9262bf50f58214110",
+        "bytes": 32002440
+      },
+      "candidate": {
+        "sha256": "0b3343dc4b923a5cb2d62510ed1c60166e8206dbe07636df84bcf0eacc6bb38c",
+        "bytes": 32006424
+      }
+    },
+    "full_ELF_size_change_percent": 0.012449050759877345,
+    "preregistered_plan": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/measurement-plan-native-final.json",
+      "sha256": "248978181bdd5b170468503badc3b42944650d126f6ae362fc94964ac1a56175",
+      "bytes": 30218
+    },
+    "raw_report": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/cohort-native-v1/report.json",
+      "sha256": "e97aa30a5d80906ee4390988d11b8d0e169c7cef899fbd316f2b615938eec40e",
+      "bytes": 1640428
+    },
+    "evidence_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/cohort-native-v1-evidence-manifest.json",
+      "sha256": "a9efbab7ae1498aad062cd845b9c7b2738a076c9c6ba5574a63a045c4815de6e",
+      "bytes": 32385
+    },
+    "local_evidence": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/local-evidence-proof.json",
+      "sha256": "fd61361149294ef6c15b41645dfaf09d873e563819c901890ab5cde0f7167d89",
+      "bytes": 42223
+    },
+    "owner_analysis": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/analysis-native-n7-v1.json",
+      "sha256": "68386487f6ec866f2314f687ea90fc9d736b5c218003779f1993a3071ae6c5d4",
+      "bytes": 109868
+    },
+    "independent_root_analysis": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/root-independent-review/audit.json",
+      "sha256": "afab425f687ffa91200faed91748bf81128b9697128f1c3015e0e7f71772d472",
+      "bytes": 93523
+    },
+    "phase0_primary_variance": {
+      "values": [
+        14107.931931000003,
+        14211.436130000002,
+        13984.096123999996,
+        14087.621084000008,
+        13946.492912000009
+      ],
+      "median": 14087.621084000008,
+      "median_absolute_deviation": 103.52496000001156,
+      "relative_mad": 0.007348647396371972,
+      "min": 13946.492912000009,
+      "max": 14211.436130000002,
+      "relative_range": 0.018806810349328736,
+      "stable_for_fixed3percent_screen_flag": true
+    },
+    "statistical_scope": "Fresh process pair is statistical unit. Nominal empirical bootstrap is exact for observed empirical distribution, not exact frequentist coverage; small N and multiple exploratory components limit inference. Distribution-free median interval uses sample min/max and has98.4375% coverage for independent continuous pairs; sign probability is unadjusted. No extrapolation to other architectures/frameworks/pages.",
+    "summary_metrics": {
+      "import_and_input_ms": {
+        "baseline": [
+          35.606609000000006,
+          35.458487000000005,
+          34.267809,
+          34.252379999999995,
+          34.763662000000004,
+          33.898739,
+          35.084539
+        ],
+        "candidate": [
+          34.641534,
+          35.127465,
+          34.518828000000006,
+          34.059353,
+          35.157779,
+          35.435026,
+          34.753705
+        ],
+        "paired_ratios": [
+          0.9728961834023564,
+          0.9906645198933614,
+          1.0073252130009247,
+          0.9943645667833887,
+          1.0113370392336687,
+          1.0453198863827944,
+          0.9905703763130533
+        ],
+        "paired_median_change_percent": -0.5635433216611307,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -0.9429623686946664,
+          1.1337039233668689
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -2.7103816597643604,
+          4.531988638279438
+        ],
+        "two_sided_exact_sign_p": 1,
+        "phase0_stable": false,
+        "provisional_regression": false
+      },
+      "process_wall_s": {
+        "baseline": [
+          18.812678547998075,
+          18.862094181997236,
+          19.1480880819945,
+          18.829347737999342,
+          19.019358480996743,
+          19.056767643000057,
+          19.067558479997388
+        ],
+        "candidate": [
+          17.939410507999128,
+          17.8893800750011,
+          18.189865332002228,
+          18.099148988003435,
+          17.93487305799499,
+          17.953513974003727,
+          17.811022378002235
+        ],
+        "paired_ratios": [
+          0.953580876972361,
+          0.9484302168353854,
+          0.949957262266131,
+          0.9612201781943673,
+          0.9429799157481932,
+          0.942106988463934,
+          0.9341008392179152
+        ],
+        "paired_median_change_percent": -5.156978316461458,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -5.789301153606596,
+          -4.641912302763895
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -6.58991607820848,
+          -3.8779821805632664
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "process_cpu_s": {
+        "baseline": [
+          18.740184,
+          18.789613000000003,
+          19.073064,
+          18.767914,
+          18.943656999999998,
+          18.978101,
+          18.994664
+        ],
+        "candidate": [
+          17.858875,
+          17.828717,
+          18.127391,
+          18.007212,
+          17.874177000000003,
+          17.8904,
+          17.744896
+        ],
+        "paired_ratios": [
+          0.9529722333569405,
+          0.9488602559296989,
+          0.9504184015740733,
+          0.9594679515262058,
+          0.9435441636216283,
+          0.942686520637655,
+          0.9342042586275809
+        ],
+        "paired_median_change_percent": -5.113974407030108,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -5.731347936234499,
+          -4.7027766643059525
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -6.579574137241906,
+          -4.053204847379421
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "post_exec_sampled_peak_RSS_kib": {
+        "baseline": [
+          176360,
+          176860,
+          176128,
+          176524,
+          176688,
+          176504,
+          177096
+        ],
+        "candidate": [
+          168740,
+          169472,
+          169112,
+          168856,
+          169240,
+          168808,
+          168932
+        ],
+        "paired_ratios": [
+          0.9567929235654343,
+          0.9582268460929548,
+          0.9601653343023255,
+          0.9565611474926922,
+          0.9578465996558906,
+          0.9563975887232017,
+          0.9539007092198581
+        ],
+        "paired_median_change_percent": -4.320707643456567,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -4.360241127679831,
+          -4.177315390704517
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -4.6099290780141855,
+          -3.9834665697674465
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "post_exec_sampled_peak_RssAnon_kib": {
+        "baseline": [
+          159632,
+          159824,
+          159212,
+          159620,
+          159524,
+          159484,
+          159928
+        ],
+        "candidate": [
+          151896,
+          152380,
+          151668,
+          151688,
+          152116,
+          152044,
+          151996
+        ],
+        "paired_ratios": [
+          0.9515385386388694,
+          0.953423766142757,
+          0.9526166369369143,
+          0.9503069790753038,
+          0.9535618464933177,
+          0.9533495523061875,
+          0.9504026812065429
+        ],
+        "paired_median_change_percent": -4.738336306308566,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -4.959731879345708,
+          -4.657623385724296
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -4.9693020924696185,
+          -4.643815350668234
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "launch_to_import_READY_receipt_s": {
+        "baseline": [
+          0.10452748099487508,
+          0.10695806700096,
+          0.10368433899566298,
+          0.10366404199885437,
+          0.10501716999715427,
+          0.10297722700488521,
+          0.10407551199750742
+        ],
+        "candidate": [
+          0.10419428200111724,
+          0.10491766199993435,
+          0.1045869420049712,
+          0.10365213300246978,
+          0.10608000899810577,
+          0.10658060700370697,
+          0.10594871800276451
+        ],
+        "paired_ratios": [
+          0.9968123311631879,
+          0.980923318285031,
+          1.0087052974253516,
+          0.9998851193127823,
+          1.0101206212372729,
+          1.034992008462714,
+          1.0179985278890769
+        ],
+        "paired_median_change_percent": 0.8705297425351644,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -0.31876688368120965,
+          1.7998527889076854
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -1.9076681714969013,
+          3.4992008462713997
+        ],
+        "two_sided_exact_sign_p": 1,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "small-string/post_warmup_batch_median_ms": {
+        "baseline": [
+          298.2503689999994,
+          298.023013,
+          303.29235999999946,
+          298.3698370000002,
+          300.90031999999974,
+          301.95148999999947,
+          301.14872899999864
+        ],
+        "candidate": [
+          291.86920999999893,
+          290.41613400000006,
+          294.5518979999997,
+          293.40164599999844,
+          290.4750559999993,
+          291.3034310000003,
+          289.796472
+        ],
+        "paired_ratios": [
+          0.9786046903432314,
+          0.97447553152548,
+          0.9711813973817218,
+          0.9833488832183739,
+          0.9653530976637033,
+          0.9647358620419485,
+          0.9623034869258947
+        ],
+        "paired_median_change_percent": -2.8818602618278177,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -3.52641379580515,
+          -2.1395309656768613
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -3.7696513074105265,
+          -1.6651116781626119
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "small-static/post_warmup_batch_median_ms": {
+        "baseline": [
+          296.4887319999998,
+          298.05799599999955,
+          302.44752700000026,
+          298.57151199999953,
+          301.5449979999994,
+          301.82686400000057,
+          301.1939619999994
+        ],
+        "candidate": [
+          292.09941100000106,
+          290.3913749999974,
+          295.7441429999999,
+          293.5558830000009,
+          291.4353780000001,
+          292.40313700000024,
+          289.41371099999924
+        ],
+        "paired_ratios": [
+          0.9851956566093083,
+          0.9742780898251691,
+          0.9778362082623332,
+          0.9832012472777422,
+          0.9664739257256747,
+          0.968777706281306,
+          0.9608881568482434
+        ],
+        "paired_median_change_percent": -2.572191017483094,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -3.35260742743253,
+          -1.6798752722257837
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -3.9111843151756642,
+          -1.4804343390691699
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "dashboard-string/post_warmup_batch_median_ms": {
+        "baseline": [
+          1011.4502409999996,
+          1013.7448290000011,
+          1030.9224029999987,
+          1013.3683419999998,
+          1022.1140230000001,
+          1024.8847020000012,
+          1024.8179659999996
+        ],
+        "candidate": [
+          960.9521330000007,
+          957.4808709999998,
+          975.0497260000011,
+          968.1463110000004,
+          961.2823129999997,
+          961.2452389999999,
+          955.1965799999998
+        ],
+        "paired_ratios": [
+          0.9500735617502326,
+          0.9444988951948565,
+          0.9458032177422788,
+          0.9553745374453395,
+          0.9404844189286694,
+          0.9379057342979042,
+          0.9320646316616196
+        ],
+        "paired_median_change_percent": -5.5501104805143475,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -6.209426570209575,
+          -4.992643824976739
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -6.7935368338380435,
+          -4.462546255466049
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "dashboard-static/post_warmup_batch_median_ms": {
+        "baseline": [
+          1008.2163659999997,
+          1012.573002000001,
+          1029.4013409999989,
+          1011.6197339999981,
+          1022.0058480000007,
+          1023.6370530000004,
+          1023.9429549999995
+        ],
+        "candidate": [
+          960.6024949999992,
+          955.8597329999993,
+          973.2836100000004,
+          965.5319569999992,
+          959.0449349999999,
+          959.9914600000011,
+          953.6247479999984
+        ],
+        "paired_ratios": [
+          0.9527741538367366,
+          0.9439909331100241,
+          0.9454850807310163,
+          0.9544415994953308,
+          0.9383947624925911,
+          0.9378240629200834,
+          0.9313260502876343
+        ],
+        "paired_median_change_percent": -5.600906688997586,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -6.217593707991664,
+          -4.722584616326342
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -6.867394971236573,
+          -4.555840050466919
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "escaped-string/post_warmup_batch_median_ms": {
+        "baseline": [
+          1009.583549,
+          1016.7678639999976,
+          1030.0070749999995,
+          1014.6343310000011,
+          1024.362970000002,
+          1024.1342630000017,
+          1025.8760840000004
+        ],
+        "candidate": [
+          961.3756219999996,
+          958.513055999998,
+          974.8126280000015,
+          967.2630280000003,
+          961.0825729999997,
+          961.7255640000021,
+          950.2747799999997
+        ],
+        "paired_ratios": [
+          0.9522496904315144,
+          0.9427058918140633,
+          0.9464135263342749,
+          0.9533119454441161,
+          0.9382246343793527,
+          0.9390619948431512,
+          0.9263056180184812
+        ],
+        "paired_median_change_percent": -5.7294108185936725,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -6.177536562064734,
+          -4.775030956848559
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -7.369438198151879,
+          -4.668805455588387
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "escaped-static/post_warmup_batch_median_ms": {
+        "baseline": [
+          1009.0981120000015,
+          1013.2737530000013,
+          1029.9846590000016,
+          1011.908787999997,
+          1022.6959769999994,
+          1026.767683,
+          1026.3113189999985
+        ],
+        "candidate": [
+          958.7342370000006,
+          956.047469000001,
+          973.9447279999986,
+          967.3436930000025,
+          959.814128,
+          960.9490240000005,
+          953.0363350000007
+        ],
+        "paired_ratios": [
+          0.950090209860584,
+          0.9435233727997292,
+          0.9455914896301355,
+          0.9559593754610276,
+          0.9385136439233305,
+          0.9358972237929312,
+          0.9286035507516429
+        ],
+        "paired_median_change_percent": -5.64766272002708,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -6.410277620706884,
+          -4.990979013941599
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -7.139644924835709,
+          -4.4040624538972395
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "all_measured_render_and_collection_ms": {
+        "baseline": [
+          13899.486944,
+          13963.742863,
+          14176.520911000005,
+          13948.588833999995,
+          14078.417956000001,
+          14110.622895,
+          14103.122172999992
+        ],
+        "candidate": [
+          13263.746453,
+          13237.014004000002,
+          13463.638578000006,
+          13375.52990400001,
+          13273.043856000002,
+          13282.621864999997,
+          13161.662035999994
+        ],
+        "paired_ratios": [
+          0.9542615858008752,
+          0.9479560125010877,
+          0.9497138728553032,
+          0.9589163508352084,
+          0.9427937071823641,
+          0.9413207314686725,
+          0.9332445592223263
+        ],
+        "paired_median_change_percent": -5.204398749891226,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -5.867926853132754,
+          -4.573841419912483
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -6.67554407776737,
+          -4.108364916479157
+        ],
+        "two_sided_exact_sign_p": 0.015625,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "all_validation_ms": {
+        "baseline": [
+          1.0667329999956934,
+          1.019821000002338,
+          1.0374040000016862,
+          1.0384559999951293,
+          1.0143200000055828,
+          1.016425999993146,
+          1.0213980000014828
+        ],
+        "candidate": [
+          1.0486390000035684,
+          1.0182100000073078,
+          1.0060629999997843,
+          1.0326080000056521,
+          1.0248830000005,
+          1.0220630000055664,
+          1.030136000000276
+        ],
+        "paired_ratios": [
+          0.9830379298360526,
+          0.9984203110202413,
+          0.9697890118007537,
+          0.9943685625683664,
+          1.0104138733287908,
+          1.0055459030096223,
+          1.0085549413634847
+        ],
+        "paired_median_change_percent": -0.15796889797586866,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -1.6962070163947351,
+          0.8554941363484669
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -3.021098819924628,
+          1.0413873328790846
+        ],
+        "two_sided_exact_sign_p": 1,
+        "phase0_stable": false,
+        "provisional_regression": false
+      }
+    },
+    "validation_only_median_flags": {
+      "dashboard-string/warmup/0/validation_ms": {
+        "baseline": [
+          0.047548999999662556,
+          0.0489100000002054,
+          0.047540999999682754,
+          0.04746400000021822,
+          0.048822000000200205,
+          0.04740400000014233,
+          0.04841800000008334
+        ],
+        "candidate": [
+          0.04898200000002362,
+          0.04833199999984572,
+          0.049465999999938504,
+          0.049837000000025,
+          0.047552000000223416,
+          0.049713999999994485,
+          0.04824099999996179
+        ],
+        "paired_ratios": [
+          1.030137332023202,
+          0.9881823757849673,
+          1.0404913653534549,
+          1.0499957862758273,
+          0.9739871369470406,
+          1.0487300649701548,
+          0.9963443347490345
+        ],
+        "paired_median_change_percent": 3.01373320232019,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -1.181762421503274,
+          4.873006497015475
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -2.6012863052959356,
+          4.999578627582735
+        ],
+        "two_sided_exact_sign_p": 1,
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "dashboard-static/measured/3/validation_ms": {
+        "baseline": [
+          0.04911600000195904,
+          0.04761000000144122,
+          0.04961600000024191,
+          0.048218999996606726,
+          0.04843100000289269,
+          0.0489229999948293,
+          0.04815299999609124
+        ],
+        "candidate": [
+          0.056340999999520136,
+          0.048004000000219094,
+          0.04838000000017928,
+          0.051848000000973116,
+          0.049897999999302556,
+          0.050786000001608045,
+          0.047360000000480795
+        ],
+        "paired_ratios": [
+          1.1471007410471725,
+          1.008275572332828,
+          0.9750886810694815,
+          1.0752607894112647,
+          1.030290516328844,
+          1.0380802486964342,
+          0.9835316595918258
+        ],
+        "paired_median_change_percent": 3.0290516328844053,
+        "nominal_exact_empirical_bootstrap_95_change_percent": [
+          -1.6468340408174242,
+          7.526078941126468
+        ],
+        "distribution_free_median_98_4375_change_percent": [
+          -2.4911318930518456,
+          14.710074104717252
+        ],
+        "two_sided_exact_sign_p": 0.453125,
+        "phase0_stable": true,
+        "provisional_regression": false
+      }
+    },
+    "provisional_component_regressions": [],
+    "functional_checks": {
+      "processes": 19,
+      "validated_renders_per_process": 768,
+      "external_full_HTML_bodies": 1140,
+      "normal_exit_empty_stderr_all": true
+    },
+    "quiet": {
+      "recognized_worker_events": 0,
+      "owned_affinity": "5",
+      "SMT_sibling_cpu1_observed_busy_ticks": 0,
+      "all_owned_workers_cleaned_up": true
+    },
+    "qualifications": [
+      "No new synthetic microbenchmark; the exact real-library phased SSR fixture is reused.",
+      "No cross-host, Node/Ladybird catch-up, deployed-page, full Speedometer or desktop responsiveness claim.",
+      "The direct functional gate and phased timing use identical cases/package/oracles but distinct chronology and output retention. Every timed phased process is still independently checked.",
+      "At most 32 complete output strings are retained until phase validation/report/release. This closed-loop lifetime differs from immediate HTTP response disposal.",
+      "Sampled RSS-family maxima are not an additive peak breakdown; unavailable short-process RSS is null. wait4 ru_maxrss can include pre-exec parent footprint.",
+      "Compiler and true post-GC retained memory remain unavailable in unchanged clean CLI, not supplied by Rust build time or last sampled RSS.",
+      "Native source/profile/functionals are bound to this new x64 cohort; neither invalid Crystal block supplies a timing sample. No pooling, cross-machine ratio or ARM relabelling."
+    ],
+    "unavailable_dimensions": [
+      "isolated JavaScript compilation time",
+      "native generated-code size during clean SSR timing",
+      "true post-GC retained heap",
+      "pauses within a render"
+    ],
+    "excluded_measurements": "Prior interrupted Crystal cohorts; no discarded samples from this fixed native N7 cohort, no pooling, retries or extension.",
+    "owner_recommendation": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-measurement-v1/recommendation-native-n7-v1.json",
+      "sha256": "a6df65be07637eaafb90734a5770178c42563904c9fc51f707b907c19338a62a",
+      "bytes": 18964
+    }
+  },
+  "local_integration": {
+    "source_files": 813,
+    "architecture": "aarch64",
+    "artifact": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/trust-js-unit-tests",
+      "sha256": "765d1037089a52dade02071b1e72db209d2cd22e11efece4b6bfe6e5c32c3e87",
+      "bytes": 249363320
+    },
+    "actual_list_count": 2492,
+    "fresh": false,
+    "focused_groups": {
+      "accumulation": 19,
+      "committed_pruning": 7,
+      "sparse_observed_recovery": 9
+    },
+    "passed": 35,
+    "failed": 0,
+    "report": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/focused-report.json",
+      "sha256": "b992eb0ece6a92c4c1f2b3c6ab26fc71823f00d5efb448f3929830bd7413d376",
+      "bytes": 53669
+    },
+    "strict_optional_all_target_lint": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/clippy-report.json",
+      "sha256": "81712e6feaa06fa5eed322f042413d338a8344b9f23739131c95248180740198",
+      "bytes": 850
+    },
+    "default_source_equivalence": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/default-source-equivalence.json",
+      "sha256": "e33771d61cf8d8983f8ae57eec5cb1a9ce2173d4726978b62841d9997aac8c50",
+      "bytes": 1096
+    },
+    "root_additional_actual_ARM_reruns": 3,
+    "cargo_fresh_false_means_workspace_artifact_rebuilt": true
+  },
+  "recorded_utc": "2026-10-14T23:08:22.664504+00:00",
+  "integration_root_review": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-integration-ab7251-validation-v1/root-independent-review/audit.json",
+    "sha256": "9c419108efc5a47f4b3c40aa56923c0bc4af9de58d48925d1e6079bbc82936b7",
+    "bytes": 1206
+  },
+  "release_functional_root_review": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-release-functional-v1/root-independent-release-functional-audit.json",
+    "sha256": "58e5b085e16f22040eef5aa1474b4a2657003d3ac571518157b8f23b98c4616e",
+    "bytes": 1675
+  }
+}

@@ -359,20 +359,33 @@ impl LStr {
     /// rescans; moving the left handle also permits amortized appends to unique temporaries.
     /// Aliases (including `s + s`) keep the strong count above one and force a separate buffer.
     pub(crate) fn concat_owned(mut self, right: &LStr) -> LStr {
+        self.append_or_replace(right);
+        self
+    }
+
+    /// Append without temporarily removing an owning binding. Build a replacement before
+    /// assigning it, so allocation failure cannot strand a cleared binding. Unique buffers
+    /// with capacity mutate only while this mutable borrow excludes every other observer;
+    /// shared strings and views retain the original contents and allocate a replacement.
+    pub(crate) fn append_or_replace(&mut self, right: &LStr) {
         if right.is_empty() {
-            return self;
+            return;
         }
         if self.is_empty() {
-            return right.clone();
+            *self = right.clone();
+            return;
         }
-        if !self.ascii_hint() && !right.ascii_hint() && crate::jstr::needs_join_fixup(&self, right)
+        if !self.ascii_hint()
+            && !right.ascii_hint()
+            && crate::jstr::needs_join_fixup(self.as_str(), right)
         {
-            return crate::jstr::concat(&self, right).into();
+            let replacement = crate::jstr::concat(self.as_str(), right).into();
+            *self = replacement;
+            return;
         }
-        if self.append_with_hint(right.as_str(), right.ascii_hint()) {
-            self
-        } else {
-            self.grow_with_hint(right.as_str(), right.ascii_hint())
+        if !self.append_with_hint(right.as_str(), right.ascii_hint()) {
+            let replacement = self.grow_with_hint(right.as_str(), right.ascii_hint());
+            *self = replacement;
         }
     }
 
@@ -641,6 +654,28 @@ mod tests {
         assert_eq!(std::mem::size_of::<LStr>(), std::mem::size_of::<usize>());
         assert_eq!(LEN_OFF, std::mem::size_of::<usize>());
         assert_eq!(CAP_OFF, LEN_OFF + 4);
+    }
+
+    #[test]
+    fn populated_append_reuses_unique_capacity_and_keeps_aliases_immutable() {
+        let mut value = LStr::alloc_with_hint("a", 16, true);
+        let pointer = value.as_ptr();
+        value.append_or_replace(&LStr::from("b"));
+        assert_eq!(value.as_ptr(), pointer);
+        assert_eq!(value.as_str(), "ab");
+        let snapshot = value.clone();
+        value.append_or_replace(&LStr::from("c"));
+        assert_eq!(snapshot.as_str(), "ab");
+        assert_eq!(value.as_str(), "abc");
+        assert!(!LStr::ptr_eq(&value, &snapshot));
+        let rhs = value.clone();
+        value.append_or_replace(&rhs);
+        assert_eq!(rhs.as_str(), "abc");
+        assert_eq!(value.as_str(), "abcabc");
+        let mut high = LStr::from(crate::jstr::from_units(&[0xd834]));
+        high.append_or_replace(&LStr::from(crate::jstr::from_units(&[0xdf06])));
+        assert_eq!(high.as_str(), "𝌆");
+        assert!(!high.ascii_hint());
     }
 
     #[test]

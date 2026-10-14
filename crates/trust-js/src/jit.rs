@@ -1951,6 +1951,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_object_literal as *const () as usize,
         crate::bytecode::jit_abstract_operation as *const () as usize,
         crate::bytecode::jit_iteration as *const () as usize,
+        crate::bytecode::string_accumulation::jit_try as *const () as usize,
     ]
 }
 
@@ -2033,7 +2034,10 @@ pub const H_OBJECT_LITERAL: usize = 30;
 pub const H_ABSTRACT: usize = 31;
 /// Iterator-protocol operations (see `bytecode::jit_iteration`).
 pub const H_ITERATION: usize = 32;
-pub const N_HELPERS: usize = 33;
+/// Complete primitive-string declarative accumulation. flag1 is an unchanged miss,
+/// not an exception; only its guarded region emitters may call this helper.
+pub const H_STRING_ACCUMULATION: usize = 33;
+pub const N_HELPERS: usize = 34;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2072,6 +2076,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "object_literal",
     "abstract_operation",
     "iteration",
+    "string_accumulation",
 ];
 
 #[inline]
@@ -2538,6 +2543,9 @@ mod asm {
         /// family whose code starts there. Nested families restore their parent when they end.
         marks: Vec<(usize, &'static str)>,
         mark_stack: Vec<&'static str>,
+        /// Immutable scalar original-PC/slot/exit-label plans; no JavaScript owners.
+        /// Checked numeric replay uses the same before-read transaction as ordinary entry.
+        string_accumulations: Vec<(u32, u16, usize)>,
     }
 
     #[derive(Clone, Copy)]
@@ -2559,6 +2567,7 @@ mod asm {
                 stubs_ok: false,
                 marks: Vec::new(),
                 mark_stack: Vec::new(),
+                string_accumulations: Vec::new(),
             }
         }
         /// Start a profiler attribution region (a no-op unless `TRUST_JS_JIT_MAP` is set).
@@ -2611,6 +2620,18 @@ mod asm {
         }
         pub fn stubs_ok(&self) -> bool {
             self.stubs_ok
+        }
+        pub fn add_string_accumulation(&mut self, pc: u32, slot: u16, exit: usize) {
+            self.string_accumulations.push((pc, slot, exit));
+        }
+        pub fn string_accumulation(&self, pc: u32) -> Option<(u16, usize)> {
+            self.string_accumulations
+                .binary_search_by_key(&pc, |&(start, _, _)| start)
+                .ok()
+                .map(|index| {
+                    let (_, slot, exit) = self.string_accumulations[index];
+                    (slot, exit)
+                })
         }
         /// The entry label of the shared stub `key`, requesting its emission on first use.
         pub fn shared_stub(&mut self, key: u32) -> usize {
@@ -3875,6 +3896,13 @@ fn compile_entry(
     let residency_ptr = &*residency as *const cache::CodeResidency as u64;
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
+    for pc in 0..ops.len() {
+        if let Some(plan) = crate::bytecode::string_accumulation::Plan::at(chunk, pc)
+            .filter(|plan| plan.end < ops.len())
+        {
+            a.add_string_accumulation(pc as u32, plan.slot, pc_labels[plan.end]);
+        }
+    }
     let l_unwind = a.new_label();
     let l_ret_ok = a.new_label();
     let l_ret_throw = a.new_label();
@@ -4027,6 +4055,16 @@ fn compile_entry(
     // by an enclosing region must inhibit baseline fusions, not destroy a stronger nested
     // loop's planning vocabulary (for example a checked, discarded local read).
     let source_targets = targeted.clone();
+    // The transaction can enter only at its original read. Keep every ordinary interior
+    // template independently resumable, including borrowed frames and exact-PC recovery.
+    // Established Number chains get a separate forward copy rather than losing their lowering.
+    for pc in 0..ops.len() {
+        if let Some(plan) = crate::bytecode::string_accumulation::Plan::at(chunk, pc)
+            .filter(|plan| plan.end < ops.len())
+        {
+            targeted[pc..plan.end].fill(true);
+        }
+    }
     // ---- op templates ----
     let mut skip = 0usize;
     // Baseline labels remain independently enterable; don't emit another optimized
@@ -4081,6 +4119,7 @@ fn compile_entry(
             a.b(l_ret_ok);
             continue;
         }
+        emit_string_accumulation(&mut a, pc as u32, false);
         // Loop-spanning chain: a fully-chainable, branch-free loop headed here runs with its
         // locals register-resident across the back edge. The plain templates for the region are
         // still emitted below (starting at `plain_h`) as the bail target; the head's canonical
@@ -4260,11 +4299,23 @@ fn compile_entry(
         }
         // Numeric register chain: a run of ops whose values stay in FP registers end to end.
         if fast & 16384 != 0 && rc_ok {
-            if let Some((chain, consumed)) = build_chain(chunk, ops, pc, &targeted, layout, fast) {
+            let accumulation = a.string_accumulation(pc as u32).is_some();
+            let chain_targets = if accumulation {
+                &source_targets
+            } else {
+                &targeted
+            };
+            if let Some((chain, consumed)) =
+                build_chain(chunk, ops, pc, chain_targets, layout, fast)
+            {
                 #[cfg(feature = "optimizing-jit")]
                 emit_coverage_ranges(&mut a, chunk, &[(pc, pc + consumed)]);
                 emit_chain(&mut a, layout, &chain, &pc_labels, l_unwind);
-                skip = consumed - 1;
+                if accumulation && pc + consumed < ops.len() {
+                    a.b(pc_labels[pc + consumed]);
+                } else {
+                    skip = consumed - 1;
+                }
                 continue;
             }
         }
@@ -17937,6 +17988,11 @@ fn emit_op_helper(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize) {
+    if idx == H_EXEC {
+        // A chain's replay ladder enters with canonical owners before this original read.
+        // General CFG emitters also flush all homes at candidate reads before calling here.
+        emit_string_accumulation(a, pc, true);
+    }
     if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS {
         // A slow path runs rarely and costs far more than a call and return: the sequence
         // lives once in a shared stub, leaving three instructions at every site.
@@ -17953,6 +18009,34 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     a.blr(16);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
+}
+
+/// Try only primitive RHS strings. Miss preserves the canonical state and continues the
+/// original operation; success commits the entire region then takes its original continuation.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool) {
+    #[cfg(test)]
+    if !replay && crate::bytecode::string_accumulation::TEST_REPLAY_ONLY.with(std::cell::Cell::get)
+    {
+        return;
+    }
+    #[cfg(not(test))]
+    let _ = replay;
+    let Some((slot, exit)) = a.string_accumulation(pc) else {
+        return;
+    };
+    let ordinary = a.new_label();
+    emit_exec_word_load(a, 9, 22, slot as i32 * 8);
+    a.lsr_imm(10, 9, 48);
+    a.movz(11, (crate::value::PACK_STR >> 48) as u32, 0);
+    a.cmp_reg_x(10, 11);
+    a.b_cond(C_NE, ordinary);
+    emit_helper(a, H_STRING_ACCUMULATION, pc);
+    a.cbz(1, false, exit);
+    a.bind(ordinary);
 }
 
 /// Generated-loop safepoint. Allocation pressure must not wait for the interrupt divider:

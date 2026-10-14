@@ -80,3 +80,9 @@ The [compiler checkpoint](../docs/compiler-review-2026-10-14.txt) records the se
 inlining, range-analysis and property-proof work, its exact validation artifacts, and
 selected browser methodology. Correctness records and diagnostic profiles do not by
 themselves establish application performance acceptance.
+
+The [declarative string accumulation record](../docs/string-accumulation.txt) and
+[validation manifest](review-string-accumulation-validation-2026-10-15.json) retain
+the native x86-64 React 19.2.7 SSR comparison: seven fixed alternating pairs, with
+separate correctness evidence for the integration. The measured rendering-duration
+reduction is scoped to that authored SSR workload.

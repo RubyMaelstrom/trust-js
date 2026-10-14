@@ -36,6 +36,9 @@ use crate::value::{PackedValue, Value};
 mod activation;
 use activation::{activation_plans_enabled, ActivationPlan};
 
+#[path = "bytecode_string_accumulation.rs"]
+pub(crate) mod string_accumulation;
+
 #[path = "bytecode_fragment_cache.rs"]
 pub(crate) mod fragment_cache;
 #[path = "bytecode_loop_fragment.rs"]
@@ -16596,6 +16599,12 @@ fn run_vm_inner_recording<S: StoredValue, const RECORD: bool>(
                 stack.push(v);
             }
             Op::LoadName(n, c) => {
+                if let Some(end) =
+                    string_accumulation::try_vm(chunk, i, env, slots, stack, op_pc, stop_at)
+                {
+                    *pc = end;
+                    continue;
+                }
                 let v = chunk.load_name_ic(i, env, n, c)?;
                 stack.push(v);
             }

@@ -817,6 +817,19 @@ pub(super) fn compile_entry(
             a.jmp(ret_ok);
             continue;
         }
+        if let Some(plan) = crate::bytecode::string_accumulation::Plan::at(chunk, pc) {
+            // All original interior labels remain below. RHS Number/Empty/objects retain
+            // their ordinary templates; this private miss flag never enters exception unwind.
+            let ordinary = a.label();
+            a.load_tag_r15(i32::from(plan.slot) * SLOT_BYTES);
+            a.cmp_eax((crate::value::PACK_STR >> 48) as u32);
+            a.jcc(0x85, ordinary);
+            a.call_helper_pair(super::H_STRING_ACCUMULATION, pc as u32);
+            a.bytes(&[0x49, 0x89, 0xc5]); // r13 = canonical sp
+            a.bytes(&[0x48, 0x85, 0xd2]); // flag0 is complete success
+            a.jcc(0x84, pcs[plan.end]);
+            a.bind(ordinary);
+        }
         if names::emit_op(&mut a, chunk, layout, ilayout, op, pc as u32, unwind) {
             continue;
         }
