@@ -429,6 +429,8 @@ pub(crate) struct Visitor {
     jit_codes: HashSet<usize>,
     #[cfg(feature = "optimizing-jit")]
     jit_call_stubs: HashSet<usize>,
+    #[cfg(feature = "optimizing-jit")]
+    execution_coverage_allocations: HashSet<usize>,
     hoist_plans: HashSet<usize>,
     binding_layouts: HashSet<usize>,
     stmt_bodies: HashSet<usize>,
@@ -692,6 +694,16 @@ impl Visitor {
         self.function_bytecode_metadata = self.function_bytecode_metadata.saturating_add(bytes);
     }
 
+    /// Shared scalar feedback/snapshots are charged once across Chunk and native leases.
+    /// Like other Rc-backed managed categories, private refcount headers are excluded; the
+    /// coverage quota reports its own explicitly labelled header/directory charges separately.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) fn execution_coverage_allocation(&mut self, identity: usize, bytes: usize) {
+        if self.execution_coverage_allocations.insert(identity) {
+            self.add_function_bytecode_bytes(bytes);
+        }
+    }
+
     pub(crate) fn inline_sites_bytes(&mut self, identity: usize, bytes: usize) -> usize {
         if self.inline_site_allocations.insert(identity) {
             bytes
@@ -953,6 +965,10 @@ impl Visitor {
         let identity = Rc::as_ptr(code) as usize;
         if self.jit_codes.insert(identity) {
             self.add_jit_heap_metadata_bytes(code.retained_heap_metadata_bytes());
+            #[cfg(feature = "optimizing-jit")]
+            if let Some((identity, bytes)) = code.execution_coverage_metadata() {
+                self.execution_coverage_allocation(identity, bytes);
+            }
             #[cfg(feature = "optimizing-jit")]
             for (identity, bytes) in code.shared_call_metadata() {
                 if self.jit_call_stubs.insert(identity) {
@@ -3970,5 +3986,46 @@ mod tests {
             visitor.jit_heap_metadata, expected,
             "revisits must not double-charge code or its stubs"
         );
+    }
+}
+
+#[cfg(all(test, feature = "optimizing-jit"))]
+mod execution_coverage_accounting_tests {
+    use super::*;
+    #[test]
+    fn shared_source_native_leases_and_frozen_handles_are_charged_once() {
+        let _control = crate::execution_coverage::TestControl::new(true);
+        let statements =
+            crate::parser::parse_script("function subject(a){if(a)return 7;return 11;}", false)
+                .ok()
+                .unwrap();
+        let crate::ast::Stmt::FuncDecl(function) = &statements[0] else {
+            panic!("fixture")
+        };
+        let chunk = crate::bytecode::compile(function).unwrap();
+        let lease =
+            crate::execution_coverage::Lease::new(chunk.execution_coverage.source().unwrap());
+        let (identity, bytes) = lease.allocation_metadata();
+        let mut visitor = Visitor::default();
+        chunk.execution_coverage.scan_retained_memory(&mut visitor);
+        assert_eq!(visitor.function_bytecode_metadata, bytes);
+        visitor.execution_coverage_allocation(identity, bytes);
+        chunk.execution_coverage.scan_retained_memory(&mut visitor);
+        assert_eq!(
+            visitor.function_bytecode_metadata, bytes,
+            "Chunk and native lease share one scalar allocation"
+        );
+        let frozen = chunk.execution_coverage.freeze();
+        let shared = frozen.freeze();
+        frozen.scan_retained_memory(&mut visitor);
+        let with_frozen = visitor.function_bytecode_metadata;
+        assert!(with_frozen > bytes);
+        shared.scan_retained_memory(&mut visitor);
+        frozen.scan_retained_memory(&mut visitor);
+        assert_eq!(
+            visitor.function_bytecode_metadata, with_frozen,
+            "frozen Rc clones charge the payload once"
+        );
+        assert_eq!(visitor.execution_coverage_allocations.len(), 2);
     }
 }

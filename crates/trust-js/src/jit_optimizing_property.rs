@@ -133,6 +133,13 @@ impl Lowering<'_, '_> {
                     })
             })
         });
+        if compact.is_none()
+            && !numeric_result
+            && generic_own.is_none()
+            && self.shared_property_read(pc, op, next)
+        {
+            return;
+        }
         let metadata = frozen_metadata.map(|(_, proof)| proof).unwrap_or_default();
         #[cfg(test)]
         TEST_METADATA_ELISIONS.with(|count| {

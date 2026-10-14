@@ -10,7 +10,7 @@
 //! ECMA-262 e28783d5 OrdinaryGet / OrdinarySetWithOwnDescriptor: reads and writes
 //! keep their current descriptor guards, actual Values and distinct ownership.
 
-use super::{frame, generic_own, heap_proofs, stack};
+use super::{frame, generic_own, heap_proofs, observed_regions, stack};
 use crate::{
     bytecode::{Chunk, IcState, Op},
     jit_ir::Cfg,
@@ -124,18 +124,21 @@ pub(super) fn selected(observations: &[Observation]) -> Vec<(u32, IcState)> {
 pub(super) struct Plan {
     pub(super) selected: Vec<(u32, IcState)>,
     pub(super) minimum_tests: u32,
+    pub(super) per_pc: Vec<Option<u32>>,
 }
 
 impl Plan {
+    #[cfg(test)]
     pub(super) fn build(
         chunk: &Chunk,
         cfg: &Cfg,
         stack: &stack::StackPlan,
         selected: &[(u32, IcState)],
     ) -> Option<Self> {
-        Self::with_objects(chunk, cfg, stack, selected, None)
+        Self::with_objects_and_regions(chunk, cfg, stack, selected, None, None)
     }
 
+    #[cfg(test)]
     pub(super) fn with_objects(
         chunk: &Chunk,
         cfg: &Cfg,
@@ -143,10 +146,35 @@ impl Plan {
         selected: &[(u32, IcState)],
         objects: Option<&super::object_facts::Plan>,
     ) -> Option<Self> {
+        Self::with_objects_and_regions(chunk, cfg, stack, selected, objects, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_with_regions(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        stack: &stack::StackPlan,
+        selected: &[(u32, IcState)],
+        regions: Option<&observed_regions::Plan>,
+    ) -> Option<Self> {
+        Self::with_objects_and_regions(chunk, cfg, stack, selected, None, regions)
+    }
+
+    pub(super) fn with_objects_and_regions(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        stack: &stack::StackPlan,
+        selected: &[(u32, IcState)],
+        objects: Option<&super::object_facts::Plan>,
+        regions: Option<&observed_regions::Plan>,
+    ) -> Option<Self> {
         if !enabled()
             || chunk.jit_ops().len() > 256
             || selected.is_empty()
             || selected.len() > MAX_SITES
+            || selected
+                .iter()
+                .any(|&(pc, _)| pc as usize >= chunk.jit_ops().len())
         {
             return None;
         }
@@ -157,10 +185,22 @@ impl Plan {
         )?;
         // Planning a baseline uses precisely the same frozen selection seam as
         // lowering its candidate. It must not consult newer caches for extra sites.
-        let proof = generic_own::Plan::build_hot_selection(chunk, cfg, &frame, stack, selected)?;
+        let selected: Vec<_> = selected
+            .iter()
+            .copied()
+            .filter(|&(pc, _)| {
+                regions.is_none_or(|plan| {
+                    plan.emission(pc as usize) == observed_regions::Emission::Native
+                })
+            })
+            .collect();
+        if selected.is_empty() {
+            return None;
+        }
+        let proof = generic_own::Plan::build_hot_selection(chunk, cfg, &frame, stack, &selected)?;
         let mut weights = vec![0u32; cfg.blocks().len()];
         let mut per_pc = vec![None; chunk.jit_ops().len()];
-        for &(pc, _) in selected {
+        for &(pc, _) in &selected {
             let site = proof
                 .read(pc as usize)
                 .or_else(|| proof.write(pc as usize))?;
@@ -169,11 +209,14 @@ impl Plan {
             weights[block] = weights[block].checked_add(credit)?;
             per_pc[pc as usize] = Some(credit);
         }
-        let minimum_tests = minimum_path(cfg, chunk, &weights, &per_pc, objects)?
+        // per_pc remains raw structural credit. The combined region estimate
+        // recomputes its paths and charges this same emitted guard once itself.
+        let minimum_tests = minimum_path(cfg, chunk, &weights, &per_pc, &[], objects, regions)?
             .saturating_sub(objects.map_or(0, |plan| plan.guard_cost));
-        (minimum_tests != 0).then(|| Self {
-            selected: selected.to_vec(),
+        (minimum_tests != 0).then_some(Self {
+            selected,
             minimum_tests,
+            per_pc,
         })
     }
 }
@@ -188,18 +231,22 @@ fn removed_tests(removed: heap_proofs::ReadElisions) -> u32 {
         + u32::from(removed.data)
 }
 
-fn minimum_path(
+pub(super) fn minimum_path(
     cfg: &Cfg,
     chunk: &Chunk,
     weights: &[u32],
     per_pc: &[Option<u32>],
+    numeric_per_pc: &[u32],
     objects: Option<&super::object_facts::Plan>,
+    regions: Option<&observed_regions::Plan>,
 ) -> Option<u32> {
     let ops = chunk.jit_ops();
     let blocks = cfg.blocks();
     if blocks.is_empty()
         || blocks.len() > 257
         || weights.len() != blocks.len()
+        || per_pc.len() != ops.len()
+        || (!numeric_per_pc.is_empty() && numeric_per_pc.len() != ops.len())
         || !cfg.handler_roots().is_empty()
         || !cfg.resume_roots().is_empty()
     {
@@ -219,6 +266,10 @@ fn minimum_path(
             break;
         }
         settled[next] = true;
+        if regions.is_some_and(|plan| plan.cuts_block(next)) {
+            // The native invocation ends here; the VM remainder cannot pay for it.
+            continue;
+        }
         for target in &blocks[next].successors {
             let target = target.0 as usize;
             if objects.is_some_and(|plan| {
@@ -235,18 +286,19 @@ fn minimum_path(
         .enumerate()
         .filter(|(id, block)| {
             distance[*id] != u32::MAX
-                && block.successors.is_empty()
-                && (block.start == ops.len()
-                    || block
-                        .end
-                        .checked_sub(1)
-                        .and_then(|pc| ops.get(pc))
-                        .is_some_and(|op| {
-                            matches!(
-                                op,
-                                Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
-                            )
-                        }))
+                && (regions.is_some_and(|plan| plan.cuts_block(*id))
+                    || block.successors.is_empty()
+                        && (block.start == ops.len()
+                            || block
+                                .end
+                                .checked_sub(1)
+                                .and_then(|pc| ops.get(pc))
+                                .is_some_and(|op| {
+                                    matches!(
+                                        op,
+                                        Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
+                                    )
+                                })))
         })
         .map(|(id, _)| distance[id])
         .min();
@@ -256,6 +308,9 @@ fn minimum_path(
         .enumerate()
         .filter(|(id, _)| distance[*id] != u32::MAX)
     {
+        if regions.is_some_and(|plan| plan.cuts_block(id)) {
+            continue;
+        }
         let mut prefix = distance[id].checked_sub(weights[id])?;
         for pc in block.start..block.end {
             if let Some(credit) = per_pc[pc] {
@@ -265,6 +320,10 @@ fn minimum_path(
                 // final opcode. Later field savings cannot pay that entry.
                 minimum = minimum.min(prefix);
             }
+            // Numeric credit never treats a potentially abrupt operation as an
+            // ordinary proven data access. Count its conservative early completion
+            // before credit for that operation, not after it.
+            prefix = prefix.checked_add(numeric_per_pc.get(pc).copied().unwrap_or(0))?;
         }
     }
     Some(minimum)

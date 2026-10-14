@@ -1658,6 +1658,9 @@ pub struct JitCode {
     /// be reclaimed, so no return PC in an outlined call stub can outlive its executable owner.
     #[cfg(feature = "optimizing-jit")]
     call_stubs: Vec<Rc<call_stub::SharedCallStub>>,
+    /// Pins scalar baseline feedback addresses, never JavaScript owners or code residency.
+    #[cfg(feature = "optimizing-jit")]
+    execution_coverage: Option<crate::execution_coverage::Lease>,
     /// Optional diagnostic counters outlive every native instruction referring to them.
     /// The diagnostic directory is weak and cannot extend this code's residency.
     #[cfg(feature = "optimizing-jit")]
@@ -1677,6 +1680,22 @@ impl Drop for JitCode {
 }
 
 impl JitCode {
+    #[cfg(test)]
+    pub(crate) fn test_coverage_layout_json() -> String {
+        #[cfg(feature = "optimizing-jit")]
+        let coverage_offset = std::mem::offset_of!(JitCode, execution_coverage).to_string();
+        #[cfg(not(feature = "optimizing-jit"))]
+        let coverage_offset = "null";
+        format!(
+            "{{\"jit_code_bytes\":{},\"jit_code_mem_offset\":{},\"jit_code_max_stack_offset\":{},\"jit_code_coverage_offset\":{},\"jit_ctx_bytes\":{},\"jit_ctx_slots_offset\":{},\"jit_ctx_chunk_offset\":{},\"jit_ctx_resume_pc_offset\":{},\"jit_frame_bytes\":{}}}",
+            std::mem::size_of::<JitCode>(), std::mem::offset_of!(JitCode, mem),
+            std::mem::offset_of!(JitCode, max_stack), coverage_offset,
+            std::mem::size_of::<JitCtx>(), std::mem::offset_of!(JitCtx, slots),
+            std::mem::offset_of!(JitCtx, chunk), std::mem::offset_of!(JitCtx, resume_pc),
+            std::mem::size_of::<JitFrame>(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn test_residency_marks(&self, reset_reference: bool) -> (u64, u8) {
         if reset_reference {
@@ -1717,6 +1736,13 @@ impl JitCode {
         self.call_stubs
             .iter()
             .map(|stub| (Rc::as_ptr(stub) as usize, stub.retained_metadata_bytes()))
+    }
+
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) fn execution_coverage_metadata(&self) -> Option<(usize, usize)> {
+        self.execution_coverage
+            .as_ref()
+            .map(crate::execution_coverage::Lease::allocation_metadata)
     }
 
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches
@@ -3918,6 +3944,15 @@ fn compile_entry(
         }
     }
     if borrowed_entry {
+        #[cfg(feature = "optimizing-jit")]
+        if chunk.execution_coverage.source().is_some() {
+            a.mov(0, 19);
+            a.mov_imm64(
+                16,
+                crate::execution_coverage::mark_native_resume as *const () as usize as u64,
+            );
+            a.blr(16);
+        }
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
         a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, resume_pc) as u32);
         a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, pc_offsets) as u32);
@@ -4027,6 +4062,14 @@ fn compile_entry(
                 }
             }
         }
+        #[cfg(feature = "optimizing-jit")]
+        if chunk
+            .execution_coverage
+            .source()
+            .is_some_and(|coverage| coverage.is_leader(pc) || targeted[pc])
+        {
+            emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 1)]);
+        }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
             // pc-offset still bind here (harmless: nothing jumps into a fused region — checked).
@@ -4071,6 +4114,8 @@ fn compile_entry(
             }
             let mut emitted_region = false;
             if let Some(plan) = plan_linked_scan(chunk, ops, pc, &cfg, layout, fast) {
+                #[cfg(feature = "optimizing-jit")]
+                emit_coverage_ranges(&mut a, chunk, &[(pc, plan.exit_pc)]);
                 let plain_h = emit_linked_scan_region(&mut a, layout, ilayout, &plan, &pc_labels);
                 a.bind(plain_h);
                 for p in pc + 1..pc + 9 {
@@ -4086,6 +4131,8 @@ fn compile_entry(
                 // General CFG lowering adds effect/call coverage, not a reason to spill
                 // already-proven numeric and element loops at every operation.
                 if let Some(plan) = plan_loop(chunk, ops, pc, &source_targets, layout, fast, &cfg) {
+                    #[cfg(feature = "optimizing-jit")]
+                    emit_coverage_ranges(&mut a, chunk, &[(plan.head, plan.exit_pc)]);
                     let plain_h =
                         emit_loop_chain(&mut a, layout, ilayout, &plan, &pc_labels, &mut targeted);
                     a.bind(plain_h);
@@ -4120,6 +4167,8 @@ fn compile_entry(
                         }
                     } else {
                         a.rewind(checkpoint);
+                        #[cfg(all(test, feature = "optimizing-jit"))]
+                        TEST_COVERAGE_REWOUND_REGIONS.with(|count| count.set(count.get() + 1));
                         if env_flag!("TRUST_JS_JIT_REGIONLOG") {
                             eprintln!("[jit-region] head {pc}: retained baseline ({} optional bytes, {} saved-work units)", emission.bytes, emission.saved_work);
                         }
@@ -4156,6 +4205,8 @@ fn compile_entry(
                     // speculative bailout destinations have been published: the mature
                     // baseline retains every independently legal span fusion.
                     a.rewind(checkpoint);
+                    #[cfg(all(test, feature = "optimizing-jit"))]
+                    TEST_COVERAGE_REWOUND_REGIONS.with(|count| count.set(count.get() + 1));
                     if env_flag!("TRUST_JS_JIT_REGIONLOG") {
                         eprintln!("[jit-region] head {pc}: retained baseline ({added} optional bytes, {} saved-work units)", emission.saved_work);
                     }
@@ -4189,6 +4240,8 @@ fn compile_entry(
                     && lhs_off + 8 < 4096
                     && rhs_off + 8 < 4096
                 {
+                    #[cfg(feature = "optimizing-jit")]
+                    emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 4)]);
                     emit_local_eq_branch(
                         &mut a,
                         layout,
@@ -4208,6 +4261,8 @@ fn compile_entry(
         // Numeric register chain: a run of ops whose values stay in FP registers end to end.
         if fast & 16384 != 0 && rc_ok {
             if let Some((chain, consumed)) = build_chain(chunk, ops, pc, &targeted, layout, fast) {
+                #[cfg(feature = "optimizing-jit")]
+                emit_coverage_ranges(&mut a, chunk, &[(pc, pc + consumed)]);
                 emit_chain(&mut a, layout, &chain, &pc_labels, l_unwind);
                 skip = consumed - 1;
                 continue;
@@ -4226,6 +4281,14 @@ fn compile_entry(
             {
                 let cond_pc = *cond_pc as usize;
                 if let Some(Op::JumpIfFalse(false_pc)) = ops.get(cond_pc) {
+                    #[cfg(feature = "optimizing-jit")]
+                    emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2), (cond_pc, cond_pc + 1)]);
+                    #[cfg(all(test, feature = "optimizing-jit"))]
+                    {
+                        // Canonical operands are still in memory; flags are produced below.
+                        a.mov_imm64(16, record_coverage_threaded_equality as *const () as u64);
+                        a.blr(16);
+                    }
                     emit_eq_inline(
                         &mut a,
                         layout,
@@ -4252,6 +4315,8 @@ fn compile_entry(
             ) = (op, ops.get(pc + 1))
             {
                 if !targeted[pc + 1] {
+                    #[cfg(feature = "optimizing-jit")]
+                    emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
                     emit_eq_inline(
                         &mut a,
                         layout,
@@ -4284,6 +4349,8 @@ fn compile_entry(
             ) = (op, ops.get(pc + 1))
             {
                 if !targeted[pc + 1] {
+                    #[cfg(feature = "optimizing-jit")]
+                    emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
                     let neg = match op {
                         Op::Lt => 5,                  // PL: !(a<b), true for unordered (NaN must jump)
                         Op::Gt => 13,                 // LE: !(a>b), true for unordered
@@ -4333,6 +4400,8 @@ fn compile_entry(
                 _ => None,
             };
             if let Some((x_off, key)) = pair {
+                #[cfg(feature = "optimizing-jit")]
+                emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
                 emit_elem_local_keyed(
                     &mut a,
                     layout,
@@ -4354,6 +4423,8 @@ fn compile_entry(
         // slot, while retaining the ordinary fallback for BigInt and unusual layouts.
         if fast & (8 | 16 | 64) == (8 | 16 | 64) {
             if let Some(slot) = local_store_pair(ops, pc, &targeted) {
+                #[cfg(feature = "optimizing-jit")]
+                emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
                 emit_store_local(
                     &mut a,
                     layout,
@@ -4372,6 +4443,8 @@ fn compile_entry(
         // before a plain lexical assignment. Keep independent Pop entries intact.
         if fast & (8 | 64) == (8 | 64) {
             if let Some(slot) = local_read_discard_pair(ops, pc, &targeted) {
+                #[cfg(feature = "optimizing-jit")]
+                emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
                 emit_discard_local_read(&mut a, slot as u32 * 8, pc as u32, l_unwind);
                 skip = 1;
                 continue;
@@ -4563,6 +4636,10 @@ fn compile_entry(
                     && ilayout.depth / 4 < 4096
                     && !chunk.jit_detailed_feedback_enabled() =>
             {
+                #[cfg(feature = "optimizing-jit")]
+                if matches!(ops.get(pc + 1), Some(Op::JumpIfFalse(_))) && !targeted[pc + 1] {
+                    emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 2)]);
+                }
                 let limit = crate::bytecode::ordinary_tail_call_depth();
                 a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, interp) as u32);
                 a.ldr_w_imm(9, 9, ilayout.depth as u32);
@@ -4866,6 +4943,11 @@ fn compile_entry(
             call_stubs: Vec::new(),
             #[cfg(feature = "optimizing-jit")]
             optimizing_diagnostics: None,
+            #[cfg(feature = "optimizing-jit")]
+            execution_coverage: chunk
+                .execution_coverage
+                .source()
+                .map(crate::execution_coverage::Lease::new),
         })
     }
 }
@@ -18392,6 +18474,132 @@ pub(crate) unsafe fn run_borrowed_frame(
 thread_local! {
     pub(crate) static TEST_NATIVE_SLICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TEST_OSR_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Before a baseline/fused-region entry, x9-x11 have no live template meaning. ORR does
+/// not update NZCV. Regions call this before allocating/loading their live register homes;
+/// branch fusions call it before producing their condition flags.
+#[cfg(all(
+    feature = "optimizing-jit",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_coverage_ranges(a: &mut asm::Asm, chunk: &Chunk, ranges: &[(usize, usize)]) {
+    let Some(coverage) = chunk.execution_coverage.source() else {
+        return;
+    };
+    match coverage.markers(ranges) {
+        Ok(markers) => {
+            for (pointer, mask) in markers {
+                a.mov_imm64(9, pointer as usize as u64);
+                a.ldrb_imm(10, 9, 0);
+                a.movz(11, u32::from(mask), 0);
+                a.logic_w(1, 10, 10, 11);
+                a.strb_imm(10, 9, 0);
+            }
+        }
+        Err(reason) => {
+            a.mov_imm64(9, coverage.unknown_ptr() as usize as u64);
+            a.ldr_w_imm(10, 9, 0);
+            a.mov_imm64(11, reason as u32 as u64);
+            a.logic_w(1, 10, 10, 11);
+            a.str_w_imm(10, 9, 0);
+        }
+    }
+}
+
+/// Uses the real JitCode lease and platform W^X mapping without a borrowed JitCtx.
+/// This test-only leaf proves generated scalar writes stay valid after its Chunk is gone.
+#[cfg(all(
+    test,
+    feature = "optimizing-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) struct CoverageMarkerLeaf(JitCode);
+
+#[cfg(all(
+    test,
+    feature = "optimizing-jit",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl CoverageMarkerLeaf {
+    pub(crate) fn new(chunk: &Chunk, ranges: &[(usize, usize)]) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        let bytes = {
+            let mut a = asm::Asm::new();
+            emit_coverage_ranges(&mut a, chunk, ranges);
+            a.ret();
+            a.finish()
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        #[cfg(target_arch = "x86_64")]
+        let bytes = x64::coverage_marker_leaf_bytes(chunk, ranges);
+        let executable = ExecutableBuffer::from_bytes(&bytes).expect("marker leaf mapping");
+        Self(JitCode {
+            mem: executable.as_ptr().cast_mut(),
+            len: executable.len(),
+            pc_offsets: Vec::new(),
+            max_stack: 0,
+            needs_global: false,
+            resume_depths: Vec::new(),
+            entry_kind: NativeEntryKind::FreshFrame,
+            osr_entry_depths: Vec::new(),
+            executable,
+            residency: Box::new(cache::CodeResidency::default()),
+            call_stubs: Vec::new(),
+            execution_coverage: chunk
+                .execution_coverage
+                .source()
+                .map(crate::execution_coverage::Lease::new),
+            optimizing_diagnostics: None,
+        })
+    }
+
+    pub(crate) fn run(&self) {
+        // SAFETY: the constructor emits only caller-saved scalar marker writes and a C ABI
+        // return. JitCode pins every referenced Cell and this borrow pins its executable map.
+        let entry: extern "C" fn() = unsafe { std::mem::transmute(self.0.mem) };
+        entry();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len
+    }
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+pub(crate) fn test_executed_register_regions() -> u64 {
+    regions::executed_regions()
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+pub(crate) fn test_direct_packed_returns() -> usize {
+    TEST_DIRECT_PACKED_RETURNS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+thread_local! {
+    static TEST_COVERAGE_THREADED_EQUALITIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_COVERAGE_REWOUND_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+extern "C" fn record_coverage_threaded_equality() {
+    TEST_COVERAGE_THREADED_EQUALITIES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+pub(crate) fn test_coverage_threaded_equalities() -> usize {
+    TEST_COVERAGE_THREADED_EQUALITIES.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, feature = "optimizing-jit", target_arch = "aarch64"))]
+pub(crate) fn test_coverage_rewound_regions() -> usize {
+    TEST_COVERAGE_REWOUND_REGIONS.with(std::cell::Cell::get)
 }
 
 /// Execute a JIT-compiled chunk: mirrors `bytecode::run` (activation env, pooled slot buffer),

@@ -24,7 +24,8 @@ const MAX_SITES: usize = 8;
 const MAX_OMITTED_PCS: usize = 32;
 pub(super) const OWNER_LEAF: usize = SITE_BASE + MAX_SITES;
 pub(super) const OWNER_LEAF_GUARDS: usize = OWNER_LEAF + 1;
-pub(super) const COUNTERS: usize = OWNER_LEAF_GUARDS + 1;
+pub(super) const OBSERVED_REGION_EXIT: usize = OWNER_LEAF_GUARDS + 1;
+pub(super) const COUNTERS: usize = OBSERVED_REGION_EXIT + 1;
 pub(super) const SHARED_CALL: usize = 10;
 pub(super) const RETAIN: usize = 11;
 pub(super) const RELEASE: usize = 12;
@@ -59,6 +60,7 @@ fn labels() -> impl Iterator<Item = (usize, &'static str)> {
     LABELS.iter().copied().enumerate().chain([
         (OWNER_LEAF, "shared_owner_leaf"),
         (OWNER_LEAF_GUARDS, "owner_leaf_guards"),
+        (OBSERVED_REGION_EXIT, "observed_region_vm_exits"),
     ])
 }
 
@@ -183,12 +185,16 @@ pub(super) struct Code {
     slots: Vec<String>,
     slot_truncated: Vec<bool>,
     continuation: Cell<bool>,
+    region_source_version: Cell<u64>,
+    region_native_ops: Cell<usize>,
+    region_cut_blocks: Cell<usize>,
     sites: RefCell<Vec<Site>>,
     omitted_pcs: RefCell<Vec<usize>>,
     omitted_sites: Cell<usize>,
     pub counters: [Cell<u64>; COUNTERS],
     pub emitted_helpers: Cell<u64>,
     pub emitted_owner_leaf_calls: Cell<u64>,
+    pub emitted_read_guard_calls: Cell<u64>,
     pub emitted_publications: Cell<u64>,
     pub emitted_guards: Cell<u64>,
     pub ir_instructions: Cell<usize>,
@@ -236,12 +242,16 @@ impl Code {
                     .map(|name| name.chars().count() > 32)
                     .collect(),
                 continuation: Cell::new(false),
+                region_source_version: Cell::new(0),
+                region_native_ops: Cell::new(chunk.jit_ops().len()),
+                region_cut_blocks: Cell::new(0),
                 sites: RefCell::new(Vec::new()),
                 omitted_pcs: RefCell::new(Vec::new()),
                 omitted_sites: Cell::new(0),
                 counters: std::array::from_fn(|_| Cell::new(0)),
                 emitted_helpers: Cell::new(0),
                 emitted_owner_leaf_calls: Cell::new(0),
+                emitted_read_guard_calls: Cell::new(0),
                 emitted_publications: Cell::new(0),
                 emitted_guards: Cell::new(0),
                 ir_instructions: Cell::new(0),
@@ -261,9 +271,16 @@ impl Code {
         self.continuation.set(continuation);
     }
 
+    pub(super) fn set_regions(&self, source_version: u64, native_ops: usize, cut_blocks: usize) {
+        self.region_source_version.set(source_version);
+        self.region_native_ops.set(native_ops);
+        self.region_cut_blocks.set(cut_blocks);
+    }
+
     pub(super) fn counts(&self, index: usize) -> bool {
         (self.runtime_counters
-            && (index < LEGACY_COUNTERS || matches!(index, OWNER_LEAF | OWNER_LEAF_GUARDS)))
+            && (index < LEGACY_COUNTERS
+                || matches!(index, OWNER_LEAF | OWNER_LEAF_GUARDS | OBSERVED_REGION_EXIT)))
             || (self.execution_counters
                 && (matches!(
                     index,
@@ -273,6 +290,7 @@ impl Code {
                         | VM_RECOVERY
                         | VM_RECOVERY_NORMAL
                         | RETIREMENT_REQUEST
+                        | OBSERVED_REGION_EXIT
                 ) || (SITE_BASE..SITE_BASE + MAX_SITES).contains(&index)))
     }
 
@@ -374,11 +392,12 @@ impl Code {
     pub(super) fn json(&self) -> String {
         use std::fmt::Write;
         let mut result = format!(
-            "{{\"id\":{},\"chunk\":{},\"ops\":{},\"age_ns\":{},\"analysis_ns\":{},\"lowering_ns\":{},\"codegen_ns\":{},\"finish_ns\":{},\"ir_instructions\":{},\"ir_blocks\":{},\"native_bytes\":{},\"emitted_helpers\":{},\"emitted_owner_leaf_calls\":{},\"emitted_publication_words\":{},\"emitted_heap_guards\":{},\"counters\":{{",
+            "{{\"id\":{},\"chunk\":{},\"ops\":{},\"age_ns\":{},\"analysis_ns\":{},\"lowering_ns\":{},\"codegen_ns\":{},\"finish_ns\":{},\"ir_instructions\":{},\"ir_blocks\":{},\"native_bytes\":{},\"emitted_helpers\":{},\"emitted_owner_leaf_calls\":{},\"emitted_read_guard_calls\":{},\"emitted_publication_words\":{},\"emitted_heap_guards\":{},\"observed_regions\":{{\"source_version\":{},\"native_selected_ops\":{},\"vm_cut_blocks\":{}}},\"counters\":{{",
             self.id, self.chunk, self.ops, nanos(self.created), self.analysis_ns.get(),
             self.lowering_ns.get(), self.codegen_ns.get(), self.finish_ns.get(),
             self.ir_instructions.get(), self.ir_blocks.get(), self.native_bytes.get(),
-            self.emitted_helpers.get(), self.emitted_owner_leaf_calls.get(), self.emitted_publications.get(), self.emitted_guards.get(),
+            self.emitted_helpers.get(), self.emitted_owner_leaf_calls.get(), self.emitted_read_guard_calls.get(), self.emitted_publications.get(), self.emitted_guards.get(),
+            self.region_source_version.get(), self.region_native_ops.get(), self.region_cut_blocks.get(),
         );
         for (index, label) in labels() {
             if index != 0 {

@@ -317,6 +317,8 @@ fn code(referenced: bool) -> Rc<JitCode> {
         call_stubs: Vec::new(),
         #[cfg(feature = "optimizing-jit")]
         optimizing_diagnostics: None,
+        #[cfg(feature = "optimizing-jit")]
+        execution_coverage: None,
     })
 }
 

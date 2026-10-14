@@ -88,6 +88,11 @@ mod names_tests;
 mod object_fact_tests;
 #[path = "jit_optimizing_object_facts.rs"]
 mod object_facts;
+#[cfg(test)]
+#[path = "jit_optimizing_observed_region_tests.rs"]
+mod observed_region_tests;
+#[path = "jit_optimizing_observed_regions.rs"]
+mod observed_regions;
 #[path = "jit_optimizing_owner_leaf.rs"]
 mod owner_leaf;
 #[cfg(test)]
@@ -105,6 +110,8 @@ mod property;
 mod property_tests;
 #[path = "jit_optimizing_ranges.rs"]
 mod ranges;
+#[path = "jit_optimizing_read_guards.rs"]
+mod read_guards;
 #[path = "jit_optimizing_recovery.rs"]
 mod recovery;
 #[path = "jit_optimizing_specialization.rs"]
@@ -366,10 +373,26 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let Some(stack) = stack::StackPlan::build(chunk, &cfg) else {
         return;
     };
+    // Freeze once before estimating cut-aware credit. The very same snapshot is
+    // copied into the eventual candidate; mutable baseline bits are never reread
+    // after they have justified this checkpoint's admission distance.
+    let region_coverage = observed_regions::enabled().then(|| chunk.execution_coverage.freeze());
+    let regions = region_coverage
+        .as_ref()
+        .and_then(|coverage| observed_regions::Plan::build(chunk, &cfg, &stack, coverage));
     let numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
         .then(|| specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties))
         .flatten();
-    let selected_structural = generic_admission::selected(&samples.structural);
+    // An omitted field read cannot supply a native Object guard. Select both
+    // structural metadata and Object-result sites from the same native prefix.
+    let selected_structural: Vec<_> = generic_admission::selected(&samples.structural)
+        .into_iter()
+        .filter(|(pc, _)| {
+            regions.as_ref().is_none_or(|plan| {
+                plan.emission(*pc as usize) == observed_regions::Emission::Native
+            })
+        })
+        .collect();
     let selected_objects = object_facts::selected(&properties, &selected_structural);
     let object_plan = object_facts::Plan::build(
         chunk,
@@ -382,17 +405,25 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             .as_ref()
             .map_or(&[], |plan| plan.properties.as_slice()),
     );
-    let structural = match object_plan.as_ref() {
-        Some(plan) => generic_admission::Plan::with_objects(
-            chunk,
-            &cfg,
-            &stack,
-            &selected_structural,
-            Some(plan),
-        ),
-        None => generic_admission::Plan::build(chunk, &cfg, &stack, &selected_structural),
-    };
-    let estimated_entries = if let Some(structural) = &structural {
+    let structural = generic_admission::Plan::with_objects_and_regions(
+        chunk,
+        &cfg,
+        &stack,
+        &selected_structural,
+        object_plan.as_ref(),
+        regions.as_ref(),
+    );
+    let estimated_entries = if let Some(regions) = &regions {
+        regions
+            .minimum_saved_tests(
+                chunk,
+                &cfg,
+                numeric.as_ref(),
+                structural.as_ref(),
+                object_plan.as_ref().filter(|_| structural.is_some()),
+            )
+            .and_then(|saved| generic_admission::admission_entries(chunk, saved, 0))
+    } else if let Some(structural) = &structural {
         generic_admission::admission_entries(
             chunk,
             numeric.as_ref().map_or(0, |plan| plan.saved_tests),
@@ -454,18 +485,31 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         }
         None
     };
-    let next = if let Some(structural) = &structural {
+    let objects = if structural.is_some() && object_plan.is_some() {
+        selected_objects.as_slice()
+    } else {
+        &[]
+    };
+    let next = if let Some(coverage) = &region_coverage {
+        bytecode::compile_for_optimizer_with_objects_and_coverage(
+            &function,
+            chunk,
+            &inputs,
+            &properties,
+            structural
+                .as_ref()
+                .map_or(&[], |plan| plan.selected.as_slice()),
+            objects,
+            coverage,
+        )
+    } else if let Some(structural) = &structural {
         bytecode::compile_for_optimizer_with_objects(
             &function,
             chunk,
             &inputs,
             &properties,
             &structural.selected,
-            if object_plan.is_some() {
-                &selected_objects
-            } else {
-                &[]
-            },
+            objects,
         )
     } else {
         bytecode::compile_for_optimizer(&function, chunk, &inputs, &properties)
@@ -850,6 +894,9 @@ struct Lowering<'a, 'b> {
     sp: Variable,
     helper_sig: SigRef,
     owner_leaf_sig: Option<SigRef>,
+    read_guard_sig: Option<SigRef>,
+    read_guard_result: Option<cranelift_codegen::ir::StackSlot>,
+    read_guard_layout: Option<&'static crate::value::JitLayout>,
     call_sig: SigRef,
     call_stubs: &'b [std::rc::Rc<super::call_stub::SharedCallStub>],
     diagnostics: Option<&'b diagnostics::Code>,
@@ -1880,6 +1927,7 @@ struct PreparedCode {
 }
 
 struct NativeFinish {
+    execution_coverage: Option<crate::execution_coverage::Lease>,
     residency: Box<CodeResidency>,
     call_stubs: Vec<std::rc::Rc<super::call_stub::SharedCallStub>>,
     diagnostic: Option<std::rc::Rc<diagnostics::Code>>,
@@ -1935,6 +1983,7 @@ impl NativeFinish {
             residency: self.residency,
             call_stubs: self.call_stubs,
             optimizing_diagnostics: self.diagnostic,
+            execution_coverage: self.execution_coverage,
         })
     }
 }
@@ -2009,6 +2058,15 @@ fn prepare_entry_with_limits(
     }
     let local_effects = std::env::var("TRUST_JS_OPT_JIT_LOCAL_EFFECTS").as_deref() != Ok("0");
     let stack_plan = stack::StackPlan::build(chunk, &cfg).ok_or(CompileError::Unsupported)?;
+    let regions = (continuation.is_none() && deopt_at.is_none())
+        .then(|| observed_regions::Plan::build(chunk, &cfg, &stack_plan, &chunk.execution_coverage))
+        .flatten();
+    if regions.is_some() && !bytecode::native_deopt::supported(chunk) {
+        return Err(CompileError::Unsupported);
+    }
+    if let (Some(record), Some(plan)) = (&diagnostic, &regions) {
+        record.set_regions(plan.source_version, plan.native_ops, plan.cut_blocks);
+    }
     // A failed/budget-exhausted value proof retains all dynamic guards, not a less
     // capable function or a different execution tier. The switch also skips analysis cost.
     let use_facts = std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0");
@@ -2121,20 +2179,15 @@ fn prepare_entry_with_limits(
         })
         .flatten();
     let structural_admission = (!chunk.optimizing_structural.is_empty() && continuation.is_none())
-        .then(|| match object_plan.as_ref() {
-            Some(plan) => generic_admission::Plan::with_objects(
+        .then(|| {
+            generic_admission::Plan::with_objects_and_regions(
                 chunk,
                 &cfg,
                 &stack_plan,
                 &chunk.optimizing_structural,
-                Some(plan),
-            ),
-            None => generic_admission::Plan::build(
-                chunk,
-                &cfg,
-                &stack_plan,
-                &chunk.optimizing_structural,
-            ),
+                object_plan.as_ref(),
+                regions.as_ref(),
+            )
         })
         .flatten();
     if !chunk.optimizing_structural.is_empty() && structural_admission.is_none() {
@@ -2158,6 +2211,20 @@ fn prepare_entry_with_limits(
             .flatten();
     if !chunk.optimizing_structural.is_empty() && generic_own_plan.is_none()
         || chunk.optimizing_candidate && specialization.is_none() && structural_admission.is_none()
+    {
+        return Err(CompileError::Unsupported);
+    }
+    if chunk.optimizing_candidate
+        && regions.as_ref().is_some_and(|plan| {
+            plan.minimum_saved_tests(
+                chunk,
+                &cfg,
+                specialization.as_ref(),
+                structural_admission.as_ref(),
+                object_plan.as_ref(),
+            )
+            .is_none()
+        })
     {
         return Err(CompileError::Unsupported);
     }
@@ -2211,6 +2278,7 @@ fn prepare_entry_with_limits(
         signature.returns.push(AbiParam::new(types::I64));
         context.func.import_signature(signature)
     });
+    let read_guard_layout = read_guards::layout(values);
     let residency = Box::<CodeResidency>::default();
     let mut builder_context = FunctionBuilderContext::new();
     {
@@ -2226,6 +2294,19 @@ fn prepare_entry_with_limits(
         b.append_block_params_for_function_params(entry);
         if let Some(record) = &diagnostic {
             emit_diagnostic_count(&mut b, record, 0, 1);
+        }
+        if let Some(coverage) = chunk.execution_coverage.source() {
+            // This route executes optimizing instructions without baseline region markers.
+            // The scalar source allocation is pinned by NativeFinish/JitCode, never Worker Job.
+            let address = b
+                .ins()
+                .iconst(types::I64, coverage.unknown_ptr() as usize as i64);
+            let previous = b.ins().load(types::I32, MemFlags::trusted(), address, 0);
+            let unknown = b.ins().bor_imm_s(
+                previous,
+                crate::execution_coverage::Reason::OptimizedNative as i64,
+            );
+            b.ins().store(MemFlags::trusted(), unknown, address, 0);
         }
         let ctx = b.block_params(entry)[0];
         let interp = b.ins().load(
@@ -2372,6 +2453,9 @@ fn prepare_entry_with_limits(
             sp,
             helper_sig,
             owner_leaf_sig,
+            read_guard_sig: None,
+            read_guard_result: None,
+            read_guard_layout,
             call_sig,
             call_stubs: &call_stubs,
             diagnostics: diagnostic.as_deref(),
@@ -2459,10 +2543,29 @@ fn prepare_entry_with_limits(
             if poll[pc] {
                 lower.poll(layout);
             }
-            if deopt_at == Some(pc) {
-                lower.deopt_before(pc, error);
-            } else {
-                lower.lower(pc, op);
+            match regions.as_ref().map(|plan| plan.emission(pc)) {
+                Some(observed_regions::Emission::Cut) => {
+                    // This ordinary workload cut is not a specialization miss.
+                    // The VM finishes the same call at the original before-op PC.
+                    lower.count_runtime(diagnostics::OBSERVED_REGION_EXIT, 1);
+                    lower.deopt_before(pc, error);
+                }
+                Some(observed_regions::Emission::OmittedInterior) => {
+                    // No normal branch or dynamic completion can enter an interior:
+                    // the unchanged CFG made every such target a block leader.
+                    // Retain a valid label without lowering an unselected operation.
+                    lower.b.ins().jump(error, &[]);
+                }
+                _ if deopt_at == Some(pc) => {
+                    lower.deopt_before(pc, error);
+                }
+                _ => {
+                    #[cfg(test)]
+                    if observed_regions::TEST_CAPTURE.with(std::cell::Cell::get) {
+                        observed_regions::TEST_LOWERED.with(|pcs| pcs.borrow_mut().push(pc));
+                    }
+                    lower.lower(pc, op);
+                }
             }
         }
         lower.b.switch_to_block(lower.pcs[ops.len()]);
@@ -2577,6 +2680,10 @@ fn prepare_entry_with_limits(
         context,
         isa: isa.clone(),
         finish: NativeFinish {
+            execution_coverage: chunk
+                .execution_coverage
+                .source()
+                .map(crate::execution_coverage::Lease::new),
             residency,
             call_stubs,
             diagnostic,

@@ -1046,6 +1046,45 @@ impl RegionIr {
     }
 }
 
+/// Exact semantic block boundaries without stack, dominance or loop analysis. Coverage needs
+/// this bounded linear layout even when full native analysis is unavailable.
+pub(crate) fn semantic_block_starts(ops: &[Op]) -> Result<Vec<usize>, BuildError> {
+    if ops.is_empty() {
+        return Err(BuildError::Empty);
+    }
+    // Leaders: entry, branch targets, the instruction after a control transfer, and both
+    // sides of handler-state changes.  Splitting at Push/PopHandler lets a future region
+    // selector reject active-handler ranges without reconstructing lexical bytecode state.
+    let mut leader = vec![false; ops.len() + 1];
+    leader[0] = true;
+    leader[ops.len()] = true;
+    for (pc, op) in ops.iter().enumerate() {
+        for (target, _) in handler_targets(op) {
+            validate_target(ops.len(), pc, target)?;
+            leader[target] = true;
+        }
+        if let Some(target) = jump_target(op) {
+            validate_target(ops.len(), pc, target)?;
+            leader[target] = true;
+        }
+        if ends_block(op)
+            || matches!(
+                op,
+                Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..) | Op::PopHandler
+            )
+        {
+            leader[pc + 1] = true;
+        }
+    }
+
+    let starts: Vec<usize> = leader
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, yes)| (*yes).then_some(pc))
+        .collect();
+    Ok(starts)
+}
+
 impl Cfg {
     pub(crate) fn build(chunk: &Chunk) -> Result<Cfg, BuildError> {
         let ops = chunk.jit_ops();
@@ -1113,39 +1152,7 @@ impl Cfg {
 
         let (pc_depth, max_settled_stack, handler_depths) = analyze_stack(ops, &mut effect)?;
 
-        // Leaders: entry, branch targets, the instruction after a control transfer, and both
-        // sides of handler-state changes.  Splitting at Push/PopHandler lets a future region
-        // selector reject active-handler ranges without reconstructing lexical bytecode state.
-        let mut leader = vec![false; ops.len() + 1];
-        leader[0] = true;
-        leader[ops.len()] = true;
-        for (pc, op) in ops.iter().enumerate() {
-            for (target, _) in handler_targets(op) {
-                validate_target(ops.len(), pc, target)?;
-                leader[target] = true;
-            }
-            if let Some(target) = jump_target(op) {
-                validate_target(ops.len(), pc, target)?;
-                leader[target] = true;
-            }
-            if ends_block(op)
-                || matches!(
-                    op,
-                    Op::PushHandler(_)
-                        | Op::PushFinally(..)
-                        | Op::PushIterator(..)
-                        | Op::PopHandler
-                )
-            {
-                leader[pc + 1] = true;
-            }
-        }
-
-        let starts: Vec<usize> = leader
-            .iter()
-            .enumerate()
-            .filter_map(|(pc, yes)| (*yes).then_some(pc))
-            .collect();
+        let starts = semantic_block_starts(ops)?;
         let mut blocks = Vec::with_capacity(starts.len().saturating_sub(1));
         let mut pc_block = vec![None; ops.len() + 1];
         for pair in starts.windows(2) {

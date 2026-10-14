@@ -276,6 +276,24 @@ Release optimizing compilation validates finalized CLIF once before backend work
 `TRUST_JS_OPT_JIT_VERIFY=1`, debug builds and tests additionally enable Cranelift's repeated
 internal verifier passes. This diagnostic does not change JavaScript guards or recovery.
 
+`TRUST_JS_OPT_JIT_COVERAGE=1` collects bounded entry provenance for each exact baseline
+bytecode version. VM and native entries mark original CFG blocks before their effects;
+shortcuts that bypass the body make unobserved blocks Unknown. Frozen optimizer snapshots
+remain immutable. Scalar leases keep native marker storage alive without owning JavaScript
+objects. The control is off by default and its implementation compiles out without
+`optimizing-jit`; see `docs/execution-coverage.txt` for limits and diagnostic scope.
+`TRUST_JS_OPT_JIT_OBSERVED_REGIONS=1` uses that frozen provenance to omit native lowering
+only for reachable blocks unobserved in the collection window. Such a path resumes the
+same invocation in the VM before its first operation. Entered and Unknown blocks retain
+native lowering; all original frame, CFG, handler and unsupported-operation checks remain.
+These ordinary VM exits do not count as specialization misses. This experiment retains
+the 256-operation hot admission limit and is off by default; see
+`docs/observed-regions-experiment.txt` for recovery and cost-accounting contracts.
+`TRUST_JS_OPT_JIT_SHARED_READ_GUARDS=1` separately shares pure scalar name/property
+validation leaves to reduce generated IR. Success returns a borrowed word with explicit
+status; the caller performs checked ownership transfer and preserves last-owner fallbacks.
+It is off by default. Reduced IR alone does not establish application speed or repayment.
+
 The standalone engine shell accepts `--tier=interp|bytecode|jit`. The runtime CLI's
 current argument parser only accepts `--tier=interp|bytecode`; use `TRUST_JS_TIER=jit`
 or the default for runtime JIT execution.

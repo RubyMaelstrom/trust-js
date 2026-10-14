@@ -2293,6 +2293,9 @@ pub(super) fn emit(
     let parameter_aliases =
         entry_kind == NativeEntryKind::BorrowedFrame && chunk.jit_borrowed_parameter_aliases();
     let emission_start = a.checkpoint();
+    #[cfg(feature = "optimizing-jit")]
+    emit_coverage_ranges(a, chunk, plan.ranges());
+
     let plain = a.new_label();
     let mut saved_work = 0usize;
     let mut targets = Vec::new();

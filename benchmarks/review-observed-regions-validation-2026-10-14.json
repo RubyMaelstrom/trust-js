@@ -1,0 +1,908 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-10-14T19:01:29.706660+00:00",
+  "status": "Compiler foundation integrated after source review, ARM validation, final-v5 native Linux/MSVC-Wine focused checks, and final-v5 Wasm compilation. No application performance acceptance or default promotion.",
+  "base_revision": "3f39a49ca884f57506dd3b0eda8ae2ec7395ab31",
+  "scope": "Compose bounded exact-version baseline entry provenance, pure shared read guards, and observed-region terminal VM cuts for existing small optimizing bodies with Object/Null/alias and iterative DFS fixes.",
+  "controls": {
+    "feature": "optimizing-jit (off by default)",
+    "coverage": "TRUST_JS_OPT_JIT_COVERAGE=1",
+    "region_selection": "TRUST_JS_OPT_JIT_OBSERVED_REGIONS=1",
+    "shared_read_guards": "TRUST_JS_OPT_JIT_SHARED_READ_GUARDS=1",
+    "runtime_selection": "TRUST_JS_OPT_JIT=1 or hot remains separately opt-in",
+    "default_runtime_controls": "All three new controls off. Whole-function hot body limit256 and existing instruction/block/admission budgets unchanged."
+  },
+  "candidate": {
+    "source_tree": "/tmp/trust-js-compiler-regions-composed-20261014",
+    "version": "v5",
+    "build_command": [
+      "taskset",
+      "-c",
+      "6-7",
+      "cargo",
+      "test",
+      "--locked",
+      "--offline",
+      "-p",
+      "trust-js",
+      "--lib",
+      "--no-run",
+      "--features",
+      "embed,optimizing-jit",
+      "--message-format=json",
+      "-j2"
+    ],
+    "features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": 2,
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/source-before.json",
+      "sha256": "ab2005306d80a419c2bd3d619f5721be2de3b9aa4b392da3bd87942567a8ab1e",
+      "bytes": 122610
+    },
+    "patch": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/source.patch",
+      "sha256": "ba1874e8939707d2c2d4f633d9797d7cdf8826e05ed073f60b4db4aaebde885a",
+      "bytes": 294771
+    },
+    "build": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/build-result.json",
+      "sha256": "11a525eed74b0f5424de111b757bc16c1abf49ef12fd2d125250c90414151fe8",
+      "bytes": 2977
+    },
+    "binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/trust-js-tests",
+      "sha256": "f42fbca599a27d6887f41c7db654cfbab9b99ad3977c88e72e18589cbd73ae3c",
+      "bytes": 247638048
+    },
+    "test_list": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/test-list.log",
+      "sha256": "47b4521a0612ce03ad1ca8784bd0bf7ea1bd12790b8af7d1b00508a1a52336bf",
+      "bytes": 197027
+    },
+    "listed_test_count": 2456,
+    "all800_current_source_hashes_verified": true,
+    "source_before_after_build_equal": true,
+    "changed_source_hashes": {
+      "AGENTS.md": "a443da2a8450a31b07eb19c3cb97eff81cff7f0a43450cc02606ce9183bf319a",
+      "crates/trust-js/src/bytecode.rs": "1a0c963a746400212bceba8a31e0c00f53280dc28087c248f59235236d9fbd94",
+      "crates/trust-js/src/bytecode_execution_coverage_tests.rs": "e0f8c34ec4243aaa1a9f19b6f9e2e5604228876afd10c4702d3a0df44e7a64d8",
+      "crates/trust-js/src/bytecode_loop_fragment.rs": "41227cd8d60d0b2adfb4ec8b8f13fedd5447e742f3edb20aa31660aa6fc8bf92",
+      "crates/trust-js/src/constructor_transfer_tests.rs": "5fa951d14e5fe923c86f550cfc820c12b5b96acc4a63ca3a6edec8c9015e901c",
+      "crates/trust-js/src/execution_coverage.rs": "ac3e29167b5ebf7e0f60c6e3b91b03bffbb93be29867dff08ec00a0293575556",
+      "crates/trust-js/src/execution_coverage_tests.rs": "8d936b0e6fd8bb2a078c7f270055c46ee5f78736aa72a8b74819fe844438f8b1",
+      "crates/trust-js/src/interpreter.rs": "1d30e7571517d8d5c616722a016261bfabb636f91979db31c9a9fb7863b96873",
+      "crates/trust-js/src/jit.rs": "c5b3384ee2336187031a80ec7e8d1f94324764f2bdd066656317e5791048c272",
+      "crates/trust-js/src/jit_cache_admission_tests.rs": "8642746da87c1f51f68cfd53cba72bfbdd0af2d9383d0b9793269e9a1cdcf42a",
+      "crates/trust-js/src/jit_ir.rs": "e46d1ee93b8ed06313e5af7ee440cfa9add04c63d61ada750d1d3a7d251ea645",
+      "crates/trust-js/src/jit_optimizing.rs": "f1f3b803e419eb1d90b98e9b7c9d5dc0eb7e04d266c19c41ad95ab3e4cc63d2f",
+      "crates/trust-js/src/jit_optimizing_diagnostics.rs": "7274392fa2bae7eeca3ca3050cb0aa35f48033d6ac97b274f12ec3759c5c11b7",
+      "crates/trust-js/src/jit_optimizing_generic_admission.rs": "b8ead2889493a24f0ddeb533023d47f0e6f8ed3e4b6fd657f941fe70d4272b99",
+      "crates/trust-js/src/jit_optimizing_names.rs": "50deb96f8b2dd544589c68122d1d94ae914fa7cf73c5e4902f0354a51bb0d239",
+      "crates/trust-js/src/jit_optimizing_observed_region_guard_tests.rs": "b7dcf91d2bb4a1127d646b0be95f9ba09182de53de8708db4c21abeca37c53c6",
+      "crates/trust-js/src/jit_optimizing_observed_region_tests.rs": "254c5280a88c523c58e3ef9060d68d9bf88920167f9d21b8e1ff62d48a9642b0",
+      "crates/trust-js/src/jit_optimizing_observed_regions.rs": "2ef3825c0cf624133517ef077d50638e01a50d7ab72f92f58d8f03b31ea1a384",
+      "crates/trust-js/src/jit_optimizing_ownership.rs": "7c8a6177915f62f2b3ea5110f748aa7a50d66af1e20666eaa65a5b6b60ebdd62",
+      "crates/trust-js/src/jit_optimizing_property.rs": "c56f9505fec6d3d33b5c329c9d9b3fed850732df550f5e53fa88ceff0b74562b",
+      "crates/trust-js/src/jit_optimizing_read_guards.rs": "e652eeabf545e588773f597643de89a5f3dd6867dfacb5f4ec88d1e73462e9cb",
+      "crates/trust-js/src/jit_regions.rs": "7a775a4900d774b5c93c6cd0cd2d34cf67ff34cdafc5370aa8b5b9229c00976b",
+      "crates/trust-js/src/jit_x64.rs": "213cae4c9c5fd6e5f4b5b730a875766ee526c35f381faa7458e83e29813254af",
+      "crates/trust-js/src/lib.rs": "d5747072ea7a8fc112bbf15fee6288c6dff8cf78e5048329c3f8adb70d4b1cfd",
+      "crates/trust-js/src/memory.rs": "52627984a61a1197f98ddc85f429cb1a0da6b72abb051e42b31e53ee3d4ead41",
+      "crates/trust-js/src/property_read.rs": "752e345540579b4f99b1c5e636fbf95dc148a65677e09c94a88a594ce49a4708",
+      "crates/trust-js/src/property_read_tests.rs": "abe56f6ec442b75ee1b287260c46f4777de7d5f64c5976334d466a612200833f",
+      "docs/execution-coverage.txt": "10e395381030182ded4324b2d7c12b07a498a578c23a26c4a9bdec7227633e6d",
+      "docs/observed-regions-experiment.txt": "c93d628d9030a66208de539d8a64adceaec22bf2b786b8a0c60310e724ca6562"
+    }
+  },
+  "version_artifacts": {
+    "v1": {
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/source-before.json",
+        "sha256": "2fe1a8f92981909fff672f7b7d65fb7c1c5c3fd6c6cd77d8b6a3dd2ac2076b6c",
+        "bytes": 122431
+      },
+      "source_after": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/source-after.json",
+        "sha256": "2fe1a8f92981909fff672f7b7d65fb7c1c5c3fd6c6cd77d8b6a3dd2ac2076b6c",
+        "bytes": 122431
+      },
+      "source_files": 799,
+      "patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/source.patch",
+        "sha256": "9b2172da9d15f27575c14e01e21fda6fb12cef7150e7f426e83da33e2ef0fcd8",
+        "bytes": 267907
+      },
+      "build": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/build-result.json",
+        "sha256": "0d0ca03fae95d64d0c1b9aeafe7d4e802b0d441404bdebb5c7967c26ad3f64ae",
+        "bytes": 3040
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/trust-js-tests",
+        "sha256": "eda39568b2bf5874befe765f78dca40113c7624a1272d9197a9c0dd94ed76a45",
+        "bytes": 247546328
+      },
+      "listed_test_count": 2453
+    },
+    "v2": {
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/source-before.json",
+        "sha256": "bec33805c697d3f12b939ece719aa7cf2232f570d1830c155fd8f9bd8233b49c",
+        "bytes": 122431
+      },
+      "source_after": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/source-after.json",
+        "sha256": "bec33805c697d3f12b939ece719aa7cf2232f570d1830c155fd8f9bd8233b49c",
+        "bytes": 122431
+      },
+      "source_files": 799,
+      "patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/source.patch",
+        "sha256": "37a64e5fa9839da6a1fd8734fc90d6687bfa5feefd8e9ab811d8bcaeea1e425d",
+        "bytes": 275916
+      },
+      "build": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/build-result.json",
+        "sha256": "7dece6bd8cbf38914f737ada336e3f1d1289a3a424dafa694ad37fd306c5810d",
+        "bytes": 2898
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/trust-js-tests",
+        "sha256": "13217f9ddedd3ef5f51ae2950593d668faf4836e038648e7cd69d46bdb73e0d4",
+        "bytes": 247451096
+      },
+      "listed_test_count": 2454
+    },
+    "v3": {
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/source-before.json",
+        "sha256": "838d93ae0e3676aa637eb9948c32af0453d83a67ce3946383bce5ec3597e148b",
+        "bytes": 122610
+      },
+      "source_after": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/source-after.json",
+        "sha256": "838d93ae0e3676aa637eb9948c32af0453d83a67ce3946383bce5ec3597e148b",
+        "bytes": 122610
+      },
+      "source_files": 800,
+      "patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/source.patch",
+        "sha256": "de1e9d014d848d72a8fdc1bde23d49db334c73647e4f6151de9e8c680084edab",
+        "bytes": 291143
+      },
+      "build": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/build-result.json",
+        "sha256": "2da56d0c8593dddb1135b22c7ba182d7f8d2be7ae48cb5626fbf9823cd65354b",
+        "bytes": 2935
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/trust-js-tests",
+        "sha256": "ec5dc6485020d740b662ab6c2926a4a6376823d1ebd98d42cd1208646722d3a8",
+        "bytes": 247640680
+      },
+      "listed_test_count": 2456
+    },
+    "v4": {
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/source-before.json",
+        "sha256": "f65b92849b76977124db83aabe6f21a5960aec24bea264c13f939585a8891f2b",
+        "bytes": 122610
+      },
+      "source_after": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/source-after.json",
+        "sha256": "f65b92849b76977124db83aabe6f21a5960aec24bea264c13f939585a8891f2b",
+        "bytes": 122610
+      },
+      "source_files": 800,
+      "patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/source.patch",
+        "sha256": "0c81579cd0504bbeb34e2ee34934ff0d10664420fb14d27d268526fcf7ec6215",
+        "bytes": 293981
+      },
+      "build": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/build-result.json",
+        "sha256": "260fb6f5256f6ebdbde6c2c48eab876872eaf6a9355317ce69f4e9b48bd17629",
+        "bytes": 2973
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/trust-js-tests",
+        "sha256": "db5947de0fc4931507d030c6c55137ff65653bbbb69bb6dbef9b14ea0fefefa8",
+        "bytes": 247658944
+      },
+      "listed_test_count": 2456
+    },
+    "v5": {
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/source-before.json",
+        "sha256": "ab2005306d80a419c2bd3d619f5721be2de3b9aa4b392da3bd87942567a8ab1e",
+        "bytes": 122610
+      },
+      "source_after": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/source-after.json",
+        "sha256": "ab2005306d80a419c2bd3d619f5721be2de3b9aa4b392da3bd87942567a8ab1e",
+        "bytes": 122610
+      },
+      "source_files": 800,
+      "patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/source.patch",
+        "sha256": "ba1874e8939707d2c2d4f633d9797d7cdf8826e05ed073f60b4db4aaebde885a",
+        "bytes": 294771
+      },
+      "build": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/build-result.json",
+        "sha256": "11a525eed74b0f5424de111b757bc16c1abf49ef12fd2d125250c90414151fe8",
+        "bytes": 2977
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/trust-js-tests",
+        "sha256": "f42fbca599a27d6887f41c7db654cfbab9b99ad3977c88e72e18589cbd73ae3c",
+        "bytes": 247638048
+      },
+      "listed_test_count": 2456
+    }
+  },
+  "version_changes": [
+    {
+      "from": "v1",
+      "to": "v2",
+      "changed_files": [
+        "crates/trust-js/src/execution_coverage_tests.rs",
+        "crates/trust-js/src/jit_optimizing_generic_admission.rs",
+        "crates/trust-js/src/jit_optimizing_observed_region_tests.rs"
+      ],
+      "description": "Test-only helper cfg gating; corrected oversized fixture from100 to160 repeated field transfers so its bytecode is actually above256; updated coverage real-inline warm fixture; added Object-branch/cold-cut cost-and-effect regression."
+    },
+    {
+      "from": "v2",
+      "to": "v3",
+      "changed_files": [
+        "crates/trust-js/src/bytecode.rs",
+        "crates/trust-js/src/bytecode_execution_coverage_tests.rs",
+        "crates/trust-js/src/jit_optimizing_generic_admission.rs",
+        "crates/trust-js/src/jit_optimizing_observed_region_guard_tests.rs",
+        "crates/trust-js/src/jit_optimizing_observed_region_tests.rs"
+      ],
+      "description": "Equivalent optional bytecode finish tail expression and generic-admission then_some cleanup, test Op::Jump constructor closures; added two guard-composition tests and their module registration. No runtime admission/capability change."
+    },
+    {
+      "from": "v3",
+      "to": "v4",
+      "changed_files": [
+        "AGENTS.md",
+        "crates/trust-js/src/jit_optimizing_observed_region_guard_tests.rs"
+      ],
+      "description": "AGENTS documentation plus first guard-test correction accounting for initialized-value and owner checks; retained a second fixture failure because normal-success LoadLocal refines the following read. No production Rust delta."
+    },
+    {
+      "from": "v4",
+      "to": "v5",
+      "changed_files": [
+        "crates/trust-js/src/bytecode_execution_coverage_tests.rs",
+        "crates/trust-js/src/jit_optimizing_observed_region_guard_tests.rs"
+      ],
+      "description": "Test formatting plus per-PC guard-test correction: adjacent generic loads remove[2,1] checks, not[2,2], and pay one Number guard. Existing native entry/recovery/effect assertions preserved. No production Rust delta."
+    }
+  ],
+  "arm64": {
+    "machine": "crystal Linux aarch64",
+    "artifact_scope": "Each entry below names the actual immutable source/binary version; successor results do not retroactively validate added tests on older artifacts.",
+    "full_suite_v2": {
+      "version": "v2",
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/source-before.json",
+        "sha256": "bec33805c697d3f12b939ece719aa7cf2232f570d1830c155fd8f9bd8233b49c",
+        "bytes": 122431
+      },
+      "binary": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/trust-js-tests",
+        "sha256": "13217f9ddedd3ef5f51ae2950593d668faf4836e038648e7cd69d46bdb73e0d4",
+        "bytes": 247451096
+      },
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/regions-composed-v2-arm-full-independent-v1/result.json",
+        "sha256": "44cec0117fc8d53e2062313d477e10a599a392e3d079ab578982e9ffe6103225",
+        "bytes": 4000
+      },
+      "closeout": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/regions-composed-v2-arm-full-independent-v1/final-manifest.json",
+        "sha256": "f08bc85ed5a31d570dfe2e5077862644c18cdbd0048f3c194b1daf672056d0b5",
+        "bytes": 1542
+      },
+      "stdout": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/regions-composed-v2-arm-full-independent-v1/suite.stdout",
+        "sha256": "7f46f392f70ff8553f37bf83c1ae66cb1c2c1fdb129ad72d9daa9b4dfab658ea",
+        "bytes": 213382
+      },
+      "stderr": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/regions-composed-v2-arm-full-independent-v1/suite.stderr",
+        "sha256": "fd172fde1e9563b15da703a7318b82852369d7149b1f1b6e587660e84d5d655a",
+        "bytes": 498790
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "8-9",
+        "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/trust-js-tests",
+        "--test-threads=2",
+        "--nocapture"
+      ],
+      "environment_overrides": {
+        "RUST_MIN_STACK": "268435456"
+      },
+      "cleared_controls": "All TRUST/LUMEN-prefixed keys and LD_PRELOAD removed; names retained in result.",
+      "test_threads": 2,
+      "cpu_affinity": "8-9",
+      "timeout_seconds": 2400,
+      "passed": 2451,
+      "failed": 0,
+      "ignored": 3,
+      "filtered_out": 0,
+      "listed_test_count": 2454,
+      "ignored_selectors": [
+        "test object_alloc_bench::gc_collection_bench ... ignored",
+        "test object_alloc_bench::object_alloc_bench ... ignored",
+        "test object_alloc_bench::object_layout_sizes ... ignored"
+      ],
+      "exit_code": 0,
+      "timed_out": false,
+      "signals_sent": false,
+      "resource_outcomes": {
+        "user_cpu_seconds": 1997.172584,
+        "system_cpu_seconds": 52.031367,
+        "max_rss_kib": 1324252,
+        "minor_faults": 20843557,
+        "major_faults": 6,
+        "voluntary_context_switches": 13717,
+        "involuntary_context_switches": 66541,
+        "scope": "Linux wait4 direct test process accumulated usage; kernel accounts reaped descendants. Not a sampled simultaneous process-tree memory peak."
+      },
+      "scope": "Exact v2 full library binary; not a final-v5 full-suite claim."
+    },
+    "focused_v2": {
+      "version": "v2",
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/focused-results.json",
+        "sha256": "02d1eeb41f573e849f7a5c75c045416cdf18b9d9a96e712559074df80e4a0bcb",
+        "bytes": 4102
+      },
+      "groups": [
+        {
+          "selector": "jit::optimizing::observed_region_tests::",
+          "passed": 15,
+          "failed": 0,
+          "exit_code": 0,
+          "parent_summary": "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 2439 filtered out; finished in 5.16s"
+        },
+        {
+          "selector": "jit::optimizing::read_guards::tests::",
+          "passed": 10,
+          "failed": 0,
+          "exit_code": 0,
+          "parent_summary": "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2444 filtered out; finished in 24.39s"
+        },
+        {
+          "selector": "jit::optimizing::generic_admission_tests::",
+          "passed": 7,
+          "failed": 0,
+          "exit_code": 0,
+          "parent_summary": "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2447 filtered out; finished in 1.68s"
+        },
+        {
+          "selector": "jit::optimizing::object_fact_tests::",
+          "passed": 15,
+          "failed": 0,
+          "exit_code": 0,
+          "parent_summary": "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 2439 filtered out; finished in 15.06s"
+        },
+        {
+          "selector": "jit::optimizing::strict_null::",
+          "passed": 8,
+          "failed": 0,
+          "exit_code": 0,
+          "parent_summary": "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2446 filtered out; finished in 7.44s"
+        }
+      ],
+      "scope": "Parent groups15regions+10sharedreads+7generic+15Object+8Null all passed. Nested child runs are not added to parent counts."
+    },
+    "strict_all_target_clippy_v3": {
+      "version": "v3",
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-lint-v2/result.json",
+        "sha256": "ec912d45bc6bd14862c60574bf5f176442fde15d368dd75db6f6c21e8b228478",
+        "bytes": 525
+      },
+      "log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-lint-v2/clippy.log",
+        "sha256": "37acb73834ee402643d08cd0c7e06391b23e3bfb0fb4fa7730412fb2e05f7b1f",
+        "bytes": 169
+      },
+      "source_inventory": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-lint-v2/source-before.json",
+        "sha256": "53e22266cbf48a9239c7fbe76525d0b9e952cdab0b36c083ad6334463918787c",
+        "bytes": 90978
+      },
+      "inventory_format": "hash strings versus build manifest hash/byte records; all800 normalized path hashes exactly equal v3",
+      "source_hashes_match_v3": true,
+      "command": [
+        "taskset",
+        "-c",
+        "6-7",
+        "cargo",
+        "clippy",
+        "--locked",
+        "--offline",
+        "-p",
+        "trust-js",
+        "--features",
+        "embed,optimizing-jit",
+        "--all-targets",
+        "-j2",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "scope": "Default intl+embed+optimizing-jit, all targets, -Dwarnings. Later v4/v5 have only docs/test changes; this is not a new final-v5 clippy invocation."
+    },
+    "focused_v4": {
+      "version": "v4",
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/focused-results.json",
+        "sha256": "6163d411345cf425a5dfa88294a15186b4dc75c837442151dfa5c326b9d83eb8",
+        "bytes": 20605
+      },
+      "coverage": {
+        "passed": 27,
+        "failed": 0,
+        "exact_selectors": 27,
+        "source": "27 distinct coverage selector processes; helper-only leaf/accounting evidence is not full engine route proof."
+      },
+      "loop_facts": {
+        "passed": 17,
+        "failed": 0,
+        "log": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/loop_facts_tests.log",
+          "sha256": "f3c0bc5d418043441de8f40e55167cc8d8d8ade5758dbe1f3e3f7d899537ecd4",
+          "bytes": 192160
+        },
+        "scope": "Parent count17; scalar-on/off/ordinary children retained separately."
+      },
+      "regions": {
+        "passed": 16,
+        "failed": 1,
+        "log": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/observed_region_tests.log",
+          "sha256": "3370f4d702878703b2fb12f5b2f6940ac603d0a1f64773937dc09469d9b476f5",
+          "bytes": 95607
+        },
+        "status": "Retained fixture failure; not a17/17 pass."
+      }
+    },
+    "corrected_guard_tests_v5": {
+      "version": "v5",
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/integration-guards-result.json",
+        "sha256": "14ed1c00f67f0930a311a507286480005533ad9fe715d73a62fcef08f02a6c41",
+        "bytes": 534
+      },
+      "log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/integration-guards.log",
+        "sha256": "3ce003f2e2fe07e911efebfb4eaaed7c2c316d84d1dc6030391e84064078e094",
+        "bytes": 17401
+      },
+      "command": [
+        "taskset",
+        "-c",
+        "6-7",
+        "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/trust-js-tests",
+        "jit::optimizing::observed_region_tests::integration_guard_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "source_hash": "b7dcf91d2bb4a1127d646b0be95f9ba09182de53de8708db4c21abeca37c53c6",
+      "scope": "Actual native entry, omitted warmed Object origin with no spurious facts/guard cost, per-PC Number/Object guard charges, original cutPC/stack depth and side effects. Manual candidate installation proves lowering/recovery, not normal hot policy or framework adoption.",
+      "final_diagnostic_rows": [
+        {
+          "code_id": 1,
+          "entries": 4,
+          "specialization_bailouts": 2,
+          "terminal_vm_recoveries": 3,
+          "ordinary_region_cuts": 1
+        },
+        {
+          "code_id": 2,
+          "entries": 3,
+          "specialization_bailouts": 0,
+          "terminal_vm_recoveries": 2,
+          "ordinary_region_cuts": 2
+        }
+      ]
+    },
+    "final_v5_formatting": {
+      "commands": [
+        "git diff --cached --check",
+        "cargo fmt --all -- --check"
+      ],
+      "exit_codes": [
+        0,
+        0
+      ],
+      "evidence": "Root message: both completed in source tree, session70668, no output. No immutable raw log supplied to this draft.",
+      "classification": "root-reported final-v5 source checks"
+    }
+  },
+  "retained_failures_and_timeouts": [
+    {
+      "version": "v1",
+      "kind": "fixture failure",
+      "evidence": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/focused-results.json",
+        "sha256": "0c23d39109e60f91094a3e888c4d740d6983a9066b7c297d5d4cb32160d7dd01",
+        "bytes": 1589
+      },
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v1/regions.log",
+        "sha256": "efe4614af412411d76c7a92ab0bfa798f25910756afac24f4ad2fe70b8ab1f05",
+        "bytes": 87370
+      },
+      "result": "13region parent passes/1failure; shared-read10passed separately.",
+      "cause": "Oversized gate fixture repeated100 transfers but actually did not produce>256ops.",
+      "resolution": "v2 increased repeat count to160 and required actual>256ops; v2 region15 and full2451/0/3 passed. Admission limit was not changed."
+    },
+    {
+      "version": "pre-v3 lint source",
+      "kind": "strict clippy failure",
+      "evidence": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-lint-v1/result.json",
+        "sha256": "bbab4d716077de9ec5e9ea6942f222b1fd1a90ad750b440ca4e600a14990884f",
+        "bytes": 527
+      },
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-lint-v1/clippy.log",
+        "sha256": "8ad1f8c2585961fe6e2439fd2c5a6d9d45839b6bf379ea1e8597d9d1f194a590",
+        "bytes": 2008
+      },
+      "cause": "One unnecessary lazy bool::then and two redundant Op::Jump closures.",
+      "resolution": "Equivalent then_some and constructor expressions; v3 strict all-target clippy passed."
+    },
+    {
+      "version": "v2",
+      "kind": "incomplete focused timeout",
+      "selected_tests": 10,
+      "timeout_seconds": 600,
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v2/deopt_tests.log",
+        "sha256": "b8189c917d13fcc159f95fff2109480bc7e1027cd166895d33fc8e7794881928",
+        "bytes": 1787
+      },
+      "exit_code": null,
+      "signals": null,
+      "evidence_classification": "Root-reported600s timeout on sharedCPU4-5 during compiler activity; raw log has no final parent summary or FAILED lines, so no standalone10-test pass claimed.",
+      "resolution": "Exact same v2 full suite subsequently completed2451/0/3 within2400s. The timed-out group is retained, not relabeled."
+    },
+    {
+      "version": "v3",
+      "kind": "guard-test fixture failure",
+      "evidence": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/integration-guards-result.json",
+        "sha256": "73aaa6b736dd556e0e95c8321c8839e1451ffd00804cb6e6246b23e026b8417c",
+        "bytes": 540
+      },
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v3/integration-guards.log",
+        "sha256": "abda783ce218aab4058a2da29bc1227a187a4c9aac141b2f5f128ec3d5889b41",
+        "bytes": 9433
+      },
+      "result": "1pass/1failure",
+      "cause": "First generic Number formal LoadLocal removes two checks (owner and initialization), not one.",
+      "resolution": "First test-only correction in v4; its uniform assumption for the second load was still wrong."
+    },
+    {
+      "version": "v4",
+      "kind": "guard-test fixture failure",
+      "evidence": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/focused-results.json",
+        "sha256": "6163d411345cf425a5dfa88294a15186b4dc75c837442151dfa5c326b9d83eb8",
+        "bytes": 20605
+      },
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v4/observed_region_tests.log",
+        "sha256": "3370f4d702878703b2fb12f5b2f6940ac603d0a1f64773937dc09469d9b476f5",
+        "bytes": 95607
+      },
+      "result": "16region passes/1failure",
+      "cause": "Normal completion of first LoadLocal initializes/refines the next local read; second load removes only its owner check.",
+      "resolution": "v5 explicitly checks per-PC category/initialization and opportunities[2,1], charges one Number guard, preserves Object guard single debit and all actual native/recovery assertions; corrected2/2passed.",
+      "correction_manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-integration-gaps-v3/manifest.json",
+        "sha256": "962197c14bc2d36470bbd465cce9c4efb5299ac446fdeef9ffcc7eb8858a9992",
+        "bytes": 2185
+      }
+    }
+  ],
+  "pending": {
+    "final_v5_full_arm_suite": {
+      "status": "Not run or claimed; exact v2 full-suite evidence and subsequent changes/checks are recorded separately.",
+      "exact_v2_full_result_kept_separate": true
+    },
+    "application_performance": {
+      "status": "not accepted; diagnostic correctness/IR/code-size observations are not performance or uptake acceptance"
+    }
+  },
+  "performance_acceptance": false,
+  "limits": [
+    "All execution evidence is unoptimized/debug, not throughput/latency acceptance.",
+    "V2\u2192v3 production Rust changes are equivalent lint cleanup; v3\u2192v5 adds only docs/test changes. This supports regression assessment, not exact final-v5 full-suite coverage.",
+    "Coverage reports conservative before-effect CFG-region entry, not per-op success, call counts or language dead code; marker-only lifetime leaves and visitor tests remain separately qualified.",
+    "Large-body framework admission is a future stage; bodies above256ops remain excluded by normal hot policy.",
+    "Final-v5 ARM guard tests, Linux99 and MSVC-Wine99 exact tests passed; final-v5 Wasm compilation passed. No final-v5 full library suite or Wasm execution is claimed.",
+    "Evidence under target is a local validation record; contributor builds/tests do not depend on it."
+  ],
+  "standards": {
+    "specification": "ECMA-262",
+    "revision": "e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "clauses": [
+      "https://tc39.es/ecma262/#sec-getvalue",
+      "https://tc39.es/ecma262/#sec-putvalue",
+      "https://tc39.es/ecma262/#sec-iteratorclose",
+      "https://tc39.es/ecma262/#sec-execution-contexts",
+      "https://tc39.es/ecma262/#sec-try-statement-runtime-semantics-evaluation"
+    ]
+  },
+  "integration_parent_revision": "d3c7c73a81b173a36645f3189bc13f13e1eb6c78",
+  "integration": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/main-integration.json",
+    "sha256": "4aaef2bbba67460f33ef3fbf4f6745fdf954ed70e8bf73b72f3aadb09bfecff3",
+    "bytes": 4839
+  },
+  "draft_provenance": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/commit-validation-draft.json",
+    "sha256": "d40b0666707b59726af0101747998f75593962c27dc90fb3509088ad90003bee",
+    "bytes": 32101
+  },
+  "native_final_v5": {
+    "report": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/report.json",
+      "sha256": "c366f48c704eb782e2711c89777420394b5d5dbb046f9f677e43f59fb6dc124c",
+      "bytes": 209774
+    },
+    "root_independent_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/root-independent-audit.json",
+      "sha256": "14970661de31eaf1d789a43b80eb01e660b695fd443bb615c38e7a84b68e5eda",
+      "bytes": 108120
+    },
+    "root_audit_script": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/root-audit.py",
+      "sha256": "a0caaaa226db6a71ff0c0afae9269445662f90bff1c819fed75be650bbc470ee",
+      "bytes": 4732
+    },
+    "source_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-transfer-v5/manifest.json",
+      "sha256": "2cbc41db07889bd5f6bfc5b09aac1af6b4a546cb1fc5c02d79eecdb8a7832a77",
+      "bytes": 1584
+    },
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-transfer-v5/source-inventory.json",
+      "sha256": "ab2005306d80a419c2bd3d619f5721be2de3b9aa4b392da3bd87942567a8ab1e",
+      "bytes": 122610
+    },
+    "source_archive": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-transfer-v5/trust-js-source-v5.tar.gz",
+      "sha256": "2d391186f9daf2e9581cc2cccf267fe11f4e9bc0c7eab36a7a75b73ebef0e2ba",
+      "bytes": 14080907
+    },
+    "matrix": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-transfer-v5/native-focused-matrix.json",
+      "sha256": "ce7541729cdd78b1619d8c24cb5ab131cfd198b20303cedde75c850bb5eb49d1",
+      "bytes": 37698
+    },
+    "group_counts": {
+      "coverage_native_x64": 24,
+      "shared_read_guard_abi": 10,
+      "observed_regions": 17,
+      "loop_alias_effects": 17,
+      "object_null_facts": 15,
+      "terminal_recovery": 3,
+      "additional_owner_alias_recovery": 11,
+      "iterative_cfg_dfs": 2
+    },
+    "explicit_ARM_only_exclusions": [
+      "execution_coverage::tests::actual_threaded_equality_enters_remote_condition_region_in_fresh_native_window",
+      "execution_coverage::tests::actual_direct_callee_entries_preserve_exact_separate_source_coverage",
+      "execution_coverage::tests::actual_optional_region_rewind_and_compilation_never_mark_execution"
+    ],
+    "exclusion_reason": {
+      "architecture": "aarch64-only",
+      "reason": "These three fixtures depend on ARM64 template fusions/direct-call/optional-region rollback and their ARM-only actual counters; x64 has no equivalent template route. Never launch them with zero-match acceptance."
+    },
+    "platforms": {
+      "linux": {
+        "status": "all99_exact_selectors_passed",
+        "runtime_scope": "Native GNU/Linux x86-64",
+        "actual_native_list_total": 2301,
+        "passed": 99,
+        "failed": 0,
+        "ignored": 0,
+        "timed_out": 0,
+        "zero_matches": 0,
+        "source_record": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/logs/linux-focused-report.json",
+          "sha256": "84439bd353ee63420f6e1044906a4743e4ed282435c4932f9a233870a44b56b6",
+          "bytes": 161100
+        },
+        "artifact_local": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/regions-linux-unit-tests",
+          "sha256": "755771b703c437a775a3c1b8197bf2e0abaf218121a4d735add9a263d0f14879",
+          "bytes": 262260000
+        },
+        "cargo_artifact": {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js#0.1.3",
+          "manifest_path": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "trust_js",
+            "src_path": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js/src/lib.rs",
+            "edition": "2021",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "default",
+            "embed",
+            "intl",
+            "optimizing-jit"
+          ],
+          "filenames": [
+            "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/target-linux/x86_64-unknown-linux-gnu/debug/deps/trust_js-108f07fcab4ad711"
+          ],
+          "executable": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/target-linux/x86_64-unknown-linux-gnu/debug/deps/trust_js-108f07fcab4ad711",
+          "fresh": false
+        }
+      },
+      "windows": {
+        "status": "all99_exact_selectors_passed",
+        "runtime_scope": "Windows MSVC x86-64 PE under Wine on native Linux; not physical Windows",
+        "actual_native_list_total": 2297,
+        "passed": 99,
+        "failed": 0,
+        "ignored": 0,
+        "timed_out": 0,
+        "zero_matches": 0,
+        "source_record": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/logs/windows-focused-report.json",
+          "sha256": "50b8452f15cfdd7294d4a2ad80259d9d755a944f4e00c919005d2907bd424589",
+          "bytes": 165146
+        },
+        "artifact_local": {
+          "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/regions-windows-unit-tests.exe",
+          "sha256": "706a9c05667e946a2cd1f43bc7da844af09b652e4f52ed4954f2614b378126ec",
+          "bytes": 59459072
+        },
+        "cargo_artifact": {
+          "reason": "compiler-artifact",
+          "package_id": "path+file:///home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js#0.1.3",
+          "manifest_path": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js/Cargo.toml",
+          "target": {
+            "kind": [
+              "lib"
+            ],
+            "crate_types": [
+              "lib"
+            ],
+            "name": "trust_js",
+            "src_path": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/source/crates/trust-js/src/lib.rs",
+            "edition": "2021",
+            "doc": true,
+            "doctest": true,
+            "test": true
+          },
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "default",
+            "embed",
+            "intl",
+            "optimizing-jit"
+          ],
+          "filenames": [
+            "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/target-windows/x86_64-pc-windows-msvc/debug/deps/trust_js-4793927b32c0fae6.exe",
+            "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/target-windows/x86_64-pc-windows-msvc/debug/deps/trust_js-4793927b32c0fae6.pdb"
+          ],
+          "executable": "/home/ruby/Programs/trust-js-regions-native-v5-20261014-2cbc41db/target-windows/x86_64-pc-windows-msvc/debug/deps/trust_js-4793927b32c0fae6.exe",
+          "fresh": false
+        }
+      }
+    },
+    "retained_excluded_initial_attempts": {
+      "status": "excluded_not_v5_compilation_not_runtime_evidence",
+      "diagnostic": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-native-v5-validation/logs/cache-reuse-v1-diagnostic.json",
+        "sha256": "6e41b52dba17add3243f4c7ea42578260d60787d743055a9f7497bc3c082a3fb",
+        "bytes": 1147
+      },
+      "explanation": "Reflinked quiescent private Cargo caches reused old engine outputs because deterministic source archive timestamps preceded fingerprint timestamps. Both old ELF/PE identities matched known earlier artifacts. No runtime selector was executed on these cache-reused outputs. Retained V1 logs/results. Cleaned only trust-js package outputs in fresh task-private targets, then fresh=false V2 builds and all99 actual-selector preflights required. Source content and original targets/artifacts never altered."
+    },
+    "scope_limits": [
+      "99 specified exact libtest selectors on each freshly compiled debug artifact; not a full v5 native library suite.",
+      "Windows MSVC x64 PE ran under Wine11.19 on native Linux, not a physical Windows installation.",
+      "No benchmark timings, throughput, startup, memory acceptance or new Test262 claim.",
+      "Tests retain their original process wrappers and own child controls; outer raw stdout/stderr are retained, success-child output remains internally captured by the frozen wrapper when that wrapper suppresses it. No direct-child adapter modifies the test-owned environment.",
+      "Original ObjectNull/QEMU/native failure/DFS negative-control/release artifacts remain separate and unchanged."
+    ],
+    "root_review": "Recomputed hashes and sizes for434 artifacts, matched every required selector to its actual platform list, confirmed fresh=false Cargo artifacts in successful build logs, and verified normal exits and successful nonempty raw summaries for all198 exact tests."
+  },
+  "wasm32_final_v5": {
+    "result": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/wasm32-check.json",
+      "sha256": "96b9312afcdc779534f146426a3a7e42d82ccbb395ed57b58ce89dd2c34d0c72",
+      "bytes": 898
+    },
+    "raw_log": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/regions-composed-v5/wasm32-check.log",
+      "sha256": "94ab587bd98d65a74d6fd7b4e1028916e719856d0ceb58e61fb54ed1e1faf6b0",
+      "bytes": 9757
+    },
+    "command": [
+      "taskset",
+      "-c",
+      "4-5",
+      "cargo",
+      "check",
+      "--locked",
+      "--offline",
+      "--target",
+      "wasm32-unknown-unknown",
+      "-p",
+      "trust-js-wasm",
+      "-p",
+      "trust-js",
+      "--lib",
+      "--features",
+      "trust-js/embed",
+      "-j2"
+    ],
+    "cwd": "/tmp/trust-js-compiler-regions-composed-20261014",
+    "RUSTC": "/tmp/trust-js-cross-validation-20261014/rust/bin/rustc",
+    "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "exit_code": 0,
+    "wall_seconds": 34.310289635992376,
+    "log_sha256": "94ab587bd98d65a74d6fd7b4e1028916e719856d0ceb58e61fb54ed1e1faf6b0",
+    "scope": "Default Intl engine + embed and Wasm bindings compile check; optimizing facility compiled out; no Wasm execution.",
+    "source_manifest_sha256": "ab2005306d80a419c2bd3d619f5721be2de3b9aa4b392da3bd87942567a8ab1e",
+    "source_files_verified_after_check": 800,
+    "warnings": 20
+  }
+}

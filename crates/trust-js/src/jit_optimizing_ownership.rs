@@ -31,7 +31,7 @@ fn record_owner_ir(kind: usize, before: (usize, usize), after: (usize, usize)) {
 }
 
 impl Lowering<'_, '_> {
-    fn owner_leaf_count(&mut self, counter: usize, amount: Value) {
+    pub(super) fn owner_leaf_count(&mut self, counter: usize, amount: Value) {
         if let Some(record) = self.diagnostics.filter(|record| record.runtime_counters) {
             let address = self
                 .b

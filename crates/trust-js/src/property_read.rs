@@ -190,6 +190,13 @@ impl Interp {
             match self.probe_binding_getter_cache(&user.env, &cache) {
                 BindingGetterProbe::Value(value) => {
                     user.binding_getter_cache.set(Some(cache));
+                    #[cfg(test)]
+                    record_binding_getter(1);
+                    #[cfg(feature = "optimizing-jit")]
+                    crate::execution_coverage::invalidate_function(
+                        &user.func,
+                        crate::execution_coverage::Reason::BindingGetterShortcut,
+                    );
                     return Some(value);
                 }
                 BindingGetterProbe::UninitializedOrImport => {
@@ -203,6 +210,13 @@ impl Interp {
                         self.resolve_binding_getter(&user.env, cache.name.as_ref())
                     {
                         user.binding_getter_cache.set(Some(Box::new(next)));
+                        #[cfg(test)]
+                        record_binding_getter(2);
+                        #[cfg(feature = "optimizing-jit")]
+                        crate::execution_coverage::invalidate_function(
+                            &user.func,
+                            crate::execution_coverage::Reason::BindingGetterShortcut,
+                        );
                         return Some(value);
                     }
                     user.binding_getter_cache.set(None);
@@ -223,6 +237,13 @@ impl Interp {
         }
         let (cache, value) = self.resolve_binding_getter(&user.env, name)?;
         user.binding_getter_cache.set(Some(Box::new(cache)));
+        #[cfg(test)]
+        record_binding_getter(0);
+        #[cfg(feature = "optimizing-jit")]
+        crate::execution_coverage::invalidate_function(
+            f,
+            crate::execution_coverage::Reason::BindingGetterShortcut,
+        );
         Some(value)
     }
 
@@ -426,6 +447,18 @@ impl Interp {
             self.interrupt_poll_force()?;
             #[cfg(test)]
             TEST_RECORD_GETTERS.with(|count| count.set(count.get() + 1));
+            #[cfg(feature = "optimizing-jit")]
+            if crate::execution_coverage::enabled() {
+                chunk
+                    .execution_coverage
+                    .invalidate(crate::execution_coverage::Reason::GetterShortcut);
+                if let Callable::User(user) = &getter.borrow().call {
+                    crate::execution_coverage::invalidate_function(
+                        &user.func,
+                        crate::execution_coverage::Reason::GetterShortcut,
+                    );
+                }
+            }
             Ok(chunk.make_record_getter_result(self, values))
         });
         self.depth -= 1;
@@ -438,4 +471,16 @@ thread_local! {
     pub(super) static TEST_RECORD_GETTERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    pub(super) static TEST_BINDING_GETTERS: std::cell::Cell<[usize; 3]> = const {
+        std::cell::Cell::new([0; 3])
+    };
+}
+
+#[cfg(test)]
+fn record_binding_getter(path: usize) {
+    TEST_BINDING_GETTERS.with(|counts| {
+        let mut next = counts.get();
+        next[path] += 1;
+        counts.set(next);
+    });
 }

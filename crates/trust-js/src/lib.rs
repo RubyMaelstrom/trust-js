@@ -66,6 +66,8 @@ mod data_copy_tests;
 #[cfg(test)]
 mod dense_slot_tests;
 mod eval;
+#[cfg(feature = "optimizing-jit")]
+mod execution_coverage;
 mod execution_storage;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
 /// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
@@ -263,6 +265,15 @@ pub fn unstable_regexp_prof_report() -> Option<String> {
 pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {
     let managed_memory = memory::json(&engine.interp);
     jit::performance_metrics_json(&managed_memory)
+}
+
+/// Scalar CFG-region provenance for this owning thread, enabled only by
+/// TRUST_JS_OPT_JIT_COVERAGE=1 in an optimizing-jit build. This observes no JavaScript state
+/// and neither collects nor schedules tasks. The result is deliberately unstable diagnostics.
+#[cfg(feature = "optimizing-jit")]
+#[doc(hidden)]
+pub fn unstable_execution_coverage_json() -> Option<String> {
+    execution_coverage::snapshot_json()
 }
 
 /// An opt-in, bounded sampler for diagnostics from a long-lived Agent.

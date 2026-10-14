@@ -14343,6 +14343,7 @@ impl Interp {
         this_val: &Value,
         args: *mut crate::value::PackedValue,
         argc: usize,
+        #[cfg(feature = "optimizing-jit")] constructor: &Gc,
     ) -> Option<Result<Value, Abrupt>> {
         let (initializer_name, initializer_cache, apply_cache) =
             chunk.jit_arguments_apply_forwarder()?;
@@ -14506,6 +14507,27 @@ impl Interp {
                 ));
             }
 
+            #[cfg(feature = "optimizing-jit")]
+            if crate::execution_coverage::enabled() {
+                chunk
+                    .execution_coverage
+                    .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
+                if let Callable::User(user) = &constructor.borrow().call {
+                    crate::execution_coverage::invalidate_function(
+                        &user.func,
+                        crate::execution_coverage::Reason::ForwarderShortcut,
+                    );
+                }
+                initializer_chunk
+                    .execution_coverage
+                    .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
+                if let Callable::User(user) = &initializer_obj.borrow().call {
+                    crate::execution_coverage::invalidate_function(
+                        &user.func,
+                        crate::execution_coverage::Reason::ForwarderShortcut,
+                    );
+                }
+            }
             let plan = initializer_chunk
                 .jit_initializer_plan()
                 .expect("initializer plan checked above");
@@ -14580,6 +14602,18 @@ impl Interp {
             return Some(Err(e));
         }
 
+        #[cfg(feature = "optimizing-jit")]
+        if crate::execution_coverage::enabled() {
+            chunk
+                .execution_coverage
+                .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
+            if let Callable::User(user) = &constructor.borrow().call {
+                crate::execution_coverage::invalidate_function(
+                    &user.func,
+                    crate::execution_coverage::Reason::ForwarderShortcut,
+                );
+            }
+        }
         let mut forwarded_this = std::mem::ManuallyDrop::new(PackedValue::pack(this_val.clone()));
         let fast = unsafe {
             self.call_jit_fast(
@@ -14845,6 +14879,19 @@ impl Interp {
                 }
             };
             if let Some(shapes) = shapes {
+                #[cfg(feature = "optimizing-jit")]
+                if crate::execution_coverage::enabled() {
+                    chunk
+                        .execution_coverage
+                        .invalidate(crate::execution_coverage::Reason::ConstructorShortcut);
+                    if let Callable::User(user) = &o.borrow().call {
+                        crate::execution_coverage::invalidate_function(
+                            &user.func,
+                            crate::execution_coverage::Reason::ConstructorShortcut,
+                        );
+                    }
+                }
+
                 let mut object = this.borrow_mut();
                 let initialized_layout = chunk.initializer_layout().is_some();
                 for field in 0..simple.len() {
@@ -14905,7 +14952,15 @@ impl Interp {
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder
                 .then(|| unsafe {
-                    self.construct_arguments_apply_forwarder(chunk, &this, &this_val, args, argc)
+                    self.construct_arguments_apply_forwarder(
+                        chunk,
+                        &this,
+                        &this_val,
+                        args,
+                        argc,
+                        #[cfg(feature = "optimizing-jit")]
+                        o,
+                    )
                 })
                 .flatten();
             if let Some(r) = forwarded {
@@ -15726,6 +15781,11 @@ impl Interp {
         // (The bytecode tier intercepted eligible calls at the top of this function; anything
         // reaching here — construct calls, uncompilable bodies — runs on the tree-walker.)
         let mut result = Ok(Value::Undefined);
+        #[cfg(feature = "optimizing-jit")]
+        crate::execution_coverage::invalidate_function(
+            func,
+            crate::execution_coverage::Reason::AstBody,
+        );
         for stmt in &func.body {
             match self.exec_stmt(stmt, &body) {
                 Ok(_) => {}

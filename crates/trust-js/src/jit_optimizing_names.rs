@@ -45,7 +45,7 @@ pub(super) fn instruction_allowance(chunk: &Chunk) -> usize {
         .saturating_mul(384)
 }
 
-fn supported(layout: &JitLayout) -> bool {
+pub(super) fn supported(layout: &JitLayout) -> bool {
     property::supported(layout)
         && layout.scope_with_valid
         && [
@@ -321,6 +321,9 @@ impl Lowering<'_, '_> {
                 return;
             }
         };
+        if self.shared_name_read(pc, op, next) {
+            return;
+        }
         let slow = self.b.create_block();
         let direct = self.b.create_block();
         let global = self.b.create_block();

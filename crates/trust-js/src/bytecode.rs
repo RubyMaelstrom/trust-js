@@ -2338,6 +2338,10 @@ pub struct Chunk {
     /// Representation-independent semantic site layout. The detailed payload is lazy and does
     /// not mirror raw IC words; a second-stage compile reuses the canonical baseline layout.
     feedback: crate::feedback::FeedbackVector,
+    /// Optional scalar region-entry feedback, or an immutable source-version snapshot.
+    /// The control is off by default; ordinary builds contain no field.
+    #[cfg(feature = "optimizing-jit")]
+    pub(crate) execution_coverage: crate::execution_coverage::Handle,
     /// RuntimeBinding::Unbound means no property-IC adapter, not an absent semantic PC.
     /// Keep transformed-PC identity separate so arithmetic/branch sites remain usable.
     #[cfg(feature = "optimizing-jit")]
@@ -2657,6 +2661,10 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
+        #[cfg(feature = "optimizing-jit")]
+        {
+            self.execution_coverage.scan_retained_memory(visitor);
+        }
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
         if matches!(self.record_getter.get(), Some(Some(_))) {
             bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
@@ -6394,6 +6402,9 @@ thread_local! {
     };
 }
 
+#[cfg(all(test, feature = "optimizing-jit"))]
+#[path = "bytecode_execution_coverage_tests.rs"]
+mod execution_coverage_tests;
 #[cfg(test)]
 #[path = "function_tiering_tests.rs"]
 mod function_tiering_tests;
@@ -6448,6 +6459,71 @@ pub(crate) fn compile_for_optimizer_with_objects(
     structural: &[(u32, IcState)],
     objects: &[(u32, IcState)],
 ) -> Option<Rc<Chunk>> {
+    compile_for_optimizer_snapshot(func, hot, inputs, properties, structural, objects, None)
+}
+
+#[cfg(all(test, feature = "optimizing-jit"))]
+pub(crate) fn compile_for_optimizer_with_structural_and_coverage(
+    func: &Function,
+    hot: &Chunk,
+    inputs: &[(u16, u32)],
+    properties: &[(u32, u32)],
+    structural: &[(u32, IcState)],
+    coverage: &crate::execution_coverage::Handle,
+) -> Option<Rc<Chunk>> {
+    compile_for_optimizer_with_objects_and_coverage(
+        func,
+        hot,
+        inputs,
+        properties,
+        structural,
+        &[],
+        coverage,
+    )
+}
+
+/// A hot observed-region checkpoint estimates credit from this exact frozen
+/// snapshot. Copy its object selections and coverage together without rereading
+/// mutable feedback after the admission decision.
+#[cfg(feature = "optimizing-jit")]
+pub(crate) fn compile_for_optimizer_with_objects_and_coverage(
+    func: &Function,
+    hot: &Chunk,
+    inputs: &[(u16, u32)],
+    properties: &[(u32, u32)],
+    structural: &[(u32, IcState)],
+    objects: &[(u32, IcState)],
+    coverage: &crate::execution_coverage::Handle,
+) -> Option<Rc<Chunk>> {
+    // Unavailable feedback remains unavailable even if quota becomes available
+    // later. A real snapshot must belong to this exact baseline graph.
+    if coverage.source().is_some()
+        || coverage.source_version().is_some()
+            && coverage.source_version() != hot.execution_coverage.source_version()
+    {
+        return None;
+    }
+    compile_for_optimizer_snapshot(
+        func,
+        hot,
+        inputs,
+        properties,
+        structural,
+        objects,
+        Some(coverage),
+    )
+}
+
+#[cfg(feature = "optimizing-jit")]
+fn compile_for_optimizer_snapshot(
+    func: &Function,
+    hot: &Chunk,
+    inputs: &[(u16, u32)],
+    properties: &[(u32, u32)],
+    structural: &[(u32, IcState)],
+    objects: &[(u32, IcState)],
+    coverage: Option<&crate::execution_coverage::Handle>,
+) -> Option<Rc<Chunk>> {
     let started = crate::jit::perf_stage_start();
     // The caller selects this Function's warmed baseline, which may already contain inline
     // splices. Regenerating the AST loses their canonical PCs and hidden frame slots.
@@ -6464,7 +6540,7 @@ pub(crate) fn compile_for_optimizer_with_objects(
         None
     } else {
         Some(Rc::new(hot.clone_for_optimizer(
-            inputs, properties, structural, objects,
+            inputs, properties, structural, objects, coverage,
         )))
     };
     crate::jit::perf_bytecode_compile_end(started, next.is_some());
@@ -6481,6 +6557,7 @@ impl Chunk {
         properties: &[(u32, u32)],
         structural: &[(u32, IcState)],
         objects: &[(u32, IcState)],
+        coverage: Option<&crate::execution_coverage::Handle>,
     ) -> Self {
         let (layout, bindings) = feedback_layout_for_ops(&self.ops, &self.names);
         let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -6603,6 +6680,7 @@ impl Chunk {
                 .collect(),
             feedback: crate::feedback::FeedbackVector::new_with_enabled(layout, bindings, false),
             feedback_pc_identity: true,
+            execution_coverage: coverage.unwrap_or(&self.execution_coverage).freeze(),
             feedback_shapes: std::cell::RefCell::new(Vec::new()),
             obj_maps: (0..self.obj_maps.len())
                 .map(|_| std::cell::OnceCell::new())
@@ -7675,7 +7753,7 @@ fn finish_chunk(
         .iter()
         .any(|op| matches!(op, Op::TailCall(..) | Op::TailEvalCallArgsArray));
     let inline_planning_genv = exclusive_inline_genv(&c.inline_targets);
-    Some(Rc::new(Chunk {
+    let chunk = Chunk {
         debug_origin: source.map_or((0, 0), |func| {
             (
                 func.start,
@@ -7726,6 +7804,8 @@ fn finish_chunk(
         feedback,
         #[cfg(feature = "optimizing-jit")]
         feedback_pc_identity: hot.is_none(),
+        #[cfg(feature = "optimizing-jit")]
+        execution_coverage: crate::execution_coverage::Handle::default(),
         feedback_shapes: std::cell::RefCell::new(Vec::new()),
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
@@ -7787,7 +7867,15 @@ fn finish_chunk(
         #[cfg(feature = "optimizing-jit")]
         optimizing_loop: std::cell::OnceCell::new(),
         osr: std::cell::OnceCell::new(),
-    }))
+    };
+    #[cfg(feature = "optimizing-jit")]
+    {
+        let mut chunk = chunk;
+        chunk.execution_coverage = crate::execution_coverage::Handle::new(&chunk);
+        Some(Rc::new(chunk))
+    }
+    #[cfg(not(feature = "optimizing-jit"))]
+    Some(Rc::new(chunk))
 }
 
 /// Machine-code runs before the first bounded, feedback-adaptive inline checkpoint.
@@ -16237,7 +16325,65 @@ impl VmRunExit {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn run_vm_inner<S: StoredValue>(
+    interpreter: &mut Interp,
+    chunk: &Chunk,
+    env: &mut Env,
+    cap_env: &Env,
+    references: &mut [crate::eval::PreparedReferenceSlot],
+    slots: &[S],
+    stack: &mut ValueStack<S>,
+    pc: &mut usize,
+    this_val: &Value,
+    handlers: &mut Vec<Handler>,
+    disposal_frames: &mut Vec<Vec<crate::interpreter::Disposable>>,
+    class_states: &mut [Option<crate::eval::PreparedClassEvaluation>],
+    stop_at: Option<usize>,
+    tiering: Option<&mut crate::tiering::VmTiering>,
+    requested: &mut bool,
+) -> Result<VmStep, Abrupt> {
+    #[cfg(feature = "optimizing-jit")]
+    if chunk.execution_coverage.source().is_some() {
+        return run_vm_inner_recording::<S, true>(
+            interpreter,
+            chunk,
+            env,
+            cap_env,
+            references,
+            slots,
+            stack,
+            pc,
+            this_val,
+            handlers,
+            disposal_frames,
+            class_states,
+            stop_at,
+            tiering,
+            requested,
+        );
+    }
+    run_vm_inner_recording::<S, false>(
+        interpreter,
+        chunk,
+        env,
+        cap_env,
+        references,
+        slots,
+        stack,
+        pc,
+        this_val,
+        handlers,
+        disposal_frames,
+        class_states,
+        stop_at,
+        tiering,
+        requested,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_vm_inner_recording<S: StoredValue, const RECORD: bool>(
     interpreter: &mut Interp,
     chunk: &Chunk,
     env: &mut Env,
@@ -16276,6 +16422,13 @@ fn run_vm_inner<S: StoredValue>(
     loop {
         if stop_at == Some(*pc) {
             return Ok(VmStep::Done(Value::Undefined));
+        }
+        #[cfg(feature = "optimizing-jit")]
+        if RECORD {
+            let source = chunk.execution_coverage.source().unwrap();
+            source.enter_pc(*pc);
+            #[cfg(test)]
+            crate::execution_coverage::record_vm_marker(source);
         }
         let op_pc = *pc;
         let op = chunk.ops[op_pc];
@@ -26415,6 +26568,22 @@ impl Chunk {
     pub(crate) fn test_ops(&self) -> &[Op] {
         &self.ops
     }
+}
+
+#[cfg(test)]
+#[test]
+fn execution_coverage_layout_sizes_and_native_frame_offsets() {
+    #[cfg(feature = "optimizing-jit")]
+    let coverage_offset = std::mem::offset_of!(Chunk, execution_coverage).to_string();
+    #[cfg(not(feature = "optimizing-jit"))]
+    let coverage_offset = "null";
+    println!(
+        "{{\"optimizing_feature\":{},\"chunk_bytes\":{},\"chunk_ops_offset\":{},\"chunk_jit_offset\":{},\"chunk_coverage_offset\":{},\"vm_coro_bytes\":{},\"native_continuation_bytes\":{},\"native\":{}}}",
+        cfg!(feature = "optimizing-jit"), std::mem::size_of::<Chunk>(),
+        std::mem::offset_of!(Chunk, ops), std::mem::offset_of!(Chunk, jit), coverage_offset,
+        std::mem::size_of::<VmCoro>(), std::mem::size_of::<NativeContinuation>(),
+        crate::jit::JitCode::test_coverage_layout_json(),
+    );
 }
 
 #[cfg(test)]
