@@ -1541,22 +1541,30 @@ fn graph_roots(blocks: &[Block], handlers: &[HandlerRoot], entry: Option<BlockId
 }
 
 fn reverse_postorder(blocks: &[Block], roots: &[BlockId]) -> Vec<BlockId> {
-    fn visit(id: BlockId, blocks: &[Block], seen: &mut [bool], post: &mut Vec<BlockId>) {
-        if std::mem::replace(&mut seen[id.index()], true) {
-            return;
-        }
-        for &succ in &blocks[id.index()].successors {
-            if blocks[succ.index()].stack_in.is_some() {
-                visit(succ, blocks, seen, post);
-            }
-        }
-        post.push(id);
-    }
-
     let mut seen = vec![false; blocks.len()];
     let mut post = Vec::new();
+    // One cursor per active DFS frame preserves successor order without consuming the
+    // native stack. Flat logical chains can produce tens of thousands of basic blocks.
+    let mut work = Vec::new();
     for &root in roots {
-        visit(root, blocks, &mut seen, &mut post);
+        if std::mem::replace(&mut seen[root.index()], true) {
+            continue;
+        }
+        work.push((root, 0));
+        while let Some((id, next)) = work.last_mut() {
+            let successors = &blocks[id.index()].successors;
+            if let Some(&succ) = successors.get(*next) {
+                *next += 1;
+                if blocks[succ.index()].stack_in.is_some()
+                    && !std::mem::replace(&mut seen[succ.index()], true)
+                {
+                    work.push((succ, 0));
+                }
+            } else {
+                post.push(*id);
+                work.pop();
+            }
+        }
     }
     post.reverse();
     post
@@ -1707,6 +1715,111 @@ mod tests {
 
     fn cfg(ops: &[Op]) -> Result<Cfg, BuildError> {
         Cfg::build_with(ops, |pc| effect(&ops[pc]))
+    }
+
+    fn rpo_block(id: u32, successors: &[u32], reachable: bool) -> Block {
+        Block {
+            start: id as usize,
+            end: id as usize + 1,
+            successors: successors.iter().copied().map(BlockId).collect(),
+            predecessors: Vec::new(),
+            stack_in: reachable.then_some(0),
+            stack_out: reachable.then_some(0),
+        }
+    }
+
+    #[test]
+    fn reverse_postorder_preserves_successor_root_cycle_and_reachability_order() {
+        let mut blocks = vec![
+            rpo_block(0, &[1, 2, 1, 6], true),
+            rpo_block(1, &[3], true),
+            rpo_block(2, &[3, 5], true),
+            rpo_block(3, &[1], true),
+            rpo_block(4, &[2], true),
+            rpo_block(5, &[], true),
+            rpo_block(6, &[7], false),
+            rpo_block(7, &[], true),
+        ];
+        let ids = |order: Vec<BlockId>| order.into_iter().map(|id| id.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(reverse_postorder(
+                &blocks,
+                &[BlockId(0), BlockId(4), BlockId(0)]
+            )),
+            [4, 0, 2, 5, 1, 3]
+        );
+        assert_eq!(
+            ids(reverse_postorder(&blocks, &[BlockId(4), BlockId(0)])),
+            [0, 4, 2, 5, 3, 1]
+        );
+        blocks[0].successors.swap(0, 1);
+        assert_eq!(
+            ids(reverse_postorder(&blocks, &[BlockId(0), BlockId(4)])),
+            [4, 0, 2, 5, 3, 1]
+        );
+        // Only successor edges filter unsettled stack depths. Independent entry roots
+        // remain visitable, matching the original traversal's entry semantics.
+        assert_eq!(ids(reverse_postorder(&blocks, &[BlockId(6)])), [6, 7]);
+        assert!(reverse_postorder(&blocks, &[]).is_empty());
+
+        fn recursive_order(blocks: &[Block], roots: &[BlockId]) -> Vec<BlockId> {
+            fn visit(id: BlockId, blocks: &[Block], seen: &mut [bool], post: &mut Vec<BlockId>) {
+                if std::mem::replace(&mut seen[id.index()], true) {
+                    return;
+                }
+                for &succ in &blocks[id.index()].successors {
+                    if blocks[succ.index()].stack_in.is_some() {
+                        visit(succ, blocks, seen, post);
+                    }
+                }
+                post.push(id);
+            }
+            let mut seen = vec![false; blocks.len()];
+            let mut post = Vec::new();
+            for &root in roots {
+                visit(root, blocks, &mut seen, &mut post);
+            }
+            post.reverse();
+            post
+        }
+        // Exhaust all directed four-node graphs, with cycles, sharing, repeated roots,
+        // and an unsettled successor. The bounded oracle is the previous algorithm.
+        for edges in 0u32..(1 << 16) {
+            let graph: Vec<_> = (0..4)
+                .map(|id| {
+                    let successors: Vec<_> = (0..4)
+                        .filter(|&succ| edges & (1 << (id * 4 + succ)) != 0)
+                        .collect();
+                    rpo_block(id, &successors, id != 2)
+                })
+                .collect();
+            let roots = [BlockId(1), BlockId(0), BlockId(2), BlockId(1)];
+            assert_eq!(
+                reverse_postorder(&graph, &roots),
+                recursive_order(&graph, &roots),
+                "edges={edges:#x}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reverse_postorder_deep_graph_fits_a_small_native_stack() {
+        std::thread::Builder::new()
+            .name("deep-cfg-rpo".into())
+            .stack_size(1 << 20)
+            .spawn(|| {
+                const N: u32 = 100_000;
+                let graph: Vec<_> = (0..N)
+                    .map(|id| rpo_block(id, &[if id + 1 < N { id + 1 } else { id }], true))
+                    .collect();
+                let order = reverse_postorder(&graph, &[BlockId(0)]);
+                assert_eq!(order.len(), N as usize);
+                assert!(order.iter().enumerate().all(|(i, id)| id.index() == i));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

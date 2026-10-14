@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-14",
+  "base_revision": "3f39a49ca884f57506dd3b0eda8ae2ec7395ab31",
+  "problem": "Native x86 full-suite execution exposed recursive control-flow reverse-postorder traversal exhausting the 1 MiB stack used by the long-expression-chain regression. An isolated rerun could pass; the bounded deep-graph negative control reliably reproduced stack exhaustion.",
+  "fix": "Use an explicit DFS cursor stack, preserving successor/root ordering, cycle handling and unsettled-successor filtering. O(V+E) work and O(V) heap storage; no compiler limit or native stack-size change.",
+  "source_hashes": {
+    "crates/trust-js/src/jit_ir.rs": "a4ea36e0f21333a1de45321df1b811ed51c5b81d858c0299dfeabe29ef6aefff"
+  },
+  "new_regressions": [
+    "Ordering for roots, shared descendants, cycles, duplicate edges, and unsettled depths; exhaustive parity against the previous traversal over all 65536 directed four-node graphs.",
+    "100000-block chain with terminal self-loop on an explicitly 1 MiB thread stack."
+  ],
+  "arm64": {
+    "machine": "crystal Linux aarch64",
+    "profile": "debug default intl + embed + optimizing-jit",
+    "build": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-main-root/build-result.json",
+      "sha256": "d253e0db76bc74063c9c6165d48e547f4e36daa2b87d9cad4357a449d7646e5f"
+    },
+    "binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-main-root/trust-js-tests",
+      "sha256": "99e755abed3a289cdffbcd70e72c841037fd5df3f33c3ed94870a8cfb2f805ea"
+    },
+    "raw_results": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-main-root/root-focused-results.json",
+      "sha256": "3016b3c1fb54104d6a5fab8649abfcabf62cbc602b2bcdb0dcbb1e2ff3d17295"
+    },
+    "passed": 24,
+    "failed": 0,
+    "scope": "23 CFG tests and the existing cross-tier long-expression-chain regression; explicit inner 1 MiB stacks unchanged."
+  },
+  "native_x86_64": {
+    "machine": "zombie Linux x86_64, Intel Core i7-6700HQ",
+    "profile": "Rust 1.98 debug native GNU default intl + embed + optimizing-jit; no stack-size override",
+    "binary": {
+      "path": "/home/ruby/Programs/trust-js-cfg-dfs-v1-20261014-3f39a49c/artifacts/dfs-linux-unit-tests",
+      "sha256": "85e135e36f62e1ff5fedb105b343ab1b62a970fb6f4ac524e8db98ae8e62069c",
+      "bytes": 257136496,
+      "source_inventory_sha256": "235347cc5c18bb2ac4801000487a6eacdac0083004eab7851839017eea42d313",
+      "patch_sha256": "57b064afcb2e919aae09be3b19baddc39e666d82682fe2bc0d2f741e4ba34b60",
+      "profile": "Rust1.98 default intl+embed+optimizing-jit debug nativeGNU Linux; no stack-size override"
+    },
+    "evidence_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-v1/native-focused/evidence-inventory.json",
+      "sha256": "c34f2ff22c4d0310ef111cc2f18272028863691ca4d1bae33bb96d8c43df59fb"
+    },
+    "passed": 24,
+    "failed": 0,
+    "scope": "Same 23 CFG tests and existing cross-tier long-expression-chain regression. Full native suite is separately in progress, not counted here."
+  },
+  "negative_control": {
+    "scope": "Separate binary with only production traversal restored to old recursion, retaining the new deep-graph test.",
+    "artifact": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-v1/negative-control/control-artifact.json",
+      "sha256": "3f7780e2be0b6c7af1373b215bf9f57fb741221d276e8b6ae452848586196e24"
+    },
+    "result": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-v1/negative-control/recursive-deep-graph-negative-control.result.json",
+      "sha256": "cb648439188d4b7ca68028376c92ee737e01c64963baf649a2b8f21f381f67ad"
+    },
+    "raw_log": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-v1/negative-control/recursive-deep-graph-negative-control.log",
+      "sha256": "5c7197e75c6a01fa0048f496039f483b00578e5a233bc0a11fb10b2d815f086c"
+    },
+    "outcome": "SIGABRT from stack overflow in 0.92 seconds, not timeout."
+  },
+  "independent_review": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261014/cfg-dfs-v1/jit-independent-source-review-v1.json",
+    "sha256": "b36d2fa48f5f8618156c582229a1a896dc7d0e80ed60fb07306fb0a9fd3f59fb"
+  },
+  "checks": [
+    "cargo fmt --all -- --check",
+    "git diff --check",
+    "Root verified all 791 frozen source hashes and native raw-result hashes."
+  ],
+  "performance_acceptance": false,
+  "limits": [
+    "This is a compiler robustness fix; no application throughput improvement claimed.",
+    "Wasm deep-thread regression is excluded; traversal itself remains platform independent.",
+    "Local target evidence is not required by contributor builds."
+  ]
+}
