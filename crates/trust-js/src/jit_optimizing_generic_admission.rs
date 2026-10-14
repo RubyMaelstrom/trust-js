@@ -168,8 +168,9 @@ impl Plan {
         objects: Option<&super::object_facts::Plan>,
         regions: Option<&observed_regions::Plan>,
     ) -> Option<Self> {
+        let large = super::large_regions::certificate(chunk, cfg, regions);
         if !enabled()
-            || chunk.jit_ops().len() > 256
+            || chunk.jit_ops().len() > 256 && !large
             || selected.is_empty()
             || selected.len() > MAX_SITES
             || selected
@@ -197,7 +198,9 @@ impl Plan {
         if selected.is_empty() {
             return None;
         }
-        let proof = generic_own::Plan::build_hot_selection(chunk, cfg, &frame, stack, &selected)?;
+        let proof = generic_own::Plan::build_hot_selection_with_regions(
+            chunk, cfg, &frame, stack, &selected, regions,
+        )?;
         let mut weights = vec![0u32; cfg.blocks().len()];
         let mut per_pc = vec![None; chunk.jit_ops().len()];
         for &(pc, _) in &selected {
@@ -211,9 +214,15 @@ impl Plan {
         }
         // per_pc remains raw structural credit. The combined region estimate
         // recomputes its paths and charges this same emitted guard once itself.
-        let minimum_tests = minimum_path(cfg, chunk, &weights, &per_pc, &[], objects, regions)?
-            .saturating_sub(objects.map_or(0, |plan| plan.guard_cost));
-        (minimum_tests != 0).then_some(Self {
+        // Large observed bodies have separate opportunity accounting. This
+        // certificate validates their scalar guards/proofs, never a minimum.
+        let minimum_tests = if large {
+            0
+        } else {
+            minimum_path(cfg, chunk, &weights, &per_pc, &[], objects, regions)?
+                .saturating_sub(objects.map_or(0, |plan| plan.guard_cost))
+        };
+        (large || minimum_tests != 0).then_some(Self {
             selected,
             minimum_tests,
             per_pc,

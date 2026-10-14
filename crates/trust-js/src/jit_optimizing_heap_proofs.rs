@@ -329,6 +329,53 @@ pub(super) fn analyze(graph: &Graph, budget: Budget) -> Option<Plan> {
     Some(Plan { redundant })
 }
 
+/// Independent native basic blocks start with empty facts. This is not a wider
+/// CFG solver: no successor, incoming alias or previous block fact is accepted.
+/// Aggregate events/work/fact limits apply across every block, including blocks
+/// that fail to provide an elision. The caller separately bounds original CFGs.
+pub(super) fn analyze_independent(graph: &Graph, budget: Budget) -> Option<Plan> {
+    let count = graph.blocks.len();
+    if count == 0
+        || count > budget.blocks
+        || graph.roots.len() != count
+        || graph.roots.iter().copied().ne(0..count)
+        || graph
+            .blocks
+            .iter()
+            .any(|block| !block.successors.is_empty())
+    {
+        return None;
+    }
+    let mut work = budget.work;
+    let mut size = 0usize;
+    let mut redundant = Vec::with_capacity(count);
+    for block in &graph.blocks {
+        size = size.checked_add(block.events.len())?;
+        if size > budget.events {
+            return None;
+        }
+        spend(&mut work, block.events.len().checked_add(1)?)?;
+        let mut facts = Facts::default();
+        let mut decisions = Vec::with_capacity(block.events.len());
+        for event in &block.events {
+            // Charge both the ordinary solver's transfer and decision passes.
+            spend(&mut work, (1 + facts.0.len()).checked_mul(2)?)?;
+            match *event {
+                Event::Guard(proof) => {
+                    decisions.push(facts.contains(proof));
+                    facts.insert(proof, budget.facts_per_block);
+                }
+                Event::Effect(effect) => {
+                    decisions.push(false);
+                    facts.effect(effect);
+                }
+            }
+        }
+        redundant.push(decisions);
+    }
+    Some(Plan { redundant })
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct ReadElisions {
     pub(super) ordinary: bool,

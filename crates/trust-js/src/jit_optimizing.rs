@@ -78,11 +78,18 @@ mod integers;
 #[cfg(test)]
 #[path = "jit_optimizing_integration_tests.rs"]
 mod integration_tests;
+#[cfg(test)]
+#[path = "jit_optimizing_large_region_tests.rs"]
+mod large_region_tests;
+#[path = "jit_optimizing_large_regions.rs"]
+mod large_regions;
 #[path = "jit_optimizing_names.rs"]
 mod names;
 #[cfg(test)]
 #[path = "jit_optimizing_names_tests.rs"]
 mod names_tests;
+#[path = "jit_optimizing_native_pcs.rs"]
+mod native_pcs;
 #[cfg(test)]
 #[path = "jit_optimizing_object_fact_tests.rs"]
 mod object_fact_tests;
@@ -245,7 +252,7 @@ fn admission_override() -> Option<u32> {
 }
 
 pub(super) fn hot_threshold(op_count: usize) -> u32 {
-    if mode() != Mode::Hot || op_count > 256 {
+    if mode() != Mode::Hot || op_count > 256 && !large_regions::source_size(op_count) {
         return 0;
     }
     // Four separated observations, without instrumenting any bytecode fast path. Only
@@ -256,7 +263,7 @@ pub(super) fn hot_threshold(op_count: usize) -> u32 {
 pub(super) fn hot_counter(chunk: &Chunk) -> Option<*const std::cell::Cell<u32>> {
     (mode() == Mode::Hot
         && !chunk.optimizing_candidate
-        && chunk.jit_ops().len() <= 256
+        && (chunk.jit_ops().len() <= 256 || large_regions::sampling_candidate(chunk))
         && !chunk.jit_detailed_feedback_enabled()
         && bytecode::native_deopt::supported(chunk)
         && has_sampling_source(chunk)
@@ -300,7 +307,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             return;
         }
     }
-    if chunk.jit_ops().len() > 256
+    if (chunk.jit_ops().len() > 256 && !large_regions::sampling_candidate(chunk))
         || chunk.jit_detailed_feedback_enabled()
         || !bytecode::native_deopt::supported(chunk)
         || !has_sampling_source(chunk)
@@ -380,6 +387,13 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let regions = region_coverage
         .as_ref()
         .and_then(|coverage| observed_regions::Plan::build(chunk, &cfg, &stack, coverage));
+    let large = chunk.jit_ops().len() > 256;
+    if large && !large_regions::certificate(chunk, &cfg, regions.as_ref()) {
+        // Unavailable/unknown-only/dead-only feedback never admits a large body.
+        // This bounded sampling attempt stops; it cannot become full-body admission.
+        chunk.optimizing_remaining.set(0);
+        return;
+    }
     let numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
         .then(|| specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties))
         .flatten();
@@ -413,7 +427,22 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         object_plan.as_ref(),
         regions.as_ref(),
     );
-    let estimated_entries = if let Some(regions) = &regions {
+    let estimated_entries = if large {
+        let regions = regions.as_ref().expect("large certificate");
+        let frame = frame::FramePlan::build(
+            chunk,
+            &cfg,
+            std::env::var("TRUST_JS_OPT_JIT_LOCAL_EFFECTS").as_deref() != Ok("0"),
+        );
+        frame.and_then(|frame| {
+            let work = large_regions::work(chunk, &cfg, &stack, &frame, regions)?;
+            let saved = large_regions::opportunity_tests(chunk, &cfg, regions, numeric.as_ref(), structural.as_ref())?;
+            if std::env::var_os("TRUST_JS_OPT_JIT_LOG").is_some() {
+                eprintln!("[optimizing-large-opportunity] source={} ops={} native_ops={} cuts={} opportunity_tests={} work={} target={}", regions.source_version, chunk.jit_ops().len(), regions.native_ops, regions.cut_blocks, saved, work.total()?, work.admission_entries(saved)?);
+            }
+            work.admission_entries(saved)
+        })
+    } else if let Some(regions) = &regions {
         regions
             .minimum_saved_tests(
                 chunk,
@@ -904,10 +933,16 @@ struct Lowering<'a, 'b> {
     ok: Block,
     error: Block,
     dispatch: Block,
-    pcs: Vec<Block>,
+    pcs: Vec<Option<Block>>,
 }
 
 impl Lowering<'_, '_> {
+    /// Every target consumer was validated against the immutable semantic graph
+    /// before lowering. A certified omitted interior cannot be indexed here.
+    fn pc_block(&self, pc: usize) -> Block {
+        self.pcs[pc].expect("preflight validated native PC")
+    }
+
     fn count_runtime(&mut self, counter: usize, amount: usize) {
         if let Some(record) = self.diagnostics {
             emit_diagnostic_count(&mut self.b, record, counter, amount);
@@ -1593,7 +1628,7 @@ impl Lowering<'_, '_> {
     }
 
     fn lower(&mut self, pc: usize, op: &Op) {
-        let next = self.pcs[pc + 1];
+        let next = self.pc_block(pc + 1);
         if self.object_comparison(pc, next) {
             return;
         }
@@ -1746,16 +1781,16 @@ impl Lowering<'_, '_> {
                 }
             }
             Op::Jump(target) => {
-                self.jump_normal(self.pcs[*target as usize]);
+                self.jump_normal(self.pc_block(*target as usize));
             }
             Op::InlineGuard(target, fallback) => {
-                self.inline_guard(*target, self.pcs[*fallback as usize], next);
+                self.inline_guard(*target, self.pc_block(*fallback as usize), next);
             }
             Op::JumpIfFalse(target)
             | Op::JumpIfFalsePeek(target)
             | Op::JumpIfTruePeek(target)
             | Op::JumpIfNotNullishPeek(target) => {
-                let target = self.pcs[*target as usize];
+                let target = self.pc_block(*target as usize);
                 self.conditional_jump(op, target, next);
             }
             Op::Return | Op::ReturnBare => self.direct_return(matches!(op, Op::Return)),
@@ -2034,9 +2069,14 @@ fn prepare_entry_with_limits(
     {
         return Err(CompileError::Unsupported);
     }
-    // The entry, every bytecode boundary, unwind/dispatch and two exits already need
-    // these blocks, before expanding even one opcode. Refuse impossible budgets before
-    // analyses or shared call-stub preparation; an ordinary body always needs instructions.
+    if chunk.optimizing_candidate
+        && ops.len() > 256
+        && (continuation.is_some() || deopt_at.is_some() || !large_regions::source_size(ops.len()))
+    {
+        return Err(CompileError::Unsupported);
+    }
+    // Retain the conservative full-body early budget check before analyses. Sparse
+    // region emission can use fewer labels, but does not relax this existing limit.
     if instruction_limit == 0 || ops.len().saturating_add(6) > block_limit {
         return Err(CompileError::LoweringBudget);
     }
@@ -2061,9 +2101,19 @@ fn prepare_entry_with_limits(
     let regions = (continuation.is_none() && deopt_at.is_none())
         .then(|| observed_regions::Plan::build(chunk, &cfg, &stack_plan, &chunk.execution_coverage))
         .flatten();
+    if chunk.optimizing_candidate
+        && ops.len() > 256
+        && !large_regions::certificate(chunk, &cfg, regions.as_ref())
+    {
+        return Err(CompileError::Unsupported);
+    }
     if regions.is_some() && !bytecode::native_deopt::supported(chunk) {
         return Err(CompileError::Unsupported);
     }
+    // Validate every physical target before generating any native control flow,
+    // including cold completion pads and the end boundary. Original analyses and
+    // recovery continue to use the unchanged full bytecode PC space.
+    let native_pcs = native_pcs::Plan::build(ops, &cfg, entry_pc, regions.as_ref())?;
     if let (Some(record), Some(plan)) = (&diagnostic, &regions) {
         record.set_regions(plan.source_version, plan.native_ops, plan.cut_blocks);
     }
@@ -2197,12 +2247,13 @@ fn prepare_entry_with_limits(
         (continuation.is_none() && property::supported(values) && elements::supported(values))
             .then(|| {
                 if chunk.optimizing_candidate {
-                    generic_own::Plan::build_hot(
+                    generic_own::Plan::build_hot_selection_with_regions(
                         chunk,
                         &cfg,
                         &frame,
                         &stack_plan,
                         &chunk.optimizing_structural,
+                        regions.as_ref(),
                     )
                 } else {
                     generic_own::Plan::build(chunk, &cfg, &frame, &stack_plan)
@@ -2214,7 +2265,36 @@ fn prepare_entry_with_limits(
     {
         return Err(CompileError::Unsupported);
     }
+    if chunk.optimizing_candidate && ops.len() > 256 {
+        let regions = regions
+            .as_ref()
+            .filter(|regions| large_regions::certificate(chunk, &cfg, Some(regions)))
+            .ok_or(CompileError::Unsupported)?;
+        let saved = large_regions::opportunity_tests(
+            chunk,
+            &cfg,
+            regions,
+            specialization.as_ref(),
+            structural_admission.as_ref(),
+        )
+        .ok_or(CompileError::Unsupported)?;
+        let work = large_regions::work(chunk, &cfg, &stack_plan, &frame, regions)
+            .ok_or(CompileError::Unsupported)?;
+        if let Some(record) = &diagnostic {
+            record.set_large_policy(
+                saved,
+                [
+                    work.native_expansion,
+                    work.original_labels,
+                    work.original_frame,
+                    work.cold_recovery,
+                    work.call_imports,
+                ],
+            );
+        }
+    }
     if chunk.optimizing_candidate
+        && ops.len() <= 256
         && regions.as_ref().is_some_and(|plan| {
             plan.minimum_saved_tests(
                 chunk,
@@ -2284,7 +2364,11 @@ fn prepare_entry_with_limits(
     {
         let mut b = FunctionBuilder::new(&mut context.func, &mut builder_context);
         let entry = b.create_block();
-        let pcs: Vec<_> = (0..=ops.len()).map(|_| b.create_block()).collect();
+        let pcs: Vec<_> = native_pcs
+            .labels()
+            .iter()
+            .map(|&present| present.then(|| b.create_block()))
+            .collect();
         let unwind = b.create_block();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I64);
@@ -2498,7 +2582,8 @@ fn prepare_entry_with_limits(
                 lower.b.switch_to_block(next);
             }
             lower.validate_loop_fields(entry_pc);
-            lower.b.ins().jump(lower.pcs[entry_pc], &[]);
+            let entry = lower.pc_block(entry_pc);
+            lower.b.ins().jump(entry, &[]);
             lower.b.switch_to_block(miss);
             lower.b.set_cold_block(miss);
             // No bytecode, getter, coercion or owner transfer has happened. Preserve the
@@ -2512,7 +2597,8 @@ fn prepare_entry_with_limits(
             }
         } else {
             lower.validate_loop_fields(entry_pc);
-            lower.b.ins().jump(lower.pcs[entry_pc], &[]);
+            let entry = lower.pc_block(entry_pc);
+            lower.b.ins().jump(entry, &[]);
         }
         let mut poll = vec![false; ops.len()];
         for (pc, op) in ops.iter().enumerate() {
@@ -2528,7 +2614,12 @@ fn prepare_entry_with_limits(
             {
                 return Err(CompileError::LoweringBudget);
             }
-            lower.b.switch_to_block(lower.pcs[pc]);
+            let Some(block) = lower.pcs[pc] else {
+                // No normal branch or dynamic completion enters this certified
+                // interior. Its cut leader resumes the original VM before effects.
+                continue;
+            };
+            lower.b.switch_to_block(block);
             if !stack_plan.reachable[pc]
                 || object_plan.as_ref().is_some_and(|plan| !plan.reachable[pc])
             {
@@ -2551,9 +2642,8 @@ fn prepare_entry_with_limits(
                     lower.deopt_before(pc, error);
                 }
                 Some(observed_regions::Emission::OmittedInterior) => {
-                    // No normal branch or dynamic completion can enter an interior:
-                    // the unchanged CFG made every such target a block leader.
-                    // Retain a valid label without lowering an unselected operation.
+                    // Only the test ablation retains these legacy unreachable
+                    // labels. Production does not allocate or emit this block.
                     lower.b.ins().jump(error, &[]);
                 }
                 _ if deopt_at == Some(pc) => {
@@ -2568,7 +2658,8 @@ fn prepare_entry_with_limits(
                 }
             }
         }
-        lower.b.switch_to_block(lower.pcs[ops.len()]);
+        let end = lower.pc_block(ops.len());
+        lower.b.switch_to_block(end);
         if stack_plan.reachable[ops.len()] {
             lower.pc = ops.len();
             lower.stack_state = stack_plan.at[ops.len()];
@@ -2621,7 +2712,8 @@ fn prepare_entry_with_limits(
             // Completion helpers returned the exact sp. Load only the proven suffix,
             // independent of whether the restored prefix is shorter than its CFG depth.
             lower.reload_stack_at(stack_plan.at[pc], integers::Point::Before);
-            lower.b.ins().jump(lower.pcs[pc], &[]);
+            let destination = lower.pc_block(pc);
+            lower.b.ins().jump(destination, &[]);
         }
         for (block, success) in [(ok, 1), (error, 0)] {
             lower.b.switch_to_block(block);

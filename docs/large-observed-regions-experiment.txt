@@ -1,0 +1,65 @@
+Large observed native regions: opt-in admission experiment
+
+TRUST_JS_OPT_JIT_LARGE_REGIONS=1 additionally requires TRUST_JS_OPT_JIT=hot,
+TRUST_JS_OPT_JIT_COVERAGE=1 and TRUST_JS_OPT_JIT_OBSERVED_REGIONS=1. It does not
+change the established <=256-bytecode policy when disabled. It admits only
+ordinary original bodies257..4096 operations with an exact frozen positive
+entry and at least one original-StackPlan-reachable unseen block-entry cut.
+Unknown and missing feedback authorize no omission. Full original CFG/stack/
+frame/value/range analyses, all handler/completion targets, slots and globally
+unsupported suspension/disposal/fragment scans remain authoritative. No OSR
+or active-frame transfer is added. Ordinary cuts use existing before-effect
+same-invocation VM recovery; specialization misses and eight-miss retirement
+remain separate. A first checkpoint snapshot may require frequent VM exits
+on paths activated later; union bits provide no path frequency.
+
+Independent-root generic own-data proofs start empty at every original block,
+retain every observer/rebind within the chosen native block, and never import
+facts over CFG edges. Original blocks are bounded4097; aggregate4096 events,
+64 facts/block and262144 work remain the existing heap solver budgets. Quota
+or proof failure declines the candidate; it never removes an unproven guard.
+
+Large benefit is deliberately named observed_native_opportunity_heuristic,
+not minimum saved tests. It sums guarded numeric and structural opportunities
+on original normal-edge native reachability from entry, stops at every VM cut,
+and gives handler roots no independent opportunity credit. Mutually exclusive
+branches may overcount per invocation; Entered is a conservative fusion union,
+not frequency or proof of completed normal execution. Every numeric entry and
+field guard is debited, even an omitted numeric field site. Large Object-result
+guard planning remains outside the existing256-operation Object proof bound.
+
+Policy work includes40 units per selected reachable native opcode, native name
+resolution allowance, all original-PC labels, full-source frame matrices and
+slots, every cut's exact dirty-slice/known-owning-suffix publication, handler
+dispatch and potential imported calls. Request work respects LOCAL_EFFECTS;
+prepared work can differ because its settled integer-scalar FramePlan differs.
+These are estimates, not actual IR. Diagnostic records expose prepared work.
+The estimate conservatively charges every original-PC label even when certified
+cold-block interiors need no physical native label. Their entry cuts and every
+semantic branch, exception, completion and VM recovery destination remain intact.
+Actual IR remains bounded16384 and65536 blocks before publication, including
+post-sealing growth. Background workers still own only Send compiler state;
+main-thread permits/frame/code leases/weak dependency pins are unchanged.
+
+The initial repayment coefficient32 and minimum4096 observed baseline entries
+are provisional opt-in engineering policy. The older1024 coefficient had a
+measured40IR/op/~5.9us codegen/IR rationale; reducing it is not evidence that
+compilation repays. Uninstrumented release compile costs, exact native/cut
+execution evidence and paired application timings must determine retention or
+revision. No default/promotion or performance advantage is claimed here.
+
+First real target is exact pinned React19.2.7 direct render-direct.cjs, sixcases
+times128, whose source-pinned baseline artifact is runtime-coverage-diagnostic-
+v1/actual-react-fixed768-source-sizing-v2.json SHA256
+9ea643274079e1b3f26d454c5a440e13f089f2c43a1bde57c910ba6ab6e3ae68.
+It recorded retryNode713 original ops/134 conservatively retained, performWork
+709/194 and distinct flattened733/210, renderElement1764/321, pushStartInstance
+3234/1035. All actor Unknown counts0 and all768 exact HTML outputs passed.
+Those sizes are coverage ranges, not native eligibility/IR or this policy's
+publication evidence. Actual same-graph compiler probes and normal-policy real
+application execution are required after source/semantic validation.
+
+Specification reference: local ECMA-262 commit e28783d5fc9dc12b3de905961e2c71410b38a202,
+spec.html Execution Contexts, GetValue/PutValue, CatchClauseEvaluation and
+TryStatement Evaluation. Compilation/admission heuristics cannot alter these
+language completion/ownership/environment contracts.

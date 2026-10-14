@@ -1,0 +1,603 @@
+{
+  "schema_version": 1,
+  "kind": "compiler-correctness-and-ir-validation",
+  "status": "Reviewed correctness and real-framework entry checkpoint; experimental and off by default; no performance acceptance",
+  "candidate": {
+    "base_commit": "d539f41df8393d262c6f418c0f4300fd19867f83",
+    "tree": "/tmp/trust-js-large-sparse-composed-20261014",
+    "source_files": 808,
+    "source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/source-before.json",
+      "sha256": "41fd4bd69f3334ebbdd2d9c9d1f7a6a3a2d64d661d5ccafbf38fb07fa10303b8"
+    },
+    "source_patch": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/source.patch",
+      "sha256": "97cedfef1925e51690a8a29840d52720195682c63efb7232e24ff0d050cdb24b"
+    },
+    "composition": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/composition.json",
+      "sha256": "ecfb95d257163f5937cc85e3b9ace8984f27b7649ec3fbebd1f253542c8058c9"
+    },
+    "test_elf": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+      "sha256": "5f2b9222704611d542fbd6e023519e4d6cfb4cb29018e80ac3401a0c36dbff1d"
+    },
+    "selectors": 2467
+  },
+  "source_roles": {
+    "sparse_v2_production": {
+      "base": "exact frozen large-observed-regions-v3",
+      "source_files": 804,
+      "owned_patch": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-v1/owned-source-v2.patch",
+        "sha256": "6c008d58184be2fc54728d64dd185bacb45942b39372403b8d120fb7172b72c2"
+      },
+      "manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-v1/manifest-final.json",
+        "sha256": "e9cbd816a447639be08bbfbb10d8d355240029013364606044e77323757225fe"
+      },
+      "changes": "Optional physical PC labels with preflight of original semantic/native/handler/abrupt/end targets; omit only certified cold interiors. No opcode/frame/stack/cleanup/recovery changes."
+    },
+    "root_composed_candidate": {
+      "base": "main d539f41d plus exact large-v3 and sparse-v2; final-v5 numeric/Object guard integration retained",
+      "inventory_verified_read_only": 808,
+      "all_shared_production_sources_match_sparse_v2": true,
+      "shared_file_differences": [
+        "AGENTS.md",
+        "crates/trust-js/src/bytecode_execution_coverage_tests.rs",
+        "crates/trust-js/src/jit_optimizing_observed_region_tests.rs",
+        "docs/large-observed-regions-experiment.txt"
+      ],
+      "extra_files": [
+        "benchmarks/review-cfg-stack-validation-2026-10-14.json",
+        "benchmarks/review-observed-regions-validation-2026-10-14.json",
+        "benchmarks/review-runtime-react-ssr-zombie-2026-10-14.json",
+        "crates/trust-js/src/jit_optimizing_observed_region_guard_tests.rs"
+      ],
+      "documentation": "React package version19.2.7; corrected frozen large-v3 provenance and experimental controls."
+    },
+    "diagnostic_probe_successor": {
+      "source_files": 805,
+      "manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-react-v1/manifest-final.json",
+        "sha256": "3273fcb762d09d1878b79061549e61c067019996e702efa21f195a136e096902"
+      },
+      "production_core": "same sparse-v2 production; only ignored runtime-external source-pinned probe and cfg(test) scalar observations added",
+      "actual_graph": "Four primary complete opcode/frame/semantic-leader/function-byte matches to certified fixed768 render-direct.cjs masks, remapped to fresh local identities. Flattened733 omitted.",
+      "candidate": false,
+      "ic_state": "cold, no sampled Number/property facts",
+      "application_executions": 0
+    }
+  },
+  "checks": [
+    {
+      "label": "root-composed-sparse",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::native_pcs::tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/sparse.log",
+        "sha256": "5bc17ee3a1707f2c45f85b85bb9a04c9ade7eca7e168ba236ccf97e9e07b3826"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    },
+    {
+      "label": "root-composed-large",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::large_region_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/large.log",
+        "sha256": "f5253ce5758a50f554d369acf8fecfe6804600098b01f23aaf7de856a0d1529f"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    },
+    {
+      "label": "root-composed-regions",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::observed_region_tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/regions.log",
+        "sha256": "6e03429505cf67aac1c2c0f7c71b7999190eeed6e26cff378db766ef22ff023d"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    },
+    {
+      "label": "root-composed-read-guards",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::read_guards::tests::",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/read-guards.log",
+        "sha256": "3adf2b35114ea44553fadd0c712f775d80b19eeba9c984d27f9f6b8c8408142a"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    },
+    {
+      "label": "root-composed-loop-owner",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::loop_facts_tests::loop_scalars_publish_breaks_and_reject_overlapping_writable_field_aliases",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/loop-owner.log",
+        "sha256": "df04f12aac61eb89504cf7cc630119bbfd90437a98e27215a02ec264d19ae838"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    },
+    {
+      "label": "root-composed-loop-alias",
+      "command": [
+        "taskset",
+        "-c",
+        "4-5",
+        "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/trust-js-tests",
+        "jit::optimizing::loop_facts_tests::loop_fields_publish_before_unmodeled_name_this_capture_and_element_reads",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "cpus": [
+        4,
+        5
+      ],
+      "raw_log": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/loop-alias.log",
+        "sha256": "d094b4abe81771df6afff611126f4a6287d39feb4979d81aa8b26d5ebf452c13"
+      },
+      "scope": "exact808-source ARM64 optimizing+embed test ELF; source-role and controls in focused-results.json"
+    }
+  ],
+  "isolated_checks": {
+    "passed": 28,
+    "failed": 0,
+    "node_completions": 4,
+    "new_native_entries": 10,
+    "strict_all_target_clippy": "passed optimizing-jit+embed -Dwarnings",
+    "evidence": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-v1/production-validation-final.json",
+      "sha256": "faefe1bc34a23770661bbda62a73d49eef350ee9ba2a333eaea0a8bb295d2912"
+    },
+    "independent_source_review": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-v1/review-independent-source-v2.json",
+      "sha256": "072f0785414ebde8dbc08c2be0c4ab1fd38af1be1b325db627bdcbf53c2ad64b"
+    },
+    "root_fresh_sparse3": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-v1/root-independent-tests.json",
+      "sha256": "145cba5b3d92f1dfa84099601e12852482ab3f16d0fdd2698a90900cc89e609d"
+    }
+  },
+  "root_composed_clippy": {
+    "command": [
+      "taskset",
+      "-c",
+      "4-5",
+      "cargo",
+      "clippy",
+      "--locked",
+      "--offline",
+      "-p",
+      "trust-js",
+      "--all-targets",
+      "--features",
+      "embed,optimizing-jit",
+      "-j2",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "result": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/clippy-result.json",
+      "sha256": "469d50345c80e50c17ca023d06845383e4816d72c3eafb10dc701d91b3420b08"
+    },
+    "raw_log": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/clippy.log",
+      "sha256": "67350c7c6f7950bce0d5ebf6bf81dbf8eddc29bd57bbcdf0f0ec35d6c3d1be86"
+    }
+  },
+  "actual_react_ir": {
+    "limits": {
+      "instructions": 16384,
+      "blocks": 65536
+    },
+    "same_original_full_analyses": true,
+    "shared_reads_enabled_pairs": [
+      {
+        "name": "retryNode",
+        "dense_ir": 6333,
+        "sparse_ir": 5377,
+        "dense_blocks": 1434,
+        "sparse_blocks": 956,
+        "native_bytes_dense": 21328,
+        "native_bytes_sparse": 21328,
+        "dense_cap_pc": 713,
+        "sparse_cap_pc": 713
+      },
+      {
+        "name": "performWork",
+        "dense_ir": 8233,
+        "sparse_ir": 7427,
+        "dense_blocks": 1744,
+        "sparse_blocks": 1341,
+        "native_bytes_dense": 32968,
+        "native_bytes_sparse": 32968,
+        "dense_cap_pc": 709,
+        "sparse_cap_pc": 709
+      },
+      {
+        "name": "renderElement",
+        "dense_ir": 16185,
+        "sparse_ir": 13883,
+        "dense_blocks": 3599,
+        "sparse_blocks": 2448,
+        "native_bytes_dense": 62776,
+        "native_bytes_sparse": 62776,
+        "dense_cap_pc": 1764,
+        "sparse_cap_pc": 1764
+      },
+      {
+        "name": "pushStartInstance",
+        "dense_ir": null,
+        "sparse_ir": null,
+        "dense_blocks": null,
+        "sparse_blocks": null,
+        "native_bytes_dense": null,
+        "native_bytes_sparse": null,
+        "dense_cap_pc": 952,
+        "sparse_cap_pc": 968
+      }
+    ],
+    "guards_disabled_performWork": {
+      "dense_final_ir": 16743,
+      "dense_outcome": "LoweringBudget",
+      "sparse_final_ir": 15937,
+      "sparse_native_bytes": 76724,
+      "sparse_outcome": "compiled"
+    },
+    "four_exact_probe_tests_passed": 4,
+    "body_attempts": 16,
+    "native_compilations": 9,
+    "evidence": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-react-v1/results-final.json",
+      "sha256": "dff44adc374e70ea98f4cc7f44c1dacfe62081dbd304e5402bc5ef3cea00dc64"
+    },
+    "root_independent_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-native-pcs-react-v1/root-independent-audit.json",
+      "sha256": "2f2e2e20316422d1bc4e8b70f1a00798bdedb7958d1ef2991fd2acac9a96e5da"
+    },
+    "parser_correction": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/sparse-pc-review-v1/probe-parser-addendum-v1.json",
+      "sha256": "fd94efb266afc3f1616eb971fcb2a2ddf93549c7c3cfd53c4fb96f70f452c7b3"
+    },
+    "interpretation": "Sparse physical labels remove frontend/SSA scaffolding, not JavaScript work. Completed shared-read-enabled bodies keep exactly the same native bytes. pushStartInstance still exceeds16K. Diagnostic debug elapsed times are not compilation-performance acceptance."
+  },
+  "performance_acceptance": false,
+  "limits_and_history": [
+    "Existing hard caps and hot thresholds are unchanged; sparse keeps the conservative ops+6 early block-cost overestimate.",
+    "Large observed admission is explicitly experimental/off by default and is separately gated by its frozen semantic benefit/work certificate.",
+    "The exact React probe tests emission only; no optimized entry, whole-function native completion, application throughput or repayment claim.",
+    "Native x64 Linux/MSVC runtime results are not inferred from ARM64/source agreement.",
+    "Initial isolated test-only E0277 compile failure is retained; production changed only in the reviewed sparse patch.",
+    "Historical cold-label parser counts corrected in separate addendum without overwriting the original manifest.",
+    "ARM focused40 and x64 focused110 per platform cover the composed source; earlier full-suite evidence belongs to earlier revisions.",
+    "Default-off browser screen and instrumented optimized React entry are different evidence scopes; no compile-cost repayment or enabled-tier performance claim.",
+    "The exact SSR emission probe is not the React DOM browser function. React SSR19.2.7 and pinned browser React DOM17.0.2 are separate workloads."
+  ],
+  "recorded_utc": "2026-10-14T20:02:49.777376+00:00",
+  "native_x64": {
+    "report": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-native-validation-v1/report.json",
+      "bytes": 8580,
+      "sha256": "f4a39a42acf7a07af4feafefe921d59a749834b180df671bbabc6f8772e015ef"
+    },
+    "root_independent_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-native-validation-v1/root-independent-audit.json",
+      "bytes": 293815,
+      "sha256": "a69d9976c81b15241867e7864f6fb775c6a8a42246c0c2b8be8ec57f20b176ad"
+    },
+    "source_files": 808,
+    "linux": {
+      "exact_passes": 110,
+      "failures": 0,
+      "ignored": 0,
+      "timeouts": 0,
+      "zero_matches": 0,
+      "listed": 2312
+    },
+    "msvc_under_wine": {
+      "exact_passes": 110,
+      "failures": 0,
+      "ignored": 0,
+      "timeouts": 0,
+      "zero_matches": 0,
+      "listed": 2308
+    },
+    "scope": "Fresh debug native ELF and MSVC PE executed on Zombie x86-64; Wine is not physical Windows. Focused tests, not full conformance or throughput."
+  },
+  "browser": {
+    "machine": "Crystal native ARM64; browser/controller CPUs5/4, one style thread",
+    "browser_revision": "4ea9b42bf48b29f0298576df527c28bdd5b962d9",
+    "speedometer_revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+    "speedometer_version": "3.1",
+    "fixture_scope": "TodoMVC React Complex DOM, Angular Complex DOM, Vue, jQuery; one iteration per fresh process, three actions per suite. Partial suite only.",
+    "build": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-build-result.json",
+      "bytes": 4815,
+      "sha256": "5a51ccd0c13f9f1594e47485da7eee41c5593aaa84ce3d537feab4b980539c5d"
+    },
+    "root_build_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-root-build-audit.json",
+      "bytes": 617,
+      "sha256": "7de23387686f5da55fb06a80e57f24ca871305a0dfe4323e8798eaf32c37709b"
+    },
+    "functional": {
+      "root_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-functional-root-recheck.json",
+        "bytes": 16309,
+        "sha256": "d0cf8a514c5284bbafe23a3bf3d6d71ff46bb01d023a28abaf8766a948c22775"
+      },
+      "variants": [
+        "baseline v3a/off",
+        "candidate/off",
+        "candidate/normal hot with coverage, observed regions, large regions and shared reads enabled"
+      ],
+      "all_twelve_DOM_states_equal": true,
+      "runtime_errors": 0,
+      "remaining_processes": 0,
+      "termination": "Official actions complete, then the bounded 60-second page session expires with browser exit code3; controllers return0. This is recorded explicitly, not a normal browser exit0 claim."
+    },
+    "diagnostic_entry": {
+      "root_review": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-react-Code1-root-review.json",
+        "bytes": 1250,
+        "sha256": "8b7e4e08199308cc391e7cd57dfc7403138e02a6220552f6d77f0f11aed55d55"
+      },
+      "source_join": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-react-Code1-source-join.json",
+        "bytes": 29368,
+        "sha256": "a61ac5b3c74fde03e27ec8455dc9e8c1c065836799415b23c8674d2bc8a264f5"
+      },
+      "framework": "React DOM17.0.2 in the pinned Speedometer bundle",
+      "served_function": "Ki",
+      "mapped_original_function": "ck",
+      "source_start": 111904,
+      "source_bytes": 4560,
+      "original_bytecodes": 1471,
+      "native_entries": 18848,
+      "native_control_flow_normal_completions": 18848,
+      "vm_recoveries": 0,
+      "specialization_bailouts": 0,
+      "retirement_requests": 0,
+      "native_bytes": 50392,
+      "scope": "Execution-instrumented diagnostic only. Native control-flow completion may include checked helper/author calls. Final code-drop event is not a specialization retirement."
+    },
+    "default_off_regression_screen": {
+      "root_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/large-sparse-composed-v1/browser-default-screen-root-audit.json",
+        "bytes": 24442,
+        "sha256": "3c0d750526490b358b3b81f685080665ddbf5b2e6bab7ca7df2bdb91373ca662"
+      },
+      "report": {
+        "path": "/big/Code/TRust/target/browser-engine-review-20261014/large-sparse-v1-runs/default-off-regression-screen-v2/report.json",
+        "bytes": 411397,
+        "sha256": "20b67dcfb730f295e795391b5c718b744ba1b0706255dd45ab7e553ae9c95bed"
+      },
+      "phase0_processes": 3,
+      "alternating_pairs": 3,
+      "valid_processes": 9,
+      "guard_events": 0,
+      "controls": "OPT_JIT=0 on both artifacts; four experimental controls absent/effective0; timing instrumentation disabled. Completed timing processes terminated three seconds after official completion.",
+      "comparisons": {
+        "Score": {
+          "baseline": [
+            0.4683017318796116,
+            0.4695819550458125,
+            0.46729602070093273
+          ],
+          "candidate": [
+            0.46806039656584913,
+            0.4681193473268957,
+            0.46731189091868774
+          ],
+          "loss_direction_ratios": [
+            1.0005156072069612,
+            1.003124433389196,
+            0.9999660393453207
+          ],
+          "paired_median_loss_percent": 0.051560720696119944
+        },
+        "Geomean": {
+          "baseline": [
+            2135.3754042000305,
+            2129.5537216766343,
+            2139.9711439871116
+          ],
+          "candidate": [
+            2136.476419148004,
+            2136.2073704287277,
+            2139.898469166067
+          ],
+          "loss_direction_ratios": [
+            1.0005156072069612,
+            1.0031244333891962,
+            0.9999660393453207
+          ],
+          "paired_median_loss_percent": 0.051560720696119944
+        },
+        "TodoMVC-React-Complex-DOM": {
+          "baseline": [
+            2050.80029296875,
+            2042.700439453125,
+            2047.300048828125
+          ],
+          "candidate": [
+            2043.099853515625,
+            2033.300048828125,
+            2035.600830078125
+          ],
+          "loss_direction_ratios": [
+            0.996245153914047,
+            0.9953980571779205,
+            0.9942855377956462
+          ],
+          "paired_median_loss_percent": -0.46019428220794856
+        },
+        "TodoMVC-Angular-Complex-DOM": {
+          "baseline": [
+            2311.500244140625,
+            2309.400390625,
+            2325.600341796875
+          ],
+          "candidate": [
+            2318.60009765625,
+            2320.700439453125,
+            2325.599853515625
+          ],
+          "loss_direction_ratios": [
+            1.0030715348326795,
+            1.0048930661283324,
+            0.999999790040773
+          ],
+          "paired_median_loss_percent": 0.30715348326795233
+        },
+        "TodoMVC-Vue": {
+          "baseline": [
+            774.999755859375,
+            772,
+            774.900146484375
+          ],
+          "candidate": [
+            772.2001953125,
+            774.000244140625,
+            775.699951171875
+          ],
+          "loss_direction_ratios": [
+            0.9963876626725248,
+            1.0025909898194625,
+            1.0010321390325303
+          ],
+          "paired_median_loss_percent": 0.10321390325302993
+        },
+        "TodoMVC-jQuery": {
+          "baseline": [
+            5659.5,
+            5647.2001953125,
+            5684.199951171875
+          ],
+          "candidate": [
+            5695.699462890625,
+            5701.800048828125,
+            5710.19970703125
+          ],
+          "loss_direction_ratios": [
+            1.0063962298596387,
+            1.0096684820136084,
+            1.004574039633144
+          ],
+          "paired_median_loss_percent": 0.6396229859638725
+        }
+      },
+      "scope": "Small descriptive regression screen; not optimization performance acceptance or a full Speedometer score."
+    },
+    "excluded_timing_cohorts": [
+      {
+        "report": {
+          "path": "/big/Code/TRust/target/browser-engine-review-20261014/large-sparse-v1-runs/default-off-regression-screen/report.json",
+          "bytes": 50773,
+          "sha256": "5878e73437ab6e43507a1ab03d09caf9b61bf522211a0144b9d6bef20d19b101"
+        },
+        "reason": "Cargo guard during baseline-only Phase0; no paired candidate; excluded in full."
+      },
+      {
+        "report": {
+          "path": "/big/Code/TRust/target/browser-engine-review-20261014/large-sparse-v1-runs/full-experiment-cost-screen-v2/report.json",
+          "bytes": 223053,
+          "sha256": "fd3a3c90d1298ff834d2423a5464f29f30bd707315b40b29c709ffdca4d72607"
+        },
+        "reason": "Cargo guard during first candidate process; interrupted entire cohort excluded. Worker origin not established."
+      }
+    ],
+    "next_measurement": "Matched native x86-64 browser artifacts are being built on exclusive Zombie. No new x86 browser timing or optimization gain is asserted here."
+  },
+  "publication": {
+    "base_commit": "d539f41df8393d262c6f418c0f4300fd19867f83",
+    "code_source_contract": "Exactly the12-file frozen large-sparse source patch; all808 original source inventory entries must match the staged tree. This additional evidence ledger is not part of the compiled candidate.",
+    "commit_identity": "The Git commit containing this ledger records the publication identity; no self-referential hash embedded."
+  }
+}

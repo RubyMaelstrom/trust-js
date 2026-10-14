@@ -143,11 +143,12 @@ impl Plan {
         if chunk.optimizing_candidate {
             return None;
         }
-        Self::build_selected(chunk, cfg, frame, stack, None)
+        Self::build_selected(chunk, cfg, frame, stack, None, None)
     }
 
     /// Compilation consumes exactly admission's frozen scalar selection, after
     /// the caller has constructed its canonical optimizer candidate.
+    #[cfg(test)]
     pub(super) fn build_hot(
         chunk: &Chunk,
         cfg: &Cfg,
@@ -165,12 +166,24 @@ impl Plan {
     /// the same selection that compilation later uses. Validate the entire set
     /// before graph allocation: dropping a stale site or choosing a newer way
     /// would disconnect emitted guards from admission's factual removed work.
+    #[cfg(test)]
     pub(super) fn build_hot_selection(
         chunk: &Chunk,
         cfg: &Cfg,
         frame: &frame::FramePlan,
         stack: &stack::StackPlan,
         selected: &[(u32, IcState)],
+    ) -> Option<Self> {
+        Self::build_hot_selection_with_regions(chunk, cfg, frame, stack, selected, None)
+    }
+
+    pub(super) fn build_hot_selection_with_regions(
+        chunk: &Chunk,
+        cfg: &Cfg,
+        frame: &frame::FramePlan,
+        stack: &stack::StackPlan,
+        selected: &[(u32, IcState)],
+        regions: Option<&super::observed_regions::Plan>,
     ) -> Option<Self> {
         if !requested() || selected.is_empty() || selected.len() > 32 {
             return None;
@@ -189,7 +202,7 @@ impl Plan {
             }
             previous = Some(pc);
         }
-        Self::build_selected(chunk, cfg, frame, stack, Some(selected))
+        Self::build_selected(chunk, cfg, frame, stack, Some(selected), regions)
     }
 
     fn build_selected(
@@ -198,11 +211,18 @@ impl Plan {
         frame: &frame::FramePlan,
         stack: &stack::StackPlan,
         selected: Option<&[(u32, IcState)]>,
+        regions: Option<&super::observed_regions::Plan>,
     ) -> Option<Self> {
         // The compiler's borrowed Script completion home distinguishes Script
         // entries from ordinary function frames that resume_before can finish.
+        let large = super::large_regions::certificate(chunk, cfg, regions);
         if !requested()
-            || cfg.blocks().len() > Budget::default().blocks
+            || cfg.blocks().len()
+                > if large {
+                    super::large_regions::MAX_BLOCKS
+                } else {
+                    Budget::default().blocks
+                }
             || chunk.jit_ops().len() > Budget::default().events
             || !crate::bytecode::native_deopt::supported(chunk)
             || chunk
@@ -232,6 +252,11 @@ impl Plan {
         for (block_index, block) in cfg.blocks().iter().enumerate() {
             let mut events = Vec::new();
             for pc in block.start..block.end {
+                if regions.is_some_and(|plan| {
+                    plan.emission(pc) != super::observed_regions::Emission::Native
+                }) {
+                    continue;
+                }
                 if poll[pc] {
                     push_event(
                         &mut events,
@@ -304,7 +329,17 @@ impl Plan {
         if sites.is_empty() {
             return None;
         }
-        let solved = heap_proofs::analyze(&graph, Budget::default())?;
+        let solved = if large {
+            heap_proofs::analyze_independent(
+                &graph,
+                Budget {
+                    blocks: super::large_regions::MAX_BLOCKS,
+                    ..Budget::default()
+                },
+            )?
+        } else {
+            heap_proofs::analyze(&graph, Budget::default())?
+        };
         let mut result = vec![None; ops.len()];
         for (pc, block, first, state, write) in sites {
             result[pc] = Some(Site {

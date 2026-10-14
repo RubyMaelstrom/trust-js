@@ -188,6 +188,8 @@ pub(super) struct Code {
     region_source_version: Cell<u64>,
     region_native_ops: Cell<usize>,
     region_cut_blocks: Cell<usize>,
+    large_opportunity_tests: Cell<u32>,
+    large_work: Cell<[u64; 5]>,
     sites: RefCell<Vec<Site>>,
     omitted_pcs: RefCell<Vec<usize>>,
     omitted_sites: Cell<usize>,
@@ -245,6 +247,8 @@ impl Code {
                 region_source_version: Cell::new(0),
                 region_native_ops: Cell::new(chunk.jit_ops().len()),
                 region_cut_blocks: Cell::new(0),
+                large_opportunity_tests: Cell::new(0),
+                large_work: Cell::new([0; 5]),
                 sites: RefCell::new(Vec::new()),
                 omitted_pcs: RefCell::new(Vec::new()),
                 omitted_sites: Cell::new(0),
@@ -389,6 +393,11 @@ impl Code {
         &self.counters[index]
     }
 
+    pub(super) fn set_large_policy(&self, opportunities: u32, work: [u64; 5]) {
+        self.large_opportunity_tests.set(opportunities);
+        self.large_work.set(work);
+    }
+
     pub(super) fn json(&self) -> String {
         use std::fmt::Write;
         let mut result = format!(
@@ -404,6 +413,11 @@ impl Code {
                 result.push(',');
             }
             let _ = write!(result, "\"{label}\":{}", self.counters[index].get());
+        }
+        result.push('}');
+        if self.large_opportunity_tests.get() != 0 {
+            let [native, original_labels, frame, recovery, imports] = self.large_work.get();
+            let _ = write!(result, ",\"large_region_policy\":{{\"kind\":\"observed_native_opportunity_heuristic\",\"opportunity_tests\":{},\"work\":{{\"native_expansion\":{native},\"original_labels\":{original_labels},\"original_frame\":{frame},\"cold_recovery\":{recovery},\"call_imports\":{imports}}},\"provisional_work_coefficient\":32,\"minimum_calls\":4096,\"frequency_or_minimum_claim\":false}}", self.large_opportunity_tests.get());
         }
         let mode = if self.execution_counters {
             "execution"
@@ -430,7 +444,7 @@ impl Code {
             .join(",");
         let sites = self.sites.borrow();
         let rows = sites.iter().enumerate().map(|(index, site)| format!("{{\"pc\":{},\"position_token\":{},\"source_byte_offset\":{},\"op\":{},\"key\":{},\"key_truncated\":{},\"kind\":{},\"native_fast_successes\":{},\"saturated\":{}}}", site.pc, site.position, if site.position == crate::stack_trace::NO_POSITION || crate::stack_trace::is_inline_position(site.position) {"null".into()} else {site.position.to_string()}, quote(&site.op), quote(&site.key), site.key_truncated, quote(site.kind), self.counters[SITE_BASE+index].get(), self.counters[SITE_BASE+index].get()==u64::MAX)).collect::<Vec<_>>().join(",");
-        let _ = write!(result, "}},\"runtime_counters\":{},\"counter_mode\":{},\"tracked_counter_labels\":[{}],\"saturated_counter_labels\":[{}],\"source_start\":{},\"source_bytes\":{},\"slots\":[{}],\"slot_label_limit_chars\":32,\"slot_label_count_limit\":4,\"slot_labels_truncated\":{:?},\"key_label_limit_chars\":64,\"entry_kind\":{},\"execution_scope\":\"physical optimizing-native entries; normal exits include terminal VM completions; native-control-flow normal completions = normal_exits - terminal_vm_normal_completions, except saturated counters; checked helpers and author calls may execute within native control flow\",\"execution_counters_saturate\":{},\"sites\":[{}],\"site_selection\":\"first eight emitted committed data-read/existing-property-overwrite fast-success PCs; creation, loop-scalar field operations, element accesses and other operation families excluded; no estimate for omitted sites\",\"site_limit\":{},\"omitted_site_count\":{},\"omitted_pcs\":{:?},\"omitted_pc_list_truncated\":{}}}", self.runtime_counters || self.execution_counters, quote(mode), tracked, saturated, self.source_origin.0, self.source_origin.1, self.slots.iter().map(|slot|quote(slot)).collect::<Vec<_>>().join(","), self.slot_truncated, quote(if self.continuation.get() {"loop_continuation"} else {"whole_function"}), self.execution_counters, rows, MAX_SITES, self.omitted_sites.get(), self.omitted_pcs.borrow(), self.omitted_sites.get()>self.omitted_pcs.borrow().len());
+        let _ = write!(result, ",\"runtime_counters\":{},\"counter_mode\":{},\"tracked_counter_labels\":[{}],\"saturated_counter_labels\":[{}],\"source_start\":{},\"source_bytes\":{},\"slots\":[{}],\"slot_label_limit_chars\":32,\"slot_label_count_limit\":4,\"slot_labels_truncated\":{:?},\"key_label_limit_chars\":64,\"entry_kind\":{},\"execution_scope\":\"physical optimizing-native entries; normal exits include terminal VM completions; native-control-flow normal completions = normal_exits - terminal_vm_normal_completions, except saturated counters; checked helpers and author calls may execute within native control flow\",\"execution_counters_saturate\":{},\"sites\":[{}],\"site_selection\":\"first eight emitted committed data-read/existing-property-overwrite fast-success PCs; creation, loop-scalar field operations, element accesses and other operation families excluded; no estimate for omitted sites\",\"site_limit\":{},\"omitted_site_count\":{},\"omitted_pcs\":{:?},\"omitted_pc_list_truncated\":{}}}", self.runtime_counters || self.execution_counters, quote(mode), tracked, saturated, self.source_origin.0, self.source_origin.1, self.slots.iter().map(|slot|quote(slot)).collect::<Vec<_>>().join(","), self.slot_truncated, quote(if self.continuation.get() {"loop_continuation"} else {"whole_function"}), self.execution_counters, rows, MAX_SITES, self.omitted_sites.get(), self.omitted_pcs.borrow(), self.omitted_sites.get()>self.omitted_pcs.borrow().len());
         result
     }
 

@@ -286,9 +286,20 @@ objects. The control is off by default and its implementation compiles out witho
 only for reachable blocks unobserved in the collection window. Such a path resumes the
 same invocation in the VM before its first operation. Entered and Unknown blocks retain
 native lowering; all original frame, CFG, handler and unsupported-operation checks remain.
-These ordinary VM exits do not count as specialization misses. This experiment retains
-the 256-operation hot admission limit and is off by default; see
+Certified cold-block interiors have no native labels; their original block-entry cuts,
+exception destinations and complete VM frame still remain. Forced-deopt and loop-continuation
+compilation retain every required original PC. Ordinary VM exits do not count as
+specialization misses. This experiment retains the 256-operation hot admission limit
+unless the separate large-region policy below is enabled, and is off by default; see
 `docs/observed-regions-experiment.txt` for recovery and cost-accounting contracts.
+`TRUST_JS_OPT_JIT_LARGE_REGIONS=1` separately admits observed parts of ordinary bodies
+with 257 through 4096 bytecodes in normal hot mode. It requires coverage and observed
+regions, a frozen entered entry and a reachable cold cut; unknown or missing feedback
+does not authorize omission. Full original semantic analyses and existing compiler limits
+remain in force. Its native-opportunity estimate is a branch-union heuristic, not a
+minimum or measured execution frequency. The work coefficient and admission distance
+are provisional; actual application entry, compilation cost and repayment still require
+validation. It is off by default; see `docs/large-observed-regions-experiment.txt`.
 `TRUST_JS_OPT_JIT_SHARED_READ_GUARDS=1` separately shares pure scalar name/property
 validation leaves to reduce generated IR. Success returns a borrowed word with explicit
 status; the caller performs checked ownership transfer and preserves last-owner fallbacks.

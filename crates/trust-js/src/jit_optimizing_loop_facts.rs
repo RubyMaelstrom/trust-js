@@ -519,7 +519,7 @@ impl Lowering<'_, '_> {
         let Some(plan) = self.loop_facts.filter(|plan| plan.contains(self.pc)) else {
             return target;
         };
-        let Some(pc) = self.pcs.iter().position(|&block| block == target) else {
+        let Some(pc) = self.pcs.iter().position(|&block| block == Some(target)) else {
             return target;
         };
         if plan.contains(pc) {
