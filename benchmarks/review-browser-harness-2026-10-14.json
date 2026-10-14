@@ -687,7 +687,7 @@
   },
   "quiet_window": "V1N7/Chromiumfinished, allownedbrowserprocesses0; buildwindowreleased forv2validation. V2browserbuildpreparation isseparate.",
   "performance_acceptance": false,
-  "updated_utc": "2026-10-14T12:17:02.358443+00:00",
+  "updated_utc": "2026-10-14T13:25:28.965607+00:00",
   "final_default_n7": {
     "analysis": {
       "path": "/big/Code/TRust/target/browser-engine-review-20261014/todomvc-v1-default-n7-analysis.json",
@@ -1832,12 +1832,208 @@
     "expired_unretained_records": 285,
     "coverage": "Existing sampling-prologue physical entry progress only; logical inline/VM calls/other seams excluded, stopped prefixes lower bounds, null unavailable. No newly emitted native probes.",
     "limits": "Final weak snapshot loses expired application chunks; absence of Qu fingerprint cannot recover its eligibility/count/decline. Aggregate zero requests/publications independently shows no optimizer publication in this pilot. One React-only iteration with TRACE/PERF forcedGC/postidle timer; no performance or application repayment claim.",
-    "next_source": "New bounded cold-drop ended-record diagnostic source is being tested/reviewed separately; no further browser build launched."
+    "next_source": "A new bounded cold-drop diagnostic source/browser and same normal-hot React pilot have now passed independent review; see admission_telemetry_diagnostic_v2. Frozen v1 source/artifact/pilot remain unchanged and its expired-row limitation remains historical evidence."
   },
   "post_checkpoint_root_audit": {
     "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/current-followups-root/audit.json",
     "sha256": "7e4467eee5246828d689a806ea63e9ecc41035d46168e5c1ec80008eee221f10",
     "scope": "Independently verified all57 clock records, raw normal-hot admission populations/histograms, zero optimizer requests/publications, referenced source/artifact/report hashes. No new browser timing; excluded cohorts unchanged.",
     "performance_acceptance": false
+  },
+  "admission_telemetry_diagnostic_v2": {
+    "status": "independently_audited_normal_hot_react_live_and_ended_diagnostic_only",
+    "timing_eligible": false,
+    "performance_acceptance": false,
+    "analysis": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/admission-telemetry-react-normalhot-v2-analysis.json",
+      "sha256": "f3b2065fa27d6269f33d8d7ae048aa83a5be8358828007b3180417113154202e"
+    },
+    "analysis_script": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/harness/analyze-admission-ended-normalhot-pilot.py",
+      "sha256": "2ea5a1f507b959f0717208c7272029215dedaf336fa70eff0409e3e29395e852"
+    },
+    "browser_manifest": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/admission-telemetry-browser-manifest-v2.json",
+      "sha256": "956a110e3a6153be4732c089f2361e114755fc09c59ae867a35ddbeb5c036c61"
+    },
+    "engine_source_manifest": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/admission-telemetry-v2/manifest.json",
+      "sha256": "b3bd4c0c3fd608867887fb30897d457f624f63d21636b97a927b65628879d216"
+    },
+    "root_audit": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261014/validation/react-admission-v2-root.json",
+      "sha256": "643da46f95ce544d8abb8f060b34c0df3b3bf49a4862546914fdabe124d49864"
+    },
+    "root_audit_scope": {
+      "verified_source_artifact_and_evidence_hashes": 2122,
+      "raw_log_reparsed": true,
+      "all285_source_spans_fnv_recomputed": true,
+      "snapshot_population_dedup_storage_recomputed": true,
+      "same_trust_runtime_controls_as_v1": true
+    },
+    "frozen_browser": {
+      "path": "/big/Code/TRust/target/browser-engine-review-20261014/admission-telemetry-v2/trust-headless",
+      "sha256": "c280d9f3a5db07c871b8bb6bbc319c29753eb849ba42a3da153e9478f3bdb83c",
+      "bytes": 96193496
+    },
+    "source_and_build_scope": "Exact frozen compiler-v2 foundation plus independently tested admission-v1/v2 scalar observations and bounded cold Chunk-drop records; no engine source promotion, execution probes, background worker, generic admission or threshold changes. Only isolated browser Cargo.toml absolute dependency path changed. All759engine/1337browser source hashes remained unchanged through the matched ordinary release build.",
+    "resolved_engine_features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "selected_workload": {
+      "suite": "TodoMVC-React-Complex-DOM",
+      "fixture_revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+      "iterations_per_fresh_process": 1,
+      "finished_official_steps": 3,
+      "scope": "Selected headless JS/DOM/layout/event-loop cold-to-warm pass; not full Speedometer score, desktop presentation or isolated engine CPU."
+    },
+    "protocol": {
+      "cpu": 5,
+      "controller_cpu": 4,
+      "normal_hot_threshold": true,
+      "hot_at_override": "absent",
+      "native_diagnostics": "compile-only; no newly emitted native/helper/execution counters",
+      "functional_state_observer": false,
+      "post_report_timer_ms": 11000,
+      "sampler_interval_seconds": 10,
+      "sampler_forced_gc": true,
+      "normal_bounded_headless_timeout_seconds": 25,
+      "runtime_trace_and_gc_logging": true,
+      "v1_trust_runtime_controls_and_collector_match": true
+    },
+    "correctness_observation": {
+      "official_completion_valid": true,
+      "normal_headless_timeout_exit": 3,
+      "zero_errors": true,
+      "panicked": false,
+      "modules_skipped": 0,
+      "owned_processes_remaining": 0,
+      "functional_observer": false
+    },
+    "population": {
+      "snapshots": 2,
+      "bootstrap_live_records": 64,
+      "bootstrap_ended_records": 0,
+      "post_workload_and_idle_live_records": 610,
+      "post_workload_and_idle_ended_records": 285,
+      "unique_deduplicated_ids": 895,
+      "early_only_ids_absent_from_final": 0,
+      "deduplication": "One last row per registry id within this current-thread process; immutable ended row supersedes earlier live observations. No cumulative-sample, address, name or source-span summation."
+    },
+    "ended_source_coverage": {
+      "exact_react_bundle_span_and_fnv_matches": 285,
+      "fixture_bundle": {
+        "path": "/big/Code/trust-js/benchmark-results/performance-implementation-20260926-bEP6pk/speedometer-official/resources/todomvc/architecture-examples/react-complex/dist/app.bundle.js",
+        "sha256": "80c43f227da4583ffe8ebf73dfb29ae9dd9fa4a3717749b11ae18d5e89b5cb32"
+      },
+      "all_matching_rows_lifetime": "ended",
+      "final_reason_counts": {
+        "awaiting_first_sample": 13,
+        "collecting_four_samples": 109,
+        "more_than_256_ops": 19,
+        "no_guardable_facts": 56,
+        "no_net_benefit": 2,
+        "no_sampling_source": 59,
+        "waiting_repayment": 27
+      },
+      "counter_scope": "Physical eligible Chunk entries reaching the existing template sampling prologue; excludes interrupted prefixes, logical inlined calls, VM calls, never-compiled functions and other compile seams. Stopped prefixes remain lower bounds, null unavailable."
+    },
+    "optimizer": {
+      "hot_requests": 0,
+      "hot_published": 0,
+      "hot_declines": 0,
+      "compile_attempts": 0,
+      "compile_successes": 0,
+      "compile_declines": 0,
+      "compile_seconds": 0.0,
+      "generated_code_bytes": 0
+    },
+    "qu_exact_source": {
+      "utf8_start": 107479,
+      "utf8_end_exclusive": 108041,
+      "source_bytes": 562,
+      "source_fingerprint_fnv1a64": "dba666f00a3f1e8f",
+      "formal_arity": 2,
+      "formal_names": [
+        "e",
+        "t"
+      ],
+      "enclosing_context": "Pinned bundle module448 has a use-strict directive at UTF-8 byte1616; Qu inherits this strict context. An extracted standalone sloppy function is a different compilation fixture, so its74-op count must not be substituted for actual registered browser metadata or the historical91-op inventory."
+    },
+    "qu_registered_versions": [
+      {
+        "id": 426,
+        "lifetime": "ended",
+        "ops": 74,
+        "prepared": false,
+        "inline_guard_sites": 0,
+        "reason": "collecting_four_samples",
+        "sample_checkpoints": 1,
+        "sampling_entries": 100,
+        "entry_quality": "exact_existing_countdown_progress",
+        "saved_tests": null,
+        "repayment_target": null,
+        "slot_labels_omitted": 0
+      },
+      {
+        "id": 527,
+        "lifetime": "ended",
+        "ops": 91,
+        "prepared": false,
+        "inline_guard_sites": 1,
+        "reason": "no_guardable_facts",
+        "sample_checkpoints": 4,
+        "sampling_entries": 256,
+        "entry_quality": "stopped_prefix_lower_bound",
+        "saved_tests": null,
+        "repayment_target": null,
+        "slot_labels_omitted": 4
+      }
+    ],
+    "qu_interpretation": "Two exact source-matched ended chunks: cold74ops/0InlineGuard retains100 exact prologue entries and1sample, still collecting four; 91ops/1InlineGuard records4samples then no_guardable_facts and only a256-entry stopped prefix. Later entries are uncounted, and these rows are not summed as logical Qu calls. The decline occurs in guarded-fact selection before an optimizer compile request; it is not an IR-budget/codegen failure or a profitability proof. Sampled numeric field masks alone do not identify which required feedback-site/ordinary-own-cache proof condition excluded each property; no individual cache-selection details or phase timestamps were retained. Ops/prepared/inline metadata describes registration, not executed native operations.",
+    "omissions_and_drop_counts": {
+      "expired_without_final_snapshot": 0,
+      "expired_records": 0,
+      "ended_records_total": 285,
+      "ended_overflow_records": 0,
+      "oversized_final_records": 0,
+      "overflow_registrations": 0,
+      "identity_exhaustion_registrations": 0,
+      "unregistered_events": 0,
+      "unregistered_chunk_drops": 3,
+      "process_reentrant_drop_skips": 0,
+      "process_tls_drop_skips": 0
+    },
+    "label_and_sample_omissions": {
+      "rows_with_truncated_labels": 0,
+      "slot_labels_omitted_total": 1884,
+      "sample_properties_omitted_total": 0
+    },
+    "retained_diagnostic_storage": {
+      "reported_bytes": {
+        "retained_ended_row_bytes": 233881,
+        "ended_row_bytes_high_water": 233881,
+        "retained_ended_storage_bytes": 246169,
+        "ended_storage_bytes_high_water": 246169
+      },
+      "independent_payload_crosscheck": {
+        "compact_row_utf8_bytes": 230971,
+        "rust_sample_class_debug_separator_bytes": 2910,
+        "reconstructed_retained_payload_bytes": 233881,
+        "reported_payload_matches": true,
+        "reported_vec_slot_bytes": 12288
+      },
+      "scope": "Actual retained Rust final-row payloads and allocated Vec slots; excludes allocator metadata, live registry labels/Weak headers, temporary serialization and JS managed memory. Not memory acceptance."
+    },
+    "limitations": [
+      "One instrumented React-only process with TRACE/GC logging, forced sampler collections, final-record allocations and post-idle timer; possible overlapping system/build activity is not controlled acceptance timing. No speedup, other-framework/full-suite/steady-state/repayment or browser-versus-Node/Ladybird engine ratio claim.",
+      "The last sampler checkpoint is not terminal process teardown; later cold-drop rows or TLS/reentrant omissions may not be reported. Three unregistered Chunk drops are retained; zero reported overflow/expired rows does not prove universal engine or process-lifetime coverage.",
+      "Slot-label omissions total1884; no truncated name/referrer rows or omitted sampled properties in the observed snapshot. Numeric observations are bounded samples, not immutable heap facts.",
+      "Aggregate zero optimizer requests/publications establishes no optimizer publication in this pilot, while sampling-prefix counts do not establish logical call counts, CPU shares or optimized native-entry coverage.",
+      "V1 diagnostic/source/artifact/pilot and all default performance cohorts remain unchanged; application performance acceptance remains pending."
+    ]
   }
 }
