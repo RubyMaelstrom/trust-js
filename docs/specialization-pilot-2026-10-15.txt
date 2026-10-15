@@ -306,3 +306,46 @@ accessor/writable checks (x64 global TESTs likewise not droppable); a
 shape census (transitions.len()) must be exposed before the gate-(b)
 baseline can be measured. Estimated diff ~550 production + ~350 test
 lines in the checklist order recorded with this session's audit.
+
+Pilot C result (implemented 2026-10-15, commits 25c34e40, 91b51030, cdfa0562)
+----------------------------------------------------------------------------
+Steps 2-4 (25c34e40): PropClass + Property::class(); transitions keyed
+(parent, key, class) through the memo, recent cache, prefix walk and
+array_length_shape; class-changing Props::insert replacements demote.
+Census growth vs the step-1 baselines: Vue 1370 -> 1436 transitions
+(+4.8%), Djot 1548 -> 1552, React 1009 -> 1013 (gate (b) at 1.5x passes
+with wide margin).
+Steps 5-6 (91b51030): every production value-only write migrated to
+set_value/set_value_at/take_value/merge_accessor/freeze_descriptors;
+acquiring &mut Property demotes and Props::get_mut is now test-only with
+no production callers (the slot escape was deleted). preventExtensions
+(ordinary + both module-namespace sites) demotes. Shape-copy sites are
+class-sound: try_copy's shape share requires an all-writable source,
+plain/lazy templates debug-assert the same, and the arguments probe
+splits so the strict poison accessor and the data callee record different
+child shapes. Three existing tests were updated to the new contract
+(copy shape divergence, getter clearing through the insert funnel,
+template value patching through set_value).
+Step 7 first slices (cdfa0562): ic_shape_probe drops its live accessor
+compare outside key-checked states, and baked property-load probes skip
+guard_prop_data on a guard-free landing. All other guards remain.
+
+Correctness: full lib suite 2062 passed at each increment, embed shape
+suite green, clippy -Dwarnings clean; focused Test262 100% on 4,666 tests
+(Object 1628, Number/Boolean/String/Proxy 1925, Function/Reflect/language
+1113, run no-LTO); tier difftest seed 7: 138 agree, 12 budget-skipped,
+no divergence. Paired fat-LTO (11 pairs, CPU 5): steps 2-6 vs Pilots A+B
+cost Vue +0.91% internal (Djot/React ~0); step 7 vs steps 5-6 is neutral
+(Vue +0.36% internal). Cumulative Pilots A+B+C vs 2f9447e1, clean
+rerun after one system-load-contaminated pass: Vue internal -3.50%,
+React +0.00%, Djot +2.72% (inside the 3% component rule but close to it;
+the Djot cost accrued roughly +1.6 from Pilot B and ~+1 from the Pilot C
+substrate). VERDICT: the class proof infrastructure is complete and
+sound, but the only consumers relying on it so far save nothing
+measurable — as the design predicted, Pilot C is an enabling step whose
+payoff requires the follow-on region load-elimination/guard-reuse work
+(gate (c)), which should be scheduled next or the substrate cost stands
+unrepaid. Remaining known hole, as designed: seal/freeze attribute passes
+through define_own_property_ordinary demote per overwritten key via the
+insert funnel (correct, fresh-id burn on those cold paths accepted;
+Object.freeze itself uses the single-demote freeze_descriptors).
