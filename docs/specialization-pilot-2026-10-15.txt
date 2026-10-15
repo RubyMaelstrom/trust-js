@@ -285,7 +285,12 @@ Shape-census baselines for Pilot C gate (b), now in PERF_METRICS as
 shape_transitions (active heap memoized edges at exit): Vue 1370,
 Djot 1548, React 1009.
 
-Pilot C status: audit completed; no code. Three blockers refine the
+Pilot C status: audit completed; checklist step 1 (shape census,
+c6d8f412, baselines above) and step 8 (replace_properties preserves
+proto_flag, 491a5ffa) are landed. Next increment is steps 2-4 together
+(PropClass + Property::class(), transition key (parent, key, class)
+including the prefix walk, and the insert existing-key demote), which
+must land atomically to keep the shape invariant true. Three blockers refine the
 design above: (1) arguments_named_shapes (interpreter.rs:13374) inserts
 `callee` as data in its probe but strict arguments install an accessor
 callee reusing that shape -- the probe must split under class encoding;
