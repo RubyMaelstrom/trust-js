@@ -96,10 +96,10 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
         if tier == Tier::Jit {
             let driver = chunk(&mut engine, "mapDrive");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&method) as usize)
+                .cached_call_for(Gc::as_ptr(&method) as usize)
                 .expect("private self-hosted method fills the native call cache");
             assert_eq!(entry.native, 0);
-            assert_eq!(entry.realm, Rc::as_ptr(&engine.interp.global) as usize);
+            assert_eq!(entry.realm, Gc::as_ptr(&engine.interp.global) as usize);
             assert_eq!(
                 entry.global_env,
                 Rc::as_ptr(&engine.interp.global_env) as usize
@@ -152,7 +152,7 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     let driver = chunk(&mut engine, "realmDrive");
     let old_environment = engine.interp.global_env.clone();
     let previous = driver
-        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("initial same-Realm cache fill");
     assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);
     engine.interp.switch_host_job_context(102);
@@ -168,14 +168,14 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
         "8"
     );
     let current = driver
-        .cached_call_for(Rc::as_ptr(&leaf) as usize)
+        .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("creation Realm remains cacheable with a replaced global environment");
     assert_ne!(current.global_env, previous.global_env);
     assert_eq!(
         current.global_env,
         Rc::as_ptr(&engine.interp.global_env) as usize
     );
-    assert_eq!(current.realm, Rc::as_ptr(&engine.interp.global) as usize);
+    assert_eq!(current.realm, Gc::as_ptr(&engine.interp.global) as usize);
     assert_eq!(
         eval(
             &mut engine,
@@ -205,7 +205,7 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
         let target = object(&mut engine, name);
         assert!(
             driver
-                .cached_call_for(Rc::as_ptr(&target) as usize)
+                .cached_call_for(Gc::as_ptr(&target) as usize)
                 .is_none(),
             "{name} retains checked generic dispatch"
         );
@@ -248,11 +248,11 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
         );
         let victim = object(&mut engine, "victim");
         let token = object(&mut engine, "token");
-        let victim_weak = Rc::downgrade(&victim);
-        let token_weak = Rc::downgrade(&token);
+        let victim_weak = Gc::downgrade(&victim);
+        let token_weak = Gc::downgrade(&token);
         let driver = chunk(&mut engine, "checkedDrive");
         let entry = driver
-            .cached_call_for(Rc::as_ptr(&victim) as usize)
+            .cached_call_for(Gc::as_ptr(&victim) as usize)
             .expect("capturing callee is cached");
         assert_ne!(
             entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
@@ -329,7 +329,7 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
         if tier == Tier::Jit {
             let driver = chunk(&mut engine, "deepDrive");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&deep) as usize)
+                .cached_call_for(Gc::as_ptr(&deep) as usize)
                 .expect("deep same-Realm closure fills the native call cache");
             assert_eq!(
                 entry.env,
@@ -373,14 +373,14 @@ fn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {
     for name in ["leaf", "native"] {
         let target = object(&mut engine, name);
         let entry = driver
-            .cached_call_for(Rc::as_ptr(&target) as usize)
+            .cached_call_for(Gc::as_ptr(&target) as usize)
             .unwrap_or_else(|| panic!("{name} did not fill its call cache with a live proxy"));
         assert_eq!(entry.native != 0, name == "native");
     }
     let maker = chunk(&mut engine, "maker");
     let target = object(&mut engine, "Box");
     assert!(
-        maker.cached_construct_for(Rc::as_ptr(&target) as usize),
+        maker.cached_construct_for(Gc::as_ptr(&target) as usize),
         "ordinary construction remained uncached"
     );
 }
@@ -418,7 +418,7 @@ fn fresh_closure_call_cache_uses_the_live_function_identity() {
             let driver = chunk(&mut engine, "drive");
             let original = object(&mut engine, "original");
             let entry = driver
-                .cached_call_for(Rc::as_ptr(&original) as usize)
+                .cached_call_for(Gc::as_ptr(&original) as usize)
                 .expect("original closure filled the call cache");
             assert_ne!(entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV, 0);
         }

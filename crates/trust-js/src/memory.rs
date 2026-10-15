@@ -2602,7 +2602,7 @@ mod tests {
             props,
             Exotic::None,
         ));
-        let weak_source = Rc::downgrade(source.as_obj().unwrap());
+        let weak_source = Gc::downgrade(source.as_obj().unwrap());
         let _keys = engine
             .interp
             .for_in_keys(&source)
@@ -3529,7 +3529,7 @@ mod tests {
         let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let before = measure(&engine.interp, &before_objects, &before_scopes);
         let object = engine.interp.global.clone();
-        let identity = Rc::as_ptr(&object) as usize;
+        let identity = Gc::as_ptr(&object) as usize;
 
         engine.interp.gc_pins.insert(identity, object.clone());
         engine.interp.proxies.insert(

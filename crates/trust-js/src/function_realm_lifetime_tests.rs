@@ -10,7 +10,7 @@ use std::rc::Rc;
 fn prototype_identity(value: &Value) -> usize {
     let object = value.as_obj().expect("fixture object");
     let object = object.borrow();
-    Rc::as_ptr(object.proto.as_ref().expect("intrinsic prototype")) as usize
+    crate::value::Gc::as_ptr(object.proto.as_ref().expect("intrinsic prototype")) as usize
 }
 
 fn thrown(result: Result<Value, Abrupt>) -> Value {
@@ -28,8 +28,8 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
         engine.set_tier_threshold(0);
         let realm = engine.interp.create_realm();
         let global = realm.as_obj().expect("Realm global");
-        let realm_key = Rc::as_ptr(global) as usize;
-        let weak_global = Rc::downgrade(global);
+        let realm_key = crate::value::Gc::as_ptr(global) as usize;
+        let weak_global = crate::value::Gc::downgrade(global);
         let (closure, constructor, old_environment, array_proto, object_proto, error_proto) =
             in_realm(&mut engine.interp, &realm, |i| {
                 i.switch_host_job_context(41);
@@ -56,7 +56,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                     let record = old.borrow();
                     let binding = record.vars.get("this").expect("global this binding");
                     assert!(!binding.mutable && !binding.deletable);
-                    assert!(Rc::ptr_eq(
+                    assert!(crate::value::Gc::ptr_eq(
                         binding.value.as_obj().expect("original global"),
                         &i.global
                     ));
@@ -69,22 +69,23 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                 for binding in old.borrow().vars.values() {
                     if let Value::Obj(object) = &binding.value {
                         assert!(
-                            Rc::ptr_eq(object, &i.global)
-                                || Rc::ptr_eq(object, closure.as_obj().unwrap())
-                                || Rc::ptr_eq(object, constructor.as_obj().unwrap())
+                            crate::value::Gc::ptr_eq(object, &i.global)
+                                || crate::value::Gc::ptr_eq(object, closure.as_obj().unwrap())
+                                || crate::value::Gc::ptr_eq(object, constructor.as_obj().unwrap())
                         );
                     }
                 }
-                let array_proto = Rc::downgrade(&i.array_proto);
-                let object_proto = Rc::downgrade(&i.object_proto);
-                let error_proto = Rc::downgrade(i.error_protos.get("TypeError").unwrap());
+                let array_proto = crate::value::Gc::downgrade(&i.array_proto);
+                let object_proto = crate::value::Gc::downgrade(&i.object_proto);
+                let error_proto =
+                    crate::value::Gc::downgrade(i.error_protos.get("TypeError").unwrap());
                 i.switch_host_job_context(42);
                 assert!(!Rc::ptr_eq(&old, &i.global_env));
                 {
                     let record = i.global_env.borrow();
                     let binding = record.vars.get("this").expect("replacement this binding");
                     assert!(!binding.mutable && !binding.deletable);
-                    assert!(Rc::ptr_eq(
+                    assert!(crate::value::Gc::ptr_eq(
                         binding.value.as_obj().expect("same Realm global"),
                         &i.global
                     ));

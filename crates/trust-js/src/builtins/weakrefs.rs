@@ -34,7 +34,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         }
         i.gc_weak_metadata_safepoint(false);
         let obj = new_from_ctor(i, "WeakRef")?;
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         i.kept_alive.push(target.clone());
         let target = crate::interpreter::WeakTarget::of(&target)
@@ -138,7 +138,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
             return Err(i.make_error("TypeError", "cleanup callback must be callable"));
         }
         let obj = new_from_ctor(i, "FinalizationRegistry")?;
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
         let cleanup_callback = i.make_job_callback(arg(a, 0));
         i.finalization_registries.insert(

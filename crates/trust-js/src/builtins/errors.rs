@@ -83,7 +83,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             ));
         }
         // Setting on %Error.prototype% itself throws (it emulates a non-writable home property).
-        if Rc::ptr_eq(&o, &i.error_protos["Error"]) {
+        if Gc::ptr_eq(&o, &i.error_protos["Error"]) {
             return Err(i.make_error("TypeError", "cannot set stack on %Error.prototype%"));
         }
         // [[GetOwnProperty]]("stack") (proxy-aware): does the receiver already have its own stack?
@@ -313,7 +313,7 @@ pub(super) fn install_errors(it: &mut Interp) {
 fn constructor_skip(i: &Interp) -> Skip {
     match &i.new_target {
         Value::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
-            Skip::UntilSeen(Rc::as_ptr(target) as usize)
+            Skip::UntilSeen(Gc::as_ptr(target) as usize)
         }
         _ => Skip::None,
     }
@@ -352,19 +352,19 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     };
     let skip = match arg(args, 1) {
         Value::Obj(function) if arg(args, 1).is_callable() => {
-            Skip::UntilSeen(Rc::as_ptr(&function) as usize)
+            Skip::UntilSeen(Gc::as_ptr(&function) as usize)
         }
         _ => Skip::None,
     };
     let trace = std::cell::RefCell::new(i.capture_stack_trace(skip));
     // The getter answers only for the object it was installed on, which it must not keep alive.
-    let holder = Rc::downgrade(&target);
+    let holder = Gc::downgrade(&target);
     let getter = i.make_native_closure(
         "",
         0,
         Rc::new(move |i: &mut Interp, this: Value, _: &[Value]| {
             let installed = matches!(&this, Value::Obj(object)
-                if std::ptr::eq(Rc::as_ptr(object), holder.as_ptr()));
+                if std::ptr::eq(Gc::as_ptr(object), holder.as_ptr()));
             let lines = match trace.borrow_mut().as_deref_mut() {
                 Some(trace) if installed => trace.lines(),
                 _ => return Ok(Value::Undefined),

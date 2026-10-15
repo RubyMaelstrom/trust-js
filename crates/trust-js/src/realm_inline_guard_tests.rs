@@ -12,7 +12,6 @@ use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 use crate::Engine;
-use std::rc::Rc;
 
 pub(crate) const TIERS: [Tier; 3] = [Tier::Interp, Tier::Bytecode, Tier::Jit];
 
@@ -21,7 +20,7 @@ pub(crate) fn in_realm<R>(it: &mut Interp, realm: &Value, f: impl FnOnce(&mut In
     let Value::Obj(global) = realm else {
         panic!("a Realm is named by its global object");
     };
-    let key = Rc::as_ptr(global) as usize;
+    let key = crate::value::Gc::as_ptr(global) as usize;
     let target = it
         .realms
         .get(&key)

@@ -8,14 +8,14 @@ fn host_arrays_move_owners_and_preserve_descriptors_at_storage_boundaries() {
     let engine = Engine::new();
     for len in [0, 1, 10, 11, 32, 33] {
         let owner = engine.interp.new_object();
-        let weak = Rc::downgrade(&owner);
+        let weak = Gc::downgrade(&owner);
         let array = engine
             .interp
             .make_array((0..len).map(|_| Value::Obj(owner.clone())).collect());
-        assert_eq!(Rc::strong_count(&owner), len + 1);
+        assert_eq!(Gc::strong_count(&owner), len + 1);
         {
             let array = array.as_obj().unwrap().borrow();
-            assert!(Rc::ptr_eq(
+            assert!(Gc::ptr_eq(
                 array.proto.as_ref().unwrap(),
                 &engine.interp.array_proto
             ));
@@ -26,7 +26,7 @@ fn host_arrays_move_owners_and_preserve_descriptors_at_storage_boundaries() {
             for index in 0..len {
                 let property = array.props.get_index(index as u32).unwrap();
                 assert!(property.writable() && property.enumerable() && property.configurable());
-                assert!(Rc::ptr_eq(property.value().as_obj().unwrap(), &owner));
+                assert!(Gc::ptr_eq(property.value().as_obj().unwrap(), &owner));
             }
             if (1..=32).contains(&len) {
                 assert!(

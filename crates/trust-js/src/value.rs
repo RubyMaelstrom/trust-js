@@ -547,13 +547,13 @@ mod packed_value_tests {
             let empty = matches!(value, Value::Empty);
             let packed = PackedValue::pack(value);
             let bits = packed.bits();
-            let owners = Rc::strong_count(&object);
+            let owners = Gc::strong_count(&object);
             for _ in 0..20 {
                 assert!(packed.number().is_none());
                 assert_eq!(packed.is_empty(), empty);
             }
             assert_eq!(packed.bits(), bits);
-            assert_eq!(Rc::strong_count(&object), owners);
+            assert_eq!(Gc::strong_count(&object), owners);
         }
     }
 
@@ -617,13 +617,13 @@ mod packed_value_tests {
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
-        let before = Rc::strong_count(&obj);
+        let before = Gc::strong_count(&obj);
         let packed = PackedValue::pack(Value::Obj(obj.clone()));
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         let out = packed.into_value();
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         drop(out);
-        assert_eq!(Rc::strong_count(&obj), before);
+        assert_eq!(Gc::strong_count(&obj), before);
     }
 
     #[test]
@@ -657,14 +657,14 @@ mod packed_value_tests {
             PackedValue::pack(Value::Sym(symbol.clone())),
         ];
         let before = [
-            Rc::strong_count(&object),
+            Gc::strong_count(&object),
             string.strong_count(),
             Rc::strong_count(&symbol),
         ];
         let copies = original.clone();
         assert_eq!(
             [
-                Rc::strong_count(&object),
+                Gc::strong_count(&object),
                 string.strong_count(),
                 Rc::strong_count(&symbol)
             ],
@@ -676,7 +676,7 @@ mod packed_value_tests {
         drop(copies);
         assert_eq!(
             [
-                Rc::strong_count(&object),
+                Gc::strong_count(&object),
                 string.strong_count(),
                 Rc::strong_count(&symbol)
             ],
@@ -724,7 +724,7 @@ mod packed_value_tests {
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
-        let before = Rc::strong_count(&obj);
+        let before = Gc::strong_count(&obj);
         let mut frame: [std::mem::MaybeUninit<PackedValue>; 5] =
             std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
         let base = frame.as_mut_ptr().cast::<PackedValue>();
@@ -736,15 +736,15 @@ mod packed_value_tests {
             base.add(3).write(PackedValue::pack(Value::Null));
             base.add(4).write(PackedValue::pack(Value::Num(-0.0)));
         }
-        assert_eq!(Rc::strong_count(&obj), before + 1);
+        assert_eq!(Gc::strong_count(&obj), before + 1);
         unsafe {
             let moved = base.add(1).read();
             base.add(1).write(PackedValue::pack(Value::Undefined));
-            assert_eq!(Rc::strong_count(&obj), before + 1);
+            assert_eq!(Gc::strong_count(&obj), before + 1);
             assert_eq!((*base).bits(), 1.5f64.to_bits());
-            assert!(matches!(moved.unpack(), Value::Obj(o) if Rc::ptr_eq(&o, &obj)));
+            assert!(matches!(moved.unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             PackedValue::replace_raw(base.add(3).cast(), moved.into_value());
-            assert_eq!(Rc::strong_count(&obj), before + 1);
+            assert_eq!(Gc::strong_count(&obj), before + 1);
             assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
             assert!(matches!((*base.add(2)).unpack(), Value::Bool(true)));
             assert!(
@@ -754,7 +754,7 @@ mod packed_value_tests {
                 std::ptr::drop_in_place(base.add(k));
             }
         }
-        assert_eq!(Rc::strong_count(&obj), before);
+        assert_eq!(Gc::strong_count(&obj), before);
     }
 
     #[test]
@@ -1188,7 +1188,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             (0, 0, 0, false)
         }
     };
-    let as_ptr = Rc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
+    let as_ptr = Gc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
     let stored_word = unsafe { *(sample as *const Gc as *const usize) };
     let gc_data_off = as_ptr.wrapping_sub(stored_word);
     let obj_addr = &*sample.borrow() as *const Object as usize;
@@ -1207,7 +1207,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let rc_strong_off = 0usize; // strong count is the RcBox's first field
                                 // Verify: the strong count sits at `stored + rc_strong_off` and reads the live count.
     let strong_ok =
-        unsafe { *((stored + rc_strong_off) as *const usize) } == Rc::strong_count(sample);
+        unsafe { *((stored + rc_strong_off) as *const usize) } == Gc::strong_count(sample);
 
     // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
     // Capacity 3 / length 1 makes the three words distinguishable.
@@ -1993,7 +1993,7 @@ impl Object {
                 #[cfg(feature = "heap-bridge")]
                 central_ref: Cell::new(Some(central_ref)),
             }));
-            reg.publish(slot, Rc::as_ptr(&obj));
+            reg.publish(slot, Gc::as_ptr(&obj));
             obj
         }
     }
@@ -3261,7 +3261,7 @@ impl Property {
         !self.accessor()
             && self
                 .packed
-                .with_object(|object| std::ptr::eq(Rc::as_ptr(object), expected))
+                .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
                 .unwrap_or(false)
     }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.

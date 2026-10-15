@@ -583,7 +583,7 @@ fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
         if !promise
             .proto
             .as_ref()
-            .is_some_and(|p| Rc::ptr_eq(p, prototype))
+            .is_some_and(|p| Gc::ptr_eq(p, prototype))
             || promise.props.contains("constructor")
         {
             return false;
@@ -594,14 +594,14 @@ fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
         .props
         .get("constructor")
         .is_some_and(|p| {
-            !p.accessor() && matches!(p.value(), Value::Obj(c) if Rc::ptr_eq(&c, ctor))
+            !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, ctor))
         });
     let Some(species) = well_known_key(i, "species") else {
         return false;
     };
     inherits_ctor && ctor.borrow().props.get(&species).is_some_and(|p| {
         p.accessor()
-            && matches!(p.getter(), Some(Value::Obj(getter)) if Rc::ptr_eq(getter, species_getter))
+            && matches!(p.getter(), Some(Value::Obj(getter)) if Gc::ptr_eq(getter, species_getter))
     })
 }
 
@@ -609,7 +609,7 @@ fn promise_species_is_intrinsic(i: &Interp, promise: &Value) -> bool {
 /// capability supplied by `ctor` through that capability's resolve function.
 fn promise_resolve(i: &mut Interp, ctor: &Value, resolution: Value) -> Result<Value, Value> {
     if let Value::Obj(o) = &resolution {
-        if i.promises.contains_key(&(Rc::as_ptr(o) as usize)) {
+        if i.promises.contains_key(&(Gc::as_ptr(o) as usize)) {
             let resolution_ctor = ab(i.get_member_key(&resolution, "constructor"))?;
             if same_value(&resolution_ctor, ctor) {
                 return Ok(resolution);

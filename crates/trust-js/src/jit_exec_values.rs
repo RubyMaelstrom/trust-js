@@ -712,7 +712,7 @@ mod tests {
 
     fn reference_count(value: &Value) -> usize {
         match value {
-            Value::Obj(object) => Rc::strong_count(object),
+            Value::Obj(object) => crate::value::Gc::strong_count(object),
             Value::Str(string) => string.strong_count(),
             Value::Sym(symbol) => Rc::strong_count(symbol),
             _ => panic!("expected a shared reference"),
@@ -750,7 +750,7 @@ mod tests {
             Value::Str(crate::lstr::LStr::from("native owner λ")),
             interp.new_symbol(Some("native owner".into())),
         ] {
-            let object_weak = value.as_obj().map(|object| Rc::downgrade(object));
+            let object_weak = value.as_obj().map(crate::value::Gc::downgrade);
             let symbol_weak = if let Value::Sym(symbol) = &value {
                 Some(Rc::downgrade(symbol))
             } else {
@@ -818,7 +818,7 @@ mod tests {
             "self",
             crate::value::Property::plain(Value::Obj(object.clone())),
         );
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let packed = PackedValue::pack(Value::Obj(object));
         let copied = native_clone(&clone, &packed).expect("object clone");
         assert!(native_drop(&release, packed).is_ok());

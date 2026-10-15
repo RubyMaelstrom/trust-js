@@ -356,7 +356,7 @@ fn owners(engine: &mut Engine, name: &str) -> usize {
     use crate::value::Value;
     let env = engine.interp.global_env.clone();
     match engine.interp.get_var(name, &env).ok().expect("binding") {
-        Value::Obj(object) => std::rc::Rc::strong_count(&object) - 1,
+        Value::Obj(object) => crate::value::Gc::strong_count(&object) - 1,
         Value::Str(text) => text.strong_count() - 1,
         _ => panic!("{name} is not an owner"),
     }

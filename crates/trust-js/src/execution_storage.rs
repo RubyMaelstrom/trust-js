@@ -293,7 +293,7 @@ mod tests {
             panic!("native receiver owner")
         };
         assert_eq!(
-            Rc::strong_count(receiver),
+            crate::value::Gc::strong_count(receiver),
             2,
             "packed receiver plus native value"
         );
@@ -301,12 +301,16 @@ mod tests {
             panic!("native argument owner")
         };
         assert_eq!(
-            Rc::strong_count(key),
+            crate::value::Gc::strong_count(key),
             1,
             "argument moved without a second owner"
         );
         interp.gc_collect();
-        assert_eq!(Rc::strong_count(key), 1, "argument remains a GC root");
+        assert_eq!(
+            crate::value::Gc::strong_count(key),
+            1,
+            "argument remains a GC root"
+        );
         match interp.call(args[0].clone(), Value::Undefined, &[args[1].clone()]) {
             Ok(value) => Ok(value),
             Err(crate::interpreter::Abrupt::Throw(error)) => Err(error),
@@ -351,7 +355,7 @@ mod tests {
             panic!("native argument owner")
         };
         assert_eq!(
-            Rc::strong_count(key),
+            crate::value::Gc::strong_count(key),
             1,
             "argument moved without a second owner"
         );
@@ -372,15 +376,17 @@ mod tests {
         assert_eq!(std::mem::size_of::<PackedValue>(), 8);
         let interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
-        let baseline = Rc::strong_count(&object);
+        let baseline = crate::value::Gc::strong_count(&object);
         let mut stack = ValueStack::<PackedValue>::default();
         stack.push(Value::Obj(object.clone()));
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
         stack.with_tail(0, |args| {
-            assert!(matches!(&args[0], Value::Obj(actual) if Rc::ptr_eq(actual, &object)));
-            assert_eq!(Rc::strong_count(&object), baseline + 2);
+            assert!(
+                matches!(&args[0], Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
+            );
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline + 2);
         });
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
         stack.push(Value::Num(-0.0));
         assert!(
             matches!(stack.pop(), Some(Value::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
@@ -397,13 +403,13 @@ mod tests {
         }
         let moved = stack.split_off(0);
         assert!(stack.is_empty());
-        assert_eq!(Rc::strong_count(&object), baseline + 1);
+        assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
         drop(moved);
-        assert_eq!(Rc::strong_count(&object), baseline);
+        assert_eq!(crate::value::Gc::strong_count(&object), baseline);
 
         let slots = [PackedValue::pack(Value::Obj(object.clone()))];
         slots.write_value(0, Value::Empty);
-        assert_eq!(Rc::strong_count(&object), baseline);
+        assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         assert!(matches!(slots.read_value(0), Value::Empty));
         slots.write_value(0, Value::Undefined);
         assert!(matches!(slots.read_value(0), Value::Undefined));
@@ -412,29 +418,32 @@ mod tests {
     #[test]
     fn compact_storage_decodes_only_argument_owners_with_exact_lifetime() {
         let object = crate::value::Object::new(None);
-        let baseline = Rc::strong_count(&object);
+        let baseline = crate::value::Gc::strong_count(&object);
         for count in 0..=8 {
             let packed: Vec<_> = (0..count)
                 .map(|_| PackedValue::pack(Value::Obj(object.clone())))
                 .collect();
             let decoded = DecodedArgs::new(&packed);
             assert_eq!(decoded.len(), count);
-            assert_eq!(Rc::strong_count(&object), baseline + count * 2);
+            assert_eq!(
+                crate::value::Gc::strong_count(&object),
+                baseline + count * 2
+            );
             assert!(matches!(&decoded, DecodedArgs::Inline { .. }) == (count <= 4));
             assert!(decoded
                 .iter()
-                .all(|value| matches!(value, Value::Obj(actual) if Rc::ptr_eq(actual, &object))));
+                .all(|value| matches!(value, Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))));
             drop(decoded);
-            assert_eq!(Rc::strong_count(&object), baseline + count);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline + count);
             drop(packed);
-            assert_eq!(Rc::strong_count(&object), baseline);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
     }
 
     #[test]
     fn compact_native_arguments_move_without_refcount_churn_and_stay_live_for_the_call() {
         let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let baseline = weak.strong_count();
         for count in [0, 1, 4, 5, 9] {
             let mut packed: Vec<_> = (0..count)
@@ -446,7 +455,7 @@ mod tests {
                     assert_eq!(arguments.len(), count);
                     assert_eq!(weak.strong_count(), baseline + count);
                     assert!(arguments.iter().all(
-                        |value| matches!(value, Value::Obj(actual) if Rc::ptr_eq(actual, &object))
+                        |value| matches!(value, Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
                     ));
                 });
                 // The packed words were moved out; the helper's unsafe contract transfers
@@ -512,10 +521,10 @@ mod tests {
             .expect("callback global")
             .value();
         let receiver = interp.new_object();
-        let receiver_weak = Rc::downgrade(&receiver);
+        let receiver_weak = crate::value::Gc::downgrade(&receiver);
         let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
         let key = interp.new_object();
-        let key_weak = Rc::downgrade(&key);
+        let key_weak = crate::value::Gc::downgrade(&key);
         let mut args = vec![
             PackedValue::pack(callback),
             PackedValue::pack(Value::Obj(key)),
@@ -547,10 +556,10 @@ mod tests {
         );
 
         let key = interp.new_object();
-        let key_weak = Rc::downgrade(&key);
+        let key_weak = crate::value::Gc::downgrade(&key);
         BOUNDARY_KEY_WEAK.with(|weak| *weak.borrow_mut() = Some(key_weak.clone()));
         let receiver = interp.new_object();
-        let receiver_weak = Rc::downgrade(&receiver);
+        let receiver_weak = crate::value::Gc::downgrade(&receiver);
         BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = Some(receiver_weak.clone()));
         let this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Obj(receiver)));
         let mut args = vec![PackedValue::pack(Value::Obj(key))];
@@ -581,7 +590,7 @@ mod tests {
     #[test]
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
         let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let slots = [
             PackedValue::pack(Value::Obj(object)),
             PackedValue::pack(Value::Empty),
@@ -609,9 +618,9 @@ mod tests {
     #[test]
     fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
         let first = crate::value::Object::new(None);
-        let first_weak = Rc::downgrade(&first);
+        let first_weak = crate::value::Gc::downgrade(&first);
         let second = crate::value::Object::new(None);
-        let second_weak = Rc::downgrade(&second);
+        let second_weak = crate::value::Gc::downgrade(&second);
         let slots = [PackedValue::pack(Value::Obj(first))];
         let shared = &slots[..];
         let alias = &shared[0];
@@ -619,9 +628,9 @@ mod tests {
         assert_eq!(first_weak.strong_count(), 0);
         assert_eq!(second_weak.strong_count(), 1);
         let seen = alias.unpack();
-        assert!(Rc::ptr_eq(
+        assert!(crate::value::Gc::ptr_eq(
             seen.as_obj().unwrap(),
-            &second_weak.upgrade().unwrap()
+            &crate::value::Gc::from(second_weak.upgrade().unwrap())
         ));
         assert_eq!(second_weak.strong_count(), 2);
         alias.replace_value(Value::Empty);
@@ -635,7 +644,7 @@ mod tests {
     fn compact_storage_raw_literals_move_packed_owners_without_refcount_churn() {
         let mut interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
-        let baseline = Rc::strong_count(&object);
+        let baseline = crate::value::Gc::strong_count(&object);
         // Exercise inline-packed, heap-packed and large dense array factories.
         for count in [0, 1, 10, 11, 32, 33, 70] {
             let mut operands: Vec<_> = (0..count)
@@ -643,7 +652,7 @@ mod tests {
                 .collect();
             let array = unsafe { interp.make_array_from_raw(operands.as_mut_ptr(), count) };
             unsafe { operands.set_len(0) };
-            assert_eq!(Rc::strong_count(&object), baseline + count);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline + count);
             let Value::Obj(array) = array else {
                 panic!("array factory returned a primitive")
             };
@@ -654,11 +663,11 @@ mod tests {
             for index in 0..count {
                 assert!(
                     matches!(array.borrow().props.get_index(index as u32).unwrap().value(),
-                    Value::Obj(actual) if Rc::ptr_eq(&actual, &object))
+                    Value::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object))
                 );
             }
             drop(array);
-            assert_eq!(Rc::strong_count(&object), baseline);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
         let template = std::cell::OnceCell::new();
         let keys = [Rc::from("held"), Rc::from("negativeZero")];
@@ -670,7 +679,7 @@ mod tests {
             let result = unsafe {
                 interp.make_plain_object_templated_from(&template, &keys, operands.as_mut_ptr(), 2)
             };
-            assert_eq!(Rc::strong_count(&object), baseline + 1);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
             let Value::Obj(result) = result else {
                 panic!("object factory returned a primitive")
             };
@@ -679,7 +688,7 @@ mod tests {
                 Value::Num(number) if number.to_bits() == (-0.0f64).to_bits())
             );
             drop(result);
-            assert_eq!(Rc::strong_count(&object), baseline);
+            assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
     }
 

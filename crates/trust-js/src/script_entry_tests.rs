@@ -263,7 +263,6 @@ fn compiled_script_uses_global_environment_this_value_not_property_object() {
 #[test]
 fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
     use crate::value::{Property, Value};
-    use std::rc::Rc;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -291,7 +290,7 @@ fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
             object.borrow().props.get("n").unwrap().value(),
             Value::Num(42.0)
         ));
-        let weak = Rc::downgrade(object);
+        let weak = crate::value::Gc::downgrade(object);
         drop(result);
         drop(body);
         engine.interp.gc_collect();

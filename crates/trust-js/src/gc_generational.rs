@@ -71,7 +71,7 @@ impl Nursery {
             object_index: objects
                 .iter()
                 .enumerate()
-                .map(|(i, o)| (Rc::as_ptr(o) as usize, i))
+                .map(|(i, o)| (Gc::as_ptr(o) as usize, i))
                 .collect(),
             scope_index: scopes
                 .iter()
@@ -127,7 +127,7 @@ impl Nursery {
         if !side_slots {
             return;
         }
-        if let Some(coroutine) = interp.generators.get(&(Rc::as_ptr(object) as usize)) {
+        if let Some(coroutine) = interp.generators.get(&(Gc::as_ptr(object) as usize)) {
             let (objects, scopes) = scratch;
             coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges { objects, scopes });
             for object in objects.drain(..) {
@@ -177,7 +177,7 @@ struct YoungEdges<'a> {
 impl GcEdgeSink for YoungEdges<'_> {
     #[inline]
     fn object(&mut self, object: &Gc) {
-        if let Some(&index) = self.object_index.get(&(Rc::as_ptr(object) as usize)) {
+        if let Some(&index) = self.object_index.get(&(Gc::as_ptr(object) as usize)) {
             self.object_internal[index] += 1;
             self.edges.push(index as u32);
         }
@@ -223,7 +223,7 @@ impl HostGcVisitor for Nursery {
     }
     fn internal(&mut self, value: &Value) {
         if let Value::Obj(object) = value {
-            if let Some(&index) = self.object_index.get(&(Rc::as_ptr(object) as usize)) {
+            if let Some(&index) = self.object_index.get(&(Gc::as_ptr(object) as usize)) {
                 self.object_internal[index] += 1;
             }
         }
@@ -233,10 +233,10 @@ impl HostGcVisitor for Nursery {
         let (Value::Obj(owner), Value::Obj(value)) = (owner, value) else {
             return;
         };
-        let Some(&target) = self.object_index.get(&(Rc::as_ptr(value) as usize)) else {
+        let Some(&target) = self.object_index.get(&(Gc::as_ptr(value) as usize)) else {
             return;
         };
-        if let Some(&source) = self.object_index.get(&(Rc::as_ptr(owner) as usize)) {
+        if let Some(&source) = self.object_index.get(&(Gc::as_ptr(owner) as usize)) {
             self.host_edges.entry(source).or_default().push(target);
         } else {
             // Every old/foreign owner is live for a minor collection. Its logical edges count
@@ -247,7 +247,7 @@ impl HostGcVisitor for Nursery {
 
     fn root(&mut self, value: &Value) {
         if let Value::Obj(object) = value {
-            if let Some(&index) = self.object_index.get(&(Rc::as_ptr(object) as usize)) {
+            if let Some(&index) = self.object_index.get(&(Gc::as_ptr(object) as usize)) {
                 self.mark(Node::Object(index));
             }
         }
@@ -319,7 +319,7 @@ impl Interp {
             }
         } else {
             for (index, object) in nursery.objects.iter().enumerate() {
-                if self.gc_pins.contains_key(&(Rc::as_ptr(object) as usize)) {
+                if self.gc_pins.contains_key(&(Gc::as_ptr(object) as usize)) {
                     nursery.object_internal[index] += 1;
                 }
             }
@@ -345,7 +345,7 @@ impl Interp {
             }
         }
         for index in 0..object_count {
-            if Rc::strong_count(&nursery.objects[index]) > nursery.object_internal[index] + 1 {
+            if Gc::strong_count(&nursery.objects[index]) > nursery.object_internal[index] + 1 {
                 nursery.mark(Node::Object(index));
             }
         }
@@ -360,7 +360,7 @@ impl Interp {
                     if native_owners[index] {
                         nursery
                             .native
-                            .trace_js(Rc::as_ptr(&nursery.objects[index]) as usize, &mut native_js);
+                            .trace_js(Gc::as_ptr(&nursery.objects[index]) as usize, &mut native_js);
                         for target in native_js.drain(..) {
                             if let Some(&index) = nursery.object_index.get(&target) {
                                 nursery.mark(Node::Object(index));
@@ -384,7 +384,7 @@ impl Interp {
             .iter()
             .enumerate()
             .filter(|(index, _)| !nursery.object_mark[*index])
-            .map(|(_, object)| Rc::as_ptr(object) as usize)
+            .map(|(_, object)| Gc::as_ptr(object) as usize)
             .collect();
         self.gc_sweep_dead_objects(&dead, &nursery.native);
         for (index, object) in nursery.objects.iter().enumerate() {
@@ -475,7 +475,7 @@ mod tests {
                 .borrow_mut()
                 .props
                 .insert("self", Property::builtin(Value::Obj(object.clone())));
-            dead.push(Rc::downgrade(&object));
+            dead.push(Gc::downgrade(&object));
         }
         let (objects, scopes) = crate::value::heap_young_snapshot(&engine.interp.gc_heap);
         assert_eq!(objects.len(), 2000);
@@ -506,8 +506,8 @@ mod tests {
             .borrow_mut()
             .props
             .insert("parent", Property::builtin(Value::Obj(old.clone())));
-        let old_weak = Rc::downgrade(&old);
-        let child_weak = Rc::downgrade(&child);
+        let old_weak = Gc::downgrade(&old);
+        let child_weak = Gc::downgrade(&child);
         drop(child);
         young(&mut engine.interp);
         assert!(child_weak.upgrade().is_some());

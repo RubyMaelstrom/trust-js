@@ -340,7 +340,7 @@ fn inherits_service_proto(i: &Interp, o: &Gc, proto_key: &str) -> bool {
     for _ in 0..64 {
         match cur {
             Some(p) => {
-                if Rc::ptr_eq(&p, &proto) {
+                if Gc::ptr_eq(&p, &proto) {
                     return true;
                 }
                 cur = p.borrow().proto.clone();

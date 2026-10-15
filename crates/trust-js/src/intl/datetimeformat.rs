@@ -7,7 +7,6 @@ use super::service::{
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
-use std::rc::Rc;
 
 /// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's algorithm).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -130,7 +129,7 @@ fn range_dates(i: &mut Interp, o: &Gc, a: &Value, b: &Value) -> Result<(f64, f64
     };
     // Two Temporal endpoints must share a calendar (RangeError otherwise).
     let cal_of = |i: &Interp, v: &Value| -> Option<String> {
-        let ptr = Rc::as_ptr(v.as_obj()?) as usize;
+        let ptr = Gc::as_ptr(v.as_obj()?) as usize;
         if i.temporal.contains_key(&ptr) {
             Some(
                 i.temporal_cal
@@ -190,7 +189,7 @@ fn era_cldr_index(cal: &str, code: &str) -> &'static str {
 fn range_type_tag(i: &Interp, v: &Value) -> u8 {
     use crate::temporal::Temporal as T;
     if let Some(o) = v.as_obj() {
-        if let Some(t) = i.temporal.get(&(Rc::as_ptr(o) as usize)) {
+        if let Some(t) = i.temporal.get(&(Gc::as_ptr(o) as usize)) {
             return match t {
                 T::Date(_) => 1,
                 T::Time(_) => 2,
@@ -768,7 +767,7 @@ fn dtf_ms_kind(i: &mut Interp, o: &Gc, date: &Value) -> Result<(f64, u8), Value>
         return Ok((0.0, 0));
     }
     if let Some(dobj) = date.as_obj() {
-        let ptr = Rc::as_ptr(dobj) as usize;
+        let ptr = Gc::as_ptr(dobj) as usize;
         if let Some(t) = i.temporal.get(&ptr).cloned() {
             // format()/formatRange() do not accept Temporal.ZonedDateTime directly (the caller can't
             // know which time zone to use); Temporal.ZonedDateTime.prototype.toLocaleString handles it.

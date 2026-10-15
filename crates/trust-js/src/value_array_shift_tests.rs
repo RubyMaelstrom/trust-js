@@ -177,21 +177,21 @@ fn dense_shift_storage_moves_reference_owners_without_retain_or_loss() {
             reverse,
             named,
         );
-        assert!(objects.iter().all(|o| Rc::strong_count(o) == 2));
+        assert!(objects.iter().all(|o| Gc::strong_count(o) == 2));
         for removed in 0..len {
             let first = props.shift_dense_array(len - removed).unwrap();
-            assert!(matches!(&first, Value::Obj(o) if Rc::ptr_eq(o, &objects[removed])));
+            assert!(matches!(&first, Value::Obj(o) if Gc::ptr_eq(o, &objects[removed])));
             for (index, object) in objects.iter().enumerate() {
                 assert_eq!(
-                    Rc::strong_count(object),
+                    Gc::strong_count(object),
                     if index < removed { 1 } else { 2 }
                 );
             }
             drop(first);
-            assert_eq!(Rc::strong_count(&objects[removed]), 1);
+            assert_eq!(Gc::strong_count(&objects[removed]), 1);
         }
         drop(props);
-        assert!(objects.iter().all(|o| Rc::strong_count(o) == 1));
+        assert!(objects.iter().all(|o| Gc::strong_count(o) == 1));
     }
 }
 
@@ -352,22 +352,22 @@ fn tiny_prepends_retain_inline_owners_before_promoting_once() {
             properties.elems.packed.is_none(),
             index < INLINE_PACKED_CAPACITY
         );
-        assert_eq!(Rc::strong_count(owner), 2);
+        assert_eq!(Gc::strong_count(owner), 2);
         for n in 0..=index {
             assert!(
                 matches!(properties.get_index(n as u32).unwrap().value(), Value::Obj(value)
-                if Rc::ptr_eq(&value, &owners[index-n]))
+                if Gc::ptr_eq(&value, &owners[index-n]))
             );
         }
     }
     for index in (0..12).rev() {
         let first = properties.shift_dense_array(index + 1).unwrap();
-        assert!(matches!(&first, Value::Obj(value) if Rc::ptr_eq(value, &owners[index])));
+        assert!(matches!(&first, Value::Obj(value) if Gc::ptr_eq(value, &owners[index])));
         drop(first);
-        assert_eq!(Rc::strong_count(&owners[index]), 1);
+        assert_eq!(Gc::strong_count(&owners[index]), 1);
     }
     drop(properties);
-    assert!(owners.iter().all(|owner| Rc::strong_count(owner) == 1));
+    assert!(owners.iter().all(|owner| Gc::strong_count(owner) == 1));
 }
 
 #[test]

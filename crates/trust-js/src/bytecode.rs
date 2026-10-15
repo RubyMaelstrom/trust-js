@@ -1369,8 +1369,8 @@ mod call_overflow_tests {
         let mut cache = CallOverflow::default();
         assert_eq!(cache.retained_bytes(), 0);
         let object = crate::value::Object::new(None);
-        let key = Rc::as_ptr(&object) as usize;
-        let pin = Rc::downgrade(&object);
+        let key = crate::value::Gc::as_ptr(&object) as usize;
+        let pin = crate::value::Gc::downgrade(&object);
         cache.insert(
             CallIc {
                 callee: key,
@@ -1385,7 +1385,7 @@ mod call_overflow_tests {
             bytes,
             CALL_OVERFLOW_SETS * std::mem::size_of::<CallOverflowSet>()
         );
-        assert_eq!(Rc::strong_count(&object), 1);
+        assert_eq!(crate::value::Gc::strong_count(&object), 1);
         assert!(cache.lookup(key, 10, 20).is_some());
         assert!(cache.lookup(key, 11, 20).is_none());
         assert!(cache.lookup(key, 10, 21).is_none());
@@ -1421,7 +1421,7 @@ mod call_overflow_tests {
         for _ in 0..=(CALL_OVERFLOW_SETS * CALL_OVERFLOW_WAYS) {
             let object = crate::value::Object::new(None);
             groups[CallOverflow::set_index(
-                Rc::as_ptr(&object) as usize,
+                crate::value::Gc::as_ptr(&object) as usize,
                 64 - CALL_OVERFLOW_SETS.ilog2(),
             )]
             .push(object);
@@ -1434,24 +1434,28 @@ mod call_overflow_tests {
         for object in group.iter().take(CALL_OVERFLOW_WAYS + 1) {
             cache.insert(
                 CallIc {
-                    callee: Rc::as_ptr(object) as usize,
+                    callee: crate::value::Gc::as_ptr(object) as usize,
                     ..CallIc::EMPTY
                 },
-                Rc::downgrade(object),
+                crate::value::Gc::downgrade(object),
             );
         }
-        assert!(cache.lookup(Rc::as_ptr(&group[0]) as usize, 0, 0).is_none());
+        assert!(cache
+            .lookup(crate::value::Gc::as_ptr(&group[0]) as usize, 0, 0)
+            .is_none());
         for object in group.iter().take(CALL_OVERFLOW_WAYS + 1).skip(1) {
-            assert!(cache.lookup(Rc::as_ptr(object) as usize, 0, 0).is_some());
+            assert!(cache
+                .lookup(crate::value::Gc::as_ptr(object) as usize, 0, 0)
+                .is_some());
         }
         let bytes = cache.retained_bytes();
         for object in groups.iter().flatten() {
             cache.insert(
                 CallIc {
-                    callee: Rc::as_ptr(object) as usize,
+                    callee: crate::value::Gc::as_ptr(object) as usize,
                     ..CallIc::EMPTY
                 },
-                Rc::downgrade(object),
+                crate::value::Gc::downgrade(object),
             );
         }
         assert!(cache.retained_bytes() >= bytes);
@@ -3032,7 +3036,7 @@ impl Chunk {
         self.call_pins
             .borrow_mut()
             .entry(entry.call.callee)
-            .or_insert_with(|| Rc::downgrade(constructor));
+            .or_insert_with(|| crate::value::Gc::downgrade(constructor));
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
@@ -8835,8 +8839,8 @@ impl Compiler {
         let f = &w.f;
         let t = self.inline_targets.len() as u32;
         self.inline_targets.push(InlineTarget {
-            expected: Rc::as_ptr(&w.obj) as usize,
-            pin: Rc::downgrade(&w.obj),
+            expected: crate::value::Gc::as_ptr(&w.obj) as usize,
+            pin: crate::value::Gc::downgrade(&w.obj),
             expected_env: w.expected_env,
             expected_genv: w.expected_genv,
             genv_pin: w.genv_pin.clone(),
@@ -14750,7 +14754,7 @@ pub(crate) fn try_function_osr(
         || function.is_generator
         || (construct
             && i.class_info
-                .get(&(Rc::as_ptr(&callee) as usize))
+                .get(&(crate::value::Gc::as_ptr(&callee) as usize))
                 .is_some_and(|class| class.derived))
         || !function
             .body
@@ -16518,7 +16522,7 @@ fn run_vm_inner<S: StoredValue>(
                 let direct = matches!(
                     (&callee, &i.eval_fn),
                     (Value::Obj(function), Some(intrinsic))
-                        if Rc::ptr_eq(function, intrinsic)
+                        if crate::value::Gc::ptr_eq(function, intrinsic)
                 );
                 let value = if !direct && matches!(op, Op::TailEvalCallArgsArray) {
                     stage_tail_call(i, chunk, op_pc, callee, receiver, args)?;
@@ -16921,7 +16925,7 @@ fn run_vm_inner<S: StoredValue>(
                 let d = it.argc as usize + 1;
                 let callee_ok = matches!(
                     &stack.read_value(stack.len() - d),
-                    Value::Obj(o) if Rc::as_ptr(o) as usize == it.expected
+                    Value::Obj(o) if crate::value::Gc::as_ptr(o) as usize == it.expected
                 );
                 let this_ok = !it.check_this
                     || matches!(stack.read_value(stack.len() - d - 1), Value::Obj(_));
@@ -19812,7 +19816,9 @@ impl Chunk {
         }
         // Global mode: only when there are no intermediate scopes whose later mutation could
         // re-route the name — i.e. the chunk runs directly under the global scope.
-        if !Rc::ptr_eq(env, &i.global_env) || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
+        if !Rc::ptr_eq(env, &i.global_env)
+            || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
+        {
             return self.deep_name_ic_fill(i, env, n, c);
         }
         let g = i.global.borrow();
@@ -20144,14 +20150,14 @@ impl Chunk {
         initializer: &crate::value::Gc,
         apply: usize,
     ) -> Option<Rc<Chunk>> {
-        let initializer_ptr = Rc::as_ptr(initializer) as usize;
+        let initializer_ptr = crate::value::Gc::as_ptr(initializer) as usize;
         self.arguments_forwarder_runtime
             .borrow()
             .as_ref()
             .filter(|runtime| {
                 runtime.initializer == initializer_ptr
                     && runtime.apply == apply
-                    && runtime.pin.as_ptr() == Rc::as_ptr(initializer)
+                    && runtime.pin.as_ptr() == crate::value::Gc::as_ptr(initializer)
             })
             .map(|runtime| runtime.chunk.clone())
     }
@@ -20162,11 +20168,11 @@ impl Chunk {
         apply: usize,
         runtime_chunk: Rc<Chunk>,
     ) {
-        let initializer_ptr = Rc::as_ptr(initializer) as usize;
+        let initializer_ptr = crate::value::Gc::as_ptr(initializer) as usize;
         *self.arguments_forwarder_runtime.borrow_mut() = Some(ForwarderRuntime {
             initializer: initializer_ptr,
             apply,
-            pin: Rc::downgrade(initializer),
+            pin: crate::value::Gc::downgrade(initializer),
             chunk: runtime_chunk,
         });
     }
@@ -21855,10 +21861,10 @@ unsafe fn jit_intrinsic_inner(
                         // execute the named builtin unchanged.
                         let dense = match (&(*base).unpack(), &(*base.add(3)).unpack()) {
                             (Value::Obj(_), Value::Obj(list))
-                                if i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
-                                    && !i
-                                        .mapped_arguments
-                                        .contains_key(&(Rc::as_ptr(list) as usize)) =>
+                                if i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
+                                    && !i.mapped_arguments.contains_key(
+                                        &(crate::value::Gc::as_ptr(list) as usize),
+                                    ) =>
                             {
                                 let b = list.borrow();
                                 let len = match b.props.get("length") {
@@ -22188,9 +22194,9 @@ fn dense_own_list(i: &Interp, list: &Value) -> Option<Vec<Value>> {
     let Value::Obj(list) = list else {
         return None;
     };
-    if !i.ordinary_get_ptr(Rc::as_ptr(list) as usize)
+    if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(list) as usize)
         || i.mapped_arguments
-            .contains_key(&(Rc::as_ptr(list) as usize))
+            .contains_key(&(crate::value::Gc::as_ptr(list) as usize))
     {
         return None;
     }
@@ -22273,7 +22279,7 @@ unsafe fn jit_call_hit_inner(
     // The callee's operand remains an owner through the whole committed call.
     // This observer-free inspection therefore needs no unpack/clone/drop round trip.
     let _ = (*sp.sub(argc + 1)).with_object(|callee| {
-        let key = Rc::as_ptr(callee) as usize;
+        let key = crate::value::Gc::as_ptr(callee) as usize;
         if key != ic.callee {
             if let crate::value::Callable::User(user) = &callee.borrow().call {
                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
@@ -22305,7 +22311,7 @@ unsafe fn jit_call_hit_inner(
     sp = args_ptr.sub(1);
     match sp.read().into_value() {
         Value::Obj(o) => {
-            if Rc::strong_count(&o) > 1 {
+            if crate::value::Gc::strong_count(&o) > 1 {
                 unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
             } else {
                 drop(o);
@@ -22393,7 +22399,7 @@ unsafe fn jit_call_hit_native(
     sp = args_ptr.sub(1);
     match sp.read().into_value() {
         Value::Obj(o) => {
-            if Rc::strong_count(&o) > 1 {
+            if crate::value::Gc::strong_count(&o) > 1 {
                 unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
             } else {
                 drop(o);
@@ -23126,7 +23132,7 @@ unsafe fn jit_new_inner(
         *sp = unsafe { args_ptr.sub(1) };
         match unsafe { sp.read().into_value() } {
             Value::Obj(o) => {
-                if Rc::strong_count(&o) > 1 {
+                if crate::value::Gc::strong_count(&o) > 1 {
                     unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
                 } else {
                     drop(o);
@@ -23765,10 +23771,11 @@ unsafe fn jit_call_inner(
                 };
                 if let Some(nf) = nf {
                     {
-                        let key = Rc::as_ptr(o) as usize;
+                        let key = crate::value::Gc::as_ptr(o) as usize;
                         let mut p = chunk.call_pins.borrow_mut();
                         if p.len() < 4096 || p.contains_key(&key) {
-                            p.entry(key).or_insert_with(|| Rc::downgrade(o));
+                            p.entry(key)
+                                .or_insert_with(|| crate::value::Gc::downgrade(o));
                             if !i
                                 .global_env_pins
                                 .iter()
@@ -23930,7 +23937,7 @@ unsafe fn jit_call_inner(
                     *sp = args_ptr.sub(1);
                     match sp.read().into_value() {
                         Value::Obj(o) => {
-                            if Rc::strong_count(&o) > 1 {
+                            if crate::value::Gc::strong_count(&o) > 1 {
                                 unsafe {
                                     Rc::decrement_strong_count(crate::value::Gc::into_raw(o))
                                 };
@@ -23966,7 +23973,7 @@ unsafe fn jit_call_inner(
         // outlined generic Value drop.
         match sp.read().into_value() {
             Value::Obj(o) => {
-                if Rc::strong_count(&o) > 1 {
+                if crate::value::Gc::strong_count(&o) > 1 {
                     unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
                 } else {
                     drop(o);
@@ -24183,7 +24190,7 @@ unsafe fn jit_callstat(
             }
         }
         if let Value::Obj(o) = &(*sp.sub(argc + 1)).unpack() {
-            if Rc::strong_count(o) <= 2 {
+            if crate::value::Gc::strong_count(o) <= 2 {
                 break 'r "gate: callee refcount <= 1";
             }
         }
@@ -26094,7 +26101,7 @@ mod return_slot_tests {
     fn jit_return_moves_owners_into_empty_and_occupied_slots() {
         for occupied in [false, true] {
             let displaced = crate::value::Object::new(None);
-            let displaced_weak = Rc::downgrade(&displaced);
+            let displaced_weak = crate::value::Gc::downgrade(&displaced);
             let mut ctx = context(if occupied {
                 Value::Obj(displaced)
             } else {
@@ -26102,7 +26109,7 @@ mod return_slot_tests {
                 Value::Undefined
             });
             let returned = crate::value::Object::new(None);
-            let returned_weak = Rc::downgrade(&returned);
+            let returned_weak = crate::value::Gc::downgrade(&returned);
             let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(returned))]);
             let base = operand.as_mut_ptr();
             let result = unsafe { jit_return(&mut ctx, 1, base.add(1)) };
@@ -26118,7 +26125,7 @@ mod return_slot_tests {
     #[test]
     fn jit_return_preserves_aliases_and_bare_return_drops_the_old_owner() {
         let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let mut ctx = context(Value::Obj(object.clone()));
         let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(object))]);
         let base = operand.as_mut_ptr();
@@ -26186,7 +26193,7 @@ mod return_slot_tests {
             assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
         }
         let object = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         let mut packed = ManuallyDrop::new(PackedValue::pack(Value::Obj(object.clone())));
         let mut wide = ManuallyDrop::new(Value::Obj(object));
         let packed_ptr = &raw mut *packed;

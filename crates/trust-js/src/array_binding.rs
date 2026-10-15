@@ -2,7 +2,6 @@
 //! ECMA-262 e28783d5: GetIteratorFromMethod, IteratorBindingInitialization, IteratorClose.
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Callable, Exotic, Value};
-use std::rc::Rc;
 
 impl Interp {
     /// A cloned slot owner is supplied here: two owners can still mean that replacing the
@@ -11,7 +10,7 @@ impl Interp {
     pub(crate) fn array_binding_old_slot_is_inert(value: &Value) -> bool {
         match value {
             Value::Obj(object) => {
-                if Rc::strong_count(object) > 2 {
+                if crate::value::Gc::strong_count(object) > 2 {
                     return true;
                 }
                 let object = object.borrow();
@@ -19,7 +18,11 @@ impl Interp {
                     return false;
                 };
                 let shared_edges = match (&object.proto, &state.target) {
-                    (Some(proto), Value::Obj(target)) if Rc::ptr_eq(proto, target) => 2,
+                    (Some(proto), Value::Obj(target))
+                        if crate::value::Gc::ptr_eq(proto, target) =>
+                    {
+                        2
+                    }
                     _ => 1,
                 };
                 // A preceding due-GC miss may leave the actual intrinsic iterator in this
@@ -30,9 +33,9 @@ impl Interp {
                     && object
                         .proto
                         .as_ref()
-                        .is_none_or(|proto| Rc::strong_count(proto) > shared_edges)
+                        .is_none_or(|proto| crate::value::Gc::strong_count(proto) > shared_edges)
                     && match &state.target {
-                        Value::Obj(target) => Rc::strong_count(target) > shared_edges,
+                        Value::Obj(target) => crate::value::Gc::strong_count(target) > shared_edges,
                         _ => true,
                     }
             }
@@ -61,7 +64,7 @@ impl Interp {
         // A custom iterator may also be its own captured next function. Retiring both
         // slots and both temporary clones together must leave an independent owner.
         if matches!((old_source, old_next), (Value::Obj(source), Value::Obj(next))
-            if Rc::ptr_eq(source, next) && Rc::strong_count(source) <= 4)
+            if crate::value::Gc::ptr_eq(source, next) && crate::value::Gc::strong_count(source) <= 4)
         {
             return Ok(None);
         }
@@ -69,16 +72,16 @@ impl Interp {
             let source = source.borrow();
             if let Exotic::ArrayIterator(state) = &source.exotic {
                 let target_edge = usize::from(
-                    matches!(&state.target, Value::Obj(target) if Rc::ptr_eq(target, next)),
+                    matches!(&state.target, Value::Obj(target) if crate::value::Gc::ptr_eq(target, next)),
                 );
                 let prototype_edge = usize::from(
                     source
                         .proto
                         .as_ref()
-                        .is_some_and(|proto| Rc::ptr_eq(proto, next)),
+                        .is_some_and(|proto| crate::value::Gc::ptr_eq(proto, next)),
                 );
                 let retired_edges = target_edge + prototype_edge;
-                if retired_edges != 0 && Rc::strong_count(next) <= retired_edges + 2 {
+                if retired_edges != 0 && crate::value::Gc::strong_count(next) <= retired_edges + 2 {
                     return Ok(None);
                 }
             }

@@ -15,7 +15,7 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
 fn function_owners(engine: &mut Engine) -> usize {
     let env = engine.interp.global_env.clone();
     let value = engine.interp.get_var("builtin", &env).ok().unwrap();
-    std::rc::Rc::strong_count(value.as_obj().unwrap()) - 1
+    crate::value::Gc::strong_count(value.as_obj().unwrap()) - 1
 }
 
 fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) {
@@ -126,8 +126,8 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
                 let value = engine.interp.get_var("builtin", &env).ok().unwrap();
                 let sentinel = engine.interp.get_var("sentinel", &env).ok().unwrap();
                 (
-                    std::rc::Rc::downgrade(value.as_obj().unwrap()),
-                    std::rc::Rc::downgrade(sentinel.as_obj().unwrap()),
+                    crate::value::Gc::downgrade(value.as_obj().unwrap()),
+                    crate::value::Gc::downgrade(sentinel.as_obj().unwrap()),
                 )
             };
             evaluate(&mut engine, "builtin=undefined; sentinel=undefined");

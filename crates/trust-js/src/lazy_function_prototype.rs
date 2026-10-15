@@ -6,7 +6,7 @@
 
 use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Weak;
 
 enum State {
     Parent(Gc),
@@ -37,7 +37,7 @@ impl LazyFunctionPrototype {
             "lazy prototype template with a non-writable or accessor field"
         );
         Self {
-            owner: Rc::downgrade(owner),
+            owner: Gc::downgrade(owner),
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
             shape: template.shape(),
@@ -254,7 +254,7 @@ mod tests {
         let mut engine = Engine::new();
         eval(&mut engine, "var F=function(){}, G=function(){};");
         let function = object(&mut engine, "F");
-        let weak = Rc::downgrade(&function);
+        let weak = Gc::downgrade(&function);
         assert_eq!(
             function
                 .borrow()
@@ -270,7 +270,7 @@ mod tests {
         engine.interp.gc_collect();
         assert!(weak.upgrade().is_none());
         let g = object(&mut engine, "G");
-        let weak_g = Rc::downgrade(&g);
+        let weak_g = Gc::downgrade(&g);
         drop(g);
         eval(&mut engine, "var escaped=G.prototype;G=null;");
         engine.interp.gc_collect();

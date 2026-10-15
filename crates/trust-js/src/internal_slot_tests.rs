@@ -232,7 +232,7 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
         );
         let env = engine.interp.global_env.clone();
         let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
-        let weak = std::rc::Rc::downgrade(cycle.as_obj().unwrap());
+        let weak = crate::value::Gc::downgrade(cycle.as_obj().unwrap());
         drop(cycle);
         engine.interp.collect_garbage_for_host();
         assert_eq!(eval(&mut engine, "live.get().marker"), "alive", "{tier:?}");
@@ -247,7 +247,7 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
             "cycle = new Intl.Collator('en-US'); compare = cycle.compare;",
         );
         let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
-        let weak = std::rc::Rc::downgrade(cycle.as_obj().unwrap());
+        let weak = crate::value::Gc::downgrade(cycle.as_obj().unwrap());
         drop(cycle);
         drop(env);
         drop(engine);

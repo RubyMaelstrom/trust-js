@@ -397,7 +397,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
         let crate::value::Value::Obj(object) = value else {
             panic!("missing function")
         };
-        let weak = std::rc::Rc::downgrade(&object);
+        let weak = crate::value::Gc::downgrade(&object);
         {
             let borrowed = object.borrow();
             let crate::value::Callable::User(user) = &borrowed.call else {
@@ -410,7 +410,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
                 .expect("self binding exists at closure creation");
             assert!(!binding.mutable && binding.initialized && !binding.strict_immutable);
             assert!(
-                matches!(&binding.value, crate::value::Value::Obj(bound) if std::rc::Rc::ptr_eq(bound, &object))
+                matches!(&binding.value, crate::value::Value::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
             );
             if !matches!(tier, Tier::Interp) {
                 assert!(
@@ -450,7 +450,7 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
             .get_var("named", &env)
             .unwrap_or_else(|_| panic!("named"));
         let object = value.as_obj().unwrap();
-        let weak = std::rc::Rc::downgrade(object);
+        let weak = crate::value::Gc::downgrade(object);
         let enabled = std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0");
         {
             let borrowed = object.borrow();

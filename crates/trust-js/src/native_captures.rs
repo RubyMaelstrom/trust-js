@@ -120,8 +120,8 @@ mod tests {
                 .borrow_mut()
                 .props
                 .insert("callback", Property::builtin(callback.clone()));
-            let weak_target = Rc::downgrade(&target);
-            let weak_callback = Rc::downgrade(object(&callback));
+            let weak_target = Gc::downgrade(&target);
+            let weak_callback = Gc::downgrade(object(&callback));
             drop((target, callback));
             collect(&mut interp, minor);
             assert!(
@@ -161,16 +161,16 @@ mod tests {
             } else {
                 first.clone()
             };
-            let weak_target = Rc::downgrade(&target);
+            let weak_target = Gc::downgrade(&target);
             drop((target, first, second));
             interp.gc_collect_young(GcCause::Explicit);
             interp.gc_collect();
             let result = interp
                 .invoke(live.clone(), Value::Null, &[])
                 .unwrap_or_else(|_| panic!("shared native invocation failed"));
-            assert!(Rc::ptr_eq(
+            assert!(Gc::ptr_eq(
                 object(&result),
-                &weak_target.upgrade().expect("live capture")
+                &Gc::from(weak_target.upgrade().expect("live capture"))
             ));
             drop((live, result));
             interp.gc_collect();
@@ -196,7 +196,7 @@ mod tests {
             .borrow_mut()
             .props
             .insert("callback", Property::builtin(callback.clone()));
-        let weak_target = Rc::downgrade(&target);
+        let weak_target = Gc::downgrade(&target);
         drop((target, callback));
         interp.gc_collect_young(GcCause::Explicit);
         interp.gc_collect();
@@ -207,9 +207,9 @@ mod tests {
         let result = interp
             .dispatch_native(&lease, Value::Undefined, &[])
             .unwrap_or_else(|_| panic!("leased native invocation failed"));
-        assert!(Rc::ptr_eq(
+        assert!(Gc::ptr_eq(
             object(&result),
-            &weak_target.upgrade().expect("leased capture")
+            &Gc::from(weak_target.upgrade().expect("leased capture"))
         ));
         drop((result, lease));
         interp.gc_collect();
@@ -238,7 +238,7 @@ mod tests {
             .borrow_mut()
             .props
             .insert("callback", Property::builtin(young_owner.clone()));
-        let weak_target = Rc::downgrade(&target);
+        let weak_target = Gc::downgrade(&target);
         drop((target, young_owner));
         interp.gc_collect_young(GcCause::Explicit);
         assert!(
@@ -248,9 +248,9 @@ mod tests {
         let result = interp
             .invoke(Value::Obj(old_owner.clone()), Value::Undefined, &[])
             .unwrap_or_else(|_| panic!("old owner invocation failed"));
-        assert!(Rc::ptr_eq(
+        assert!(Gc::ptr_eq(
             object(&result),
-            &weak_target.upgrade().expect("old owner's capture")
+            &Gc::from(weak_target.upgrade().expect("old owner's capture"))
         ));
         drop((old_owner, result));
         interp.gc_collect();
@@ -274,7 +274,7 @@ mod tests {
             .borrow_mut()
             .props
             .insert("callback", Property::builtin(callback.clone()));
-        let weak_target = Rc::downgrade(&target);
+        let weak_target = Gc::downgrade(&target);
         let foreign_interp = Interp::new();
         let foreign_owner = Object::new(None);
         foreign_owner.borrow_mut().call = object(&callback).borrow().call.clone();
@@ -289,9 +289,9 @@ mod tests {
         let result = interp
             .invoke(Value::Obj(foreign_owner.clone()), Value::Null, &[])
             .unwrap_or_else(|_| panic!("foreign owner's invocation failed"));
-        assert!(Rc::ptr_eq(
+        assert!(Gc::ptr_eq(
             object(&result),
-            &weak_target.upgrade().expect("foreign capture")
+            &Gc::from(weak_target.upgrade().expect("foreign capture"))
         ));
         drop((result, foreign_owner, foreign_interp));
         interp.gc_collect_with_edge_budget(GcCause::Explicit, 0);
@@ -334,7 +334,7 @@ mod tests {
                 vec![Value::Obj(target.clone()), Value::Bool(throws)],
             );
             let lease = object(&callback).borrow().call.clone();
-            let weak_target = Rc::downgrade(&target);
+            let weak_target = Gc::downgrade(&target);
             // Exercise dispatch with no function Object owner at all. Its
             // in-flight NativeCallable lease must protect borrowed captures.
             drop((target, callback));
@@ -343,9 +343,9 @@ mod tests {
                 Err(crate::interpreter::Abrupt::Throw(value)) if throws => value,
                 _ => panic!("native completion changed"),
             };
-            assert!(Rc::ptr_eq(
+            assert!(Gc::ptr_eq(
                 object(&result),
-                &weak_target.upgrade().expect("active capture")
+                &Gc::from(weak_target.upgrade().expect("active capture"))
             ));
             drop((lease, result));
             interp.gc_collect();

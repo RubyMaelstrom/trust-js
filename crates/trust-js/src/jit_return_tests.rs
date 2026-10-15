@@ -150,7 +150,7 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
         let (chunk, code) = compile_return(&mut engine, source);
         for occupied in [false, true] {
             let object = crate::value::Object::new(None);
-            let weak = Rc::downgrade(&object);
+            let weak = crate::value::Gc::downgrade(&object);
             let previous = if occupied {
                 Value::Obj(object.clone())
             } else {
@@ -176,7 +176,7 @@ fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let mut engine = Engine::new();
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
     let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
-    let weak = Rc::downgrade(&object);
+    let weak = crate::value::Gc::downgrade(&object);
     object.borrow_mut().props.insert(
         "self",
         crate::value::Property::plain(Value::Obj(object.clone())),
@@ -196,7 +196,7 @@ fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     );
     let returned = result.as_obj().unwrap();
     let self_value = returned.borrow().props.get("self").unwrap().value();
-    assert!(matches!(&self_value, Value::Obj(value) if Rc::ptr_eq(value, returned)));
+    assert!(matches!(&self_value, Value::Obj(value) if crate::value::Gc::ptr_eq(value, returned)));
     drop(self_value);
     drop(result);
     engine.interp.gc_collect();

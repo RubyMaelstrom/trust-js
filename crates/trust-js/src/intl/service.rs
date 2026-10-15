@@ -255,11 +255,11 @@ fn realm_protos_of<'a>(
 ) -> Option<&'a crate::fasthash::FastMap<&'static str, Gc>> {
     let mut cur = func.borrow().proto.clone();
     while let Some(p) = cur {
-        if std::rc::Rc::ptr_eq(&p, &i.function_proto) {
+        if crate::value::Gc::ptr_eq(&p, &i.function_proto) {
             return Some(&i.extra_protos);
         }
         for rs in i.realms.values() {
-            if std::rc::Rc::ptr_eq(&p, &rs.function_proto) {
+            if crate::value::Gc::ptr_eq(&p, &rs.function_proto) {
                 return Some(&rs.extra_protos);
             }
         }

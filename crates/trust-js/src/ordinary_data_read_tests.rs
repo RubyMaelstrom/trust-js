@@ -127,7 +127,7 @@ fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
             .borrow_mut()
             .props
             .insert("alive", Property::plain(Value::Num(37.0)));
-        let weak = Rc::downgrade(&payload);
+        let weak = Gc::downgrade(&payload);
         holder
             .borrow_mut()
             .props
@@ -331,7 +331,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
         let mut engine = Engine::new();
         run(&mut engine, "var F=function(){};");
         let function = object(&mut engine, "F");
-        let weak_function = Rc::downgrade(&function);
+        let weak_function = Gc::downgrade(&function);
         let holder_shape = function.borrow().props.shape();
         let before = crate::value::heap_live_objects(&engine.interp.gc_heap);
         let (first, trace) = read(
@@ -373,9 +373,9 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
             .get("constructor")
             .unwrap()
             .value();
-        assert!(Rc::ptr_eq(
+        assert!(Gc::ptr_eq(
             constructor.as_obj().unwrap(),
-            &weak_function.upgrade().unwrap()
+            &Gc::from(weak_function.upgrade().unwrap())
         ));
         drop(constructor);
         drop(first);

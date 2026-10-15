@@ -258,7 +258,7 @@ mod tests {
             .eval_value("buffer")
             .unwrap()
             .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
+        let ptr = Gc::as_ptr(buffer.as_obj().unwrap()) as usize;
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -365,7 +365,7 @@ mod tests {
             .eval_value("buffer")
             .unwrap()
             .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
+        let ptr = Gc::as_ptr(buffer.as_obj().unwrap()) as usize;
         let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
         drop(buffer);
         eval(&mut engine, "a = null; buffer = null;");
@@ -414,7 +414,7 @@ mod tests {
             .eval_value("buffer")
             .unwrap()
             .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Rc::as_ptr(buffer.as_obj().unwrap()) as usize;
+        let ptr = Gc::as_ptr(buffer.as_obj().unwrap()) as usize;
         let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
         assert!(engine.interp.detach_array_buffer(&buffer));
         assert!(

@@ -137,7 +137,7 @@ mod tests {
     fn transferred_owners_and_binding_attributes_restore_on_unwind() {
         let environment = new_scope(None);
         let old = crate::value::Object::new(None);
-        let weak = Rc::downgrade(&old);
+        let weak = crate::value::Gc::downgrade(&old);
         environment
             .borrow_mut()
             .vars

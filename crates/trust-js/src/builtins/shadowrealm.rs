@@ -16,7 +16,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
             return Err(i.make_error("TypeError", "ShadowRealm constructor requires 'new'"));
         }
         let obj = Object::new(i.extra_protos.get("ShadowRealm").cloned());
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         // The realm lives in a pointer-keyed internal-slot table. Pin the owner against allocator
         // address reuse; the cycle collector evicts the Box before releasing the pin.
         i.gc_pin(&obj);

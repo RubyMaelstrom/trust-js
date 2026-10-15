@@ -2197,7 +2197,7 @@ impl Interp {
         // A module namespace's [[GetOwnProperty]] runs during enumeration, so an uninitialized
         // export makes the loop throw before any iteration.
         if let Value::Obj(object) = v {
-            let ptr = std::rc::Rc::as_ptr(object) as usize;
+            let ptr = crate::value::Gc::as_ptr(object) as usize;
             if self.is_namespace(ptr) {
                 for key in &keys {
                     if let Some(result) = self.namespace_own_property(ptr, key) {
@@ -2223,7 +2223,7 @@ impl Interp {
         value: &Value,
         mut pins: Option<&mut EnumerationLayouts>,
     ) -> Option<EnumerationShape> {
-        let mut current = Rc::as_ptr(value.as_obj()?);
+        let mut current = Gc::as_ptr(value.as_obj()?);
         let mut shape = EnumerationShape {
             levels: [(0, 0, 0); 6],
             depth: 0,
@@ -2249,7 +2249,7 @@ impl Interp {
             }
             shape.depth += 1;
             match object.proto.as_ref() {
-                Some(parent) => current = Rc::as_ptr(parent),
+                Some(parent) => current = Gc::as_ptr(parent),
                 None => return Some(shape),
             }
         }
@@ -2273,7 +2273,7 @@ impl Interp {
             let ov = Value::Obj(o.clone());
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].
-            if self.proxies.contains_key(&(Rc::as_ptr(&o) as usize)) {
+            if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
                 let keys =
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
@@ -2328,7 +2328,7 @@ impl Interp {
                 .filter(|key| !Interp::is_sym_key(key))
                 .map(|key| key.to_string())
                 .collect();
-            if let Some(info) = self.typed_arrays.get(&(Rc::as_ptr(&o) as usize)).copied() {
+            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&o) as usize)).copied() {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
                     let k = idx.to_string();
                     if seen.insert(k.clone()) {
@@ -2614,7 +2614,7 @@ impl Interp {
         }
         // Fast path: an own data property of an ordinary global (the overwhelmingly common
         // resolution for builtins and script-level bindings) — one hash lookup, no trap walk.
-        if self.ordinary_get_ptr(Rc::as_ptr(&self.global) as usize) {
+        if self.ordinary_get_ptr(Gc::as_ptr(&self.global) as usize) {
             let b = self.global.borrow();
             if matches!(b.exotic, crate::value::Exotic::None) {
                 if let Some(p) = b.props.get(name) {
@@ -3155,7 +3155,7 @@ impl Interp {
         };
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         if let Some((target, handler)) = self.proxy_at(ptr) {
             if matches!(handler, Value::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
@@ -4200,7 +4200,7 @@ impl Interp {
         site_id: u64,
         quasis: &[(Option<String>, String)],
     ) -> Result<Value, Abrupt> {
-        let site = (Rc::as_ptr(&self.global) as usize, site_id);
+        let site = (Gc::as_ptr(&self.global) as usize, site_id);
         let strings = match self.template_cache.get(&site) {
             Some(v) => v.clone(),
             None => {
@@ -4465,7 +4465,7 @@ impl Interp {
         let (func, receiver) = self.get_var_with("eval", env)?;
         let direct = matches!(
             (&func, &self.eval_fn),
-            (Value::Obj(function), Some(intrinsic)) if Rc::ptr_eq(function, intrinsic)
+            (Value::Obj(function), Some(intrinsic)) if Gc::ptr_eq(function, intrinsic)
         );
         let argv = self.eval_args(args, env)?;
         if direct {
@@ -4651,8 +4651,8 @@ impl Interp {
     /// (TRust JS cannot truly suspend).
     pub(crate) fn await_value(&mut self, v: Value) -> Result<Value, Abrupt> {
         let ptr = match &v {
-            Value::Obj(o) if self.promises.contains_key(&(Rc::as_ptr(o) as usize)) => {
-                Rc::as_ptr(o) as usize
+            Value::Obj(o) if self.promises.contains_key(&(Gc::as_ptr(o) as usize)) => {
+                Gc::as_ptr(o) as usize
             }
             Value::Obj(_) => {
                 // Await of a plain object goes through the promise resolution procedure: a
@@ -4685,7 +4685,7 @@ impl Interp {
 
     pub(crate) fn new_promise(&mut self) -> Value {
         let obj = Object::new(self.extra_protos.get("Promise").cloned());
-        let p = Rc::as_ptr(&obj) as usize;
+        let p = Gc::as_ptr(&obj) as usize;
         self.gc_pin(&obj);
         self.promises.insert(p, PromiseState::default());
         Value::Obj(obj)
@@ -4753,7 +4753,7 @@ impl Interp {
         };
         matches!(bound.args.first(), Some(Value::Obj(flag))
         if flag.borrow().proto.as_ref().is_some_and(|proto| {
-            Rc::ptr_eq(proto, &self.host_resolution_marker)
+            Gc::ptr_eq(proto, &self.host_resolution_marker)
         }))
     }
 
@@ -4768,13 +4768,13 @@ impl Interp {
         // Follow a subclass graft's forwarding link (see run_constructor_on's native arm).
         let mut promise = promise.clone();
         if let Value::Obj(o) = &promise {
-            if let Some(f) = self.promise_forward.get(&(Rc::as_ptr(o) as usize)) {
+            if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
                 promise = f.clone();
             }
         }
         let promise = &promise;
         let ptr = match promise {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         if self.promises.get(&ptr).map(|s| s.status).unwrap_or(1) != 0 {
@@ -4782,7 +4782,7 @@ impl Interp {
         }
         // Resolving a promise with ITSELF is a TypeError rejection (chaining cycle).
         if let (Value::Obj(p), Value::Obj(v)) = (promise, &value) {
-            if Rc::ptr_eq(p, v) {
+            if Gc::ptr_eq(p, v) {
                 let e = crate::interpreter::abrupt_value(
                     self.throw("TypeError", "Chaining cycle detected for promise"),
                 );
@@ -4840,7 +4840,7 @@ impl Interp {
     pub(crate) fn reject_promise(&mut self, promise: &Value, reason: Value) {
         let mut promise = promise.clone();
         if let Value::Obj(o) = &promise {
-            if let Some(f) = self.promise_forward.get(&(Rc::as_ptr(o) as usize)) {
+            if let Some(f) = self.promise_forward.get(&(Gc::as_ptr(o) as usize)) {
                 promise = f.clone();
             }
         }
@@ -4849,7 +4849,7 @@ impl Interp {
 
     fn settle(&mut self, promise: &Value, value: Value, fulfilled: bool) {
         let ptr = match promise {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         let (reactions, handled) = match self.promises.get_mut(&ptr) {
@@ -4934,7 +4934,7 @@ impl Interp {
         result: Value,
     ) {
         let ptr = match promise {
-            Value::Obj(o) => Rc::as_ptr(o) as usize,
+            Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
         let (status, handled, outstanding) =
@@ -5011,7 +5011,7 @@ impl Interp {
         let Some(realm) = handler.internal.realm() else {
             return self.promise_job_target(&handler.callback, same_realm_context);
         };
-        let host_context = if realm == Rc::as_ptr(&self.global) as usize {
+        let host_context = if realm == Gc::as_ptr(&self.global) as usize {
             same_realm_context
         } else {
             self.realms
@@ -5035,7 +5035,7 @@ impl Interp {
         if !handler.is_callable() {
             return (None, same_realm_context);
         }
-        let current_realm = Rc::as_ptr(&self.global) as usize;
+        let current_realm = Gc::as_ptr(&self.global) as usize;
         let realm = match handler {
             Value::Obj(handler) => match self.get_function_realm_global(handler) {
                 Ok(Some(realm)) => realm,
@@ -5237,7 +5237,7 @@ impl Interp {
         &mut self,
         registry: Value,
     ) -> Result<(), crate::InterruptReason> {
-        let Some(ptr) = registry.as_obj().map(|object| Rc::as_ptr(object) as usize) else {
+        let Some(ptr) = registry.as_obj().map(|object| Gc::as_ptr(object) as usize) else {
             return Ok(());
         };
         if let Some(state) = self.finalization_registries.get_mut(&ptr) {
@@ -5295,7 +5295,7 @@ impl Interp {
         // HostEnqueuePromiseJob. HTML §8.1.6.6.4 prepares that Realm's settings before invoking
         // the job. Enter the Realm around the complete abstract closure, rather than waiting for
         // `Call(handler)` to switch after the host preparation callback has already run.
-        let current_realm = Rc::as_ptr(&self.global) as usize;
+        let current_realm = Gc::as_ptr(&self.global) as usize;
         if let Some(target_realm) = job.realm.filter(|realm| *realm != current_realm) {
             if let Some(target) = self
                 .realms
@@ -5326,7 +5326,7 @@ impl Interp {
         let Value::Obj(async_promise) = &handler.callback else {
             return;
         };
-        let key = Rc::as_ptr(async_promise) as usize;
+        let key = Gc::as_ptr(async_promise) as usize;
         let previous_entry = self.host_entry_realm;
         if self.capture_job_script_caller {
             self.host_entry_realm = handler.internal.realm();
@@ -5447,7 +5447,7 @@ impl Interp {
         proto: Option<crate::value::Gc>,
     ) -> Value {
         let obj = Object::new(proto);
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         // source/flags/global/... are accessor getters on RegExp.prototype (computed from the
         // matcher); only `lastIndex` is an own writable data property.
         obj.borrow_mut().props.insert(
@@ -6499,7 +6499,7 @@ impl Interp {
         // https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation
         self.gc_pin(&ctor_obj);
         self.class_info.insert(
-            Rc::as_ptr(&ctor_obj) as usize,
+            Gc::as_ptr(&ctor_obj) as usize,
             ClassInfo {
                 fields: inst_fields.into(),
                 field_env: inst_env,
@@ -6904,7 +6904,7 @@ impl Interp {
             Value::Obj(o) => o.clone(),
             _ => return Err(self.throw("TypeError", "super target is not a constructor")),
         };
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         // A proxy parent constructs through its [[Construct]] trap machinery; the returned object
         // is what super() binds as `this` (the object-override path in the super-call code).
         if self.proxies.contains_key(&ptr) {
@@ -6949,7 +6949,7 @@ impl Interp {
                 self.constructing = saved;
                 let made = made?;
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
-                    if !Rc::ptr_eq(src, dst) {
+                    if !Gc::ptr_eq(src, dst) {
                         for k in src.borrow().props.keys() {
                             let p = src.borrow().props.get(&k).cloned().unwrap();
                             dst.borrow_mut().props.insert(k, p);
@@ -6981,7 +6981,7 @@ impl Interp {
                         }
                         // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
                         // onto `this`, so a subclass instance carries the built-in's state.
-                        let (sp, dp) = (Rc::as_ptr(src) as usize, Rc::as_ptr(dst) as usize);
+                        let (sp, dp) = (Gc::as_ptr(src) as usize, Gc::as_ptr(dst) as usize);
                         self.gc_pin(dst);
                         let mut moved_collection = false;
                         if let Some(v) = self.map_data.remove(&sp) {
@@ -7068,7 +7068,7 @@ impl Interp {
         // packed values directly instead of rebuilding keys, lookups and shape transitions.
         if excluded.is_empty() {
             if let Value::Obj(source) = value {
-                if !Rc::ptr_eq(source, rest) {
+                if !Gc::ptr_eq(source, rest) {
                     let source = source.borrow();
                     if source.ic_plain.get() && matches!(source.exotic, Exotic::None) {
                         let mut target = rest.borrow_mut();
@@ -7178,7 +7178,7 @@ impl Interp {
             Value::Obj(o) => o.clone(),
             _ => return Ok(()),
         };
-        let ptr = Rc::as_ptr(&obj) as usize;
+        let ptr = Gc::as_ptr(&obj) as usize;
         let (fields, field_env, initializers, priv_members) = match self.class_info.get(&ptr) {
             // InitializeInstanceElements has nothing to add for a class without elements.
             Some(i)
@@ -7595,7 +7595,7 @@ impl Interp {
             {
                 if let Value::Obj(o) = &base {
                     self.defer_trigger(o, Some(prop))?;
-                    let ptr = Rc::as_ptr(o) as usize;
+                    let ptr = Gc::as_ptr(o) as usize;
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {
@@ -7654,7 +7654,7 @@ impl Interp {
                         .map(|p| p.configurable())
                         .unwrap_or(true);
                     if configurable {
-                        self.unmap_argument(Rc::as_ptr(o) as usize, prop);
+                        self.unmap_argument(Gc::as_ptr(o) as usize, prop);
                         o.borrow_mut().props.remove(prop);
                         return Ok(Value::Bool(true));
                     }
@@ -8630,11 +8630,11 @@ impl Interp {
             // prototype-chain property read: an own override or altered function prototype
             // falls through, as do proxies and other side-table exotics.
             let inherits_default = match r {
-                Value::Obj(o) if self.ordinary_get_ptr(Rc::as_ptr(o) as usize) => {
+                Value::Obj(o) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                     let b = o.borrow();
                     b.proto
                         .as_ref()
-                        .is_some_and(|p| Rc::ptr_eq(p, &self.function_proto))
+                        .is_some_and(|p| Gc::ptr_eq(p, &self.function_proto))
                         && !b.props.contains(&key)
                 }
                 _ => false,
@@ -8718,7 +8718,7 @@ impl Interp {
                         && b.props.shape() == cached.recv_shape
                         && b.proto
                             .as_ref()
-                            .is_some_and(|p| Rc::ptr_eq(p, &self.function_proto)))
+                            .is_some_and(|p| Gc::ptr_eq(p, &self.function_proto)))
                     .then(|| {
                         b.props
                             .entry_at(cached.slot as usize)
@@ -8735,7 +8735,7 @@ impl Interp {
                     while let Some(object) = cur {
                         let next = object.borrow().proto.clone();
                         match next {
-                            Some(proto) if Rc::ptr_eq(&proto, &target) => {
+                            Some(proto) if Gc::ptr_eq(&proto, &target) => {
                                 return Ok(Value::Bool(true));
                             }
                             Some(proto) => cur = Some(proto),
@@ -8746,7 +8746,7 @@ impl Interp {
             }
         }
         let fill = match (key.as_deref(), r) {
-            (Some(key), Value::Obj(o)) if self.ordinary_get_ptr(Rc::as_ptr(o) as usize) => {
+            (Some(key), Value::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                 let b = o.borrow();
                 if b.is_constructor
                     && matches!(b.exotic, Exotic::None)
@@ -8754,7 +8754,7 @@ impl Interp {
                     && crate::value::is_cacheable_shape(b.props.shape())
                     && b.proto
                         .as_ref()
-                        .is_some_and(|p| Rc::ptr_eq(p, &self.function_proto))
+                        .is_some_and(|p| Gc::ptr_eq(p, &self.function_proto))
                     && !b.props.contains(key)
                 {
                     b.props.prototype_slot().and_then(|slot| {
@@ -8814,7 +8814,7 @@ impl Interp {
                 let next = cur.borrow().proto.clone();
                 match next {
                     Some(x) => {
-                        if Rc::ptr_eq(&x, &proto) {
+                        if Gc::ptr_eq(&x, &proto) {
                             return Ok(true);
                         }
                         cur = x;
@@ -8829,7 +8829,7 @@ impl Interp {
             let next = crate::builtins::js_get_prototype_of(self, &cur).map_err(Abrupt::Throw)?;
             match next {
                 Value::Obj(x) => {
-                    if Rc::ptr_eq(&x, &proto) {
+                    if Gc::ptr_eq(&x, &proto) {
                         return Ok(true);
                     }
                     cur = Value::Obj(x);
@@ -9073,7 +9073,7 @@ impl Interp {
             (Value::BigInt(x), Value::BigInt(y)) => x == y,
             (Value::Str(x), Value::Str(y)) => x == y,
             (Value::Sym(x), Value::Sym(y)) => x.id == y.id,
-            (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
+            (Value::Obj(x), Value::Obj(y)) => Gc::ptr_eq(x, y),
             _ => false,
         }
     }
@@ -9081,7 +9081,7 @@ impl Interp {
     /// IsConstructor: whether `v` has a [[Construct]] internal method.
     pub(crate) fn value_is_constructor(&self, v: &Value) -> bool {
         let Value::Obj(o) = v else { return false };
-        if let Some((target, _)) = self.proxies.get(&(Rc::as_ptr(o) as usize)) {
+        if let Some((target, _)) = self.proxies.get(&(Gc::as_ptr(o) as usize)) {
             // A proxy is a constructor exactly when its target is.
             return self.value_is_constructor(&target.clone());
         }

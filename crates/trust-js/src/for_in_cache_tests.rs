@@ -117,13 +117,13 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     let weak_layout = Rc::downgrade(&layout);
     let a = predicted_object(&layout, 1);
     let b = predicted_object(&layout, 2);
-    let weak_a = Rc::downgrade(a.as_obj().unwrap());
+    let weak_a = crate::value::Gc::downgrade(a.as_obj().unwrap());
     let first = backing(&mut engine, &a);
     let second = backing(&mut engine, &b);
     assert_eq!(key_at(&first, 0), "a");
     assert_eq!(key_at(&second, 1), "b");
     assert!(
-        !Rc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
+        !crate::value::Gc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
         "live prefix participates in proof"
     );
     let references = Rc::strong_count(&layout);
@@ -224,14 +224,17 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
         .borrow_mut()
         .props
         .insert("own", Property::plain(Value::Num(2.0)));
-    let weak_object = Rc::downgrade(&object);
-    let weak_proto = Rc::downgrade(&prototype);
+    let weak_object = crate::value::Gc::downgrade(&object);
+    let weak_proto = crate::value::Gc::downgrade(&prototype);
     let source = Value::Obj(object);
     let keys = backing(&mut engine, &source);
     let allocated = heap_allocated_objects(&engine.interp.gc_heap);
     for _ in 0..1000 {
         let next = backing(&mut engine, &source);
-        assert!(Rc::ptr_eq(keys.as_obj().unwrap(), next.as_obj().unwrap()));
+        assert!(crate::value::Gc::ptr_eq(
+            keys.as_obj().unwrap(),
+            next.as_obj().unwrap()
+        ));
     }
     assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
     {

@@ -8000,7 +8000,7 @@ mod direct_call_tests {
                 match (&operands[1].unpack(), &value) {
                     (Value::Num(a), Value::Num(b)) => assert_eq!(a, b),
                     (Value::Str(a), Value::Str(b)) => assert!(crate::lstr::LStr::ptr_eq(a, b)),
-                    (Value::Obj(a), Value::Obj(b)) => assert!(std::rc::Rc::ptr_eq(a, b)),
+                    (Value::Obj(a), Value::Obj(b)) => assert!(crate::value::Gc::ptr_eq(a, b)),
                     _ => panic!("wrong computed value"),
                 }
                 drop(operands);
@@ -8164,7 +8164,6 @@ mod direct_call_tests {
     #[test]
     fn secondary_probe_matches_rust_across_growth_epoch_and_realm_misses() {
         use crate::bytecode::{CallIc, CallOverflow};
-        use std::rc::Rc;
         let mut engine = crate::Engine::new();
         let layout = crate::interpreter::interp_layout(&mut engine.interp);
         let mut asm = super::asm::Asm::new();
@@ -8203,17 +8202,17 @@ mod direct_call_tests {
                 let object = crate::value::Object::new(None);
                 engine.interp.call_overflow.insert(
                     CallIc {
-                        callee: Rc::as_ptr(&object) as usize,
+                        callee: crate::value::Gc::as_ptr(&object) as usize,
                         epoch: 7,
                         global_env: 123,
                         ..CallIc::EMPTY
                     },
-                    Rc::downgrade(&object),
+                    crate::value::Gc::downgrade(&object),
                 );
                 objects.push(object);
             }
             for object in &objects {
-                let key = Rc::as_ptr(object) as usize;
+                let key = crate::value::Gc::as_ptr(object) as usize;
                 let expected = engine.interp.call_overflow.lookup(key, 123, 7);
                 let found = unsafe { probe(context.as_ptr(), key, 7, 123) };
                 assert_eq!(!found.is_null(), expected.is_some(), "batch {batch}");

@@ -295,7 +295,7 @@ fn read_duration(i: &mut Interp, v: &Value) -> Result<[f64; 10], Value> {
     // are NOT consulted (they may be redefined).
     if let Value::Obj(o) = v {
         if let Some(crate::temporal::Temporal::Duration(d)) =
-            i.temporal.get(&(std::rc::Rc::as_ptr(o) as usize))
+            i.temporal.get(&(crate::value::Gc::as_ptr(o) as usize))
         {
             return Ok([
                 d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, d.ms, d.us, d.ns,

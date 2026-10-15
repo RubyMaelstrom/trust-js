@@ -1830,7 +1830,7 @@ mod tests {
             let Value::Obj(expected) = &reported else {
                 panic!("an object")
             };
-            assert!(Rc::ptr_eq(&prototype, expected));
+            assert!(std::ptr::eq(prototype.as_ptr(), expected.as_ptr()));
         }
         let handle = env.handle(throwing);
         assert_eq!(

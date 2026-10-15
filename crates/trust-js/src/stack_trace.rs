@@ -846,7 +846,7 @@ impl Interp {
                 for (callee, inner) in chain {
                     if let Skip::UntilSeen(target) = skip {
                         if skipping {
-                            skipping = Rc::as_ptr(&callee) as usize != target;
+                            skipping = crate::value::Gc::as_ptr(&callee) as usize != target;
                             continue;
                         }
                     }
@@ -1041,7 +1041,7 @@ mod tests {
     fn shared_inline_sites_keep_positions_live_until_the_last_chunk() {
         let engine = crate::Engine::new();
         let callee = engine.interp.new_object();
-        let pin = Rc::downgrade(&callee);
+        let pin = crate::value::Gc::downgrade(&callee);
         let (mut sites, positions) = InlineSites::register(vec![
             InlineSite {
                 callee: pin.clone(),

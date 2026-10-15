@@ -35,7 +35,7 @@ impl Key {
         labels: &[&str],
     ) -> bool {
         self.site.as_ptr() == Rc::as_ptr(site)
-            && self.realm.as_ptr() == Rc::as_ptr(realm)
+            && self.realm.as_ptr() == Gc::as_ptr(realm)
             && self.kind == kind
             && self.context == context
             && self.labels.iter().map(|s| &**s).eq(labels.iter().copied())
@@ -186,7 +186,7 @@ impl Cache {
         storage.entries[index] = Some(Entry {
             key: Key {
                 site: Rc::downgrade(site),
-                realm: Rc::downgrade(realm),
+                realm: Gc::downgrade(realm),
                 kind,
                 context,
                 labels: labels

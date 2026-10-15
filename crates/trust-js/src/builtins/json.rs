@@ -445,7 +445,7 @@ fn json_plain_get(i: &Interp, object: &Gc) -> bool {
         && (i.mapped_arguments.is_empty()
             || !i
                 .mapped_arguments
-                .contains_key(&(Rc::as_ptr(object) as usize)))
+                .contains_key(&(Gc::as_ptr(object) as usize)))
 }
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
@@ -597,7 +597,7 @@ fn json_serialize_property(
 
 /// The start of SerializeJSONObject/Array: the cycle check and the deeper indentation.
 fn json_enter(i: &mut Interp, s: &mut Serializer, object: &Gc) -> Result<usize, Value> {
-    let ptr = Rc::as_ptr(object) as usize;
+    let ptr = Gc::as_ptr(object) as usize;
     let shallow = &s.stack[..s.stack.len().min(JSON_STACK_SCAN)];
     if shallow.contains(&ptr) || s.deep_stack.contains(&ptr) {
         return Err(i.make_error("TypeError", "Converting circular structure to JSON"));
@@ -621,9 +621,9 @@ fn json_leave(s: &mut Serializer, object: &Gc, stepback: usize, any: bool, close
     }
     s.out.push(close);
     let ptr = s.stack.pop();
-    debug_assert_eq!(ptr, Some(Rc::as_ptr(object) as usize));
+    debug_assert_eq!(ptr, Some(Gc::as_ptr(object) as usize));
     if s.stack.len() >= JSON_STACK_SCAN {
-        s.deep_stack.remove(&(Rc::as_ptr(object) as usize));
+        s.deep_stack.remove(&(Gc::as_ptr(object) as usize));
     }
 }
 

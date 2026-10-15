@@ -475,3 +475,31 @@ Corrections to the S1 record above: release ran 10 of its 11 tests (the
 verifier test is debug-only), and "spike green in release" was evidence
 about the spike's scanner only. "Known S1 limits" is superseded except
 the x64 note (asm now written, still unvalidated).
+
+S2 ownership switch (started 2026-10-15; owner: proceed after S1)
+-----------------------------------------------------------------
+Baseline at 75e1b77d, default features (`cargo test -p trust-js --lib
+--features embed`, debug): 2149 passed / 0 failed / 3 ignored, ~4.5 min
+of test time.
+
+Strategy. The GcCell payload is literally RefCell<Object>: Gc derefs to
+RefCell<Object> in both builds, so the thousands of .borrow()/
+.borrow_mut() sites, Ref/RefMut types and RefCell::as_ptr callers compile
+unchanged. Rc-specific operations go through Gc associated functions
+(as_ptr, ptr_eq, downgrade, strong_count, as_rc) that gc-heap
+reimplements; each as_rc use marks a site that genuinely needs an Rc.
+Planned I9 enforcement without a mutator-side borrow counter: the tracer
+borrows each reachable object, and a mutably borrowed one aborts the
+collection and defers it (debug builds assert, locating the site).
+
+Step 1, seam (default build, no behavior change): Gc's Deref target
+changed from Rc<RefCell<Object>> to RefCell<Object>. 755 call sites
+(440 as_ptr, 123 ptr_eq, 108 downgrade, 84 strong_count) were rewritten
+by a fixer driven by rustc's JSON diagnostics — only calls rustc flags,
+never textually similar Rc<SymbolData>/Env calls — plus qualified paths
+and ~15 hand fixes (weak upgrades in tests; jit_x64_property_tests,
+found by inspection because this host cannot compile x86_64; a
+trust-js-node test now compares identity through RefCell::as_ptr, since
+Gc is not part of the embed API). Lib suite unchanged (2149/0/3);
+workspace builds with tests; clippy clean with embed, embed+gc-heap and
+for trust-js-node.

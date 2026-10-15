@@ -64,7 +64,7 @@ fn iterator_results_remove_wrapper_allocations_but_public_next_keeps_identity() 
             .interp
             .call(next, iterator, &[])
             .unwrap_or_else(|_| panic!("public next"));
-        assert!(!std::rc::Rc::ptr_eq(
+        assert!(!crate::value::Gc::ptr_eq(
             first.as_obj().unwrap(),
             second.as_obj().unwrap()
         ));
@@ -257,7 +257,7 @@ fn iterator_results_private_target_is_traced_and_collectable() {
             let crate::value::Exotic::ArrayIterator(state) = &object.exotic else {
                 panic!("private iterator slots")
             };
-            std::rc::Rc::downgrade(state.target.as_obj().unwrap())
+            crate::value::Gc::downgrade(state.target.as_obj().unwrap())
         };
         engine
             .interp

@@ -313,7 +313,10 @@ impl Interp {
     fn new_evaluation_promise(&mut self) -> Value {
         let promise = self.new_promise();
         if let Value::Obj(object) = &promise {
-            if let Some(state) = self.promises.get_mut(&(Rc::as_ptr(object) as usize)) {
+            if let Some(state) = self
+                .promises
+                .get_mut(&(crate::value::Gc::as_ptr(object) as usize))
+            {
                 state.handled = true;
             }
         }
@@ -365,7 +368,7 @@ impl Interp {
         self.drain_microtasks_interruptible()
             .map_err(Abrupt::Interrupt)?;
         if let Value::Obj(o) = &top {
-            if let Some(ps) = self.promises.get(&(Rc::as_ptr(o) as usize)) {
+            if let Some(ps) = self.promises.get(&(crate::value::Gc::as_ptr(o) as usize)) {
                 if ps.status == 2 {
                     let reason = ps.value.clone();
                     return Err(Abrupt::Throw(reason));
@@ -1073,7 +1076,8 @@ impl Interp {
         // released per-Document module map may otherwise drop the last strong
         // namespace handle and let an unrelated allocation reuse its address.
         self.gc_pin(ns);
-        self.module_ns.insert(Rc::as_ptr(ns) as usize, live);
+        self.module_ns
+            .insert(crate::value::Gc::as_ptr(ns) as usize, live);
         Ok(())
     }
 
@@ -1108,14 +1112,19 @@ impl Interp {
             dst.extensible = false;
             dst.props.demote_shape();
         }
-        if let Some(live) = self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned() {
+        if let Some(live) = self
+            .module_ns
+            .get(&(crate::value::Gc::as_ptr(base_o) as usize))
+            .cloned()
+        {
             dns.borrow().ic_plain.set(false);
             self.gc_pin(&dns);
-            self.module_ns.insert(Rc::as_ptr(&dns) as usize, live);
+            self.module_ns
+                .insert(crate::value::Gc::as_ptr(&dns) as usize, live);
         }
         dns.borrow().ic_plain.set(false);
         self.deferred_ns
-            .insert(Rc::as_ptr(&dns) as usize, dep.to_string());
+            .insert(crate::value::Gc::as_ptr(&dns) as usize, dep.to_string());
         self.deferred_ns_objs
             .insert(dep.to_string(), Value::Obj(dns.clone()));
         Value::Obj(dns)
@@ -1140,7 +1149,9 @@ impl Interp {
             // A stub minted mid-link for a cyclic dependency copied an empty export table —
             // hydrate it from the real namespace now that the module is linked and evaluated.
             if let Some(Value::Obj(stub)) = self.deferred_ns_objs.get(key).cloned() {
-                let hydrated = self.module_ns.contains_key(&(Rc::as_ptr(&stub) as usize));
+                let hydrated = self
+                    .module_ns
+                    .contains_key(&(crate::value::Gc::as_ptr(&stub) as usize));
                 if !hydrated {
                     let base = self.module_recs[key].ns.clone();
                     if let Value::Obj(base_o) = &base {
@@ -1163,12 +1174,15 @@ impl Interp {
                                 }
                             }
                         }
-                        if let Some(live) =
-                            self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned()
+                        if let Some(live) = self
+                            .module_ns
+                            .get(&(crate::value::Gc::as_ptr(base_o) as usize))
+                            .cloned()
                         {
                             stub.borrow().ic_plain.set(false);
                             self.gc_pin(&stub);
-                            self.module_ns.insert(Rc::as_ptr(&stub) as usize, live);
+                            self.module_ns
+                                .insert(crate::value::Gc::as_ptr(&stub) as usize, live);
                         }
                     }
                 }
@@ -1592,10 +1606,11 @@ impl Interp {
                 return;
             };
             if let Value::Obj(o) = &top {
-                self.generators.insert(Rc::as_ptr(o) as usize, coro);
+                self.generators
+                    .insert(crate::value::Gc::as_ptr(o) as usize, coro);
             }
             let top_key = match &top {
-                Value::Obj(o) => Rc::as_ptr(o) as usize,
+                Value::Obj(o) => crate::value::Gc::as_ptr(o) as usize,
                 _ => return,
             };
             self.drive_async(
@@ -2006,7 +2021,9 @@ impl Interp {
 fn same_binding(a: &Resolution, b: &Resolution) -> bool {
     match (a, b) {
         (Resolution::Local(e1, l1), Resolution::Local(e2, l2)) => Rc::ptr_eq(e1, e2) && l1 == l2,
-        (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => Rc::ptr_eq(o1, o2),
+        (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => {
+            crate::value::Gc::ptr_eq(o1, o2)
+        }
         (Resolution::DeferNs(d1), Resolution::DeferNs(d2)) => d1 == d2,
         _ => false,
     }

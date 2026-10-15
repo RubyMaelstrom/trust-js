@@ -4,7 +4,6 @@
 
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Gc, Value};
-use std::rc::Rc;
 
 impl Interp {
     pub(crate) fn host_named_supported(&self, object: &Gc, key: &str) -> bool {
@@ -12,7 +11,7 @@ impl Interp {
             return false;
         }
         self.host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
             .is_some_and(|live| {
                 live.names.is_some_and(|names| {
@@ -29,7 +28,7 @@ impl Interp {
             || Self::is_sym_key(key)
             || !self
                 .host_indexed
-                .get(&(Rc::as_ptr(object) as usize))
+                .get(&(Gc::as_ptr(object) as usize))
                 .is_some_and(|properties| {
                     properties
                         .live
@@ -86,7 +85,7 @@ impl Interp {
         }
         let getter = self
             .host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.as_ref())
             .and_then(|live| live.named_getter.clone())
             .expect("named membership requires a getter");
@@ -110,7 +109,7 @@ impl Interp {
     pub(crate) fn host_named_keys(&mut self, object: &Gc) -> Result<Vec<String>, Abrupt> {
         let Some(live) = self
             .host_indexed
-            .get(&(Rc::as_ptr(object) as usize))
+            .get(&(Gc::as_ptr(object) as usize))
             .and_then(|properties| properties.live.clone())
         else {
             return Ok(Vec::new());
@@ -289,7 +288,7 @@ mod tests {
     fn live_collections53_state_and_getters_are_traced_without_pinning_cycles() {
         let mut engine = setup(Tier::Jit);
         let target = value(&mut engine, "liveCollection");
-        let pointer = Rc::as_ptr(target.as_obj().unwrap()) as usize;
+        let pointer = Gc::as_ptr(target.as_obj().unwrap()) as usize;
         run(
             &mut engine,
             "collectionState.owner=liveCollection;collectionState=null;liveCollection=null",

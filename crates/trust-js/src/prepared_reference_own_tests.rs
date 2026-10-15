@@ -237,7 +237,7 @@ fn prepared_reference_own_numeric_internal_names_never_bypass_mapped_arguments()
         "var observe;var owner=(function(a){observe=()=>a;return arguments})(3);",
     );
     let owner = object(&mut engine, "owner");
-    let pointer = Rc::as_ptr(&owner) as usize;
+    let pointer = Gc::as_ptr(&owner) as usize;
     assert!(engine.interp.mapped_arguments.contains_key(&pointer));
     let mut reference = PreparedReference::object(Rc::from("0"), owner.clone(), false);
     // Simulate a previously published ordinary shape hint: owner kind must still be checked.
@@ -292,7 +292,7 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
     assert!(engine
         .interp
         .refresh_reference_own_data_hint(&mut reference));
-    let pointer = Rc::as_ptr(&owner) as usize;
+    let pointer = Gc::as_ptr(&owner) as usize;
     // Registration marks the object as side-table exotic, as install_indexed_properties does.
     owner.borrow().ic_plain.set(false);
     engine.interp.host_indexed.insert(
@@ -380,13 +380,13 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Num(29.0)));
-    let weak_child = Rc::downgrade(&child);
+    let weak_child = Gc::downgrade(&child);
     let owner = Object::new(None);
     owner
         .borrow_mut()
         .props
         .insert("value", Property::plain(Value::Obj(child)));
-    let weak_owner = Rc::downgrade(&owner);
+    let weak_owner = Gc::downgrade(&owner);
     let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
     let returned = engine
         .interp

@@ -19,7 +19,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
         // A proxy is a constructor exactly when its target is one.
         obj.borrow_mut().is_constructor = is_constructor_value(&target);
     }
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.inline_ic_safe.set(false);
     obj.borrow().ic_plain.set(false);
@@ -29,7 +29,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
 
 fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
     if let Value::Obj(o) = arg(a, 0) {
-        let ptr = Rc::as_ptr(&o) as usize;
+        let ptr = Gc::as_ptr(&o) as usize;
         // Keep the entry but null the handler, so the object stays a (revoked) Proxy and every
         // operation throws a TypeError rather than silently acting like a plain object.
         if let Some((target, _)) = i.proxies.get(&ptr).cloned() {

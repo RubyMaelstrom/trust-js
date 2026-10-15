@@ -70,7 +70,7 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     let (Value::Obj(actual), Value::Obj(expected)) = (result, owner) else {
         panic!("owned objects");
     };
-    assert!(Rc::ptr_eq(&actual, &expected));
+    assert!(crate::value::Gc::ptr_eq(&actual, &expected));
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
 }
 
@@ -97,6 +97,6 @@ fn osr_compile_unavailable_keeps_exact_baseline_state_without_replay() {
     let (Value::Obj(actual), Value::Obj(expected)) = (result, owner) else {
         panic!("owned objects");
     };
-    assert!(Rc::ptr_eq(&actual, &expected));
+    assert!(crate::value::Gc::ptr_eq(&actual, &expected));
     assert_eq!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()), 0);
 }

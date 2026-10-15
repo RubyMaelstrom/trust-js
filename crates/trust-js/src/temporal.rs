@@ -134,13 +134,13 @@ fn balance_year_month(year: i64, month: i64) -> (i64, u8) {
 
 fn get(i: &Interp, this: &Value) -> Option<Temporal> {
     match this {
-        Value::Obj(o) => i.temporal.get(&(Rc::as_ptr(o) as usize)).cloned(),
+        Value::Obj(o) => i.temporal.get(&(Gc::as_ptr(o) as usize)).cloned(),
         _ => None,
     }
 }
 fn make(i: &mut Interp, proto: &str, data: Temporal) -> Value {
     let obj = Object::new(i.extra_protos.get(proto).cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.temporal.insert(p, data);
     Value::Obj(obj)
@@ -1742,7 +1742,7 @@ fn make_like(i: &mut Interp, src: &Value, kind: &str, t: Temporal) -> Value {
 /// Record the calendar id on a just-created Temporal object.
 fn set_cal(i: &mut Interp, v: &Value, cal: std::rc::Rc<str>) {
     if let Value::Obj(o) = v {
-        i.temporal_cal.insert(Rc::as_ptr(o) as usize, cal);
+        i.temporal_cal.insert(Gc::as_ptr(o) as usize, cal);
     }
 }
 
@@ -1751,7 +1751,7 @@ fn cal_of(i: &Interp, this: &Value) -> std::rc::Rc<str> {
     match this {
         Value::Obj(o) => i
             .temporal_cal
-            .get(&(Rc::as_ptr(o) as usize))
+            .get(&(Gc::as_ptr(o) as usize))
             .cloned()
             .unwrap_or_else(|| std::rc::Rc::from("iso8601")),
         _ => std::rc::Rc::from("iso8601"),
@@ -2621,7 +2621,7 @@ fn zoned_to_locale_string(i: &mut Interp, this: Value, a: &[Value]) -> Result<Va
         Some(o) => o.clone(),
         None => return Err(i.make_error("TypeError", "not an object")),
     };
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     let (epoch_ns, tz) = match i.temporal.get(&ptr) {
         Some(Temporal::Zoned { epoch_ns, tz, .. }) => (*epoch_ns, tz.clone()),
         _ => return Err(i.make_error(

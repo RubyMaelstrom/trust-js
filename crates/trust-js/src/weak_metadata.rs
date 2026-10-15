@@ -507,7 +507,7 @@ mod tests {
 
     fn reference(interp: &mut Interp, target: &WeakTarget) -> Gc {
         let owner = Object::new(None);
-        let identity = Rc::as_ptr(&owner) as usize;
+        let identity = Gc::as_ptr(&owner) as usize;
         interp.gc_pin(&owner);
         interp.weak_refs.insert(identity, Some(target.clone()));
         interp
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(engine.interp.kept_alive.is_empty());
         assert!(target.upgrade().is_none());
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         assert_eq!(queue.pending_len(), 0);
         // Even an entirely empty subsequent checkpoint must notify the host exactly once.
         let _borrowed = queue.entries.borrow_mut();
@@ -951,7 +951,7 @@ mod tests {
         assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 1);
         engine.interp.gc_suppressed -= 1;
         engine.interp.gc_weak_metadata_safepoint(true);
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&reference) as usize)].is_none());
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&reference) as usize)].is_none());
         for keep_owner in [false, true] {
             let mut engine = Engine::new();
             let source = format!(
@@ -997,9 +997,9 @@ mod tests {
             assert_eq!(second.weak_metadata.deaths.pending_len(), 1);
             first.interp.gc_clear_weak_targets(&FastSet::default());
             second.gc_clear_weak_targets(&FastSet::default());
-            assert!(first.interp.weak_refs[&(Rc::as_ptr(&first_ref) as usize)].is_none());
-            assert!(first.interp.weak_refs[&(Rc::as_ptr(&first_ref_again) as usize)].is_none());
-            assert!(second.weak_refs[&(Rc::as_ptr(&second_ref) as usize)].is_none());
+            assert!(first.interp.weak_refs[&(Gc::as_ptr(&first_ref) as usize)].is_none());
+            assert!(first.interp.weak_refs[&(Gc::as_ptr(&first_ref_again) as usize)].is_none());
+            assert!(second.weak_refs[&(Gc::as_ptr(&second_ref) as usize)].is_none());
             assert_eq!(first.interp.weak_metadata.deaths.pending_len(), 0);
             assert_eq!(second.weak_metadata.deaths.pending_len(), 0);
         }
@@ -1022,7 +1022,7 @@ mod tests {
         );
         drop(target);
         second.interp.gc_clear_weak_targets(&FastSet::default());
-        assert!(second.interp.weak_refs[&(Rc::as_ptr(&other_owner) as usize)].is_none());
+        assert!(second.interp.weak_refs[&(Gc::as_ptr(&other_owner) as usize)].is_none());
     }
 
     #[test]
@@ -1040,7 +1040,7 @@ mod tests {
         );
         engine.interp.clear_kept_objects();
         engine.interp.gc_collect_young(GcCause::Explicit);
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         let other = Value::Obj(Object::new(None));
         let other_weak = WeakTarget::of(&other).unwrap();
         let ephemeral_owner = reference(&mut engine.interp, &other_weak);
@@ -1162,7 +1162,7 @@ mod tests {
         drop(symbol);
         drop(borrowed);
         engine.interp.gc_drain_weak_deaths();
-        assert!(engine.interp.weak_refs[&(Rc::as_ptr(&owner) as usize)].is_none());
+        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
     }
 
     #[test]

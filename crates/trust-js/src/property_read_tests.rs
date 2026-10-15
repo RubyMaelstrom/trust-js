@@ -266,7 +266,7 @@ fn getter_cache_owned_snapshot_stays_two_words_and_retains_exactly_one_owner() {
     assert_eq!(std::mem::size_of::<Option<CachedGet>>(), 16);
     let mut engine = Engine::new();
     let object = Object::new(None);
-    let weak = Rc::downgrade(&object);
+    let weak = Gc::downgrade(&object);
     let property = Property::plain(Value::Obj(object));
     assert_eq!(weak.strong_count(), 1);
     let read = engine
@@ -308,7 +308,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
             )
             .unwrap()
     };
-    let weak = Rc::downgrade(function.as_obj().unwrap());
+    let weak = Gc::downgrade(function.as_obj().unwrap());
     drop(function);
     engine.interp.gc_collect();
     let prototype = read.data().unwrap();
@@ -317,9 +317,9 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
         .get_member_key(&prototype, "constructor")
         .ok()
         .unwrap();
-    assert!(Rc::ptr_eq(
+    assert!(Gc::ptr_eq(
         constructor.as_obj().unwrap(),
-        &weak.upgrade().unwrap()
+        &Gc::from(weak.upgrade().unwrap())
     ));
     drop((prototype, constructor));
     engine.interp.gc_collect();
@@ -341,7 +341,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
                 Ok(object.props.get("id").unwrap().value())
             }),
         );
-        let weak = Rc::downgrade(getter.as_obj().unwrap());
+        let weak = Gc::downgrade(getter.as_obj().unwrap());
         holder.borrow_mut().props.insert(
             "cached",
             Property::accessor_prop(Some(getter), None, true, true),
@@ -544,7 +544,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
             Ok(this)
         }),
     );
-    let weak = Rc::downgrade(getter.as_obj().unwrap());
+    let weak = Gc::downgrade(getter.as_obj().unwrap());
     object.borrow_mut().props.insert(
         "cached",
         Property::accessor_prop(Some(getter), None, true, true),
@@ -555,7 +555,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         .get_computed_property(&base, &key)
         .ok()
         .unwrap();
-    assert!(Rc::ptr_eq(result.as_obj().unwrap(), &object));
+    assert!(Gc::ptr_eq(result.as_obj().unwrap(), &object));
     assert_eq!(called.get(), 1);
     assert!(weak.upgrade().is_none());
     assert!(matches!(

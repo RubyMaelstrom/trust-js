@@ -64,7 +64,7 @@ fn object_alloc_bench() {
         std::hint::black_box(Rc::new(std::cell::RefCell::new([0u8; 136])));
     });
     time_per_op("Rc::downgrade + drop weak", N, |_| {
-        std::hint::black_box(Rc::downgrade(&proto));
+        std::hint::black_box(crate::value::Gc::downgrade(&proto));
     });
     #[cfg(not(target_arch = "wasm32"))]
     time_per_op("stacker::remaining_stack()", N, |_| {

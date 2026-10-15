@@ -7,7 +7,6 @@
 use crate::fasthash::FastMap;
 use crate::host::NativeGcId;
 use crate::value::Value;
-use std::rc::Rc;
 
 #[derive(Clone, Copy)]
 enum Target {
@@ -82,7 +81,7 @@ impl NativeGcGraph {
             let to = self.index(to);
             let head = self
                 .js_edges
-                .entry(Rc::as_ptr(owner) as usize)
+                .entry(crate::value::Gc::as_ptr(owner) as usize)
                 .or_insert(END);
             let next = *head;
             *head = self.edges.len();
@@ -99,7 +98,7 @@ impl NativeGcGraph {
             let next = self.heads[from];
             self.heads[from] = self.edges.len();
             self.edges.push(Edge {
-                target: Target::JavaScript(Rc::as_ptr(value) as usize),
+                target: Target::JavaScript(crate::value::Gc::as_ptr(value) as usize),
                 next,
             });
         }
@@ -179,9 +178,9 @@ mod tests {
     fn native_graph_traces_mixed_cycles_without_strong_handles() {
         let left = Value::Obj(Object::new(None));
         let right = Value::Obj(Object::new(None));
-        let left_id = Rc::as_ptr(left.as_obj().unwrap()) as usize;
-        let right_id = Rc::as_ptr(right.as_obj().unwrap()) as usize;
-        let before = Rc::strong_count(left.as_obj().unwrap());
+        let left_id = crate::value::Gc::as_ptr(left.as_obj().unwrap()) as usize;
+        let right_id = crate::value::Gc::as_ptr(right.as_obj().unwrap()) as usize;
+        let before = crate::value::Gc::strong_count(left.as_obj().unwrap());
         let mut graph = NativeGcGraph::default();
         graph.js_to_native(&left, node(1, 1));
         graph.native_edge(node(1, 1), node(1, 2));
@@ -190,7 +189,10 @@ mod tests {
         graph.js_to_native(&right, node(1, 3));
         graph.native_to_js(node(1, 3), &left);
         graph.native_edge(node(2, 1), node(2, 2));
-        assert_eq!(Rc::strong_count(left.as_obj().unwrap()), before);
+        assert_eq!(
+            crate::value::Gc::strong_count(left.as_obj().unwrap()),
+            before
+        );
         let mut reachable = Vec::new();
         graph.trace_roots(&mut reachable);
         assert!(reachable.is_empty());
@@ -209,7 +211,7 @@ mod tests {
     fn native_minor_old_prefix_activates_foreign_edges_without_enumerating_old_heap() {
         let live = Value::Obj(Object::new(None));
         let dead = Value::Obj(Object::new(None));
-        let live_pointer = Rc::as_ptr(live.as_obj().unwrap()) as usize;
+        let live_pointer = crate::value::Gc::as_ptr(live.as_obj().unwrap()) as usize;
         let mut graph = NativeGcGraph::default();
         graph.declare_old_generation("test.dom", 1, 100_000);
         assert!(
@@ -330,7 +332,7 @@ mod tests {
         }
         let weak: Vec<_> = values
             .iter()
-            .map(|v| Rc::downgrade(v.as_obj().unwrap()))
+            .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
             .collect();
         engine.interp.op_state().put(MixedHost {
             values,
@@ -379,7 +381,7 @@ mod tests {
         let dead2 = Value::Obj(Object::new(None));
         let weak: Vec<_> = [&key, &dead1, &dead2]
             .iter()
-            .map(|v| Rc::downgrade(v.as_obj().unwrap()))
+            .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
             .collect();
         engine.interp.op_state().put(MixedHost {
             values: vec![owner, key, dead1, dead2],

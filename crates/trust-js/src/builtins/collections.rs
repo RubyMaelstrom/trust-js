@@ -151,7 +151,7 @@ fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     // The Set algebra algorithms use OrdinaryObjectCreate(%Set.prototype%), not species or the
     // currently active new.target (which may belong to an unrelated enclosing constructor).
     let obj = Object::new(i.extra_protos.get("Set").cloned());
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     i.map_data.insert(
         ptr,
@@ -424,7 +424,7 @@ fn collection_ctor(
         return Err(i.make_error("TypeError", "Constructor requires 'new'"));
     }
     let obj = new_from_ctor(i, name)?;
-    let ptr = Rc::as_ptr(&obj) as usize;
+    let ptr = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     let kind = if is_set {
         CollectionKind::Set
@@ -685,7 +685,7 @@ pub(super) fn install_map_like(
             })?;
             drop(group_index);
             let m = Object::new(i.extra_protos.get("Map").cloned());
-            let ptr = Rc::as_ptr(&m) as usize;
+            let ptr = Gc::as_ptr(&m) as usize;
             i.gc_pin(&m);
             i.map_data
                 .insert(ptr, OrderedCollection::new(CollectionKind::Map));
@@ -884,7 +884,7 @@ fn collection_of_kind<'a>(
     kind: crate::ordered_collection::CollectionKind,
 ) -> Result<&'a crate::ordered_collection::OrderedCollection, Value> {
     this.as_obj()
-        .and_then(|object| i.map_data.get(&(Rc::as_ptr(object) as usize)))
+        .and_then(|object| i.map_data.get(&(Gc::as_ptr(object) as usize)))
         .filter(|data| data.kind() == kind)
         .ok_or_else(|| i.make_error("TypeError", "method called on an incompatible receiver"))
 }
@@ -912,7 +912,7 @@ pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
     // `map_set` with one [[MapData]] lookup (`insert` canonicalizes -0).
     let data = this
         .as_obj()
-        .and_then(|object| i.map_data.get_mut(&(Rc::as_ptr(object) as usize)))
+        .and_then(|object| i.map_data.get_mut(&(Gc::as_ptr(object) as usize)))
         .filter(|data| data.kind() == crate::ordered_collection::CollectionKind::Map);
     match data {
         Some(data) => data.insert(arg(a, 0), arg(a, 1)),

@@ -33,7 +33,7 @@ impl Snapshot<'_> {
         let objects: FastMap<_, _> = self
             .objects
             .iter()
-            .map(|o| (Rc::as_ptr(o) as usize, o))
+            .map(|o| (Gc::as_ptr(o) as usize, o))
             .collect();
         let scopes: FastMap<_, _> = self
             .scopes
@@ -48,7 +48,7 @@ impl Snapshot<'_> {
             }
         };
         for object in self.object_roots {
-            add(Node::Object(Rc::as_ptr(object) as usize));
+            add(Node::Object(Gc::as_ptr(object) as usize));
         }
         for scope in self.scope_roots {
             add(Node::Scope(Rc::as_ptr(scope) as usize));
@@ -62,10 +62,10 @@ impl Snapshot<'_> {
             for (key, value) in entries {
                 let Value::Obj(value) = value else { continue };
                 let owner = Node::Object(owner);
-                let value = Node::Object(Rc::as_ptr(value) as usize);
+                let value = Node::Object(Gc::as_ptr(value) as usize);
                 match key.upgrade() {
                     Some(Value::Obj(key)) => {
-                        let key = Node::Object(Rc::as_ptr(&key) as usize);
+                        let key = Node::Object(Gc::as_ptr(&key) as usize);
                         ephemerons.entry(owner).or_default().push((key, value));
                         ephemerons.entry(key).or_default().push((owner, value));
                     }
@@ -93,7 +93,7 @@ impl Snapshot<'_> {
                     }
                     destinations.extend(object_edges.drain(..).map(|o| {
                         (
-                            Node::Object(Rc::as_ptr(&o) as usize),
+                            Node::Object(Gc::as_ptr(&o) as usize),
                             "object/internal-slot",
                         )
                     }));
@@ -130,12 +130,12 @@ impl Snapshot<'_> {
                     }
                     if let Some(Value::Obj(object)) = &b.with_obj {
                         destinations
-                            .push((Node::Object(Rc::as_ptr(object) as usize), "with-object"));
+                            .push((Node::Object(Gc::as_ptr(object) as usize), "with-object"));
                     }
                     for binding in b.vars.values() {
                         if let Value::Obj(object) = &binding.value {
                             destinations
-                                .push((Node::Object(Rc::as_ptr(object) as usize), "binding"));
+                                .push((Node::Object(Gc::as_ptr(object) as usize), "binding"));
                         }
                         if let Some((scope, _)) = binding.import_ref.as_deref() {
                             destinations
@@ -149,7 +149,7 @@ impl Snapshot<'_> {
                 destinations.extend(
                     members
                         .iter()
-                        .map(|o| (Node::Object(Rc::as_ptr(o) as usize), "realm-intrinsics")),
+                        .map(|o| (Node::Object(Gc::as_ptr(o) as usize), "realm-intrinsics")),
                 );
                 destinations.push((Node::Scope(Rc::as_ptr(scope) as usize), "realm-environment"));
             }

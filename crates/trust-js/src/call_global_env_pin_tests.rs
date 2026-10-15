@@ -54,8 +54,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
         .member_get(&main, "nativeRealmProbe")
         .ok()
         .expect("installed native probe");
-    let native_id = Rc::as_ptr(native.as_obj().unwrap()) as usize;
-    let native_pin = Rc::downgrade(native.as_obj().unwrap());
+    let native_id = crate::value::Gc::as_ptr(native.as_obj().unwrap()) as usize;
+    let native_pin = crate::value::Gc::downgrade(native.as_obj().unwrap());
     let bytes =
         crate::compile_snapshot("globalThis.subject = function(native) { return native(); };")
             .expect("shared caller snapshot");

@@ -380,7 +380,7 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
         }
         Value::Obj(value) => {
             state.write_u8(8);
-            state.write_usize(Rc::as_ptr(value) as usize);
+            state.write_usize(Gc::as_ptr(value) as usize);
         }
     }
     // The table masks the LOW hash bits to choose its initial bucket. Fx's
@@ -606,13 +606,13 @@ mod tests {
         let key = crate::value::Object::new(None);
         let first = crate::value::Object::new(None);
         let second = crate::value::Object::new(None);
-        let first_weak = Rc::downgrade(&first);
-        let second_weak = Rc::downgrade(&second);
+        let first_weak = Gc::downgrade(&first);
+        let second_weak = Gc::downgrade(&second);
         let mut data = OrderedCollection::new(CollectionKind::Map);
         data.insert(Value::Obj(key.clone()), Value::Obj(first));
-        assert_eq!(Rc::strong_count(&key), 2);
+        assert_eq!(Gc::strong_count(&key), 2);
         data.insert(Value::Obj(key.clone()), Value::Obj(second));
-        assert_eq!(Rc::strong_count(&key), 2, "index never owns another key");
+        assert_eq!(Gc::strong_count(&key), 2, "index never owns another key");
         assert!(
             first_weak.upgrade().is_none(),
             "replaced payload drops once"
@@ -620,7 +620,7 @@ mod tests {
         assert!(second_weak.upgrade().is_some());
         assert_eq!(data.len(), 1);
         assert!(data.delete(&Value::Obj(key.clone())));
-        assert_eq!(Rc::strong_count(&key), 1);
+        assert_eq!(Gc::strong_count(&key), 1);
         assert!(
             second_weak.upgrade().is_none(),
             "deleted payload drops once"

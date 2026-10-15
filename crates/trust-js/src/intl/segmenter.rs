@@ -640,7 +640,7 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
         .get(BOUNDARIES_SLOT)
         .map(|p| p.value());
     if let Some(Value::Obj(buffer)) = cached {
-        if let Some(bytes) = i.local_buffer(Rc::as_ptr(&buffer) as usize) {
+        if let Some(bytes) = i.local_buffer(Gc::as_ptr(&buffer) as usize) {
             return bytes.clone();
         }
     }

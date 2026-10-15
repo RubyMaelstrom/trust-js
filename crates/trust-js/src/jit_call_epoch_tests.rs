@@ -186,7 +186,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     let cells =
         unsafe { &*(chunk.jit_call_cache_ptr(cache) as *const [Cell<CallIc>; CALL_IC_WAYS]) };
     let object = Object::new(None);
-    let key = Rc::as_ptr(&object) as usize;
+    let key = crate::value::Gc::as_ptr(&object) as usize;
     let realm = Rc::as_ptr(&engine.interp.global_env) as usize;
     let mut context = ProbeContext([0; size_of::<JitCtx>().div_ceil(size_of::<usize>())]);
     context.0[offset_of!(JitCtx, interp) / size_of::<usize>()] =
@@ -220,10 +220,10 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
         cells[0].set(CallIc { epoch, ..seed });
         assert_eq!(invoke(&mut context), (2, 0), "real primary hit at {epoch}");
         cells[0].set(CallIc::EMPTY);
-        engine
-            .interp
-            .call_overflow
-            .insert(CallIc { epoch, ..seed }, Rc::downgrade(&object));
+        engine.interp.call_overflow.insert(
+            CallIc { epoch, ..seed },
+            crate::value::Gc::downgrade(&object),
+        );
         // A non-direct overflow hit intentionally re-probes in H_CALL, with way=4.
         assert_eq!(
             invoke(&mut context),
@@ -281,7 +281,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     }
     engine.interp.call_overflow.raw_sets = original_sets;
     assert_eq!(
-        Rc::strong_count(&object),
+        crate::value::Gc::strong_count(&object),
         2,
         "the probe must not consume the callee owner"
     );

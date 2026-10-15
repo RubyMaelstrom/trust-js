@@ -297,7 +297,9 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
                 "wrong named result for {kind:?} at value tag {tag}"
             );
             if kind.is_method() {
-                assert!(matches!(&values[1], Value::Obj(value) if Rc::ptr_eq(value, &receiver)));
+                assert!(
+                    matches!(&values[1], Value::Obj(value) if crate::value::Gc::ptr_eq(value, &receiver))
+                );
                 assert_eq!(values.len(), 3);
             } else {
                 assert_eq!(values.len(), 2);
@@ -314,15 +316,15 @@ fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
     use_kind(&mut chunk, site, ReadKind::Local);
 
     let result = crate::value::Object::new(None);
-    let weak_result = Rc::downgrade(&result);
+    let weak_result = crate::value::Gc::downgrade(&result);
     let receiver = crate::value::Object::new(None);
-    let weak_receiver = Rc::downgrade(&receiver);
+    let weak_receiver = crate::value::Gc::downgrade(&receiver);
     receiver.borrow_mut().props.insert(
         "value",
         crate::value::Property::plain(Value::Obj(result.clone())),
     );
     let prefix = crate::value::Object::new(None);
-    let weak_prefix = Rc::downgrade(&prefix);
+    let weak_prefix = crate::value::Gc::downgrade(&prefix);
     let mut outcome = invoke(
         &mut engine,
         &chunk,
@@ -418,11 +420,11 @@ fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner()
             "value",
             crate::value::Property::accessor_prop(Some(getter.clone()), None, true, true),
         );
-        let weak_receiver = Rc::downgrade(&receiver);
+        let weak_receiver = crate::value::Gc::downgrade(&receiver);
         let receiver_value = Value::Obj(receiver.clone());
         drop(receiver);
         let prefix = crate::value::Object::new(None);
-        let weak_prefix = Rc::downgrade(&prefix);
+        let weak_prefix = crate::value::Gc::downgrade(&prefix);
         let expected_prefix = Value::Obj(prefix.clone());
         let mut outcome = invoke(
             &mut engine,

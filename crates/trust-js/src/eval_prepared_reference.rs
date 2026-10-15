@@ -195,7 +195,7 @@ impl Interp {
     fn refresh_reference_own_data_hint(&self, reference: &mut PreparedReference) -> bool {
         debug_assert_eq!(reference.kind, REFERENCE_OBJECT);
         let object = reference.object.as_ref().expect("object Reference owner");
-        let pointer = Rc::as_ptr(object) as usize;
+        let pointer = Gc::as_ptr(object) as usize;
         let hint = if self.ordinary_get_ptr(pointer)
             && (self.mapped_arguments.is_empty() || !self.mapped_arguments.contains_key(&pointer))
         {

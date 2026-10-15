@@ -539,11 +539,11 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         );
         let target = value(&mut e, "target");
         let object = target.as_obj().unwrap();
-        let object_pin = Rc::downgrade(object);
+        let object_pin = crate::value::Gc::downgrade(object);
         let function_pin = function_pin(&target);
         let object_weak_before = object_pin.weak_count();
         let function_weak_before = function_pin.weak_count();
-        let key = Rc::as_ptr(object) as usize;
+        let key = crate::value::Gc::as_ptr(object) as usize;
         warm(&mut e);
         let caller = chunk(&mut e.interp, "invokeTarget");
         assert!(caller.jit.get().flatten().is_some(), "real compiled caller");
@@ -586,7 +586,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         assert_ne!(
             value(&mut e, "target")
                 .as_obj()
-                .map(|object| Rc::as_ptr(object))
+                .map(crate::value::Gc::as_ptr)
                 .unwrap() as usize,
             key
         );
@@ -598,11 +598,11 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         let mut e = engine();
         eval(&mut e, "var factory=new Function('offset','return function(x){return offset+x}');var first=factory(17),sibling=factory(37);function invokeShared(f,x){return f(x,99);}");
         let first = value(&mut e, "first");
-        let first_pin = Rc::downgrade(first.as_obj().unwrap());
-        let first_key = Rc::as_ptr(first.as_obj().unwrap()) as usize;
+        let first_pin = crate::value::Gc::downgrade(first.as_obj().unwrap());
+        let first_key = crate::value::Gc::as_ptr(first.as_obj().unwrap()) as usize;
         let ast = function_pin(&first);
         let sibling = value(&mut e, "sibling");
-        let sibling_key = Rc::as_ptr(sibling.as_obj().unwrap()) as usize;
+        let sibling_key = crate::value::Gc::as_ptr(sibling.as_obj().unwrap()) as usize;
         assert_eq!(ast.as_ptr(), function_pin(&sibling).as_ptr());
         assert_eq!(
             eval(
@@ -650,8 +650,8 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         );
         warm(&mut e);
         let target = value(&mut e, "target");
-        let pin = Rc::downgrade(target.as_obj().unwrap());
-        let key = Rc::as_ptr(target.as_obj().unwrap()) as usize;
+        let pin = crate::value::Gc::downgrade(target.as_obj().unwrap());
+        let key = crate::value::Gc::as_ptr(target.as_obj().unwrap()) as usize;
         let caller = chunk(&mut e.interp, "invokeTarget");
         let caller_code = Rc::downgrade(&caller.jit.get().flatten().unwrap());
         let ic = caller.cached_call_for(key).expect("native primary entry");

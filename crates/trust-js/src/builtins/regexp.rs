@@ -12,7 +12,7 @@ fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Va
             });
         }
         // The %RegExp.prototype% object itself has default values rather than throwing.
-        if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
+        if i.extra_protos.get("RegExp").map(|p| Gc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(match flag {
                 Some(_) => Value::Undefined,
                 None => Value::lstr(""),
@@ -87,7 +87,7 @@ fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
             }
             return Ok(Value::lstr(out));
         }
-        if i.extra_protos.get("RegExp").map(|p| Rc::as_ptr(p) as usize) == Some(ptr) {
+        if i.extra_protos.get("RegExp").map(|p| Gc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(Value::lstr("(?:)"));
         }
     }
@@ -159,7 +159,7 @@ pub(super) fn literal_match_dependencies_canonical(i: &Interp) -> bool {
         "sticky",
         "exec",
     ];
-    let proto_ptr = Rc::as_ptr(proto) as usize;
+    let proto_ptr = Gc::as_ptr(proto) as usize;
     let shape = p.props.shape();
     let cached = i.regexp_dependency_cache.get();
     let slots = if cached.proto == proto_ptr && cached.shape == shape {
@@ -251,7 +251,7 @@ fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::r
     let Value::Obj(obj) = this else {
         return None;
     };
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr).cloned()?;
     let b = obj.borrow();
     if !matches!(b.exotic, Exotic::None)
@@ -259,7 +259,7 @@ fn direct_reg_exp_flags(i: &Interp, this: &Value) -> Option<std::rc::Rc<crate::r
             .proto
             .as_ref()
             .zip(i.extra_protos.get("RegExp"))
-            .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+            .is_some_and(|(a, b)| Gc::ptr_eq(a, b))
         || FLAG_PROP_NAMES.iter().any(|name| b.props.contains(name))
     {
         return None;
@@ -331,7 +331,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
                 .borrow()
                 .proto
                 .as_ref()
-                .map(|p| Rc::ptr_eq(p, rp))
+                .map(|p| Gc::ptr_eq(p, rp))
                 .unwrap_or(false);
             if !direct {
                 return Err(i.make_error(
@@ -341,14 +341,14 @@ pub(super) fn install_regexp(it: &mut Interp) {
             }
         }
         let (source, flags) = match arg(a, 0) {
-            Value::Obj(o) if i.regexps.contains_key(&(Rc::as_ptr(&o) as usize)) => {
+            Value::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(&o) as usize)) => {
                 // A RegExp pattern copies its source/flags; a second flags argument is then an error.
                 if !matches!(arg(a, 1), Value::Undefined) {
                     return Err(
                         i.make_error("TypeError", "cannot supply flags when compiling a RegExp")
                     );
                 }
-                let re = i.regexps[&(Rc::as_ptr(&o) as usize)].clone();
+                let re = i.regexps[&(Gc::as_ptr(&o) as usize)].clone();
                 (re.source.clone(), re.flags.clone())
             }
             Value::Undefined => (String::new(), regexp_flags_arg(i, a)?),
@@ -403,7 +403,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let flags_arg = arg(a, 1);
         // IsRegExp: an Object whose truthy @@match (when defined) or [[RegExpMatcher]] slot.
         let has_slots = matches!(&pattern, Value::Obj(o)
-            if i.regexps.contains_key(&(Rc::as_ptr(o) as usize)));
+            if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
         let pattern_is_regexp = if matches!(pattern, Value::Obj(_)) {
             let m = match well_known_key(i, "match") {
                 Some(key) => ab(i.get_member_key(&pattern, &key))?,
@@ -422,7 +422,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         if !i.constructing && pattern_is_regexp && matches!(flags_arg, Value::Undefined) {
             let c = ab(i.get_member_key(&pattern, "constructor"))?;
             let same = match (&c, i.extra_protos.get("%RegExpCtor%")) {
-                (Value::Obj(co), Some(rc)) => Rc::ptr_eq(co, rc),
+                (Value::Obj(co), Some(rc)) => Gc::ptr_eq(co, rc),
                 _ => false,
             };
             if same {
@@ -434,7 +434,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         // RegExpInitialize run the ToString coercions.
         let (src_v, fl_v) = if has_slots {
             let re = match &pattern {
-                Value::Obj(o) => i.regexps[&(Rc::as_ptr(o) as usize)].clone(),
+                Value::Obj(o) => i.regexps[&(Gc::as_ptr(o) as usize)].clone(),
                 _ => unreachable!(),
             };
             let fl = match flags_arg {
@@ -565,7 +565,7 @@ fn regexp_escape_cp(cp: u32, first: bool) -> String {
 fn regexp_legacy_brand(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
     let ctor = i.extra_protos.get("%RegExpCtor%").cloned();
     match (this, ctor) {
-        (Value::Obj(o), Some(c)) if Rc::ptr_eq(o, &c) => Ok(c),
+        (Value::Obj(o), Some(c)) if Gc::ptr_eq(o, &c) => Ok(c),
         _ => Err(i.make_error(
             "TypeError",
             "RegExp legacy static accessor called on an incompatible receiver",
@@ -854,7 +854,7 @@ fn re_sym_replace_impl(
     // internal flags are checked before entering the allocation-free matcher.
     if discard_result && !functional {
         if let Value::Obj(obj) = &this {
-            let ptr = Rc::as_ptr(obj) as usize;
+            let ptr = Gc::as_ptr(obj) as usize;
             let re = i.regexps.get(&ptr).cloned();
             let direct_exec = re.as_ref().is_some_and(|re| {
                 let b = obj.borrow();
@@ -862,7 +862,7 @@ fn re_sym_replace_impl(
                     .proto
                     .as_ref()
                     .zip(i.extra_protos.get("RegExp"))
-                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b));
+                    .is_some_and(|(a, b)| Gc::ptr_eq(a, b));
                 if !matches!(b.exotic, Exotic::None)
                     || b.props.contains("exec")
                     || !direct_proto
@@ -1266,7 +1266,7 @@ fn re_sym_matchall(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
 /// %RegExp%.prototype without running user code. The splitter's own RegExpExec then finds the
 /// intrinsic `exec`. `None` when any of them could run user code.
 fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Regex>> {
-    let ptr = Rc::as_ptr(obj) as usize;
+    let ptr = Gc::as_ptr(obj) as usize;
     let re = i.regexps.get(&ptr)?.clone();
     let proto = i.extra_protos.get("RegExp")?.clone();
     let ctor = i.extra_protos.get("%RegExpCtor%")?.clone();
@@ -1276,7 +1276,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
     {
         let b = obj.borrow();
         if !matches!(b.exotic, Exotic::None)
-            || b.proto.as_ref().is_none_or(|p| !Rc::ptr_eq(p, &proto))
+            || b.proto.as_ref().is_none_or(|p| !Gc::ptr_eq(p, &proto))
             || b.props.contains(&match_key)
             || [
                 "constructor",
@@ -1307,7 +1307,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
             .filter(|property| !property.accessor())
             .map(Property::value)
             .is_some_and(
-                |value| matches!(value, Value::Obj(ref found) if Rc::ptr_eq(found, &ctor)),
+                |value| matches!(value, Value::Obj(ref found) if Gc::ptr_eq(found, &ctor)),
             );
         let match_ok = p
             .props
@@ -1322,7 +1322,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
         let species_ok = c.props.get(&species_key).is_some_and(|property| {
             matches!(
                 property.getter(),
-                Some(Value::Obj(function)) if Rc::ptr_eq(function, &species_getter)
+                Some(Value::Obj(function)) if Gc::ptr_eq(function, &species_getter)
             ) && property.setter().is_none()
         });
         let prototype_ok = c
@@ -1331,7 +1331,7 @@ fn split_species_canonical(i: &Interp, obj: &Gc) -> Option<Rc<crate::regex::Rege
             .filter(|property| !property.accessor())
             .map(Property::value)
             .is_some_and(
-                |value| matches!(value, Value::Obj(ref found) if Rc::ptr_eq(found, &proto)),
+                |value| matches!(value, Value::Obj(ref found) if Gc::ptr_eq(found, &proto)),
             );
         if !species_ok || !prototype_ok {
             return None;

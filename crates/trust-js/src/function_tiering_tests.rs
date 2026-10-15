@@ -481,9 +481,9 @@ fn migrated_private_homes_release_overwritten_objects_before_returning() {
             engine.set_tier_threshold(32);
             install_native(&mut engine, "watch", |i, _, args| {
                 let object = args[0].as_obj().expect("watched typed array");
-                let info = i.typed_arrays[&(std::rc::Rc::as_ptr(object) as usize)];
+                let info = i.typed_arrays[&(crate::value::Gc::as_ptr(object) as usize)];
                 WATCHED_BUFFER_OWNER.with(|owner| {
-                    *owner.borrow_mut() = Some((std::rc::Rc::downgrade(object), info.buffer));
+                    *owner.borrow_mut() = Some((crate::value::Gc::downgrade(object), info.buffer));
                 });
                 Ok(crate::value::Value::Undefined)
             });

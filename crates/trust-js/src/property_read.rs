@@ -425,13 +425,12 @@ impl Interp {
             execution_stack_exhausted, with_execution_stack, GC_CALL_POLL_MASK,
         };
         use crate::value::{Callable, Exotic};
-        use std::rc::Rc;
         if self.tier != crate::bytecode::Tier::Jit || self.pending_tail.is_some() {
             return None;
         }
         let getter = getter.as_obj()?;
         let receiver = receiver.as_obj()?;
-        let key = Rc::as_ptr(getter) as usize;
+        let key = crate::value::Gc::as_ptr(getter) as usize;
         if !self.ordinary_get_ptr(key) {
             return None;
         }
@@ -441,7 +440,7 @@ impl Interp {
                 return None;
             };
             let f = &user.func;
-            if user.realm != Rc::as_ptr(&self.global) as usize
+            if user.realm != crate::value::Gc::as_ptr(&self.global) as usize
                 || !f.params.is_empty()
                 || f.is_arrow
                 || f.is_async
@@ -457,7 +456,7 @@ impl Interp {
             }
             chunk.clone()
         };
-        if !self.ordinary_get_ptr(Rc::as_ptr(receiver) as usize)
+        if !self.ordinary_get_ptr(crate::value::Gc::as_ptr(receiver) as usize)
             || (!self.class_info.is_empty() && self.class_info.contains_key(&key))
             || self.gc_tick.wrapping_add(1) & GC_CALL_POLL_MASK == 0
             || crate::value::heap_live_objects(&self.gc_heap) > self.gc_next

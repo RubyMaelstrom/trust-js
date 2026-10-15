@@ -853,7 +853,6 @@ fn legacy_function_reflection_diagnostics_preserve_lazy_materialization() {
 
 #[test]
 fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
-    use std::rc::Rc;
     for mode in [1, 2] {
         let mut engine = Engine::new();
         engine.set_tier(crate::bytecode::Tier::Jit);
@@ -888,7 +887,7 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
         let crate::value::Value::Obj(function) = value else {
             panic!("function object")
         };
-        let weak = Rc::downgrade(&function);
+        let weak = crate::value::Gc::downgrade(&function);
         drop(function);
         let source = format!("try {{ dispatch(victim,{mode}) }} catch(error) {{ error===sentinel ? 'sentinel' : 'wrong error' }}");
         assert_eq!(
@@ -1377,7 +1376,7 @@ fn embedder_indexed_property_side_table_does_not_pin_dead_objects() {
     let target = Value::Obj(engine.ctx().new_object());
     let pointer = target
         .as_obj()
-        .map(|object| std::rc::Rc::as_ptr(object) as usize)
+        .map(|object| crate::value::Gc::as_ptr(object) as usize)
         .expect("target is an object");
     engine
         .ctx()
@@ -3464,8 +3463,6 @@ fn nested_calls_keep_the_surrounding_agent_activation_on_the_fast_path() {
 #[cfg(feature = "embed")]
 #[test]
 fn host_call_entry_activates_the_receiving_engine_agent() {
-    use std::rc::Rc;
-
     fn make_object(
         ctx: &mut crate::embed::Ctx,
         _this: Value,
@@ -3510,22 +3507,20 @@ fn host_call_entry_activates_the_receiving_engine_agent() {
     let second_snapshot = crate::value::heap_gc_snapshot(&second.interp.gc_heap);
     assert!(first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(!second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(!first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
 }
 
 #[test]
 fn shadow_realm_heap_transitions_restore_the_caller_heap() {
-    use std::rc::Rc;
-
     let mut engine = Engine::new();
     let _ = engine
         .eval(
@@ -3558,7 +3553,7 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         Some(crate::value::Value::Obj(object)) => object,
         _ => panic!("parent marker was retained"),
     };
-    let shadow_key = Rc::as_ptr(&shadow) as usize;
+    let shadow_key = crate::value::Gc::as_ptr(&shadow) as usize;
     let child = engine
         .interp
         .shadow_realms
@@ -3579,16 +3574,16 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
     let child_snapshot = crate::value::heap_gc_snapshot(&child.gc_heap);
     assert!(parent_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &parent_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &parent_object)));
     assert!(!child_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &parent_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &parent_object)));
     assert!(child_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &child_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &child_object)));
     assert!(!parent_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &child_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &child_object)));
 }
 
 #[test]
@@ -6624,8 +6619,6 @@ fn gc_keeps_reachable_cycles() {
 
 #[test]
 fn gc_registry_reuses_dead_object_slots() {
-    use std::rc::Rc;
-
     let (slots_before, _) = crate::value::gc_registry_stats();
     for _ in 0..200_000 {
         drop(crate::value::Object::new(None));
@@ -6640,9 +6633,9 @@ fn gc_registry_reuses_dead_object_slots() {
     // A live weak slot must become a strong snapshot handle, then tombstone synchronously when
     // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
     let object = crate::value::Object::new(None);
-    let ptr = Rc::as_ptr(&object);
+    let ptr = crate::value::Gc::as_ptr(&object);
     let snapshot = crate::value::gc_snapshot();
-    assert!(snapshot.iter().any(|o| Rc::as_ptr(o) == ptr));
+    assert!(snapshot.iter().any(|o| crate::value::Gc::as_ptr(o) == ptr));
     drop(snapshot);
     drop(object);
     let (slots_final, free_final) = crate::value::gc_registry_stats();
@@ -6677,8 +6670,6 @@ fn gc_registry_remains_valid_across_repeated_sweeps() {
 
 #[test]
 fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
-    use std::rc::Rc;
-
     // ECMA-262 §9.7 Agents makes the executing thread a replaceable component of an Agent, and
     // §27.5.3.3 GeneratorResume runs the suspended [[GeneratorContext]]. An object and lexical
     // environment allocated by that context therefore remain owned by the same Agent when TRust JS
@@ -6718,7 +6709,7 @@ fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
     assert!(
         snapshot
             .iter()
-            .any(|object| Rc::ptr_eq(object, &worker_object)),
+            .any(|object| crate::value::Gc::ptr_eq(object, &worker_object)),
         "the Agent heap omitted an object allocated by its suspended execution context"
     );
     let scopes_after = crate::value::gc_scope_snapshot(&engine.interp.gc_heap).len();
@@ -6754,8 +6745,6 @@ fn gc_registry_follows_an_agent_across_generator_vm_resumptions() {
 
 #[test]
 fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
-    use std::rc::Rc;
-
     let mut first = Engine::new();
     let mut second = Engine::new();
     let _ = first
@@ -6792,16 +6781,16 @@ fn independent_agents_have_independent_gc_registries_on_one_driver_thread() {
 
     assert!(first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
     assert!(!first_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &second_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &second_object)));
     assert!(!second_snapshot
         .iter()
-        .any(|object| Rc::ptr_eq(object, &first_object)));
+        .any(|object| crate::value::Gc::ptr_eq(object, &first_object)));
 }
 
 #[test]
@@ -6931,7 +6920,7 @@ fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
             let heap = Rc::downgrade(&engine.interp.gc_heap);
             let objects: Vec<_> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
                 .iter()
-                .map(|object| Rc::downgrade(object))
+                .map(crate::value::Gc::downgrade)
                 .collect();
             let scopes: Vec<_> = crate::value::gc_scope_snapshot(&engine.interp.gc_heap)
                 .iter()
@@ -29523,7 +29512,7 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                     .interp
                     .get_var("o", &env)
                     .unwrap_or_else(|_| panic!("o"));
-                let weak = std::rc::Rc::downgrade(value.as_obj().unwrap());
+                let weak = crate::value::Gc::downgrade(value.as_obj().unwrap());
                 drop(value);
                 run_in(&mut engine, "o = null;");
                 if !needs_home {
@@ -31510,7 +31499,7 @@ fn number_format_composes_per_units_from_cldr_patterns() {
 fn embedding_helpers_follow_their_documented_semantics() {
     let mut engine = Engine::new();
     let same = |a: &Value, b: &Value| match (a, b) {
-        (Value::Obj(a), Value::Obj(b)) => std::rc::Rc::ptr_eq(a, b),
+        (Value::Obj(a), Value::Obj(b)) => crate::value::Gc::ptr_eq(a, b),
         _ => false,
     };
     let value = |engine: &mut Engine, source: &str| {

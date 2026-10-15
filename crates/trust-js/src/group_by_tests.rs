@@ -287,9 +287,9 @@ fn group_by_cached_callees_keep_then_release_their_final_owners() {
                     .get_var(name, &env)
                     .unwrap_or_else(|_| panic!("fixture callee {name}"));
                 let object = callee.as_obj().unwrap();
-                weak_callees.push(std::rc::Rc::downgrade(object));
+                weak_callees.push(crate::value::Gc::downgrade(object));
                 let sentinel = engine.interp.new_object();
-                weak_fields.push(std::rc::Rc::downgrade(&sentinel));
+                weak_fields.push(crate::value::Gc::downgrade(&sentinel));
                 object.borrow_mut().props.insert(
                     "sentinel",
                     crate::value::Property::plain(Value::Obj(sentinel)),

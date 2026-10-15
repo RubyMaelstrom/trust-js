@@ -463,7 +463,7 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
             let Value::Obj(global) = &child else {
                 unreachable!()
             };
-            addresses.push(Rc::as_ptr(global) as usize);
+            addresses.push(crate::value::Gc::as_ptr(global) as usize);
             assert_eq!(
                 in_realm(it, &child, run),
                 expected,
@@ -494,7 +494,7 @@ fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
         let Value::Obj(global) = &child else {
             unreachable!()
         };
-        let address = Rc::as_ptr(global) as usize;
+        let address = crate::value::Gc::as_ptr(global) as usize;
         let child_statics = in_realm(it, &child, |it| {
             eval_string(
                 it,

@@ -45,7 +45,7 @@ pub(crate) fn snapshot_target_index(
         return live
             .iter()
             .enumerate()
-            .map(|(index, object)| (Rc::as_ptr(object) as usize, index))
+            .map(|(index, object)| (Gc::as_ptr(object) as usize, index))
             .collect();
     }
     let mut wanted = FastSet::with_capacity_and_hasher(count, Default::default());
@@ -59,7 +59,7 @@ pub(crate) fn snapshot_target_index(
     );
     let mut index = FastMap::with_capacity_and_hasher(wanted.len(), Default::default());
     for (slot, object) in live.iter().enumerate() {
-        let pointer = Rc::as_ptr(object) as usize;
+        let pointer = Gc::as_ptr(object) as usize;
         if wanted.remove(&pointer) {
             index.insert(pointer, slot);
             if wanted.is_empty() {
@@ -191,7 +191,7 @@ impl GcEdgeSink for CountedEdges<'_> {
         let target =
             unsafe { object.try_borrow_unguarded() }.expect("object mutably borrowed during GC");
         target.gc_scratch.set(target.gc_scratch.get() + 1);
-        self.objects.push(Rc::as_ptr(object));
+        self.objects.push(Gc::as_ptr(object));
     }
 
     #[inline]
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn snapshot_target_index_preserves_requested_identities_and_ownership() {
         let live: Vec<_> = (0..128).map(|_| Object::new(None)).collect();
-        let pointer = |index: usize| Rc::as_ptr(&live[index]) as usize;
+        let pointer = |index: usize| Gc::as_ptr(&live[index]) as usize;
         let empty = FastMap::default();
         let none = snapshot_target_index(&live, &[], &empty, &empty);
         assert!(none.is_empty());
@@ -345,7 +345,7 @@ mod tests {
         }
         assert!(!sparse.contains_key(&usize::MAX));
         assert!(!sparse.contains_key(&pointer(0)), "owners are not targets");
-        assert!(live.iter().all(|object| Rc::strong_count(object) == 1));
+        assert!(live.iter().all(|object| Gc::strong_count(object) == 1));
 
         // A dense request uses the previous full-map path; duplicate-heavy
         // requests also take this conservative storage bound.
@@ -360,7 +360,7 @@ mod tests {
             }
         }
         assert!(snapshot_target_index(&[], &roots, &edges, &templates).is_empty());
-        assert!(live.iter().all(|object| Rc::strong_count(object) == 1));
+        assert!(live.iter().all(|object| Gc::strong_count(object) == 1));
     }
 
     fn value(engine: &mut Engine, source: &str) -> String {
@@ -381,7 +381,7 @@ mod tests {
         let index = snapshot
             .iter()
             .enumerate()
-            .map(|(n, object)| (Rc::as_ptr(object) as usize, n))
+            .map(|(n, object)| (Gc::as_ptr(object) as usize, n))
             .collect();
         assert!(engine.interp.gc_slot_owner_mask(&index).enabled());
     }
@@ -422,9 +422,9 @@ mod tests {
         let index = ordinary
             .iter()
             .enumerate()
-            .map(|(n, object)| (Rc::as_ptr(object) as usize, n))
+            .map(|(n, object)| (Gc::as_ptr(object) as usize, n))
             .collect();
-        let key = |n: usize| Rc::as_ptr(&ordinary[n]) as usize;
+        let key = |n: usize| Gc::as_ptr(&ordinary[n]) as usize;
         engine.interp.class_info.insert(
             key(0),
             ClassInfo {
@@ -546,7 +546,7 @@ mod tests {
             let Value::Obj(object) = &owner else {
                 unreachable!()
             };
-            let ptr = Rc::as_ptr(object) as usize;
+            let ptr = Gc::as_ptr(object) as usize;
             assert!(!engine.interp.gc_pins.contains_key(&ptr));
             // Three stored handles to the same target are three internal owners, while
             // three table kinds sharing one owner must all participate in the mark.
@@ -751,16 +751,16 @@ mod tests {
     fn cache_records_identities_without_owners_and_falls_back_within_its_budget() {
         let object = Object::new(None);
         let mut cache = GcEdgeCache::new(3, 160);
-        let mut objects: Vec<ObjectEdge> = vec![Rc::as_ptr(&object)];
+        let mut objects: Vec<ObjectEdge> = vec![Gc::as_ptr(&object)];
         let mut scopes = vec![0u32];
-        let count = Rc::strong_count(&object);
+        let count = Gc::strong_count(&object);
         assert!(cache.prepare(objects.len(), scopes.len()));
         cache.record(true, &mut objects, &mut scopes);
         assert!(objects.is_empty() && scopes.is_empty());
-        assert_eq!(Rc::strong_count(&object), count);
-        assert_eq!(cache.get(0).unwrap().0, &[Rc::as_ptr(&object)][..]);
+        assert_eq!(Gc::strong_count(&object), count);
+        assert_eq!(cache.get(0).unwrap().0, &[Gc::as_ptr(&object)][..]);
         assert_eq!(cache.get(0).unwrap().1, &[0][..]);
-        objects.extend((0..20).map(|_| Rc::as_ptr(&object)));
+        objects.extend((0..20).map(|_| Gc::as_ptr(&object)));
         assert!(!cache.prepare(objects.len(), 0));
         cache.record(false, &mut objects, &mut scopes);
         assert!(objects.is_empty());
@@ -769,19 +769,19 @@ mod tests {
         cache.record(true, &mut objects, &mut scopes);
         assert!(cache.get(2).unwrap().0.is_empty());
         drop(cache);
-        assert_eq!(Rc::strong_count(&object), count);
+        assert_eq!(Gc::strong_count(&object), count);
     }
 
     #[test]
     fn zero_budget_never_retains_edges() {
         let object = Object::new(None);
         let mut cache = GcEdgeCache::new(1, 0);
-        let mut objects: Vec<ObjectEdge> = vec![Rc::as_ptr(&object)];
+        let mut objects: Vec<ObjectEdge> = vec![Gc::as_ptr(&object)];
         let mut scopes = Vec::new();
         assert!(!cache.prepare(1, 0));
         cache.record(false, &mut objects, &mut scopes);
         assert!(cache.get(0).is_none());
-        assert_eq!(Rc::strong_count(&object), 1);
+        assert_eq!(Gc::strong_count(&object), 1);
     }
 
     #[test]

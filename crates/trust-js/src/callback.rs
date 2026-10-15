@@ -477,7 +477,7 @@ mod tests {
             .get_var("retained", &env)
             .ok()
             .expect("function");
-        let pin = std::rc::Rc::downgrade(callee.as_obj().unwrap());
+        let pin = crate::value::Gc::downgrade(callee.as_obj().unwrap());
         let receiver = engine.interp.new_object();
         receiver
             .borrow_mut()
@@ -503,7 +503,7 @@ mod tests {
             assert!(matches!(result, Value::Num(31.0)));
         }
         assert_eq!(
-            std::rc::Rc::strong_count(&receiver),
+            crate::value::Gc::strong_count(&receiver),
             1,
             "no argument owner remains in a frame"
         );

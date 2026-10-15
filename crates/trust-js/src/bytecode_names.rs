@@ -150,7 +150,7 @@ impl ResolutionIc {
                 }
                 Target::Global { shape, slot } => {
                     if !Rc::ptr_eq(&env, &i.global_env)
-                        || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize)
+                        || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                     {
                         return None;
                     }
@@ -197,7 +197,7 @@ impl ResolutionIc {
                     slot: scope.vars.binding_slot(name),
                 })
             } else if Rc::ptr_eq(&env, &i.global_env) {
-                if !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
+                if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
                     return None;
                 }
                 let global = i.global.borrow();
@@ -319,7 +319,7 @@ impl DeepNameIc {
             }
             Target::Global { shape, slot } => {
                 if !Rc::ptr_eq(env, &i.global_env)
-                    || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize)
+                    || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
                     return None;
                 }
@@ -376,7 +376,7 @@ impl DeepNameIc {
             }
             Target::Global { shape, slot } => {
                 if !Rc::ptr_eq(env, &i.global_env)
-                    || !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize)
+                    || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
                     return false;
                 }
@@ -448,7 +448,7 @@ impl Chunk {
                     binding.value.clone(),
                 ))
             } else if Rc::ptr_eq(&current, &i.global_env) {
-                if !i.ordinary_get_ptr(Rc::as_ptr(&i.global) as usize) {
+                if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
                     return None;
                 }
                 let global = i.global.borrow();

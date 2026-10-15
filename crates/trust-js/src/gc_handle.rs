@@ -2,10 +2,12 @@
 //!
 //! [`Gc`] is `repr(transparent)` over `Rc<RefCell<Object>>`: its bits, the packed-value payload,
 //! every JIT layout offset and every raw-pointer conversion are exactly those of the `Rc`. It
-//! dereferences to that `Rc`, so `Rc::as_ptr(&gc)`, `Rc::ptr_eq`, `Rc::strong_count`,
-//! `Rc::downgrade` and `.borrow()` keep working unchanged. What the wrapper adds is an engine-owned
-//! release path: the collector and memory-management policy can observe the release of a final
-//! reference without changing any of the thousands of handle users.
+//! dereferences to the `RefCell<Object>`, so `.borrow()`/`.borrow_mut()` keep working unchanged.
+//! Identity and ownership go through associated functions — [`Gc::as_ptr`], [`Gc::ptr_eq`],
+//! [`Gc::downgrade`], [`Gc::strong_count`] — never through `Rc` directly, so the P1 GC heap
+//! (feature `gc-heap`) can replace the `Rc` behind this seam. What the wrapper adds is an
+//! engine-owned release path: the collector and memory-management policy can observe the release
+//! of a final reference without changing any of the thousands of handle users.
 //!
 //! Releasing the final reference destroys the object and, through ordinary field drop glue,
 //! releases its children. Chains (linked lists, closure chains, nested arrays) therefore used to
@@ -60,12 +62,50 @@ impl Gc {
         // SAFETY: `this` is never used or dropped again, so the Rc is moved out exactly once.
         unsafe { ManuallyDrop::take(&mut this.0) }
     }
+
+    /// The object's address: its identity for address-keyed tables and raw-pointer round trips.
+    /// An associated function (like `Rc::as_ptr`), so `gc.as_ptr()` still names
+    /// `RefCell::as_ptr`.
+    #[inline]
+    pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
+        Rc::as_ptr(&this.0)
+    }
+
+    /// Whether two handles name the same object.
+    #[inline]
+    pub fn ptr_eq(a: &Gc, b: &Gc) -> bool {
+        Rc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// A weak handle (see [`WeakGc`]).
+    #[inline]
+    pub fn downgrade(this: &Gc) -> WeakGc {
+        Rc::downgrade(&this.0)
+    }
+
+    /// The number of strong handles. Refcount-observing heuristics must treat this as advisory:
+    /// a tracing heap has no such count.
+    #[inline]
+    pub fn strong_count(this: &Gc) -> usize {
+        Rc::strong_count(&this.0)
+    }
+
+    /// The `Rc` behind this handle, for the few paths that genuinely depend on `Rc` itself
+    /// (generated-code layouts, `Rc`-typed host interfaces). Each use is a P1 migration site.
+    #[inline]
+    pub fn as_rc(this: &Gc) -> &Rc<RefCell<Object>> {
+        &this.0
+    }
 }
 
+/// A weak object handle: `upgrade()` yields `Option<Rc<RefCell<Object>>>`; wrap it with
+/// `Gc::from`.
+pub type WeakGc = std::rc::Weak<RefCell<Object>>;
+
 impl std::ops::Deref for Gc {
-    type Target = Rc<RefCell<Object>>;
+    type Target = RefCell<Object>;
     #[inline]
-    fn deref(&self) -> &Rc<RefCell<Object>> {
+    fn deref(&self) -> &RefCell<Object> {
         &self.0
     }
 }

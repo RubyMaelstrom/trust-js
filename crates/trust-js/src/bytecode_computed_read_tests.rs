@@ -145,7 +145,7 @@ fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
                 .borrow_mut()
                 .props
                 .insert("value", crate::value::Property::plain(value.clone()));
-            let weak = Rc::downgrade(&object);
+            let weak = crate::value::Gc::downgrade(&object);
             let (result, error) = invoke(
                 &mut engine,
                 op,
@@ -211,7 +211,9 @@ fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
             evaluate(&mut engine, "calls=0;");
             let prefix = crate::value::Object::new(None);
             let (result, error) = invoke(&mut engine, op, object, key, Value::Obj(prefix.clone()));
-            assert!(matches!(&result[0],Value::Obj(actual) if Rc::ptr_eq(actual,&prefix)));
+            assert!(
+                matches!(&result[0],Value::Obj(actual) if crate::value::Gc::ptr_eq(actual,&prefix))
+            );
             assert_eq!(evaluate(&mut engine, "calls"), expected_calls.to_string());
             let Some(Abrupt::Throw(error)) = error else {
                 panic!("expected exact throw");

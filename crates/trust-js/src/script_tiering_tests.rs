@@ -251,7 +251,6 @@ fn hot_script_borrowed_this_is_the_global_environment_this_value() {
 #[test]
 fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
     use crate::value::{Property, Value};
-    use std::rc::Rc;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -289,7 +288,7 @@ fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
             object.borrow().props.get("k").unwrap().value(),
             Value::Num(1999.0)
         ));
-        let weak = Rc::downgrade(object);
+        let weak = crate::value::Gc::downgrade(object);
         drop(result);
         drop(body);
         engine.interp.gc_collect();

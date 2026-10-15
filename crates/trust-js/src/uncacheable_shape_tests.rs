@@ -197,12 +197,12 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         engine
             .interp
             .construct_ics
-            .remove(&(Rc::as_ptr(&ctor) as usize));
+            .remove(&(Gc::as_ptr(&ctor) as usize));
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let global_env = Rc::as_ptr(&engine.interp.global_env) as usize;
         assert!(engine
             .interp
-            .construct_ic_fill(&ctor, Rc::as_ptr(&ctor) as usize, epoch, global_env)
+            .construct_ic_fill(&ctor, Gc::as_ptr(&ctor) as usize, epoch, global_env)
             .is_none());
         let cache = Cell::new(IcState::EMPTY);
         let old = object(&mut engine, "old");
@@ -224,7 +224,7 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
         assert!(!engine
             .interp
             .construct_ics
-            .contains_key(&(Rc::as_ptr(&ctor) as usize)));
+            .contains_key(&(Gc::as_ptr(&ctor) as usize)));
         run(
             &mut engine,
             "function makeAfter(x){return new C(x);}for(var j=0;j<160;j++)makeAfter(j);",

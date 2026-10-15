@@ -69,7 +69,7 @@ fn make_262(it: &mut Interp, realm_global: Option<Value>) -> Value {
     });
     it.def_method(&host, "detachArrayBuffer", 1, |i, _t, args| {
         if let Value::Obj(o) = arg(args, 0) {
-            let p = Rc::as_ptr(&o) as usize;
+            let p = Gc::as_ptr(&o) as usize;
             // DetachArrayBuffer asserts IsSharedArrayBuffer is false: a Shared Data Block cannot be
             // detached, so refuse instead of leaving the buffer half detached.
             if i.is_shared_buffer(p) {
@@ -144,7 +144,7 @@ fn make_abstract_module_source(it: &mut Interp) -> Value {
 /// Reconstruct a SharedArrayBuffer object in this agent from an owning broadcast block.
 fn agent_make_shared(i: &mut Interp, block: crate::interpreter::SharedMem, len: usize) -> Value {
     let obj = Object::new(i.extra_protos.get("SharedArrayBuffer").cloned());
-    let p = Rc::as_ptr(&obj) as usize;
+    let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
     let id = block.id();
     i.array_buffers.insert(p, BufferData::Shared(block));
@@ -183,7 +183,7 @@ pub(super) fn install_agent(it: &mut Interp, host: &Gc) {
         // Accept a SharedArrayBuffer directly, or a TypedArray view over one.
         let p = match sab.as_obj() {
             Some(o) => {
-                let p = Rc::as_ptr(o) as usize;
+                let p = Gc::as_ptr(o) as usize;
                 if i.is_shared_buffer(p) {
                     p
                 } else if let Some(info) = i.typed_arrays.get(&p) {

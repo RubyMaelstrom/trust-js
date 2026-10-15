@@ -234,12 +234,12 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     let mut reference = PreparedReference::object(Rc::from("outer"), object.clone(), false);
     reference.slot = object.borrow().props.slot_of("outer").unwrap();
     reference.shape = object.borrow().props.shape();
-    let count = Rc::strong_count(&object);
+    let count = crate::value::Gc::strong_count(&object);
     assert_ne!(unsafe { probe(&reference) }, 0);
     for shape in [0, u32::MAX] {
         reference.shape = shape;
         assert_eq!(unsafe { probe(&reference) }, 0);
-        assert_eq!(Rc::strong_count(&object), count);
+        assert_eq!(crate::value::Gc::strong_count(&object), count);
         assert_eq!(reference.shape, shape);
     }
 }
