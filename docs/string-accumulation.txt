@@ -93,14 +93,58 @@ artifact size increased from 32,002,440 to 32,006,424 bytes (0.0125%). This is f
 ELF size, not generated-code size or JavaScript compilation time.
 
 The measured component is exact d539 plus V5, with matched release features and
-flags on Zombie (Intel Core i7-6700HQ). The current ab7251 integration is covered by
-the separate correctness checks above; it has not been substituted into those
-measurements. This result supports committing the transaction for this authored
+flags on Zombie (Intel Core i7-6700HQ). The separate ab7251 integration is covered by
+the correctness checks above; it has not been substituted into those
+measurements. This result supported committing the transaction for this authored
 React SSR workload. It is not a deployed-page result, official Speedometer score,
 isolated compilation-cost improvement, post-GC retained-memory result or speed
 comparison with Node/Ladybird. True post-GC memory and isolated compilation remain
 unavailable in the unchanged clean runtime. Previously interrupted Crystal timing
 cohorts remain excluded, with no pooling or cross-machine ratios.
+
+Selected client-framework check
+-------------------------------
+
+A separate native x86-64 browser comparison uses exact ab7251e8 versus committed
+46103f81, both with default JIT and TRUST_JS_OPT_JIT=0. The browser is pinned to
+4ea9b42b and the official Speedometer 3.1 fixture to 1386415b. Matched release
+builds use mimalloc, optimization level 3, no LTO and 64 codegen units. The selected
+suites are TodoMVC-React-Complex-DOM, TodoMVC-Angular-Complex-DOM, TodoMVC-Vue and
+TodoMVC-jQuery, with one official iteration per fresh browser on Zombie.
+
+Five baseline variance processes preceded seven fixed alternating pairs. All 19
+processes completed 12 steps and 43 metrics each without a guard interruption or
+cleanup failure. Two separate functional companions matched all 24 ordered Todo
+states and the pinned English labels, with no errors, panics or skipped modules.
+Each functional companion naturally reached its 60-second page-session timeout (exit
+3); both controllers exited 0 and left no owned browser processes.
+
+The selected geometric-mean duration was 0.63% higher, with a nominal empirical
+95% interval of +0.33% to +0.84%. The conservative 98.4375% median interval was
++0.008% to +1.28%. This is a small consistent client cost, not parity or a client
+speedup. Suite median duration changes were React +0.43%, Angular +0.94%, Vue
++0.78% and jQuery -0.84%. No component median exceeded the fixed 3% material-loss
+threshold. Five Phase0 precision flags remain: React suite total, Vue
+DeletingAllItems total and Sync, and jQuery DeletingAllItems Sync and Async. Four
+marginal component intervals still permit losses above 3%; all values and flags
+are retained in the record.
+
+Peak RSS was imprecise: its baseline range/median was 13.29%, and the paired
+median change of -4.68% had an empirical interval of -9.39% to +6.75%. This does
+not establish a memory improvement or equivalence. Sampled process-group peak RSS
+was also noisy, with an interval permitting an 11.07% increase. One candidate run
+used 1.400 seconds more sampled CPU and 1.438 seconds more official wall time
+than its paired baseline; 1.245 seconds of that wall difference occurred inside
+the official interval but outside action clocks. Its cause remains unassigned.
+This check does not establish tail equivalence or isolated startup behavior.
+
+This is a completed scoped client check, not overall browser performance
+acceptance. It does not replace the separate SSR result or establish a full
+Speedometer score, desktop/GPU responsiveness, steady-state behavior or isolated
+JavaScript CPU performance. Compilation remains within the applicable official
+clocks; isolated compilation, natural GC pauses and true post-GC retained memory
+remain unavailable. No samples were discarded and no cohort was extended or
+pooled.
 
 See benchmarks/review-string-accumulation-validation-2026-10-15.json for source,
 artifact, suite, platform, raw evidence and independent review identifiers.

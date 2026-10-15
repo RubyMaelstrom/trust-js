@@ -919,5 +919,695 @@
     "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-native-release-functional-v1/root-independent-release-functional-audit.json",
     "sha256": "58e5b085e16f22040eef5aa1474b4a2657003d3ac571518157b8f23b98c4616e",
     "bytes": 1675
+  },
+  "client_browser_review": {
+    "status": "completed_scoped_fixed_N7_client_cost_review_not_overall_browser_acceptance",
+    "recorded_utc": "2026-10-15T00:23:03.580704+00:00",
+    "performance_acceptance": false,
+    "client_speedup_or_parity_claimed": false,
+    "SSR_result_kept_separate": true,
+    "purpose": "Check the committed default append path on client frameworks; the preceding accepted component SSR measurements retain their original source and artifact scope.",
+    "engine_revisions": {
+      "baseline": "ab7251e8c6cd66557d0ad2c5ddf6d5ca5dbbf902",
+      "candidate": "46103f811f4054866a7067132d12412969cf5ef8"
+    },
+    "engine_source_files": {
+      "baseline": 811,
+      "candidate": 815
+    },
+    "browser_revision": "4ea9b42bf48b29f0298576df527c28bdd5b962d9",
+    "browser_source_files_per_artifact": 1337,
+    "official_fixture": {
+      "revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+      "files": 1118,
+      "manifest_sha256": "8fe295c903426f6292f40e353de0ae89637ac8ee78c98fdf14fcde13aa9de085"
+    },
+    "selected_suites": [
+      "TodoMVC-React-Complex-DOM",
+      "TodoMVC-Angular-Complex-DOM",
+      "TodoMVC-Vue",
+      "TodoMVC-jQuery"
+    ],
+    "machine": {
+      "host": "zombie",
+      "architecture": "x86_64-unknown-linux-gnu",
+      "processor": "Intel Core i7-6700HQ",
+      "controller_cpu": 4,
+      "browser_cpu": 5,
+      "browser_SMT_sibling_cpu": 1,
+      "governor": "powersave",
+      "system_controls_changed": false
+    },
+    "matched_release": {
+      "opt_level": 3,
+      "lto": false,
+      "codegen_units": 64,
+      "incremental": true,
+      "allocator_feature": "mimalloc",
+      "browser_features": [
+        "default",
+        "mimalloc"
+      ],
+      "runtime_engine_features": [
+        "default",
+        "embed",
+        "intl",
+        "optimizing-jit"
+      ],
+      "runtime_controls": {
+        "TRUST_JS_TIER": "jit",
+        "TRUST_JS_OPT_JIT": "0",
+        "TRUST_STYLE_THREADS": "1"
+      },
+      "fresh_engine_and_browser_Cargo_artifacts": true,
+      "only_browser_source_override": "Absolute trust-js Cargo dependency path for each pinned engine."
+    },
+    "artifacts": {
+      "baseline": {
+        "sha256": "fb10ee0ce5add39cb5e328936d7137d8958c538ddea1482c53082bd5d6a4815d",
+        "bytes": 108359648
+      },
+      "candidate": {
+        "sha256": "9d58a04fb8142175c461de723026faf730fbaca85c3cdc82459ef133a7d241f1",
+        "bytes": 108389248
+      }
+    },
+    "fixed_protocol": {
+      "baseline_Phase0_processes": 5,
+      "alternating_pairs": 7,
+      "fresh_processes": 19,
+      "iterations_per_process": 1,
+      "official_steps_per_process": 12,
+      "official_metric_rows": 817,
+      "started_utc": "2026-10-15T00:07:09.263453+00:00",
+      "finished_utc": "2026-10-15T00:14:40.796258+00:00",
+      "all_processes_valid": true,
+      "both_optional_optimizers": "0",
+      "timing_probes": "Unchanged one-shot official collector only; trace/state/stage/PERF/GC/compiler/admission/profiler probes and threshold overrides absent.",
+      "no_retries_extensions_or_pooling": true,
+      "bounds_seconds": {
+        "browser": 180,
+        "controller": 225,
+        "cohort": 2400
+      }
+    },
+    "functional_companions": {
+      "processes": 2,
+      "exact_ordered_Todo_states": 24,
+      "steps_and_metrics_per_process": [
+        12,
+        43
+      ],
+      "all_nonempty_states_match_first100_pinned_English_labels": true,
+      "states_identical_between_artifacts": true,
+      "errors_panics_module_skips": 0,
+      "controller_exit_codes": [
+        0,
+        0
+      ],
+      "browser_natural_session_timeout_exit_codes": [
+        3,
+        3
+      ],
+      "natural_session_timeout_seconds": 60,
+      "remaining_processes": 0,
+      "timing_eligible": false
+    },
+    "evidence": {
+      "prepared_source": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-prepared-v1/prepared-manifest.json",
+        "sha256": "7d81bfddd3bcf16161c8c3e1d69f52a2a888679d1276281ffc20ce480d4ff224",
+        "bytes": 8459
+      },
+      "matched_build_manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/final-build-manifest.json",
+        "sha256": "7aa27f677f124a66400283eb8974f88eb6e2a343d3684fcb530f4dc98cc421e7",
+        "bytes": 36737
+      },
+      "independent_build_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/root-final-build-audit.json",
+        "sha256": "baae0b7015526193c2f6d6b41a306df3d3e757c1520d2dec9a828a66145c9abc",
+        "bytes": 1105
+      },
+      "functional_report": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native/prerequisites.json",
+        "sha256": "8fe86ff2f4e14178bd79f991e0f8b01cf0625b2415cea29ba90c9ef6874f672f",
+        "bytes": 9453
+      },
+      "functional_reparse": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native-functionals-offline-audit.json",
+        "sha256": "aaf24ca9d79014eee7abc93cdaf6b9342c74d6164441f7a29d04d2af1d254586",
+        "bytes": 19705
+      },
+      "independent_functional_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/root-final-functional-audit.json",
+        "sha256": "dba767a500630641edb3e70b25b8ce71eff0b3b3441a127d72014d7a2decf700",
+        "bytes": 418
+      },
+      "fixed_plan": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/timing-plan-v1.json",
+        "sha256": "5fd85dee27502d2a132a3739c1d1029a600ce3e41a3a8e8a344eab64cda033ee",
+        "bytes": 15087
+      },
+      "independent_plan_review": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/root-timing-plan-audit.json",
+        "sha256": "848209b786fb993aff6d51d64d43d1393c7bdad7d40602db5489588e893ae173",
+        "bytes": 530
+      },
+      "raw_report": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native/screen-default-v1/report.json",
+        "sha256": "da0072d2a766a42377471816fdc8dd7d8ae04baf1df352dd5db732fa1cbcadf9",
+        "bytes": 835906
+      },
+      "raw_evidence_manifest": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native/final-measurement-evidence.json",
+        "sha256": "3489aaabeb2806660a1880c1523ee8f045bf4480b26b9682e9f50a5db4c46ef0",
+        "bytes": 45216
+      },
+      "owner_analysis": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/analysis-native-browser-N7-v1.json",
+        "sha256": "474f31ebcd9c98223e2f90cec094ed7c5c94f117c3026b350fa31ecab432f3d4",
+        "bytes": 226257
+      },
+      "independent_timing_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/root-final-timing-audit.json",
+        "sha256": "457ce116d068115ec8806bbe2324f370e4bc4623193c67232d1a7a0e11b1be12",
+        "bytes": 67435
+      },
+      "owned_cleanup": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native/owned-cleanup-after-timing.json",
+        "sha256": "8231dc99f60ee27a01703f95e4605ff70a77165b39c2412efb9f272a9fc2635e",
+        "bytes": 3944
+      },
+      "lease_handback": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/native/lease-handback.json",
+        "sha256": "cc050d1698d5383fd239134cd13159967ceffa67168e146bad14df7d68f879e5",
+        "bytes": 358
+      },
+      "second_independent_raw_audit": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261014/string-accumulation-browser-native-build-v1/engine-independent-screen-audit-v1/review.json",
+        "sha256": "81050e78f7a0a44b9f1feb61e2efb760bb0b89e7630a6f98bdba60faa94e1046",
+        "bytes": 1005753
+      }
+    },
+    "statistical_scope": "Fresh process pair is the statistical unit. Nominal equal-tailed 95% empirical-bootstrap median intervals are exact for the observed empirical distribution, not guaranteed frequentist coverage. Conservative sample min/max intervals cover the median at 98.4375% for independent continuous pairs; component intervals are marginal, not simultaneous.",
+    "regression_policy": "Stable component is provisionally regressed when its nominal 95% comparison interval excludes parity in the slower direction and median loss exceeds 3%. Five baseline runs precede all candidates; relative MAD > 1% or range/median > 6% flags insufficient precision without widening thresholds.",
+    "primary": {
+      "interpretation": "Baseline/candidate selected Score, equivalent geometric-mean duration cost. Arithmetic Score decrease is stated separately.",
+      "loss_direction_paired_ratios": [
+        1.008422731102466,
+        1.0069122699639494,
+        1.0036066425107435,
+        1.0063254553018217,
+        1.000082158268757,
+        1.012824036055285,
+        1.0033105509040467
+      ],
+      "paired_median_loss_percent": 0.6325455301821714,
+      "nominal_empirical_bootstrap_95_loss_percent": [
+        0.33105509040467496,
+        0.8422731102466052
+      ],
+      "distribution_free_median_98_4375_loss_percent": [
+        0.008215826875690446,
+        1.2824036055284926
+      ],
+      "phase0_stable": true,
+      "provisional_regression": false,
+      "arithmetic_score_change_percent": -0.6285695416424208,
+      "all_seven_duration_cost_ratios_above_parity": true,
+      "phase0_relative_MAD": 0.00309553738714279,
+      "phase0_range_over_median": 0.010703647207562127
+    },
+    "per_suite_duration": {
+      "TodoMVC-React-Complex-DOM": {
+        "paired_median_loss_percent": 0.4310697793203033,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          0.1856899349888641,
+          1.6613881023141763
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.12710089133805003,
+          2.4166983823970645
+        ],
+        "phase0_stable": false,
+        "provisional_regression": false
+      },
+      "TodoMVC-Angular-Complex-DOM": {
+        "paired_median_loss_percent": 0.9420160462637384,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          0.8209583546039401,
+          1.507463350503846
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          0.4077638231936076,
+          2.2324836170607876
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "TodoMVC-Vue": {
+        "paired_median_loss_percent": 0.7762483952159505,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          0.6622090013668869,
+          1.8166278556551063
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          0.5416853585455073,
+          1.94281216258132
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "TodoMVC-jQuery": {
+        "paired_median_loss_percent": -0.835279420516033,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -1.7087898100535681,
+          0.13831057489308574
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -1.9705786540650139,
+          1.579441025276096
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      }
+    },
+    "all_component_columns": [
+      "paired_median_loss_percent",
+      "nominal_empirical95_lower_loss_percent",
+      "nominal_empirical95_upper_loss_percent"
+    ],
+    "all_43_component_loss_percent": {
+      "Geomean": [
+        0.6325455301821492,
+        0.33105509040467496,
+        0.8422731102466052
+      ],
+      "Iteration-0-Total": [
+        0.12078738790943788,
+        -0.41863559013087803,
+        0.5094562232806688
+      ],
+      "Score": [
+        0.6325455301821714,
+        0.33105509040467496,
+        0.8422731102466052
+      ],
+      "TodoMVC-Angular-Complex-DOM": [
+        0.9420160462637384,
+        0.8209583546039401,
+        1.507463350503846
+      ],
+      "TodoMVC-Angular-Complex-DOM/Adding100Items": [
+        1.5687124405276753,
+        0.8720383356957573,
+        1.9322759024110958
+      ],
+      "TodoMVC-Angular-Complex-DOM/Adding100Items/Async": [
+        2.987755779212131,
+        1.525879780731798,
+        3.375903980855277
+      ],
+      "TodoMVC-Angular-Complex-DOM/Adding100Items/Sync": [
+        1.2996927987300788,
+        0.6732093932391603,
+        1.9102860680926481
+      ],
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems": [
+        1.1266333708364273,
+        0.414550477532849,
+        1.4706147965443117
+      ],
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Async": [
+        2.640420047290859,
+        2.509290833513389,
+        3.357035410721476
+      ],
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Sync": [
+        0.3191870052226875,
+        -0.34369070294023585,
+        0.8845448786855004
+      ],
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems": [
+        0.40214856284617184,
+        0.25511763087040507,
+        1.0561836711457495
+      ],
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Async": [
+        0.988087740690613,
+        -1.943636646462199,
+        1.199670929145924
+      ],
+      "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Sync": [
+        0.5836665309053135,
+        -0.31898598733584027,
+        1.4756516771448736
+      ],
+      "TodoMVC-React-Complex-DOM": [
+        0.4310697793203033,
+        0.1856899349888641,
+        1.6613881023141763
+      ],
+      "TodoMVC-React-Complex-DOM/Adding100Items": [
+        0.3509049791378338,
+        -0.41409037508178814,
+        1.0694306178134605
+      ],
+      "TodoMVC-React-Complex-DOM/Adding100Items/Async": [
+        0.13639247726375814,
+        -2.194756830253386,
+        1.6702486429548413
+      ],
+      "TodoMVC-React-Complex-DOM/Adding100Items/Sync": [
+        0.3892331674358651,
+        -0.0879335643059087,
+        0.9986282324875972
+      ],
+      "TodoMVC-React-Complex-DOM/CompletingAllItems": [
+        0.6915719597218484,
+        0.467435361819879,
+        1.6102221512068748
+      ],
+      "TodoMVC-React-Complex-DOM/CompletingAllItems/Async": [
+        2.5580827579941845,
+        1.820274057572524,
+        3.6807425050464637
+      ],
+      "TodoMVC-React-Complex-DOM/CompletingAllItems/Sync": [
+        0.11236640844451973,
+        -0.18292506976916867,
+        0.8516678495386731
+      ],
+      "TodoMVC-React-Complex-DOM/DeletingAllItems": [
+        0.21147582530012254,
+        -0.41911803351735166,
+        2.7179183354266945
+      ],
+      "TodoMVC-React-Complex-DOM/DeletingAllItems/Async": [
+        1.4324179125354108,
+        -1.5266535381709967,
+        2.1193346440397276
+      ],
+      "TodoMVC-React-Complex-DOM/DeletingAllItems/Sync": [
+        5.499902651084909e-05,
+        -0.4039608213340373,
+        2.3271617694651026
+      ],
+      "TodoMVC-Vue": [
+        0.7762483952159505,
+        0.6622090013668869,
+        1.8166278556551063
+      ],
+      "TodoMVC-Vue/Adding100Items": [
+        1.0683760683760646,
+        -0.06479465686797248,
+        2.157909516265577
+      ],
+      "TodoMVC-Vue/Adding100Items/Async": [
+        1.295242323898349,
+        -0.026641827017026554,
+        2.437024623932693
+      ],
+      "TodoMVC-Vue/Adding100Items/Sync": [
+        0.9998914930555491,
+        -0.22747598864564234,
+        1.9320401278409172
+      ],
+      "TodoMVC-Vue/CompletingAllItems": [
+        2.164852777263926,
+        0.9259728405204948,
+        2.8332408439434076
+      ],
+      "TodoMVC-Vue/CompletingAllItems/Async": [
+        2.0427785406769594,
+        0.7500483588328333,
+        2.8490015279069025
+      ],
+      "TodoMVC-Vue/CompletingAllItems/Sync": [
+        2.724721799991614,
+        -2.6185362434495207,
+        5.639585771466216
+      ],
+      "TodoMVC-Vue/DeletingAllItems": [
+        -0.5706484356361896,
+        -0.7030634336622321,
+        0.4353460638271578
+      ],
+      "TodoMVC-Vue/DeletingAllItems/Async": [
+        0.41192368360243314,
+        -0.811822034318832,
+        1.2197179464276786
+      ],
+      "TodoMVC-Vue/DeletingAllItems/Sync": [
+        0.17341811552313846,
+        -0.9328705908663637,
+        0.7061328184762461
+      ],
+      "TodoMVC-jQuery": [
+        -0.835279420516033,
+        -1.7087898100535681,
+        0.13831057489308574
+      ],
+      "TodoMVC-jQuery/Adding100Items": [
+        -0.08708878618817195,
+        -1.2691679415482215,
+        1.117871348284094
+      ],
+      "TodoMVC-jQuery/Adding100Items/Async": [
+        -0.38251557496020716,
+        -2.2035148011195993,
+        0.35365064811092584
+      ],
+      "TodoMVC-jQuery/Adding100Items/Sync": [
+        -0.02105901304338964,
+        -0.8374905455423964,
+        1.4307138624408466
+      ],
+      "TodoMVC-jQuery/CompletingAllItems": [
+        -0.18173677061444904,
+        -1.2550461999062623,
+        0.6642306163353151
+      ],
+      "TodoMVC-jQuery/CompletingAllItems/Async": [
+        1.2898453820292533,
+        -1.9393747559566021,
+        2.891394078559184
+      ],
+      "TodoMVC-jQuery/CompletingAllItems/Sync": [
+        -0.5513142282853711,
+        -1.0516285473143094,
+        0.5329207495272437
+      ],
+      "TodoMVC-jQuery/DeletingAllItems": [
+        -1.2692500186350597,
+        -3.990280169667715,
+        -0.5248133736874161
+      ],
+      "TodoMVC-jQuery/DeletingAllItems/Async": [
+        -0.5672762775689622,
+        -10.790149287656304,
+        1.2225303759509254
+      ],
+      "TodoMVC-jQuery/DeletingAllItems/Sync": [
+        -1.4281102790562716,
+        -2.3090525377261972,
+        1.0761254126562925
+      ]
+    },
+    "five_Phase0_component_flags": [
+      "TodoMVC-React-Complex-DOM",
+      "TodoMVC-Vue/DeletingAllItems",
+      "TodoMVC-Vue/DeletingAllItems/Sync",
+      "TodoMVC-jQuery/DeletingAllItems/Async",
+      "TodoMVC-jQuery/DeletingAllItems/Sync"
+    ],
+    "component_intervals_still_permitting_above3percent_loss": [
+      "TodoMVC-Angular-Complex-DOM/Adding100Items/Async",
+      "TodoMVC-Angular-Complex-DOM/CompletingAllItems/Async",
+      "TodoMVC-React-Complex-DOM/CompletingAllItems/Async",
+      "TodoMVC-Vue/CompletingAllItems/Sync"
+    ],
+    "provisional_component_regressions": [],
+    "resources": {
+      "observed_browser_peak_rss_kib": {
+        "paired_median_loss_percent": -4.683005407893226,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -9.394768280661436,
+          6.746723621887085
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -10.9553620032662,
+          8.927063832911198
+        ],
+        "phase0_stable": false,
+        "provisional_regression": false
+      },
+      "observed_process_cpu_seconds": {
+        "paired_median_loss_percent": 0.3628823224468558,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -0.15424164524420192,
+          0.7216494845360799
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.5112474437627745,
+          7.194244604316546
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "observer_sampled_process_cpu_seconds": {
+        "paired_median_loss_percent": 0.3628823224468558,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -0.15424164524420192,
+          0.7216494845360799
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.5112474437627745,
+          7.14285714285714
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "official_measurement_wall_s": {
+        "paired_median_loss_percent": 0.3124803308105273,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -0.10701644309349945,
+          0.681828770178039
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.6589979577130145,
+          7.539798533161712
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "official_action_sum_s": {
+        "paired_median_loss_percent": 0.12078738790943788,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -0.41863559013086693,
+          0.5094562232806688
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.7051837300919406,
+          1.4083401575595733
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "inside_official_wall_outside_actions_s": {
+        "paired_median_loss_percent": 0.9788200283173065,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          0.6864578956079281,
+          1.911034414750179
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.5417030710197168,
+          23.025151137411527
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "launch_before_official_interval_s": {
+        "paired_median_loss_percent": -0.20659591961328383,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -1.3013638964451846,
+          0.7985995281100555
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -1.866245797174837,
+          1.188185154866983
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "whole_process_wall_s": {
+        "paired_median_loss_percent": 0.2776031122822209,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -0.08747316419622786,
+          0.5847167191619818
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -0.5529155844303579,
+          6.344786464818641
+        ],
+        "phase0_stable": true,
+        "provisional_regression": false
+      },
+      "sampled_peak_group_rss_kib": {
+        "paired_median_loss_percent": -3.4635534837671678,
+        "nominal_empirical_bootstrap_95_loss_percent": [
+          -5.496746130188779,
+          11.066518426119254
+        ],
+        "distribution_free_median_98_4375_loss_percent": [
+          -7.803634152931638,
+          18.750565621097202
+        ],
+        "phase0_stable": false,
+        "provisional_regression": false
+      }
+    },
+    "provisional_resource_regressions": [],
+    "peak_RSS_precision_limit": {
+      "phase0_relative_MAD": 0.01274714213818391,
+      "phase0_range_over_median": 0.13289956143504206,
+      "memory_equivalence_or_improvement_claimed": false
+    },
+    "retained_pair6_candidate_tail": {
+      "observed_process_cpu_seconds": {
+        "baseline": 19.46,
+        "candidate": 20.86,
+        "difference": 1.3999999999999986,
+        "ratio": 1.0719424460431655
+      },
+      "official_measurement_wall_s": {
+        "baseline": 19.070800048828126,
+        "candidate": 20.508699951171874,
+        "difference": 1.437899902343748,
+        "ratio": 1.0753979853316171
+      },
+      "official_action_sum_s": {
+        "baseline": 13.6615,
+        "candidate": 13.853900390625,
+        "difference": 0.19240039062500003,
+        "ratio": 1.0140834015755957
+      },
+      "inside_official_wall_outside_actions_s": {
+        "baseline": 5.409300048828125,
+        "candidate": 6.654799560546875,
+        "difference": 1.2454995117187506,
+        "ratio": 1.2302515113741153
+      },
+      "launch_before_official_interval_s": {
+        "baseline": 0.6175090891718753,
+        "candidate": 0.609473048828125,
+        "difference": -0.008036040343750273,
+        "ratio": 0.9869863610355482
+      }
+    },
+    "quiet_and_cleanup": {
+      "recognized_worker_events": 0,
+      "all_observed_browser_thread_affinity_masks": [
+        "5"
+      ],
+      "maximum_observed_SMT_sibling_cpu1_busy_seconds": 0.03,
+      "maximum_live_endpoint_cpu5_busy_minus_sampled_owned_seconds": 0.040000000000002034,
+      "owned_browser_roots_verified_gone": 19,
+      "fixture_server_identity_checked_stopped": true,
+      "all_own_remote_workers_and_copies_exited_before_lease_handback": true
+    },
+    "qualifications": [
+      "This selected headless one-iteration JS/DOM/layout/event-loop workload is not an official full Speedometer score, desktop/GPU responsiveness, steady-state or isolated-JavaScript result.",
+      "Measured selected geometric-mean duration cost is small and consistent; no client speedup, parity or overall browser acceptance claim.",
+      "All 43 component medians are below the fixed 3% material-loss threshold. Five Phase0 flags and four marginal component intervals permitting greater losses remain visible.",
+      "Peak RSS is noisy and its interval permits a material increase; no memory equivalence or improvement claim. True post-GC retained heap is unavailable.",
+      "The longer pair 6 candidate run remains included. Its extra own CPU and official wall occur largely outside measured action clocks, without causal attribution or tail-equivalence claim.",
+      "Compilation is included wherever it occurs within the official clocks; isolated compiler time, generated JIT size and natural GC pauses are unavailable.",
+      "CPU and memory are sampled; CPU5 busy minus sampled owned CPU is approximate and does not identify foreign work.",
+      "Launch-minus-official residual includes initialization prefix plus report/transport/validation suffix and is not isolated engine startup.",
+      "The accepted authored React SSR comparison remains exact d539 plus V5 and is not relabelled as this ab7251/46103f client comparison.",
+      "No installed artifact promotion, Node/Ladybird ratio, cross-host comparison or discarded samples."
+    ]
   }
 }
