@@ -2329,19 +2329,19 @@ pub(crate) fn scan_gc_heap_retained_memory(
         shapes
             .transitions
             .len()
-            .saturating_mul(std::mem::size_of::<((u32, Rc<str>), u32)>()),
+            .saturating_mul(std::mem::size_of::<((u32, Rc<str>, PropClass), u32)>()),
     );
     bytes = bytes.saturating_add(shapes.layouts.allocated_bytes());
     bytes = bytes.saturating_add(
         shapes
             .recent
             .capacity()
-            .saturating_mul(std::mem::size_of::<Option<(u32, Rc<str>, u32)>>()),
+            .saturating_mul(std::mem::size_of::<Option<(u32, Rc<str>, PropClass, u32)>>()),
     );
-    for (_, key) in shapes.transitions.keys() {
+    for (_, key, _) in shapes.transitions.keys() {
         visitor.rc_str(key);
     }
-    for (_, key, _) in shapes.recent.iter().flatten() {
+    for (_, key, ..) in shapes.recent.iter().flatten() {
         visitor.rc_str(key);
     }
     for layout in shapes.layouts.iter() {
@@ -3084,6 +3084,17 @@ pub(crate) struct Accessors {
     pub set: Option<Value>,
 }
 
+/// Descriptor class as encoded in shape transitions (Pilot C): the only descriptor facts
+/// a shape may eventually prove. Until every `&mut Property` escape demotes on class
+/// change, a shape's classes are recorded but are NOT yet a consumer proof — consumers
+/// still re-check descriptor bits live.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PropClass {
+    DataWritable,
+    DataNonWritable,
+    Accessor,
+}
+
 pub(crate) const PROP_ACCESSOR: usize = 1;
 pub(crate) const PROP_WRITABLE: usize = 2;
 pub(crate) const PROP_ENUMERABLE: usize = 4;
@@ -3186,6 +3197,18 @@ impl Property {
     #[inline]
     pub(crate) fn writable(&self) -> bool {
         self.meta & PROP_WRITABLE != 0
+    }
+    /// The descriptor class this property contributes to its object's shape. Accessor
+    /// takes precedence (an accessor descriptor's writable bit is meaningless).
+    #[inline]
+    pub(crate) fn class(&self) -> PropClass {
+        if self.accessor() {
+            PropClass::Accessor
+        } else if self.writable() {
+            PropClass::DataWritable
+        } else {
+            PropClass::DataNonWritable
+        }
     }
     #[inline]
     pub(crate) fn enumerable(&self) -> bool {
@@ -3932,11 +3955,12 @@ pub struct Props {
     /// (their fill-time chain walks proved "no hop shadows this name" — see
     /// [`crate::bytecode::IC_CREATE`]). Set by the creation-IC fill walk itself, one-way.
     proto_flag: std::cell::Cell<bool>,
-    /// Object shape (hidden class): the id encoding this map's ordered key sequence (see
-    /// [`ShapeTable`]). A shared cacheable id proves the same keys in the same order, so an
-    /// inline cache that recorded (shape, slot) from one object can trust that slot
-    /// on any other object of the same shape — without a key compare. Bumped to a child on
-    /// new-key insert, to a fresh unique on a structural removal. Only consulted for non-exotic
+    /// Object shape (hidden class): the id encoding this map's ordered (key, descriptor
+    /// class) sequence (see [`ShapeTable`]). A shared cacheable id proves the same keys in
+    /// the same order, so an inline cache that recorded (shape, slot) from one object can
+    /// trust that slot on any other object of the same shape — without a key compare.
+    /// Bumped to a child on new-key insert, to a fresh unique on a structural removal or
+    /// a class-changing descriptor replacement. Only consulted for non-exotic
     /// objects (arrays keep the key-compare path — same shape can mean different element counts).
     shape: u32,
     /// One nullable cold-sidecar pointer shared by the optional hash index, packed elements,
@@ -4066,16 +4090,18 @@ pub(crate) fn bump_proto_epoch() {
     );
 }
 
-/// The object-shape (hidden-class) transition tree. A shape id encodes an *ordered sequence of
-/// property keys*. A shared cacheable id proves the same keys in the same order (attributes
-/// are NOT encoded; the inline cache re-checks accessor/writable at the slot).
-/// `transitions[(parent, key)] = child` is memoized within an Agent, so its structurally-identical
+/// The object-shape (hidden-class) transition tree. A shape id encodes an *ordered sequence
+/// of (property key, descriptor class) pairs*. A shared cacheable id proves the same keys
+/// in the same order; the recorded classes are not yet a consumer proof — the inline cache
+/// still re-checks accessor/writable at the slot until every `&mut Property` escape demotes
+/// on class change (Pilot C steps 5-6).
+/// `transitions[(parent, key, class)] = child` is memoized within an Agent, so its structurally-identical
 /// objects converge on one id. Fresh IDs are process-wide and never reused: foreign objects and
 /// foreign-context mutations cannot collide with another Agent's proofs. A structural *removal* can't be a tree
 /// transition (it doesn't extend the key sequence), so it mints a fresh unique id that no cache
 /// ever holds — forcing a re-derive.
 struct ShapeTable {
-    transitions: crate::fasthash::FastMap<(u32, Rc<str>), u32>,
+    transitions: crate::fasthash::FastMap<(u32, Rc<str>, PropClass), u32>,
     /// Bounded tagged lookup: process-wide IDs are never dense within a particular heap.
     layouts: ShapeLayouts,
     /// Direct-mapped memo of recent `transitions` hits keyed by parent shape and key *identity*
@@ -4083,7 +4109,7 @@ struct ShapeTable {
     /// names, a chunk's constant keys), so most transitions skip hashing and comparing the key
     /// text. Each entry holds its key, so the identity cannot be reused by another string, and
     /// `transitions` is append-only, so an entry never disagrees with it.
-    recent: Vec<Option<(u32, Rc<str>, u32)>>,
+    recent: Vec<Option<(u32, Rc<str>, PropClass, u32)>>,
 }
 
 const RECENT_TRANSITIONS: usize = 512;
@@ -4114,11 +4140,14 @@ impl ShapeTable {
     }
 }
 
-/// The child shape reached by adding `key` to shape `parent` (memoized so it is shared).
+/// The child shape reached by adding `key` with descriptor class `class` to shape
+/// `parent` (memoized so it is shared). Two maps with the same keys but different
+/// descriptor classes now get different shapes; the layout still records keys only.
 fn shape_transition(
     parent: u32,
     key: &Rc<str>,
-    prefix: Option<&[Rc<str>]>,
+    class: PropClass,
+    prefix: Option<&[(Rc<str>, PropClass)]>,
 ) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
@@ -4129,14 +4158,15 @@ fn shape_transition(
         }
         let slot = recent_transition_slot(parent, key);
         let recent = shapes.recent.get(slot).and_then(Option::as_ref).and_then(
-            |(cached_parent, cached_key, child)| {
-                (*cached_parent == parent && Rc::ptr_eq(cached_key, key)).then_some(*child)
+            |(cached_parent, cached_key, cached_class, child)| {
+                (*cached_parent == parent && Rc::ptr_eq(cached_key, key) && *cached_class == class)
+                    .then_some(*child)
             },
         );
         let id = if let Some(id) = recent {
             id
         } else {
-            let pair = (parent, key.clone());
+            let pair = (parent, key.clone(), class);
             let id = if let Some(&id) = shapes.transitions.get(&pair) {
                 id
             } else {
@@ -4150,7 +4180,7 @@ fn shape_transition(
                 if shapes.recent.is_empty() {
                     shapes.recent.resize(RECENT_TRANSITIONS, None);
                 }
-                shapes.recent[slot] = Some((parent, key.clone(), id));
+                shapes.recent[slot] = Some((parent, key.clone(), class, id));
             }
             id
         };
@@ -4167,7 +4197,7 @@ fn shape_transition(
             return (id, None);
         }
         let mut names = Vec::with_capacity(prefix.len() + 1);
-        names.extend_from_slice(prefix);
+        names.extend(prefix.iter().map(|(name, _)| name.clone()));
         names.push(key.clone());
         let layout = new_shared_indexed_property_layout(names);
         shapes.layouts.insert(id, layout.clone());
@@ -4177,8 +4207,11 @@ fn shape_transition(
         // Extend only matching predictions, never oscillate between incompatible branches.
         // No shape identity or observable property changes: field count still defines presence.
         let mut prefix_shape = SHAPE_EMPTY;
-        for name in prefix {
-            let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name.clone())) else {
+        for (name, class) in prefix {
+            let Some(&prefix_id) = shapes
+                .transitions
+                .get(&(prefix_shape, name.clone(), *class))
+            else {
                 break;
             };
             if let Some(prediction) = shapes.layouts.get_mut(prefix_id) {
@@ -4232,7 +4265,9 @@ fn array_length_shape(length_key: &Rc<str>) -> u32 {
             return cached;
         }
         let mut shapes = heap.shapes.borrow_mut();
-        let key = (SHAPE_EMPTY, length_key.clone());
+        // Array `length` is created writable; a later non-writable redefinition demotes
+        // through the ordinary insert path like any other class change.
+        let key = (SHAPE_EMPTY, length_key.clone(), PropClass::DataWritable);
         let shape = if let Some(&shape) = shapes.transitions.get(&key) {
             shape
         } else {
@@ -6083,6 +6118,16 @@ impl Props {
             self.mirror_invalidate();
         }
         if let Some(i) = self.find(&key) {
+            // A whole-descriptor replacement that changes descriptor class cannot stay
+            // on a shape that records the old class: demote to a fresh unique shape
+            // (the removal precedent). Array element entries are exempt exactly as in
+            // `remove` — their shape tracks named keys only. Class-preserving
+            // replacements (including enumerable/configurable-only changes) keep it.
+            if self.entries.fields[i].class() != prop.class()
+                && !(self.elem_mode.get() && canonical_index(&key).is_some())
+            {
+                self.shape = shape_fresh();
+            }
             self.entries.fields[i] = prop;
             if self.mirror_flags & MIRROR_OK != 0
                 && key.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
@@ -6110,8 +6155,14 @@ impl Props {
                 let prefix = (!self.elem_mode.get()
                     && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
                     && !self.entries.predicts(&key))
-                .then(|| self.entries.keys());
-                let (shape, layout) = shape_transition(self.shape, &key, prefix);
+                .then(|| {
+                    self.entries
+                        .iter()
+                        .map(|(name, property)| (name.clone(), property.class()))
+                        .collect::<Vec<_>>()
+                });
+                let (shape, layout) =
+                    shape_transition(self.shape, &key, prop.class(), prefix.as_deref());
                 self.shape = shape;
                 if let Some(layout) = layout {
                     self.entries.layout = Some(layout);

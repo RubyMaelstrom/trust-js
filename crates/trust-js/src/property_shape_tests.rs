@@ -148,7 +148,7 @@ fn property_shapes_uncacheable_prefix_never_enters_transition_or_layout_cache() 
     assert!(!shapes
         .transitions
         .keys()
-        .any(|(parent, _)| *parent == SHAPE_UNCACHEABLE));
+        .any(|(parent, ..)| *parent == SHAPE_UNCACHEABLE));
     assert!(shapes.layouts.get(SHAPE_UNCACHEABLE).is_none());
 }
 
@@ -187,6 +187,56 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
         Value::Num(12.0)
     ));
     assert!(matches!(props.get("11").unwrap().value(), Value::Num(11.0)));
+}
+
+#[test]
+fn shape_transitions_distinguish_descriptor_classes() {
+    let mut engine = Engine::new();
+    let shape_of = |engine: &mut Engine, source: &str| {
+        value(engine, source)
+            .as_obj()
+            .unwrap()
+            .borrow()
+            .props
+            .shape()
+    };
+    let writable = shape_of(&mut engine, "({pc_x: 1})");
+    let writable_again = shape_of(&mut engine, "({pc_x: 2})");
+    let nonwritable = shape_of(
+        &mut engine,
+        "Object.defineProperty({}, 'pc_x', {value: 1, writable: false})",
+    );
+    let accessor = shape_of(
+        &mut engine,
+        "Object.defineProperty({}, 'pc_x', {get() { return 1; }})",
+    );
+    assert_eq!(writable, writable_again, "same key + class reconverges");
+    assert_ne!(writable, nonwritable);
+    assert_ne!(writable, accessor);
+    assert_ne!(nonwritable, accessor);
+}
+
+#[test]
+fn class_changing_insert_demotes_but_class_preserving_insert_keeps_shape() {
+    let engine = Engine::new();
+    engine.interp.activate_gc_heap();
+    let mut props = Props::new();
+    props.insert("pc_k", Property::plain(Value::Num(1.0)));
+    let shared = props.shape();
+    // Same-class replacement (enumerable-only difference included) keeps the shape.
+    props.insert("pc_k", Property::data(Value::Num(2.0), true, false, true));
+    assert_eq!(props.shape(), shared);
+    // Writable -> non-writable is a class change: demote to a fresh unique shape.
+    props.insert("pc_k", Property::data(Value::Num(3.0), false, false, true));
+    assert_ne!(props.shape(), shared);
+    let demoted = props.shape();
+    // Data -> accessor likewise demotes again rather than reusing any shared shape.
+    props.insert(
+        "pc_k",
+        Property::accessor_prop(Some(Value::Num(0.0)), None, false, true),
+    );
+    assert_ne!(props.shape(), demoted);
+    assert_ne!(props.shape(), shared);
 }
 
 #[test]
