@@ -188,3 +188,30 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
     ));
     assert!(matches!(props.get("11").unwrap().value(), Value::Num(11.0)));
 }
+
+#[test]
+fn shape_transition_census_counts_shared_edges_once() {
+    let mut engine = Engine::new();
+    run(&mut engine, "var warm = ({census_a: 1}); 'ok'");
+    let before = active_shape_transition_count();
+    run(
+        &mut engine,
+        "var x1 = ({census_p: 1, census_q: 2}), x2 = ({census_r: 3}); 'ok'",
+    );
+    let after_first = active_shape_transition_count();
+    assert!(
+        after_first >= before + 3,
+        "three new (parent, key) edges are memoized: {before} -> {after_first}"
+    );
+    // Reassignment (not fresh `var`s, whose global keys would add their own edges):
+    // structurally identical literals must reuse every memoized transition.
+    run(
+        &mut engine,
+        "x1 = ({census_p: 4, census_q: 5}); x2 = ({census_r: 6}); 'ok'",
+    );
+    assert_eq!(
+        active_shape_transition_count(),
+        after_first,
+        "structurally identical objects reuse the memoized transitions"
+    );
+}

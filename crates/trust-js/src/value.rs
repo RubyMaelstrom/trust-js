@@ -2658,6 +2658,17 @@ pub(crate) fn heap_allocated_objects(heap: &GcHeap) -> u64 {
     heap.allocated.get()
 }
 
+/// Number of memoized `(parent, key)` shape transitions in the active heap's shape
+/// table: the shape-growth census Pilot C gates on (each entry is one shared layout
+/// edge; fresh unique shapes minted by removals are deliberately not counted).
+pub(crate) fn active_shape_transition_count() -> u64 {
+    with_active_gc_heap(|heap| {
+        heap.shapes
+            .try_borrow()
+            .map_or(0, |shapes| shapes.transitions.len() as u64)
+    })
+}
+
 /// Stable address of this Agent's live-object counter. JIT activations capture it when execution
 /// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
 /// Both native backends capture this pointer in the shared JIT entry paths. Those
