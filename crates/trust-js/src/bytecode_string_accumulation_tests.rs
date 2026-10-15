@@ -70,15 +70,8 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     let view = root.slice_bytes(0, 900);
     let alias = view.clone();
     let env = scope(&engine, Value::Str(view));
-    let stored = try_store(
-        &chunk,
-        &mut engine.interp,
-        &env,
-        plan,
-        Value::lstr("!"),
-        || {},
-    )
-    .expect("ordinary view-backed holder");
+    let stored = try_store(&chunk, &mut engine.interp, &env, plan, Value::lstr("!"))
+        .expect("ordinary view-backed holder");
     assert_eq!(
         stored.result.unwrap().as_engine_text().unwrap(),
         format!("{}!", "x".repeat(900))
@@ -86,7 +79,7 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
     assert_eq!(alias.as_str(), "x".repeat(900));
     assert_eq!(root.as_str(), "x".repeat(1024));
     let old = result(&env);
-    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old.clone(), || {}).unwrap();
+    let twice = try_store(&chunk, &mut engine.interp, &env, plan, old.clone()).unwrap();
     assert_eq!(
         twice.result.unwrap().as_engine_text().unwrap(),
         format!("{0}!{0}!", "x".repeat(900))
@@ -102,7 +95,6 @@ fn populated_holder_transaction_preserves_aliases_views_and_surrogate_boundary()
         &env,
         plan,
         Value::from_utf16(&[0xdf06]),
-        || {},
     )
     .unwrap()
     .result
@@ -136,7 +128,6 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
             _ => unreachable!(),
         }
         let old = env.borrow().vars.get("result").map(|b| b.value.clone());
-        let entered = Cell::new(false);
         assert!(
             try_store(
                 &chunk,
@@ -144,12 +135,10 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
                 &env,
                 plan,
                 Value::lstr("suffix"),
-                || entered.set(true)
             )
             .is_none(),
             "denial {kind}"
         );
-        assert!(!entered.get());
         if let Some(old) = old {
             assert_eq!(old.as_engine_text(), result(&env).as_engine_text());
         }
@@ -162,27 +151,15 @@ fn proof_denials_leave_the_original_holder_and_stack_untouched() {
         Value::Num(2.0),
         Value::Bool(true),
     ] {
-        assert!(
-            try_store(&chunk, &mut engine.interp, &env, plan, right, || panic!(
-                "denied"
-            ))
-            .is_none()
-        );
+        assert!(try_store(&chunk, &mut engine.interp, &env, plan, right).is_none());
         assert_eq!(result(&env).as_engine_text().unwrap(), "prefix");
     }
-    let mut deep = env;
+    let mut deep = env.clone();
     for _ in 0..MAX_SCOPES {
         deep = new_scope(Some(deep));
     }
-    assert!(try_store(
-        &chunk,
-        &mut engine.interp,
-        &deep,
-        plan,
-        Value::lstr("!"),
-        || panic!("bounded denial")
-    )
-    .is_none());
+    assert!(try_store(&chunk, &mut engine.interp, &deep, plan, Value::lstr("!")).is_none());
+    assert_eq!(result(&env).as_engine_text().unwrap(), "prefix");
 }
 
 #[test]
@@ -453,24 +430,8 @@ fn exact_shared_chunk_never_reuses_another_closures_holder() {
     let left = scope(&engine, Value::lstr("left"));
     let right = scope(&engine, Value::lstr("right"));
     for _ in 0..8 {
-        try_store(
-            &chunk,
-            &mut engine.interp,
-            &left,
-            plan,
-            Value::lstr("L"),
-            || {},
-        )
-        .unwrap();
-        try_store(
-            &chunk,
-            &mut engine.interp,
-            &right,
-            plan,
-            Value::lstr("R"),
-            || {},
-        )
-        .unwrap();
+        try_store(&chunk, &mut engine.interp, &left, plan, Value::lstr("L")).unwrap();
+        try_store(&chunk, &mut engine.interp, &right, plan, Value::lstr("R")).unwrap();
     }
     assert_eq!(result(&left).as_engine_text().unwrap(), "leftLLLLLLLL");
     assert_eq!(result(&right).as_engine_text().unwrap(), "rightRRRRRRRR");
@@ -541,15 +502,7 @@ fn length_denial_preserves_binding_and_throws_at_original_add() {
         &engine,
         Value::from_engine_text("x".repeat(MAX_STR_LEN - 1)),
     );
-    assert!(try_store(
-        &chunk,
-        &mut engine.interp,
-        &holder,
-        plan,
-        Value::lstr("xx"),
-        || panic!("length proof must fail before mutation")
-    )
-    .is_none());
+    assert!(try_store(&chunk, &mut engine.interp, &holder, plan, Value::lstr("xx")).is_none());
     assert_eq!(
         result(&holder).as_engine_text().unwrap().len(),
         MAX_STR_LEN - 1
@@ -675,15 +628,10 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
         bytecode::compile(&function("function* subject(part){yield result+=part;}")).unwrap();
     let original = first_plan(&chunk);
     {
-        // Finalize this synthetic no-Dup graph before its fresh exact-version coverage is
-        // created. Undef supplies the following Yield's independently specified value.
+        // Undef supplies the following Yield's independently specified value.
         let chunk = Rc::get_mut(&mut chunk).unwrap();
         chunk.ops[original.pc + 3] = chunk.ops[original.pc + 4];
         chunk.ops[original.pc + 4] = Op::Undef;
-        #[cfg(feature = "optimizing-jit")]
-        {
-            chunk.execution_coverage = crate::execution_coverage::Handle::new(chunk);
-        }
     }
     let plan = first_plan(&chunk);
     assert!(!plan.keep);

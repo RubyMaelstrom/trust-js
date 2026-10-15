@@ -24,7 +24,6 @@ use property_shapes::SHAPE_LAYOUT_CACHE_LIMIT;
 pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_BITS;
 #[cfg(any(
     test,
-    feature = "optimizing-jit",
     all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -180,19 +179,10 @@ pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 mod lazy_function_prototype;
 use lazy_function_prototype::LazyFunctionPrototype;
 
-#[cfg(feature = "optimizing-jit")]
-#[path = "packed_owner_layout.rs"]
-mod packed_owner_layout;
-
-#[cfg(feature = "optimizing-jit")]
-pub(crate) fn jit_packed_owners_supported(layout: &JitLayout) -> bool {
-    packed_owner_layout::supported(layout)
-}
-
 impl PackedValue {
     /// Borrow the encoded bits without transferring their reference ownership. Generated code
     /// may copy this word only after applying the matching clone/move ownership operation.
-    #[cfg(any(test, feature = "optimizing-jit"))]
+    #[cfg(test)]
     #[inline]
     pub(crate) fn bits(&self) -> u64 {
         self.0.get()
@@ -256,20 +246,6 @@ impl PackedValue {
         }
         let string = std::mem::ManuallyDrop::new(unsafe { self.read_word::<crate::lstr::LStr>() });
         Some(f(&string))
-    }
-
-    /// A non-owning class observation; does not unpack a heap owner or lazy value.
-    #[cfg(feature = "optimizing-jit")]
-    #[inline]
-    pub(crate) fn is_boolean(&self) -> bool {
-        self.tag() == PACK_BOOL
-    }
-
-    /// A bounded feedback checkpoint may temporarily retain an already materialized object.
-    /// Unlike unpack/object this never observes or materializes a deferred prototype.
-    #[cfg(feature = "optimizing-jit")]
-    pub(crate) fn sampled_object(&self) -> Option<Gc> {
-        (self.tag() == PACK_OBJ).then(|| unsafe { self.clone_word() })
     }
 
     /// Inspect a Number without manufacturing an owning Value. In particular, rejecting a
@@ -399,39 +375,6 @@ impl PackedValue {
             }
             _ => Value::Num(f64::from_bits(self.0.get())),
         }
-    }
-
-    /// Compare a borrowed execution word with canonical engine text without manufacturing
-    /// a temporary String owner. Other language types are strictly unequal to a String.
-    ///
-    /// # Safety
-    /// If `bits` has the String tag, an owning canonical/SSA word must keep that exact LStr
-    /// allocation live for this call. This routine cannot allocate, poll, collect or call JS.
-    #[cfg(feature = "optimizing-jit")]
-    #[inline]
-    pub(crate) unsafe fn raw_string_equals(bits: u64, literal: &str) -> bool {
-        let word = std::mem::ManuallyDrop::new(Self(Cell::new(bits)));
-        if word.tag() != PACK_STR {
-            return false;
-        }
-        let string = std::mem::ManuallyDrop::new(unsafe { word.read_word::<crate::lstr::LStr>() });
-        string.as_str() == literal
-    }
-
-    /// Borrow canonical engine text once for an observer-free primitive operation. Views
-    /// and lone surrogates retain the existing LStr representation; no temporary owner is made.
-    ///
-    /// # Safety
-    /// An owning canonical or SSA word must pin this allocation throughout `f`. The closure
-    /// must not allocate, poll, collect, call JavaScript, or mutate that owner's storage.
-    #[cfg(feature = "optimizing-jit")]
-    #[inline]
-    pub(crate) unsafe fn with_raw_string_text<R>(
-        bits: u64,
-        f: impl FnOnce(&str) -> R,
-    ) -> Option<R> {
-        let word = std::mem::ManuallyDrop::new(Self(Cell::new(bits)));
-        word.with_string(|string| f(string.as_str()))
     }
 
     /// Lend the strong object edge this word owns (an object, or a deferred prototype's single
@@ -3258,12 +3201,6 @@ impl Property {
         } else {
             self.packed.number()
         }
-    }
-    /// A class observation of an already materialized own data value. This neither
-    /// retains an object nor materializes a deferred function prototype.
-    #[cfg(feature = "optimizing-jit")]
-    pub(crate) fn is_object_value(&self) -> bool {
-        !self.accessor() && self.packed.tag() == PACK_OBJ
     }
     /// Collector-only owning edge, lent without a reference-count round trip. A deferred
     /// prototype owns its realm parent until first observation; afterward it owns the

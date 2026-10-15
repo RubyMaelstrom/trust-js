@@ -30,37 +30,6 @@ struct Asm {
     patches: Vec<(usize, usize)>,
 }
 
-/// Called only before an operation produces flags or a live scratch value.
-#[cfg(feature = "optimizing-jit")]
-fn emit_coverage_ranges(a: &mut Asm, chunk: &Chunk, ranges: &[(usize, usize)]) {
-    let Some(coverage) = chunk.execution_coverage.source() else {
-        return;
-    };
-    match coverage.markers(ranges) {
-        Ok(markers) => {
-            for (pointer, mask) in markers {
-                a.bytes(&[0x48, 0xb8]); // movabs rax,address
-                a.bytes(&(pointer as usize as u64).to_le_bytes());
-                a.bytes(&[0x80, 0x08, mask]); // or byte [rax],mask (clobbers flags)
-            }
-        }
-        Err(reason) => {
-            a.bytes(&[0x48, 0xb8]);
-            a.bytes(&(coverage.unknown_ptr() as usize as u64).to_le_bytes());
-            a.bytes(&[0x81, 0x08]); // or dword [rax],reason
-            a.bytes(&(reason as u32).to_le_bytes());
-        }
-    }
-}
-
-#[cfg(all(test, feature = "optimizing-jit"))]
-pub(super) fn coverage_marker_leaf_bytes(chunk: &Chunk, ranges: &[(usize, usize)]) -> Vec<u8> {
-    let mut a = Asm::new();
-    emit_coverage_ranges(&mut a, chunk, ranges);
-    a.bytes(&[0xc3]); // ret; no JitCtx or JavaScript storage is accessed.
-    a.code
-}
-
 impl Asm {
     fn new() -> Self {
         Self {
@@ -719,50 +688,7 @@ pub(super) fn compile_entry(
         a.interrupt_poll(interrupt_offset, unwind);
     }
 
-    #[cfg(feature = "optimizing-jit")]
-    if !borrowed_entry {
-        if let Some(counter) = super::optimizing::hot_counter(chunk) {
-            let done = a.label();
-            a.bytes(&[0x48, 0xb8]); // movabs rax,counter
-            a.bytes(&(counter as usize as u64).to_le_bytes());
-            a.bytes(&[0x83, 0x38, 0x00]); // cmp dword [rax],0
-            a.jcc(0x84, done);
-            a.bytes(&[0x83, 0x28, 0x01]); // sub dword [rax],1
-            a.jcc(0x85, done);
-            a.bytes(&[0x4d, 0x89, 0xac, 0x24]); // ctx.final_sp = r13
-            a.bytes(&(std::mem::offset_of!(super::JitCtx, final_sp) as i32).to_le_bytes());
-            #[cfg(not(target_os = "windows"))]
-            a.bytes(&[0x4c, 0x89, 0xe7]); // rdi=ctx
-            #[cfg(target_os = "windows")]
-            a.bytes(&[0x48, 0x83, 0xec, 0x20, 0x4c, 0x89, 0xe1]); // shadow area; rcx=ctx
-            a.bytes(&[0x48, 0xb8]);
-            a.bytes(
-                &(super::optimizing::request_hot_upgrade as *const () as usize as u64)
-                    .to_le_bytes(),
-            );
-            a.bytes(&[0xff, 0xd0]); // call rax (void scalar C ABI)
-            #[cfg(target_os = "windows")]
-            a.bytes(&[0x48, 0x83, 0xc4, 0x20]);
-            a.bind(done);
-        }
-    }
-
     if borrowed_entry {
-        #[cfg(feature = "optimizing-jit")]
-        if chunk.execution_coverage.source().is_some() {
-            #[cfg(not(target_os = "windows"))]
-            a.bytes(&[0x4c, 0x89, 0xe7]); // rdi=ctx
-            #[cfg(target_os = "windows")]
-            a.bytes(&[0x48, 0x83, 0xec, 0x20, 0x4c, 0x89, 0xe1]); // shadow; rcx=ctx
-            a.bytes(&[0x48, 0xb8]);
-            a.bytes(
-                &(crate::execution_coverage::mark_native_resume as *const () as usize as u64)
-                    .to_le_bytes(),
-            );
-            a.bytes(&[0xff, 0xd0]);
-            #[cfg(target_os = "windows")]
-            a.bytes(&[0x48, 0x83, 0xc4, 0x20]);
-        }
         // The shared slice entry validates resume_pc before exposing canonical storage to
         // machine code. Every x64 bytecode PC has an explicit label (no fused-away targets).
         a.bytes(&[0x49, 0x8b, 0x84, 0x24]); // rax = ctx.resume_pc
@@ -782,35 +708,6 @@ pub(super) fn compile_entry(
         pc_offsets.push(a.code.len() as u32);
         if interrupt_targets[pc] {
             a.interrupt_poll(interrupt_offset, unwind);
-            #[cfg(feature = "optimizing-jit")]
-            if !borrowed_entry {
-                if let Some(counter) = super::optimizing::loop_entry::counter(chunk, pc) {
-                    let done = a.label();
-                    a.mov_word_imm(counter as usize as u64);
-                    a.bytes(&[0x83, 0x38, 0x00]); // cmp dword [rax],0
-                    a.jcc(0x84, done);
-                    a.bytes(&[0xff, 0x08]); // dec dword [rax]
-                    a.jcc(0x85, done);
-                    a.call_helper_pair(super::H_OPT_LOOP, pc as u32);
-                    a.bytes(&[0x49, 0x89, 0xc5]); // r13=returned canonical sp
-                    a.bytes(&[0x48, 0x85, 0xd2]); // test rdx,rdx
-                    a.jcc(0x84, done);
-                    a.bytes(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx,1
-                    a.jcc(0x84, ret_ok);
-                    a.jmp(ret_throw);
-                    a.bind(done);
-                }
-            }
-        }
-        #[cfg(feature = "optimizing-jit")]
-        if chunk
-            .execution_coverage
-            .source()
-            .is_some_and(|coverage| coverage.is_leader(pc))
-        {
-            // No flags or rax value survives a semantic block boundary: predecessor branches
-            // consumed flags before transfer, and canonical operands are in r13/r15 storage.
-            emit_coverage_ranges(&mut a, chunk, &[(pc, pc + 1)]);
         }
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
             a.helper_spflag(H_SLICE_OP, pc as u32, ret_throw);
@@ -1242,15 +1139,6 @@ pub(super) fn compile_entry(
         }),
         executable,
         residency,
-        #[cfg(feature = "optimizing-jit")]
-        call_stubs: Vec::new(),
-        #[cfg(feature = "optimizing-jit")]
-        optimizing_diagnostics: None,
-        #[cfg(feature = "optimizing-jit")]
-        execution_coverage: chunk
-            .execution_coverage
-            .source()
-            .map(crate::execution_coverage::Lease::new),
     })
 }
 

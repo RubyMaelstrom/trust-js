@@ -29,8 +29,6 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             ])
             .env(CHILD, "1")
             .env("TRUST_JS_INLINE_AT", "0")
-            .env("TRUST_JS_OPT_JIT", "0")
-            .env_remove("TRUST_JS_OPT_JIT_DEOPT_AT")
             .output()
             .expect("isolated global epoch test");
         assert!(

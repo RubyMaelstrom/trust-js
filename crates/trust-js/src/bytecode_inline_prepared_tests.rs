@@ -157,8 +157,7 @@ fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
     if std::env::var_os(CHILD).is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","jit::inline_prepared_tests::prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies","--nocapture"])
-            .env(CHILD,"1").env("TRUST_JS_INLINE_AT","8").env("TRUST_JS_OPT_JIT","0")
-            .env_remove("TRUST_JS_OPT_JIT_DEOPT_AT").output().unwrap();
+            .env(CHILD,"1").env("TRUST_JS_INLINE_AT","8").output().unwrap();
         assert!(
             output.status.success(),
             "{}\n{}",

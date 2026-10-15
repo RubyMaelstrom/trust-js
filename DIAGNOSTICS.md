@@ -88,62 +88,15 @@ comment/example in the same change.
   optional compile/drop metadata; it neither instruments native instructions nor
   loads a profiler library. Keep it disabled for uninstrumented timing comparisons.
 
-## Optimizing-JIT diagnostics and ablations
+## Architecture diagnostics
 
-`TRUST_JS_OPT_JIT_LOG=1` reports
-declines, and `TRUST_JS_OPT_JIT_DUMP=1` prints bytecode/CLIF for diagnosis.
-
-`TRUST_JS_OPT_JIT_DIAGNOSTICS=1` adds bounded per-native-body compilation, entry,
-helper, heap-guard, owner-transfer, frame-publication and specialization-bailout observations. It emits
-compiler/drop records and includes live records in performance metrics. Disabled
-emission adds no native instructions. `TRUST_JS_OPT_JIT_DIAGNOSTICS=compile` records
-compilation/static counts and emits the ordinary uninstrumented body. Instrumented
-IR is larger and still subject
-to the same compiler limits; diagnostic runs cannot be acceptance timings.
-`TRUST_JS_OPT_JIT_DIAGNOSTICS=execution` separately records physical optimized entries,
-normal/error exits, terminal VM recoveries, specialization retirement and the first eight
-emitted committed data-property read/existing-overwrite, literal-comparison, ordered-case
-or borrowed-owner-window sites. One dispatch event counts its group; one borrowed event
-counts a local copy or owning call-input materialization, not its loads or call completion.
-Normal exits include recovered VM completions;
-native control flow may still call checked helpers or author code. Loop-continuation and
-whole-function retirement use separate miss states. Creation, computed elements and scalar
-loop-field accesses are outside the site counters. Execution counters saturate; the legacy
-Full-mode counters keep their existing behavior. Shared-owner leaf counters are Full-only
-and have distinct storage from execution sites. Dynamic diagnostic metadata capacities are
-included in retained memory, and the directory holds weak references.
-
-The separate `architecture-diagnostics` feature records allocation sites/lifetimes
+The `architecture-diagnostics` feature records allocation sites/lifetimes
 in the live Rc heap and call-cache epoch/refill traffic. It adds no object owners;
 site and registry-slot limits report untracked allocations. Initial exotic family
 is recorded at allocation, before later function/exotic initialization. Lifetimes
 use heap allocation ordinals and completed collections, not elapsed time. Live
 families at collection are a separate population sample. These probes compile out
 of ordinary builds; use them only for diagnostics, never performance acceptance.
-
-`TRUST_JS_OPT_JIT_DEOPT_AT=N` is a development stress hook: an eligible optimized function
-exits to its ordinary VM continuation when it reaches bytecode boundary N, before that operation.
-It is unset by default, is not a type-specialization policy, and must be absent during
-performance measurements. Suspended frames are not admitted by this hook; eligible flattened
-inline bodies continue in their canonical remapped slots and logical source frames.
-
-`TRUST_JS_OPT_JIT_SPARSE_RELOADS=0` is a compiler-emission diagnostic ablation: reload all
-tracked local register copies after observers instead of the bounded liveness plan. It does
-not remove canonical frame owners, change GC roots, or disable state publication. Keep the
-setting explicit in measurement manifests; the optimizing tier itself remains opt-in.
-`TRUST_JS_OPT_JIT_LOCAL_EFFECTS=0` retains the all-clobber helper analysis for a diagnostic
-comparison. The development default separates canonical publication from private-slot
-write effects: preserved register words do not imply immutable objects or environments.
-Full-reload mode (`TRUST_JS_OPT_JIT_SPARSE_RELOADS=0`) still forces all tracked reloads.
-`TRUST_JS_OPT_JIT_VALUE_FACTS=0` disables the experimental whole-function value-category
-analysis and its guard/owner-check elisions. The analysis proves normal-result categories,
-not immutable heap contents or numeric ranges; unknown effects and completion landings
-retain dynamic checks. Budget exhaustion also retains those checks. This switch skips
-analysis itself, unlike the reload-emission-only ablation above.
-
-Release optimizing compilation validates finalized CLIF once before backend work.
-`TRUST_JS_OPT_JIT_VERIFY=1`, debug builds and tests additionally enable Cranelift's repeated
-internal verifier passes. This diagnostic does not change JavaScript guards or recovery.
 
 ## Benchmark runners
 

@@ -38,6 +38,10 @@ dependencies.
 
 ## Performance work
 
+Optimize the established bytecode/native JIT pipeline and shared runtime as one engine.
+The optional Cranelift JavaScript backend has been removed; its dated investigation
+records are historical evidence, not an active implementation roadmap.
+
 Use release builds and record the machine, revision, tier, flags, and workload.
 Follow [benchmarks/README.md](benchmarks/README.md) for comparison and regression
 policy. Check correctness as well as throughput, memory, startup, and compilation

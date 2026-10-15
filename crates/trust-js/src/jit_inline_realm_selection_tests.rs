@@ -229,18 +229,6 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
         })
         .unwrap();
     assert_eq!(target.genv_pin.as_ptr() as usize, address);
-    #[cfg(feature = "optimizing-jit")]
-    {
-        let weak_count = Rc::weak_count(&planning);
-        let optimized = bytecode::compile_for_optimizer(&user.func, &chunk, &[], &[]).unwrap();
-        assert!(
-            Rc::weak_count(&planning) > weak_count,
-            "optimizer snapshot retains allocation pins"
-        );
-        assert!(optimized.inline_realm_compatible(address));
-        drop(optimized);
-        assert_eq!(Rc::weak_count(&planning), weak_count);
-    }
     assert_eq!(Rc::strong_count(&planning), 1);
     drop(chunk);
     assert_eq!(

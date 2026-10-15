@@ -9311,8 +9311,6 @@ fn default_constructor(derived: bool, class: &Class) -> Function {
         calls: std::cell::Cell::new(0),
         code: std::cell::OnceCell::new(),
         code2: std::cell::OnceCell::new(),
-        #[cfg(feature = "optimizing-jit")]
-        optimizing_code: std::cell::OnceCell::new(),
         fn_maps: std::cell::OnceCell::new(),
         env_layouts: std::cell::OnceCell::new(),
         name: None,

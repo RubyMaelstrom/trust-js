@@ -39,8 +39,7 @@ interior boundary declines the transaction, and middle-PC native resumes execute
 the ordinary suffix. No author callback, coercion, GC poll, interruption check or
 recoverable JavaScript error occurs between the proved read and committed store.
 With operation statistics enabled, the transaction declines so the original
-checked operations and their PCs remain observable. Optional execution coverage
-marks a conservative superset of the original entered operations.
+checked operations and their PCs remain observable.
 
 The semantic review used local ECMA-262 revision
  e28783d5fc9dc12b3de905961e2c71410b38a202:

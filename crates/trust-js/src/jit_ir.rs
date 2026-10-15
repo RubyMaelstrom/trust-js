@@ -1,7 +1,7 @@
-//! Target-neutral control-flow and stack analysis for optimizing JIT regions.
+//! Target-neutral control-flow and stack analysis for native JIT regions.
 //!
 //! The baseline emitters deliberately remain architecture-specific.  This module owns the
-//! shared facts an optimizing tier needs: exact settled stack depths, basic blocks, normal-flow
+//! shared facts the native region emitters need: exact settled stack depths, basic blocks, normal-flow
 //! dominance, and natural loops.  Exception handlers are represented as independent roots, not
 //! ordinary predecessors -- a catch is entered with the saved try-entry depth plus the thrown
 //! value, and pretending `PushHandler` branches to it would make dominance unsound.
@@ -999,7 +999,7 @@ impl RegionIr {
 
     /// Publish a conservative deoptimization record for one SSA side exit. Every logical local
     /// and operand is copied from its baseline frame slot; speculative representation changes are
-    /// intentionally absent until the optimizing tier has an executable guard and resume path.
+    /// intentionally absent from this baseline-frame materialization description.
     pub(crate) fn deopt_record_for_exit(
         &self,
         exit_index: usize,

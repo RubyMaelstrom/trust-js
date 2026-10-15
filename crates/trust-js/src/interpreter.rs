@@ -3059,12 +3059,6 @@ pub struct Interp {
     /// Hot-loop poll divider. Execution tiers increment this cheaply and consult the shared
     /// atomics/deadline only once per bounded batch.
     pub(crate) interrupt_poll_tick: u32,
-    #[cfg(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    pub(crate) optimizing_background: Option<Box<crate::jit::OptimizingBackground>>,
     /// The tree-walking evaluator's stack-gateway divider: it queries the native stack once per
     /// eight evaluations, so at least once every eight levels of nesting (see `Interp::eval`).
     pub(crate) ast_tick: u32,
@@ -3626,12 +3620,6 @@ interp_memory_inventory! {
     wall_clock => "external",
     runtime_interrupt => "external",
     interrupt_poll_tick => "non_owning",
-    #[cfg(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    optimizing_background => "measured",
     ast_tick => "non_owning",
     strict => "non_owning",
     tier => "non_owning",
@@ -3804,16 +3792,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    let background_field = usize::from(cfg!(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
-        )
-    )));
-    assert_eq!(names.len(), 168 + background_field);
+    assert_eq!(names.len(), 168);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3825,12 +3804,6 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
 
 impl Drop for Interp {
     fn drop(&mut self) {
-        #[cfg(all(
-            feature = "optimizing-jit",
-            any(target_arch = "aarch64", target_arch = "x86_64"),
-            any(target_os = "linux", target_os = "macos", target_os = "windows")
-        ))]
-        drop(self.optimizing_background.take());
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush
         // the opt-in function profile when the owning Agent is destroyed so browser-workload
         // diagnostics retain their measurements; `dump` clears the TLS aggregate, preventing a
@@ -5154,12 +5127,6 @@ impl Interp {
             wall_clock: None,
             runtime_interrupt: Default::default(),
             interrupt_poll_tick: 0,
-            #[cfg(all(
-                feature = "optimizing-jit",
-                any(target_arch = "aarch64", target_arch = "x86_64"),
-                any(target_os = "linux", target_os = "macos", target_os = "windows")
-            ))]
-            optimizing_background: None,
             ast_tick: 0,
             strict: false,
             depth: 0,
@@ -14357,7 +14324,6 @@ impl Interp {
         this_val: &Value,
         args: *mut crate::value::PackedValue,
         argc: usize,
-        #[cfg(feature = "optimizing-jit")] constructor: &Gc,
     ) -> Option<Result<Value, Abrupt>> {
         let (initializer_name, initializer_cache, apply_cache) =
             chunk.jit_arguments_apply_forwarder()?;
@@ -14521,27 +14487,6 @@ impl Interp {
                 ));
             }
 
-            #[cfg(feature = "optimizing-jit")]
-            if crate::execution_coverage::enabled() {
-                chunk
-                    .execution_coverage
-                    .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
-                if let Callable::User(user) = &constructor.borrow().call {
-                    crate::execution_coverage::invalidate_function(
-                        &user.func,
-                        crate::execution_coverage::Reason::ForwarderShortcut,
-                    );
-                }
-                initializer_chunk
-                    .execution_coverage
-                    .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
-                if let Callable::User(user) = &initializer_obj.borrow().call {
-                    crate::execution_coverage::invalidate_function(
-                        &user.func,
-                        crate::execution_coverage::Reason::ForwarderShortcut,
-                    );
-                }
-            }
             let plan = initializer_chunk
                 .jit_initializer_plan()
                 .expect("initializer plan checked above");
@@ -14616,18 +14561,6 @@ impl Interp {
             return Some(Err(e));
         }
 
-        #[cfg(feature = "optimizing-jit")]
-        if crate::execution_coverage::enabled() {
-            chunk
-                .execution_coverage
-                .invalidate(crate::execution_coverage::Reason::ForwarderShortcut);
-            if let Callable::User(user) = &constructor.borrow().call {
-                crate::execution_coverage::invalidate_function(
-                    &user.func,
-                    crate::execution_coverage::Reason::ForwarderShortcut,
-                );
-            }
-        }
         let mut forwarded_this = std::mem::ManuallyDrop::new(PackedValue::pack(this_val.clone()));
         let fast = unsafe {
             self.call_jit_fast(
@@ -14893,19 +14826,6 @@ impl Interp {
                 }
             };
             if let Some(shapes) = shapes {
-                #[cfg(feature = "optimizing-jit")]
-                if crate::execution_coverage::enabled() {
-                    chunk
-                        .execution_coverage
-                        .invalidate(crate::execution_coverage::Reason::ConstructorShortcut);
-                    if let Callable::User(user) = &o.borrow().call {
-                        crate::execution_coverage::invalidate_function(
-                            &user.func,
-                            crate::execution_coverage::Reason::ConstructorShortcut,
-                        );
-                    }
-                }
-
                 let mut object = this.borrow_mut();
                 let initialized_layout = chunk.initializer_layout().is_some();
                 for field in 0..simple.len() {
@@ -14966,15 +14886,7 @@ impl Interp {
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder
                 .then(|| unsafe {
-                    self.construct_arguments_apply_forwarder(
-                        chunk,
-                        &this,
-                        &this_val,
-                        args,
-                        argc,
-                        #[cfg(feature = "optimizing-jit")]
-                        o,
-                    )
+                    self.construct_arguments_apply_forwarder(chunk, &this, &this_val, args, argc)
                 })
                 .flatten();
             if let Some(r) = forwarded {
@@ -15795,11 +15707,6 @@ impl Interp {
         // (The bytecode tier intercepted eligible calls at the top of this function; anything
         // reaching here — construct calls, uncompilable bodies — runs on the tree-walker.)
         let mut result = Ok(Value::Undefined);
-        #[cfg(feature = "optimizing-jit")]
-        crate::execution_coverage::invalidate_function(
-            func,
-            crate::execution_coverage::Reason::AstBody,
-        );
         for stmt in &func.body {
             match self.exec_stmt(stmt, &body) {
                 Ok(_) => {}

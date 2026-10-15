@@ -359,14 +359,6 @@ fn compile(
     Some((chunk, completion, seeds))
 }
 
-#[cfg(all(test, feature = "optimizing-jit"))]
-pub(crate) fn compile_for_region_exclusion_test(
-    source: Source<'_>,
-    i: &Interp,
-) -> Option<Rc<Chunk>> {
-    compile(source, &[], Context::current(i)).map(|(chunk, _, _)| chunk)
-}
-
 fn function_owns_loop(function: &Function, site: &LoopSite) -> bool {
     let mut pending = function.body.iter().collect::<Vec<_>>();
     while let Some(statement) = pending.pop() {

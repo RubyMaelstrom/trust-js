@@ -427,10 +427,6 @@ pub(crate) struct Visitor {
     chunks: HashSet<usize>,
     inline_site_allocations: HashSet<usize>,
     jit_codes: HashSet<usize>,
-    #[cfg(feature = "optimizing-jit")]
-    jit_call_stubs: HashSet<usize>,
-    #[cfg(feature = "optimizing-jit")]
-    execution_coverage_allocations: HashSet<usize>,
     hoist_plans: HashSet<usize>,
     binding_layouts: HashSet<usize>,
     stmt_bodies: HashSet<usize>,
@@ -456,7 +452,6 @@ pub(crate) struct Visitor {
     callable_metadata: usize,
     function_bytecode_metadata: usize,
     function_bytecode_opaque_storage: bool,
-    background_compiler_unmeasured: bool,
     jit_heap_metadata: usize,
     regexp_metadata: usize,
     detached_property_storage: usize,
@@ -694,16 +689,6 @@ impl Visitor {
         self.function_bytecode_metadata = self.function_bytecode_metadata.saturating_add(bytes);
     }
 
-    /// Shared scalar feedback/snapshots are charged once across Chunk and native leases.
-    /// Like other Rc-backed managed categories, private refcount headers are excluded; the
-    /// coverage quota reports its own explicitly labelled header/directory charges separately.
-    #[cfg(feature = "optimizing-jit")]
-    pub(crate) fn execution_coverage_allocation(&mut self, identity: usize, bytes: usize) {
-        if self.execution_coverage_allocations.insert(identity) {
-            self.add_function_bytecode_bytes(bytes);
-        }
-    }
-
     pub(crate) fn inline_sites_bytes(&mut self, identity: usize, bytes: usize) -> usize {
         if self.inline_site_allocations.insert(identity) {
             bytes
@@ -714,15 +699,6 @@ impl Visitor {
 
     pub(crate) fn mark_function_bytecode_opaque_storage(&mut self) {
         self.function_bytecode_opaque_storage = true;
-    }
-
-    #[cfg(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    pub(crate) fn mark_background_compiler_unmeasured(&mut self) {
-        self.background_compiler_unmeasured = true;
     }
 
     pub(crate) fn add_jit_heap_metadata_bytes(&mut self, bytes: usize) {
@@ -876,10 +852,6 @@ impl Visitor {
         if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
             self.chunk(chunk);
         }
-        #[cfg(feature = "optimizing-jit")]
-        if let Some(chunk) = function.optimizing_code.get().and_then(Option::as_ref) {
-            self.chunk(chunk);
-        }
         if let Some(maps) = function.fn_maps.get() {
             self.props(&maps.function);
             if let Some(prototype_map) = &maps.prototype {
@@ -965,16 +937,6 @@ impl Visitor {
         let identity = Rc::as_ptr(code) as usize;
         if self.jit_codes.insert(identity) {
             self.add_jit_heap_metadata_bytes(code.retained_heap_metadata_bytes());
-            #[cfg(feature = "optimizing-jit")]
-            if let Some((identity, bytes)) = code.execution_coverage_metadata() {
-                self.execution_coverage_allocation(identity, bytes);
-            }
-            #[cfg(feature = "optimizing-jit")]
-            for (identity, bytes) in code.shared_call_metadata() {
-                if self.jit_call_stubs.insert(identity) {
-                    self.add_jit_heap_metadata_bytes(bytes);
-                }
-            }
         }
     }
 
@@ -2372,22 +2334,6 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
 
 fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
-    #[cfg(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    if let Some(state) = &interp.optimizing_background {
-        state.scan_retained_memory(&mut visitor);
-    }
-    #[cfg(all(
-        feature = "optimizing-jit",
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    if crate::jit::optimizing_background_in_flight() {
-        visitor.mark_background_compiler_unmeasured();
-    }
     let mut totals = DirectTotals::default();
     scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
     scan_symbol_agent(interp, &mut visitor, &mut totals);
@@ -2436,12 +2382,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
                 "native closure captured allocations are unreported or have conflicting identities",
             )
         },
-        function_bytecode_metadata: if visitor.background_compiler_unmeasured {
-            Category::incomplete_lower_bound(
-                visitor.function_bytecode_metadata,
-                "background compiler IR, scratch, channels and pending native metadata are unmeasured",
-            )
-        } else if visitor.function_bytecode_opaque_storage {
+        function_bytecode_metadata: if visitor.function_bytecode_opaque_storage {
             Category::lower_bound(
                 visitor.function_bytecode_metadata,
                 "Chunk call-pin HashMap bucket storage is opaque",
@@ -3914,118 +3855,5 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(chunk);
         assert!(weak.upgrade().is_none());
-    }
-
-    #[cfg(all(
-        feature = "optimizing-jit",
-        target_arch = "aarch64",
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    #[test]
-    fn shared_native_call_metadata_is_counted_once_across_bodies() {
-        const CHILD: &str = "TRUST_JS_TEST_SHARED_STUB_MEMORY_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "memory::tests::shared_native_call_metadata_is_counted_once_across_bodies",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("TRUST_JS_OPT_JIT", "1")
-                .env_remove("TRUST_JS_JIT_NO_DIRECT_CALLS")
-                .env_remove("TRUST_JS_OPT_JIT_CALL_STUBS")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        let mut engine = crate::Engine::new();
-        let body = crate::parser::parse_script("function subject(f){return f(1);}", false)
-            .ok()
-            .unwrap();
-        let crate::ast::Stmt::FuncDecl(function) = &body[0] else {
-            panic!("function")
-        };
-        let chunk = crate::bytecode::compile(function).unwrap();
-        let values = crate::value::jit_layout(&engine.interp.object_proto);
-        let interp = crate::interpreter::interp_layout(&mut engine.interp);
-        let compile = || {
-            let crate::jit::JitCompileOutcome::Compiled(code) =
-                crate::jit::compile_profiled(&chunk, &values, &interp)
-            else {
-                panic!("optimizing body");
-            };
-            Rc::new(code)
-        };
-        let first = compile();
-        let second = compile();
-        let first_shared: Vec<_> = first.shared_call_metadata().collect();
-        let second_shared: Vec<_> = second.shared_call_metadata().collect();
-        assert_eq!(first_shared.len(), 1);
-        assert_eq!(
-            first_shared, second_shared,
-            "identical emitted contracts share one allocation"
-        );
-        let mut visitor = Visitor::default();
-        visitor.jit_code(&first);
-        visitor.jit_code(&second);
-        let expected = first.retained_heap_metadata_bytes()
-            + second.retained_heap_metadata_bytes()
-            + first_shared[0].1;
-        assert_eq!(visitor.jit_heap_metadata, expected);
-        assert_eq!(visitor.jit_call_stubs.len(), 1);
-        visitor.jit_code(&first);
-        visitor.jit_code(&second);
-        assert_eq!(
-            visitor.jit_heap_metadata, expected,
-            "revisits must not double-charge code or its stubs"
-        );
-    }
-}
-
-#[cfg(all(test, feature = "optimizing-jit"))]
-mod execution_coverage_accounting_tests {
-    use super::*;
-    #[test]
-    fn shared_source_native_leases_and_frozen_handles_are_charged_once() {
-        let _control = crate::execution_coverage::TestControl::new(true);
-        let statements =
-            crate::parser::parse_script("function subject(a){if(a)return 7;return 11;}", false)
-                .ok()
-                .unwrap();
-        let crate::ast::Stmt::FuncDecl(function) = &statements[0] else {
-            panic!("fixture")
-        };
-        let chunk = crate::bytecode::compile(function).unwrap();
-        let lease =
-            crate::execution_coverage::Lease::new(chunk.execution_coverage.source().unwrap());
-        let (identity, bytes) = lease.allocation_metadata();
-        let mut visitor = Visitor::default();
-        chunk.execution_coverage.scan_retained_memory(&mut visitor);
-        assert_eq!(visitor.function_bytecode_metadata, bytes);
-        visitor.execution_coverage_allocation(identity, bytes);
-        chunk.execution_coverage.scan_retained_memory(&mut visitor);
-        assert_eq!(
-            visitor.function_bytecode_metadata, bytes,
-            "Chunk and native lease share one scalar allocation"
-        );
-        let frozen = chunk.execution_coverage.freeze();
-        let shared = frozen.freeze();
-        frozen.scan_retained_memory(&mut visitor);
-        let with_frozen = visitor.function_bytecode_metadata;
-        assert!(with_frozen > bytes);
-        shared.scan_retained_memory(&mut visitor);
-        frozen.scan_retained_memory(&mut visitor);
-        assert_eq!(
-            visitor.function_bytecode_metadata, with_frozen,
-            "frozen Rc clones charge the payload once"
-        );
-        assert_eq!(visitor.execution_coverage_allocations.len(), 2);
     }
 }

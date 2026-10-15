@@ -192,11 +192,6 @@ impl Interp {
                     user.binding_getter_cache.set(Some(cache));
                     #[cfg(test)]
                     record_binding_getter(1);
-                    #[cfg(feature = "optimizing-jit")]
-                    crate::execution_coverage::invalidate_function(
-                        &user.func,
-                        crate::execution_coverage::Reason::BindingGetterShortcut,
-                    );
                     return Some(value);
                 }
                 BindingGetterProbe::UninitializedOrImport => {
@@ -212,11 +207,6 @@ impl Interp {
                         user.binding_getter_cache.set(Some(Box::new(next)));
                         #[cfg(test)]
                         record_binding_getter(2);
-                        #[cfg(feature = "optimizing-jit")]
-                        crate::execution_coverage::invalidate_function(
-                            &user.func,
-                            crate::execution_coverage::Reason::BindingGetterShortcut,
-                        );
                         return Some(value);
                     }
                     user.binding_getter_cache.set(None);
@@ -239,11 +229,6 @@ impl Interp {
         user.binding_getter_cache.set(Some(Box::new(cache)));
         #[cfg(test)]
         record_binding_getter(0);
-        #[cfg(feature = "optimizing-jit")]
-        crate::execution_coverage::invalidate_function(
-            f,
-            crate::execution_coverage::Reason::BindingGetterShortcut,
-        );
         Some(value)
     }
 
@@ -447,18 +432,6 @@ impl Interp {
             self.interrupt_poll_force()?;
             #[cfg(test)]
             TEST_RECORD_GETTERS.with(|count| count.set(count.get() + 1));
-            #[cfg(feature = "optimizing-jit")]
-            if crate::execution_coverage::enabled() {
-                chunk
-                    .execution_coverage
-                    .invalidate(crate::execution_coverage::Reason::GetterShortcut);
-                if let Callable::User(user) = &getter.borrow().call {
-                    crate::execution_coverage::invalidate_function(
-                        &user.func,
-                        crate::execution_coverage::Reason::GetterShortcut,
-                    );
-                }
-            }
             Ok(chunk.make_record_getter_result(self, values))
         });
         self.depth -= 1;

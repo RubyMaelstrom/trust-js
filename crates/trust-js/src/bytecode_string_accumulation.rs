@@ -83,7 +83,6 @@ fn try_store(
     env: &Env,
     plan: Plan,
     right: Value,
-    enter: impl FnOnce(),
 ) -> Option<Stored> {
     let Value::Str(ref suffix) = right else {
         return None;
@@ -119,7 +118,6 @@ fn try_store(
                     &binding.value,
                     &right,
                 );
-                enter();
                 // The binding remains populated, including throughout allocation. There is no
                 // copied left operand to retain the prefix: no observer or interior resume can
                 // enter this region. Real aliases (including the RHS/view owners) remain live.
@@ -164,14 +162,6 @@ pub(super) fn try_vm<S: StoredValue>(
         env,
         plan,
         slots.read_value(plan.slot as usize),
-        || {
-            #[cfg(feature = "optimizing-jit")]
-            if let Some(source) = chunk.execution_coverage.source() {
-                for pc in plan.pc..plan.end {
-                    source.enter_pc(pc);
-                }
-            }
-        },
     )?;
     if let Some(result) = stored.result {
         stack.push(result);
@@ -208,21 +198,7 @@ pub(crate) unsafe extern "C" fn jit_try(
         Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
     });
     let right = unsafe { ctx.clone_slot(plan.slot as usize) };
-    let Some(stored) = try_store(
-        chunk,
-        unsafe { &mut *ctx.interp },
-        &env,
-        plan,
-        right,
-        || {
-            #[cfg(feature = "optimizing-jit")]
-            if let Some(source) = chunk.execution_coverage.source() {
-                for pc in plan.pc..plan.end {
-                    source.enter_pc(pc);
-                }
-            }
-        },
-    ) else {
+    let Some(stored) = try_store(chunk, unsafe { &mut *ctx.interp }, &env, plan, right) else {
         return crate::jit::SpFlag { sp, flag: 1 };
     };
     let end_sp = if let Some(result) = stored.result {

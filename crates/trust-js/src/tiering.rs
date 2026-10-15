@@ -115,48 +115,6 @@ impl OsrCodeState {
     }
 }
 
-/// One bounded optimizing continuation per Chunk. Counters contain no JS owners;
-/// their immutable vector is pinned by the same Chunk as the generated loads.
-#[cfg(feature = "optimizing-jit")]
-pub(crate) struct OptimizingLoopState {
-    pub(crate) counters: Vec<(usize, Cell<u32>)>,
-    pub(crate) selected: Cell<Option<usize>>,
-    pub(crate) attempted: Cell<bool>,
-    pub(crate) code: crate::jit::cache::NativeCodeSlot,
-    pub(crate) misses: Cell<u8>,
-    #[cfg(test)]
-    pub(crate) entries: Cell<usize>,
-}
-
-#[cfg(feature = "optimizing-jit")]
-impl OptimizingLoopState {
-    pub(crate) fn new(headers: Vec<usize>, threshold: u32) -> Self {
-        Self {
-            counters: headers
-                .into_iter()
-                .map(|pc| (pc, Cell::new(threshold)))
-                .collect(),
-            selected: Cell::new(None),
-            attempted: Cell::new(false),
-            code: crate::jit::cache::NativeCodeSlot::new(),
-            misses: Cell::new(0),
-            #[cfg(test)]
-            entries: Cell::new(0),
-        }
-    }
-
-    pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
-        visitor.add_function_bytecode_bytes(
-            std::mem::size_of::<Self>()
-                + self.counters.capacity() * std::mem::size_of::<(usize, Cell<u32>)>()
-                + self.code.retained_metadata_bytes(),
-        );
-        if let Some(Some(code)) = self.code.get() {
-            visitor.jit_code(&code);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -346,38 +346,6 @@ impl ValueClass {
     }
 }
 
-/// Bounded live entry observations for the optimizing tier. These use the same portable
-/// classes as site feedback, but are indexed by formal argument position, not bytecode PC.
-/// A native entry checkpoint supplies class bits without cloning/materializing Values.
-/// They are samples, never proofs: publication requires guards on every invocation.
-#[cfg(feature = "optimizing-jit")]
-pub(crate) type StructuralObservation = (u32, Cell<Option<crate::bytecode::IcState>>, Cell<bool>);
-
-#[cfg(feature = "optimizing-jit")]
-pub(crate) struct EntrySamples {
-    pub(crate) entries: Cell<u64>,
-    pub(crate) interval: Cell<u32>,
-    pub(crate) samples: Cell<u8>,
-    pub(crate) classes: [Cell<u32>; 16],
-    pub(crate) properties: Box<[(u32, Cell<u32>)]>,
-    /// Repeated warmed data-IC snapshots; scalar observations, never live proofs.
-    pub(crate) structural: Box<[StructuralObservation]>,
-}
-
-#[cfg(feature = "optimizing-jit")]
-impl EntrySamples {
-    pub(crate) fn new(interval: u32) -> Self {
-        Self {
-            entries: Cell::new(0),
-            interval: Cell::new(interval),
-            samples: Cell::new(0),
-            classes: std::array::from_fn(|_| Cell::new(0)),
-            properties: Box::default(),
-            structural: Box::default(),
-        }
-    }
-}
-
 /// Semantic position of an observation within its site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

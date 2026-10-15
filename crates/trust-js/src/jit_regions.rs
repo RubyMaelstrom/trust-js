@@ -2293,8 +2293,6 @@ pub(super) fn emit(
     let parameter_aliases =
         entry_kind == NativeEntryKind::BorrowedFrame && chunk.jit_borrowed_parameter_aliases();
     let emission_start = a.checkpoint();
-    #[cfg(feature = "optimizing-jit")]
-    emit_coverage_ranges(a, chunk, plan.ranges());
 
     let plain = a.new_label();
     let mut saved_work = 0usize;
@@ -3590,22 +3588,6 @@ pub(super) fn emit(
             if target <= from {
                 let poll = a.new_label();
                 exits.push((poll, target));
-                #[cfg(feature = "optimizing-jit")]
-                if entry_kind == NativeEntryKind::FreshFrame {
-                    if let Some(counter) = optimizing::loop_entry::counter(chunk, target) {
-                        let done = a.new_label();
-                        a.mov_imm64(9, counter as usize as u64);
-                        a.ldr_w_imm(10, 9, 0);
-                        a.cbz(10, false, done);
-                        // Leave the due visit for the canonical header: its
-                        // checkpoint sees every private home flushed exactly once.
-                        a.cmp_imm_w(10, 1);
-                        a.b_cond(C_EQ, poll);
-                        a.sub_imm(10, 10, 1);
-                        a.str_w_imm(10, 9, 0);
-                        a.bind(done);
-                    }
-                }
                 emit_region_poll_guard(a, ilayout, poll, true);
             }
             a.b(to);

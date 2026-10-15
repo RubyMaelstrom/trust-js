@@ -22,14 +22,6 @@ pub(super) fn unregister(memory: *mut u8) {
     let _ = memory;
 }
 
-#[cfg(feature = "optimizing-jit")]
-pub(super) fn register_stub(argc: u16, with_this: bool, memory: *mut u8, length: usize) {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    native::register_stub(argc, with_this, memory, length);
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    let _ = (argc, with_this, memory, length);
-}
-
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod native {
     use super::*;
@@ -122,22 +114,6 @@ mod native {
             return;
         }
         register_label(label(chunk, memory as usize), memory, length);
-    }
-
-    #[cfg(feature = "optimizing-jit")]
-    pub(super) fn register_stub(argc: u16, with_this: bool, memory: *mut u8, length: usize) {
-        if collector().is_none() {
-            return;
-        }
-        register_label(
-            CString::new(format!(
-                "TrustJsJIT::CallStub(argc={argc},this={with_this})@{:x}",
-                memory as usize,
-            ))
-            .expect("generated call-stub label has no NUL"),
-            memory,
-            length,
-        );
     }
 
     fn register_label(name: CString, memory: *mut u8, length: usize) {

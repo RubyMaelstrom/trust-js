@@ -789,11 +789,6 @@ pub struct Function {
     /// `bytecode::plan_inlines`). Preferred over `code` wherever a chunk is fetched; `code`
     /// stays alive because filled call ICs hold raw pointers into it.
     pub code2: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
-    /// A separately published optimizing version of the selected canonical body, including
-    /// any guarded baseline inlines. The baseline tiers remain available after retirement;
-    /// active invocations and raw call-cache pointers keep their original immutable chunks.
-    #[cfg(feature = "optimizing-jit")]
-    pub(crate) optimizing_code: std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>>,
     /// Lazily-built object-map templates for closures of this function (see
     /// `Interp::make_function`): the function object's `Props` (length/name and a `prototype`
     /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
@@ -1441,19 +1436,9 @@ impl Function {
     /// Select code for a new invocation; live activations retain their own chunk.
     /// ECMA-262 e28783d5, Execution Contexts / PrepareForOrdinaryCall: changing a
     /// later entry must not replace an existing invocation's evaluation state.
-    /// A failed specialization reuses the already warmed baseline, including its guarded
-    /// inlines. Its immutable optimizing slot prevents repeated speculative attempts.
     #[inline]
     #[cfg(test)]
     pub(crate) fn execution_code(&self) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
-        #[cfg(feature = "optimizing-jit")]
-        if let Some(Some(chunk)) = self.optimizing_code.get() {
-            if chunk.optimizing_misses.get() < crate::bytecode::SPECIALIZATION_MISS_LIMIT {
-                return self.optimizing_code.get();
-            }
-            // Retired code remains charged to the bounded executable cache until pressure
-            // or destruction reclaims it after all active frames and leases have finished.
-        }
         self.code2.get().or_else(|| self.code.get())
     }
 
@@ -1466,14 +1451,6 @@ impl Function {
         &self,
         genv: usize,
     ) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
-        #[cfg(feature = "optimizing-jit")]
-        if let Some(Some(chunk)) = self.optimizing_code.get() {
-            if chunk.optimizing_misses.get() < crate::bytecode::SPECIALIZATION_MISS_LIMIT
-                && chunk.inline_realm_compatible(genv)
-            {
-                return self.optimizing_code.get();
-            }
-        }
         match self.code2.get() {
             Some(Some(chunk)) if !chunk.inline_realm_compatible(genv) => self.code.get(),
             Some(_) => self.code2.get(),
