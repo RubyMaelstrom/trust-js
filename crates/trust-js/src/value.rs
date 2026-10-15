@@ -1110,6 +1110,11 @@ pub struct JitLayout {
     /// `Exotic::StrWrap`'s discriminant byte (String.prototype IS a StrWrap — the GetMethod
     /// template accepts it as a named-read holder; index/length reads never take that path).
     pub exotic_strwrap_tag: u8,
+    /// `Exotic::NumWrap`'s discriminant byte (Number.prototype and Number wrappers: named
+    /// entries are shape-pinned like StrWrap's, and no name is exotic-provided).
+    pub exotic_numwrap_tag: u8,
+    /// `Exotic::BoolWrap`'s discriminant byte (Boolean.prototype and Boolean wrappers).
+    pub exotic_boolwrap_tag: u8,
     /// `ic_plain` byte within `Object` (the per-receiver "not in an exotic side table" flag).
     pub obj_ic_plain: usize,
     /// Fail-closed probe for ordinary numeric typed-array backing storage.
@@ -1324,6 +1329,31 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let exotic_array_tag = unsafe { *(&arr as *const Exotic as *const u8) };
     let sw = Exotic::str_wrap("".into());
     let exotic_strwrap_tag = unsafe { *(&sw as *const Exotic as *const u8) };
+    let nw = Exotic::NumWrap(0.0);
+    let exotic_numwrap_tag = unsafe { *(&nw as *const Exotic as *const u8) };
+    let bw = Exotic::BoolWrap(false);
+    let exotic_boolwrap_tag = unsafe { *(&bw as *const Exotic as *const u8) };
+    // The tag byte is a sound guard only while it is distinct per admitted variant and
+    // payload-independent (a repr(Rust) niche layout could break either property).
+    debug_assert!({
+        let tags = [
+            exotic_none_tag,
+            exotic_array_tag,
+            exotic_strwrap_tag,
+            exotic_numwrap_tag,
+            exotic_boolwrap_tag,
+        ];
+        tags.iter().enumerate().all(|(i, t)| !tags[..i].contains(t))
+    });
+    debug_assert_eq!(exotic_numwrap_tag, unsafe {
+        *(&Exotic::NumWrap(-1.25) as *const Exotic as *const u8)
+    });
+    debug_assert_eq!(exotic_boolwrap_tag, unsafe {
+        *(&Exotic::BoolWrap(true) as *const Exotic as *const u8)
+    });
+    debug_assert_eq!(exotic_strwrap_tag, unsafe {
+        *(&Exotic::str_wrap("x".into()) as *const Exotic as *const u8)
+    });
 
     // Scope offsets for the inline LoadName template: Rc::as_ptr → RefCell<Scope> value →
     // Scope.vars → VarMap generation. The RefCell value offset is probed on a live scope.
@@ -1453,6 +1483,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         exotic_none_tag,
         exotic_array_tag,
         exotic_strwrap_tag,
+        exotic_numwrap_tag,
+        exotic_boolwrap_tag,
         scope_gen,
         scope_layout,
         scope_parent,

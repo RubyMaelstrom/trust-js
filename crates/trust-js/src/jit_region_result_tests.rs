@@ -168,6 +168,60 @@ fn region_results_cold_feedback_keeps_baseline_native_property_continuation() {
 }
 
 #[test]
+fn primitive_wrapper_proto_reads_hit_the_native_property_template() {
+    let mut engine = engine(
+        Tier::Jit,
+        r#"
+        Number.prototype.__pilotHit = 3;
+        Boolean.prototype.__pilotHit = 4;
+        Number.prototype.__pilotThis = function() { 'use strict'; return this.__pilotHit; };
+        function readFlag(v) { return v.__pilotHit; }
+        function readAbsent(v) { return v.__pilotNone; }
+        function fixed(v) { return v.toFixed(0); }
+        function runFlag() { var s = 0; for (var k = 0; k < 20; k++) s += readFlag(1) + readFlag(true); return s; }
+        function runAbsent() { var s = 0; for (var k = 0; k < 20; k++) s += (readAbsent(1) === undefined) + (readAbsent(true) === undefined); return s; }
+        function runFixed() { var s = ''; for (var k = 0; k < 20; k++) s += fixed(2); return s; }
+        function runThis() { var s = 0; for (var k = 0; k < 20; k++) s += (1).__pilotThis(); return s; }
+        for (var k = 0; k < 40; k++) { runFlag(); runAbsent(); runFixed(); runThis(); }
+    "#,
+    );
+    // Each measured runner body contains only the candidate property loads, so a
+    // native data/absence event delta attributes the hit to that form.
+    let before = PROPERTY_PATHS.with(std::cell::Cell::get);
+    assert_eq!(evaluate(&mut engine, "runFlag()"), "140");
+    let after = PROPERTY_PATHS.with(std::cell::Cell::get);
+    assert!(
+        after[0] > before[0],
+        "local Num/Bool wrapper-prototype data reads execute the native data probe"
+    );
+    let before = after;
+    assert_eq!(evaluate(&mut engine, "runAbsent()"), "40");
+    let after = PROPERTY_PATHS.with(std::cell::Cell::get);
+    assert!(
+        after[1] > before[1],
+        "absent reads on Num/Bool receivers execute the native absence probe"
+    );
+    let before = after;
+    assert_eq!(evaluate(&mut engine, "runFixed()"), "2".repeat(20));
+    let after = PROPERTY_PATHS.with(std::cell::Cell::get);
+    assert!(
+        after[0] > before[0],
+        "Number method loads execute the native data probe"
+    );
+    // runThis performs exactly two candidate loads per iteration (the method load and
+    // the strict `this` read inside it); more than one native hit per iteration on
+    // average is only possible when the `this` form also stays native.
+    let before = after;
+    assert_eq!(evaluate(&mut engine, "runThis()"), "60");
+    let after = PROPERTY_PATHS.with(std::cell::Cell::get);
+    assert!(
+        after[0] - before[0] > 20,
+        "strict primitive `this` reads execute the native data probe ({} hits)",
+        after[0] - before[0]
+    );
+}
+
+#[test]
 fn region_results_warmed_own_reads_keep_borrowing_and_receiver_guard_reuse() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(

@@ -1,7 +1,9 @@
 //! ECMA-262 e28783d5: OrdinaryGet, GetValue, Call, OrdinaryCallBindThis,
 //! ValidateAndApplyPropertyDescriptor, Proxy [[Get]], and Forbidden Extensions.
 use super::*;
-use crate::bytecode::{IcState, Tier, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY, PROP_IC_WAYS};
+use crate::bytecode::{
+    IcState, Tier, IC_ABSENT, IC_ACCESSOR, IC_ARR_KEYCHK, IC_EMPTY, PROP_IC_WAYS,
+};
 use crate::{Completion, Engine};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -706,6 +708,203 @@ fn getter_cache_legacy_poison_stays_generic_and_getter_exceptions_propagate() {
             assert!(cache.iter().all(|c| c.get().depth == IC_EMPTY));
             assert!(engine.interp.get_prop_ic(&strict, key, &cache[0]).is_err());
         }
+    }
+}
+
+#[test]
+fn primitive_wrapper_proto_data_reads_are_tier_identical() {
+    check(
+        r#"
+        Number.prototype.__flag = 11;
+        Boolean.prototype.__flag = 22;
+        String.prototype.__flag = 33;
+        function viaLocal(v) { return v.__flag; }
+        function viaAbsent(v) { return v.__no_such; }
+        function viaThis() { 'use strict'; return this.__flag; }
+        function fixed(v) { return v.toFixed(1); }
+        function boolStr(v) { return v.toString(); }
+        function strLen(v) { return v.length; }
+        function nullishThrew(v) { try { v.__flag; return false; } catch (e) { return e instanceof TypeError; } }
+        function missingThrew(v) { try { v.__nope(); return false; } catch (e) { return e instanceof TypeError; } }
+        var other = $262.createRealm();
+        var foreignRead = other.evalScript('(function(v) { return v.__flag; })');
+        other.evalScript('Number.prototype.__flag = 111');
+        var ok = true;
+        for (var i = 0; i < 120; i++) {
+            ok = viaLocal(1) === 11 && viaLocal(true) === 22 && viaLocal('s') === 33 && ok;
+            ok = viaLocal(NaN) === 11 && viaLocal(-0) === 11 && viaLocal(Infinity) === 11
+                && viaLocal(false) === 22 && ok;
+            ok = viaAbsent(1) === undefined && viaAbsent(false) === undefined
+                && viaAbsent('s') === undefined && ok;
+            ok = viaThis.call(2) === 11 && viaThis.call(false) === 22
+                && viaThis.call('x') === 33 && ok;
+            ok = fixed(1.25) === '1.3' && boolStr(true) === 'true' && strLen('abcd') === 4 && ok;
+            ok = foreignRead(1) === 111 && viaLocal(1) === 11 && ok;
+            ok = nullishThrew(null) && nullishThrew(undefined)
+                && missingThrew(1) && missingThrew(true) && ok;
+            ok = viaLocal(Symbol('x')) === undefined && viaLocal(10n) === undefined && ok;
+        }
+        var wn = Object(7), wb = Object(true), ws = Object('q');
+        var wrapped = [viaLocal(wn), viaLocal(wb), viaLocal(ws)].join(',');
+        wn.__flag = 99;
+        [ok, wrapped, viaLocal(wn), viaLocal(Object(3)), (5).__flag,
+            strLen(5) === undefined].join('|')
+    "#,
+        "true|11,22,33|99|11|11|true",
+    );
+}
+
+#[test]
+fn primitive_wrapper_proto_getters_run_and_mutations_are_live() {
+    check(
+        r#"
+        var calls = 0;
+        function readG(v) { return v.__g; }
+        Object.defineProperty(Number.prototype, '__g', { configurable: true,
+            get: function() { calls++; return 100 + Number(this); } });
+        var sum = 0;
+        for (var i = 0; i < 60; i++) sum += readG(1);
+        var afterGetter = [sum, calls].join(',');
+        Object.defineProperty(Number.prototype, '__g', { configurable: true, value: 7 });
+        var asData = readG(1) + ',' + calls;
+        for (var i = 0; i < 60; i++) readG(1);
+        Object.defineProperty(Number.prototype, '__g', { configurable: true,
+            get: function() { calls++; return 9; } });
+        var asGetterAgain = readG(1) + ',' + calls;
+        Number.prototype.__m = 1;
+        function readM(v) { return v.__m; }
+        for (var i = 0; i < 60; i++) readM(0);
+        var m1 = readM(0);
+        Number.prototype.__m = 2;
+        var m2 = readM(0);
+        delete Number.prototype.__m;
+        var m3 = readM(0) === undefined;
+        function readLate(v) { return v.__late; }
+        for (var i = 0; i < 60; i++) readLate(1);
+        var lateBefore = readLate(1) === undefined;
+        Number.prototype.__late = 5;
+        var lateAfter = readLate(1);
+        function readLateB(v) { return v.__lateB; }
+        for (var i = 0; i < 60; i++) readLateB(true);
+        var lateBBefore = readLateB(true) === undefined;
+        Object.prototype.__lateB = 6;
+        var lateBAfter = readLateB(true) + ',' + readLateB(0);
+        delete Object.prototype.__lateB;
+        var w = Object(true);
+        function readW(v) { return v.__flagW; }
+        Boolean.prototype.__flagW = 1;
+        for (var i = 0; i < 60; i++) readW(w);
+        var wBefore = readW(w);
+        Object.setPrototypeOf(w, { __flagW: 77 });
+        var wAfter = readW(w);
+        var ocalls = 0;
+        function readO(v) { return v.__og; }
+        for (var i = 0; i < 60; i++) readO(1);
+        Object.defineProperty(Object.prototype, '__og', { configurable: true,
+            get: function() { ocalls++; return 55; } });
+        var og = readO(1) + ',' + readO(1) + ',' + ocalls;
+        delete Object.prototype.__og;
+        var ogGone = readO(1) === undefined;
+        var wg = Object(5), wcalls = 0;
+        Object.defineProperty(wg, '__wg', { configurable: true,
+            get: function() { wcalls++; return Number(this) + 1; } });
+        function readWG(v) { return v.__wg; }
+        var wgsum = 0;
+        for (var i = 0; i < 60; i++) wgsum += readWG(wg);
+        [afterGetter, asData, asGetterAgain, m1, m2, m3, lateBefore, lateAfter,
+            lateBBefore, lateBAfter, wBefore, wAfter, og, ogGone, wgsum, wcalls].join('|')
+    "#,
+        "6060,60|7,60|9,61|1|2|true|true|5|true|6,6|1|77|55,55,2|true|360|60",
+    );
+}
+
+#[test]
+fn primitive_wrapper_prototypes_fill_the_get_ic() {
+    let mut engine = Engine::new();
+    evaluate(
+        &mut engine,
+        r#"
+        Number.prototype.__pilot = 41;
+        Boolean.prototype.__pilot = 42;
+        var pilotGetterCalls = 0;
+        Object.defineProperty(Boolean.prototype, '__pilot_g', { configurable: true,
+            get: function() { pilotGetterCalls++; return 43; } });
+        var pilotWrapper = Object(3);
+        "#,
+    );
+    for (label, base, expected) in [
+        ("number", Value::Num(1.0), 41.0),
+        ("boolean", Value::Bool(true), 42.0),
+    ] {
+        let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+        for _ in 0..2 {
+            assert!(
+                matches!(engine.interp.get_prop_ic(&base, "__pilot", &cache[0]), Ok(Value::Num(n)) if n == expected),
+                "{label}"
+            );
+            assert_eq!(
+                cache[0].get().depth,
+                0,
+                "{label}: own holder on the wrapper prototype"
+            );
+        }
+        let absent = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+        for _ in 0..2 {
+            assert!(matches!(
+                engine
+                    .interp
+                    .get_prop_ic(&base, "__pilot_absent", &absent[0]),
+                Ok(Value::Undefined)
+            ));
+            assert_eq!(absent[0].get().depth, IC_ABSENT, "{label}");
+        }
+    }
+    // A cached absence must observe a late addition on the wrapper prototype.
+    let late = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+    assert!(matches!(
+        engine
+            .interp
+            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]),
+        Ok(Value::Undefined)
+    ));
+    evaluate(&mut engine, "Number.prototype.__pilot_late = 44;");
+    assert!(matches!(
+        engine
+            .interp
+            .get_prop_ic(&Value::Num(1.0), "__pilot_late", &late[0]),
+        Ok(Value::Num(44.0))
+    ));
+    // Accessors cache as accessor states and the live getter runs on every read.
+    let accessor = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+    for _ in 0..2 {
+        assert!(matches!(
+            engine
+                .interp
+                .get_prop_ic(&Value::Bool(false), "__pilot_g", &accessor[0]),
+            Ok(Value::Num(43.0))
+        ));
+        assert_eq!(accessor[0].get().depth, IC_ACCESSOR);
+    }
+    let global = Value::Obj(engine.interp.global.clone());
+    assert!(matches!(
+        engine.interp.get_member_key(&global, "pilotGetterCalls"),
+        Ok(Value::Num(2.0))
+    ));
+    // Wrapper objects resolve through their wrapper prototype at depth 1.
+    let wrapper = engine
+        .interp
+        .get_member_key(&global, "pilotWrapper")
+        .ok()
+        .unwrap();
+    let wrap_cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+    for _ in 0..2 {
+        assert!(matches!(
+            engine
+                .interp
+                .get_prop_ic(&wrapper, "__pilot", &wrap_cache[0]),
+            Ok(Value::Num(41.0))
+        ));
+        assert_eq!(wrap_cache[0].get().depth, 1);
     }
 }
 

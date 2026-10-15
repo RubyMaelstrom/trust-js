@@ -2931,6 +2931,11 @@ pub(crate) struct InterpLayout {
     /// `string_proto` (a `Gc` = one stored `Rc` pointer): the GetMethod template resolves
     /// string-primitive receivers against the ACTIVE realm's String.prototype through this.
     pub string_proto: usize,
+    /// `number_proto` / `boolean_proto`: Number/Boolean-primitive receivers in the
+    /// non-consuming property-load forms resolve against the ACTIVE realm's wrapper
+    /// prototypes through these (both fields are realm-swapped with `string_proto`).
+    pub number_proto: usize,
+    pub boolean_proto: usize,
     /// Canonical Function.prototype, used to validate the ordinary `instanceof` fast path.
     pub function_proto: usize,
     pub call_overflow_sets: usize,
@@ -3009,6 +3014,8 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         fp_len_word: fp.1,
         fp_cap_word: fp.2,
         string_proto: off(&i.string_proto as *const _ as usize),
+        number_proto: off(&i.number_proto as *const _ as usize),
+        boolean_proto: off(&i.boolean_proto as *const _ as usize),
         function_proto: off(&i.function_proto as *const _ as usize),
         call_overflow_sets: off(&i.call_overflow.raw_sets as *const _ as usize),
         call_overflow_shift: off(&i.call_overflow.hash_shift as *const _ as usize),
@@ -8240,15 +8247,24 @@ impl Interp {
 
     /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
     /// `Exotic::Array` is allowed: array *named* reads are ordinary (`length` is a real stored
-    /// property); everything else exotic (string wrappers, arguments, …) and anything in a side
-    /// table (proxy, namespace, typed array) is not.
+    /// property); the primitive wrappers are allowed as justified below; everything else exotic
+    /// (arguments, …) and anything in a side table (proxy, namespace, typed array) is not.
     #[inline]
     fn ic_plain_ptr(&self, _ptr: usize, b: &Object) -> bool {
         // StrWrap (String.prototype, string wrapper objects): index and `length` reads are
         // exotic-provided and never live in `entries`, and StrWrap maps are NOT `elem_mode`,
         // so named entries stay shape-pinned — a named non-index IC over one is as sound as
-        // over an ordinary object.
-        matches!(b.exotic, Exotic::None | Exotic::Array | Exotic::StrWrap(_)) && b.ic_plain.get()
+        // over an ordinary object. NumWrap/BoolWrap (Number/Boolean prototypes and their
+        // wrappers) are stricter still: no name is exotic-provided at all, and they are never
+        // `elem_mode` either (`mark_array` fires only on becoming `Exotic::Array`).
+        matches!(
+            b.exotic,
+            Exotic::None
+                | Exotic::Array
+                | Exotic::StrWrap(_)
+                | Exotic::NumWrap(_)
+                | Exotic::BoolWrap(_)
+        ) && b.ic_plain.get()
     }
 
     /// The `GetProp`/`GetMethod` inline-cache fast path; `None` means "take the slow path".
@@ -8358,8 +8374,13 @@ impl Interp {
             let mut cur = head;
             for (k, &shape) in shapes.iter().take(levels).enumerate() {
                 let b = unsafe { (*cur).borrow() };
-                if !(matches!(b.exotic, Exotic::None)
-                    && b.ic_plain.get()
+                // Absence-of-entry proves OrdinaryGet absence only where no name is
+                // exotic-provided: `None` plus NumWrap/BoolWrap (never StrWrap's
+                // `length`/indices, never Array elements), mirrored in the fill.
+                if !(matches!(
+                    b.exotic,
+                    Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
+                ) && b.ic_plain.get()
                     && b.props.shape() == shape)
                 {
                     return None;
@@ -8400,9 +8421,13 @@ impl Interp {
             let non_digit = !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
             let recv_shape_ok = matches!(rb.exotic, Exotic::None)
                 || (matches!(rb.exotic, Exotic::Array) && (depth >= 1 || keychk) && non_digit)
-                // StrWrap named entries are shape-pinned (not elem_mode); index/length reads
-                // are exotic-provided and never fill states at this site's name.
-                || (matches!(rb.exotic, Exotic::StrWrap(_)) && non_digit);
+                // Wrapper named entries are shape-pinned (not elem_mode); StrWrap index/length
+                // reads are exotic-provided and never fill states at this site's name, and the
+                // digit gate is kept for Num/Bool wrappers too, mirroring StrWrap.
+                || (matches!(
+                    rb.exotic,
+                    Exotic::StrWrap(_) | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
+                ) && non_digit);
             if recv_shape_ok && rb.ic_plain.get() && rb.props.shape() == st.recv_shape {
                 if depth == 0 {
                     let property = if keychk {
@@ -8433,8 +8458,13 @@ impl Interp {
                         .take(depth.saturating_sub(1) as usize)
                     {
                         let mb = (*hp).borrow();
-                        if !(matches!(mb.exotic, Exotic::None | Exotic::StrWrap(_))
-                            && mb.ic_plain.get()
+                        if !(matches!(
+                            mb.exotic,
+                            Exotic::None
+                                | Exotic::StrWrap(_)
+                                | Exotic::NumWrap(_)
+                                | Exotic::BoolWrap(_)
+                        ) && mb.ic_plain.get()
                             && mb.props.shape() == mid_shape)
                         {
                             return None;
@@ -8442,8 +8472,13 @@ impl Interp {
                         hp = Rc::as_ptr(mb.proto.as_ref()?);
                     }
                     let hb = (*hp).borrow();
-                    let holder_exotic_ok = matches!(hb.exotic, Exotic::None | Exotic::StrWrap(_))
-                        || (keychk && matches!(hb.exotic, Exotic::Array));
+                    let holder_exotic_ok = matches!(
+                        hb.exotic,
+                        Exotic::None
+                            | Exotic::StrWrap(_)
+                            | Exotic::NumWrap(_)
+                            | Exotic::BoolWrap(_)
+                    ) || (keychk && matches!(hb.exotic, Exotic::Array));
                     if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
                     {
                         let property = if keychk {
@@ -8495,8 +8530,9 @@ impl Interp {
         // a shape match couldn't prove an index-like name is still absent).
         let mut mids = [None; 4];
         // Level shapes for an absent-property fill (see `IC_ABSENT`): valid only while every
-        // level so far is a plain `Exotic::None` object (exotics answer some names outside
-        // their entries — a wrapper's `length` — so absence-of-entry proves nothing there).
+        // level so far answers no name outside its entries — plain `Exotic::None` objects and
+        // NumWrap/BoolWrap wrappers. StrWrap (`length`/indices) and Array (elements) answer
+        // names exotically, so absence-of-entry proves nothing across them.
         let mut absent_shapes = [0; 6];
         let mut absent_ok = true;
         unsafe {
@@ -8506,7 +8542,11 @@ impl Interp {
                     return None;
                 }
                 absent_shapes[depth as usize] = b.props.shape();
-                absent_ok = absent_ok && matches!(b.exotic, Exotic::None);
+                absent_ok = absent_ok
+                    && matches!(
+                        b.exotic,
+                        Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
+                    );
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.property_at(slot).unwrap();
                     let v = self.snapshot_cached_get(
@@ -8522,7 +8562,13 @@ impl Interp {
                     // (`IC_ARR_KEYCHK`): hits re-verify the entry's key, and the JIT templates
                     // (exact depth compares, no bounds check) route it to the helper. Digit
                     // names stay uncached (element reads have their own paths).
-                    let keychk = !matches!(b.exotic, Exotic::None | Exotic::StrWrap(_));
+                    let keychk = !matches!(
+                        b.exotic,
+                        Exotic::None
+                            | Exotic::StrWrap(_)
+                            | Exotic::NumWrap(_)
+                            | Exotic::BoolWrap(_)
+                    );
                     if keychk && name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
                         return Some(v);
                     }
@@ -8565,7 +8611,14 @@ impl Interp {
                     }
                     return Some(v);
                 }
-                if (1..=4).contains(&depth) && matches!(b.exotic, Exotic::None | Exotic::StrWrap(_))
+                if (1..=4).contains(&depth)
+                    && matches!(
+                        b.exotic,
+                        Exotic::None
+                            | Exotic::StrWrap(_)
+                            | Exotic::NumWrap(_)
+                            | Exotic::BoolWrap(_)
+                    )
                 {
                     mids[depth as usize - 1] = Some(b.props.shape());
                 }
@@ -8573,8 +8626,8 @@ impl Interp {
                     Some(p) => cur = Rc::as_ptr(p),
                     None => {
                         // Chain ended: the property is absent. Cache that (the cheapest read
-                        // there is) when every level was a plain ordinary object and the
-                        // chain fits the recorded shape fields. OrdinaryGet must observe
+                        // there is) when every level answered no name outside its entries
+                        // and the chain fits the recorded shape fields. OrdinaryGet must observe
                         // additions and prototype swaps at every level, including deep bases.
                         let levels = depth as usize + 1;
                         if absent_ok && levels <= absent_shapes.len() {

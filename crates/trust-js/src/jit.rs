@@ -2109,7 +2109,7 @@ mod shared_stub_tests {
                 keys.push(
                     SharedStub::PropWays(PropProbeFlags {
                         arr_ok: bits & 1 != 0,
-                        str_ok: bits & 2 != 0,
+                        wrap_ok: bits & 2 != 0,
                         method: bits & 4 != 0,
                         kc: bits & 8 != 0,
                     })
@@ -5051,6 +5051,58 @@ fn guard_prop_writable(a: &mut asm::Asm, reg: u32, base: u32, flags: u32, slow: 
     a.cbz(reg, false, slow);
 }
 
+/// Branch to `miss` unless the exotic discriminant byte already loaded in `reg` is
+/// `Exotic::None` or an admitted primitive-wrapper tag. Wrapper tags are admitted only at
+/// sites whose compile-time name passed the wrapper name gates (not `length`/`description`,
+/// not digit-leading): StrWrap answers those names outside its entries, Num/Bool wrappers
+/// answer none. Shape, `ic_plain`, slot bounds and the live accessor bit are still checked
+/// by the caller around this guard, so a mutation after the fill re-routes to the helper.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn guard_exotic_none_or_wrap(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    reg: u32,
+    str_wrap: bool,
+    num_bool_wrap: bool,
+    miss: usize,
+) {
+    if !str_wrap && !num_bool_wrap {
+        a.cmp_imm_w(reg, layout.exotic_none_tag as u32);
+        a.b_cond(C_NE, miss);
+        return;
+    }
+    let ok = a.new_label();
+    a.cmp_imm_w(reg, layout.exotic_none_tag as u32);
+    a.b_cond(C_EQ, ok);
+    if str_wrap {
+        a.cmp_imm_w(reg, layout.exotic_strwrap_tag as u32);
+        a.b_cond(C_EQ, ok);
+    }
+    if num_bool_wrap {
+        a.cmp_imm_w(reg, layout.exotic_numwrap_tag as u32);
+        a.b_cond(C_EQ, ok);
+        a.cmp_imm_w(reg, layout.exotic_boolwrap_tag as u32);
+        a.b_cond(C_EQ, ok);
+    }
+    a.b(miss);
+    a.bind(ok);
+}
+
+/// x10 = the ACTIVE realm's wrapper prototype at `proto_off` within the `Interp` reached
+/// through ctx.interp — never an embedded prototype identity, so a realm swap between the
+/// fill and the hit is observed exactly as the Rust helper observes it.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_load_active_proto(a: &mut asm::Asm, proto_off: usize) {
+    a.ldr_imm(10, 19, 72); // ctx.interp
+    a.ldr_imm(10, 10, proto_off as u32);
+}
+
 /// Inline shape-validated property load, unified over `GetProp` (`method == false`: pop the
 /// receiver, push the value in its slot) and `GetMethod` (`method == true`: the receiver stays —
 /// it is re-used as `this` — and the method pushes above it), and over IC depths 0..=2:
@@ -5090,8 +5142,9 @@ enum PropRecv {
 struct PropProbeFlags {
     /// An `Exotic::Array` receiver may shape-validate (the site's name is not an element key).
     arr_ok: bool,
-    /// A string-primitive method read probes `String.prototype` (and StrWrap holders pass).
-    str_ok: bool,
+    /// A primitive read in a non-consuming form probes the active realm's wrapper
+    /// prototype (and Str/Num/Bool wrapper receivers, mids and holders pass).
+    wrap_ok: bool,
     /// A method load: cached absence is not served (the helper throws for a missing method).
     method: bool,
     /// Key-checked Array holder states route to the site's key compare.
@@ -5123,7 +5176,7 @@ fn emit_prop_way_probe(
     };
     let PropProbeFlags {
         arr_ok,
-        str_ok,
+        wrap_ok,
         method,
         kc,
     } = flags;
@@ -5139,12 +5192,12 @@ fn emit_prop_way_probe(
     // receiver hop: exotic None (or Array when `arr_ok` — but only as a NON-holder, so an
     // Array receiver additionally requires depth ≥ 1: its shape proves named-key ABSENCE,
     // not slot positions, because element entries occupy slots without transitioning the
-    // shape; or StrWrap when `str_ok` — String.prototype/string wrappers intercept only
-    // index and `length` reads, both excluded by the str_ok name gates), plain,
-    // shape == recv_shape; x11 = receiver object base
+    // shape; or a primitive wrapper when `wrap_ok` — StrWrap intercepts only index and
+    // `length` reads and Num/Bool wrappers intercept none, all excluded by the wrap_ok
+    // name gates), plain, shape == recv_shape; x11 = receiver object base
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(14, 11, ex);
-    if arr_ok || str_ok {
+    if arr_ok || wrap_ok {
         let ex_ok = a.new_label();
         a.cmp_imm_w(14, none_tag);
         a.b_cond(C_EQ, ex_ok);
@@ -5156,8 +5209,12 @@ fn emit_prop_way_probe(
             a.b(ex_ok);
             a.bind(not_arr);
         }
-        if str_ok {
+        if wrap_ok {
             a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
+            a.b_cond(C_EQ, ex_ok);
+            a.cmp_imm_w(14, layout.exotic_numwrap_tag as u32);
+            a.b_cond(C_EQ, ex_ok);
+            a.cmp_imm_w(14, layout.exotic_boolwrap_tag as u32);
             a.b_cond(C_EQ, ex_ok);
         }
         a.b(miss);
@@ -5206,8 +5263,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    a.cmp_imm_w(14, none_tag);
-    a.b_cond(C_NE, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5219,8 +5275,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    a.cmp_imm_w(14, none_tag);
-    a.b_cond(C_NE, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5236,8 +5291,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    a.cmp_imm_w(14, none_tag);
-    a.b_cond(C_NE, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5250,8 +5304,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    a.cmp_imm_w(14, none_tag);
-    a.b_cond(C_NE, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5260,20 +5313,20 @@ fn emit_prop_way_probe(
     a.b_cond(C_NE, miss);
     a.b(load);
     // Cached ABSENCE (`IC_ABSENT`, the AST-shaped read `node.optionalField`): re-walk the
-    // live chain — every level None-exotic, ic-plain, shape matching the recorded walk
-    // (level 1 already validated by the receiver checks above; ABSENT states only fill
-    // from all-None chains, so re-require None on receivers the `arr_ok`/`str_ok` gates
-    // let through) — and the chain must END where the fill saw it end. Then the read is
-    // `undefined` with no entry scan at all. Method loads keep the helper (an absent
-    // method throws there anyway).
+    // live chain — every level ic-plain with a shape matching the recorded walk and an
+    // exotic that answers no name outside its entries (None or Num/Bool wrapper; ABSENT
+    // states fill only from such chains, so re-require that on receivers the
+    // `arr_ok`/`wrap_ok` gates let through — an Array or StrWrap level keeps the helper,
+    // exactly as in `ic_shape_probe`) — and the chain must END where the fill saw it end.
+    // Then the read is `undefined` with no entry scan at all. Method loads keep the
+    // helper (an absent method throws there anyway).
     a.bind(other);
     if !method {
         a.cmp_imm_w(9, crate::bytecode::IC_ABSENT as u32);
         a.b_cond(C_NE, kc_route);
-        if arr_ok || str_ok {
+        if arr_ok || wrap_ok {
             a.ldrb_imm(14, 11, ex);
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, false, true, miss);
         }
         let chain_end = a.new_label();
         for (lvl, shape_off) in [
@@ -5289,8 +5342,7 @@ fn emit_prop_way_probe(
             a.cbz(17, true, miss); // chain ended before the recorded level count
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, false, true, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5473,17 +5525,61 @@ fn emit_prop_load_inline(
     // 1. receiver must be an Obj (tag 8); x10 = its stored Rc pointer, kept live for the final
     //    receiver drop (stack form) — hop walking uses x17. The this/slot forms read a binding
     //    the frame owns: no refcount management at all.
-    // String-primitive receivers (method loads only — the receiver slot is never dropped or
-    // refcounted on this path): resolve against the active realm's String.prototype, whose
-    // stored Rc pointer plays the receiver role for the probe. The Rust helper fills the SAME
-    // site cache with proto-based states (see get_prop_ic's primitive arm), so shapes align.
-    let str_ok = method
+    // Primitive receivers in the NON-CONSUMING forms only (a method load keeps its stack
+    // receiver as `this`; the this/slot forms never drop or refcount theirs): resolve against
+    // the active realm's wrapper prototype, whose stored Rc pointer plays the receiver role
+    // for the probe. The Rust helper fills the SAME site cache with proto-based states (see
+    // get_prop_ic's primitive arm), so shapes align. The consuming stack GetProp keeps the
+    // helper for primitives: its commit drops the receiver word through x10, which a
+    // substituted prototype pointer must never stand in for. Name gates mirror the helper's
+    // primitive arm (`length`/`description`/digit-leading stay checked).
+    let fits_proto = |off: usize| off & 7 == 0 && off / 8 < 4096;
+    let wrap_ok = (method || !matches!(recv, PropRecv::Stack))
         && il.valid
-        && il.string_proto & 7 == 0
-        && il.string_proto / 8 < 4096
+        && fits_proto(il.string_proto)
+        && fits_proto(il.number_proto)
+        && fits_proto(il.boolean_proto)
         && name != "length"
         && name != "description"
         && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
+    // Packed receiver word in x9 → x10 = the object the probe walks: the Obj payload itself,
+    // or the active realm's wrapper prototype for a Str/Num/Bool primitive (kinds are the
+    // wide-Value discriminants `emit_exec_kind` decodes: Bool 3, Num 4, Str 6, Obj 8).
+    // Every other kind (nullish, Symbol, BigInt, Empty) branches to `slow` before anything
+    // is written, where the helper reproduces OrdinaryGet — including its TypeError — with
+    // the original primitive receiver for any accessor it runs.
+    let emit_packed_probe_receiver = |a: &mut asm::Asm| {
+        let obj_recv = a.new_label();
+        let str_recv = a.new_label();
+        let bool_recv = a.new_label();
+        let probe_go = a.new_label();
+        // Obj is the overwhelmingly common receiver: single out with the cheap top-16
+        // compare first (as the string-method path always did) so ordinary object reads
+        // pay nothing for the primitive cases. Kind discrimination below runs only for
+        // non-object receivers.
+        a.lsr_imm(11, 9, 48);
+        a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
+        a.cmp_reg_w(11, 12);
+        a.b_cond(C_EQ, obj_recv);
+        emit_exec_kind(a, 9, 11, 12, slow);
+        a.cmp_imm_w(11, 6);
+        a.b_cond(C_EQ, str_recv);
+        a.cmp_imm_w(11, 3);
+        a.b_cond(C_EQ, bool_recv);
+        a.cmp_imm_w(11, 4); // Num is the only remaining admissible kind
+        a.b_cond(C_NE, slow);
+        emit_load_active_proto(a, il.number_proto);
+        a.b(probe_go);
+        a.bind(str_recv);
+        emit_load_active_proto(a, il.string_proto);
+        a.b(probe_go);
+        a.bind(bool_recv);
+        emit_load_active_proto(a, il.boolean_proto);
+        a.b(probe_go);
+        a.bind(obj_recv);
+        emit_exec_payload(a, 9, 10);
+        a.bind(probe_go);
+    };
     // `length` of a String primitive is its own non-writable, non-configurable data property
     // (ECMA-262 §10.4.3.5 StringGetOwnProperty via ToObject), so no user code can intervene.
     let string_length = !method && name == "length";
@@ -5493,20 +5589,11 @@ fn emit_prop_load_inline(
             if string_length {
                 emit_ascii_string_length(a, 9, true, done, slow);
             }
-            if str_ok {
-                let obj_recv = a.new_label();
-                let probe_go = a.new_label();
-                a.lsr_imm(11, 9, 48);
-                a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
-                a.cmp_reg_w(11, 12);
-                a.b_cond(C_EQ, obj_recv);
-                emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 11, slow);
-                a.ldr_imm(10, 19, 72); // ctx.interp
-                a.ldr_imm(10, 10, il.string_proto as u32);
-                a.b(probe_go);
-                a.bind(obj_recv);
-                emit_exec_payload(a, 9, 10);
-                a.bind(probe_go);
+            if wrap_ok {
+                // Stack + wrap_ok implies a method load: the receiver word is neither
+                // dropped nor refcounted below, so no strong-count gate applies to x10.
+                debug_assert!(method);
+                emit_packed_probe_receiver(a);
             } else {
                 emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
                 emit_exec_payload(a, 9, 10);
@@ -5521,17 +5608,49 @@ fn emit_prop_load_inline(
         PropRecv::This => {
             a.ldr_imm(14, 19, 48); // ctx.this_raw → the frame's `this` Value
             a.ldurb(9, 14, 0);
-            a.cmp_imm_w(9, 8);
-            a.b_cond(C_NE, slow);
-            a.ldur(10, 14, 8);
+            if wrap_ok {
+                // The wide `this` word's low byte IS the Value discriminant (same numbering
+                // as above; an Empty/TDZ `this` or any other kind keeps the helper's throw).
+                let obj_recv = a.new_label();
+                let str_recv = a.new_label();
+                let bool_recv = a.new_label();
+                let probe_go = a.new_label();
+                a.cmp_imm_w(9, 8);
+                a.b_cond(C_EQ, obj_recv);
+                a.cmp_imm_w(9, 6);
+                a.b_cond(C_EQ, str_recv);
+                a.cmp_imm_w(9, 3);
+                a.b_cond(C_EQ, bool_recv);
+                a.cmp_imm_w(9, 4);
+                a.b_cond(C_NE, slow);
+                emit_load_active_proto(a, il.number_proto);
+                a.b(probe_go);
+                a.bind(str_recv);
+                emit_load_active_proto(a, il.string_proto);
+                a.b(probe_go);
+                a.bind(bool_recv);
+                emit_load_active_proto(a, il.boolean_proto);
+                a.b(probe_go);
+                a.bind(obj_recv);
+                a.ldur(10, 14, 8);
+                a.bind(probe_go);
+            } else {
+                a.cmp_imm_w(9, 8);
+                a.b_cond(C_NE, slow);
+                a.ldur(10, 14, 8);
+            }
         }
         PropRecv::Slot(off) => {
             emit_exec_word_load(a, 9, 22, off as i32);
             if string_length {
                 emit_ascii_string_length(a, 9, false, done, slow);
             }
-            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
-            emit_exec_payload(a, 9, 10);
+            if wrap_ok {
+                emit_packed_probe_receiver(a);
+            } else {
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+                emit_exec_payload(a, 9, 10);
+            }
         }
     }
     // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
@@ -5562,7 +5681,7 @@ fn emit_prop_load_inline(
     let emit_baked = |a: &mut asm::Asm, st: crate::bytecode::IcState, miss: usize| {
         a.add_imm(11, 10, rcv);
         a.ldrb_imm(14, 11, ex);
-        if arr_ok || str_ok {
+        if arr_ok || wrap_ok {
             let recv_exotic_ok = a.new_label();
             a.cmp_imm_w(14, none_tag);
             a.b_cond(C_EQ, recv_exotic_ok);
@@ -5570,8 +5689,12 @@ fn emit_prop_load_inline(
                 a.cmp_imm_w(14, layout.exotic_array_tag as u32);
                 a.b_cond(C_EQ, recv_exotic_ok);
             }
-            if str_ok {
+            if wrap_ok {
                 a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
+                a.b_cond(C_EQ, recv_exotic_ok);
+                a.cmp_imm_w(14, layout.exotic_numwrap_tag as u32);
+                a.b_cond(C_EQ, recv_exotic_ok);
+                a.cmp_imm_w(14, layout.exotic_boolwrap_tag as u32);
                 a.b_cond(C_EQ, recv_exotic_ok);
             }
             a.b(miss);
@@ -5591,8 +5714,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5610,8 +5732,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5629,8 +5750,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5668,7 +5788,7 @@ fn emit_prop_load_inline(
     if compact.is_none() {
         let flags = PropProbeFlags {
             arr_ok,
-            str_ok,
+            wrap_ok,
             method,
             kc,
         };
@@ -10848,7 +10968,7 @@ impl SharedStub {
             SharedStub::PropWays(flags) => {
                 Self::PROP_WAYS
                     | u32::from(flags.arr_ok)
-                    | u32::from(flags.str_ok) << 1
+                    | u32::from(flags.wrap_ok) << 1
                     | u32::from(flags.method) << 2
                     | u32::from(flags.kc) << 3
             }
@@ -10901,7 +11021,7 @@ impl SharedStub {
             ))]
             Self::PROP_WAYS => SharedStub::PropWays(PropProbeFlags {
                 arr_ok: key & 1 != 0,
-                str_ok: key & 2 != 0,
+                wrap_ok: key & 2 != 0,
                 method: key & 4 != 0,
                 kc: key & 8 != 0,
             }),
