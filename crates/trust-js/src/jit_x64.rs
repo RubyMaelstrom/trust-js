@@ -410,6 +410,169 @@ fn a_jne_or_unordered(a: &mut Asm, slow: usize) {
     a.jcc(0x8a, slow);
 }
 
+// ECMA-262 e28783d5, OrdinaryGet: an ordinary own data descriptor returns its live value.
+// No getter, prototype walk, conversion or JavaScript call occurs on this path.
+#[cfg(test)]
+thread_local! {
+    static TEST_OWN_PROPERTY_READS: [std::cell::Cell<usize>; 2] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    };
+}
+
+/// Probe the live property IC, including fills made after this machine body was compiled.
+/// Receiver, cache, bounds, descriptor and owner checks precede the single clone/push commit.
+/// The canonical local/this owner keeps the receiver alive throughout the borrowed lookup.
+fn emit_prop_own(
+    a: &mut Asm,
+    layout: &crate::value::JitLayout,
+    cache: usize,
+    recv: PropRecv,
+    slow: usize,
+) -> bool {
+    use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
+    let offsets = [
+        layout.obj_from_rc,
+        layout.obj_exotic,
+        layout.obj_ic_plain,
+        layout.obj_props + layout.props_shape,
+        layout.obj_props + layout.props_entries + layout.vec_len_off,
+        layout.obj_props + layout.props_entries + layout.vec_ptr_off,
+        layout.entry_size,
+        layout.entry_value,
+        layout.entry_accessor,
+        layout.rc_strong_off,
+    ];
+    if !layout.valid
+        || layout.entry_accessor != layout.entry_value + 8
+        || cache == 0
+        || offsets.iter().any(|offset| *offset > i32::MAX as usize)
+    {
+        return false;
+    }
+    match recv {
+        PropRecv::This => {
+            a.bytes(&[0x49, 0x8b, 0x84, 0x24, 0x30, 0, 0, 0]); // rax=ctx.this_raw
+            a.bytes(&[0x80, 0x38, 0x08]); // wide Value::Obj
+            a.jcc(0x85, slow);
+            a.bytes(&[0x4c, 0x8b, 0x50, 0x08]); // r10=stored receiver owner
+        }
+        PropRecv::Slot(slot) => {
+            let off = i32::from(slot) * SLOT_BYTES;
+            a.load_tag_r15(off);
+            a.cmp_eax((PACK_OBJ >> 48) as u32); // Empty/primitive receivers retain the helper
+            a.jcc(0x85, slow);
+            a.bytes(&[0x4d, 0x8b, 0x97]);
+            a.bytes(&off.to_le_bytes());
+            a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
+        }
+    }
+    a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object body
+    a.bytes(&(layout.obj_from_rc as i32).to_le_bytes());
+    a.bytes(&[0x41, 0x80, 0xbb]); // receiver must have ordinary internal methods
+    a.bytes(&(layout.obj_exotic as i32).to_le_bytes());
+    a.bytes(&[layout.exotic_none_tag]);
+    a.jcc(0x85, slow);
+    a.bytes(&[0x41, 0x80, 0xbb]);
+    a.bytes(&(layout.obj_ic_plain as i32).to_le_bytes());
+    a.bytes(&[0]);
+    a.jcc(0x84, slow);
+    a.bytes(&[0x45, 0x8b, 0x83]); // r8d=live receiver shape
+    a.bytes(&((layout.obj_props + layout.props_shape) as i32).to_le_bytes());
+    a.bytes(&[0x49, 0xb9]); // r9=first live cache way, pinned by this Chunk
+    a.bytes(&(cache as u64).to_le_bytes());
+    a.bytes(&[0xb9]); // ecx=ways remaining
+    a.bytes(&(PROP_IC_WAYS as u32).to_le_bytes());
+    let probe = a.label();
+    let next = a.label();
+    let found = a.label();
+    a.bind(probe);
+    a.bytes(&[0x41, 0x80, 0xb9]); // cmp byte [r9+depth],0: own data only
+    a.bytes(&(IC_OFF_DEPTH as i32).to_le_bytes());
+    a.bytes(&[0]);
+    a.jcc(0x85, next);
+    a.bytes(&[0x45, 0x3b, 0x81]); // cmp r8d,[r9+recv_shape]
+    a.bytes(&(IC_OFF_RECV_SHAPE as i32).to_le_bytes());
+    a.jcc(0x85, next);
+    a.bytes(&[0x41, 0x8b, 0x91]); // edx=live cached slot (zero extended)
+    a.bytes(&(IC_OFF_SLOT as i32).to_le_bytes());
+    a.jmp(found);
+    a.bind(next);
+    a.bytes(&[0x49, 0x81, 0xc1]); // advance to the next Cell<IcState>
+    a.bytes(
+        &(std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>() as i32).to_le_bytes(),
+    );
+    a.bytes(&[0xff, 0xc9]); // dec ecx
+    a.jcc(0x85, probe);
+    a.jmp(slow);
+    a.bind(found);
+    a.bytes(&[0x49, 0x3b, 0x93]); // cmp rdx,live entry count
+    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_len_off) as i32).to_le_bytes());
+    a.jcc(0x83, slow);
+    a.bytes(&[0x49, 0x8b, 0x83]); // rax=live entries buffer
+    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_ptr_off) as i32).to_le_bytes());
+    a.bytes(&[0x48, 0x69, 0xd2]); // imul rdx,rdx,entry_size
+    a.bytes(&(layout.entry_size as i32).to_le_bytes());
+    a.bytes(&[0x48, 0x01, 0xd0]); // rax=Property address
+    a.bytes(&[0xf6, 0x80]); // reject live accessor, even if its cached shape still matches
+    a.bytes(&(layout.entry_accessor as i32).to_le_bytes());
+    a.bytes(&[crate::value::PROP_ACCESSOR as u8]);
+    a.jcc(0x85, slow);
+    a.bytes(&[0x4c, 0x8b, 0x90]); // r10=borrowed live packed property word
+    a.bytes(&(layout.entry_value as i32).to_le_bytes());
+    a.bytes(&[0x4c, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=value tag
+    a.cmp_eax((crate::value::PACK_EMPTY >> 48) as u32);
+    a.jcc(0x84, slow);
+    let immediate = a.label();
+    let copied = a.label();
+    // BigInt and reserved/lazy-prototype words keep their checked materialization.
+    a.reference_or_immediate(true, immediate, slow);
+    a.bytes(&[0x4c, 0x89, 0xd0]);
+    a.payload_rax_to_rdx();
+    a.inc_strong_rdx(layout.rc_strong_off as i32);
+    a.jmp(copied);
+    a.bind(immediate);
+    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word; no ownership traffic
+    a.bind(copied);
+    a.store_word_r13(0);
+    a.add_sp(8);
+    #[cfg(test)]
+    TEST_OWN_PROPERTY_READS.with(|counts| {
+        let index = usize::from(matches!(recv, PropRecv::This));
+        a.mov_word_imm(counts[index].as_ptr() as usize as u64);
+        a.bytes(&[0x48, 0xff, 0x00]); // inc qword [rax], no callback or production instructions
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_prop_read(
+    a: &mut Asm,
+    chunk: &Chunk,
+    layout: &crate::value::JitLayout,
+    cache: u32,
+    recv: PropRecv,
+    pc: u32,
+    unwind: usize,
+) {
+    let slow = a.label();
+    let numeric = a.label();
+    let done = a.label();
+    if emit_prop_own(a, layout, chunk.jit_cache_ptr(cache), recv, numeric) {
+        a.jmp(done);
+    }
+    a.bind(numeric);
+    // Retain the established warmed Number path for inherited reads and unsupported layouts.
+    if chunk
+        .jit_cache_preferred(cache)
+        .is_some_and(|state| emit_prop_num(a, layout, state, recv, slow))
+    {
+        a.jmp(done);
+    }
+    a.bind(slow);
+    a.helper_spflag(H_GET_PROP, pc, unwind);
+    a.bind(done);
+}
+
 /// Compact monomorphic property-number load. Every cached structural fact is rechecked against
 /// the live object graph; a miss reaches H_GET_PROP before stack or refcount state changes.
 fn emit_prop_num(
@@ -1003,34 +1166,26 @@ pub(super) fn compile_entry(
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
             }
             Op::GetPropThis(_, cache) => {
-                let slow = a.label();
-                let done = a.label();
-                let emitted = chunk
-                    .jit_cache_preferred(*cache)
-                    .is_some_and(|st| emit_prop_num(&mut a, layout, st, PropRecv::This, slow));
-                if emitted {
-                    a.jmp(done);
-                    a.bind(slow);
-                    a.helper_spflag(H_GET_PROP, pc as u32, unwind);
-                    a.bind(done);
-                } else {
-                    a.helper_spflag(H_GET_PROP, pc as u32, unwind);
-                }
+                emit_prop_read(
+                    &mut a,
+                    chunk,
+                    layout,
+                    *cache,
+                    PropRecv::This,
+                    pc as u32,
+                    unwind,
+                );
             }
             Op::GetPropLocal(slot, _, cache) => {
-                let slow = a.label();
-                let done = a.label();
-                let emitted = chunk.jit_cache_preferred(*cache).is_some_and(|st| {
-                    emit_prop_num(&mut a, layout, st, PropRecv::Slot(*slot), slow)
-                });
-                if emitted {
-                    a.jmp(done);
-                    a.bind(slow);
-                    a.helper_spflag(H_GET_PROP, pc as u32, unwind);
-                    a.bind(done);
-                } else {
-                    a.helper_spflag(H_GET_PROP, pc as u32, unwind);
-                }
+                emit_prop_read(
+                    &mut a,
+                    chunk,
+                    layout,
+                    *cache,
+                    PropRecv::Slot(*slot),
+                    pc as u32,
+                    unwind,
+                );
             }
             Op::GetProp(..) | Op::GetMethod(..) => a.helper_spflag(H_GET_PROP, pc as u32, unwind),
             Op::GetMethodElem => a.helper_spflag(H_GET_METHOD_ELEM, pc as u32, unwind),
@@ -1304,3 +1459,7 @@ mod tests {
         assert_native_code(&mut engine, "transfer", true);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "jit_x64_property_tests.rs"]
+mod property_tests;

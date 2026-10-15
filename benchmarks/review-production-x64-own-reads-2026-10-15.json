@@ -1,0 +1,280 @@
+{
+  "date": "2026-10-15",
+  "base_engine_commit": "6b21062465137b10533931919c92931d7f4fa1f4",
+  "change": "Inline ordinary own-data GetPropLocal/GetPropThis reads in the existing x86-64 template JIT. Live four-way caches can become useful after native compilation; scalar and supported reference results use the existing ownership representation. Checked fallbacks and the existing inherited Number path remain.",
+  "integration": "Default x86-64 production path; no optional compiler, feature flag or runtime opt-in. Release artifacts were not installed or promoted.",
+  "implementation_files": [
+    {
+      "path": "crates/trust-js/src/jit_x64.rs",
+      "sha256": "df286e178612d2237c8c9c02c14b0e4710f036accba7d6a3c277da83a9c65abc"
+    },
+    {
+      "path": "crates/trust-js/src/jit_x64_property_tests.rs",
+      "sha256": "508bae3013aee0139669b7f446d3105304959c3a381bd311bf765ae62c31e81e"
+    }
+  ],
+  "native_build": "Rust1.98.0, x86_64-unknown-linux-gnu, release opt3/fat-LTO/one-codegen-unit/panic-abort, -j2; default/intl/embed only.",
+  "machine": {
+    "hostname": "zombie",
+    "uname": [
+      "Linux",
+      "zombie",
+      "7.2.9-2-cachyos",
+      "#1 SMP PREEMPT_DYNAMIC Fri, 09 Oct 2026 15:36:46 +0000",
+      "x86_64"
+    ],
+    "python": "3.14.8 (main, Oct 13 2026, 10:33:10) [GCC 16.2.1 20260810]",
+    "controller_cpu": 4,
+    "JS_cpu": 5,
+    "maximum_frequency_khz": "3500000",
+    "governor": "powersave"
+  },
+  "timing_controls": {
+    "NODE_ENV": "production",
+    "TRUST_JS_TIER": "jit"
+  },
+  "protocol": "Five baseline stability runs followed by seven alternating process pairs per cohort; all samples retained. Diagnostics run separately.",
+  "correctness": {
+    "baseline_full_native_GNU": {
+      "passed": 1981,
+      "failed": 0,
+      "ignored": 3
+    },
+    "candidate_full_native_GNU": {
+      "passed": 1985,
+      "failed": 0,
+      "ignored": 3
+    },
+    "candidate_focused_native_GNU": {
+      "passed": 16,
+      "failed": 0
+    },
+    "candidate_focused_MSVC_under_Wine": {
+      "passed": 16,
+      "failed": 0
+    },
+    "SSR_timing_processes": 19,
+    "SSR_complete_HTML_equalities_in_timing": 14592,
+    "SSR_external_full_edge_body_checks_in_timing": 1140,
+    "separate_release_functionals": "Two processes,768 complete HTML equalities and60 external body checks each.",
+    "diagnostics": "Two separate OPSTAT processes each validated all768 complete HTML outputs; timing-ineligible.",
+    "native_x64_all_target_Clippy": {
+      "passed": true,
+      "result": {
+        "path": "/big/Code/trust-js/target/compiler-review-20261015/backend-removal-x64-v1/performance-evidence/candidate-native-clippy-project-policy/result.json",
+        "bytes": 1189,
+        "sha256": "9c342867567e1a2971a9da1e9171253c2479d7d34e15a23311c2d1019e3c2323"
+      },
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "-p",
+        "trust-js",
+        "--all-targets",
+        "--features",
+        "embed",
+        "-j2",
+        "--",
+        "-Dwarnings",
+        "-Adead_code"
+      ],
+      "qualification": "Honors explicit workspace allowances for type_complexity, too_many_arguments, needless_range_loop and doc_lazy_continuation. Only known preexisting platform dead_code warnings are permitted; native compilation logs retain their text.",
+      "previous_wrong_invocation": "Earlier -Dclippy::all overrode legitimate workspace allows and failed on unchanged files. This was a lint-command error, not an engine correctness failure; full failed logs are preserved."
+    }
+  },
+  "SSR": {
+    "all_measured_render_and_collection_ms": {
+      "median_cost_change_percent": -3.0424944996563563,
+      "observed_pair_range_percent": [
+        -5.288070571078752,
+        -1.7206808774467452
+      ],
+      "slower_pairs": 0
+    },
+    "process_wall_s": {
+      "median_cost_change_percent": -3.057383922548318,
+      "observed_pair_range_percent": [
+        -5.126632636249817,
+        -1.8446431517110229
+      ],
+      "slower_pairs": 0
+    },
+    "process_cpu_s": {
+      "median_cost_change_percent": -3.0147368948003295,
+      "observed_pair_range_percent": [
+        -5.237754549282537,
+        -1.7787767849816172
+      ],
+      "slower_pairs": 0
+    },
+    "post_exec_sampled_peak_RSS_kib": {
+      "median_cost_change_percent": 0.20723167071601267,
+      "observed_pair_range_percent": [
+        -0.0664514904120006,
+        0.3835616438356171
+      ],
+      "slower_pairs": 6
+    },
+    "small-string/cold/0/render_and_collection_ms": {
+      "median_cost_change_percent": 0.5074571837651476,
+      "observed_pair_range_percent": [
+        -0.5484475381608789,
+        0.8817955914278031
+      ],
+      "slower_pairs": 5
+    }
+  },
+  "fixed_RayTrace": {
+    "work": "Exactly32 warmup+32 measured renders in every fresh process, upstream computational kernel unchanged; actual counts and checksum validated.",
+    "metrics": {
+      "process_wall_s": {
+        "median_cost_change_percent": -4.764391560269743,
+        "observed_pair_range_percent": [
+          -8.229761255480206,
+          -3.510889832988884
+        ],
+        "slower_pairs": 0
+      },
+      "process_cpu_s": {
+        "median_cost_change_percent": -4.702893993557556,
+        "observed_pair_range_percent": [
+          -8.22921450771531,
+          -3.510551303297904
+        ],
+        "slower_pairs": 0
+      },
+      "post_exec_sampled_peak_RSS_kib": {
+        "median_cost_change_percent": 0.5492970859324098,
+        "observed_pair_range_percent": [
+          -0.5008811798534407,
+          0.6579557038272732
+        ],
+        "slower_pairs": 5
+      }
+    }
+  },
+  "browser": {
+    "fixture": "Speedometer3.1 revision1386415b; browser revision4ea9b42b; four selected TodoMVC suites, one official iteration per process. Matched release opt3/no-LTO/64-codegen-unit builds with default engine features.",
+    "functional_states_equal": true,
+    "timing_processes": 19,
+    "suite_metrics": {
+      "TodoMVC-React-Complex-DOM": {
+        "paired_median_cost_change_percent": -0.9776810953591619,
+        "observed_ratio_range": [
+          0.9765450418337168,
+          1.0038256058799422
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      },
+      "TodoMVC-Angular-Complex-DOM": {
+        "paired_median_cost_change_percent": -1.276344308043087,
+        "observed_ratio_range": [
+          0.9698527066424624,
+          0.9967106866704589
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      },
+      "TodoMVC-Vue": {
+        "paired_median_cost_change_percent": -0.9699842221653876,
+        "observed_ratio_range": [
+          0.9731343804137793,
+          0.9994613809057427
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      },
+      "TodoMVC-jQuery": {
+        "paired_median_cost_change_percent": -0.6691616834985759,
+        "observed_ratio_range": [
+          0.9827520337188271,
+          1.0112590830962451
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      },
+      "Score": {
+        "paired_median_cost_change_percent": -1.4054726143809981,
+        "observed_ratio_range": [
+          0.9838391448954783,
+          1.000433959769865
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      }
+    },
+    "resources": {
+      "observed_process_cpu_seconds": {
+        "paired_median_cost_change_percent": -0.6622516556291314,
+        "observed_ratio_range": [
+          0.9853756933938478,
+          1.068698347107438
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      },
+      "observed_browser_peak_rss_kib": {
+        "paired_median_cost_change_percent": 0.3509077199698396,
+        "observed_ratio_range": [
+          0.964514260046481,
+          1.109225491966059
+        ],
+        "complete_pairs": true,
+        "discarded_samples": 0
+      }
+    },
+    "largest_component_median_slowdown_percent": 1.4957848056469158,
+    "assessment": "No consistent application regression detected. Modest framework median improvements are descriptive; aggregate interval crosses parity. No equivalence or full-Speedometer improvement claim. No component median slowdown exceeds1.5%.",
+    "limits": [
+      "Thirteen precision-flagged components; noisy RSS and broad resource bounds.",
+      "Pair4 outer wall/CPU/non-action-gap outlier and pair2 memory increase are retained."
+    ]
+  },
+  "uptake": {
+    "diagnostic": "Fixed768-render React workload, separate OPSTAT runs",
+    "GetPropLocal_helper_calls_baseline": 26790464,
+    "GetPropLocal_helper_calls_candidate": 5632345,
+    "avoided_helper_calls": 21158119
+  },
+  "checks": {
+    "native_GNU_candidate_full": "1985 passed,0 failed,3 ignored",
+    "native_GNU_and_MSVC_under_Wine_focused": "16 passed per platform",
+    "Node_semantics_oracle": "v24.21.0, true",
+    "final_ARM_workspace_all_targets_all_features_Clippy_D_warnings": "pass",
+    "native_x64_Clippy": "pass with -Dwarnings -Adead_code, retaining only known preexisting platform dead-code allowance",
+    "final_cargo_fmt_and_diff_checks": "pass"
+  },
+  "cost_and_scope_limits": [
+    "First small-string cold render is+0.507% (~0.11ms); import/startup is mixed near zero.",
+    "Cold harness validation-only microclock rose0.418 microseconds; it is not an application startup metric and its Phase0 range was11.23%.",
+    "Peak RSS rises0.21% in SSR and0.55% in fixed RayTrace; sampled process memory is not post-GC retained memory.",
+    "Compiler/generated-JIT-code/GC-pause/post-GC breakdown unavailable. Full-process costs include compilation.",
+    "Adaptive RayTrace ran unequal work; its process-time differences are not used as fixed-work regressions.",
+    "These workload results do not establish general engine speed or complete language conformance."
+  ],
+  "evidence": [
+    {
+      "path": "target/compiler-review-20261015/backend-removal-x64-v1/independent-analysis.json",
+      "sha256": "4b9c05bed6ea0f96b6a76de3134dccb7885c8d25594a2ccc4d772ac3a5c5eca3"
+    },
+    {
+      "path": "target/compiler-review-20261015/backend-removal-x64-v1/independent-peer-review.json",
+      "sha256": "7785a8314cdbc4d390a878f304b4be08578b19e22306eff29003d725193f94b8"
+    },
+    {
+      "path": "target/compiler-review-20261015/production-x64-own-read-browser-v1/seven-pair-analysis.json",
+      "sha256": "23743eac70c1af45bbc083fdf1a632596ff11e839bfeca1cf4619c589c8f2048"
+    },
+    {
+      "path": "target/compiler-review-20261015/production-x64-own-read-browser-v1/final-review.json",
+      "sha256": "73efcadfa335f371ee5ab6e810dd1fda04bbb52f65d85c7430f8a1592c1c92ce"
+    },
+    {
+      "path": "target/compiler-review-20261015/production-x64-own-read-browser-v1/independent-browser-peer-review.json",
+      "sha256": "23d527182c29a13941802e73073655c1c855c2628bad66d79795d6f8ce65c096"
+    }
+  ]
+}
