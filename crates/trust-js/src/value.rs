@@ -1914,6 +1914,12 @@ impl Object {
     /// Replace only the receiver's ordinary property payload. Engine state belongs to this
     /// receiver, even when an Array.fill fast path materializes fresh dense storage around it.
     pub(crate) fn replace_properties(&mut self, mut properties: Props) {
+        // `proto_flag` is a property of the OBJECT's history (it served as a live
+        // prototype), not of either property map: a whole-map swap must not clear it,
+        // or later structural changes would stop bumping the creation-IC epoch.
+        properties
+            .proto_flag
+            .set(self.props.proto_flag.get() || properties.proto_flag.get());
         let slots = self.take_internal_slots();
         if let Some(buffers) = properties.elems.0.as_deref_mut() {
             buffers.internal_slots = slots;

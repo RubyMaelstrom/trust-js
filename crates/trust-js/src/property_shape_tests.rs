@@ -190,6 +190,24 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
 }
 
 #[test]
+fn replace_properties_preserves_live_prototype_flag() {
+    let mut engine = Engine::new();
+    let obj = value(&mut engine, "({keep: 1})");
+    let o = obj.as_obj().unwrap().clone();
+    o.borrow().props.mark_proto();
+    o.borrow_mut().replace_properties(Props::with_capacity(0));
+    let epoch = proto_epoch();
+    o.borrow_mut()
+        .props
+        .insert("added", Property::plain(Value::Num(1.0)));
+    assert_ne!(
+        proto_epoch(),
+        epoch,
+        "structural changes after a whole-map swap still invalidate creation ICs"
+    );
+}
+
+#[test]
 fn shape_transition_census_counts_shared_edges_once() {
     let mut engine = Engine::new();
     run(&mut engine, "var warm = ({census_a: 1}); 'ok'");
