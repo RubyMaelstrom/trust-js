@@ -426,6 +426,10 @@ pub(crate) struct Heap {
     growth_percent: usize,
     stress_every: usize,
     allocs_since_gc: usize,
+    /// When false, allocation never collects: the embedder polls
+    /// [`Heap::collection_due`] at its own safepoints, where it can supply
+    /// roots the heap cannot see (the interpreter's state).
+    collect_on_alloc: bool,
     stats: GcStats,
 }
 
@@ -456,6 +460,7 @@ impl Heap {
             growth_percent: DEFAULT_GROWTH_PERCENT,
             stress_every: 0,
             allocs_since_gc: 0,
+            collect_on_alloc: true,
             stats: GcStats::default(),
         }
     }
@@ -527,6 +532,19 @@ impl Heap {
 
     pub(crate) fn set_stress_every(&mut self, allocs: usize) {
         self.stress_every = allocs;
+    }
+
+    /// See the `collect_on_alloc` field.
+    pub(crate) fn set_collect_on_alloc(&mut self, collect: bool) {
+        self.collect_on_alloc = collect;
+    }
+
+    /// Whether a collection is due: the allocation budget is spent, the
+    /// stress interval elapsed, or an earlier request was deferred.
+    pub(crate) fn collection_due(&self) -> bool {
+        self.control.pending_collect.get()
+            || self.allocated_bytes > self.trigger_bytes
+            || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
     }
 
     /// The next collection is due once allocated bytes exceed
@@ -624,7 +642,7 @@ impl Heap {
         let due = self.control.pending_collect.get()
             || self.allocated_bytes.saturating_add(upcoming) > self.trigger_bytes
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every);
-        if due {
+        if due && self.collect_on_alloc {
             self.collect();
         }
     }
@@ -1258,14 +1276,12 @@ impl Heap {
     }
 }
 
-impl Drop for Heap {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            self.debug_assert_quiescent();
-        }
-        // I5 teardown: every remaining cell dies with its heap. Finalizers
-        // run in no particular order (see FinalizeFn).
-        for page in self.pages.iter().flatten() {
+impl Heap {
+    /// I5 teardown: finalize every remaining cell and free all heap memory,
+    /// leaving an empty heap. Finalizers run in no particular order (see
+    /// FinalizeFn). Every handle into this heap dangles afterwards.
+    pub(crate) fn release_all(&mut self) {
+        for page in std::mem::take(&mut self.pages).into_iter().flatten() {
             if let Some(finalize) = self.descs[page.desc.0 as usize].finalize {
                 for i in 0..page.cells {
                     if bit(&page.allocated, i) {
@@ -1276,13 +1292,29 @@ impl Drop for Heap {
             // SAFETY: allocated in new_page with this layout.
             unsafe { dealloc(page.base as *mut u8, page_layout()) };
         }
-        for (&start, large) in &self.larges {
+        for (start, large) in std::mem::take(&mut self.larges) {
             if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
                 finalize(start as *mut u8);
             }
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
         }
+        self.free_page_slots.clear();
+        self.page_map.clear();
+        for class in self.classes.iter_mut().flatten() {
+            *class = ClassPages::default();
+        }
+        self.large_span = (usize::MAX, 0);
+        self.allocated_bytes = 0;
+    }
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.debug_assert_quiescent();
+        }
+        self.release_all();
     }
 }
 

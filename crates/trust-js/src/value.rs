@@ -2172,6 +2172,24 @@ impl<T> SlotRegistry<T> {
         self.entries.len() - self.free.len()
     }
 
+    /// Every live entry's address.
+    #[cfg(feature = "gc-heap")]
+    fn entry_ptrs(&self) -> impl Iterator<Item = *const RefCell<T>> + '_ {
+        self.entries
+            .iter()
+            .copied()
+            .filter(|entry| !entry.is_null())
+    }
+
+    /// The live young entries' addresses.
+    #[cfg(feature = "gc-heap")]
+    fn young_entry_ptrs(&self) -> impl Iterator<Item = *const RefCell<T>> + '_ {
+        self.young_slots
+            .iter()
+            .map(|&slot| self.entries[slot])
+            .filter(|entry| !entry.is_null())
+    }
+
     fn requested_bytes(&self) -> usize {
         self.entries
             .capacity()
@@ -2233,9 +2251,75 @@ pub(crate) struct GcState {
     allocated: Cell<u64>,
     #[cfg(feature = "heap-bridge")]
     pub(crate) central: RefCell<crate::heap::CentralHeap>,
+    /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
+    /// `new_object_heap`); collections run at interpreter safepoints, which supply the roots.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) core: RefCell<crate::gc_core::Heap>,
+    #[cfg(feature = "gc-heap")]
+    pub(crate) object_desc: crate::gc_core::DescId,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
+
+/// The cell heap behind a [`GcState`] and its object descriptor.
+#[cfg(feature = "gc-heap")]
+fn new_object_heap() -> (crate::gc_core::Heap, crate::gc_core::DescId) {
+    let mut core = crate::gc_core::Heap::new();
+    core.set_collect_on_alloc(false);
+    let object_desc = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "object",
+        trace: trace_object_cell,
+        weak: None,
+        finalize: Some(finalize_object_cell),
+    });
+    (core, object_desc)
+}
+
+/// Strong edges of an object cell. S2 step 2b runs no collection; the object descriptor's
+/// edges (the intrinsic half of `Interp::visit_object_edges`) land with collection in step 3.
+#[cfg(feature = "gc-heap")]
+fn trace_object_cell(_cell: *const u8, _visit: &mut dyn FnMut(*const u8)) {}
+
+/// Run `Object::drop` and release the object's Rust-heap payload when its cell dies.
+#[cfg(feature = "gc-heap")]
+fn finalize_object_cell(cell: *mut u8) {
+    // SAFETY: object cells are initialized by `Gc::new_in` before any collection or teardown.
+    unsafe { std::ptr::drop_in_place(cell as *mut RefCell<Object>) };
+}
+
+/// A fresh cell for one object in `heap` (see `Gc::new_in`).
+#[cfg(feature = "gc-heap")]
+pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
+    heap.core
+        .borrow_mut()
+        .alloc(heap.object_desc, std::mem::size_of::<RefCell<Object>>())
+        .cast()
+}
+
+/// Ends an Agent's object heap: declared as the interpreter's LAST field, so it runs after every
+/// other field (anything that might still read an object) has dropped. Finalizes every remaining
+/// object, clears weak handles into the heap and frees its memory.
+#[cfg(feature = "gc-heap")]
+pub(crate) struct HeapRelease(GcHeap);
+
+#[cfg(feature = "gc-heap")]
+impl HeapRelease {
+    pub(crate) fn new(heap: &GcHeap) -> Self {
+        Self(heap.clone())
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl Drop for HeapRelease {
+    fn drop(&mut self) {
+        let heap = &self.0;
+        {
+            let core = heap.core.borrow();
+            crate::gc_handle::clear_dead_weak_cells(|ptr| core.resolve(ptr as u64).is_some());
+        }
+        heap.core.borrow_mut().release_all();
+    }
+}
 
 /// Sparse destruction watches. Objects that have never been weak targets perform only the flag
 /// check, with no hash lookup or queue operation on destruction.
@@ -2522,6 +2606,8 @@ thread_local! {
 
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    #[cfg(feature = "gc-heap")]
+    let (core, object_desc) = new_object_heap();
     Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "architecture-diagnostics")]
@@ -2537,6 +2623,10 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         allocated: Cell::new(0),
         #[cfg(feature = "heap-bridge")]
         central: RefCell::new(crate::heap::CentralHeap::new()),
+        #[cfg(feature = "gc-heap")]
+        core: RefCell::new(core),
+        #[cfg(feature = "gc-heap")]
+        object_desc,
     })
 }
 
@@ -2755,6 +2845,7 @@ pub(crate) fn bench_registry_cycle(heap: &GcHeap, entry: *const Object) {
     registry.remove(slot);
 }
 
+#[cfg(not(feature = "gc-heap"))]
 pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
     heap.registry
         .borrow()
@@ -2764,15 +2855,34 @@ pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
         .collect()
 }
 
+#[cfg(feature = "gc-heap")]
+pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
+    // SAFETY: registry entries are live object cells (removed by `Object::drop`).
+    heap.registry
+        .borrow()
+        .entry_ptrs()
+        .map(|entry| unsafe { Gc::from_raw(entry) })
+        .collect()
+}
+
 /// Snapshot just the nursery. Old-to-young strong references are conservatively roots in the
 /// refcount-based nursery collector, so no uninstrumented native/property write can lose one.
 pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
+    #[cfg(not(feature = "gc-heap"))]
     let objects = heap
         .registry
         .borrow()
         .young_snapshot()
         .into_iter()
         .map(Gc::from_rc)
+        .collect();
+    // SAFETY: registry entries are live object cells (removed by `Object::drop`).
+    #[cfg(feature = "gc-heap")]
+    let objects = heap
+        .registry
+        .borrow()
+        .young_entry_ptrs()
+        .map(|entry| unsafe { Gc::from_raw(entry) })
         .collect();
     let scopes = heap.scopes.borrow().young_snapshot();
     (objects, scopes)

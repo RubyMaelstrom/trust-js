@@ -514,3 +514,41 @@ rebuilding an Rc; Gc::new_in(heap, ..) receives the owning Agent heap;
 array_binding's destruction-observing strong-count tests became
 Gc::outlives_release (always true on a tracing heap). Lib suite unchanged
 (2149/0/3); clippy clean (embed, embed+gc-heap); workspace builds.
+
+Step 2b, the gc-heap object model (collection still disabled): under
+--features gc-heap, Gc is the Copy address of a gc_core cell holding the
+RefCell<Object> (gc_handle.rs `cell`; the default `rc` implementation is
+unchanged). GcState owns the cell heap (allocation never collects:
+collect_on_alloc = false); the object finalizer is drop_in_place, so
+Object::drop still runs at reclamation. WeakGc is a shared (address,
+alive) cell tracked per thread and cleared by collections or heap
+teardown. HeapRelease, the interpreter's LAST field, finalizes and frees
+the Agent's cells after every other field has dropped. Tier::admitted()
+clamps Jit to Bytecode (the JIT refuses admission in S2). Every
+old-collector entry point routes to gc_collect_with_cause, a no-op under
+gc-heap until step 3. Clippy allows clone/drop/forget on Copy handles
+under gc-heap only (code is shared with the default build).
+Default build: lib suite 2149/0/3 unchanged; clippy clean.
+gc-heap: lib suite 1756 passed / 426 failed / 8 ignored. Failure
+families: strong_count assertions in tests (no reference counts), ~150
+JIT-tier tests (refused by design), reclamation and weak-clearing tests
+(need collection: step 3), ownership-precision tests asserting
+refcount-timed releases.
+
+S2 design decisions from the step-3 survey (recorded in the plan before
+acting):
+- Collections run only at interpreter safepoints (gc_check, task
+  boundaries, buffer pressure, explicit), as today; allocation never
+  collects. The rooting obligation (I1) therefore applies at safepoints.
+- Environment records must become heap cells in S2: Env is
+  Rc<RefCell<Scope>> held in Rust locals throughout the tree-walker and
+  VM, and the conservative scan can only discover handles that point into
+  the GC heap. The same seam approach as Gc applies.
+- Rust-heap Value containers live across a safepoint (spread and
+  argument buffers, literal element vectors) need a rooted container
+  (JavaScriptCore's MarkedArgumentBuffer is the analog), found and
+  verified by stress collection at every safepoint with poisoning on.
+- Roots: Interp::trace_gc_roots destructures Interp exhaustively, so a
+  new field cannot compile until classified (Decision 2 enforcement);
+  owner-keyed side tables become owner-conditional callbacks that trace
+  an owner's side slots once it is marked.

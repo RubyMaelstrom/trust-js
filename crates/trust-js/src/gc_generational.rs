@@ -274,6 +274,10 @@ fn visit_scope_edges(scope: &Env, sink: &mut impl GcEdgeSink) {
 
 impl Interp {
     pub(crate) fn gc_collect_young(&mut self, cause: crate::value::GcCause) {
+        // P1 S2: the refcount nursery must never see cell handles; gc-heap collects in full.
+        if cfg!(feature = "gc-heap") {
+            return self.gc_collect_with_cause(cause);
+        }
         let (objects, scopes) = crate::value::heap_young_snapshot(&self.gc_heap);
         if objects.len() >= SCOPE_EDGE as usize || scopes.len() >= SCOPE_EDGE as usize {
             // Edge identities are 31-bit; such a nursery is far beyond any live-object limit.

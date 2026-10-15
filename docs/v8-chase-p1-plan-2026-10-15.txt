@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, (this commit) | steps 1–2a (Gc seam, weak handles, refcount helpers; no behavior change): lib suite 2149/0/3 unchanged |
+| S2 | in progress | 88462dc1, 8cc370f1, (this commit) | steps 1–2b: Gc seam; gc-heap object model with collection disabled. Default suite 2149/0/3 unchanged; gc-heap suite 1756/426/8 (triaged) |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |
@@ -456,6 +456,17 @@ Recorded deviations (S1 review, 2026-10-15; details in the program record):
   requested on an unregistered segment defer.
 - wasm32: the S0-deferred prototype run is re-deferred to the S2 wasm32
   acceptance gate (this box's rustc/LLVM has no WebAssembly backend).
+
+Recorded deviations (S2, 2026-10-16; details in the program record):
+
+- S2 also moves environment records (Env) onto the GC heap as cells.
+  Rust-local Env handles are pervasive, and the conservative scan only
+  discovers handles into the GC heap; without this, I1 cannot hold.
+  S4 still owns the tailored environment *layout*.
+- Collections run only at interpreter safepoints, never on allocation;
+  GC stress therefore means "collect at every safepoint".
+- Rust-heap Value containers live across a safepoint use a rooted
+  container type; stress plus poisoning finds the sites (I1 audit).
 
 ### Working agreements (all agents)
 

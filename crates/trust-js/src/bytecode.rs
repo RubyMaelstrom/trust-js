@@ -61,6 +61,18 @@ pub enum Tier {
     Jit,
 }
 
+impl Tier {
+    /// The tier this build runs for a request: under the P1 gc-heap object model (S2) the JIT
+    /// refuses admission and compiled code stays on the bytecode VM.
+    pub(crate) const fn admitted(self) -> Tier {
+        if cfg!(feature = "gc-heap") && matches!(self, Tier::Jit) {
+            Tier::Bytecode
+        } else {
+            self
+        }
+    }
+}
+
 /// Per-site property inline-cache state. `depth == IC_EMPTY` means the site has not cached yet.
 /// Otherwise the property was last found as an own descriptor of the object
 /// `depth` prototype hops above the receiver, at `entries` slot `slot` — and every hop below the

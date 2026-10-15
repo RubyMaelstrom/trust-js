@@ -19,6 +19,12 @@
 // on purpose: converting an object can run user `valueOf`/`toString`/getters, which mutate the
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
+// Under the P1 gc-heap object model (S2) handles are `Copy`: code shared with the default build
+// still clones, drops or forgets them where an `Rc` handle must be retained or released.
+#![cfg_attr(
+    feature = "gc-heap",
+    allow(dropping_copy_types, forgetting_copy_types, clippy::clone_on_copy)
+)]
 
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
 /// read is cached, because a libc environment lookup scans every variable under a lock and the
@@ -865,7 +871,7 @@ impl Engine {
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls; `Jit` is the default and lowers
     /// eligible bytecode to native code where the backend supports the host architecture.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
-        self.interp.tier = tier;
+        self.interp.tier = tier.admitted();
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).

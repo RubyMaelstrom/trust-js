@@ -3578,6 +3578,11 @@ pub struct Interp {
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
     pub(crate) async_gen_queue:
         HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
+    /// P1 S2: frees this Agent's object cells. Keep it the LAST field: fields drop in
+    /// declaration order, and every earlier one may still read objects as it drops.
+    #[cfg(feature = "gc-heap")]
+    #[allow(dead_code)] // held for its Drop
+    heap_release: crate::value::HeapRelease,
 }
 
 // Phase 0 managed-memory ownership inventory. This macro deliberately generates both the golden
@@ -3768,6 +3773,8 @@ interp_memory_inventory! {
     pending_finalization_cleanup => "measured",
     async_gen_busy => "measured",
     async_gen_queue => "measured",
+    #[cfg(feature = "gc-heap")]
+    heap_release => "non_owning",
 }
 
 #[cfg(test)]
@@ -5160,7 +5167,8 @@ impl Interp {
                 Ok("interp") => crate::bytecode::Tier::Interp,
                 Ok("bytecode") => crate::bytecode::Tier::Bytecode,
                 _ => crate::bytecode::Tier::Jit,
-            },
+            }
+            .admitted(),
             tier_threshold: std::env::var("TRUST_JS_TIER_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -5285,6 +5293,8 @@ impl Interp {
             pending_finalization_cleanup: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
+            #[cfg(feature = "gc-heap")]
+            heap_release: crate::value::HeapRelease::new(&gc_heap),
         };
         crate::builtins::install(&mut interp);
         // `this` at the top level is the global object (sloppy mode).
@@ -10972,7 +10982,8 @@ impl Interp {
     }
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
-        if self.gc_suppressed != 0 {
+        // P1 S2 step 2b: the gc-heap object model runs no collection yet.
+        if self.gc_suppressed != 0 || cfg!(feature = "gc-heap") {
             return Ok(());
         }
         self.gc_weak_metadata_safepoint(false);
@@ -11578,8 +11589,13 @@ impl Interp {
         }
     }
 
-    fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
+    pub(crate) fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
         self.buffer_gc.since_gc = 0;
+        // P1 S2 step 2b: the gc-heap object model runs no collection yet; the refcount cycle
+        // collector below must never see cell handles.
+        if cfg!(feature = "gc-heap") {
+            return;
+        }
         // Allocation and task-boundary pressure usually visit only newly allocated objects,
         // with bounded major-collection debt: a retained page heap is not rescanned for each
         // 1/8 of growth. Explicit/idle collections and released documents revisit everything.
@@ -11604,6 +11620,10 @@ impl Interp {
         cause: crate::value::GcCause,
         edge_budget: usize,
     ) {
+        // P1 S2: the refcount cycle collector must never see cell handles.
+        if cfg!(feature = "gc-heap") {
+            return self.gc_collect_with_cause(cause);
+        }
         // Read-only collector passes touch every object's scratch cells. Borrowing through the
         // RefCell flag would write (and dirty) each object's header twice per pass; the
         // collector holds no mutable object borrow during these passes, so read the cells
