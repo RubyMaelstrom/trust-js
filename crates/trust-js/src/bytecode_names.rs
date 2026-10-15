@@ -8,7 +8,7 @@ use super::{Chunk, NameIc};
 use crate::interpreter::{Abrupt, Binding, Env, Interp, Scope, VarMap};
 use crate::value::{Exotic, Value};
 use std::cell::{Cell, RefCell};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 // No real aligned pointer has this value. Existing native compact probes safely miss it.
 pub(crate) const DEEP_NAME_IC: usize = 4;
@@ -19,7 +19,7 @@ struct Guard {
     identity: usize,
     generation: u32,
     layout: u32,
-    pin: Weak<RefCell<Scope>>,
+    pin: crate::interpreter::WeakEnv,
 }
 
 /// Auditable native descriptor prefix. It never owns a raw referent: the containing IC owns
@@ -60,7 +60,7 @@ pub(crate) const NAME_GUARD_LAYOUT: usize = std::mem::offset_of!(Guard, layout);
 impl Guard {
     fn matches(&self, env: &Env, scope: &Scope) -> bool {
         scope.with_obj.is_none()
-            && ((self.pin.as_ptr() == Rc::as_ptr(env)
+            && ((self.pin.as_ptr() == Env::as_ptr(env)
                 && scope.vars.matches_generation(self.generation))
                 || (self.layout != 0 && self.layout == scope.vars.layout_id()))
     }
@@ -132,7 +132,7 @@ impl ResolutionIc {
             }
             match self.target {
                 Target::Binding { pointer, slot } => {
-                    let binding = if guard.pin.as_ptr() == Rc::as_ptr(&env)
+                    let binding = if guard.pin.as_ptr() == Env::as_ptr(&env)
                         && scope.vars.matches_generation(guard.generation)
                     {
                         unsafe { &*pointer }
@@ -149,7 +149,7 @@ impl ResolutionIc {
                     ));
                 }
                 Target::Global { shape, slot } => {
-                    if !Rc::ptr_eq(&env, &i.global_env)
+                    if !Env::ptr_eq(&env, &i.global_env)
                         || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                     {
                         return None;
@@ -186,8 +186,8 @@ impl ResolutionIc {
                 return None;
             }
             guards.push(Guard {
-                identity: Rc::as_ptr(&env) as usize,
-                pin: Rc::downgrade(&env),
+                identity: Env::as_ptr(&env) as usize,
+                pin: Env::downgrade(&env),
                 generation: scope.vars.generation(),
                 layout: scope.vars.layout_id(),
             });
@@ -196,7 +196,7 @@ impl ResolutionIc {
                     pointer: binding,
                     slot: scope.vars.binding_slot(name),
                 })
-            } else if Rc::ptr_eq(&env, &i.global_env) {
+            } else if Env::ptr_eq(&env, &i.global_env) {
                 if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
                     return None;
                 }
@@ -294,7 +294,7 @@ impl DeepNameIc {
             return None;
         };
         let guard = self.guards.last()?;
-        if guard.pin.as_ptr() == Rc::as_ptr(env) && vars.matches_generation(guard.generation) {
+        if guard.pin.as_ptr() == Env::as_ptr(env) && vars.matches_generation(guard.generation) {
             // The identity is weak-pinned and structural generation is unchanged.
             Some(unsafe { &*pointer })
         } else {
@@ -318,7 +318,7 @@ impl DeepNameIc {
                 (binding.initialized && binding.import_ref.is_none()).then(|| binding.value.clone())
             }
             Target::Global { shape, slot } => {
-                if !Rc::ptr_eq(env, &i.global_env)
+                if !Env::ptr_eq(env, &i.global_env)
                     || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
                     return None;
@@ -375,7 +375,7 @@ impl DeepNameIc {
                 false
             }
             Target::Global { shape, slot } => {
-                if !Rc::ptr_eq(env, &i.global_env)
+                if !Env::ptr_eq(env, &i.global_env)
                     || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
                     return false;
@@ -431,8 +431,8 @@ impl Chunk {
                 return None;
             }
             guards.push(Guard {
-                identity: Rc::as_ptr(&current) as usize,
-                pin: Rc::downgrade(&current),
+                identity: Env::as_ptr(&current) as usize,
+                pin: Env::downgrade(&current),
                 generation: scope.vars.generation(),
                 layout: scope.vars.layout_id(),
             });
@@ -447,7 +447,7 @@ impl Chunk {
                     },
                     binding.value.clone(),
                 ))
-            } else if Rc::ptr_eq(&current, &i.global_env) {
+            } else if Env::ptr_eq(&current, &i.global_env) {
                 if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize) {
                     return None;
                 }
@@ -628,7 +628,7 @@ mod tests {
             chunk.load_name_ic(&mut engine.interp, &second, name, cache),
             Ok(Value::Num(43.0))
         ));
-        let weak = Rc::downgrade(&first);
+        let weak = Env::downgrade(&first);
         drop(first);
         assert!(
             weak.upgrade().is_none(),
@@ -757,7 +757,7 @@ mod tests {
             .interp
             .write_prepared_reference(&mut reference, Value::Num(37.0))
             .is_err());
-        let weak = Rc::downgrade(&holder);
+        let weak = Env::downgrade(&holder);
         drop(holder);
         assert!(
             weak.upgrade().is_none(),

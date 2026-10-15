@@ -2020,7 +2020,7 @@ impl Interp {
 /// is not ambiguous).
 fn same_binding(a: &Resolution, b: &Resolution) -> bool {
     match (a, b) {
-        (Resolution::Local(e1, l1), Resolution::Local(e2, l2)) => Rc::ptr_eq(e1, e2) && l1 == l2,
+        (Resolution::Local(e1, l1), Resolution::Local(e2, l2)) => Env::ptr_eq(e1, e2) && l1 == l2,
         (Resolution::Ns(Value::Obj(o1)), Resolution::Ns(Value::Obj(o2))) => {
             crate::value::Gc::ptr_eq(o1, o2)
         }

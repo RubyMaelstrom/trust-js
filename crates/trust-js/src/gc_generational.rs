@@ -17,7 +17,6 @@ use crate::gc_edges::GcEdgeSink;
 use crate::host::HostGcVisitor;
 use crate::interpreter::{Env, Interp};
 use crate::value::{Callable, Exotic, Gc, Value};
-use std::rc::Rc;
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -76,7 +75,7 @@ impl Nursery {
             scope_index: scopes
                 .iter()
                 .enumerate()
-                .map(|(i, s)| (Rc::as_ptr(s) as usize, i))
+                .map(|(i, s)| (Env::as_ptr(s) as usize, i))
                 .collect(),
             object_internal: vec![0; objects.len()],
             scope_internal: vec![0; scopes.len()],
@@ -185,7 +184,7 @@ impl GcEdgeSink for YoungEdges<'_> {
 
     #[inline]
     fn scope(&mut self, scope: &Env) {
-        if let Some(&index) = self.scope_index.get(&(Rc::as_ptr(scope) as usize)) {
+        if let Some(&index) = self.scope_index.get(&(Env::as_ptr(scope) as usize)) {
             self.scope_internal[index] += 1;
             self.edges.push(index as u32 | SCOPE_EDGE);
         }
@@ -354,7 +353,7 @@ impl Interp {
             }
         }
         for index in 0..scope_count {
-            if Rc::strong_count(&nursery.scopes[index]) > nursery.scope_internal[index] + 1 {
+            if Env::strong_count(&nursery.scopes[index]) > nursery.scope_internal[index] + 1 {
                 nursery.mark(Node::Scope(index));
             }
         }

@@ -1335,7 +1335,7 @@ fn scan_realm(
                 interp
                     .global_env_pins
                     .capacity()
-                    .saturating_mul(size_of::<std::rc::Weak<RefCell<Scope>>>()),
+                    .saturating_mul(size_of::<crate::interpreter::WeakEnv>()),
             ),
     );
     for (slots, stack) in &interp.vm_pool {

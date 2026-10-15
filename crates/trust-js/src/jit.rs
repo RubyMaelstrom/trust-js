@@ -1783,7 +1783,7 @@ fn jit_env_parent_raw(env: &Env) -> *const u8 {
     env.borrow()
         .parent
         .as_ref()
-        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8)
+        .map_or(std::ptr::null(), |parent| Env::as_ptr(parent) as *const u8)
 }
 
 /// Byte offset of the live-length word in `JitCtx::handlers`.
@@ -18365,10 +18365,10 @@ pub(crate) unsafe fn run_borrowed_frame(
         final_sp: stack_base.add(initial_depth),
         slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
-        env_raw: Rc::as_ptr(env) as *const u8,
+        env_raw: Env::as_ptr(env) as *const u8,
         this_raw: std::ptr::null(),
         global_body: jit_global_body(i, code),
-        genv: Rc::as_ptr(&i.global_env) as usize,
+        genv: Env::as_ptr(&i.global_env) as usize,
         interp: i,
         chunk,
         this_val: this_val.clone(),
@@ -18497,7 +18497,7 @@ pub fn run(
     stack.reserve(code.max_stack);
 
     let stack_base = stack.as_mut_ptr();
-    let env_raw = Rc::as_ptr(&env) as *const u8;
+    let env_raw = Env::as_ptr(&env) as *const u8;
     let env_parent_raw = jit_env_parent_raw(&env);
     let mut ctx = JitCtx {
         helpers: i.jit_helpers.as_ptr(),
@@ -18506,7 +18506,7 @@ pub fn run(
         env_raw,
         this_raw: std::ptr::null(),
         global_body: jit_global_body(i, code),
-        genv: Rc::as_ptr(&i.global_env) as usize,
+        genv: Env::as_ptr(&i.global_env) as usize,
         env_parent_raw,
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
@@ -18862,10 +18862,10 @@ unsafe fn run_moved_inner(
     let env = unsafe { &*env };
     ctx.stack_base = stack_base;
     ctx.final_sp = stack_base;
-    ctx.env_raw = Rc::as_ptr(env) as *const u8;
+    ctx.env_raw = Env::as_ptr(env) as *const u8;
     ctx.env_parent_raw = jit_env_parent_raw(env);
     ctx.global_body = jit_global_body(i, code);
-    ctx.genv = Rc::as_ptr(&i.global_env) as usize;
+    ctx.genv = Env::as_ptr(&i.global_env) as usize;
     ctx.chunk = Rc::as_ptr(chunk);
     ctx.this_val = this_val;
     ctx.n_slots = n_slots;
@@ -18954,10 +18954,10 @@ unsafe fn run_moved_oversized(
         helpers: i.jit_helpers.as_ptr(),
         stack_base,
         final_sp: stack_base,
-        env_raw: Rc::as_ptr(env) as *const u8,
+        env_raw: Env::as_ptr(env) as *const u8,
         this_raw: std::ptr::null(),
         global_body: jit_global_body(i, code),
-        genv: Rc::as_ptr(&i.global_env) as usize,
+        genv: Env::as_ptr(&i.global_env) as usize,
         env_parent_raw: jit_env_parent_raw(env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),

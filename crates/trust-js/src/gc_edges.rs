@@ -9,7 +9,6 @@ use crate::fasthash::FastSet;
 use crate::interpreter::Env;
 use crate::value::{Gc, Value};
 use std::mem::size_of;
-use std::rc::Rc;
 
 pub(crate) const EDGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -196,7 +195,7 @@ impl GcEdgeSink for CountedEdges<'_> {
 
     #[inline]
     fn scope(&mut self, scope: &Env) {
-        if let Some(&index) = self.scope_index.get(&(Rc::as_ptr(scope) as usize)) {
+        if let Some(&index) = self.scope_index.get(&(Env::as_ptr(scope) as usize)) {
             self.scope_internal[index] += 1;
             self.scopes.push(index as u32);
         }
@@ -325,6 +324,7 @@ mod tests {
     use crate::bytecode::Tier;
     use crate::value::Object;
     use crate::{Completion, Engine};
+    use std::rc::Rc;
 
     #[test]
     fn snapshot_target_index_preserves_requested_identities_and_ownership() {

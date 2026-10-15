@@ -214,7 +214,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     for generation in [0, 1, u32::MAX - 1, u32::MAX] {
         holder.borrow_mut().vars.set_generation_for_test(generation);
         let reference = PreparedReference::scope(Rc::from("outer"), holder.clone(), true);
-        let count = Rc::strong_count(&holder);
+        let count = Env::strong_count(&holder);
         assert_eq!(
             unsafe { probe(&reference) },
             if generation == u32::MAX {
@@ -223,7 +223,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
                 reference.binding as usize
             }
         );
-        assert_eq!(Rc::strong_count(&holder), count);
+        assert_eq!(Env::strong_count(&holder), count);
         assert_eq!(reference.generation, generation);
     }
     let object = crate::value::Object::new(None);

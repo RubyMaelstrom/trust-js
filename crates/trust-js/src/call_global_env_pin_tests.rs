@@ -108,9 +108,9 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     assert_ne!(original.native, 0);
     assert_eq!(
         original.global_env,
-        Rc::as_ptr(&engine.interp.global_env) as usize
+        crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
     );
-    let retired_env = Rc::downgrade(&engine.interp.global_env);
+    let retired_env = crate::interpreter::Env::downgrade(&engine.interp.global_env);
     assert!(engine
         .interp
         .global_env_pins
@@ -183,7 +183,7 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             let entry = cell.get();
             if entry.callee == native_id {
                 cell.set(CallIc {
-                    global_env: Rc::as_ptr(&i.global_env) as usize,
+                    global_env: crate::interpreter::Env::as_ptr(&i.global_env) as usize,
                     ..entry
                 });
             }

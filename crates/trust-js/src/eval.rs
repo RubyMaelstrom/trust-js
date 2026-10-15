@@ -2563,7 +2563,7 @@ impl Interp {
         // lookup, so this avoids an `Rc` bump+drop per hop — the dominant cost when a free/global
         // name misses every intermediate scope. `with`-object scopes take the owned slow path.
         type ScopeCell = std::cell::RefCell<crate::interpreter::Scope>;
-        let mut cur: *const ScopeCell = Rc::as_ptr(env);
+        let mut cur: *const ScopeCell = Env::as_ptr(env);
         loop {
             let b = unsafe { (*cur).borrow() };
             if let Some(binding) = b.vars.get(name) {
@@ -2602,13 +2602,13 @@ impl Interp {
                 // `with_has_binding` said no — continue up the chain. Re-borrow to read `parent`.
                 let b = unsafe { (*cur).borrow() };
                 match b.parent.as_ref() {
-                    Some(p) => cur = Rc::as_ptr(p),
+                    Some(p) => cur = Env::as_ptr(p),
                     None => break,
                 }
                 continue;
             }
             match b.parent.as_ref() {
-                Some(p) => cur = Rc::as_ptr(p),
+                Some(p) => cur = Env::as_ptr(p),
                 None => break,
             }
         }
@@ -2648,7 +2648,7 @@ impl Interp {
     fn in_function_code(&self, env: &Env) -> bool {
         let mut cur = Some(env.clone());
         while let Some(s) = cur {
-            if Rc::ptr_eq(&s, &self.global_env) {
+            if Env::ptr_eq(&s, &self.global_env) {
                 return false;
             }
             let (has_this, parent) = {
@@ -2820,7 +2820,7 @@ impl Interp {
                 // deleted, or for a function's `arguments`, which FunctionDeclarationInstantiation
                 // does not create (no arguments object, or one in a separate parameter scope).
                 // SetMutableBinding then creates it, deletable, as B.3.3.3 re-creates the former.
-                if !Rc::ptr_eq(&s, &self.global_env) {
+                if !Env::ptr_eq(&s, &self.global_env) {
                     let mut b = Binding::data(val, true, true);
                     b.deletable = true;
                     s.borrow_mut().vars.insert(name.to_string(), b);
@@ -5676,7 +5676,7 @@ impl Interp {
         self.apply_hoist_ops(&hoist_ops, &probe, false);
         self.strict = saved_strict;
         let var_bindings = ordered_global_hoist_bindings(&hoist_ops);
-        let is_global = Rc::ptr_eq(var_env, &self.global_env);
+        let is_global = Env::ptr_eq(var_env, &self.global_env);
 
         if !strict {
             // A sloppy eval must not hoist a `var` over a same-named global lexical declaration...
@@ -5694,7 +5694,7 @@ impl Interp {
             // environment (block `let`/`const`, a parameter scope's `arguments`/parameters, etc.).
             let mut cur = Some(lex_env.clone());
             while let Some(s) = cur {
-                if Rc::ptr_eq(&s, var_env) {
+                if Env::ptr_eq(&s, var_env) {
                     break;
                 }
                 let (skip, parent) = {

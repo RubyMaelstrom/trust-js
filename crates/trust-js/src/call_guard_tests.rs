@@ -102,7 +102,7 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
             assert_eq!(entry.realm, Gc::as_ptr(&engine.interp.global) as usize);
             assert_eq!(
                 entry.global_env,
-                Rc::as_ptr(&engine.interp.global_env) as usize
+                crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
             );
             assert!(!entry.code.is_null());
             assert!(driver.jit_runs.get() > 0);
@@ -154,9 +154,15 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     let previous = driver
         .cached_call_for(Gc::as_ptr(&leaf) as usize)
         .expect("initial same-Realm cache fill");
-    assert_eq!(previous.global_env, Rc::as_ptr(&old_environment) as usize);
+    assert_eq!(
+        previous.global_env,
+        crate::interpreter::Env::as_ptr(&old_environment) as usize
+    );
     engine.interp.switch_host_job_context(102);
-    assert!(!Rc::ptr_eq(&old_environment, &engine.interp.global_env));
+    assert!(!crate::interpreter::Env::ptr_eq(
+        &old_environment,
+        &engine.interp.global_env
+    ));
     assert_eq!(
         eval(
             &mut engine,
@@ -173,7 +179,7 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     assert_ne!(current.global_env, previous.global_env);
     assert_eq!(
         current.global_env,
-        Rc::as_ptr(&engine.interp.global_env) as usize
+        crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
     );
     assert_eq!(current.realm, Gc::as_ptr(&engine.interp.global) as usize);
     assert_eq!(
@@ -313,7 +319,7 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
             _ => panic!("deep user closure"),
         };
         let mut depth = 0;
-        while !Rc::ptr_eq(&current, &engine.interp.global_env) {
+        while !crate::interpreter::Env::ptr_eq(&current, &engine.interp.global_env) {
             let next = current
                 .borrow()
                 .parent
@@ -334,7 +340,7 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
             assert_eq!(
                 entry.env,
                 match &deep.borrow().call {
-                    Callable::User(user) => Rc::as_ptr(&user.env),
+                    Callable::User(user) => crate::interpreter::Env::as_ptr(&user.env),
                     _ => unreachable!(),
                 }
             );

@@ -10,7 +10,6 @@ use super::{observe_arithmetic_operands, observe_arithmetic_result, Chunk, Op};
 use crate::execution_storage::{SlotAccess, StoredValue, ValueStack};
 use crate::interpreter::{Env, Interp, MAX_STR_LEN};
 use crate::value::{PackedValue, Value};
-use std::rc::Rc;
 
 const MAX_SCOPES: usize = 16;
 
@@ -90,7 +89,7 @@ fn try_store(
     let name = &chunk.names[plan.name as usize];
     let mut current = env.clone();
     for _ in 0..MAX_SCOPES {
-        if Rc::ptr_eq(&current, &interp.global_env) {
+        if Env::ptr_eq(&current, &interp.global_env) {
             return None;
         }
         let parent = {
@@ -195,7 +194,9 @@ pub(crate) unsafe extern "C" fn jit_try(
     }
     // As in jit_exec_inner, the running callee's swapped env_raw is authoritative.
     let env = std::mem::ManuallyDrop::new(unsafe {
-        Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+        crate::interpreter::Env::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        )
     });
     let right = unsafe { ctx.clone_slot(plan.slot as usize) };
     let Some(stored) = try_store(chunk, unsafe { &mut *ctx.interp }, &env, plan, right) else {

@@ -427,7 +427,7 @@ mod tests {
             };
             let left = environment(&mut engine, "left59");
             let right = environment(&mut engine, "right59");
-            assert!(!Rc::ptr_eq(&left, &right));
+            assert!(!Env::ptr_eq(&left, &right));
             if tier != Tier::Interp
                 && activation_plans_enabled()
                 && crate::interpreter::indexed_activations_enabled()

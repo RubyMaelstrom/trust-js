@@ -205,14 +205,14 @@ fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
         .borrow_mut()
         .vars
         .insert("x", Binding::data(Value::Num(1.0), true, true));
-    let weak = Rc::downgrade(&scope);
+    let weak = Env::downgrade(&scope);
     slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
     assert!(weak.upgrade().is_some());
     let next = new_scope(None);
     next.borrow_mut()
         .vars
         .insert("x", Binding::data(Value::Num(2.0), true, true));
-    let next_weak = Rc::downgrade(&next);
+    let next_weak = Env::downgrade(&next);
     slot.set(PreparedReference::scope(Rc::from("x"), next, true));
     assert!(
         weak.upgrade().is_none(),

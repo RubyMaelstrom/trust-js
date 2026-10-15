@@ -5,7 +5,6 @@ use crate::interpreter::Abrupt;
 use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global, TIERS};
 use crate::value::Value;
 use crate::Engine;
-use std::rc::Rc;
 
 fn prototype_identity(value: &Value) -> usize {
     let object = value.as_obj().expect("fixture object");
@@ -80,7 +79,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                 let error_proto =
                     crate::value::Gc::downgrade(i.error_protos.get("TypeError").unwrap());
                 i.switch_host_job_context(42);
-                assert!(!Rc::ptr_eq(&old, &i.global_env));
+                assert!(!crate::interpreter::Env::ptr_eq(&old, &i.global_env));
                 {
                     let record = i.global_env.borrow();
                     let binding = record.vars.get("this").expect("replacement this binding");
@@ -93,7 +92,7 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
                 (
                     closure,
                     constructor,
-                    Rc::downgrade(&old),
+                    crate::interpreter::Env::downgrade(&old),
                     array_proto,
                     object_proto,
                     error_proto,

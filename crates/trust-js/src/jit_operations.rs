@@ -200,7 +200,7 @@ pub(super) fn emit(
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
                 chunk.jit_name_number(*cache),
-                std::rc::Rc::as_ptr(&env) as u64,
+                crate::interpreter::Env::as_ptr(&env) as u64,
                 pc as u32,
                 unwind,
                 matches!(op, Op::LoadNameForCallIn(..)),

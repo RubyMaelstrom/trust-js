@@ -288,12 +288,11 @@ impl Interp {
         cache: &crate::interpreter::BindingGetterCache,
     ) -> BindingGetterProbe {
         use crate::interpreter::MAX_BINDING_GETTER_SCOPES;
-        use std::rc::Rc;
 
         if cache.scopes.is_empty() || cache.scopes.len() > MAX_BINDING_GETTER_SCOPES {
             return BindingGetterProbe::Stale;
         }
-        let mut scope_ptr = Rc::as_ptr(start);
+        let mut scope_ptr = crate::interpreter::Env::as_ptr(start);
         for (index, guard) in cache.scopes.iter().enumerate() {
             if scope_ptr != guard.pin.as_ptr() {
                 return BindingGetterProbe::Stale;
@@ -324,7 +323,7 @@ impl Interp {
             let Some(parent) = scope.parent.as_ref() else {
                 return BindingGetterProbe::Stale;
             };
-            scope_ptr = Rc::as_ptr(parent);
+            scope_ptr = crate::interpreter::Env::as_ptr(parent);
         }
         BindingGetterProbe::Stale
     }
@@ -344,7 +343,7 @@ impl Interp {
         // pointers first so those getters keep the allocation-free Call fallback. The
         // captured environment owns the first scope and every live parent link owns the
         // next; no JavaScript or GC boundary occurs during this bounded walk.
-        let mut scope_ptr = Rc::as_ptr(start);
+        let mut scope_ptr = crate::interpreter::Env::as_ptr(start);
         let mut scope_count = None;
         for depth in 1..=crate::interpreter::MAX_BINDING_GETTER_SCOPES {
             // SAFETY: `start` and each traversed scope's parent keep this chain alive for
@@ -366,7 +365,7 @@ impl Interp {
                 scope_count = Some(depth);
                 break;
             }
-            scope_ptr = Rc::as_ptr(scope.parent.as_ref()?);
+            scope_ptr = crate::interpreter::Env::as_ptr(scope.parent.as_ref()?);
         }
         let scope_count = scope_count?;
 
@@ -387,7 +386,7 @@ impl Interp {
                 return None;
             }
             scopes.push(BindingGetterScopeGuard {
-                pin: Rc::downgrade(&env),
+                pin: crate::interpreter::Env::downgrade(&env),
                 generation: scope.vars.generation(),
             });
             if index + 1 == scope_count {

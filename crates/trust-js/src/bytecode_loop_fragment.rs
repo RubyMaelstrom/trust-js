@@ -430,8 +430,8 @@ fn function_private_bindings(
         return Vec::new();
     }
     let root = crate::interpreter::nearest_var_env(env);
-    if Rc::ptr_eq(&root, &closure)
-        || Rc::ptr_eq(&root, &i.global_env)
+    if Env::ptr_eq(&root, &closure)
+        || Env::ptr_eq(&root, &i.global_env)
         || root.borrow().parent.is_none()
     {
         return Vec::new();

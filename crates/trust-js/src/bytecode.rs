@@ -344,7 +344,7 @@ mod binding_layout_cache_tests {
         }
         assert_eq!(chunk.name_caches[cache as usize].get().env, FIXED_NAME_IC);
         assert!(chunk.name_pins.borrow()[cache as usize].is_none());
-        let weak = Rc::downgrade(&first);
+        let weak = Env::downgrade(&first);
         drop(first);
         assert!(
             weak.upgrade().is_none(),
@@ -436,7 +436,7 @@ mod binding_layout_cache_tests {
         ));
         assert_eq!(chunk.name_caches[cache as usize].get().env & 7, 6);
         let second = make_child(&parent, "padding", layout);
-        assert!(!Rc::ptr_eq(&first, &second));
+        assert!(!Env::ptr_eq(&first, &second));
         assert!(matches!(
             chunk.name_ic_hit(&engine.interp, &second, cache),
             Some(Value::Num(17.0))
@@ -509,7 +509,7 @@ mod binding_layout_cache_tests {
         chunk
             .load_name_ic(&mut engine.interp, &second, name, cache)
             .unwrap_or_else(|_| panic!("layout cache refill threw"));
-        let weak_parent = Rc::downgrade(&parent);
+        let weak_parent = Env::downgrade(&parent);
         drop((first, second, shadow, other, parent));
         assert!(
             weak_parent.upgrade().is_none(),
@@ -964,7 +964,7 @@ pub struct InlineTarget {
     /// Keeps the planning global-environment allocation from address reuse, without owning
     /// any bindings or Realm objects. Self-hosted callees may have a private environment
     /// that does not retain this global environment. Native guards have no epoch check.
-    pub genv_pin: std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>,
+    pub genv_pin: crate::interpreter::WeakEnv,
     pub argc: u16,
     /// Sloppy callee that reads `this`: the receiver must already be an object (the generic
     /// path would box a primitive or substitute the global object).
@@ -1002,7 +1002,7 @@ pub(crate) fn invalidate_call_caches() {
 /// key text, so shapes, exotics and later definitions never make it unsound.
 pub(crate) struct PrivateSite {
     env: std::cell::Cell<usize>,
-    pin: std::cell::RefCell<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
+    pin: std::cell::RefCell<crate::interpreter::WeakEnv>,
     key: std::cell::RefCell<Option<crate::lstr::LStr>>,
     slot: std::cell::Cell<u32>,
     /// The entry key last found for `key`. Instances that share a property layout share this
@@ -1014,7 +1014,7 @@ impl PrivateSite {
     pub(crate) fn new() -> Self {
         Self {
             env: std::cell::Cell::new(0),
-            pin: std::cell::RefCell::new(std::rc::Weak::new()),
+            pin: std::cell::RefCell::new(crate::interpreter::WeakEnv::new()),
             key: std::cell::RefCell::new(None),
             slot: std::cell::Cell::new(u32::MAX),
             entry_key: std::cell::RefCell::new(None),
@@ -1028,7 +1028,7 @@ impl PrivateSite {
         env: &Env,
         resolve: impl FnOnce() -> crate::lstr::LStr,
     ) -> crate::lstr::LStr {
-        let raw = Rc::as_ptr(env) as usize;
+        let raw = Env::as_ptr(env) as usize;
         if self.env.get() == raw {
             if let Some(key) = self.key.borrow().as_ref() {
                 return key.clone();
@@ -1045,7 +1045,7 @@ impl PrivateSite {
             *self.entry_key.borrow_mut() = None;
         }
         *self.key.borrow_mut() = Some(key.clone());
-        *self.pin.borrow_mut() = Rc::downgrade(env);
+        *self.pin.borrow_mut() = Env::downgrade(env);
         self.env.set(raw);
         key
     }
@@ -2358,9 +2358,7 @@ pub struct Chunk {
     resolution_caches: std::cell::OnceCell<Box<[lexical_cache::ResolutionSite]>>,
     /// Weak handles pinning each name cache's scope allocation (parallel to `name_caches`), so
     /// the cached raw `env` pointer can never be recycled into a different scope while cached.
-    name_pins: std::cell::RefCell<
-        Vec<Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>>,
-    >,
+    name_pins: std::cell::RefCell<Vec<Option<crate::interpreter::WeakEnv>>>,
     /// Numeric value observed when each name cache was filled. The JIT compares the live value
     /// before using it, so ordinary assignment needs no invalidation. Split validity/bits keeps
     /// this at nine bytes per site rather than padding a feedback struct to sixteen.
@@ -2370,9 +2368,7 @@ pub struct Chunk {
     /// this always resolves in the current activation; a weak pin keeps its raw scope pointer
     /// ABA-safe until a fresh/recursive activation refills the entry.
     cap_caches: Vec<std::cell::Cell<NameIc>>,
-    cap_pins: std::cell::RefCell<
-        Vec<Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>>,
-    >,
+    cap_pins: std::cell::RefCell<Vec<Option<crate::interpreter::WeakEnv>>>,
     /// Parsed straight-line initializer body (`this.x = arg` with optional truthy defaults).
     initializer_plan: std::cell::OnceCell<Option<InitializerPlan>>,
     /// Complete creation-shape chain for an exact straight-line constructor, keyed by the live
@@ -2745,18 +2741,19 @@ impl Chunk {
                 visitor.props(map);
             }
         }
-        bytes =
-            bytes
-                .saturating_add(self.name_pins.borrow().capacity().saturating_mul(
-                    std::mem::size_of::<
-                        Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
-                    >(),
-                ))
-                .saturating_add(self.cap_pins.borrow().capacity().saturating_mul(
-                    std::mem::size_of::<
-                        Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>,
-                    >(),
-                ));
+        bytes = bytes
+            .saturating_add(
+                self.name_pins
+                    .borrow()
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<crate::interpreter::WeakEnv>>()),
+            )
+            .saturating_add(
+                self.cap_pins
+                    .borrow()
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<crate::interpreter::WeakEnv>>()),
+            );
         if let Some(Some(plan)) = self.initializer_plan.get() {
             bytes = bytes.saturating_add(
                 plan.fields
@@ -6375,7 +6372,7 @@ fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])
         .collect()
 }
 
-type NamePin = Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>;
+type NamePin = Option<crate::interpreter::WeakEnv>;
 type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>);
 type CallPin = crate::value::WeakGc;
 
@@ -7757,8 +7754,8 @@ fn plan_inlines_at(
                 obj,
                 free_names,
                 expected_env: 0,
-                expected_genv: Rc::as_ptr(genv) as usize,
-                genv_pin: Rc::downgrade(genv),
+                expected_genv: Env::as_ptr(genv) as usize,
+                genv_pin: Env::downgrade(genv),
                 nested,
             });
         }
@@ -8122,7 +8119,7 @@ pub struct InlineWay {
     pub expected_env: usize,
     /// The planning Realm's global environment (see [`InlineTarget::expected_genv`]).
     pub expected_genv: usize,
-    pub genv_pin: std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>,
+    pub genv_pin: crate::interpreter::WeakEnv,
     /// The callee's OWN inline plan (depth-capped recursion): call sites inside the spliced
     /// body splice too, keyed by the callee-frame ordinal — its first-compile cache numbering,
     /// which the splice reproduces by walking the same AST in the same order.
@@ -16936,8 +16933,8 @@ fn run_vm_inner<S: StoredValue>(
                 );
                 let this_ok = !it.check_this
                     || matches!(stack.read_value(stack.len() - d - 1), Value::Obj(_));
-                let env_ok = it.expected_env == 0 || Rc::as_ptr(env) as usize == it.expected_env;
-                let realm_ok = Rc::as_ptr(&i.global_env) as usize == it.expected_genv;
+                let env_ok = it.expected_env == 0 || Env::as_ptr(env) as usize == it.expected_env;
+                let realm_ok = Env::as_ptr(&i.global_env) as usize == it.expected_genv;
                 if !(callee_ok && this_ok && env_ok && realm_ok) {
                     *pc = target as usize;
                 }
@@ -19671,7 +19668,7 @@ impl Chunk {
         if ic.env == lexical_cache::DEEP_NAME_IC {
             return self.deep_name_ic_hit(i, env, c);
         }
-        let raw = Rc::as_ptr(env) as usize;
+        let raw = Env::as_ptr(env) as usize;
         if ic.env == raw {
             let b = env.borrow();
             if !b.vars.matches_generation(ic.gen) {
@@ -19714,7 +19711,7 @@ impl Chunk {
                 return None;
             }
             let p = b.parent.as_ref()?;
-            if Rc::as_ptr(p) as usize != ic.env & !7 {
+            if Env::as_ptr(p) as usize != ic.env & !7 {
                 return None;
             }
             let pb = p.borrow();
@@ -19755,7 +19752,7 @@ impl Chunk {
                     && layout_id != 0
                     && previous.env > FIXED_NAME_IC
                     && previous.env & 7 == 0
-                    && previous.env != Rc::as_ptr(env) as usize
+                    && previous.env != Env::as_ptr(env) as usize
                     && previous.act_gen == layout_id
                 {
                     if let Some(slot) = b.vars.binding_slot(&self.names[n as usize]) {
@@ -19771,14 +19768,14 @@ impl Chunk {
                     }
                 }
                 self.name_caches[c as usize].set(NameIc {
-                    env: Rc::as_ptr(env) as usize,
+                    env: Env::as_ptr(env) as usize,
                     binding: bd as *const _ as usize as u64,
                     gen: b.vars.generation(),
                     act_gen: layout_id,
                 });
                 drop(b);
                 // Pin the scope allocation so the raw `env` compare stays ABA-safe.
-                self.name_pins.borrow_mut()[c as usize] = Some(Rc::downgrade(env));
+                self.name_pins.borrow_mut()[c as usize] = Some(Env::downgrade(env));
                 return Some(v);
             }
             // A published binding-layout identity proves the same key set even
@@ -19799,7 +19796,7 @@ impl Chunk {
                                 let v = bd.value.clone();
                                 self.record_name_number(c as usize, &v);
                                 self.name_caches[c as usize].set(NameIc {
-                                    env: Rc::as_ptr(p) as usize
+                                    env: Env::as_ptr(p) as usize
                                         | if layout_id != 0 { 6 } else { 2 },
                                     binding: bd as *const _ as usize as u64,
                                     gen: pb.vars.generation(),
@@ -19809,7 +19806,7 @@ impl Chunk {
                                         b.vars.generation()
                                     },
                                 });
-                                let pin = Rc::downgrade(p);
+                                let pin = Env::downgrade(p);
                                 drop(pb);
                                 drop(b);
                                 // Pin the PARENT: that's the raw pointer the hit compares.
@@ -19823,7 +19820,7 @@ impl Chunk {
         }
         // Global mode: only when there are no intermediate scopes whose later mutation could
         // re-route the name — i.e. the chunk runs directly under the global scope.
-        if !Rc::ptr_eq(env, &i.global_env)
+        if !Env::ptr_eq(env, &i.global_env)
             || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
         {
             return self.deep_name_ic_fill(i, env, n, c);
@@ -19842,13 +19839,13 @@ impl Chunk {
         let v = p.value();
         self.record_name_number(c as usize, &v);
         self.name_caches[c as usize].set(NameIc {
-            env: Rc::as_ptr(env) as usize | 1,
+            env: Env::as_ptr(env) as usize | 1,
             binding: ((g.props.shape() as u64) << 32) | slot as u64,
             gen: env.borrow().vars.generation(),
             act_gen: 0,
         });
         drop(g);
-        self.name_pins.borrow_mut()[c as usize] = Some(Rc::downgrade(env));
+        self.name_pins.borrow_mut()[c as usize] = Some(Env::downgrade(env));
         Some(v)
     }
     /// Cached free-name read: hit, else depth-0 refill, else the interpreter's full walk
@@ -19875,7 +19872,7 @@ impl Chunk {
     /// activation allocation from being recycled while its raw pointer remains cached.
     fn cap_binding_ptr(&self, env: &Env, n: u32) -> *mut crate::interpreter::Binding {
         let index = n as usize;
-        let raw = Rc::as_ptr(env) as usize;
+        let raw = Env::as_ptr(env) as usize;
         let ic = self.cap_caches[index].get();
         {
             let b = env.borrow();
@@ -19924,7 +19921,7 @@ impl Chunk {
                 gen: generation,
                 act_gen: layout_id,
             });
-            self.cap_pins.borrow_mut()[index] = Some(Rc::downgrade(env));
+            self.cap_pins.borrow_mut()[index] = Some(Env::downgrade(env));
         } else {
             self.cap_caches[index].set(NameIc::EMPTY);
             self.cap_pins.borrow_mut()[index] = None;
@@ -20042,7 +20039,7 @@ impl Chunk {
             let _ = self.name_ic_fill(i, env, n, c);
             return Ok(());
         }
-        let raw = Rc::as_ptr(env) as usize;
+        let raw = Env::as_ptr(env) as usize;
         let value = if ic.env == raw {
             let b = env.borrow_mut();
             if b.vars.matches_generation(ic.gen) {
@@ -20076,7 +20073,7 @@ impl Chunk {
                     .flatten()
             };
             if let Some(parent) = parent {
-                if Rc::as_ptr(&parent) as usize == ic.env & !7 {
+                if Env::as_ptr(&parent) as usize == ic.env & !7 {
                     let pb = parent.borrow_mut();
                     if pb.vars.matches_generation(ic.gen) {
                         let bd = unsafe {
@@ -20976,12 +20973,12 @@ unsafe fn jit_continuation_operation(
     );
     let sp = ctx.stack_base.add(stack.len());
     stack.set_len(0);
-    ctx.env_raw = Rc::as_ptr(&*state.env) as *const u8;
+    ctx.env_raw = Env::as_ptr(&*state.env) as *const u8;
     ctx.env_parent_raw = (*state.env)
         .borrow()
         .parent
         .as_ref()
-        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+        .map_or(std::ptr::null(), |parent| Env::as_ptr(parent) as *const u8);
     if exits {
         ctx.resume_pc = next;
     }
@@ -21014,10 +21011,10 @@ pub(crate) unsafe extern "C" fn jit_slice_op(
 
 unsafe fn new_native_activation(ctx: &crate::jit::JitCtx) -> Box<NativeActivation> {
     let chunk = &*ctx.chunk;
-    let borrowed = std::mem::ManuallyDrop::new(Rc::from_raw(
+    let borrowed = std::mem::ManuallyDrop::new(crate::interpreter::Env::from_raw(
         ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
     ));
-    let env = Rc::clone(&borrowed);
+    let env = crate::interpreter::Env::clone(&borrowed);
     Box::new(NativeActivation {
         chunk: ctx.chunk,
         cap_env: env.clone(),
@@ -21071,7 +21068,7 @@ pub(crate) unsafe extern "C" fn jit_reference_op(
     let i = &mut *ctx.interp;
     let result = match chunk.ops[pc as usize] {
         Op::ResolveNameRef(name, reference) => {
-            let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+            let env = std::mem::ManuallyDrop::new(crate::interpreter::Env::from_raw(
                 ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
             ));
             chunk.resolve_name_reference(i, &env, name).map(|value| {
@@ -21257,13 +21254,13 @@ unsafe fn jit_scope_op(
         Op::PopEnv => pop_lexical_scope(&mut activation.env),
         _ => unreachable!("lexical environment helper operation"),
     }
-    ctx.env_raw = Rc::as_ptr(&activation.env) as *const u8;
+    ctx.env_raw = Env::as_ptr(&activation.env) as *const u8;
     ctx.env_parent_raw = activation
         .env
         .borrow()
         .parent
         .as_ref()
-        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+        .map_or(std::ptr::null(), |parent| Env::as_ptr(parent) as *const u8);
     crate::jit::SpFlag { sp, flag: 0 }
 }
 
@@ -21311,13 +21308,13 @@ unsafe fn jit_vm_operation(
     let depth = activation.stack.len();
     std::ptr::copy_nonoverlapping(activation.stack.as_ptr(), ctx.stack_base, depth);
     activation.stack.set_len(0);
-    ctx.env_raw = Rc::as_ptr(&activation.env) as *const u8;
+    ctx.env_raw = Env::as_ptr(&activation.env) as *const u8;
     ctx.env_parent_raw = activation
         .env
         .borrow()
         .parent
         .as_ref()
-        .map_or(std::ptr::null(), |parent| Rc::as_ptr(parent) as *const u8);
+        .map_or(std::ptr::null(), |parent| Env::as_ptr(parent) as *const u8);
     let sp = ctx.stack_base.add(depth);
     match result {
         Ok(VmStep::Done(_)) => crate::jit::SpFlag { sp, flag: 0 },
@@ -21341,7 +21338,9 @@ unsafe fn jit_private_op_inner(
     let chunk = &*ctx.chunk;
     // As in `jit_exec_inner`: the swapped `env_raw` names this activation's environment.
     let env_h = std::mem::ManuallyDrop::new(unsafe {
-        Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+        crate::interpreter::Env::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        )
     });
     let private_env: &Env = match ctx.activation.as_ref() {
         Some(activation) if activation.chunk == ctx.chunk => &activation.env,
@@ -21614,7 +21613,9 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         // the call. The captured binding lives in the body's activation record, which env_raw
         // leaves inside a block or `with` scope.
         let env = std::mem::ManuallyDrop::new(unsafe {
-            Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+            crate::interpreter::Env::from_raw(
+                ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+            )
         });
         let cap_env = unsafe { jit_cap_env(ctx, &env) };
         chunk.release_overwritten_captured_string(cap_env, *name, &left);
@@ -22291,7 +22292,7 @@ unsafe fn jit_call_hit_inner(
             if let crate::value::Callable::User(user) = &callee.borrow().call {
                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
                 ic.callee = key;
-                ic.env = Rc::as_ptr(&user.env);
+                ic.env = Env::as_ptr(&user.env);
             }
         }
     });
@@ -22594,7 +22595,7 @@ unsafe fn jit_object_literal_inner(
                     i.to_property_key(&key)?
                 }
             };
-            let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+            let env = std::mem::ManuallyDrop::new(crate::interpreter::Env::from_raw(
                 ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
             ));
             let func = &chunk.funcs[function as usize];
@@ -22623,7 +22624,7 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
         unreachable!("jit_make_closure emitted only for MakeClosure");
     };
     // Borrowed, like `jit_exec_inner`: the frame keeps its current environment alive.
-    let env = std::mem::ManuallyDrop::new(Rc::from_raw(
+    let env = std::mem::ManuallyDrop::new(crate::interpreter::Env::from_raw(
         ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
     ));
     let name = (name != u32::MAX).then(|| &chunk.names[name as usize]);
@@ -23768,9 +23769,9 @@ unsafe fn jit_call_inner(
                             if !i
                                 .global_env_pins
                                 .iter()
-                                .any(|g| g.as_ptr() == Rc::as_ptr(&i.global_env))
+                                .any(|g| g.as_ptr() == Env::as_ptr(&i.global_env))
                             {
-                                let g = Rc::downgrade(&i.global_env);
+                                let g = Env::downgrade(&i.global_env);
                                 i.global_env_pins.push(g);
                             }
                             let evicted = chunk.call_caches[c as usize].fill(
@@ -23779,7 +23780,7 @@ unsafe fn jit_call_inner(
                                     env: std::ptr::null(),
                                     chunk: std::ptr::null(),
                                     code: std::ptr::null(),
-                                    global_env: Rc::as_ptr(&i.global_env) as usize,
+                                    global_env: Env::as_ptr(&i.global_env) as usize,
                                     strict: true,
                                     uses_this: true,
                                     n_params: 0,
@@ -24494,7 +24495,9 @@ unsafe fn jit_exec_inner(
     // local, `run_moved`'s caller keeps one alive, and a direct call pins the callee object
     // (whose `Callable::User` owns the env) on the caller's operand stack until after finish.
     let env_h = std::mem::ManuallyDrop::new(unsafe {
-        Rc::from_raw(ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>)
+        crate::interpreter::Env::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        )
     });
     let env: &Env = &env_h;
     let cap_env = jit_cap_env(ctx, env);

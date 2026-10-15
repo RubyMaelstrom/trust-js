@@ -552,3 +552,15 @@ acting):
   new field cannot compile until classified (Decision 2 enforcement);
   owner-keyed side tables become owner-conditional callbacks that trace
   an owner's side slots once it is marked.
+
+Step 3a, environment seam (default build, no behavior change): Env is a
+newtype (env_handle.rs) over Rc<RefCell<Scope>>, dereferencing to the
+RefCell<Scope>; identity and ownership go through Env::as_ptr/ptr_eq/
+downgrade/strong_count/from_raw/clone_from_raw and WeakEnv, as for Gc.
+The four Scope constructions became Env::new(scope) (the scope already
+names its heap). 173 calls rewritten by the same rustc-driven fixer
+(generalized to pick the handle type from what rustc reports finding),
+13 Weak<RefCell<Scope>> types became WeakEnv, and the bytecode VM's
+raw-environment reborrows use Env::from_raw. Default suite 2149/0/3
+unchanged; workspace builds; clippy clean on both feature sets; gc-heap
+suite unchanged (1756/426/8).

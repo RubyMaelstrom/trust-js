@@ -1362,9 +1362,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         let b = probe_env.borrow();
         &*b as *const crate::interpreter::Scope as usize
     };
-    let scope_refcell = scope_addr - Rc::as_ptr(&probe_env) as usize;
+    let scope_refcell = scope_addr - Env::as_ptr(&probe_env) as usize;
     let scope_stored = unsafe { *(&probe_env as *const Env as *const usize) };
-    let scope_data_off = (Rc::as_ptr(&probe_env) as usize).wrapping_sub(scope_stored);
+    let scope_data_off = (Env::as_ptr(&probe_env) as usize).wrapping_sub(scope_stored);
     let parent_some = Some(probe_env.clone());
     let parent_none: Option<Env> = None;
     let scope_parent_valid = std::mem::size_of::<Option<Env>>() == std::mem::size_of::<usize>()
@@ -2884,7 +2884,13 @@ pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
         .young_entry_ptrs()
         .map(|entry| unsafe { Gc::from_raw(entry) })
         .collect();
-    let scopes = heap.scopes.borrow().young_snapshot();
+    let scopes = heap
+        .scopes
+        .borrow()
+        .young_snapshot()
+        .into_iter()
+        .map(Env::from_rc)
+        .collect();
     (objects, scopes)
 }
 
@@ -2972,7 +2978,7 @@ pub(crate) fn gc_register_scope(scope: &Env) {
         .gc_heap
         .scopes
         .borrow_mut()
-        .publish(slot, Rc::as_ptr(scope));
+        .publish(slot, Env::as_ptr(scope));
     record
         .gc_slot
         .set(slot.try_into().expect("scope registry exceeded u32 slots"));
@@ -2996,7 +3002,12 @@ pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
 
 /// The live scopes owned by `heap`.
 pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
-    heap.scopes.borrow().snapshot()
+    heap.scopes
+        .borrow()
+        .snapshot()
+        .into_iter()
+        .map(Env::from_rc)
+        .collect()
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use crate::bytecode::{self, Tier};
 use crate::interpreter::{new_scope, Binding};
 use crate::{Completion, Engine};
 use std::cell::Cell;
+use std::rc::Rc;
 
 fn eval(engine: &mut Engine, source: &str) -> String {
     match engine

@@ -71,6 +71,7 @@ mod coroutine;
 mod data_copy_tests;
 #[cfg(test)]
 mod dense_slot_tests;
+mod env_handle;
 mod eval;
 mod execution_storage;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box

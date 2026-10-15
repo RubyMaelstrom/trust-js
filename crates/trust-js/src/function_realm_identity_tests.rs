@@ -5,7 +5,6 @@
 use crate::realm_inline_guard_tests::{set_global, TIERS};
 use crate::value::Value;
 use crate::{Completion, Engine};
-use std::rc::Rc;
 
 fn eval(engine: &mut Engine, source: &str) -> String {
     match engine.eval(source, false).expect("Realm fixture parses") {
@@ -33,7 +32,7 @@ fn function_realm_identity_survives_host_environment_and_prototype_changes() {
         set_global(&mut engine.interp, "foreign", foreign);
         let previous_environment = engine.interp.global_env.clone();
         engine.interp.switch_host_job_context(42);
-        assert!(!Rc::ptr_eq(
+        assert!(!crate::interpreter::Env::ptr_eq(
             &previous_environment,
             &engine.interp.global_env
         ));

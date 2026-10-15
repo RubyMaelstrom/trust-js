@@ -199,7 +199,7 @@ fn uncacheable_shapes_preserve_constructor_and_instanceof_semantics_all_tiers() 
             .construct_ics
             .remove(&(Gc::as_ptr(&ctor) as usize));
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-        let global_env = Rc::as_ptr(&engine.interp.global_env) as usize;
+        let global_env = Env::as_ptr(&engine.interp.global_env) as usize;
         assert!(engine
             .interp
             .construct_ic_fill(&ctor, Gc::as_ptr(&ctor) as usize, epoch, global_env)

@@ -79,7 +79,7 @@ impl Registry {
     pub(crate) fn read(&self, environment: &Env, name: &str) -> Option<Value> {
         let aliases = self.0.borrow();
         let alias = aliases.iter().rev().find(|alias| {
-            Rc::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
+            Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         })?;
         // The scoped registration pins this shared Cell owner; it cannot resize or move.
         Some(unsafe { &*alias.slot }.unpack())
@@ -88,7 +88,7 @@ impl Registry {
     pub(crate) fn write(&self, environment: &Env, name: &str, value: &Value) -> bool {
         let aliases = self.0.borrow();
         let Some(alias) = aliases.iter().rev().find(|alias| {
-            Rc::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
+            Env::ptr_eq(&alias.environment, environment) && alias.name.as_ref() == name
         }) else {
             return false;
         };

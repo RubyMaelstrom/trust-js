@@ -224,10 +224,10 @@ mod tests {
             .borrow_mut()
             .vars
             .insert("value", Binding::data(Value::Num(9.0), true, true));
-        let count = std::rc::Rc::strong_count(&inner);
+        let count = crate::interpreter::Env::strong_count(&inner);
         assert_eq!(classify_name(&inner, "value"), (NamePath::Declarative, 0));
         assert_eq!(
-            std::rc::Rc::strong_count(&inner),
+            crate::interpreter::Env::strong_count(&inner),
             count,
             "no retained scope handles"
         );

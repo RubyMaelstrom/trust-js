@@ -21,7 +21,7 @@ struct ProbeContext([u8; size_of::<JitCtx>()]);
 impl ProbeContext {
     fn new(engine: &crate::Engine, env: &Env) -> Self {
         let mut context = Self([0; size_of::<JitCtx>()]);
-        context.word(offset_of!(JitCtx, env_raw), Rc::as_ptr(env) as usize);
+        context.word(offset_of!(JitCtx, env_raw), Env::as_ptr(env) as usize);
         context.word(
             offset_of!(JitCtx, env_parent_raw),
             jit_env_parent_raw(env) as usize,
@@ -32,7 +32,7 @@ impl ProbeContext {
         );
         context.word(
             offset_of!(JitCtx, genv),
-            Rc::as_ptr(&engine.interp.global_env) as usize,
+            Env::as_ptr(&engine.interp.global_env) as usize,
         );
         context
     }
@@ -127,7 +127,7 @@ fn binding_ic(env: &Env) -> (NameIc, ProbeResult) {
     let binding = scope.vars.get("outer").unwrap();
     (
         NameIc {
-            env: Rc::as_ptr(env) as usize,
+            env: Env::as_ptr(env) as usize,
             binding: binding as *const Binding as usize as u64,
             gen: scope.vars.generation(),
             act_gen: 0,
@@ -382,7 +382,7 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
         )
     };
     let ic = NameIc {
-        env: Rc::as_ptr(&env) as usize | 1,
+        env: Env::as_ptr(&env) as usize | 1,
         binding: (u64::from(shape) << 32) | slot as u64,
         gen: env.borrow().vars.generation(),
         act_gen: 0,
@@ -410,7 +410,7 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
     assert_eq!(probe(&code, &context).address, 0);
     let other = binding_scope(None);
     cache.set(NameIc {
-        env: Rc::as_ptr(&other) as usize | 1,
+        env: Env::as_ptr(&other) as usize | 1,
         ..ic
     });
     assert_eq!(probe(&code, &context).address, 0); // unrelated identity is never dereferenced

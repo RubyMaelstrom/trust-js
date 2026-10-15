@@ -1126,7 +1126,7 @@ pub fn futex_notify(
     (taken.len() as u64, own_tokens)
 }
 
-pub type Env = Rc<RefCell<Scope>>;
+pub use crate::env_handle::{Env, WeakEnv};
 
 /// How [`Interp::resolve_cached_call`] found a call target: a live way or overflow entry to copy
 /// as it is, or a code-sharing copy already adjusted to the live closure.
@@ -1966,9 +1966,9 @@ mod binding_layout_tests {
         let exporter = new_scope(None);
         let mut first = Binding::data(Value::Undefined, false, true);
         first.set_import_reference(Some((exporter.clone(), "source".into())));
-        let before = Rc::strong_count(&exporter);
+        let before = Env::strong_count(&exporter);
         let second = first.clone();
-        assert_eq!(Rc::strong_count(&exporter), before + 1);
+        assert_eq!(Env::strong_count(&exporter), before + 1);
         let left = first.import_ref.as_deref().unwrap();
         let right = second.import_ref.as_deref().unwrap();
         assert!(
@@ -1977,9 +1977,9 @@ mod binding_layout_tests {
         );
         assert!(Rc::ptr_eq(&left.1, &right.1));
         drop(second);
-        assert_eq!(Rc::strong_count(&exporter), before);
+        assert_eq!(Env::strong_count(&exporter), before);
         first.set_import_reference(None);
-        assert_eq!(Rc::strong_count(&exporter), 1);
+        assert_eq!(Env::strong_count(&exporter), 1);
     }
 
     #[test]
@@ -2007,7 +2007,7 @@ mod binding_layout_tests {
             import.set_import_reference(Some((exporter.clone(), "source".into())));
             global.borrow_mut().vars.insert("coldLeft", import.clone());
             global.borrow_mut().vars.insert("coldRight", import);
-            let weak = Rc::downgrade(&exporter);
+            let weak = Env::downgrade(&exporter);
             drop(exporter);
             assert_eq!(evaluate(&mut engine, "function readCold(){return coldLeft.n+coldRight.n;}for(var k=0;k<40;k++)readCold();readCold()"), "14");
             engine.interp.gc_collect();
@@ -2168,7 +2168,7 @@ mod binding_layout_tests {
                 ),
                 "true"
             );
-            assert!(Rc::ptr_eq(&first, &closure_env(&mut engine, "one")));
+            assert!(Env::ptr_eq(&first, &closure_env(&mut engine, "one")));
             first
                 .borrow_mut()
                 .vars
@@ -2377,7 +2377,7 @@ pub struct Binding {
 /// value. Each structural generation validates the cached Binding pointer.
 #[derive(Clone)]
 pub(crate) struct BindingGetterScopeGuard {
-    pub(crate) pin: std::rc::Weak<std::cell::RefCell<Scope>>,
+    pub(crate) pin: crate::interpreter::WeakEnv,
     pub(crate) generation: u32,
 }
 
@@ -2428,7 +2428,7 @@ fn register_scope(e: &Env) {
 
 pub fn new_scope(parent: Option<Env>) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Rc::new(RefCell::new(Scope {
+    let e = Env::new(Scope {
         gc_slot: std::cell::Cell::new(u32::MAX),
         gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
@@ -2438,7 +2438,7 @@ pub fn new_scope(parent: Option<Env>) -> Env {
         var_boundary: false,
         catch_param: false,
         lexical_names: ScopeNames::default(),
-    }));
+    });
     register_scope(&e);
     e
 }
@@ -2455,7 +2455,7 @@ pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) 
 
 pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Rc::new(RefCell::new(Scope {
+    let e = Env::new(Scope {
         gc_slot: std::cell::Cell::new(u32::MAX),
         gc_heap: crate::value::active_gc_heap(),
         vars,
@@ -2465,7 +2465,7 @@ pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> 
         var_boundary: true,
         catch_param: false,
         lexical_names: ScopeNames::default(),
-    }));
+    });
     register_scope(&e);
     e
 }
@@ -2474,7 +2474,7 @@ pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> 
 /// var-hoisting walk skips it (see [`Scope::catch_param`]).
 pub fn new_catch_scope(parent: Env) -> Env {
     let under_with = parent.borrow().under_with;
-    let e = Rc::new(RefCell::new(Scope {
+    let e = Env::new(Scope {
         gc_slot: std::cell::Cell::new(u32::MAX),
         gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
@@ -2484,14 +2484,14 @@ pub fn new_catch_scope(parent: Env) -> Env {
         var_boundary: false,
         catch_param: true,
         lexical_names: ScopeNames::default(),
-    }));
+    });
     register_scope(&e);
     e
 }
 
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
-    let e = Rc::new(RefCell::new(Scope {
+    let e = Env::new(Scope {
         gc_slot: std::cell::Cell::new(u32::MAX),
         gc_heap: crate::value::active_gc_heap(),
         vars: Default::default(),
@@ -2501,7 +2501,7 @@ pub fn new_with_scope(parent: Env, obj: Value) -> Env {
         var_boundary: false,
         catch_param: false,
         lexical_names: ScopeNames::default(),
-    }));
+    });
     register_scope(&e);
     e
 }
@@ -3137,7 +3137,7 @@ pub struct Interp {
     /// [`crate::bytecode::CallIc::global_env`]): the cached same-realm proof compares the scope
     /// address raw, so its allocation header must not be recycled while the cache survives. A
     /// strong `Env` here would make every realm touched by JIT code immortal.
-    pub(crate) global_env_pins: Vec<std::rc::Weak<RefCell<Scope>>>,
+    pub(crate) global_env_pins: Vec<crate::interpreter::WeakEnv>,
     /// The byte position of the explicit call (or `new`, `super()`, tagged template) the
     /// innermost execution context is making, or [`crate::stack_trace::NO_POSITION`] outside one.
     /// Pushing a function frame moves it into [`FnFrame::call_site`]; popping restores it (see
@@ -4563,7 +4563,7 @@ impl Interp {
                 .host_settings_states
                 .get(&(realm, context))
                 .is_some_and(|state| {
-                    Rc::ptr_eq(&state.global_env, &self.global_env)
+                    Env::ptr_eq(&state.global_env, &self.global_env)
                         && Rc::ptr_eq(&state.global_var_names, &self.global_var_names)
                 })
         {
@@ -11646,7 +11646,7 @@ impl Interp {
         let sidx: crate::fasthash::FastMap<usize, usize> = scopes
             .iter()
             .enumerate()
-            .map(|(k, e)| (Rc::as_ptr(e) as usize, k))
+            .map(|(k, e)| (Env::as_ptr(e) as usize, k))
             .collect();
         let mut s_internal = vec![0u32; scopes.len()];
         let mut s_mark = vec![false; scopes.len()];
@@ -11688,7 +11688,7 @@ impl Interp {
         for e in &scopes {
             let b = e.borrow();
             if let Some(p) = &b.parent {
-                if let Some(&k) = sidx.get(&(Rc::as_ptr(p) as usize)) {
+                if let Some(&k) = sidx.get(&(Env::as_ptr(p) as usize)) {
                     s_internal[k] += 1;
                 }
             }
@@ -11702,7 +11702,7 @@ impl Interp {
                     ob.gc_scratch.set(ob.gc_scratch.get() + 1);
                 }
                 if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
+                    if let Some(&k) = sidx.get(&(Env::as_ptr(ie) as usize)) {
                         s_internal[k] += 1;
                     }
                 }
@@ -11772,7 +11772,7 @@ impl Interp {
                         .set(borrowed.gc_scratch.get().saturating_add(1));
                 }
             }
-            let scope_ptr = Rc::as_ptr(&realm.global_env) as usize;
+            let scope_ptr = Env::as_ptr(&realm.global_env) as usize;
             realm_scope_members.insert(scope_ptr, *realm_key);
             if let Some(&index) = sidx.get(&scope_ptr) {
                 s_internal[index] = s_internal[index].saturating_add(1);
@@ -11865,7 +11865,7 @@ impl Interp {
                 b.gc_scratch.set(b.gc_scratch.get().saturating_add(1));
             }
             for scope in scope_refs.drain(..) {
-                if let Some(&index) = sidx.get(&(Rc::as_ptr(&scope) as usize)) {
+                if let Some(&index) = sidx.get(&(Env::as_ptr(&scope) as usize)) {
                     s_internal[index] = s_internal[index].saturating_add(1);
                 }
             }
@@ -11892,7 +11892,7 @@ impl Interp {
             }
         }
         for (k, e) in scopes.iter().enumerate() {
-            if Rc::strong_count(e) > s_internal[k] as usize + 1 {
+            if Env::strong_count(e) > s_internal[k] as usize + 1 {
                 s_mark[k] = true;
                 sstack.push(e.clone());
             }
@@ -12057,7 +12057,7 @@ impl Interp {
             let mut sshown = 0;
             for (k, e) in scopes.iter().enumerate() {
                 let internal = s_internal[k] as usize;
-                let strong = Rc::strong_count(e);
+                let strong = Env::strong_count(e);
                 if strong <= internal + 1 {
                     continue;
                 }
@@ -12238,7 +12238,7 @@ impl Interp {
                         }
                     }
                     for e in scope_refs.drain(..) {
-                        if let Some(&k) = sidx.get(&(Rc::as_ptr(&e) as usize)) {
+                        if let Some(&k) = sidx.get(&(Env::as_ptr(&e) as usize)) {
                             if !s_mark[k] {
                                 s_mark[k] = true;
                                 sstack.push(e);
@@ -12291,7 +12291,7 @@ impl Interp {
                             }
                         }
                         for scope in scope_refs.drain(..) {
-                            if let Some(&index) = sidx.get(&(Rc::as_ptr(&scope) as usize)) {
+                            if let Some(&index) = sidx.get(&(Env::as_ptr(&scope) as usize)) {
                                 if !s_mark[index] {
                                     s_mark[index] = true;
                                     sstack.push(scope);
@@ -12312,7 +12312,7 @@ impl Interp {
                                     stack.push(object.clone());
                                 }
                             }
-                            if let Some(&index) = sidx.get(&(Rc::as_ptr(env) as usize)) {
+                            if let Some(&index) = sidx.get(&(Env::as_ptr(env) as usize)) {
                                 if !s_mark[index] {
                                     s_mark[index] = true;
                                     sstack.push(env.clone());
@@ -12368,7 +12368,7 @@ impl Interp {
                 continue;
             }
             let Some(e) = sstack.pop() else { break };
-            if let Some(&realm_key) = realm_scope_members.get(&(Rc::as_ptr(&e) as usize)) {
+            if let Some(&realm_key) = realm_scope_members.get(&(Env::as_ptr(&e) as usize)) {
                 if activated_realms.insert(realm_key) {
                     if let Some((objects, env)) = realm_groups.get(&realm_key) {
                         for object in objects {
@@ -12377,7 +12377,7 @@ impl Interp {
                                 stack.push(object.clone());
                             }
                         }
-                        if let Some(&index) = sidx.get(&(Rc::as_ptr(env) as usize)) {
+                        if let Some(&index) = sidx.get(&(Env::as_ptr(env) as usize)) {
                             if !s_mark[index] {
                                 s_mark[index] = true;
                                 sstack.push(env.clone());
@@ -12388,7 +12388,7 @@ impl Interp {
             }
             let b = e.borrow();
             if let Some(p) = &b.parent {
-                if let Some(&k) = sidx.get(&(Rc::as_ptr(p) as usize)) {
+                if let Some(&k) = sidx.get(&(Env::as_ptr(p) as usize)) {
                     if !s_mark[k] {
                         s_mark[k] = true;
                         sstack.push(p.clone());
@@ -12409,7 +12409,7 @@ impl Interp {
                     }
                 }
                 if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Rc::as_ptr(ie) as usize)) {
+                    if let Some(&k) = sidx.get(&(Env::as_ptr(ie) as usize)) {
                         if !s_mark[k] {
                             s_mark[k] = true;
                             sstack.push(ie.clone());
@@ -13612,7 +13612,7 @@ impl Interp {
                     Rc::as_ptr(func),
                     chunk,
                     Gc::as_ptr(&self.global) as usize,
-                    Rc::as_ptr(&self.global_env) as usize,
+                    Env::as_ptr(&self.global_env) as usize,
                 );
                 crate::jit::run(self, chunk, &code, closure, this_val, args)
             }
@@ -13870,7 +13870,7 @@ impl Interp {
             return CachedCall::Miss;
         };
         let key = Gc::as_ptr(o) as usize;
-        let genv = Rc::as_ptr(&self.global_env) as usize;
+        let genv = Env::as_ptr(&self.global_env) as usize;
         // Probe the identity fields through the Cell without copying whole entries; only the
         // hit is copied out (nothing re-entrant runs between the probe and the copy).
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
@@ -13915,7 +13915,7 @@ impl Interp {
                             && user.realm == Gc::as_ptr(&self.global) as usize
                             && !user.env.borrow().under_with =>
                     {
-                        (Rc::as_ptr(&user.func), Rc::as_ptr(&user.env))
+                        (Rc::as_ptr(&user.func), Env::as_ptr(&user.env))
                     }
                     _ => return CachedCall::Miss,
                 };
@@ -14002,7 +14002,7 @@ impl Interp {
     pub(crate) fn prepared_call_current(&self, prepared: &PreparedCall) -> bool {
         prepared.ic.epoch
             == crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
-            && prepared.ic.global_env == Rc::as_ptr(&self.global_env) as usize
+            && prepared.ic.global_env == Env::as_ptr(&self.global_env) as usize
     }
 
     /// One call through a current [`PreparedCall`], with exactly the effects of the
@@ -14085,7 +14085,7 @@ impl Interp {
         // operand stack keeps it alive through its never-reassigned `call` field. `env_ptr`
         // is the LIVE callee's env — for a func-keyed hit it differs from `ic.env` (which
         // belongs to whichever closure instance filled the entry).
-        let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(env_ptr) });
+        let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(env_ptr) });
         let chunk = unsafe { &*ic.chunk };
         let this_read = unsafe { this_slot.read() }.into_value();
         let this_val = if !ic.uses_this {
@@ -14296,7 +14296,7 @@ impl Interp {
         // because the callee object (held by the caller's operand stack) owns it through its
         // `call` field, which is never reassigned while live. ManuallyDrop = a non-owning
         // `&Env` fabricated from the raw pointer; nothing below moves it out.
-        let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ic.env) });
+        let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(ic.env) });
         let chunk = unsafe { &*ic.chunk };
         // OrdinaryCallBindThis on the moved `this` (bind_compiled_this, inlined over `ic.strict`
         // and the fill-time `uses_this`).
@@ -14378,7 +14378,7 @@ impl Interp {
         crate::jit::perf_inline_attempt();
         // A cached native checkpoint must still describe the active Realm. Borrow its live
         // environment for planning; raw addresses cannot manufacture a lifetime pin.
-        if genv != Rc::as_ptr(&self.global_env) as usize {
+        if genv != Env::as_ptr(&self.global_env) as usize {
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -14527,14 +14527,14 @@ impl Interp {
                 } else {
                     let same_realm = if self.multi_realm() {
                         type ScopeCell = RefCell<Scope>;
-                        let mut cur: *const ScopeCell = Rc::as_ptr(&user.env);
+                        let mut cur: *const ScopeCell = Env::as_ptr(&user.env);
                         let mut active = false;
                         for _ in 0..8 {
-                            if cur == Rc::as_ptr(&self.global_env) {
+                            if cur == Env::as_ptr(&self.global_env) {
                                 active = true;
                                 break;
                             }
-                            match unsafe { (*cur).borrow().parent.as_ref().map(Rc::as_ptr) } {
+                            match unsafe { (*cur).borrow().parent.as_ref().map(Env::as_ptr) } {
                                 Some(parent) => cur = parent,
                                 None => break,
                             }
@@ -14546,7 +14546,7 @@ impl Interp {
                     if same_realm {
                         let runtime = user
                             .func
-                            .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
+                            .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                             .and_then(Option::as_ref)
                             .filter(|initializer_chunk| {
                                 initializer_chunk
@@ -14748,7 +14748,7 @@ impl Interp {
         if epoch == u32::MAX {
             return None;
         }
-        let genv = Rc::as_ptr(&self.global_env) as usize;
+        let genv = Env::as_ptr(&self.global_env) as usize;
         // A live site entry can only have been installed by `construct_ic_fill`, hence it is
         // already known to be a same-realm ordinary user constructor. Probe it before classifying
         // natives: hot `new C()` sites otherwise borrow C and look up `.prototype` twice per
@@ -15024,7 +15024,7 @@ impl Interp {
             construct: true,
             extra: None,
         });
-        let env = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ic.env) });
+        let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(ic.env) });
         let tv = if ic.uses_this {
             this_val.clone()
         } else {
@@ -15151,7 +15151,7 @@ impl Interp {
             }
             (b.props.shape(), slot as u32)
         };
-        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
+        let chunk = match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -15178,14 +15178,14 @@ impl Interp {
         if !self
             .global_env_pins
             .iter()
-            .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))
+            .any(|g| g.as_ptr() == Env::as_ptr(&self.global_env))
         {
-            let g = Rc::downgrade(&self.global_env);
+            let g = Env::downgrade(&self.global_env);
             self.global_env_pins.push(g);
         }
         let ic = crate::bytecode::CallIc {
             callee: key,
-            env: Rc::as_ptr(&env),
+            env: Env::as_ptr(&env),
             chunk: chunk as *const Rc<crate::bytecode::Chunk>,
             code: Rc::as_ptr(&code),
             global_env: genv,
@@ -15273,7 +15273,7 @@ impl Interp {
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
         // Function's chunk handles remain set-once, but native residency is
         // reclaimable. Hold the owned code lease through GC and the whole call.
-        let chunk = match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
+        let chunk = match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -15307,9 +15307,9 @@ impl Interp {
                 if !self
                     .global_env_pins
                     .iter()
-                    .any(|g| g.as_ptr() == Rc::as_ptr(&self.global_env))
+                    .any(|g| g.as_ptr() == Env::as_ptr(&self.global_env))
                 {
-                    let genv = Rc::downgrade(&self.global_env);
+                    let genv = Env::downgrade(&self.global_env);
                     self.global_env_pins.push(genv);
                 }
                 let (n_params, n_slots) = chunk.jit_frame();
@@ -15317,10 +15317,10 @@ impl Interp {
                     let evicted = cs.fill(
                         crate::bytecode::CallIc {
                             callee: key,
-                            env: Rc::as_ptr(&env),
+                            env: Env::as_ptr(&env),
                             chunk: chunk as *const Rc<crate::bytecode::Chunk>,
                             code: Rc::as_ptr(&code),
-                            global_env: Rc::as_ptr(&self.global_env) as usize,
+                            global_env: Env::as_ptr(&self.global_env) as usize,
                             strict: func.is_strict,
                             uses_this: chunk.needs_frame_this(),
                             n_params: n_params as u16,
@@ -15406,7 +15406,7 @@ impl Interp {
             Rc::as_ptr(&func),
             chunk,
             realm,
-            Rc::as_ptr(&self.global_env) as usize,
+            Env::as_ptr(&self.global_env) as usize,
         );
         let mut r = with_execution_stack(self.depth, || {
             if needs_env {
@@ -15474,7 +15474,7 @@ impl Interp {
             &closure,
             fn_obj,
             realm_key,
-            Rc::as_ptr(&self.global_env) as usize,
+            Env::as_ptr(&self.global_env) as usize,
         );
         // The callee runs (or compiles) now: read a snapshot-encoded body once, ahead of the
         // body-fact scan below.
@@ -15527,7 +15527,7 @@ impl Interp {
                 }
             }
             if let Some(chunk) = func
-                .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
+                .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
             {
@@ -15821,7 +15821,7 @@ impl Interp {
             && allow_compiled_body
         {
             if let Some(chunk) = func
-                .execution_code_for(Rc::as_ptr(&self.global_env) as usize)
+                .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| chunk.prepared_entry)
             {
@@ -16016,7 +16016,7 @@ impl Interp {
             func.calls.set(n);
             let _ = func.code.set(crate::bytecode::compile(func));
         }
-        match func.execution_code_for(Rc::as_ptr(&self.global_env) as usize) {
+        match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
             Some(Some(chunk)) => Some(chunk.clone()),
             _ => None,
         }

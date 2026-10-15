@@ -378,7 +378,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         assert!(function.code2.set(Some(chunk.clone())).is_ok());
         assert!(Rc::ptr_eq(
             function
-                .execution_code_for(Rc::as_ptr(&engine.interp.global_env) as usize)
+                .execution_code_for(Env::as_ptr(&engine.interp.global_env) as usize)
                 .and_then(Option::as_ref)
                 .unwrap(),
             &chunk

@@ -55,7 +55,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
         for _ in 0..8 {
             assert_eq!(eval_string(i, "subject(5)"), "9:8:8");
         }
-        let genv = Rc::as_ptr(&i.global_env) as usize;
+        let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
         let plan = bytecode::plan_inlines(&primary, function, user.realm, &i.global_env);
         assert!(!plan.is_empty());
         let inlined = bytecode::compile_with_inlines(function, &plan, &primary)
@@ -84,7 +84,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
                 Rc::ptr_eq(function, &child_user.func),
                 "shared AST and second-stage slot"
             );
-            let child_genv = Rc::as_ptr(&i.global_env) as usize;
+            let child_genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
             assert!(!inlined.inline_realm_compatible(child_genv));
             assert!(Rc::ptr_eq(
                 function
@@ -165,7 +165,7 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
     code.residency.referenced.set(0);
     in_realm(i, &child, |i| {
         run(i, snapshot);
-        let genv = Rc::as_ptr(&i.global_env) as usize;
+        let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
         assert!(secondary.inline_realm_compatible(genv));
         assert!(Rc::ptr_eq(
             user.func
@@ -206,20 +206,20 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
     // A separate live environment makes the allocation lease independently observable.
     // Only metadata is tested here; this graph is never run against an unrelated Realm.
     let planning = crate::interpreter::new_scope(None);
-    let address = Rc::as_ptr(&planning) as usize;
-    let weak = Rc::downgrade(&planning);
-    let weak_before = Rc::weak_count(&planning);
+    let address = crate::interpreter::Env::as_ptr(&planning) as usize;
+    let weak = crate::interpreter::Env::downgrade(&planning);
+    let weak_before = crate::interpreter::Env::weak_count(&planning);
     let plan = bytecode::plan_inlines(&primary, &user.func, user.realm, &planning);
     assert!(!plan.is_empty());
     assert_eq!(
-        Rc::strong_count(&planning),
+        crate::interpreter::Env::strong_count(&planning),
         1,
         "metadata must not keep bindings/Realm values alive"
     );
     let chunk = bytecode::compile_with_inlines(&user.func, &plan, &primary).unwrap();
     assert!(chunk.inline_realm_compatible(address));
     drop(plan);
-    assert!(Rc::weak_count(&planning) > weak_before);
+    assert!(crate::interpreter::Env::weak_count(&planning) > weak_before);
     let target = chunk
         .jit_ops()
         .iter()
@@ -229,10 +229,10 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
         })
         .unwrap();
     assert_eq!(target.genv_pin.as_ptr() as usize, address);
-    assert_eq!(Rc::strong_count(&planning), 1);
+    assert_eq!(crate::interpreter::Env::strong_count(&planning), 1);
     drop(chunk);
     assert_eq!(
-        Rc::weak_count(&planning),
+        crate::interpreter::Env::weak_count(&planning),
         weak_before,
         "last inline owner releases its allocation lease"
     );
@@ -251,7 +251,7 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
     assert!(
         replacements
             .iter()
-            .all(|env| Rc::as_ptr(env) as usize != address),
+            .all(|env| crate::interpreter::Env::as_ptr(env) as usize != address),
         "a retained inline pin prevents another environment reusing the guard's address"
     );
     drop(chunk);

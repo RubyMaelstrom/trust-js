@@ -187,7 +187,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
         unsafe { &*(chunk.jit_call_cache_ptr(cache) as *const [Cell<CallIc>; CALL_IC_WAYS]) };
     let object = Object::new(None);
     let key = crate::value::Gc::as_ptr(&object) as usize;
-    let realm = Rc::as_ptr(&engine.interp.global_env) as usize;
+    let realm = Env::as_ptr(&engine.interp.global_env) as usize;
     let mut context = ProbeContext([0; size_of::<JitCtx>().div_ceil(size_of::<usize>())]);
     context.0[offset_of!(JitCtx, interp) / size_of::<usize>()] =
         &mut *engine.interp as *mut _ as usize;

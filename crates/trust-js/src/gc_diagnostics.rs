@@ -7,7 +7,6 @@ use crate::gc_native::NativeGcGraph;
 use crate::interpreter::{Env, Interp};
 use crate::value::{Callable, Gc, Value};
 use std::collections::VecDeque;
-use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Node {
@@ -38,7 +37,7 @@ impl Snapshot<'_> {
         let scopes: FastMap<_, _> = self
             .scopes
             .iter()
-            .map(|s| (Rc::as_ptr(s) as usize, s))
+            .map(|s| (Env::as_ptr(s) as usize, s))
             .collect();
         let mut parents = FastMap::<Node, Option<(Node, &'static str)>>::default();
         let mut pending = VecDeque::new();
@@ -51,7 +50,7 @@ impl Snapshot<'_> {
             add(Node::Object(Gc::as_ptr(object) as usize));
         }
         for scope in self.scope_roots {
-            add(Node::Scope(Rc::as_ptr(scope) as usize));
+            add(Node::Scope(Env::as_ptr(scope) as usize));
         }
         let mut native = self.native.clone();
         let mut object_edges = Vec::new();
@@ -97,11 +96,12 @@ impl Snapshot<'_> {
                             "object/internal-slot",
                         )
                     }));
-                    destinations.extend(
-                        scope_edges.drain(..).map(|s| {
-                            (Node::Scope(Rc::as_ptr(&s) as usize), "captured-environment")
-                        }),
-                    );
+                    destinations.extend(scope_edges.drain(..).map(|s| {
+                        (
+                            Node::Scope(Env::as_ptr(&s) as usize),
+                            "captured-environment",
+                        )
+                    }));
                     native.trace_js(id, &mut native_edges);
                     destinations.extend(
                         native_edges
@@ -124,7 +124,7 @@ impl Snapshot<'_> {
                     let b = scope.borrow();
                     if let Some(parent) = &b.parent {
                         destinations.push((
-                            Node::Scope(Rc::as_ptr(parent) as usize),
+                            Node::Scope(Env::as_ptr(parent) as usize),
                             "parent-environment",
                         ));
                     }
@@ -139,7 +139,7 @@ impl Snapshot<'_> {
                         }
                         if let Some((scope, _)) = binding.import_ref.as_deref() {
                             destinations
-                                .push((Node::Scope(Rc::as_ptr(scope) as usize), "import-binding"));
+                                .push((Node::Scope(Env::as_ptr(scope) as usize), "import-binding"));
                         }
                     }
                     self.realm_scope_members.get(&id)
@@ -151,7 +151,10 @@ impl Snapshot<'_> {
                         .iter()
                         .map(|o| (Node::Object(Gc::as_ptr(o) as usize), "realm-intrinsics")),
                 );
-                destinations.push((Node::Scope(Rc::as_ptr(scope) as usize), "realm-environment"));
+                destinations.push((
+                    Node::Scope(Env::as_ptr(scope) as usize),
+                    "realm-environment",
+                ));
             }
             if let Some(entries) = ephemerons.get(&from) {
                 for &(other, value) in entries {
