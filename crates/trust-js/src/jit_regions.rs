@@ -11,7 +11,9 @@ use crate::jit_ir::{Cfg, FrameLoc, InstKind, RegionIr, ValueDef};
 #[cfg(test)]
 thread_local! {
     static EXECUTED_REGIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static BORROWED_READS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    // (borrowed own reads, receiver-guard reuses, whole-load value CSEs)
+    static BORROWED_READS: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
     static GUARDED_REGIONS: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
     static FUSED_PREDICATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static REUSED_CHAINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -277,8 +279,16 @@ pub(super) fn emit_lowering_event(a: &mut asm::Asm, function: u64) {
 #[cfg(test)]
 extern "C" fn record_borrowed_read(reused: u64) {
     BORROWED_READS.with(|counts| {
-        let (reads, reuses) = counts.get();
-        counts.set((reads + 1, reuses + reused));
+        let (reads, reuses, cses) = counts.get();
+        counts.set((reads + 1, reuses + reused, cses));
+    });
+}
+
+#[cfg(test)]
+extern "C" fn record_borrowed_cse() {
+    BORROWED_READS.with(|counts| {
+        let (reads, reuses, cses) = counts.get();
+        counts.set((reads, reuses, cses + 1));
     });
 }
 
@@ -1333,21 +1343,62 @@ fn number(a: &mut asm::Asm, stack: &mut [Operand], physical: usize, index: usize
 /// effect-free part of one basic block. In particular no assumption of distinct
 /// objects is made from distinct local slots: every possible heap effect clears
 /// the entire set. IC cells and their chunk are pinned for native execution.
+///
+/// `guards` maps a receiver to the cache whose shape a successful read proved
+/// equal to the receiver's (guard reuse). `values` additionally maps
+/// (receiver, name) to the operand-stack index holding that read's borrowed
+/// value, so a repeated read of the same field inside the same effect-free
+/// span can copy the register instead of reloading. The value cannot have
+/// changed: the same clearing discipline applies, and a CSE use additionally
+/// requires the recorded operand to still be `BorrowedValue` (conversions
+/// and materialization change the kind). Every producer of a `BorrowedValue`
+/// forgets facts at the index it pushes, so a reused stack index never
+/// aliases a different field's value. A CSE never updates `guards`: it
+/// validated no new cache, so the guard chain must keep the last cache a
+/// real read actually proved.
 #[derive(Default)]
-struct OwnReadFacts(Vec<(PropRecv, usize)>);
+struct OwnReadFacts {
+    guards: Vec<(PropRecv, usize)>,
+    values: Vec<(PropRecv, u32, usize)>,
+}
 
 impl OwnReadFacts {
     fn clear(&mut self) {
-        self.0.clear();
+        self.guards.clear();
+        self.values.clear();
     }
 
     fn record(&mut self, receiver: PropRecv, cache: usize) -> Option<usize> {
-        if let Some((_, previous)) = self.0.iter_mut().find(|(r, _)| *r == receiver) {
+        if let Some((_, previous)) = self.guards.iter_mut().find(|(r, _)| *r == receiver) {
             Some(std::mem::replace(previous, cache))
         } else {
-            self.0.push((receiver, cache));
+            self.guards.push((receiver, cache));
             None
         }
+    }
+
+    fn forget_index(&mut self, index: usize) {
+        self.values.retain(|&(_, _, at)| at != index);
+    }
+
+    fn record_value(&mut self, receiver: PropRecv, name: u32, index: usize) {
+        self.forget_index(index);
+        if let Some(entry) = self
+            .values
+            .iter_mut()
+            .find(|(r, n, _)| *r == receiver && *n == name)
+        {
+            entry.2 = index;
+        } else {
+            self.values.push((receiver, name, index));
+        }
+    }
+
+    fn value_index(&self, receiver: PropRecv, name: u32) -> Option<usize> {
+        self.values
+            .iter()
+            .find(|(r, n, _)| *r == receiver && *n == name)
+            .map(|&(_, _, at)| at)
     }
 }
 
@@ -1427,7 +1478,11 @@ fn emit_borrowed_own_read(
     );
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
-    guard_prop_data(a, 9, 15, layout.entry_accessor as u32, fail);
+    // No live descriptor-kind check: the receiver shape was just proved equal
+    // to the cell shape (directly, or transitively through equal cell shapes
+    // on the reuse path), the cell depth byte is 0 (data only), and shapes
+    // encode (key, PropClass) per slot, so (shape, slot) proves this entry
+    // is a data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
     a.lsr_imm(9, 12, 48);
     for tag in [crate::value::PACK_BIGINT, crate::value::PACK_EMPTY] {
@@ -1539,7 +1594,10 @@ fn emit_borrowed_method(
     );
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
-    guard_prop_data(a, 9, 15, layout.entry_accessor as u32, fail);
+    // No live descriptor-kind check: holder shape was just proved equal to
+    // the baked feedback shape, the baked depth is a data depth (<= 3), and
+    // shapes encode (key, PropClass) per slot, so (shape, slot) proves a
+    // data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
     a.lsr_imm(9, 12, 48);
     for tag in [crate::value::PACK_BIGINT, crate::value::PACK_EMPTY] {
@@ -2981,6 +3039,9 @@ pub(super) fn emit(
                         physical,
                         bailout,
                     );
+                    // The method word is a new BorrowedValue producer: no CSE
+                    // fact may keep pointing at the index it lands on.
+                    own_facts.forget_index(stack.len());
                     stack.push(Operand::BorrowedValue);
                 }
                 Op::GetPropLocal(_, _, _) | Op::GetPropThis(_, _)
@@ -2992,23 +3053,52 @@ pub(super) fn emit(
                             if plan.reg(slot).is_some() || slot as u32 * 8 + 8 >= 4096) =>
                 {
                     saved_work += 2; // no property owner clone/drop
-                    let (receiver, cache) = match ops[pc] {
-                        Op::GetPropLocal(slot, _, cache) => {
-                            (PropRecv::Slot(slot as u32 * 8), chunk.jit_cache_ptr(cache))
+                    let (receiver, name, cache) = match ops[pc] {
+                        Op::GetPropLocal(slot, name, cache) => (
+                            PropRecv::Slot(slot as u32 * 8),
+                            name,
+                            chunk.jit_cache_ptr(cache),
+                        ),
+                        Op::GetPropThis(name, cache) => {
+                            (PropRecv::This, name, chunk.jit_cache_ptr(cache))
                         }
-                        Op::GetPropThis(_, cache) => (PropRecv::This, chunk.jit_cache_ptr(cache)),
                         _ => unreachable!(),
                     };
-                    let previous = own_facts.record(receiver, cache);
-                    emit_borrowed_own_read(
-                        a,
-                        layout,
-                        receiver,
-                        cache,
-                        previous,
-                        16 + depth as u32,
-                        bailout,
-                    );
+                    // A repeated read of the same field in the same effect-free
+                    // span observes the same value: copy the first read's
+                    // register instead of reloading (see OwnReadFacts).
+                    let cse_from = own_facts
+                        .value_index(receiver, name)
+                        .filter(|&at| matches!(stack.get(at), Some(Operand::BorrowedValue)));
+                    if let Some(at) = cse_from {
+                        saved_work += 4; // the whole borrowed load is elided
+                        a.fmov_d_d(16 + depth as u32, 16 + at as u32);
+                        #[cfg(test)]
+                        {
+                            a.sub_imm(31, 31, 128);
+                            for index in (16..32).step_by(2) {
+                                a.stp_d_off(index, index + 1, (index - 16) as i32 * 8);
+                            }
+                            a.mov_imm64(16, record_borrowed_cse as *const () as u64);
+                            a.blr(16);
+                            for index in (16..32).step_by(2) {
+                                a.ldp_d_off(index, index + 1, (index - 16) as i32 * 8);
+                            }
+                            a.add_imm(31, 31, 128);
+                        }
+                    } else {
+                        let previous = own_facts.record(receiver, cache);
+                        emit_borrowed_own_read(
+                            a,
+                            layout,
+                            receiver,
+                            cache,
+                            previous,
+                            16 + depth as u32,
+                            bailout,
+                        );
+                    }
+                    own_facts.record_value(receiver, name, depth);
                     stack.push(Operand::BorrowedValue);
                 }
                 Op::LoadLocal(slot) if plan.reg(slot).is_some() => {
@@ -3353,6 +3443,8 @@ pub(super) fn emit(
                     stack.pop();
                 }
                 Op::Dup if !matches!(stack.last(), Some(Operand::Canonical)) => {
+                    // Dup can push a copied BorrowedValue onto a reused index.
+                    own_facts.forget_index(stack.len());
                     duplicate_operand(a, &mut stack, physical);
                 }
                 Op::Jump(target) => {
@@ -4201,6 +4293,10 @@ mod tests {
                 assert!(after.0 > before.0, "must execute borrowed property reads");
                 assert!(after.1 > before.1, "must execute reused receiver guards");
             }
+            if warmed && source.contains("REQUIRE_CSE") {
+                let after = BORROWED_READS.with(std::cell::Cell::get);
+                assert!(after.2 > before.2, "must execute whole-load value CSEs");
+            }
             engine.interp.gc_collect();
         }
     }
@@ -4298,6 +4394,39 @@ mod tests {
             good=droppedReceiver()===276&&good;
             function numeric(o){var s=0;for(var i=0;i<24;i++)s+=o.a+o.b;return s;}
             good=numeric({a:2,b:3})===120&&good;
+            good;
+        "#,
+            true,
+        );
+    }
+
+    #[test]
+    fn borrowed_own_read_cse_copies_only_live_same_field_values() {
+        check_borrowed_reads(
+            r#"
+            // REQUIRE_CSE
+            function twice(o,n){var s=0;for(var i=0;i<n;i++)s+=o.a+o.a;return s;}
+            function mix(o,n){var s=0;for(var i=0;i<n;i++)s+=o.a+o.b+o.a;return s;}
+            function store(o,n){var s=0;for(var i=0;i<n;i++){s+=o.a;o.a=5;s+=o.a;o.a=2;}return s;}
+            function swap(o,p,n){var s=0;for(var i=0;i<n;i++){s+=o.a;o=p;s+=o.a;o={a:2};}return s;}
+            function consumed(o,n){var s=0;for(var i=0;i<n;i++)s+=(o.a+1)+o.a;return s;}
+            function big(o,n){var s=0n;for(var i=0;i<n;i++)s+=o.a+o.a;return s;}
+            var o={a:2,b:100}, good=twice(o,30)===120&&mix(o,30)===3120;
+            good=store(o,30)===210&&o.a===2&&good;
+            good=swap({a:2},{a:10},30)===360&&consumed(o,30)===150&&good;
+            good=big({a:3n},10)===60n&&good;
+            beginOwnReadNativeTest();
+            good=twice(o,30)===120&&mix(o,30)===3120&&good;
+            good=store(o,30)===210&&o.a===2&&good;
+            good=swap({a:2},{a:10},30)===360&&consumed(o,30)===150&&good;
+            good=big({a:3n},10)===60n&&good;
+            o.a=7;good=twice(o,30)===420&&good;o.a=2;
+            var gets=0;
+            Object.defineProperty(o,'a',{get(){gets++;return 11;},configurable:true});
+            good=twice(o,30)===660&&gets===60&&good;
+            delete o.a;o.a=2;good=twice(o,30)===120&&good;
+            function viaThis(n){var s=0;for(var i=0;i<n;i++)s+=this.a+this.a;return s;}
+            good=viaThis.call(o,30)===120&&good;
             good;
         "#,
             true,

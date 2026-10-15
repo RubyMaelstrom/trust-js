@@ -349,3 +349,77 @@ unrepaid. Remaining known hole, as designed: seal/freeze attribute passes
 through define_own_property_ordinary demote per overwritten key via the
 insert funnel (correct, fresh-id burn on those cold paths accepted;
 Object.freeze itself uses the single-demote freeze_descriptors).
+
+Pilot C follow-on R1: region load elimination on the class proof (2026-10-15)
+==============================================================================
+
+Survey result (region-ir-surveyor + main thread, jit_regions.rs): region
+property reuse is guard-only. OwnReadFacts is keyed by receiver location
+(local slot offset / this), survives only effect-free spans of one basic
+block (any heap-effect op, local store, branch, or catch-all arm clears
+it wholesale), and emit_borrowed_own_read always reloads the live value
+and re-checks guard_prop_data (:1430). Values are never CSE'd. No
+property-load node exists in jit_ir.rs; all of this lives in the aarch64
+region emitter.
+
+Increment R1 (two slices, one validation):
+  3a. Delete guard_prop_data at jit_regions.rs:1430 (borrowed own read)
+      and :1542 (borrowed method). Same proof as step 7: receiver shape
+      is compared against the cell/baked shape immediately before, the
+      own-read cell depth byte is checked live == 0 (:1391, data only;
+      accessor 0x20 / keychk 0x40 bail), the method state is baked with
+      depth <= 3 (data only), and shape now encodes (key, PropClass) per
+      slot, so (shape, slot) determines the descriptor class. A cell
+      rewritten by the helper to an accessor state fails the depth-byte
+      check; a class-changing write on the object demotes its shape and
+      fails the shape compare.
+  3b. Value CSE inside the effect-free span: OwnReadFacts additionally
+      keys (receiver, name const) -> stack index of the first read's
+      BorrowedValue. A repeated GetPropLocal/GetPropThis for the same
+      receiver+name while that operand is still BorrowedValue at the
+      recorded index emits one fmov register copy instead of the whole
+      load (~15 insns incl. cache-cell reads, bounds, tag checks).
+      Identity safety: facts are cleared on every heap effect/local
+      store/branch as today (value cannot change in-span); in-place
+      operand conversion or materialize-fill changes the operand kind
+      (checked at use); the three BorrowedValue producers (own read
+      record, borrowed method, Dup) forget facts at the index they push,
+      so a reused stack index can never alias a different field's value.
+      Different cache cells for the same name are fine: JS semantics of
+      the second read is the same object's same-named own value, already
+      loaded; the copy can only avoid a bail, never change the value.
+      Cross-block/loop-carried CSE is explicitly out of scope (facts die
+      at merges and loop headers as today).
+
+Pre-registered gate: full lib suite + clippy -Dwarnings + new mutation
+fixtures (intervening store, receiver reassignment, Pop/Dup index reuse,
+interleaved fields o.a+o.b+o.a, accessor/BigInt fallouts) + difftest +
+Test262 property subsets must pass; a cfg(test) CSE counter must prove
+the copy path executes. Perf: paired fat-LTO A/B vs 559b3e14 on
+Vue/React/Djot fixtures, CPU-pinned, >= 11 pairs. Prediction: Vue
+-0.3%..-1.5% (borrowed-read frequency in regions is unmeasured; could
+be within noise), React/Djot ~0. Landing bar: no fixture median worse
+than +0.3% for R1 itself, and cumulative Djot vs 2f9447e1 must stay
+under the 3% component rule (currently +2.72%). If 3b fails fixtures or
+perf, keep 3a only (independently validated); if Djot breaches 3%
+cumulative, stop and investigate before landing either.
+
+R1 result: landed slices 3a+3b together. Validation: 2,145 lib tests
+pass (incl. new borrowed_own_read_cse_copies_only_live_same_field_values
+with REQUIRE_CSE counter assertion, intervening store / receiver swap /
+consumed-operand / interleaved-field / BigInt / accessor-redefine
+fixtures); clippy -Dwarnings clean; difftest seed 7: 138 agree, 12
+budget-skipped; Test262 built-ins/{Object,Proxy,Reflect} +
+language/expressions: 14,977/14,977. Regions are aarch64-only
+(#[cfg(target_arch="aarch64")] mod regions), so x64 is untouched.
+
+Perf (fat-LTO pairs, CPU 5, 11 pairs, internal elapsed medians):
+R1 vs 559b3e14 (pilotC7-lto): Vue -0.54%, React +0.00%, Djot -0.52%
+— inside the predicted band, no fixture above the +0.3% bar.
+Cumulative R1 vs 2f9447e1: Vue -3.66%, React +0.00%, Djot +2.66%
+(still under the 3% component rule; was +2.72% after Pilot C).
+Fixture outputs identical except Vue's elapsed_ms field. Verdict:
+gate PASS. Pilot C's ~+0.9% Vue substrate cost is partially repaid;
+remaining region headroom is cross-block/loop-carried guard and value
+reuse (facts still die at merges and loop headers), plus borrowed
+chains for stack receivers (o.a.b) which regions do not yet admit.
