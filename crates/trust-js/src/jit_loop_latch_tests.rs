@@ -373,7 +373,7 @@ fn loop_latch_loop_completions_and_finally_remain_tier_equivalent() {
 }
 
 thread_local! {
-    static LOCAL_ROOT: std::cell::RefCell<Option<std::rc::Weak<std::cell::RefCell<crate::value::Object>>>> = const { std::cell::RefCell::new(None) };
+    static LOCAL_ROOT: std::cell::RefCell<Option<crate::value::WeakGc>> = const { std::cell::RefCell::new(None) };
 }
 
 fn arm_latch_gc(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {

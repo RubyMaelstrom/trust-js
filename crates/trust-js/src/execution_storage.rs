@@ -276,10 +276,10 @@ mod tests {
     use std::rc::Rc;
 
     thread_local! {
-        static BOUNDARY_KEY_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
+        static BOUNDARY_KEY_WEAK: RefCell<Option<crate::value::WeakGc>> = const {
             RefCell::new(None)
         };
-        static BOUNDARY_RECEIVER_WEAK: RefCell<Option<std::rc::Weak<RefCell<crate::value::Object>>>> = const {
+        static BOUNDARY_RECEIVER_WEAK: RefCell<Option<crate::value::WeakGc>> = const {
             RefCell::new(None)
         };
     }
@@ -630,7 +630,7 @@ mod tests {
         let seen = alias.unpack();
         assert!(crate::value::Gc::ptr_eq(
             seen.as_obj().unwrap(),
-            &crate::value::Gc::from(second_weak.upgrade().unwrap())
+            &second_weak.upgrade().unwrap()
         ));
         assert_eq!(second_weak.strong_count(), 2);
         alias.replace_value(Value::Empty);

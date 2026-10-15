@@ -37,7 +37,7 @@ use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
 #[path = "property_shape_tests.rs"]
 mod property_shape_tests;
 
-pub use crate::gc_handle::Gc;
+pub use crate::gc_handle::{Gc, WeakGc};
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
@@ -1976,23 +1976,26 @@ impl Object {
                     crate::heap::HeapGeneration::Young,
                 )
                 .expect("central heap handle space exhausted during bridge allocation");
-            let obj = Gc::new(RefCell::new(Object {
-                gc_heap: heap.clone(),
-                proto,
-                props,
-                extensible: true,
-                call: Callable::None,
-                exotic,
-                ic_plain: Cell::new(true),
-                native_typed_array: None,
-                is_constructor: false,
-                gc_mark: Cell::new(false),
-                gc_weak_observed: Cell::new(false),
-                gc_internal: Cell::new(slot_u32),
-                gc_scratch: Cell::new(0),
-                #[cfg(feature = "heap-bridge")]
-                central_ref: Cell::new(Some(central_ref)),
-            }));
+            let obj = Gc::new_in(
+                &heap,
+                RefCell::new(Object {
+                    gc_heap: heap.clone(),
+                    proto,
+                    props,
+                    extensible: true,
+                    call: Callable::None,
+                    exotic,
+                    ic_plain: Cell::new(true),
+                    native_typed_array: None,
+                    is_constructor: false,
+                    gc_mark: Cell::new(false),
+                    gc_weak_observed: Cell::new(false),
+                    gc_internal: Cell::new(slot_u32),
+                    gc_scratch: Cell::new(0),
+                    #[cfg(feature = "heap-bridge")]
+                    central_ref: Cell::new(Some(central_ref)),
+                }),
+            );
             reg.publish(slot, Gc::as_ptr(&obj));
             obj
         }

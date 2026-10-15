@@ -6,7 +6,6 @@
 
 use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
 use std::cell::RefCell;
-use std::rc::Weak;
 
 enum State {
     Parent(Gc),
@@ -14,7 +13,7 @@ enum State {
 }
 
 pub(super) struct LazyFunctionPrototype {
-    owner: Weak<RefCell<Object>>,
+    owner: crate::value::WeakGc,
     state: RefCell<State>,
     // Reuse the creation Agent's exact key layout/shape, not whichever Agent first reads it.
     // Keys contain no ECMAScript object edges and do not keep the function/realm alive.
@@ -64,7 +63,7 @@ impl LazyFunctionPrototype {
             props
                 .entries
                 .fields
-                .push(Property::builtin(super::Value::Obj(super::Gc::from(owner))));
+                .push(Property::builtin(super::Value::Obj(owner)));
         }
         props.shape = self.shape;
         let prototype = Object::new_with_parts(Some(parent.clone()), props, Exotic::None);

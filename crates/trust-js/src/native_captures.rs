@@ -170,7 +170,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("shared native invocation failed"));
             assert!(Gc::ptr_eq(
                 object(&result),
-                &Gc::from(weak_target.upgrade().expect("live capture"))
+                &weak_target.upgrade().expect("live capture")
             ));
             drop((live, result));
             interp.gc_collect();
@@ -209,7 +209,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("leased native invocation failed"));
         assert!(Gc::ptr_eq(
             object(&result),
-            &Gc::from(weak_target.upgrade().expect("leased capture"))
+            &weak_target.upgrade().expect("leased capture")
         ));
         drop((result, lease));
         interp.gc_collect();
@@ -250,7 +250,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("old owner invocation failed"));
         assert!(Gc::ptr_eq(
             object(&result),
-            &Gc::from(weak_target.upgrade().expect("old owner's capture"))
+            &weak_target.upgrade().expect("old owner's capture")
         ));
         drop((old_owner, result));
         interp.gc_collect();
@@ -291,7 +291,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("foreign owner's invocation failed"));
         assert!(Gc::ptr_eq(
             object(&result),
-            &Gc::from(weak_target.upgrade().expect("foreign capture"))
+            &weak_target.upgrade().expect("foreign capture")
         ));
         drop((result, foreign_owner, foreign_interp));
         interp.gc_collect_with_edge_budget(GcCause::Explicit, 0);
@@ -345,7 +345,7 @@ mod tests {
             };
             assert!(Gc::ptr_eq(
                 object(&result),
-                &Gc::from(weak_target.upgrade().expect("active capture"))
+                &weak_target.upgrade().expect("active capture")
             ));
             drop((lease, result));
             interp.gc_collect();

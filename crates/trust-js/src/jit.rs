@@ -1903,7 +1903,8 @@ pub const H_LOOP_BACKEDGE: usize = 23;
 unsafe extern "C" fn jit_prepare_packed_numeric_mirror(
     raw: *const std::cell::RefCell<crate::value::Object>,
 ) {
-    let object = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(raw) });
+    // SAFETY: the activation owns `raw` (see above).
+    let object = unsafe { &*raw };
     let Ok(mut body) = object.try_borrow_mut() else {
         return;
     };
@@ -4524,7 +4525,7 @@ fn compile_entry(
                 // like `value::jit_layout` probes it. A dead callee (or an unprobed layout)
                 // degrades to the generic call unconditionally.
                 let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
-                    let some: Option<crate::value::Gc> = Some(crate::value::Gc::from(o));
+                    let some: Option<crate::value::Gc> = Some(o);
                     unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
                 });
                 match stored {

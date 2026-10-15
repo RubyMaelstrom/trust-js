@@ -65,7 +65,7 @@ pub(crate) fn is_inline_position(position: u32) -> bool {
 /// when the caller is spliced too).
 #[derive(Clone)]
 pub(crate) struct InlineSite {
-    pub(crate) callee: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pub(crate) callee: crate::value::WeakGc,
     pub(crate) inner: u32,
     pub(crate) outer: u32,
 }
@@ -238,7 +238,7 @@ pub(crate) fn inline_chain(mut position: u32) -> (Vec<(crate::value::Gc, u32)>, 
             } else {
                 site.inner
             };
-            chain.push((crate::value::Gc::from(callee), inner));
+            chain.push((callee, inner));
         }
         position = site.outer;
     }

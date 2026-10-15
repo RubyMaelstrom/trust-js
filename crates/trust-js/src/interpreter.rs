@@ -697,11 +697,11 @@ impl BufferData {
 /// callbacks whose strong lifetime is represented by a reachable JavaScript wrapper; retaining a
 /// strong `Value` in both graphs would turn otherwise collectable cross-boundary cycles immortal.
 #[derive(Clone)]
-pub struct WeakValue(std::rc::Weak<RefCell<crate::value::Object>>);
+pub struct WeakValue(crate::value::WeakGc);
 
 impl WeakValue {
     pub fn upgrade(&self) -> Option<Value> {
-        self.0.upgrade().map(|object| Value::Obj(Gc::from(object)))
+        self.0.upgrade().map(Value::Obj)
     }
 }
 
@@ -790,7 +790,7 @@ impl WeakKey {
 /// ECMA-262 §9.9 requires these edges not to contribute to liveness.
 #[derive(Clone)]
 pub(crate) enum WeakTarget {
-    Object(std::rc::Weak<RefCell<crate::value::Object>>),
+    Object(crate::value::WeakGc),
     Symbol(std::rc::Weak<SymbolData>, u64),
 }
 
@@ -812,7 +812,7 @@ impl WeakTarget {
 
     pub(crate) fn upgrade(&self) -> Option<Value> {
         match self {
-            Self::Object(object) => object.upgrade().map(|object| Value::Obj(Gc::from(object))),
+            Self::Object(object) => object.upgrade().map(Value::Obj),
             Self::Symbol(symbol, _) => symbol.upgrade().map(Value::Sym),
         }
     }
@@ -1287,10 +1287,7 @@ impl FnFrame {
     /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
     pub fn callee(&self) -> Gc {
         let p = self.fn_ptr as *const RefCell<crate::value::Object>;
-        unsafe {
-            Rc::increment_strong_count(p);
-            Gc::from_raw(p)
-        }
+        unsafe { Gc::clone_from_raw(p) }
     }
 }
 
@@ -1396,7 +1393,7 @@ fn retained_str_units_bytes(
 /// Realm is gone its statics can no longer be observed.
 #[derive(Clone)]
 pub(crate) struct RegexpLastMatch {
-    pub ctor: std::rc::Weak<RefCell<crate::value::Object>>,
+    pub ctor: crate::value::WeakGc,
     pub input: crate::lstr::LStr,
     pub text: Rc<crate::regex::ReText>,
     pub caps: Vec<Option<(usize, usize)>>,
@@ -3027,7 +3024,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
 
 struct ConstructIc {
     call: crate::bytecode::CallIc,
-    pin: std::rc::Weak<RefCell<crate::value::Object>>,
+    pin: crate::value::WeakGc,
     /// Shape and own-entry slot of the constructor's `prototype` data property. The slot's
     /// value is deliberately read live on every `new`, so `F.prototype = other` remains visible
     /// without invalidation; the shape guard only removes the repeated string-map lookup.
@@ -3135,8 +3132,7 @@ pub struct Interp {
     /// through a site's normal polymorphic ways, so tying a pin to a physical cache cell would
     /// break when `ic_insert` demotes that state. The Weak prevents allocator ABA while any
     /// cached state compares the encoded raw prototype address.
-    pub(crate) creation_pins:
-        crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>,
+    pub(crate) creation_pins: crate::fasthash::FastMap<usize, crate::value::WeakGc>,
     /// Weak allocation pins for every global scope a call cache has recorded (see
     /// [`crate::bytecode::CallIc::global_env`]): the cached same-realm proof compares the scope
     /// address raw, so its allocation header must not be recycled while the cache survives. A
@@ -3219,7 +3215,7 @@ pub struct Interp {
     /// Weak identity pins prevent address reuse without rooting either functions or realms.
     /// The collector activates the owning realm when a registered function is reachable.
     pub(crate) native_function_realms:
-        RefCell<crate::fasthash::FastMap<usize, (std::rc::Weak<RefCell<Object>>, usize)>>,
+        RefCell<crate::fasthash::FastMap<usize, (crate::value::WeakGc, usize)>>,
     /// The "no-elements-on-array-protos" protector: `(epoch, clean)` — while `epoch` matches the
     /// live [`crate::value::proto_epoch`], `clean` says the canonical `Array.prototype` →
     /// `Object.prototype` chain has no canonical-index own keys, no exotic hops, and terminates
@@ -3266,13 +3262,8 @@ pub struct Interp {
     /// weak-pinned by constructor identity. Unlike `construct_ics`, this also covers constructors
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
     /// wrappers), so fresh instances share keys and reserve slots for creation-IC appends.
-    pub(crate) construct_capacity_hints: crate::fasthash::FastMap<
-        usize,
-        (
-            std::rc::Weak<RefCell<crate::value::Object>>,
-            crate::value::PropertyLayout,
-        ),
-    >,
+    pub(crate) construct_capacity_hints:
+        crate::fasthash::FastMap<usize, (crate::value::WeakGc, crate::value::PropertyLayout)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
     pub(crate) iterator_sym: Option<Rc<SymbolData>>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
@@ -3409,8 +3400,7 @@ pub struct Interp {
     /// The `$262.IsHTMLDDA` objects (emulate `document.all`), indexed weakly by identity: typeof
     /// "undefined", falsy, and loosely equal to undefined/null, despite being callable Objects.
     /// The realm/global property is the real owner; this language-level brand must not retain it.
-    pub(crate) htmldda:
-        crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>,
+    pub(crate) htmldda: crate::fasthash::FastMap<usize, crate::value::WeakGc>,
     /// The caller's realm during a cross-realm [[Construct]]: the spec pops the callee context
     /// before throwing a derived constructor's return/`this` validation errors, so those errors
     /// belong to the caller's realm.
@@ -4421,8 +4411,8 @@ pub(crate) struct SharedSnapshot {
 #[derive(Default)]
 pub(crate) struct TaAccessorProof {
     epoch: u32,
-    holder: std::rc::Weak<RefCell<Object>>,
-    concrete: [std::rc::Weak<RefCell<Object>>; 4],
+    holder: crate::value::WeakGc,
+    concrete: [crate::value::WeakGc; 4],
     next_concrete: usize,
 }
 
@@ -9711,7 +9701,7 @@ impl Interp {
             Value::Obj(o) => self
                 .htmldda
                 .get(&(Gc::as_ptr(o) as usize))
-                .is_some_and(|dda| std::rc::Weak::ptr_eq(dda, &Gc::downgrade(o))),
+                .is_some_and(|dda| dda.ptr_eq(&Gc::downgrade(o))),
             _ => false,
         }
     }
@@ -11505,7 +11495,7 @@ impl Interp {
         // future object reusing the address can't inherit stale metadata.
         self.native_function_realms.get_mut().retain(|_, (pin, _)| {
             pin.upgrade().is_some_and(|function| {
-                !garbage_objects.contains(&(Rc::as_ptr(&function) as usize))
+                !garbage_objects.contains(&(Gc::as_ptr(&function) as usize))
             })
         });
         // Evict the chosen dead set in batches. Probing all internal-slot tables for each
@@ -12199,10 +12189,7 @@ impl Interp {
                         if !pb.gc_mark.get() {
                             pb.gc_mark.set(true);
                             // SAFETY: as above; the new handle owns its own strong reference.
-                            stack.push(unsafe {
-                                Rc::increment_strong_count(p);
-                                Gc::from_raw(p)
-                            });
+                            stack.push(unsafe { Gc::clone_from_raw(p) });
                         }
                     }
                     for &k in edge_scopes {
@@ -15230,7 +15217,7 @@ impl Interp {
         // subsequent calls take [`Interp::call_jit_cached`]'s pointer-compare path.
         site: Option<(
             &crate::bytecode::CallSite,
-            &RefCell<crate::fasthash::FastMap<usize, std::rc::Weak<RefCell<crate::value::Object>>>>,
+            &RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>,
         )>,
     ) -> Option<Result<Value, Abrupt>> {
         // Eligibility belongs to the callee, not to all objects in the Agent. Proxy

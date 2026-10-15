@@ -10,7 +10,7 @@ impl Interp {
     pub(crate) fn array_binding_old_slot_is_inert(value: &Value) -> bool {
         match value {
             Value::Obj(object) => {
-                if crate::value::Gc::strong_count(object) > 2 {
+                if crate::value::Gc::outlives_release(object, 2) {
                     return true;
                 }
                 let object = object.borrow();
@@ -33,9 +33,11 @@ impl Interp {
                     && object
                         .proto
                         .as_ref()
-                        .is_none_or(|proto| crate::value::Gc::strong_count(proto) > shared_edges)
+                        .is_none_or(|proto| crate::value::Gc::outlives_release(proto, shared_edges))
                     && match &state.target {
-                        Value::Obj(target) => crate::value::Gc::strong_count(target) > shared_edges,
+                        Value::Obj(target) => {
+                            crate::value::Gc::outlives_release(target, shared_edges)
+                        }
                         _ => true,
                     }
             }
@@ -64,7 +66,7 @@ impl Interp {
         // A custom iterator may also be its own captured next function. Retiring both
         // slots and both temporary clones together must leave an independent owner.
         if matches!((old_source, old_next), (Value::Obj(source), Value::Obj(next))
-            if crate::value::Gc::ptr_eq(source, next) && crate::value::Gc::strong_count(source) <= 4)
+            if crate::value::Gc::ptr_eq(source, next) && !crate::value::Gc::outlives_release(source, 4))
         {
             return Ok(None);
         }
@@ -81,7 +83,9 @@ impl Interp {
                         .is_some_and(|proto| crate::value::Gc::ptr_eq(proto, next)),
                 );
                 let retired_edges = target_edge + prototype_edge;
-                if retired_edges != 0 && crate::value::Gc::strong_count(next) <= retired_edges + 2 {
+                if retired_edges != 0
+                    && !crate::value::Gc::outlives_release(next, retired_edges + 2)
+                {
                     return Ok(None);
                 }
             }

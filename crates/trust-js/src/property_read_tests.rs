@@ -319,7 +319,7 @@ fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_dr
         .unwrap();
     assert!(Gc::ptr_eq(
         constructor.as_obj().unwrap(),
-        &Gc::from(weak.upgrade().unwrap())
+        &weak.upgrade().unwrap()
     ));
     drop((prototype, constructor));
     engine.interp.gc_collect();

@@ -451,10 +451,7 @@ fn sloppy_fragment_aliases_retire_on_collection_and_host_interruption() {
     }
 }
 
-type WatchedBufferOwner = (
-    std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
-    usize,
-);
+type WatchedBufferOwner = (crate::value::WeakGc, usize);
 thread_local! {
     static WATCHED_BUFFER_OWNER: std::cell::RefCell<Option<WatchedBufferOwner>> = const {
         std::cell::RefCell::new(None)

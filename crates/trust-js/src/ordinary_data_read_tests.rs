@@ -375,7 +375,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
             .value();
         assert!(Gc::ptr_eq(
             constructor.as_obj().unwrap(),
-            &Gc::from(weak_function.upgrade().unwrap())
+            &weak_function.upgrade().unwrap()
         ));
         drop(constructor);
         drop(first);

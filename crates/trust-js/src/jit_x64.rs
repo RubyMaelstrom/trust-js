@@ -1097,7 +1097,7 @@ pub(super) fn compile_entry(
             Op::InlineGuard(t, target) => {
                 let it = chunk.jit_inline_target(*t);
                 let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
-                    let some: Option<crate::value::Gc> = Some(crate::value::Gc::from(o));
+                    let some: Option<crate::value::Gc> = Some(o);
                     unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
                 });
                 match stored {

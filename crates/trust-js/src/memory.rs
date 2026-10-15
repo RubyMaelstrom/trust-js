@@ -1329,7 +1329,7 @@ fn scan_realm(
                 interp
                     .creation_pins
                     .len()
-                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+                    .saturating_mul(size_of::<(usize, crate::value::WeakGc)>()),
             )
             .saturating_add(
                 interp
@@ -1452,7 +1452,7 @@ fn scan_realm(
                     .native_function_realms
                     .borrow()
                     .len()
-                    .saturating_mul(size_of::<(usize, (std::rc::Weak<RefCell<Object>>, usize))>()),
+                    .saturating_mul(size_of::<(usize, (crate::value::WeakGc, usize))>()),
             )
             .saturating_add(
                 interp
@@ -1460,14 +1460,14 @@ fn scan_realm(
                     .len()
                     .saturating_mul(size_of::<(
                         usize,
-                        (std::rc::Weak<RefCell<Object>>, crate::value::PropertyLayout),
+                        (crate::value::WeakGc, crate::value::PropertyLayout),
                     )>()),
             )
             .saturating_add(
                 interp
                     .htmldda
                     .len()
-                    .saturating_mul(size_of::<(usize, std::rc::Weak<RefCell<Object>>)>()),
+                    .saturating_mul(size_of::<(usize, crate::value::WeakGc)>()),
             ),
     );
     for line in &interp.console {

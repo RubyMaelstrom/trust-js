@@ -7,8 +7,7 @@
 //! HashMap bucket/control storage are reported separately by memory.rs.
 use super::loop_fragment::{Context, Plan, RootKind};
 use crate::ast::LoopSiteToken;
-use crate::value::{Gc, Object};
-use std::cell::RefCell;
+use crate::value::Gc;
 use std::rc::{Rc, Weak};
 
 const ENTRIES: usize = 64;
@@ -19,7 +18,7 @@ const TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 struct Key {
     site: Weak<LoopSiteToken>,
-    realm: Weak<RefCell<Object>>,
+    realm: crate::value::WeakGc,
     kind: RootKind,
     context: Context,
     labels: Box<[Box<str>]>,

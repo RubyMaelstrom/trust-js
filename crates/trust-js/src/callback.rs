@@ -8,10 +8,9 @@
 use crate::bytecode::{CallSite, Tier};
 use crate::fasthash::FastMap;
 use crate::interpreter::{Abrupt, Interp, PreparedCall};
-use crate::value::{Object, PackedValue, Value};
+use crate::value::{PackedValue, Value};
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
-use std::rc::Weak;
 
 pub(crate) struct Callback {
     // This strong root owns the closure and its environment across every GC/callback reentry.
@@ -34,7 +33,7 @@ const PREPARE_ATTEMPTS: u8 = 32;
 /// never caches a property lookup: proxy traps and accessor functions are fetched afresh first.
 pub(crate) struct CallbackCache {
     site: CallSite,
-    pins: RefCell<FastMap<usize, Weak<RefCell<Object>>>>,
+    pins: RefCell<FastMap<usize, crate::value::WeakGc>>,
 }
 
 impl Callback {
@@ -215,7 +214,7 @@ impl CallbackCache {
                 self.pins
                     .borrow()
                     .len()
-                    .saturating_mul(std::mem::size_of::<(usize, Weak<RefCell<Object>>)>()),
+                    .saturating_mul(std::mem::size_of::<(usize, crate::value::WeakGc)>()),
             )
     }
 }

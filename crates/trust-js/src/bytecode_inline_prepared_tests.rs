@@ -106,7 +106,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
                 panic!("planned user callee")
             };
             // FnFrame tracks the callable object identity, rather than the shared AST.
-            LEAF_FUNCTION.with(|function| function.set(std::rc::Rc::as_ptr(&callee) as usize));
+            LEAF_FUNCTION.with(|function| function.set(crate::value::Gc::as_ptr(&callee) as usize));
             let body = user.func.execution_code().and_then(Option::as_ref).unwrap();
             body.jit.get().flatten()
         });

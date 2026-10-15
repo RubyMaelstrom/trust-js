@@ -939,7 +939,7 @@ pub struct InlineTarget {
     pub expected: usize,
     /// Keeps `expected` from ever being recycled (same ABA argument as [`CallIc`]): a live
     /// `Value::Obj` whose payload equals it therefore IS the same, still-alive function.
-    pub pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pub pin: crate::value::WeakGc,
     /// Exact shared closure environment required by a non-global free-name inline. Zero means
     /// the callee has no such dependency.
     pub expected_env: usize,
@@ -1129,14 +1129,14 @@ struct CallOverflowEntry {
     call: CallIc,
     // Unlike a site's entries, this cache can outlive the originating Chunk. It must own
     // its OWN Weak allocation pin; borrowing that chunk's ABA proof would be unsound.
-    pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pin: crate::value::WeakGc,
 }
 
 impl Default for CallOverflowEntry {
     fn default() -> Self {
         Self {
             call: CallIc::EMPTY,
-            pin: std::rc::Weak::new(),
+            pin: crate::value::WeakGc::new(),
         }
     }
 }
@@ -1196,11 +1196,7 @@ impl CallOverflow {
         }
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        call: CallIc,
-        pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
-    ) {
+    pub(crate) fn insert(&mut self, call: CallIc, pin: crate::value::WeakGc) {
         if call.epoch == u32::MAX {
             return;
         }
@@ -2398,9 +2394,7 @@ pub struct Chunk {
     /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
     /// keyed by that address — one pin per distinct callee no matter how often sites refill, so a
     /// megamorphic site can't exhaust the budget for the whole chunk.
-    call_pins: std::cell::RefCell<
-        crate::fasthash::FastMap<usize, std::rc::Weak<std::cell::RefCell<crate::value::Object>>>,
-    >,
+    call_pins: std::cell::RefCell<crate::fasthash::FastMap<usize, crate::value::WeakGc>>,
     /// The inline sites this chunk's positions name (`crate::stack_trace::InlineSite`).
     inline_sites: crate::stack_trace::InlineSites,
     /// Guard data for speculatively inlined call sites (`Op::InlineGuard` indexes this).
@@ -2774,10 +2768,11 @@ impl Chunk {
             }
         }
         let call_pins = self.call_pins.borrow();
-        bytes = bytes.saturating_add(call_pins.len().saturating_mul(std::mem::size_of::<(
-            usize,
-            std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
-        )>()));
+        bytes = bytes.saturating_add(
+            call_pins
+                .len()
+                .saturating_mul(std::mem::size_of::<(usize, crate::value::WeakGc)>()),
+        );
         if call_pins.capacity() != 0 {
             visitor.mark_function_bytecode_opaque_storage();
         }
@@ -2848,7 +2843,7 @@ struct ArgumentsForwarder {
 struct ForwarderRuntime {
     initializer: usize,
     apply: usize,
-    pin: std::rc::Weak<std::cell::RefCell<crate::value::Object>>,
+    pin: crate::value::WeakGc,
     chunk: Rc<Chunk>,
 }
 
@@ -6370,7 +6365,7 @@ fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])
 
 type NamePin = Option<std::rc::Weak<std::cell::RefCell<crate::interpreter::Scope>>>;
 type NameSeed = (Rc<str>, NameIc, NamePin, Option<u64>);
-type CallPin = std::rc::Weak<std::cell::RefCell<crate::value::Object>>;
+type CallPin = crate::value::WeakGc;
 
 struct CallSeed {
     entries: [CallIc; CALL_IC_WAYS],
@@ -7639,7 +7634,7 @@ fn plan_inlines_at(
             let Some(weak) = pins.get(&ic.callee) else {
                 skip!(idx, "no pin")
             };
-            let Some(obj) = weak.upgrade().map(crate::value::Gc::from) else {
+            let Some(obj) = weak.upgrade() else {
                 skip!(idx, "dead callee")
             };
             let b = obj.borrow();
@@ -22310,13 +22305,7 @@ unsafe fn jit_call_hit_inner(
     // (same ownership story as jit_call_inner's Some arm).
     sp = args_ptr.sub(1);
     match sp.read().into_value() {
-        Value::Obj(o) => {
-            if crate::value::Gc::strong_count(&o) > 1 {
-                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
-            } else {
-                drop(o);
-            }
-        }
+        Value::Obj(o) => crate::value::Gc::release(o),
         other => drop(other),
     }
     if with_this {
@@ -22398,13 +22387,7 @@ unsafe fn jit_call_hit_native(
     // Arguments and `this` were moved; pop them virtually and drop only the callee slot.
     sp = args_ptr.sub(1);
     match sp.read().into_value() {
-        Value::Obj(o) => {
-            if crate::value::Gc::strong_count(&o) > 1 {
-                unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
-            } else {
-                drop(o);
-            }
-        }
+        Value::Obj(o) => crate::value::Gc::release(o),
         other => drop(other),
     }
     if with_this {
@@ -23131,13 +23114,7 @@ unsafe fn jit_new_inner(
     } {
         *sp = unsafe { args_ptr.sub(1) };
         match unsafe { sp.read().into_value() } {
-            Value::Obj(o) => {
-                if crate::value::Gc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
-                } else {
-                    drop(o);
-                }
-            }
+            Value::Obj(o) => crate::value::Gc::release(o),
             other => drop(other),
         }
         let v = r?;
@@ -23936,15 +23913,7 @@ unsafe fn jit_call_inner(
                     // Arguments and `this` were consumed; drop only the callee slot.
                     *sp = args_ptr.sub(1);
                     match sp.read().into_value() {
-                        Value::Obj(o) => {
-                            if crate::value::Gc::strong_count(&o) > 1 {
-                                unsafe {
-                                    Rc::decrement_strong_count(crate::value::Gc::into_raw(o))
-                                };
-                            } else {
-                                drop(o);
-                            }
-                        }
+                        Value::Obj(o) => crate::value::Gc::release(o),
                         other => drop(other),
                     }
                     if with_this {
@@ -23972,13 +23941,7 @@ unsafe fn jit_call_inner(
         // live references, so peel that case into a bare refcount decrement instead of the
         // outlined generic Value drop.
         match sp.read().into_value() {
-            Value::Obj(o) => {
-                if crate::value::Gc::strong_count(&o) > 1 {
-                    unsafe { Rc::decrement_strong_count(crate::value::Gc::into_raw(o)) };
-                } else {
-                    drop(o);
-                }
-            }
+            Value::Obj(o) => crate::value::Gc::release(o),
             other => drop(other),
         }
         if with_this {

@@ -32,9 +32,10 @@ impl Gc {
         Gc(ManuallyDrop::new(rc))
     }
 
-    /// Wrap a new object allocation.
+    /// Allocate `object` in `heap`, the agent heap that owns it.
     #[inline]
-    pub(crate) fn new(object: RefCell<Object>) -> Gc {
+    pub(crate) fn new_in(heap: &crate::value::GcHeap, object: RefCell<Object>) -> Gc {
+        let _ = heap;
         Gc::from_rc(Rc::new(object))
     }
 
@@ -80,14 +81,22 @@ impl Gc {
     /// A weak handle (see [`WeakGc`]).
     #[inline]
     pub fn downgrade(this: &Gc) -> WeakGc {
-        Rc::downgrade(&this.0)
+        WeakGc(Rc::downgrade(&this.0))
     }
 
-    /// The number of strong handles. Refcount-observing heuristics must treat this as advisory:
-    /// a tracing heap has no such count.
+    /// The number of strong handles. Production code asks [`Gc::outlives_release`] instead: a
+    /// tracing heap has no such count.
     #[inline]
     pub fn strong_count(this: &Gc) -> usize {
         Rc::strong_count(&this.0)
+    }
+
+    /// Whether the object survives the release of `released` of its handles: releasing them
+    /// cannot run its destructor (or weak observers) synchronously. Always true on a tracing
+    /// heap, where releasing a handle never destroys anything.
+    #[inline]
+    pub fn outlives_release(this: &Gc, released: usize) -> bool {
+        Rc::strong_count(&this.0) > released
     }
 
     /// The `Rc` behind this handle, for the few paths that genuinely depend on `Rc` itself
@@ -96,11 +105,69 @@ impl Gc {
     pub fn as_rc(this: &Gc) -> &Rc<RefCell<Object>> {
         &this.0
     }
+
+    /// A new owner of the object at `ptr`, which another handle keeps alive.
+    ///
+    /// # Safety
+    /// `ptr` must be [`Gc::as_ptr`] of a live object.
+    #[inline]
+    pub unsafe fn clone_from_raw(ptr: *const RefCell<Object>) -> Gc {
+        unsafe {
+            Rc::increment_strong_count(ptr);
+            Gc::from_raw(ptr)
+        }
+    }
+
+    /// Release a handle, skipping the final-release bookkeeping when another owner remains.
+    /// Equivalent to `drop(this)`; hot VM paths use it for consumed callee slots.
+    #[inline]
+    pub fn release(this: Gc) {
+        if Rc::strong_count(&this.0) > 1 {
+            // SAFETY: `into_raw` gives up this handle's reference, which is released here.
+            unsafe { Rc::decrement_strong_count(Gc::into_raw(this)) };
+        } else {
+            drop(this);
+        }
+    }
 }
 
-/// A weak object handle: `upgrade()` yields `Option<Rc<RefCell<Object>>>`; wrap it with
-/// `Gc::from`.
-pub type WeakGc = std::rc::Weak<RefCell<Object>>;
+/// A weak object handle. [`WeakGc::upgrade`] yields a [`Gc`] while the object is alive.
+#[derive(Clone, Default)]
+pub struct WeakGc(std::rc::Weak<RefCell<Object>>);
+
+impl WeakGc {
+    /// A handle that never upgrades.
+    #[inline]
+    pub fn new() -> WeakGc {
+        WeakGc(std::rc::Weak::new())
+    }
+
+    #[inline]
+    pub fn upgrade(&self) -> Option<Gc> {
+        self.0.upgrade().map(Gc::from_rc)
+    }
+
+    /// The object's address ([`Gc::as_ptr`]), valid as an identity even after it died.
+    #[inline]
+    pub fn as_ptr(&self) -> *const RefCell<Object> {
+        self.0.as_ptr()
+    }
+
+    #[inline]
+    pub fn ptr_eq(&self, other: &WeakGc) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+
+    #[inline]
+    pub fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    #[inline]
+    pub fn weak_count(&self) -> usize {
+        self.0.weak_count()
+    }
+}
 
 impl std::ops::Deref for Gc {
     type Target = RefCell<Object>;

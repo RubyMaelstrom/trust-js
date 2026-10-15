@@ -503,3 +503,14 @@ trust-js-node test now compares identity through RefCell::as_ptr, since
 Gc is not part of the embed API). Lib suite unchanged (2149/0/3);
 workspace builds with tests; clippy clean with embed, embed+gc-heap and
 for trust-js-node.
+
+Step 2a, remaining Rc tricks behind the seam (default build, no behavior
+change): WeakGc is a newtype whose upgrade() yields Gc (35 explicit
+Weak<RefCell<Object>> types replaced); object refcount manipulation goes
+through Gc::clone_from_raw (FnFrame::callee, old-collector marking) and
+Gc::release (five consumed-callee fast paths in the bytecode VM);
+jit_prepare_packed_numeric_mirror borrows the RefCell directly instead of
+rebuilding an Rc; Gc::new_in(heap, ..) receives the owning Agent heap;
+array_binding's destruction-observing strong-count tests became
+Gc::outlives_release (always true on a tracing heap). Lib suite unchanged
+(2149/0/3); clippy clean (embed, embed+gc-heap); workspace builds.

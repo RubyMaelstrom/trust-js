@@ -5775,14 +5775,14 @@ pub(crate) struct ArrayIterationProof {
     iterator_key: Option<Rc<str>>,
     iterator_slot: usize,
     next_slot: usize,
-    values: std::rc::Weak<RefCell<Object>>,
-    next: std::rc::Weak<RefCell<Object>>,
-    prototype: std::rc::Weak<RefCell<Object>>,
+    values: crate::value::WeakGc,
+    next: crate::value::WeakGc,
+    prototype: crate::value::WeakGc,
 }
 
 impl ArrayIterationProof {
     /// Whether the slot at `slot` of `object` holds exactly the pinned function `expected`.
-    fn holds(object: &Gc, slot: usize, expected: &std::rc::Weak<RefCell<Object>>) -> bool {
+    fn holds(object: &Gc, slot: usize, expected: &crate::value::WeakGc) -> bool {
         object
             .borrow()
             .props
@@ -5878,12 +5878,7 @@ pub(crate) fn array_iteration_is_intrinsic(i: &Interp, value: &Value) -> bool {
 /// [`array_iteration_is_intrinsic`], returning the `next` method GetIterator reads. `None`
 /// means "use the observable algorithm".
 pub(crate) fn intrinsic_array_iteration_next(i: &Interp, value: &Value) -> Option<Value> {
-    with_intrinsic_array_iteration(i, value, |proof| {
-        proof
-            .next
-            .upgrade()
-            .map(|next| Value::Obj(Gc::from_rc(next)))
-    })
+    with_intrinsic_array_iteration(i, value, |proof| proof.next.upgrade().map(Value::Obj))
 }
 
 fn with_intrinsic_array_iteration<R>(
@@ -5903,7 +5898,7 @@ fn with_intrinsic_array_iteration<R>(
                 return None;
             }
         }
-        let prototype = Gc::from_rc(proof.prototype.upgrade()?);
+        let prototype = proof.prototype.upgrade()?;
         if !ArrayIterationProof::holds(&i.array_proto, proof.iterator_slot, &proof.values)
             || !ArrayIterationProof::holds(&prototype, proof.next_slot, &proof.next)
         {
