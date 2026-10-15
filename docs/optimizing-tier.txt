@@ -101,6 +101,18 @@ eligibility can therefore change without a configured threshold override. Smalle
 or earlier compiler eligibility do not establish framework native entry,
 compilation repayment or application performance acceptance.
 
+A separate native x86-64 comparison of the frozen 826-file runtime-probe snapshot
+used normal hot admission and only toggled borrowed operands. On the fixed React
+19.2.7 direct SSR workload, seven alternating process pairs showed 2.65% less
+renderer-and-equality time (empirical 95% interval: 1.31% to 3.29% less). Sampled
+peak RSS rose 2.44%, and the dashboard-static case took 1.76% longer. Separate
+same-artifact diagnostics proved actual pushStartInstance optimizing native publication
+and entry with borrowing enabled; those counters do not describe the timed processes.
+This is scoped SSR evidence, separate from later main/activation compositions;
+compilation repayment was not isolated and defaults remain off. See
+benchmarks/review-borrowed-operands-react-2026-10-15.txt for all six cases, the
+retained invalid attempts, exact controls and artifact provenance.
+
 Normative basis: ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
 GetValue, PutValue and ArgumentListEvaluation preserve reference and argument order:
 https://tc39.es/ecma262/#sec-getvalue
@@ -133,7 +145,7 @@ retain the existing post-effect validation and exact recovery boundary.
 The unchanged field-loop kernel runs about 4.52 times faster, but the subsequent
 effect-scoped application screen has a score ratio of 0.978085 versus template
 execution. Neither the feature nor either runtime admission policy is enabled by
-default. Switching code generators has not established an application gain.
+default. Those loop-continuation measurements did not establish an application gain.
 Representation, activation, DOM traversal and retained-style improvements now
 reside in the primary source trees and ordinary release artifacts. Their final
 performance acceptance remains in progress. See architecture-outcome-20260929.md

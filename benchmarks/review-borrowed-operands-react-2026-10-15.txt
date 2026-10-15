@@ -1,0 +1,236 @@
+Borrowed operands: native React SSR comparison, 2026-10-15
+==========================================================
+
+Result and scope
+----------------
+The same native x86-64 release CLI, with only borrowed operands toggled from 0 to
+1, used 2.65% less renderer-and-equality time on the fixed React 19.2.7 SSR
+workload. The preregistered empirical 95% paired-bootstrap interval is 1.31% to
+3.29% less time. Sampled process peak RSS increased 2.44%, and dashboard-static
+rendering took 1.76% longer. These costs remain part of the result.
+
+This measures a separate frozen 826-file runtime-probe snapshot based on f09aac63,
+including selected native PCs, borrowed windows and lazy owner-helper addresses.
+It is not a measurement of later main or logical-activation compositions. The
+optimizing-jit feature, hot runtime selection and borrowed operands remain opt-in;
+no default, hard IR/block cap or configured hotness threshold changed. This is an
+authored SSR comparison, not browser/Speedometer or Node/Ladybird performance.
+
+All six cases and resources
+--------------------------
+Values are changes in the median of seven paired candidate/baseline ratios.
+Negative time changes mean less time; positive resource changes mean more use.
+These are paired medians, not ratios of independently computed arm medians.
+Intervals are nominal empirical 95% intervals. Parallel components and resources
+are exploratory, unadjusted intervals; the six cases are not extra replications.
+
+  Metric                         Change       95% interval
+  ----------------------------  --------   ------------------
+  Six-case total (primary)         -2.65%     -3.29% to  -1.31%
+  small-string                    -1.31%     -1.96% to  +1.33%
+  small-static                    -1.02%     -1.86% to  +1.20%
+  dashboard-string                +0.42%     -0.56% to  +3.02%
+  dashboard-static                +1.76%     +0.90% to  +2.82%
+  escaped-string                 -10.38%    -11.01% to  -9.76%
+  escaped-static                  -4.12%     -4.64% to  -3.65%
+
+  Process wall time               -2.69%     -3.36% to  -1.37%
+  Process CPU                     -2.62%     -3.20% to  -1.25%
+  Process user CPU                -2.60%     -3.10% to  -1.26%
+  Process system CPU              -4.70%     -9.20% to  +0.13%
+  Import/input time                0.00%     -2.78% to   0.00%
+  Post-exec sampled peak RSS       +2.44%     +2.04% to  +2.71%
+  wait4 peak RSS                   +2.51%     +2.04% to  +2.66%
+
+The primary sums the six original integer-millisecond Date.now intervals. Each
+includes rendering, complete-string equality and the existing case-begin output;
+import/input, completed-record HTML serialization and the final coverage footer
+are outside those clocks. Process wall/CPU/RSS includes export and normal teardown.
+wait4 RSS also includes pre-exec activity; sampled VmHWM is a separate observation.
+Neither is post-GC retained JavaScript memory.
+
+All seven primary pairs improved. Baseline totals by pair were
+15724, 15808, 15997, 16010, 15770, 15767, 15996 ms; matched candidate totals were
+15588, 15389, 15470, 15301, 15563, 15415, 15534 ms. The primary median ratio is
+0.9734944331983806, with interval [0.9670563230605739, 0.9868738110336082].
+The sampled-RSS ratio is 1.0244475378458326, with interval
+[1.0204401148125597, 1.0271016256628707]. Full samples for all 14 metrics remain
+in the machine-readable analysis.
+
+No stable measured component met the recorded regression criterion: median loss
+above 3% with its 95% interval excluding parity in the slower direction. The
+memory increase and dashboard-static slowdown are still visible tradeoffs, not
+claims of parity. Dashboard-string's interval permits a 3.02% loss, so component
+equivalence is not established. Thirteen of 14 Phase0 metrics were stable under
+the fixed precision rule; system CPU was noisy and has no equivalence claim.
+
+Protocol and correctness
+------------------------
+Five baseline variance processes preceded seven fixed alternating pairs:
+B/C, C/B, B/C, C/B, B/C, C/B, B/C. Every fresh process ran the unchanged six cases
+128 times, with no additional warmup, calls, drain, selected cases or thresholds.
+The fixed 19 processes completed 14,592 renders. Every render checked complete
+HTML equality internally; independent replay also checked all 228 retained first
+and last complete UTF-8 bodies and their hashes against the pinned oracle.
+Distinct bodies for all 14,592 renders are not independently logged.
+
+Phase0 primary totals were 15799, 15817, 15852, 15752, 15676 ms: relative MAD
+0.2975%, range/median 1.1140%, within the preregistered 1% and 6% limits. After
+all pairs, an arm's primary sample beyond max(6*MAD, 6% of arm median) would have
+excluded the entire cohort. None did. No sample was deleted, replaced or pooled.
+The bootstrap uses random.Random(20261015), 50,000 resamples of seven complete
+pair indices with replacement, median candidate/baseline ratio for each draw,
+and linear q*(N-1) percentiles at 2.5 and 97.5. It ran only after measurement and
+raw evidence sealing. Independent review reproduced the arrays, draw hash,
+intervals, correctness, resource calculations and policy flags.
+
+Renderer CPU was 5, controller CPU 4; CPU 1 is CPU 5's physical sibling and had
+zero busy ticks in retained per-process samples. No governor was changed: the
+recorded governor was powersave with a 3,500,000 kHz maximum. The dedicated native
+host was Zombie, Linux 7.2.9-2-cachyos, x86_64. Measurement ran from
+2026-10-15 03:49:55 to 03:55:01 UTC. The per-process watchdog was 600 seconds and
+the prospective native whole-cohort watchdog 1200 seconds.
+
+The sampled 0.2-second comm/executable guard and between-process checks found no
+foreign worker. They cannot prove global idleness or exclude unknown/sub-200ms
+activity. Seven expected children briefly lacked /proc/exe while exiting. Each
+observation matched the actual unreaped child PID/start and stable parent; the
+controller required exact-PID/UID terminal waitid(WEXITED|WNOHANG|WNOWAIT) proof
+before wait4. State alone never exempted a worker. All 19 processes exited 0,
+passed affinity/output/pin/oracle checks and left no owned group survivors or
+cleanup errors. No other SSH command ran during the cohort.
+
+Exact build, input and controls
+------------------------------
+Source: /tmp/trust-js-selected-native-pcs-runtime-probe-v3-20261015, 826 files.
+Base: f09aac630b02bc9693e07fbfd3dd671a329ef42a plus the frozen compiler/bridge
+snapshot, identified by the complete source inventory below. The probe's cold
+coverage/policy export is present in the same ELF in both arms; native execution
+diagnostics are off for timing. Required baseline coverage feedback remains on.
+The fixture's timing_eligible:false and performance_acceptance:false literals
+were preserved: this result uses a separately preregistered external protocol.
+It is not the older phased 32-warmup/96-measured fixture.
+
+Build command (CLI only, private target, native GNU x86-64):
+  cargo build --offline --locked --release -p trust-js-cli \
+    --features optimizing-jit --target x86_64-unknown-linux-gnu -j4 \
+    --message-format=json-render-diagnostics
+CARGO_INCREMENTAL=0; runtime engine features default, embed, intl, optimizing-jit.
+Rust 1.98.0, commit 88d9e12ae178fab0fb5cc050a94da85685d449ea, LLVM 22.1.8.
+Runtime/CLI profile: opt3, no debug assertions, no tests, fat LTO, one codegen unit,
+panic=abort. The build-time host snapshot engine is separately recorded as opt0.
+Cargo JSON proves fresh:false for runtime engine and CLI. Source/ancestor/HOME
+Cargo configurations were inventoried; no applicable profile or rustflag override
+was present. The native CLI optional/default all-target checks passed; raw unused
+code warnings are retained, with no strict native lint claim.
+
+Every process used taskset -c 5 and the same frozen-cli-release. The exact clean
+base environment was PATH=/usr/bin:/bin, HOME=/home/ruby, LANG=C.UTF-8,
+LC_ALL=C.UTF-8, TZ=UTC, TMPDIR=/tmp. Common controls were:
+  NODE_ENV=production
+  TRUST_JS_TIER=jit
+  TRUST_JS_OPT_JIT=hot
+  TRUST_JS_OPT_JIT_BACKGROUND=0
+  TRUST_JS_OPT_JIT_OSR=0
+  TRUST_JS_OPT_JIT_GENERIC_OWN=1
+  TRUST_JS_OPT_JIT_SHARED_OWNERS=1
+  TRUST_JS_OPT_JIT_SHARED_RECOVERY=1
+  TRUST_JS_OPT_JIT_DIAGNOSTICS=0
+  TRUST_JS_OPT_JIT_OBSERVED_REGIONS=1
+  TRUST_JS_OPT_JIT_LARGE_REGIONS=1
+  TRUST_JS_OPT_JIT_SHARED_READ_GUARDS=1
+  TRUST_JS_OPT_JIT_COVERAGE=1
+  TRUST_JS_OPT_JIT_VALUE_FACTS=1
+  TRUST_JS_OPT_JIT_LOCAL_EFFECTS=1
+  TRUST_JS_OPT_JIT_SPARSE_RELOADS=1
+  SSR_RENDERS=128
+The sole arm difference was TRUST_JS_OPT_JIT_BORROWED_OPERANDS=0 versus 1.
+HOT_AT, INLINE_AT, TIER_THRESHOLD, JIT_ADMIT_RUNS, DEOPT_AT, optimizer logging,
+admission/PERF metrics, loaders and profilers were absent. No native execution
+counter is inferred for these timed processes.
+
+React and react-dom were 19.2.7 (scheduler 0.27.0); the 85 original package files
+and all workload/oracle bytes were pinned. A separate same-source/ELF prerequisite
+ran OPT0 functional control and both normal-hot execution-diagnostic arms. Each
+completed the same 768 renders. With borrowing enabled, actual pushStartInstance
+Code 4/body 159 compiled, published and recorded 177,559 native entries/normal
+native returns. The disabled arm had no optimizing compiled/publication/native
+push event; template code remained available. Normal native returns may still
+invoke checked helpers; the diagnostic run's zero terminal VM recoveries,
+bailouts and retirement requests does not establish zero helper work.
+Those counters are separate evidence, not counters for the timed processes or
+proof that only pushStartInstance caused the measured difference. Other hot
+functions and admission distances can change under the same normal policy.
+
+Retained failures and interpretation limits
+------------------------------------------
+Two earlier Crystal cohorts and the first native cohort remain wholly excluded.
+Crystal V1 stopped on its own exited child's unavailable exe; Crystal V2 stopped
+on an unattributed Cargo worker. Native V1 stopped on its own unreaped child in
+state R with unavailable exe (11 completed valid processes). None supplied partial
+pair ratios or bootstrap samples. Their reports and cleanup records were retained.
+The reviewed guard successor passed 48 source/pure/real-child checks before this
+new prospective cohort; no workload was replayed to fill a missing sample.
+
+Normal-policy compilation occurs within applicable workload clocks, but isolated
+compilation cost and repayment were not measured. There is no separate startup,
+pause/tail-latency or post-GC retained-memory result. No fully uninstrumented
+process claim is made: the cold final coverage export remains. This evidence
+supports only the exact authored SSR comparison. It neither enables the optimizer
+or borrowing by default nor establishes browser, whole-engine or Node/Ladybird
+performance, a completed optimizing tier or current-main performance acceptance.
+
+Provenance and retained evidence
+-------------------------------
+All hashes below are SHA-256. Source and binary stayed identical before/after;
+all 949 original prepared files and their one symlink were verified unchanged.
+Local investigation artifacts are retained evidence, not build dependencies.
+
+  Source inventory (826 files):
+    2eb02c431a06edc96a0e8a194c33f426094b88ad348901c30d6fd5b569481fa3
+  Native release ELF (32,192,776 bytes):
+    990ad3e0a98f4aa6af891c1ec60e66ec652a0d5be5abc2164cd103f652bf3cfa
+  Original direct768 render-direct.cjs:
+    a1d40f5dd7732b6182a37c4aa613572c5d53020c067a5eec15695780a9030cb1
+  react-dom-server-legacy.node.production.js (242,793 bytes):
+    a2fb5cb23114673bf370869d43d90c043aa919ebcc6cdbd5de9a46c72b17707a
+  Complete HTML oracle manifest:
+    307ffaf43ba3f8c8ab186cb5490d3f9823b1b09399f79d37cd0d979ccd1a0364
+  Bound prospective native plan:
+    bf54f519c74ced25f2b933bb0742b847dcf80ad83c90660bd6b5456341058501
+  Preregistered analysis-spec.json:
+    5a8524f6ed76fcb4604bdaf52c1860af1bae0fae0ede4cd22396efa71f6170d7
+  Native source/package/controller bundle:
+    1f14758fb78727f0fb84b005c45203138ecd6f8e96ab4192b3800f94e712f768
+  Terminal-proof guard/controller patch:
+    eef50fc06d70107d8c9568d212e52c852ba3854aa4ebe014a2257a1bfa3ce7ad
+  Terminal-proof guard/controller overlay archive:
+    d5fe1102d5c8abcb3894a576bd9cca6129884c4542fd0d255f96863c1fe93c96
+  Completed raw report:
+    506d3de0b9f27747df8e35487e23367f2481487463d7029a8a323e07da8b7f63
+  Raw archive (101 files/100 seal references):
+    93ce17a4d7297b62f41498c355350d78ed200438d6b204e80daa135411696732
+  Paired analysis:
+    a18b5b2a3b373027431b9131dd1f8e4fbcf4f555ca73d577e42540550ee553a0
+  Independent completed-cohort audit:
+    e5e8bbee8871ac720a4a548566103728a6b636683fc8d53158e971b335086e05
+  Root independent raw replay:
+    12dc74f0111c802f317696e9df1f09a11729d501a4d00dc8504cb94f2fdde964
+  Final measurement manifest:
+    bd80d0ecf2aea0b8fad47e753d4b793c78e3fec67871fee9576ca1bef3889c2b
+
+Under target/compiler-review-20261015/:
+  selected-native-pcs-native-terminal-guard-v1/validation-final.json
+    links raw records, plans, guard review, analysis and source/ELF evidence;
+  selected-native-pcs-native-terminal-guard-v1/benchmark-audit-completed-native-v1/
+    review.json and owner-analysis-crosscheck.json retain independent replay;
+  selected-native-pcs-native-terminal-guard-v1/root-independent-raw-replay.json
+    retains the separate root replay of raw HTML, resources and bootstrap;
+  selected-native-pcs-react-native-preparation-v2/native-build-evidence/
+    retains actual Cargo feature/profile/configuration and fresh-artifact proof;
+  selected-native-pcs-react-native-preparation-v2/native-prerequisite-evidence/
+    retains same-artifact correctness and actual normal-policy entry evidence;
+  selected-native-pcs-react-native-preparation-v2/native-invalid-cohort-evidence/
+    retains the excluded first native attempt;
+  selected-native-pcs-react-measurement-v1/ and
+  selected-native-pcs-react-measurement-v2/ retain the excluded Crystal attempts.

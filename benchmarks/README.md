@@ -90,3 +90,8 @@ reduction is scoped to that authored SSR workload.
 The [inline named-field experiment](review-inline-named-fields-2026-10-15.json)
 records a separate seven-pair React SSR comparison. It found no convincing speed
 gain; the object-layout patch remains an isolated experiment and was not promoted.
+
+The [borrowed-operands comparison](review-borrowed-operands-react-2026-10-15.txt)
+records a separate native x86-64 React SSR result: 2.65% less rendering-and-equality
+time with 2.44% higher peak RSS. It covers the exact frozen compiler probe and
+keeps the optional optimization disabled by default.
