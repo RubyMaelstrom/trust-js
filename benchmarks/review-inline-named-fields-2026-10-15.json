@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "status": "completed_negative_SSR_performance_experiment",
+  "date": "2026-10-15",
+  "decision": {
+    "enable_by_default": false,
+    "SSR_throughput_performance_accepted": false,
+    "client_browser_performance_accepted": false,
+    "reason": "No convincing throughput benefit. Keep the feature experimental and disabled by default; no extension or repeat of this cohort is planned."
+  },
+  "source": {
+    "base_commit": "46103f811f4054866a7067132d12412969cf5ef8",
+    "inventory": {
+      "path": "target/compiler-review-20261014/inline-named-fields-v9/source-before.json",
+      "sha256": "d49f15456b19fdb62c4ddc1ad6ef3a5bfd0571c3ba265d225ed10c7407903180"
+    },
+    "source_files": 819,
+    "patch": {
+      "path": "target/compiler-review-20261014/inline-named-fields-v9/source.patch",
+      "sha256": "9799db642073e48c7df714548976756fd0fbeeef8df24aa1d5e3e1cbc5f81fff"
+    },
+    "same_source_for_both_artifacts": true,
+    "note": "d49f1545 is the source inventory SHA prefix, not a Git revision.",
+    "integration_status": "Isolated uncommitted experimental patch, not enabled or merged into the production tree by this measurement."
+  },
+  "build": {
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "Runtime engine and CLI optimization level 3, fat LTO, one codegen unit, panic abort; actual Cargo artifacts fresh:false. Separate host snapshot engine default/intl optimization level 0 is a build dependency.",
+    "baseline_features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "candidate_features": [
+      "default",
+      "embed",
+      "inline-named-fields",
+      "intl",
+      "optimizing-jit"
+    ],
+    "only_feature_delta": [
+      "inline-named-fields"
+    ],
+    "architecture_diagnostics": false,
+    "baseline_CLI": {
+      "sha256": "c2ddededebc61cc21349bf4d2849255e20e84c6d957627ff9cd8cece2890e592",
+      "bytes": 32019720
+    },
+    "candidate_CLI": {
+      "sha256": "ee12d34295111dac4ed6d9a9e61350706de6f7b5b1051ab826d28b386cfb0c18",
+      "bytes": 32035288
+    },
+    "warnings": "Raw Cargo warnings are retained; the builds are not described as warning-free.",
+    "matched_build_report": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-results-v1/native/matched-build-report.json",
+      "sha256": "16cb43065489fc813f69cd6b4478333e6452d16ac23ae32f3486a1dd80f23439"
+    }
+  },
+  "workload": {
+    "name": "Pinned runtime-react-phased-v2 authored dashboard using real React/react-dom 19.2.7",
+    "methods": [
+      "renderToString",
+      "renderToStaticMarkup"
+    ],
+    "manifest": {
+      "path": "target/compiler-review-20261014/runtime-react-phased-v2/manifest.json",
+      "sha256": "7b0a18b3723e06a581469e8cfddfc8795570d82ff7b148655b684619dda5000a"
+    },
+    "package_sources": {
+      "path": "target/compiler-review-20261014/runtime-react-ssr-v1/package-source-before.json",
+      "sha256": "f4762ddcb6822c80f10316d0e147ebc30b6013710a199fcd8b87b3d9b51f7e8d"
+    },
+    "oracle": {
+      "path": "target/compiler-review-20261014/runtime-react-ssr-v1/oracle-dashboard/manifest.json",
+      "sha256": "307ffaf43ba3f8c8ab186cb5490d3f9823b1b09399f79d37cd0d979ccd1a0364"
+    },
+    "cases": [
+      "small-string",
+      "small-static",
+      "dashboard-string",
+      "dashboard-static",
+      "escaped-string",
+      "escaped-static"
+    ],
+    "calls_per_case": "32 warm calls including first-per-case cold render, then three measured batches of 32",
+    "calls_per_process": 768,
+    "warm_calls": 192,
+    "measured_calls": 576,
+    "scope": "Closed-loop SSR of an authored realistic component/data tree; not a deployed page, browser or full Speedometer workload. Only the first case is the first process render. Original direct768 diagnostics are separate and were not timed or pooled."
+  },
+  "protocol": {
+    "runtime_controls": {
+      "NODE_ENV": "production",
+      "TRUST_JS_TIER": "jit",
+      "TRUST_JS_OPT_JIT": "0"
+    },
+    "all_diagnostics_and_threshold_overrides_absent": true,
+    "Phase0_baseline_processes": 5,
+    "fixed_pairs": 7,
+    "fresh_processes": 19,
+    "pair_order": [
+      [
+        "baseline",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "baseline"
+      ],
+      [
+        "baseline",
+        "candidate"
+      ]
+    ],
+    "process_watchdog_s": 180,
+    "cohort_watchdog_s": 2400,
+    "no_retries_extensions_trimming_or_pooling": true,
+    "measurement_utc": [
+      "2026-10-15T01:15:48.360872+00:00",
+      "2026-10-15T01:21:36.492633+00:00"
+    ],
+    "plan": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-timing-plan-v1/timing-plan-final-v1.json",
+      "sha256": "25b1b00ac6c487b7f2a1d3105c7210f3b3b63bdc5f70011053083b482a178b10"
+    }
+  },
+  "machine_and_quiet": {
+    "host": "Zombie, Intel Core i7-6700HQ, GNU Linux x86-64",
+    "controller_CPU": 4,
+    "runtime_CPU": 5,
+    "SMT_sibling_CPU": 1,
+    "policy": "Unchanged intel_pstate powersave; allowed CPU0\u20137; physical sibling pairs 0/4, 1/5, 2/6, 3/7. Exclusive remote scheduler lease.",
+    "guard_events": 0,
+    "runtime_affinity_masks": [
+      "5"
+    ],
+    "live_window_SMT_sibling_busy_ticks_all19": 0,
+    "approximate_CPU5_busy_minus_owned_CPU_seconds_range": [
+      0.03,
+      0.07
+    ],
+    "load_limit": "Sampled asynchronous endpoints omit startup/exit edges and are not exact competing CPU time; no cause is assigned to paired render/CPU tails."
+  },
+  "correctness_and_cleanup": {
+    "valid_normal_exit_processes": 19,
+    "external_complete_HTML_body_checks": 1140,
+    "internal_complete_output_equalities": 14592,
+    "source_files_unchanged_after_timing": 819,
+    "owned_workers_remaining": 0,
+    "tmpfs_copies_removed": true
+  },
+  "Phase0_precision": {
+    "stable_components": 54,
+    "total_components": 81,
+    "primary_median_ms": 13315.705107999991,
+    "primary_relative_MAD_percent": 0.470792350022409,
+    "primary_relative_range_percent": 1.7436580647953468,
+    "flags": "27 components fail the fixed precision policy, mostly tiny validation clocks plus system CPU, one cold render, aggregate validation and the residual. All remain reported."
+  },
+  "primary": {
+    "paired_median_cost_change_percent": 0.7200497375213111,
+    "nominal_95_bootstrap_interval_percent": [
+      -0.9528801717893387,
+      3.1510294907273417
+    ],
+    "unit": "Sum of milliseconds for 576 measured renders per process",
+    "raw_seven_paired_ratios": [
+      1.036151734780686,
+      1.0108952221942518,
+      0.9904711982821066,
+      1.007200497375213,
+      1.0315102949072734,
+      0.9823632884058501,
+      1.0007029847002806
+    ],
+    "baseline_process_median_ms": 13254.468046999995,
+    "candidate_process_median_ms": 13352.246376999998,
+    "conservative_98_4375_sign_interval_percent": [
+      -1.7636711594149923,
+      3.6151734780685896
+    ],
+    "baseline_ms_in_pair_order": [
+      13118.244446,
+      13174.720115,
+      13482.778612000002,
+      13256.790889000005,
+      13254.468046999995,
+      13486.401346999994,
+      13228.536832000005
+    ],
+    "candidate_ms_in_pair_order": [
+      13592.491739999998,
+      13318.261618000004,
+      13354.303888,
+      13352.246376999998,
+      13672.120243999998,
+      13248.545576,
+      13237.836291
+    ]
+  },
+  "six_case_post_warmup_batch_medians": {
+    "small-string": {
+      "paired_median_cost_change_percent": 1.1334244472608113,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.5415403974512456,
+        3.3859967198691443
+      ]
+    },
+    "small-static": {
+      "paired_median_cost_change_percent": 1.4623570640290628,
+      "nominal_95_bootstrap_interval_percent": [
+        -1.4879529581740325,
+        3.1955529664665416
+      ]
+    },
+    "dashboard-string": {
+      "paired_median_cost_change_percent": 1.4514103097418518,
+      "nominal_95_bootstrap_interval_percent": [
+        -1.2889953902499585,
+        2.899422420596043
+      ]
+    },
+    "dashboard-static": {
+      "paired_median_cost_change_percent": 0.5742124389601644,
+      "nominal_95_bootstrap_interval_percent": [
+        -1.2092141888027097,
+        3.090321088061665
+      ]
+    },
+    "escaped-string": {
+      "paired_median_cost_change_percent": 0.2271238516170504,
+      "nominal_95_bootstrap_interval_percent": [
+        -1.0110346007421112,
+        2.992321578870061
+      ]
+    },
+    "escaped-static": {
+      "paired_median_cost_change_percent": 0.03213085530890947,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.7739930402960837,
+        3.016006485615952
+      ]
+    }
+  },
+  "process_and_memory": {
+    "process_wall_s": {
+      "paired_median_cost_change_percent": 0.9186991027881897,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.9343278282270773,
+        3.05469073857203
+      ]
+    },
+    "process_cpu_s": {
+      "paired_median_cost_change_percent": 0.924668545710583,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.8897585196060542,
+        3.075039807033675
+      ]
+    },
+    "sampled_post_exec_peak_RSS_KiB": {
+      "paired_median_cost_change_percent": -0.41397582381188514,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.46899426784783316,
+        0.009501864740957267
+      ],
+      "baseline_median_KiB": 168872,
+      "candidate_median_KiB": 168264
+    },
+    "wait4_peak_RSS_KiB_including_preexec": {
+      "paired_median_cost_change_percent": -0.41397582381188514,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.49495571448869846,
+        -0.16849799463654058
+      ],
+      "baseline_median_KiB": 168872,
+      "candidate_median_KiB": 168264
+    },
+    "sampled_post_exec_peak_RssAnon_KiB": {
+      "paired_median_cost_change_percent": -0.36078266136465587,
+      "nominal_95_bootstrap_interval_percent": [
+        -0.40290725233054214,
+        -0.21614782402403776
+      ],
+      "baseline_median_KiB": 151884,
+      "candidate_median_KiB": 151324
+    }
+  },
+  "interpretation": [
+    "The primary median is slightly slower and its interval includes parity while allowing more than 3% cost. No stable provisional regression is flagged; this does not establish equivalence or a speedup.",
+    "Anonymous and wait4 peak memory decrease slightly with nominal intervals excluding parity; sampled post-exec VmHWM includes parity. These process peaks do not establish live JavaScript heap, allocation traffic, post-GC retention or an allocator size-class benefit.",
+    "Exact-capacity object plus field storage grows 16 bytes for empty or larger objects, is equal for one field and saves 16 bytes for two fields. Actual Vec capacities and receiver populations matter; no allocation population or capacity census is available in this clean cohort.",
+    "Clocks include compilation and rendering/collection work; they do not isolate compilation or natural GC. No optimizing-tier adoption claim follows from OPT_JIT=0.",
+    "The seven-pair empirical bootstrap has small-sample limits. Primary sign bounds have at least 98.4375% median coverage under independent paired observations. Secondary intervals have no multiple-comparison correction. Every pair and tail is retained.",
+    "No overall engine, Node/Ladybird, cross-host or client browser performance claim. Client validation remains separate if a later evidence-based representation change warrants it.",
+    "Referenced raw artifacts and the experimental source patch are retained in ignored local investigation directories; they are not required build inputs or guaranteed in a fresh clone."
+  ],
+  "zero_workload_launcher_failure": {
+    "timed_samples": 0,
+    "reason": "Invalid taskset -c4 syntax stopped the first shell launcher before help/controller/workload markers. Root authorized a spacing-only two-line successor with the same plan and inputs. No actual timed cohort was retried.",
+    "record": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-timing-plan-v1/launcher-failure-and-amendment-v2.json",
+      "sha256": "6b4aad29670b13b2e65f56a332b6c70aa670531b5cc70a4443b87af7a0d87b0f"
+    }
+  },
+  "evidence": {
+    "raw_report": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/native/cohort-timing-v1/report.json",
+      "sha256": "6017e52001cdb8a52723116a0fa9c9b50dc941c36c08c2d4001d4bb226b86c23"
+    },
+    "analysis_81_components": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/analysis-native-n7-v1.json",
+      "sha256": "421e8eb344863fcfdb2d7dfed1b4c232da6e64347f7ba1baafc5fbd95276bde7"
+    },
+    "resource_load_and_tails": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/resource-load-and-tails-v1.json",
+      "sha256": "23e5bc424f3245d8e55cb101fb0ad3b5fe620d16ce7171bd148ac80f677acdee"
+    },
+    "cleanup": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/timing-cleanup-v1.json",
+      "sha256": "d97f7b808a6f94339f3ede3039d424efc54c01a86b976c4817caa745a793ad58"
+    },
+    "raw_inventory": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/timing-evidence-inventory-v1.json",
+      "sha256": "c2160ce4eb8a0250f8b772be1c842d80db7224c73d167e6ad83042e8454f8a21"
+    },
+    "local_copy_proof": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/local-copy-proof.json",
+      "sha256": "f6925e8938e20e5623b4eb87faf98741592d2965e939aa547a90909da8785d29"
+    },
+    "root_build_functional_audit": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-results-v1/root-build-functional-audit.json",
+      "sha256": "432b4463764ed7df63252176ec4a61568a47007cde2d128d1424c50dd012dc1c"
+    },
+    "root_independent_timing_audit": {
+      "path": "target/compiler-review-20261015/inline-named-fields-react-measurement-v1/root-independent-timing-audit.json",
+      "sha256": "2bde76797e070bf521fb9314619f5112f0d61044588d2930d600ba26d3de0399"
+    }
+  }
+}

@@ -86,3 +86,7 @@ The [declarative string accumulation record](../docs/string-accumulation.txt) an
 the native x86-64 React 19.2.7 SSR comparison: seven fixed alternating pairs, with
 separate correctness evidence for the integration. The measured rendering-duration
 reduction is scoped to that authored SSR workload.
+
+The [inline named-field experiment](review-inline-named-fields-2026-10-15.json)
+records a separate seven-pair React SSR comparison. It found no convincing speed
+gain; the object-layout patch remains an isolated experiment and was not promoted.
