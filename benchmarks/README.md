@@ -107,3 +107,10 @@ The [borrowed own-read validation](review-borrowed-own-reads-validation-2026-10-
 records a separate optional compiler feature retained outside main. It covers bounded
 owner transactions and recovery before the original expression prefix; it is a correctness
 and admission record, not an accepted application speed result.
+
+The [resumed Ladybird review](review-ladybird-resumption-2026-10-15.txt) preserves the
+new activation/native-call and borrowed-read checkpoints. A fresh seven-pair browser
+comparison still holds the activation candidate for Vue regressions. The
+[sparse borrowed-read planner](review-borrowed-own-reads-sparse-validation-2026-10-15.json)
+reaches native execution on the React diagnostic under the existing opt-in admission
+rules; application performance acceptance remains separate.

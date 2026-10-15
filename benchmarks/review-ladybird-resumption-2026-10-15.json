@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-15",
+  "status": "continued_in_isolated_review_branches; activation_browser_regression_remains; borrowed_read_admission_blocker_resolved",
+  "main_engine_revision": "f34eb4f9fa1631ec335ade30d50cb3644fad413e",
+  "production_promoted": false,
+  "installed_artifact_replaced": false,
+  "original_checkpoints": {
+    "activation": {
+      "path": "/tmp/trust-js-activation-promotion-20261015",
+      "revision": "a9ba62d26dad3e55e62bf21f54b448cf88bdc879"
+    },
+    "borrowed_reads": {
+      "path": "/tmp/trust-js-borrowed-own-reads-checkpoint-20261015",
+      "revision": "84e041636478e744ae59100825bcb41ccff5f580"
+    }
+  },
+  "activation": {
+    "branch": "review/activation-resumed-20261015",
+    "path": "/tmp/trust-js-activation-resumed-20261015",
+    "revision": "7d43ecf9a581fe730a5625677a66b4cbd32b34ae",
+    "browser_implementation_revision": "8d80b888b140e2421f46bbddfde0794b0218011c",
+    "changes": [
+      "Stop current-frame legacy activation probes upon reaching an older physical depth; preserve same-depth logical/container records and older-target searches.",
+      "Reuse shared call stubs before assembly using complete scalar emission inputs; changed keys still compare exact bytes and unwind data."
+    ],
+    "mechanism_evidence": {
+      "missing_current_frame_probe_fixture": {
+        "older_records": 256,
+        "old_two_probe_visits": 512,
+        "new_two_probe_visits": 2
+      },
+      "shared_stub_cache": "One assembly for the first request and no new assembly for 32 equivalent requests from a distinct caller Chunk; changed layouts, weak lifetime and checked fallbacks tested.",
+      "additional_key_bytes_per_stub_ARM64": 784
+    },
+    "validation": {
+      "optional_selected_parent_executions": 61,
+      "default_selected_parent_executions": 34,
+      "default_all_target_check": true,
+      "optional_all_target_clippy_D_warnings_no_allowance": true,
+      "platform": "Native ARM64; x64 encoding/unwind tests assembled on ARM64. Native x64 browser evidence is separate.",
+      "record": {
+        "path": "target/compiler-review-20261015/activation-resumed-combined-validation-v1/validation.json",
+        "bytes": 13878,
+        "sha256": "00518e84e2d0b4fae1f6b1c7d336280143fa56719a061c87f623d11a837f6568"
+      },
+      "formatting_successor": {
+        "path": "target/compiler-review-20261015/activation-resumed-format-v1/identity-and-format.json",
+        "bytes": 1141,
+        "sha256": "c971a5f434795bdf0673946978b8865d9a4d950ef70f6c6989718e7fbd5a3e76"
+      },
+      "scope": "95 selected test executions on 8d80, not a full suite. The sole later source delta is whitespace in one cfg(test) file; scoped formatting passes on 7d43. Failed formatting check remains preserved.",
+      "test_failures": 0
+    },
+    "direct_call_diagnostic": {
+      "record": {
+        "path": "target/compiler-review-20261015/activation-vue-direct-call-diagnostic-v1/report.json",
+        "bytes": 580167,
+        "sha256": "2b201c2d7a9ff67808acd5e6e84722021eb52a64a4ca071db8bb19c181763c26"
+      },
+      "scope": "Separate fixed three-quartet Vue-only baseline/candidate by direct-call on/off diagnostic, four exact-state functional companions. No pooling with the later cohort. Direct calls partly contribute; completion cost remains when disabled."
+    },
+    "browser": {
+      "plan": {
+        "path": "target/compiler-review-20261015/activation-depth-call-cache-browser-v1/screen-plan.json",
+        "bytes": 11461,
+        "sha256": "f8c875718f6778fd1f9cf5dac12e2af83387ac18367039fbb1a9725a59d20b69"
+      },
+      "handoff": {
+        "path": "target/compiler-review-20261015/activation-depth-call-cache-browser-v1/handoff.json",
+        "bytes": 14043,
+        "sha256": "c55c8e9b8373fed7f283c37cb48cb1aa6c38ecac029cf9e252cc78f232984db4"
+      },
+      "analysis": {
+        "path": "target/compiler-review-20261015/activation-depth-call-cache-browser-v1/seven-pair-analysis.json",
+        "bytes": 126138,
+        "sha256": "268fc4d5572b24fad06061e0ed25de33c5cfb255dc9c0c4ddd2aefc8c3676b66"
+      },
+      "components": {
+        "path": "target/compiler-review-20261015/activation-depth-call-cache-browser-v1/seven-pair-components.csv",
+        "bytes": 22852,
+        "sha256": "7f553b6524684a7fcc5afcabddb62e3c8c37ed3f8263df059b8e76c1505be03c"
+      },
+      "root_recomputation": {
+        "path": "target/compiler-review-20261015/activation-depth-call-cache-browser-v1/root-ratio-review.json",
+        "bytes": 1452,
+        "sha256": "b73f1e7e128ba39366e063a4b3a475a4997fba389f16e0d41953f90d0ed2f1ca"
+      },
+      "baseline_engine": "6ffb311a727dd949fbbf639e2d0de51cbe5d6732",
+      "candidate_elf_sha256": "c660c2d7f60a0df10def52e21e8ba57e23abf611890cde067d8fc89ded2edc27",
+      "machine": "zombie, Intel Core i7-6700HQ, native Linux x86-64, browser CPU5/controller CPU4, powersave policy 800 MHz through 3.5 GHz; exact kernel/governor/topology in plan",
+      "subset": [
+        "TodoMVC-React-Complex-DOM",
+        "TodoMVC-Angular-Complex-DOM",
+        "TodoMVC-Vue",
+        "TodoMVC-jQuery"
+      ],
+      "optimizer_runtime": "0 for both families; default direct calls",
+      "phase0_baselines": 5,
+      "fixed_pairs": 7,
+      "timed_processes": 19,
+      "functional_companions": 2,
+      "functional_states_per_companion": 12,
+      "all_functional_states_equal": true,
+      "javascript_errors": 0,
+      "samples_discarded": 0,
+      "stable_provisional_regressions": {
+        "TodoMVC-Vue/CompletingAllItems/Async": {
+          "median_loss_percent": 3.1842691857381977,
+          "paired_min_max_percent": [
+            2.2567230512649417,
+            4.176578484798266
+          ],
+          "phase0_noise": false,
+          "stable_provisional_regression": true
+        },
+        "TodoMVC-Vue/DeletingAllItems": {
+          "median_loss_percent": 4.133857925170847,
+          "paired_min_max_percent": [
+            2.960359318592065,
+            4.5228991828621945
+          ],
+          "phase0_noise": false,
+          "stable_provisional_regression": true
+        },
+        "TodoMVC-Vue/DeletingAllItems/Sync": {
+          "median_loss_percent": 4.741379310344818,
+          "paired_min_max_percent": [
+            3.8733733787515767,
+            5.123613028050089
+          ],
+          "phase0_noise": false,
+          "stable_provisional_regression": true
+        }
+      },
+      "other_descriptive_metric_concerns": [
+        "TodoMVC-Angular-Complex-DOM/DeletingAllItems/Async",
+        "TodoMVC-Vue/CompletingAllItems/Async",
+        "TodoMVC-Vue/DeletingAllItems",
+        "TodoMVC-Vue/DeletingAllItems/Sync"
+      ],
+      "phase0_precision_flagged_metrics": [
+        "TodoMVC-jQuery/CompletingAllItems/Async",
+        "TodoMVC-jQuery/DeletingAllItems/Async",
+        "TodoMVC-jQuery/DeletingAllItems/Sync"
+      ],
+      "subset_score_cost_percent": 0.8326915666708734,
+      "sampled_process_cpu_cost_percent": 0.5612244897959195,
+      "peak_rss_cost_percent": 0.8467473918446267,
+      "interpretation": "HOLD. Three stable Vue component metrics meet the predeclared provisional regression rule. The seven-pair min/max intervals have 98.4375% pointwise coverage only under independent continuous pair ratios; they are not multiplicity-adjusted. Angular async deletion remains a descriptive concern with an interval crossing parity. Peak RSS is noisy. No overall gain, equivalence, full Speedometer, desktop-presentation, isolated compiler/GC cost or accepted performance claim.",
+      "source_scope": "Browser uses the exact original 853-file engine plus eight changed/added files from 8d80, yielding 855 files. Original documentation differences and excluded branch reports are recorded, so this is not falsely labeled an exact Git checkout. The later 7d43 test-only formatting does not change release code. All original source/artifact snapshots and the pre-Cargo setup failure are preserved."
+    }
+  },
+  "borrowed_reads": {
+    "branch": "review/borrowed-own-reads-sparse-20261015",
+    "path": "/tmp/trust-js-borrowed-own-reads-sparse-20261015",
+    "revision": "c7202706c820f0afb4103e6ea4172634bd87de8a",
+    "implementation_revision": "11e4ba27a3c3398f110bb04da190b358c4741df9",
+    "base": "84e041636478e744ae59100825bcb41ccff5f580",
+    "dependency": "The original held activation a9ba candidate; not composed with the separate activation-resumed branch.",
+    "first_scanner_revision": "aae69cc0",
+    "lint_only_revision": "7ffd51f6",
+    "changes": [
+      "Skip repeated failed local-only suffix searches while retaining earliest eligible certificates.",
+      "Plan only native CFG interiors, freeze read recipes on demand, replace full-source Site/recipe/result/blocked arrays with sparse sites and one compact owner map, and fuse numeric-credit filtering/counting.",
+      "Validate all result metadata, cap the forest-only result certificate at the existing normal-selection bound of 32, and charge remaining scans, validation, temporary allocations and recovery. Compiler caps, admission thresholds and semantic credit remain unchanged."
+    ],
+    "validation_report": {
+      "path": "benchmarks/review-borrowed-own-reads-sparse-validation-2026-10-15.json",
+      "bytes": 11818,
+      "sha256": "7ec455fa2b9b3e8a56489d20ad537dd554ee42494659f7c92cfe96bfa4d482fe"
+    },
+    "focused_parents": 19,
+    "successful_full_execution_children": 38,
+    "unknown_region_control_passed": true,
+    "strict_all_target_clippy_no_allowance": true,
+    "first_checkpoint_cost": {
+      "original_analysis": 230963,
+      "original_total_forest_work": 236243,
+      "scanner_only_analysis": 72113,
+      "scanner_only_total": 77393,
+      "sparse_analysis": 17813,
+      "sparse_lowering": 5280,
+      "sparse_total": 23093
+    },
+    "actual_react_first_checkpoint": {
+      "source_start": 148841,
+      "bytecodes": 1764,
+      "dense_source_visits": 1734,
+      "sparse_source_visits": 279,
+      "dense_recipe_preparations": 162,
+      "sparse_recipe_preparations": 22,
+      "dense_name_bytes": 1681,
+      "sparse_name_bytes": 227,
+      "dense_principal_array_bytes": 236376,
+      "sparse_owner_site_bytes": 7344,
+      "memory_scope": "Transient planner arrays/payload estimate, not process RSS or retained JavaScript heap.",
+      "dense_oracle_revision": "aae69cc0; independent copy of the scanner-improved dense planner, not the original repeated-suffix scanner"
+    },
+    "admission": {
+      "feature_off_publication_entries": 400222,
+      "original_feature_on_target_without_publication": 742830,
+      "scanner_only_target_without_publication": 511775,
+      "sparse_first_target": 432793,
+      "sparse_stabilized_target_and_publication": 436431,
+      "later_forest_total_work": 25132,
+      "interpretation": "Observed non-admission is resolved on this opt-in fixture. Feature-on publication still occurs later than feature-off; no repayment or timing claim."
+    },
+    "application_evidence": {
+      "compile_diagnostic": {
+        "path": "target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/final.json",
+        "bytes": 3977,
+        "sha256": "f4698c20e51ad5da85938b5f69949abe3b89533757f9ae2fbc45cbb0fbf1e9e9"
+      },
+      "execution_diagnostic": {
+        "path": "target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/execution-final.json",
+        "bytes": 3354,
+        "sha256": "97962de00a0d0434a09b9e94fb2f991d9e17a68b17f348cd1c34a16ee99c65bc"
+      },
+      "compile_html_equalities": 1536,
+      "execution_html_equalities": 1536,
+      "native_witness": {
+        "baseline": 262146217361472,
+        "candidate": 262146223491904,
+        "code_id": 5,
+        "target": 436431,
+        "publication_entries": 436431,
+        "optimized_native_entries": 4393,
+        "forest_attempts": 4189,
+        "forest_commits": 4189,
+        "terminal_vm_recoveries": 0
+      },
+      "planner_oracle": "Independent test-only copy of the preceding dense planner compares complete selected certificates on the same actual React snapshots.",
+      "scope": "Pinned React 19.2.7 production CJS through the private loader, native ARM64 debug engine, explicit opt-in hot/coverage/observed/large/ownership controls; no HOT_AT/deopt override. Aggregate forest commits are not a witness for every source site. Execution-mode zero helper counters do not establish helper-free execution. No runtime-CLI/Node compatibility, timing or application performance acceptance."
+    },
+    "status": "Preserved experimental review candidate; optional switches remain off by default and the activation dependency is still held."
+  },
+  "next_required_work": [
+    "Attribute and rework the remaining default-path Vue costs; direct-call ablation explains only part of the effect. Do not promote the activation candidate while the stable regressions remain.",
+    "Measure uninstrumented compilation, application time and memory for borrowed reads against feature-off under identical controls; ordinary-policy native uptake alone does not establish repayment. Validate any composition with the newer activation changes independently."
+  ],
+  "artifact_policy": "Raw target artifacts are retained evidence, not build dependencies. Original /tmp checkpoints remain untouched; implementation successors are preserved in named Git review branches."
+}

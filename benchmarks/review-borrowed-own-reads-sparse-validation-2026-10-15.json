@@ -1,0 +1,192 @@
+{
+  "status": "held optional compiler successor; ordinary-policy actual React uptake established; performance repayment unmeasured",
+  "branch": "review/borrowed-own-reads-sparse-20261015",
+  "source_base": "aae69cc0",
+  "original_feature_base": "84e041636478e744ae59100825bcb41ccff5f580",
+  "activation_dependency": "a9ba62d26dad3e55e62bf21f54b448cf88bdc879; no composition with later activation successors",
+  "lint_only_commit": "7ffd51f6: cfg(test) on existing admission wrapper whose callers are test-only",
+  "source_inventory": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/feature-source-final.json",
+    "bytes": 661,
+    "sha256": "ebc99bd26057407891ad25d7d03707d90828cba5f65a2588f03d0146338f0438"
+  },
+  "source_to_diagnostic_binding": {
+    "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/source-binding.json",
+    "bytes": 3017,
+    "sha256": "5c34074e9c51e6c877f137a117c49fe90484d913240a13433f7e9c0341d8516e"
+  },
+  "implementation": [
+    "Reuse authoritative semantic CFG block boundaries; remove duplicate full-source jump/root bitmap and skip omitted cold interiors. Unknown blocks retain native planning.",
+    "Remove full-source result/recipe arrays. Validate every original result entry; prepare each demanded own-read recipe once through a monotonic positive/negative cache. A decreasing query declines conservatively.",
+    "Keep sparse Site payloads behind one compact original-PC u32 owner map, preserving constant-time site/interior/coverage queries and exact consumed versus Stack endpoint boundaries.",
+    "Fuse numeric-credit retain and saturating sum into one original-opportunity walk; preserve all prior credits and owner/recovery contracts.",
+    "Decline forest planning above32 Number/Object result entries, derived from existing normal16 numeric+16 Object selections (large bodies at most16); complete ordinary lowering remains. Private/forced oversized inputs do not open a quadratic validation path."
+  ],
+  "accounting": {
+    "formula": "3*(original_ops+1) + 18*native_ops + 6*CFG_blocks + 3*handler_and_resume_roots + 32*native_candidate_starts + 32*native_read_sites + 3*native_name_bytes + 3*results^2 + 3*results*native_read_sites + 3*original_numeric_opportunities",
+    "scope": "Native counts include every source operation/read/candidate in retained native blocks, even if an inner certificate later fails. Original owner initialization, pricing pass, block enumeration, defensive root validation, temporary arrays, selected-range writes, self-validation and original result/credit walks remain priced. Full original semantic CFG/frame/native-PC scaffold charges and every recovery publication charge remain elsewhere unchanged.",
+    "policy": "No admission floor, benefit credit, runtime switch default or compiler instruction/block cap relaxation."
+  },
+  "standards": {
+    "snapshot": "ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202",
+    "local": "/big/web-standards/repositories/tc39/ecma262/spec.html:13389 (OrdinaryGet), :20033 (ArgumentListEvaluation)",
+    "scope": "Compiler metadata changes preserve complete checked fallback and original observable evaluation order."
+  },
+  "validation": {
+    "platform": "AArch64 GNU/Linux debug unit artifact; default,intl,embed,optimizing-jit",
+    "focused_final": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/focused-final-result.json",
+      "bytes": 530,
+      "sha256": "3573c0769ed77e7771be5c8e6d56c89aa718166773d6eb240189ac56b0b3a4c6"
+    },
+    "parents": 19,
+    "Full_and_execution_children": 38,
+    "earlier_pre_lint_run": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/focused-result.json",
+      "bytes": 490,
+      "sha256": "b7303093618d609db65c223d4b0b1ee405fc82caecd4f35735428dfbda95ee14"
+    },
+    "controls": "Adversarial failed/local-only/high-arity starts, own/nested/prototype failures, all stress boundaries, frozen cold/unknown blocks, root/endpoint/overlap ownership, malformed cold result entries, oversized result decline, unchanged transaction/GC/callback/source-position/Realm controls.",
+    "unknown_region_integration": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/unknown-regions-result.json",
+      "bytes": 218,
+      "sha256": "76f69bf7ec7a2e3e2a5dd7bb5dabcf4a1270988dbd011d2783b977ec28d6ea11"
+    },
+    "strict_final_clippy": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/clippy-strict-final-result.json",
+      "bytes": 366,
+      "sha256": "9c0570b8304754dce8530d5b400138c7e267dbce75b72001cf34cb8cd92d5de0"
+    },
+    "strict_initial_failure": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-reads-sparse-v1/clippy-strict-result.json",
+      "bytes": 369,
+      "sha256": "36c024308eaf3daea4566d8511ee47d95f4bed699bb4cbdda4e78c48a1041e4f"
+    },
+    "lint_qualification": "Initial sparse strict gate found newly test-only interior() and iter().next() in a fixture. Fixed by cfg(test) and first(); reran all19 parents/38 children and strict -D warnings without allowance. Frozen private diagnostic differs by these explicitly bound lint-only lines plus disclosed probes/oracle.",
+    "format": "Changed Rust-file rustfmt --check, git diff --check, forward and reverse diagnostic-overlay git apply --check passed.",
+    "development_compile_issues": "Private BOOLEAN test constant and nested Option recipe-cache closure type were corrected before the first full passing sparse parent run; no failed runtime comparison was discarded."
+  },
+  "application_compile": {
+    "record": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/final.json",
+      "bytes": 3977,
+      "sha256": "f4698c20e51ad5da85938b5f69949abe3b89533757f9ae2fbc45cbb0fbf1e9e9"
+    },
+    "binary": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/frozen-tests",
+      "bytes": 266563696,
+      "sha256": "c9432e4108dc74433784d87a3edc4f18514434debb5f593d1247688fd25172a2"
+    },
+    "full_source_inventory": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/source-before.json",
+      "bytes": 133516,
+      "sha256": "cc9b4244aa4b3093c66a4e9534a37c2608286d046c5672d68851e75aaa7c3ed1"
+    },
+    "fixture": "Pinned React19.2.7/react-dom production3 modules, six128-render dashboard cases,768 complete HTML equalities per isolated flag child;1536 total.",
+    "policy": "Existing normal-hot controls, identical source/oracles, no threshold/cap/stress override. Private loader and oracle excluded from feature branch.",
+    "independent_oracle": "Complete aae69cc0 dense planner copied only into diagnostic source. All selected PCs, outputs, endpoints, root/input slots, names/cache IDs, nine IC scalar fields, elisions, result categories and specialization flags agree at all three checkpoints and prepare.",
+    "first_checkpoint": {
+      "original_ops": 1764,
+      "native_ops": 309,
+      "selected_forests": 2,
+      "analysis_work": 17813,
+      "lowering_work": 5280,
+      "total_forest_work": 23093,
+      "target": 432793,
+      "old_source_visits": 1734,
+      "new_source_visits": 279,
+      "old_recipe_preparations": 162,
+      "new_recipe_preparations": 22,
+      "old_name_bytes": 1681,
+      "new_name_bytes": 227,
+      "omitted_ops_skipped": 1455
+    },
+    "stable_checkpoint": {
+      "native_ops": 321,
+      "selected_forests": 3,
+      "analysis_work": 18366,
+      "lowering_work": 6766,
+      "total_forest_work": 25132,
+      "target": 436431,
+      "old_source_visits": 1733,
+      "new_source_visits": 290,
+      "old_recipe_preparations": 162,
+      "new_recipe_preparations": 25,
+      "old_name_bytes": 1681,
+      "new_name_bytes": 251
+    },
+    "prior_attempts": {
+      "original_84e": {
+        "first_analysis_work": 230963,
+        "total_forest_work": 236243,
+        "target": 742830,
+        "publication": false
+      },
+      "scanner_aae": {
+        "first_analysis_work": 72113,
+        "total_forest_work": 77393,
+        "target": 511775,
+        "publication": false
+      }
+    },
+    "flag0_publication_entries": 400222,
+    "flag1_publication_entries": 436431,
+    "transient_layout_estimate": {
+      "prior_principal_dense_array_bytes": 236376,
+      "new_owner_and_site_capacity_bytes": 7344,
+      "qualification": "Compiler metadata estimate excludes common selected-node/output buffers and the prior one-byte end fence; no retained JavaScript heap or allocation-time claim."
+    },
+    "explicit_opt_in_controls": {
+      "TRUST_JS_TIER": "jit",
+      "TRUST_JS_OPT_JIT": "hot",
+      "TRUST_JS_OPT_JIT_BACKGROUND": "0",
+      "TRUST_JS_OPT_JIT_OSR": "0",
+      "TRUST_JS_OPT_JIT_GENERIC_OWN": "1",
+      "TRUST_JS_OPT_JIT_SHARED_OWNERS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_READ_GUARDS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_RECOVERY": "1",
+      "TRUST_JS_OPT_JIT_COVERAGE": "1",
+      "TRUST_JS_OPT_JIT_OBSERVED_REGIONS": "1",
+      "TRUST_JS_OPT_JIT_LARGE_REGIONS": "1",
+      "TRUST_JS_OPT_JIT_VALUE_FACTS": "1",
+      "TRUST_JS_OPT_JIT_LOCAL_EFFECTS": "1",
+      "TRUST_JS_OPT_JIT_SPARSE_RELOADS": "1",
+      "TRUST_JS_OPT_JIT_BORROWED_OPERANDS": "1",
+      "TRUST_JS_OPT_JIT_BORROWED_READS": "0/1 isolated flag children",
+      "TRUST_JS_OPT_JIT_DIAGNOSTICS": "compile; separate execution run uses execution",
+      "TRUST_JS_OPT_JIT_LOG": "1"
+    },
+    "normal_admission_qualification": "All inherited TRUST_JS_* flags are cleared before this explicit opt-in matrix. Normal optimizing admission floors, distances and compiler limits apply within that matrix; this is not default-policy selection. The optimizing backend and borrowed-read feature remain off by default. No HOT_AT, deopt or cap override is present."
+  },
+  "application_execution": {
+    "record": {
+      "path": "/big/Code/trust-js/target/compiler-review-20261015/borrowed-own-read-sparse-ledger-v1/execution-final.json",
+      "bytes": 3354,
+      "sha256": "97962de00a0d0434a09b9e94fb2f991d9e17a68b17f348cd1c34a16ee99c65bc"
+    },
+    "same_binary": true,
+    "complete_HTML_equalities": 1536,
+    "counter_join": {
+      "baseline": 262146217361472,
+      "candidate": 262146223491904,
+      "code_id": 5,
+      "target": 436431,
+      "publication_entries": 436431,
+      "optimized_native_entries": 4393,
+      "forest_attempts": 4189,
+      "forest_commits": 4189,
+      "terminal_vm_recoveries": 0
+    },
+    "scope": "Separate instrumented Execution run under unchanged normal-hot controls. CodeID5 and exact published candidate pointer identify4393 physical optimized entries and4189 aggregate forest commits, with0 terminal VM recoveries. The aggregate counter does not identify each PC404 execution. Zero untracked helper counters are not a helper-free claim."
+  },
+  "limits": [
+    "Publication remains later than flag0 (436431 versus400222). Resolved nonuptake does not establish compilation repayment, throughput, startup or memory acceptance.",
+    "No feature-specific broad Test262, fresh x64/Windows/macOS/wasm, physical Windows or CLI/runtime compatibility claim. Prior platform evidence is historical.",
+    "The activation dependency remains held. No main merge, code composition with later activation fixes, installed artifact promotion or default-feature change.",
+    "All3072 complete HTML equalities across Compile and Execution runs passed; diagnostic wall times are not performance measurements."
+  ],
+  "performance_acceptance": false,
+  "installed_artifact_promoted": false,
+  "owned_workers_at_close": [],
+  "engine_source_commit": "11e4ba27"
+}

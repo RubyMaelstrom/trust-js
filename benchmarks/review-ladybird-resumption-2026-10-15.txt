@@ -1,0 +1,60 @@
+Ladybird review continuation — 2026-10-15
+
+Both original /tmp checkpoints were found and preserved. Work continued in two
+new review branches; no engine change was merged into main or installed.
+
+Activation and native calls
+
+review/activation-resumed-20261015
+/tmp/trust-js-activation-resumed-20261015
+
+The successor bounds current-frame legacy argument lookups by physical depth and
+reuses shared call stubs before assembling them again. The cache key contains all
+scalar emission inputs; checked fallbacks, weak lifetime and unwind data remain.
+95 selected ARM64 test executions, default all-target checking, optional all-target
+Clippy with warnings denied, and changed-file formatting passed. The retained
+8d80 browser source differs from final 7d43 only in test-file whitespace.
+
+A fresh native x86-64 comparison used five baseline checks and seven alternating
+pairs of the same four Speedometer suites: React, Angular, Vue and jQuery. Both
+functional companions matched all 12 states with zero JavaScript errors. All 19
+timed processes completed and all samples were retained. The candidate remains
+HELD: stable paired median cost increases were 3.18% for Vue completion async,
+4.13% for Vue deletion overall, and 4.74% for Vue deletion sync. All seven ratios
+were slower for each of these metrics. The subset score cost was 0.83% higher;
+this supplies no application gain. Peak RSS was noisy. The earlier direct-call
+ablation was separate and is not pooled into this cohort.
+
+Borrowed own-property reads
+
+review/borrowed-own-reads-sparse-20261015
+/tmp/trust-js-borrowed-own-reads-sparse-20261015
+
+The planner avoids repeated failed suffix scans and work on excluded native
+blocks, prepares recipes only when needed, and stores sparse sites with a compact
+owner index. Full semantic CFG validation and recovery remain. Work estimates
+account for the remaining traversals; thresholds, compiler caps and benefit
+credit were not loosened.
+
+On the actual React fixture, first-checkpoint forest work fell from 236,243 to
+23,093 units. The first scanner-only revision still failed to admit the target;
+the sparse revision publishes it after 436,431 entries under the same opt-in hot
+controls. Feature-off publishes earlier, at 400,222 entries. The final execution
+diagnostic observed 4,393 physical optimized entries and 4,189 committed forests,
+with zero terminal VM recoveries. Compile and Execution runs each passed 1,536
+complete HTML equality checks. A separate copy of the old dense planner matched
+the selected certificates. Nineteen focused parents and 38 Full/Execution child
+runs passed, as did the unknown-region control and strict all-target Clippy.
+
+This resolves the observed admission blocker, not application repayment. These
+are private-loader ARM64 debug diagnostics with explicit opt-in controls, not
+performance timings, default-on policy or full Node compatibility. The aggregate
+commit counter does not identify every source site. The feature branch retains
+its original held activation dependency and has not been composed with the newer
+activation branch.
+
+Exact commits, controls, raw evidence hashes, failed attempts, all component
+results and remaining gates are in review-ladybird-resumption-2026-10-15.json and
+review-borrowed-own-reads-sparse-validation-2026-10-15.json. Raw local artifacts
+are evidence, not build dependencies. No performance acceptance or promotion is
+claimed.
