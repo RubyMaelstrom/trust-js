@@ -1,0 +1,29 @@
+Gate fixtures for the V8-chase program (preserved 2026-10-15, P1-S0.0)
+======================================================================
+
+These three files are the framework workloads used by every performance
+gate in docs/v8-chase-p1-plan-2026-10-15.txt and by the Pilot A/B/R1
+measurements in docs/specialization-pilot-2026-10-15.txt. They were
+previously kept only in the gitignored benchmark-results/ tree; the
+workspace copies were lost and these were recovered from
+/tmp/trust-js-review-controls-wnym0ybo/ (file dates 2026-09-29, matching
+the originals). Do not edit them: gate comparability depends on byte
+identity. Any replacement must be recorded here with new hashes and a
+re-baseline.
+
+sha256:
+  vue.js   38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc
+  react.js 1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc
+  djot.js  c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682
+
+Content:
+  vue.js   Minimal webpack loader + pinned Speedometer Vue vendor bundle;
+           reactivity workload, n=10000. Expected output fields:
+           observed=30016, invocations=12359 (elapsed_ms varies).
+           Verified 2026-10-15 on trust-js e3310993 (fat LTO): matches.
+  react.js React reducer workload, 20 passes.
+           Expected: checksum=2124760, expected=2124760. Verified same run.
+  djot.js  Djot parser (UMD bundle) workload; internal elapsed reporting.
+
+Run with the engine binary (trust-js-cli accepts only interp|bytecode):
+  taskset -c 5 target/release/trust-js --tier=jit benchmarks/fixtures/vue.js
