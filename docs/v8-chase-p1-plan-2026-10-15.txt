@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, (this commit) | steps 1–3a (Env seam): Gc seam; gc-heap object model with collection disabled. Default suite 2149/0/3 unchanged; gc-heap suite 1756/426/8 (triaged) |
+| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, (this commit) | steps 1–3b (Env seam; environments as cells): Gc seam; gc-heap object model with collection disabled. Default suite 2149/0/3 unchanged; gc-heap suite 1756/426/8 (triaged) |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |

@@ -22,7 +22,7 @@
 //! nothing; the collector reclaims unreachable cells. Both builds expose the same API.
 
 #[cfg(feature = "gc-heap")]
-pub(crate) use cell::clear_dead_weak_cells;
+pub(crate) use cell::{clear_dead_weak_cells, WeakRef};
 #[cfg(feature = "gc-heap")]
 pub use cell::{Gc, WeakGc};
 #[cfg(not(feature = "gc-heap"))]
@@ -368,11 +368,53 @@ mod cell {
     /// A weak object handle. [`WeakGc::upgrade`] yields a [`Gc`] until a collection (or the
     /// heap's teardown) finds the target dead and clears the shared cell.
     #[derive(Clone, Default)]
-    pub struct WeakGc(Option<Rc<WeakCell>>);
+    pub struct WeakGc(WeakRef);
 
-    pub struct WeakCell {
+    /// The untyped weak reference behind [`WeakGc`] and `WeakEnv`: a target address and a flag
+    /// the owning heap clears when the target dies. Never cleared means never upgraded twice
+    /// across a reused address: the flag is cleared before the target's cell is freed.
+    #[derive(Clone, Default)]
+    pub(crate) struct WeakRef(Option<Rc<WeakCell>>);
+
+    pub(crate) struct WeakCell {
         ptr: usize,
         alive: Cell<bool>,
+    }
+
+    impl WeakRef {
+        pub(crate) fn to(ptr: usize) -> WeakRef {
+            let cell = Rc::new(WeakCell {
+                ptr,
+                alive: Cell::new(true),
+            });
+            WEAK_CELLS.with(|cells| {
+                let mut cells = cells.borrow_mut();
+                if cells.cells.len() >= cells.prune_at {
+                    cells.cells.retain(|cell| cell.strong_count() > 0);
+                    cells.prune_at = (cells.cells.len() * 2).max(1024);
+                }
+                cells.cells.push(Rc::downgrade(&cell));
+            });
+            WeakRef(Some(cell))
+        }
+
+        /// The target address while it is alive.
+        #[inline]
+        pub(crate) fn live_ptr(&self) -> Option<usize> {
+            let cell = self.0.as_ref()?;
+            cell.alive.get().then_some(cell.ptr)
+        }
+
+        /// The target address, alive or not (null for a never-upgrading handle).
+        #[inline]
+        pub(crate) fn ptr(&self) -> usize {
+            self.0.as_ref().map_or(0, |cell| cell.ptr)
+        }
+
+        #[inline]
+        pub(crate) fn handles(&self) -> usize {
+            self.0.as_ref().map_or(0, Rc::strong_count)
+        }
     }
 
     struct WeakCells {
@@ -389,42 +431,27 @@ mod cell {
 
     impl WeakGc {
         fn of(target: &Gc) -> WeakGc {
-            let cell = Rc::new(WeakCell {
-                ptr: Gc::as_ptr(target) as usize,
-                alive: Cell::new(true),
-            });
-            WEAK_CELLS.with(|cells| {
-                let mut cells = cells.borrow_mut();
-                if cells.cells.len() >= cells.prune_at {
-                    cells.cells.retain(|cell| cell.strong_count() > 0);
-                    cells.prune_at = (cells.cells.len() * 2).max(1024);
-                }
-                cells.cells.push(Rc::downgrade(&cell));
-            });
-            WeakGc(Some(cell))
+            WeakGc(WeakRef::to(Gc::as_ptr(target) as usize))
         }
 
         /// A handle that never upgrades.
         #[inline]
         pub fn new() -> WeakGc {
-            WeakGc(None)
+            WeakGc(WeakRef::default())
         }
 
         #[inline]
         pub fn upgrade(&self) -> Option<Gc> {
-            let cell = self.0.as_ref()?;
-            // SAFETY: `alive` is cleared before the target's cell is freed.
-            cell.alive
-                .get()
-                .then(|| unsafe { Gc::from_raw(cell.ptr as *const RefCell<Object>) })
+            // SAFETY: the alive flag is cleared before the target's cell is freed.
+            self.0
+                .live_ptr()
+                .map(|ptr| unsafe { Gc::from_raw(ptr as *const RefCell<Object>) })
         }
 
         /// The object's address ([`Gc::as_ptr`]), valid as an identity even after it died.
         #[inline]
         pub fn as_ptr(&self) -> *const RefCell<Object> {
-            self.0
-                .as_ref()
-                .map_or(std::ptr::null(), |cell| cell.ptr as *const RefCell<Object>)
+            self.0.ptr() as *const RefCell<Object>
         }
 
         #[inline]
@@ -434,12 +461,12 @@ mod cell {
 
         #[inline]
         pub fn strong_count(&self) -> usize {
-            usize::from(self.0.as_ref().is_some_and(|cell| cell.alive.get()))
+            usize::from(self.0.live_ptr().is_some())
         }
 
         #[inline]
         pub fn weak_count(&self) -> usize {
-            self.0.as_ref().map_or(0, Rc::strong_count)
+            self.0.handles()
         }
     }
 

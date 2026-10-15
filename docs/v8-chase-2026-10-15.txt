@@ -564,3 +564,17 @@ names its heap). 173 calls rewritten by the same rustc-driven fixer
 raw-environment reborrows use Env::from_raw. Default suite 2149/0/3
 unchanged; workspace builds; clippy clean on both feature sets; gc-heap
 suite unchanged (1756/426/8).
+
+Step 3b, environments as GC cells (gc-heap; collection still disabled):
+Env is the Copy address of a gc_core cell holding RefCell<Scope>, with
+its own descriptor (trace_scope_cell / finalize_scope_cell); WeakEnv and
+WeakGc share one untyped WeakRef (address + alive flag). The cell
+descriptors' trace functions are written: an object reports its own edges
+(prototype, every property and internal slot, array-iterator target,
+closure environment, bound/wrapped targets, native captures and retained
+reporters), an environment its bindings, imports, parent and with-object.
+Object, Callable, Exotic, Scope and Binding are destructured or matched
+exhaustively (gc_trace.rs GcTrace), so a new field or variant does not
+compile until classified. Default suite unchanged (2149/0/3); clippy clean
+on both feature sets. gc-heap suite 1747/435/8: the 9 newly failing tests
+assert refcount-timed environment releases (expected until collection).

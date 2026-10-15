@@ -100,6 +100,8 @@ mod gc_native;
 #[cfg(test)]
 mod gc_scan_spike;
 mod gc_sweep;
+#[cfg(feature = "gc-heap")]
+mod gc_trace;
 #[cfg(test)]
 mod group_by_tests;
 mod heap;

@@ -2210,6 +2210,7 @@ impl<T> SlotRegistry<T> {
     }
 
     /// Strong handles to every live entry.
+    #[cfg(not(feature = "gc-heap"))]
     fn snapshot(&self) -> Vec<Rc<RefCell<T>>> {
         let mut live = Vec::with_capacity(self.live_len());
         for &entry in &self.entries {
@@ -2223,6 +2224,7 @@ impl<T> SlotRegistry<T> {
     }
 
     /// Strong handles to the live young entries.
+    #[cfg(not(feature = "gc-heap"))]
     fn young_snapshot(&self) -> Vec<Rc<RefCell<T>>> {
         self.young_slots
             .iter()
@@ -2257,13 +2259,19 @@ pub(crate) struct GcState {
     pub(crate) core: RefCell<crate::gc_core::Heap>,
     #[cfg(feature = "gc-heap")]
     pub(crate) object_desc: crate::gc_core::DescId,
+    #[cfg(feature = "gc-heap")]
+    pub(crate) scope_desc: crate::gc_core::DescId,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
 
-/// The cell heap behind a [`GcState`] and its object descriptor.
+/// The cell heap behind a [`GcState`] and its object and environment descriptors.
 #[cfg(feature = "gc-heap")]
-fn new_object_heap() -> (crate::gc_core::Heap, crate::gc_core::DescId) {
+fn new_cell_heap() -> (
+    crate::gc_core::Heap,
+    crate::gc_core::DescId,
+    crate::gc_core::DescId,
+) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
     let object_desc = core.register_desc(crate::gc_core::LayoutDesc {
@@ -2272,13 +2280,166 @@ fn new_object_heap() -> (crate::gc_core::Heap, crate::gc_core::DescId) {
         weak: None,
         finalize: Some(finalize_object_cell),
     });
-    (core, object_desc)
+    let scope_desc = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "environment",
+        trace: trace_scope_cell,
+        weak: None,
+        finalize: Some(finalize_scope_cell),
+    });
+    (core, object_desc, scope_desc)
 }
 
-/// Strong edges of an object cell. S2 step 2b runs no collection; the object descriptor's
-/// edges (the intrinsic half of `Interp::visit_object_edges`) land with collection in step 3.
+/// Strong edges an object holds itself. Edges kept for it in the interpreter's owner-keyed
+/// side tables are reported by the interpreter once the object is marked.
 #[cfg(feature = "gc-heap")]
-fn trace_object_cell(_cell: *const u8, _visit: &mut dyn FnMut(*const u8)) {}
+fn trace_object_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+    use crate::gc_trace::GcTrace;
+    // SAFETY: collections run at safepoints, where no object is mutably borrowed (I9);
+    // `try_borrow_unguarded` panics if one is.
+    let object = unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
+        .expect("object mutably borrowed during GC (I9)");
+    object.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+/// Strong edges of an environment record.
+#[cfg(feature = "gc-heap")]
+fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+    use crate::gc_trace::GcTrace;
+    // SAFETY: as for objects (I9).
+    let scope =
+        unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
+            .expect("environment mutably borrowed during GC (I9)");
+    scope.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+/// Run `Scope::drop` and release the record's Rust-heap payload when its cell dies.
+#[cfg(feature = "gc-heap")]
+fn finalize_scope_cell(cell: *mut u8) {
+    // SAFETY: environment cells are initialized by `Env::new` before any collection.
+    unsafe { std::ptr::drop_in_place(cell as *mut RefCell<crate::interpreter::Scope>) };
+}
+
+/// A fresh cell for one environment record in `heap` (see `Env::new`).
+#[cfg(feature = "gc-heap")]
+pub(crate) fn alloc_scope_cell(heap: &GcHeap) -> *mut RefCell<crate::interpreter::Scope> {
+    heap.core
+        .borrow_mut()
+        .alloc(
+            heap.scope_desc,
+            std::mem::size_of::<RefCell<crate::interpreter::Scope>>(),
+        )
+        .cast()
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for Object {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Object {
+            gc_heap: _,
+            proto,
+            props,
+            extensible: _,
+            call,
+            exotic,
+            ic_plain: _,
+            native_typed_array: _, // byte storage only
+            is_constructor: _,
+            gc_mark: _,
+            gc_weak_observed: _,
+            gc_internal: _,
+            gc_scratch: _,
+            #[cfg(feature = "heap-bridge")]
+                central_ref: _,
+        } = self;
+        if let Some(proto) = proto {
+            sink.object(proto);
+        }
+        for property in props.values().chain(self.internal_slots().values()) {
+            property.trace_gc(sink);
+        }
+        match exotic {
+            Exotic::ArrayIterator(state) => sink.value(&state.target),
+            Exotic::None
+            | Exotic::Array
+            | Exotic::BoolWrap(_)
+            | Exotic::NumWrap(_)
+            | Exotic::StrWrap(_)
+            | Exotic::SymWrap(_)
+            | Exotic::BigIntWrap(_)
+            | Exotic::Error(_) // frames hold names and sources, not values
+            | Exotic::Arguments
+            | Exotic::StringIterator(_) => {}
+        }
+        match call {
+            Callable::User(user) => sink.env(&user.env),
+            Callable::Bound(bound) => {
+                sink.object(&bound.target);
+                sink.value(&bound.this);
+                for argument in &bound.args {
+                    sink.value(argument);
+                }
+            }
+            Callable::WrappedShadow(shadow) => sink.value(&shadow.target),
+            Callable::WrappedCross(cross) => sink.value(&cross.target),
+            Callable::NativeData(native) => native.trace_gc(sink),
+            Callable::None
+            | Callable::Native(_)
+            | Callable::AccessorGet(_)
+            | Callable::AccessorSet(_)
+            | Callable::PropGet(_)
+            | Callable::PropSet(_)
+            | Callable::PrivatePropGet(_)
+            | Callable::PrivatePropSet(_) => {}
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for Property {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.with_object_edge(|object| sink.object(object));
+        if let Some(getter) = self.getter() {
+            sink.value(getter);
+        }
+        if let Some(setter) = self.setter() {
+            sink.value(setter);
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for NativeCallable {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        struct Retained<'a>(&'a mut dyn crate::gc_trace::GcSink);
+        impl NativeRetainedMemoryVisitor for Retained<'_> {
+            fn allocation(&mut self, _: RetainedManagedAllocation) {}
+            fn value(&mut self, value: &Value) {
+                self.0.value(value);
+            }
+        }
+        match &self.body {
+            NativeCallableBody::Captured { captures, .. } => {
+                for capture in captures.iter() {
+                    sink.value(capture);
+                }
+            }
+            // An opaque closure's captures are visible only through its retained reporter;
+            // one without a reporter must not hold JavaScript values (Decision 2).
+            NativeCallableBody::Opaque(_) => {}
+        }
+        if let Some(retained) = &self.retained {
+            retained.scan_retained_memory(&mut Retained(sink));
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl PackedValue {
+    /// Report this word's strong object edge: an object, or a deferred prototype's edge.
+    pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.with_object_edge(|object| sink.object(object));
+    }
+}
 
 /// Run `Object::drop` and release the object's Rust-heap payload when its cell dies.
 #[cfg(feature = "gc-heap")]
@@ -2607,7 +2768,7 @@ thread_local! {
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     #[cfg(feature = "gc-heap")]
-    let (core, object_desc) = new_object_heap();
+    let (core, object_desc, scope_desc) = new_cell_heap();
     Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "architecture-diagnostics")]
@@ -2627,6 +2788,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         core: RefCell::new(core),
         #[cfg(feature = "gc-heap")]
         object_desc,
+        #[cfg(feature = "gc-heap")]
+        scope_desc,
     })
 }
 
@@ -2829,6 +2992,7 @@ pub fn gc_snapshot() -> Vec<Gc> {
 /// # Safety
 /// `object` must be a non-null registry entry. `Object::drop` clears the entry before the
 /// allocation is released, so a registered object's strong count is at least one.
+#[cfg(not(feature = "gc-heap"))]
 unsafe fn upgrade_registered<T>(entry: *const RefCell<T>) -> Rc<RefCell<T>> {
     unsafe {
         Rc::increment_strong_count(entry);
@@ -2884,12 +3048,21 @@ pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
         .young_entry_ptrs()
         .map(|entry| unsafe { Gc::from_raw(entry) })
         .collect();
+    #[cfg(not(feature = "gc-heap"))]
     let scopes = heap
         .scopes
         .borrow()
         .young_snapshot()
         .into_iter()
         .map(Env::from_rc)
+        .collect();
+    // SAFETY: registry entries are live environment cells (removed by `Scope::drop`).
+    #[cfg(feature = "gc-heap")]
+    let scopes = heap
+        .scopes
+        .borrow()
+        .young_entry_ptrs()
+        .map(|entry| unsafe { Env::from_raw(entry) })
         .collect();
     (objects, scopes)
 }
@@ -3001,12 +3174,23 @@ pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
 }
 
 /// The live scopes owned by `heap`.
+#[cfg(not(feature = "gc-heap"))]
 pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
     heap.scopes
         .borrow()
         .snapshot()
         .into_iter()
         .map(Env::from_rc)
+        .collect()
+}
+
+#[cfg(feature = "gc-heap")]
+pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
+    // SAFETY: registry entries are live environment cells (removed by `Scope::drop`).
+    heap.scopes
+        .borrow()
+        .entry_ptrs()
+        .map(|entry| unsafe { Env::from_raw(entry) })
         .collect()
 }
 
