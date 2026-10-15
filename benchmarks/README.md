@@ -102,3 +102,8 @@ three-pair browser screen. The combined engine source remains isolated and is no
 to main; preserving a review checkpoint does not change that decision.
 The [43-component paired results](review-activation-speedometer-components-2026-10-15.csv)
 retain all three baseline/candidate values and cost ratios without editing the frozen CSV.
+
+The [borrowed own-read validation](review-borrowed-own-reads-validation-2026-10-15.json)
+records a separate optional compiler feature retained outside main. It covers bounded
+owner transactions and recovery before the original expression prefix; it is a correctness
+and admission record, not an accepted application speed result.

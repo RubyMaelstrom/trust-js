@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-15",
+  "status": "correctness_validated_separate_feature_with_observed_target_normal_admission_nonuptake",
+  "main_production_merge": false,
+  "implementation_scope": "Bounded mixed local/ordinary own-data read forests with atomic final packed-owner materialization in the optional optimizing tier. The complete implementation remains isolated from main; no speedup or application performance acceptance is claimed.",
+  "preservation": {
+    "review_branch": "review/borrowed-own-reads-20261015",
+    "branch_base": "a9ba62d26dad3e55e62bf21f54b448cf88bdc879",
+    "base_branch": "review/activation-native-calls-20261015",
+    "snapshot_source_freeze": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/source-freeze.json",
+      "bytes": 5169,
+      "sha256": "9d866f37502f71bee09294c55be6147d6566ec531d096b565f24144744e53253"
+    },
+    "source_inventory": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/source-before.json",
+      "bytes": 132282,
+      "sha256": "7a788722785330a4ff180f006f07df3acee15721b75909f42a98977342cc7247"
+    },
+    "files": 858,
+    "feature_changed_paths": [
+      "crates/trust-js/src/jit_optimizing.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_activation_tests.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_operands.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_owner_tests.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_owners.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_read_guards.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_read_tests.rs",
+      "crates/trust-js/src/jit_optimizing_borrowed_reads.rs",
+      "crates/trust-js/src/jit_optimizing_counter_ir.rs",
+      "crates/trust-js/src/jit_optimizing_diagnostics.rs",
+      "crates/trust-js/src/jit_optimizing_generic_admission.rs",
+      "crates/trust-js/src/jit_optimizing_large_region_tests.rs",
+      "crates/trust-js/src/jit_optimizing_large_regions.rs",
+      "crates/trust-js/src/jit_optimizing_native_pc_tests.rs",
+      "crates/trust-js/src/jit_optimizing_native_pcs.rs"
+    ],
+    "incremental_on_held_853": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-documentation-v2/incremental-on-held-activation.patch",
+      "bytes": 149036,
+      "sha256": "90ca0baf271533232be75bbe61596fb91cee7083c791dfcf234974e7d3a77f52"
+    },
+    "full_snapshot_patch_against_original_1b": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/main-relative.patch",
+      "bytes": 1090917,
+      "sha256": "228243a45cd7d5ccbf44d9b26593dfd0590cfc6bc0ddf7e13361e11e8ff531cb"
+    },
+    "retained_source_archive": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-x64-preparation-v2/corrected-source-v2.tar.gz",
+      "bytes": 12332875,
+      "sha256": "b35c9cd3ead682ae3601f20929630808a9967c6d392cea055fcf0772eb5af5aa"
+    },
+    "qualification": "Root prepared the exact15 source changes on the separate review branch and verified855 non-documentation files against this858-file snapshot. Main correctness/benchmark/docs commits remain intact; private ledger hooks are excluded.",
+    "incremental_patch_base": "Apply to a9ba62d26dad3e55e62bf21f54b448cf88bdc879; root checked forward application on the held activation branch and reverse application on the exact feature source."
+  },
+  "controls": {
+    "cargo_feature": "optimizing-jit, off by default",
+    "runtime_switch": "TRUST_JS_OPT_JIT_BORROWED_READS=1; unset or0 disables this feature",
+    "optimizing_backend": "TRUST_JS_OPT_JIT explicitly selects the optional tier; main default execution does not enable it",
+    "new_mechanism_children": {
+      "TRUST_JS_OPT_JIT": "0, followed by explicit compilation of the actual warmed same Chunk",
+      "TRUST_JS_INLINE_AT": "0",
+      "TRUST_JS_OPT_JIT_BORROWED_READS": "1 except explicit disabled/unset parity",
+      "TRUST_JS_OPT_JIT_BORROWED_OPERANDS": "0",
+      "TRUST_JS_OPT_JIT_HEAP_OPS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_OWNERS": "1",
+      "TRUST_JS_OPT_JIT_SHARED_RECOVERY": "1",
+      "TRUST_JS_OPT_JIT_CALL_STUBS": "0",
+      "TRUST_JS_OPT_JIT_DIAGNOSTICS": [
+        "1 (Full)",
+        "execution"
+      ]
+    },
+    "exact_retained_control_matrix": {
+      "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/execution-plan.json",
+      "bytes": 15333,
+      "sha256": "2dc4cc65026f29ebfdf1d06297b8bf9747cae53e67d005ba4af8b45d578e6d8a"
+    }
+  },
+  "contracts": {
+    "bounds": {
+      "original_operations": 32,
+      "ordinary_own_reads": 8,
+      "final_storage_words": 16,
+      "nested_read_hops": 4,
+      "owner_changes": 16
+    },
+    "roots": "Use current owning SSA locals and unchanged live heap edges. No successful-path canonical root publication; no compiled JavaScript object/Realm owner is added.",
+    "guards": "Reuse only the exact frozen receiver-specific metadata certificate; otherwise retain live ordinary/plain/exotic/shape/bounds/data checks. Required Number/Object result guards remain. Readonly own data and opaque final Proxy/Function values are supported; observable receiver operations remain checked.",
+    "atomicity": "Validate all input classes, allocation aliases, overflow and last-owner release before any header write. Immediately commit matching final stack/local owner moves after success; no failing guard/observer/destructor may intervene.",
+    "recovery": "Publish original start dirty locals and owning input stack, resume the unchanged VM prefix exactly once. Ordinary materialization misses do not retire code. Required specialization keeps separate full-u32 originating and resume PCs and the existing eight-miss retirement policy.",
+    "boundaries": "No borrowed word crosses a source control-flow root, handler/resume/stress/inline boundary, store, poll, author operation or GC observer. Call/store/stack endpoints retain original PCs, callee/receiver ownership, source-position tokens and completion/legacy-argument fences.",
+    "cost": "Full-source analysis128*(ops+1)+3*static property-name bytes, bounded planning/minimum work and every possible recovery publication are priced. Covered numeric credit is removed conservatively; exact existing metadata guards/credit remain consistent. No new semantic benefit credit, threshold or cap change."
+  },
+  "compiler_limits": {
+    "forced_mechanism_compile_with_deopt_instructions": 262144,
+    "forced_block_limit": 65536,
+    "explicit_f64_and_disabled_parity_instructions": 16384,
+    "normal_hot_candidate_instructions": "min(40*original_ops + existing names::instruction_allowance,16384)",
+    "qualification": "Forced native success does not prove ordinary hot-policy budget eligibility, admission or application uptake."
+  },
+  "validation": {
+    "ARM": {
+      "local_gate": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/local-gate-final.json",
+        "bytes": 5282,
+        "sha256": "856eca76ce5416e1f87315ccad2b2570ecd4586910f0795227d4832cdbed6c08"
+      },
+      "fresh_final_build": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/build-result.json",
+        "bytes": 237689,
+        "sha256": "a1c3f4f5a94f4bc7c22cac721ce19415695f01cd617a0abf72ac0921af0b76f0"
+      },
+      "binary": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/trust-js-tests",
+        "bytes": 265147048,
+        "sha256": "402f07c15261bef3425e432de60778695c3e124c0cdbfd66fa8ffb04e0063c43"
+      },
+      "actual_full_list_count": 2751,
+      "initial_60": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v1/focused-results.json",
+        "bytes": 110749,
+        "sha256": "2936826972327407e6a83a94ee49400f2f40fe45e8d73b48507263ea1a973154"
+      },
+      "initial_result": "58pass/2fail; original failures retained",
+      "test_only_successor": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/v1-to-v2-test-only.patch",
+        "bytes": 3764,
+        "sha256": "be4cdfd256988816abef618d65285eb50c9ba3944d5827120e44192f46ab68a2"
+      },
+      "affected_2": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/focused-results.json",
+        "bytes": 4660,
+        "sha256": "60ff1335fc3866fed62ed994e4c7d7e5ee4655ecdb251ce3a54ca951855aa586"
+      },
+      "affected_result": "2pass/0fail,4 raw Full/Execution children;58 unchanged parents not rerun on final binary",
+      "checks": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/checks-results.json",
+        "bytes": 3121,
+        "sha256": "871abcaf3b302b74a64b6ff166c1af04ae3d3c68e8befb209a2e88cc8d475937"
+      },
+      "check_scope": "strict optional all-target Clippy -D warnings -A dead_code and default+embed all-target check both passed",
+      "root_corrected_case_audit": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-v2/root-corrected-arm-audit.json",
+        "bytes": 1117,
+        "sha256": "67a85c3c31b13b602f5f55ea10f50142f798514be866c791f93cb1ed5bac8ad9"
+      }
+    },
+    "x64": {
+      "native_final": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/validation-final.json",
+        "bytes": 10884,
+        "sha256": "0daa709f0336af48da9fbaeb88746a09cf88a82933d90ae7b82c3d50368687e9"
+      },
+      "local_raw_verification": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/local-verification.json",
+        "bytes": 6416,
+        "sha256": "0f3dfb2ab0aa28fbba490c9b779f2a1af0a32ce59cfcee9cdbee50b6daccdb8f"
+      },
+      "root_raw_audit": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/root-raw-native-audit.json",
+        "bytes": 947,
+        "sha256": "0d394c3bc9868f97acc36abf8e6cab9d93e2b2407d15ae1e51a6c0c3fc8baf10"
+      },
+      "platforms": [
+        {
+          "platform": "linux",
+          "passed": 60,
+          "failed": 0,
+          "binary": {
+            "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/retrieved/artifacts/linux-optional/trust-js-unit-tests",
+            "bytes": 279065256,
+            "sha256": "6a1d542ee9d0b97fd755ea735f8f51101d1d83a04e9162462c6334b03add0c69"
+          },
+          "actual_list_count": 2599,
+          "features": [
+            "default",
+            "embed",
+            "intl",
+            "optimizing-jit"
+          ],
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "forwarded_children_parsed": 38
+        },
+        {
+          "platform": "windows",
+          "passed": 60,
+          "failed": 0,
+          "binary": {
+            "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/retrieved/artifacts/windows-optional/trust-js-unit-tests.exe",
+            "bytes": 63091712,
+            "sha256": "573d70fd7d163a92340ee0e1dfd01f6c50309fd4f9d315d83d81a5b5f796f224"
+          },
+          "actual_list_count": 2601,
+          "features": [
+            "default",
+            "embed",
+            "intl",
+            "optimizing-jit"
+          ],
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "forwarded_children_parsed": 38
+        }
+      ],
+      "parents_total": 120,
+      "forwarded_children_parsed_total": 76,
+      "qualification": "Native GNU/Linux x64 and actual MSVC PE under Wine/Linux; not physical Windows. Optional-feature debug unit artifacts; no new default-platform runtime or performance claim.",
+      "independent_peer_audit": {
+        "path": "target/compiler-review-20261015/borrowed-own-reads-native-x64-execution-v2/execution-coverage-independent-audit-v1/review.json",
+        "bytes": 59850,
+        "sha256": "20c7cbe3299f1b785cfb614d4046cf6f12d19f1e2c033fcc934d445fc5ad08ae"
+      }
+    },
+    "case_scope": "17 forest parents and11 scalar transaction parents, plus retained21 local-loan/9 native-PC controls, corrected AO-owner cleanup and terminal-recovery controls. Scalar owner tests establish count algebra; actual forest native-entry/commit/recovery assertions establish execution.",
+    "successful_suppressed_children": "Only source-forwarded38 children per x64 platform have independently parsed raw child blocks. Existing suppressing wrappers remain source/parent asserted.",
+    "ao_owner_cleanup_dependency": {
+      "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/v3-test-only.patch",
+      "bytes": 2575,
+      "sha256": "3975311a469472b2e0bbfc69f375180bad4ddc57438a42b6bc1b9a90f1d45825"
+    },
+    "feature_specific_broad_test262_run": false
+  },
+  "application_diagnostic": {
+    "final": {
+      "path": "target/compiler-review-20261015/borrowed-own-read-ledger-v3/final.json",
+      "bytes": 3072,
+      "sha256": "2ab94addece1bc3e7ffaf817cd73ed24dfba1e8ba2b31a39807c2089c950e439"
+    },
+    "analysis": {
+      "path": "target/compiler-review-20261015/borrowed-own-read-ledger-v3/analysis-final.json",
+      "bytes": 15028,
+      "sha256": "4a8087c028f5ea5494c84d10f73035441f6a3ac5a04c897c2cfafea38d140756"
+    },
+    "root_audit": {
+      "path": "target/compiler-review-20261015/borrowed-own-read-ledger-v3/root-ledger-audit-v2.json",
+      "bytes": 2005,
+      "sha256": "d82fa7168e9e59cde9dc7689efd7eb936c1dfbaa219114818a18ded301ff82e4"
+    },
+    "source_freeze": {
+      "path": "target/compiler-review-20261015/borrowed-own-read-ledger-v3/source-freeze.json",
+      "bytes": 2171,
+      "sha256": "f43a36fca370415b00afc00269b102310b274e315293003c9d44a6588de91ade"
+    },
+    "inputs": {
+      "path": "target/compiler-review-20261015/borrowed-own-read-ledger-v3/inputs.json",
+      "bytes": 3527,
+      "sha256": "ca03e7526324969a9059efe5ba1006291bea76885f7c348a919e1c6818354015"
+    },
+    "profile": "AArch64 debug unit executable, opt_level0/debuginfo2/debug_assertions/overflow_checks; compile diagnostics",
+    "fixture": "Actual pinned React19.2.7/react-dom production CJS3 modules through the previously reviewed private loader and six128-render dashboard cases,768 completeHTML equalities per isolated flag child",
+    "html_equalities": {
+      "flag0": 768,
+      "flag1": 768
+    },
+    "selected_function": {
+      "source_start": 148841,
+      "source_bytes": 20373,
+      "ops": 1764,
+      "forest_start": 404,
+      "forest_endpoint": 413,
+      "nodes": 9,
+      "outputs": 9,
+      "endpoint": "CallWithThis9"
+    },
+    "flag0": {
+      "checkpoint_targets": [
+        399550,
+        400222,
+        400222
+      ],
+      "published_code_id": 5,
+      "publication_entries": 400222,
+      "compiled_ir": 7362,
+      "compiled_native_bytes": 43200,
+      "prepared_code_work": 275212
+    },
+    "flag1": {
+      "selected_forests": 2,
+      "selected_target_start": 404,
+      "selected_target_endpoint": 413,
+      "selected_target_nodes": 9,
+      "selected_target_outputs": 9,
+      "forest_analysis_work": 230963,
+      "forest_lowering_work": 5280,
+      "forest_total_work": 236243,
+      "net_added_first_checkpoint_work": 236005,
+      "full_first_checkpoint_work": 510695,
+      "target": 742830,
+      "checkpoint_entries": 256,
+      "optimizing_candidates_for_selected_function": 0,
+      "publications_for_selected_function": 0
+    },
+    "interpretation": "The real nine-argument prefix was selected, but the added honestly charged work prevented optimizing-backend admission of that function within this workload. This is observed nonuptake, not merely an absence of timings. Other functions are outside this selection.",
+    "scope_limits": [
+      "No runtime-CLI/Node compatibility or performance comparison. No timing ratio or speed claim.",
+      "Compile mode does not track native entry counts, helper frequency or guard hit rate. Successful slot publication is distinct from native execution.",
+      "Code5 joins its compiled record by exact pointer andCodeID. Do not assign latest baseline masks or checkpoint work to an earlier prepared Code.",
+      "Prepared Code fullwork275212 differs from stabilized checkpoint work275152; its cold recovery is6200. Retired teardown records describe lifetime end, not specialization retirement.",
+      "Private absolute-path loader/hooks exist only in the859-file diagnostic snapshot and are excluded from the858-file feature source."
+    ]
+  },
+  "limits_and_resume_issue": [
+    "New forest children use CALL_STUBS0; no new forest/shared-call positive witness.",
+    "The F64 fixture proves packed-prefix/mirror/callback preservation, not live unboxedF64 across the atomic helper.",
+    "No feature-specific broad Test262, physicalWindows, macOS or wasm claim.",
+    "Several semantic families remain outside the bounded grammar and retain complete checked fallback.",
+    "The dependency activation candidate is itself held outside main after separate browser slowdown concerns. No application result from prior local-only borrowed operands transfers to this feature.",
+    "Future resumption would need a genuine reduction in analysis/recovery cost or a justified benefit model, followed by ordinary-policy uptake and application evidence. No such further work was started.",
+    "Local target artifacts retain raw evidence but are not build dependencies; the named review branch preserves the implementation for a fresh checkout."
+  ],
+  "owned_workers_at_close": [],
+  "performance_acceptance": false,
+  "installed_artifact_promoted": false
+}
