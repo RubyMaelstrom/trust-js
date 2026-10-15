@@ -8603,6 +8603,81 @@ impl Interp {
         None
     }
 
+    /// Diagnostic (`TRUST_JS_JIT_PROPSTAT`): classify why a named read that reached a JIT
+    /// property helper was not served by the inline template. Read-only: it walks live
+    /// descriptors like `ic_get_rederive` but fills nothing and runs no JavaScript, so it
+    /// observes OrdinaryGet's resolution (ECMA-262 e28783d5, #sec-ordinaryget) without
+    /// performing it. The buckets mirror the template guards in `emit_prop_way_probe`.
+    pub(crate) fn propstat_classify(
+        &self,
+        base: &Value,
+        name: &str,
+        cache: &std::cell::Cell<crate::bytecode::IcState>,
+    ) -> &'static str {
+        let Value::Obj(o) = base else {
+            return match base {
+                Value::Str(_) | Value::Num(_) | Value::Bool(_) => "receiver: primitive",
+                _ => "receiver: non-object",
+            };
+        };
+        if self.is_proxy_value(base) {
+            return "receiver: proxy";
+        }
+        let head = Rc::as_ptr(o);
+        let recv_shape = match unsafe { (*head).try_borrow() } {
+            Ok(b) => b.props.shape(),
+            Err(_) => return "receiver: borrowed (unclassified)",
+        };
+        let cached = (0..crate::bytecode::PROP_IC_WAYS).any(|k| {
+            let st = self.ic_way(cache, k).get();
+            st.depth != crate::bytecode::IC_EMPTY && st.recv_shape == recv_shape
+        });
+        let mut cur = head;
+        for depth in 0..=8u32 {
+            let b = match unsafe { (*cur).try_borrow() } {
+                Ok(b) => b,
+                Err(_) => return "chain: borrowed (unclassified)",
+            };
+            if !self.ic_plain_ptr(cur as usize, &b) {
+                return if depth == 0 {
+                    "receiver: exotic/side-table"
+                } else {
+                    "chain: non-plain hop"
+                };
+            }
+            if let Some(slot) = b.props.slot_of(name) {
+                let Some(p) = b.props.property_at(slot) else {
+                    return "holder: slot vanished";
+                };
+                if p.accessor() {
+                    return "accessor descriptor";
+                }
+                if matches!(b.exotic, Exotic::Array) {
+                    return "array holder (key-checked)";
+                }
+                if depth > 3 {
+                    return "data at depth > 3";
+                }
+                return if cached {
+                    "data cached (other template guard)"
+                } else {
+                    "data uncached (shape churn)"
+                };
+            }
+            match b.proto.as_ref() {
+                Some(p) => cur = Rc::as_ptr(p),
+                None => {
+                    return if cached {
+                        "absent cached (other template guard)"
+                    } else {
+                        "absent uncached"
+                    }
+                }
+            }
+        }
+        "chain: deeper than 8"
+    }
+
     /// `obj.name = v` write with a per-site inline cache (bytecode `SetProp`/`SetPropDrop`). The
     /// fast path overwrites an existing own writable data property (OrdinarySet's winning case,
     /// correct regardless of the prototype chain); everything else defers to full `[[Set]]`.

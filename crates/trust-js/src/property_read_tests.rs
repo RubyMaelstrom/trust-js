@@ -726,3 +726,134 @@ fn getter_cache_data_only_forwarding_does_not_call_a_speculative_getter() {
         "true|7|2|2",
     );
 }
+
+#[test]
+fn propstat_classify_buckets_match_template_guards_without_running_getters() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "var plain={a:1},acc={},gets=0;\
+             Object.defineProperty(acc,'x',{get(){gets++;return 1},configurable:true});\
+             var px=new Proxy(plain,{});'ok'"
+        ),
+        "ok"
+    );
+    let env = engine.interp.global_env.clone();
+    let var = |engine: &mut Engine, name: &str| {
+        engine
+            .interp
+            .get_var(name, &env)
+            .ok()
+            .unwrap_or_else(|| panic!("missing global {name}"))
+    };
+    let plain = var(&mut engine, "plain");
+    let acc = var(&mut engine, "acc");
+    let px = var(&mut engine, "px");
+    let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
+    let classify = |engine: &Engine, base: &Value, name: &str| {
+        engine.interp.propstat_classify(base, name, &cache[0])
+    };
+    assert_eq!(
+        classify(&engine, &plain, "a"),
+        "data uncached (shape churn)"
+    );
+    assert_eq!(classify(&engine, &acc, "x"), "accessor descriptor");
+    assert_eq!(classify(&engine, &px, "a"), "receiver: proxy");
+    assert_eq!(classify(&engine, &plain, "missing"), "absent uncached");
+    assert_eq!(
+        classify(&engine, &Value::Num(1.0), "x"),
+        "receiver: primitive"
+    );
+    assert!(cache.iter().all(|c| c.get().depth == IC_EMPTY));
+    assert_eq!(evaluate(&mut engine, "String(gets)"), "0");
+}
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[test]
+fn propstat_diagnostic_tallies_helper_reasons_at_exit() {
+    if std::env::var_os("TRUST_JS_PROPSTAT_CHILD").is_none() {
+        let name =
+            "interpreter::property_read_tests::propstat_diagnostic_tallies_helper_reasons_at_exit";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("TRUST_JS_PROPSTAT_CHILD", "1")
+            .env("TRUST_JS_JIT_PROPSTAT", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "exact child must execute: {stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("[jit-propstat]") && stderr.contains("accessor descriptor"),
+            "accessor helper reads remain attributed: {stderr}"
+        );
+        return;
+    }
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "var acc={},sum=0;\
+             Object.defineProperty(acc,'x',{get(){return 2},configurable:true});\
+             function read(o){return o.x}\
+             for(var k=0;k<80;k++)sum+=read(acc);\
+             String(sum)"
+        ),
+        "160"
+    );
+}
+
+#[test]
+fn validated_accessor_reads_observe_live_mutations_in_every_tier() {
+    // Warmed accessor sites (the JIT template's validated accessor landing) must observe
+    // every mutation between fill and hit: binding updates, getter replacement,
+    // accessor<->data conversion, delete, prototype swaps, missing getters and throws.
+    // Expectations are Node-verified.
+    check(
+        r#"
+        function f1(){var gets=0,binding={tag:'b1'};var o={};Object.defineProperty(o,'x',{get(){gets++;return binding},configurable:true});function read(v){return v.x}var out=[];for(var k=0;k<90;k++)out.push(read(o).tag);binding={tag:'b2'};out.push(read(o).tag);Object.defineProperty(o,'x',{get(){gets++;return {tag:'g2'}},configurable:true});out.push(read(o).tag);Object.defineProperty(o,'x',{value:{tag:'data'},configurable:true});out.push(read(o).tag);for(var k=0;k<40;k++)read(o);Object.defineProperty(o,'x',{get(){gets++;return {tag:'g3'}},configurable:true});out.push(read(o).tag);delete o.x;out.push(String(read(o)));return [out[0],out[89],out[90],out[91],out[92],out[93],out[94],gets].join('|')}
+        function f2(){var gets=0;function C(){}Object.defineProperty(C.prototype,'y',{get(){gets++;return this.mark},configurable:true});var a=new C();a.mark='A';var b=new C();b.mark='B';function read(v){return v.y}var s='';for(var k=0;k<60;k++)s+=read(k%2?a:b);Object.setPrototypeOf(a,{y:'patched'});var after=read(a)+read(b);Object.defineProperty(C.prototype,'y',{value:'proto-data',configurable:true});return [s.length,s.slice(0,4),after,read(b),gets].join('|')}
+        function f3(){var exp={},current={v:1};Object.defineProperty(exp,'kJ',{enumerable:true,get:function(){return current}});function use(){return exp.kJ.v}var s=0;for(var k=0;k<80;k++)s+=use();current={v:5};s+=use();return [s,exp.kJ===current].join('|')}
+        function f4(){var warm={};Object.defineProperty(warm,'x',{get(){return 1},configurable:true});var o={n:0};Object.defineProperty(o,'x',{get(){this.n++;if(this.n===3)throw new Error('boom');return this.n},configurable:true});function read(v){return v.x}for(var k=0;k<60;k++)read(warm);var out=[read(o),read(o)];var err='';try{read(o)}catch(e){err=e.message}Object.defineProperty(o,'x',{get:undefined,set(v){},configurable:true});return [out.join(','),err,String(read(o)),o.n].join('|')}
+        function f5(){var o={tag:'T'};Object.defineProperty(o,'m',{get(){return function(){return this.tag}},configurable:true});function call(v){return v.m()}var s='';for(var k=0;k<60;k++)s+=call(o);return [s.length,s.slice(0,3),call(o)].join('|')}
+        [f1(),f2(),f3(),f4(),f5()].join('\n')
+    "#,
+        "b1|b1|b2|g2|data|g3|undefined|93\n60|BABA|patchedB|proto-data|61\n85|true\n1,2|boom|undefined|3\n60|TTT|T",
+    );
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[test]
+fn validated_accessor_landing_is_exercised_by_jit_reads() {
+    let before = property_read::TEST_VALIDATED_ACCESSORS.with(Cell::get);
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            "var acc={},sum=0;\
+             Object.defineProperty(acc,'x',{get(){return 2},configurable:true});\
+             function read(o){return o.x}\
+             for(var k=0;k<80;k++)sum+=read(acc);\
+             String(sum)"
+        ),
+        "160"
+    );
+    assert!(
+        property_read::TEST_VALIDATED_ACCESSORS.with(Cell::get) > before,
+        "warmed JIT accessor reads must take the validated landing"
+    );
+}

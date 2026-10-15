@@ -182,6 +182,7 @@ fn invoke(
         env_parent_raw: std::ptr::null(),
         opstat_enabled: false,
         callstat_enabled: false,
+        propstat_enabled: false,
         inline_recompile_at: inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&interp.gc_heap),
         activation: None,
@@ -189,6 +190,8 @@ fn invoke(
         resume_pc: 0,
         resume_step: None,
         references_raw: std::ptr::null_mut(),
+        accessor_holder: 0,
+        accessor_slot: 0,
     };
     ctx.this_raw = &ctx.this_val;
 

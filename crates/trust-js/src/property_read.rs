@@ -167,6 +167,52 @@ impl Interp {
         }
     }
 
+    /// Validated accessor path for the JIT template's accessor landing: the template has
+    /// already shape-validated the receiver's chain and the holder slot live, and no
+    /// JavaScript ran since, so the descriptor at (`holder`, `slot`) is this name's
+    /// OrdinaryGet resolution. Re-read the live getter there (identity is never cached),
+    /// release the borrow, then run the same binding/record proofs and Call boundary as
+    /// `finish_cached_accessor`. `None` declines to the ordinary resolution.
+    ///
+    /// # Safety
+    /// `holder` must be the `Rc::as_ptr` of an object on `receiver`'s live prototype
+    /// chain (or the receiver itself), published by the template during this synchronous
+    /// helper call. The caller roots `receiver`, which transitively keeps the holder
+    /// alive for the read, exactly as in `ic_shape_probe`'s raw chain walk.
+    pub(crate) unsafe fn accessor_validated_get(
+        &mut self,
+        holder: usize,
+        slot: u32,
+        name: &str,
+        receiver: &Value,
+    ) -> Option<Result<Value, Abrupt>> {
+        let holder_ref = unsafe { &*(holder as *const std::cell::RefCell<crate::value::Object>) };
+        let getter = {
+            let b = holder_ref.try_borrow().ok()?;
+            let p = b.props.property_at(slot as usize)?;
+            if !p.accessor() {
+                return None;
+            }
+            p.getter().cloned()
+        };
+        #[cfg(test)]
+        TEST_VALIDATED_ACCESSORS.with(|count| count.set(count.get() + 1));
+        // Retain the legacy ThrowTypeError censorship from snapshot_cached_accessor.
+        if matches!(name, "caller" | "arguments") && self.is_throw_type_error(&getter) {
+            return None;
+        }
+        let Some(getter) = getter else {
+            return Some(Ok(Value::Undefined));
+        };
+        if let Some(value) = self.try_binding_getter(&getter) {
+            return Some(Ok(value));
+        }
+        if let Some(result) = self.try_record_getter(&getter, receiver) {
+            return Some(result);
+        }
+        Some(self.call_callback(getter, receiver.clone(), &[]))
+    }
+
     /// A getter whose entire body is `return <identifier>` — the export accessors module
     /// bundlers emit (`() => binding`) — observes nothing but that binding. When the name
     /// resolves, before any object Environment Record, to an initialized ordinary declarative
@@ -442,6 +488,9 @@ impl Interp {
 #[cfg(test)]
 thread_local! {
     pub(super) static TEST_RECORD_GETTERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static TEST_VALIDATED_ACCESSORS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(super) static TEST_BINDING_GETTERS: std::cell::Cell<[usize; 3]> = const {

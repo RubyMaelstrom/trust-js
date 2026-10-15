@@ -82,6 +82,27 @@ comment/example in the same change.
 - `TRUST_JS_JIT_NO_INT_REGS=1` keeps every int32 result of a register region (bitwise operators,
   shifts, `Math.imul`) in a floating-point register instead of leaving it in an integer
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
+- `TRUST_JS_PERF_METRICS=1` prints one JSON JIT/collector performance summary at normal
+  exit (compile attempts/seconds/bytes, inline attempts, lex/parse/bytecode-compile time,
+  native-call time, GC pauses and post-GC managed memory). Diagnostic only; excluded from
+  acceptance timing.
+- Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
+  `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
+  pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
+  direct-call sequence, `TRUST_JS_JIT_NATIVESTAT=1` counts those calls by native callee,
+  and `TRUST_JS_JIT_PROPSTAT=1` counts why named reads reaching a JIT property helper were
+  not served by the inline template (proxy, exotic/side-table, accessor, array holder,
+  depth, absent, or uncached/cached data; `=2` adds the site). `TRUST_JS_JIT_PROFILE_AFTER_MS=N`
+  delays the OPSTAT/CALLSTAT/PROPSTAT counting window past startup.
+- `TRUST_JS_JIT_MAP=1` prints `[jit-map-range]`/`[jit-map-pc]`/`[jit-map-mark]` lines mapping
+  generated code ranges to chunk source offsets, bytecode pcs and attribution families, for
+  joining sampling-profiler addresses back to operations.
+- `TRUST_JS_FEEDBACK_PROFILE=1` enables the detailed per-site feedback vector; it changes
+  the execution paths that collect it, so its observations are not observations of ordinary
+  optimized execution and it is never an acceptance setting.
+- `TRUST_JS_GC_LOG=1` logs collections; `TRUST_JS_GC_DUMP=1` dumps external-root shapes
+  (bounded by `TRUST_JS_GC_DUMP_MIN_OBJECTS`/`TRUST_JS_GC_DUMP_ROOT_LIMIT`), and
+  `TRUST_JS_GC_RETAINING_PATHS=1` adds retaining paths.
 - On GNU/Linux, `TRUST_JS_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

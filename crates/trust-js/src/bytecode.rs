@@ -23463,6 +23463,41 @@ mod named_read_helper_tests;
 /// Dedicated property-read entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::get_prop_ic`] for the four read shapes, skipping the generic
 /// op decode.
+/// Consume a validated accessor (holder, slot) published by the ARM64 template's
+/// accessor landing for THIS helper call. Always clears the publication, including on
+/// decline, so it can never leak into a nested or later helper call. Detailed-feedback
+/// runs keep the canonical profiled resolution, whose observations must see every read.
+unsafe fn jit_accessor_fast(
+    validated: (usize, u32),
+    i: &mut Interp,
+    chunk: &Chunk,
+    name: &str,
+    receiver: &Value,
+) -> Option<Result<Value, Abrupt>> {
+    let (holder, slot) = validated;
+    if holder == 0 || chunk.feedback.detailed_enabled() {
+        return None;
+    }
+    unsafe { i.accessor_validated_get(holder, slot, name, receiver) }
+}
+
+/// Packed-receiver form of [`jit_accessor_fast`]: unpacks (clones) the receiver only
+/// when a validated accessor was actually published, so ordinary helper reads pay no
+/// extra ownership traffic for the fast path's existence.
+unsafe fn jit_accessor_fast_packed(
+    validated: (usize, u32),
+    i: &mut Interp,
+    chunk: &Chunk,
+    name: &str,
+    packed: &PackedValue,
+) -> Option<Result<Value, Abrupt>> {
+    if validated.0 == 0 || chunk.feedback.detailed_enabled() {
+        return None;
+    }
+    let receiver = packed.unpack();
+    unsafe { i.accessor_validated_get(validated.0, validated.1, name, &receiver) }
+}
+
 pub(crate) unsafe extern "C" fn jit_get_prop(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -23472,34 +23507,73 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    // Consume any validated accessor publication up front: every exit of this helper,
+    // including error returns, leaves the fields clear for the next helper call.
+    let accessor_validated = (ctx.accessor_holder, ctx.accessor_slot);
+    ctx.accessor_holder = 0;
+    ctx.accessor_slot = 0;
     let _inline_position = ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize);
     let r: Result<(), Abrupt> = (|| {
         match chunk.ops[pc as usize] {
             Op::GetProp(n, c) => {
                 sp = sp.sub(1);
                 let obj = sp.read();
-                let v = get_named_property_packed(
-                    i,
-                    chunk,
-                    pc as usize,
-                    &obj,
-                    &chunk.names[n as usize],
-                    &chunk.caches[c as usize],
-                )?;
+                if ctx.propstat_enabled {
+                    jit_propstat(
+                        ctx,
+                        i,
+                        &obj.unpack(),
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                        pc,
+                    );
+                }
+                let v = match unsafe {
+                    jit_accessor_fast_packed(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        &obj,
+                    )
+                } {
+                    Some(r) => PackedValue::pack(r?),
+                    None => get_named_property_packed(
+                        i,
+                        chunk,
+                        pc as usize,
+                        &obj,
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                    )?,
+                };
                 sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
             Op::GetPropThis(n, c) => {
                 let this = &*ctx.this_raw;
-                let v = get_named_property(
+                jit_propstat(
+                    ctx,
                     i,
-                    chunk,
-                    pc as usize,
                     this,
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
-                )?;
+                    pc,
+                );
+                let v = match unsafe {
+                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], this)
+                } {
+                    Some(r) => r?,
+                    None => get_named_property(
+                        i,
+                        chunk,
+                        pc as usize,
+                        this,
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                    )?,
+                };
                 sp.write(PackedValue::pack(v));
                 sp = sp.add(1);
                 Ok(())
@@ -23516,28 +23590,70 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         ),
                     ));
                 }
-                let v = get_named_property_packed(
-                    i,
-                    chunk,
-                    pc as usize,
-                    obj,
-                    &chunk.names[n as usize],
-                    &chunk.caches[c as usize],
-                )?;
+                if ctx.propstat_enabled {
+                    jit_propstat(
+                        ctx,
+                        i,
+                        &(*obj).unpack(),
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                        pc,
+                    );
+                }
+                let v = match unsafe {
+                    jit_accessor_fast_packed(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        &*obj,
+                    )
+                } {
+                    Some(r) => PackedValue::pack(r?),
+                    None => get_named_property_packed(
+                        i,
+                        chunk,
+                        pc as usize,
+                        obj,
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                    )?,
+                };
                 sp.write(v);
                 sp = sp.add(1);
                 Ok(())
             }
             Op::GetMethod(n, c) => {
                 let obj = sp.sub(1); // receiver stays on the stack
-                let m = get_named_property_packed(
-                    i,
-                    chunk,
-                    pc as usize,
-                    obj,
-                    &chunk.names[n as usize],
-                    &chunk.caches[c as usize],
-                )?;
+                if ctx.propstat_enabled {
+                    jit_propstat(
+                        ctx,
+                        i,
+                        &(*obj).unpack(),
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                        pc,
+                    );
+                }
+                let m = match unsafe {
+                    jit_accessor_fast_packed(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        &*obj,
+                    )
+                } {
+                    Some(r) => PackedValue::pack(r?),
+                    None => get_named_property_packed(
+                        i,
+                        chunk,
+                        pc as usize,
+                        obj,
+                        &chunk.names[n as usize],
+                        &chunk.caches[c as usize],
+                    )?,
+                };
                 sp.write(m);
                 sp = sp.add(1);
                 Ok(())
@@ -23885,6 +24001,52 @@ unsafe fn jit_call_inner(
 /// Debug: `TRUST_JS_JIT_CALLSTAT=1` tallies, for every call that reaches the way-1 HIT helper,
 /// which direct-call gate would have (or did) reject the shared-ctx fast path. Temporary
 /// diagnostic mirroring `emit_direct_call`'s runtime checks in emission order.
+/// Debug: `TRUST_JS_JIT_PROPSTAT=1` tallies, for every named read that reaches a JIT
+/// property helper, why the inline template did not serve it (see
+/// [`crate::interpreter::Interp::propstat_classify`]); `=2` adds the site, like
+/// `TRUST_JS_JIT_OPSTAT=2`. Mirrors `jit_callstat`'s diagnostic contract.
+pub(crate) fn jit_propstat_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_JS_JIT_PROPSTAT").is_some())
+}
+
+#[inline(always)]
+fn jit_propstat(
+    ctx: &crate::jit::JitCtx,
+    i: &Interp,
+    base: &Value,
+    name: &str,
+    cache: &std::cell::Cell<IcState>,
+    pc: u32,
+) {
+    if !ctx.propstat_enabled || !jit_profile_window_open() {
+        return;
+    }
+    struct Dump(crate::fasthash::FastMap<String, u64>);
+    impl Drop for Dump {
+        fn drop(&mut self) {
+            let mut v: Vec<_> = self.0.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            for (r, n) in v.iter().take(32) {
+                eprintln!("[jit-propstat] {n:>12}  {r}");
+            }
+        }
+    }
+    thread_local! {
+        static COUNTS: std::cell::RefCell<Dump> =
+            std::cell::RefCell::new(Dump(Default::default()));
+    }
+    let reason = i.propstat_classify(base, name, cache);
+    let key = if std::env::var("TRUST_JS_JIT_PROPSTAT").as_deref() == Ok("2") {
+        let chunk = unsafe { &*ctx.chunk };
+        let params: Vec<&str> = chunk.slot_names.iter().take(3).map(|s| &**s).collect();
+        format!("{reason} {name:?} @ fn({}) pc{pc}", params.join(","))
+    } else {
+        reason.to_string()
+    };
+    let _ = COUNTS.try_with(|c| *c.borrow_mut().0.entry(key).or_insert(0) += 1);
+}
+
 pub(crate) fn jit_callstat_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -24518,6 +24680,14 @@ unsafe fn jit_exec_inner(
         Op::LoadThis => push!(ctx.this_val.clone()),
         Op::GetProp(n, c) => {
             let obj = pop!();
+            jit_propstat(
+                ctx,
+                i,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+                pc,
+            );
             let v = get_named_property(
                 i,
                 chunk,
@@ -24530,6 +24700,14 @@ unsafe fn jit_exec_inner(
         }
         Op::GetPropThis(n, c) => {
             let this = (*ctx.this_raw).clone();
+            jit_propstat(
+                ctx,
+                i,
+                &this,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+                pc,
+            );
             let v = get_named_property(
                 i,
                 chunk,
@@ -24551,6 +24729,14 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
+            jit_propstat(
+                ctx,
+                i,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+                pc,
+            );
             let v = get_named_property(
                 i,
                 chunk,
@@ -24930,6 +25116,14 @@ unsafe fn jit_exec_inner(
         }
         Op::GetMethod(n, c) => {
             let obj = pop!();
+            jit_propstat(
+                ctx,
+                i,
+                &obj,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+                pc,
+            );
             let m = get_named_property(
                 i,
                 chunk,
@@ -25878,6 +26072,8 @@ mod return_slot_tests {
             activation: None,
             resume_activation: std::ptr::null_mut(),
             references_raw: std::ptr::null_mut(),
+            accessor_holder: 0,
+            accessor_slot: 0,
             resume_pc: 0,
             resume_step: None,
             handler_floor: 0,
@@ -25888,6 +26084,7 @@ mod return_slot_tests {
             env_parent_raw: std::ptr::null(),
             opstat_enabled: false,
             callstat_enabled: false,
+            propstat_enabled: false,
             inline_recompile_at: 100,
             live_objects: std::ptr::null(),
         }

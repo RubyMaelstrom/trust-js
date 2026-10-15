@@ -1716,6 +1716,7 @@ pub struct JitCtx {
     /// lookup in every JIT helper when operation statistics are disabled.
     pub opstat_enabled: bool,
     pub callstat_enabled: bool,
+    pub propstat_enabled: bool,
     pub inline_recompile_at: u32,
     /// Address of the executing thread's live-object counter. Compiled chunks may cross thread
     /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
@@ -1729,6 +1730,12 @@ pub struct JitCtx {
     pub(crate) resume_step: Option<crate::bytecode::VmStep>,
     /// Canonical Reference owners for this frame; null until a fresh activation needs them.
     pub(crate) references_raw: *mut crate::eval::PreparedReferenceSlot,
+    /// Validated accessor holder (`Rc::as_ptr` as usize) and slot, set by the ARM64
+    /// property template's accessor landing immediately before it calls `jit_get_prop`.
+    /// The helper consumes (clears) both before any JavaScript can run, so no validated
+    /// state can outlive the synchronous helper call that observed it. 0 = none.
+    pub accessor_holder: usize,
+    pub accessor_slot: u32,
 }
 
 impl JitCtx {
@@ -5168,16 +5175,29 @@ fn emit_prop_way_probe(
     // depth routing: 0 → holder is the receiver; 1 → one hop; 2/3 validate their recorded
     // intermediate shapes then fall to d1 for the holder. Non-plain depths divert to the
     // key-checked decoder (`kc_route`) so the common depths pay nothing for its existence.
+    // Accessor states (IC_ACCESSOR | depth, never key-checked here) route identically:
+    // the chain validation is descriptor-kind agnostic, and the load landing re-checks
+    // the live descriptor kind and diverts accessors to the validated accessor landing.
+    let kc_route = if kc { a.new_label() } else { miss };
+    let depth2 = a.new_label();
+    let depth3 = a.new_label();
+    let other = a.new_label();
     a.cbz(9, false, load);
     a.cmp_imm_w(9, 1);
     a.b_cond(C_EQ, d1);
-    let kc_route = if kc { a.new_label() } else { miss };
-    let depth2 = a.new_label();
-    let other = a.new_label();
+    a.cmp_imm_w(9, crate::bytecode::IC_ACCESSOR as u32);
+    a.b_cond(C_EQ, load);
+    a.cmp_imm_w(9, (crate::bytecode::IC_ACCESSOR | 1) as u32);
+    a.b_cond(C_EQ, d1);
+    a.cmp_imm_w(9, (crate::bytecode::IC_ACCESSOR | 2) as u32);
+    a.b_cond(C_EQ, depth2);
+    a.cmp_imm_w(9, (crate::bytecode::IC_ACCESSOR | 3) as u32);
+    a.b_cond(C_EQ, depth3);
     a.cmp_imm_w(9, 2);
     a.b_cond(C_EQ, depth2);
     a.cmp_imm_w(9, 3);
     a.b_cond(C_NE, other);
+    a.bind(depth3);
     a.ldrb_imm(14, 12, IC_OFF_MID_OK);
     a.cmp_imm_w(14, 3);
     a.b_cond(C_NE, miss);
@@ -5677,6 +5697,7 @@ fn emit_prop_load_inline(
     //    stale cache would be memory-unsafe, so verify), then entry = entries + slot*size;
     //    data property; non-BigInt
     let val = a.new_label();
+    let accessor_hit = a.new_label();
     a.bind(load);
     a.ldr_imm(16, 11, en_len);
     a.cmp_reg_x(13, 16);
@@ -5685,7 +5706,10 @@ fn emit_prop_load_inline(
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     a.bind(val);
-    guard_prop_data(a, 9, 15, ea, slow);
+    // An accessor at the validated slot is not a miss: the chain shapes, holder and slot
+    // are already proven, so record them for the helper's validated accessor path instead
+    // of discarding the validation and re-deriving the resolution in Rust.
+    guard_prop_data(a, 9, 15, ea, accessor_hit);
     if layout.entry_accessor == layout.entry_value + 8 {
         // Heap and execution words share the encoding; clone only the actual owner.
         a.ldur(12, 15, ev);
@@ -5790,6 +5814,16 @@ fn emit_prop_load_inline(
         regions::emit_property_event(a, 1);
         a.b(done);
     }
+    // Validated accessor landing: x11 = holder object base, x13 = slot. Publish both for
+    // `jit_get_prop`'s validated accessor path, then take the ordinary helper call. No
+    // JavaScript can run between the validation above and the helper consuming these.
+    a.bind(accessor_hit);
+    // x11 is the Object base; the helper wants the `Rc::as_ptr` form (the RefCell),
+    // which sits `obj_from_rc - gc_data_off` (the RefCell value offset) before it.
+    debug_assert!(layout.gc_data_off <= rcv as usize);
+    a.sub_imm(9, 11, rcv - layout.gc_data_off as u32);
+    a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
+    a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
     a.bind(slow);
     #[cfg(test)]
     regions::emit_property_event(a, 2);
@@ -18219,11 +18253,14 @@ pub(crate) unsafe fn run_borrowed_frame(
         env_parent_raw: jit_env_parent_raw(env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+        propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
         activation: None,
         resume_activation: state,
         references_raw: (&mut *state.references).as_mut_ptr(),
+        accessor_holder: 0,
+        accessor_slot: 0,
         resume_pc: *pc,
         resume_step: None,
     };
@@ -18344,6 +18381,7 @@ pub fn run(
         env_parent_raw,
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+        propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
         interp: i as *mut Interp,
@@ -18356,6 +18394,8 @@ pub fn run(
         activation: None,
         resume_activation: std::ptr::null_mut(),
         references_raw: std::ptr::null_mut(),
+        accessor_holder: 0,
+        accessor_slot: 0,
         resume_pc: 0,
         resume_step: None,
         handler_floor: 0,
@@ -18452,6 +18492,7 @@ impl JitFrame {
                 env_parent_raw: std::ptr::null(),
                 opstat_enabled: crate::bytecode::jit_opstat_enabled(),
                 callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+                propstat_enabled: crate::bytecode::jit_propstat_enabled(),
                 inline_recompile_at: crate::bytecode::inline_recompile_at(),
                 live_objects: crate::value::live_objects_ptr(&i.gc_heap),
                 activation: None,
@@ -18459,6 +18500,8 @@ impl JitFrame {
                 resume_pc: 0,
                 resume_step: None,
                 references_raw: std::ptr::null_mut(),
+                accessor_holder: 0,
+                accessor_slot: 0,
             });
             (*base).ctx.this_raw = std::ptr::addr_of!((*base).ctx.this_val);
             std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
@@ -18789,6 +18832,7 @@ unsafe fn run_moved_oversized(
         env_parent_raw: jit_env_parent_raw(env),
         opstat_enabled: crate::bytecode::jit_opstat_enabled(),
         callstat_enabled: crate::bytecode::jit_callstat_enabled(),
+        propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
         interp: i as *mut Interp,
@@ -18801,6 +18845,8 @@ unsafe fn run_moved_oversized(
         activation: None,
         resume_activation: std::ptr::null_mut(),
         references_raw: std::ptr::null_mut(),
+        accessor_holder: 0,
+        accessor_slot: 0,
         resume_pc: 0,
         resume_step: None,
         handler_floor: 0,

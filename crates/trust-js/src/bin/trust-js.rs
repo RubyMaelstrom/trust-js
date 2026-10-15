@@ -188,6 +188,7 @@ Diagnostics (env, unstable):
   TRUST_JS_REGEXP_PROF=1     Report matcher instruction/scan/attempt/backtrack/tier counts at exit
   TRUST_JS_REGEXP_TIER_UP_AT=N  Promote eligible ASCII matchers after N calls; 0 disables
   TRUST_JS_JIT_CALLSTAT=1    Tally calls that reach the inline-cache call helper
+  TRUST_JS_JIT_PROPSTAT=1    Tally why named reads reach a JIT property helper (=2 adds sites)
   TRUST_JS_JIT_CODE_BUDGET_MB=N  Process-wide live executable-code cap, 1..1024 MiB
   TRUST_JS_JIT_LOOPLOG=1     Trace JIT loop back-edge compilation
   TRUST_JS_PERF_METRICS=1    Print one JSON JIT/collector performance summary at normal exit
