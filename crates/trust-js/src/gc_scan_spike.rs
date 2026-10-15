@@ -131,7 +131,14 @@ fn deep_scan(
     let marker = 0u64;
     let unspilled = unsafe { scan(arena, &marker as *const u64, top) };
     eprintln!("spike: unspilled same-frame scan found {unspilled:?}");
-    black_box((raw, tagged, interior, holder.field, hidden_usize, heap_words));
+    black_box((
+        raw,
+        tagged,
+        interior,
+        holder.field,
+        hidden_usize,
+        heap_words,
+    ));
     found
 }
 
@@ -233,6 +240,9 @@ fn spike_scan_cost_is_linear_and_small() {
     let elapsed = start.elapsed();
     black_box(total);
     // Recorded for the S0 report; bound is deliberately loose (CI noise).
-    assert!(elapsed.as_millis() < 1000, "100x1MiB scans took {elapsed:?}");
+    assert!(
+        elapsed.as_millis() < 1000,
+        "100x1MiB scans took {elapsed:?}"
+    );
     eprintln!("spike: 100 scans of 1MiB in {elapsed:?}");
 }

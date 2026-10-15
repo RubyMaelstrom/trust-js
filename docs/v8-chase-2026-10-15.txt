@@ -312,3 +312,45 @@ the existing += fast paths (AppendProp, eval Add, builtins concat).
 S0 status: a/b/c/d/e complete except wasm32 prototype run (deferred,
 above) and Speedometer smoke (not run; fixtures only). Proposed S6
 thresholds in S0b section. Awaiting owner go/no-go for S1.
+
+S1 heap core (2026-10-15, owner go/no-go: GO)
+---------------------------------------------
+Audit outcome (Decision 4/5): heap.rs (1,419 lines) is a handle-table
+design (HeapRef index+cookie -> boxed storage); its storage model
+contradicts Decision 1, so it is NOT extended. Harvested: NoGcScope
+pattern (tagged.rs, reimplemented over a shared control block),
+stats/verifier concepts. tagged.rs TaggedValue encoding stays for
+S5; its RootMap/DeoptRecord remains Phase-3 scaffolding. gc_edges.rs
+trace_gc functions become descriptor sources at S2. gc_handle.rs is
+the S2 seam. New core: crates/trust-js/src/gc_core.rs behind feature
+gc-heap (default off; default build verified unchanged).
+
+Implemented: 64KiB pages segregated by (size class x descriptor),
+side-table page metadata with interior-pointer resolution, allocation
+bitmap (conservative hits on free cells ignored — a stale stack word
+marking free-list linkage was caught by the verifier during bring-up),
+large-object path, mark-sweep with precise descriptor tracing,
+conservative roots (aarch64 callee-saved register spill via asm,
+stack range + registered extra ranges, tagged root ranges, traced
+container roots), ephemeron fixed point, weak-slot clearing, sweep
+hooks with liveness predicate (I8), I9 machinery (no-GC regions with
+pending-collect deferral, zeroed allocate-then-publish), heap
+verifier + debug cell poisoning, GC stress knob (collect armed per N
+allocations), finalizers.
+
+Tests: 11 gc_core tests (chains, interior/tagged roots, ephemeron
+chain fixed point, weak slots, nogc deferral, finalizers, large
+objects, sweep-hook side-table pruning, 200-node stress graph under
+collect-every-alloc, stack-resident rooting, debug verifier panic)
+pass in debug and release; S0 spike tests still pass in release.
+Death assertions collect on a fresh thread — same-thread collect
+correctly retains via this frame's registers (observed in release:
+ephemeron/weak tests initially "failed" by retaining 5/5 cells).
+Clippy -Dwarnings clean with and without gc-heap; fmt clean.
+
+Known S1 limits carried forward: no per-target spill on x64 yet
+(stack scan only; contract requires it before authority there);
+stacker segment exact-bounds registration is API-only (engine wrapper
+lands at S2; unregistered segments stay no-GC regions); sweep-hook
+liveness set is O(live) memory per collection (tune later); verifier
+runs automatically only in debug builds.

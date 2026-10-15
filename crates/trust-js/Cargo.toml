@@ -35,6 +35,9 @@ architecture-diagnostics = []
 # live object while the existing `Rc<RefCell<Object>>` graph remains authoritative; never enabled
 # by the default production build until relocation and differential gates are complete.
 heap-bridge = []
+# P1 (rearch/v8-chase) pointer-based GC heap core; additive and default-off
+# until the S6 flip. See docs/v8-chase-p1-plan-2026-10-15.txt.
+gc-heap = []
 
 [lints]
 workspace = true

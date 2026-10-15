@@ -83,6 +83,8 @@ mod for_in_cache_tests;
 mod function_realm_identity_tests;
 #[cfg(test)]
 mod function_realm_lifetime_tests;
+#[cfg(feature = "gc-heap")]
+mod gc_core;
 mod gc_diagnostics;
 mod gc_edges;
 mod gc_generational;
