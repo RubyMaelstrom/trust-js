@@ -1,0 +1,296 @@
+Specialization pilot: Phase 0 attribution and design, 2026-10-15
+================================================================
+
+Status: Phase 0 (diagnostic + attribution + this design) is implemented and
+validated. No pilot optimization below is implemented yet. Each pilot has a
+predicted-saving gate recorded BEFORE implementation, following the rule from
+docs/architecture-reassessment-20260928.md: a helper-count target alone is not
+evidence; the first milestone is a material full-workload improvement over the
+production template/region tier under benchmarks/README.md regression policy.
+
+Baseline: 2f9447e1 (current HEAD) on crystal, aarch64 Linux, Cortex-X925,
+Rust 1.99.0, release opt-level 3 / fat LTO / one codegen unit, CPU 5 affinity.
+Baseline shell SHA-256 541c0207f437eea2711c3d46be31725ebe2fdb7880e32a5705d1641abc4dca64.
+Iteration builds from here use CARGO_PROFILE_RELEASE_LTO=false with multiple
+codegen units; acceptance timing always uses matched fat-LTO pairs.
+
+Diagnostics used (DIAGNOSTICS.md; the source is authoritative)
+--------------------------------------------------------------
+- TRUST_JS_PERF_METRICS=1: compile/GC/native/memory summary at exit.
+- TRUST_JS_JIT_OPSTAT=1|=2: ops reaching helpers, optionally per site.
+- TRUST_JS_JIT_CALLSTAT=1: direct-call gate rejection reasons.
+- TRUST_JS_JIT_PROPSTAT=1|=2 (NEW in this change): why named reads reaching a
+  JIT property helper were not served by the inline template. Read-only
+  classification mirrors emit_prop_way_probe's guards; =2 adds name+site.
+- TRUST_JS_JIT_MAP=1 and TRUST_JS_JIT_GPROFNG=1 with gprofng, plus perf record
+  for generated-code attribution.
+- architecture-diagnostics feature was NOT needed for Phase 0 conclusions;
+  the 2026-10-06 object-layout inventory (docs/object-layout-inventory-
+  20261006.txt) already supplies the live property census.
+All diagnostic runs are excluded from acceptance timing per DIAGNOSTICS.md.
+
+Real-workload baselines (selected Octane kept only as a control)
+----------------------------------------------------------------
+Fixtures: benchmark-results/engine-optimization-20260929/{react,djot,vue}.js
+(local investigation inputs; outputs verified against Node v24 in this session
+and in benchmarks/review-applications-v3-2026-10-14.json). Internal elapsed
+(excludes process startup):
+  React reducer:  TRust 72 ms,  Node 19 ms   (3.8x)
+  Vue reactivity: TRust 574 ms, Node 116 ms  (4.9x)
+  Djot: wall 271 ms vs Node 131 ms; internal in the frozen record 186 vs 50.
+Selected Octane control at HEAD reproduces the frozen record: composite 1842
+vs recorded 1839 (Node 31991). Richards is treated as synthetic and is not a
+pilot target.
+
+Attribution findings
+--------------------
+Sampling (perf, CPU 5, repeated fresh processes; [unknown] = generated code):
+- Vue: generated ~30%, PackedValue pack/unpack/drop ~9.6%, property-get
+  helper chain ~9.4%, call/frame helpers ~7.3%, GC/alloc ~2.7%.
+- Djot: generated ~30%, pack/drop ~7.3%, GC/alloc ~6.2%, compile ~5.9%
+  (per-process), calls ~3.4%; remaining mass is string/regexp work.
+- React: generated ~60%, everything else diffuse; only 46 named reads reach
+  a property helper in the whole run.
+PERF_METRICS (Richards control): JIT compile 10.7 ms, GC pauses 5.4 ms,
+native calls 4.1 ms -- none explains the steady-state gap.
+
+PROPSTAT (one run each; counts are helper reaches, not time):
+- Vue (735,630 helper reads): accessor descriptor 443,187 (60%),
+  proxy receiver 123,158 (17%), primitive receiver 111,877 (15%),
+  absent uncached 57,361 (8%), data shape churn 35 (0.005%).
+  Named sites (=2): accessors are webpack export binding getters
+  ("kJ","yk","Kn","RI",... defined by the bundle's defineProperty get
+  helper, bodies `function(){return <binding>}`); primitive/proxy/absent
+  reads are Vue flag checks "__v_isRef"/"__v_raw"/"__v_isReadonly"/
+  "__v_isShallow"; proxy reads also include the driver's own
+  count/nested/items/length through the reactive proxy.
+- Djot (4,317 helper reads): array holder 2,617, data churn 1,527 -- the
+  property helper is not Djot's bottleneck.
+- React (46 helper reads): property helpers are irrelevant to its gap.
+
+Conclusions that constrain the pilots:
+1. Shape churn is NOT a measured problem on these workloads. Widening shape
+   polymorphism or cache ways is not a pilot.
+2. No single helper family explains all three workloads. Generated-code
+   quality (guards, ownership traffic, pack/unpack at boundaries) is the
+   only common mass; per-workload pilots must still clear app-level gates.
+3. The removed Cranelift tier already proved that kernel speed without
+   representation facts does not repay (4.52x scalar kernel, negative to
+   zero application result; docs/architecture-outcome-20260929.md,
+   docs/compiler-review-2026-10-14.txt). Do not rebuild a separate tier.
+
+Shape/descriptor mutation audit (summary)
+-----------------------------------------
+Today's shape proves only the ordered key sequence (value.rs:4020); kind,
+writability, prototype and extensibility live outside it, so every consumer
+re-reads descriptor bits live. Nearly every dangerous in-place mutation
+funnels through two chokepoints: the existing-key branch of Props::insert
+(value.rs:6036, whole-descriptor replacement with no shape change -- the
+funnel for define_own_property_ordinary, accessor installs, array-length
+rewrites) and the &mut Property escapes get_mut/entry_at_mut (value.rs:5846).
+Freeze/seal and prototype swaps never touch the shape; PROTO_EPOCH
+(value.rs:3987) is bumped at only three unconditional sites plus
+note_structural on flagged live prototypes, and ordinary get/set ICs never
+consult it. Two shape-copying sites assume attributes are not encoded and
+would break under a richer shape: try_copy_named_data_from (value.rs:4499)
+and instantiate_plain_packed (value.rs:4703). Full site list with file:line
+citations was produced for this design; unresolved items are the ~30 direct
+`.proto =` writes (mostly fresh-object wiring, per-site exposure unread),
+descriptor writes in snapshot.rs/host.rs/modules.rs, and x64 store
+inlining (stores apparently are not inlined on x64).
+
+Minimal shape design (Pilot C substrate): encode per-field class in
+{DataWritable, DataNonWritable, Accessor} in the transition key
+(parent, key, class); class-changing redefines demote to a fresh unique
+shape (the delete precedent, value.rs:6154) instead of mid-sequence
+attribute transitions; value-only stores move to a dedicated
+Props::set_value_at and get_mut/entry_at_mut on named keys demote on
+acquisition (the mirror_invalidate discipline); preventExtensions demotes;
+the two shape-copying sites land on the all-plain variant or demote.
+Prototype identity and value category stay OUT of the shape (PROTO_EPOCH
+remains the chain cell; mirror_flags already covers element categories).
+Cost: +0 bytes/object; shape-table growth ~1.0-1.3x on plain-dominated
+workloads, bounded 3x adversarially; faster burn of the u32 shape space is
+the accepted risk. Droppable rechecks: guard_prop_data/guard_prop_writable
+(3 insns each, ~35 ARM64 sites, jit.rs:5029), the accessor compares in
+ic_shape_probe and set ICs, and the two region borrowed-read guards
+(jit_regions.rs:1430,1542); x64 drops its accessor TESTs
+(jit_x64.rs:516,684). Per-hop exotic/ic_plain checks, the proto chase,
+slot bounds and value-tag checks are NOT droppable.
+
+Ranked pilots (each independently gated; stop at the first that fails)
+----------------------------------------------------------------------
+Pilot A -- binding/accessor getter load specialization (largest, Vue-led)
+  Sequence: GetProp/GetPropLocal whose IC state is IC_ACCESSOR and whose
+  live getter is a proven binding getter (`return <ident>`, the
+  try_binding_getter contract in property_read.rs:177). Today every such
+  read pays helper entry + 4-way Rust probe + getter snapshot/clone +
+  binding-scope probe to load one binding.
+  Design: extend the accessor IC with a guarded fast landing in the ARM64
+  template: shape-validate as today, then branch to a dedicated accessor
+  helper (not jit_exec) that re-reads the live getter at the validated
+  slot and executes the existing binding/record getter proofs, falling
+  back to OrdinaryGet otherwise. Getter identity is never cached across
+  a borrow release (property_read.rs:3 contract retained). Second step,
+  only if the first repays: emit the binding-scope generation guards
+  inline for cache-proven getters.
+  Predicted saving (pre-registered): 443k accessor helper reads/Vue run;
+  property-chain + try_binding_getter exclusive share is ~11% of Vue CPU.
+  Removing the generic dispatch/probe layers (not the proof itself) is
+  predicted at 4-8% of Vue internal time. GATE: accept only if Vue
+  internal improves >=4% paired (9+ pairs, CPU 5, fat LTO) with React and
+  Djot each within the 3% component rule and selected Octane not
+  regressed. If <4%, revert; the remaining cost is the proof, which
+  belongs to Pilot C's shape facts, not to more accessor plumbing.
+  x64: the dedicated helper is backend-shared; x64 templates keep routing
+  accessor states to it until own-read parity work resumes there.
+
+Pilot B -- primitive named loads (Num/Bool/Str prototypes)
+  Sequence: `v.__v_isRef`-style flag reads and Number/Boolean method
+  loads on primitive receivers. Today only String-prototype METHOD loads
+  inline (jit.rs:5461); Num/Bool prototypes are NumWrap/BoolWrap exotics
+  excluded from the IC entirely (ic_plain_ptr), so those reads never fill.
+  Design: (1) admit NumWrap/BoolWrap alongside StrWrap in ic_plain_ptr,
+  ic_shape_probe and ic_get_rederive (named entries are shape-pinned:
+  wrappers are never elem_mode -- mark_array fires only on becoming
+  Exotic::Array, value.rs:4924; digit names stay excluded by the existing
+  name gates); (2) add exotic_numwrap/boolwrap tags to JitLayout and
+  number_proto/boolean_proto offsets to InterpLayout (both fields are
+  already realm-swapped, interpreter.rs:4514); (3) in
+  emit_prop_load_inline, substitute the active realm's wrapper prototype
+  for Str/Num/Bool receivers in the non-consuming forms (GetMethod,
+  GetPropLocal, GetPropThis). Consuming GetProp keeps the helper.
+  Predicted saving: 112k primitive + part of 57k absent helper reads/Vue
+  run; predicted 2-5% of Vue internal, plus general Number/Boolean
+  method-load improvements off-fixture. GATE: Vue >=2.5% paired, no
+  component regressions, Test262 focused property/Number/Boolean/String
+  scopes clean in all tiers, difftest clean. x64 must at minimum not
+  regress (its template consumes the same live cache ways; verify on
+  zombie that NumWrap states route to checked helpers there).
+
+Pilot C -- shape class encoding (substrate; direct gain small, enabling)
+  Design as in the audit summary above. Direct predicted saving is
+  deliberately low (guard removal only): 1-3% on property-heavy app
+  controls. Its purpose is to let ONE shape compare prove descriptor
+  kind+writability so region load-elimination and guard reuse across
+  control flow become sound without live descriptor re-reads.
+  GATE: accept only with (a) no app-control regression beyond the 3%
+  rule (a <=5% component step requires explicit user acceptance per
+  benchmarks/README.md and must be justified as this enabling step),
+  (b) shape-table growth measured (PERF_METRICS + a shape census on
+  Vue/Djot/React within 1.5x of baseline distinct shapes), and
+  (c) a follow-on region experiment design that consumes the new proof.
+  Without (c) scheduled, do not land C alone -- that is how the earlier
+  header/inline2 layout candidates became rejected churn
+  (docs/runtime-optimization-phase-20261006.txt).
+
+Pilot D -- proxy flag reads (only after A/B evidence)
+  123k proxy helper reads/Vue run are mostly __v_raw/__v_is* checks and
+  the driver's reactive reads. No design is pre-registered: if A+B leave
+  proxy reads dominant, first measure trap-cache hit behavior with
+  PROPSTAT=2 + a proxy-trap tally before proposing a proxy IC. Proxies
+  are where unsound caching is easiest; no gate, no work.
+
+Explicitly not next: a new optimizing backend, a moving GC (measured
+GC/allocator shares cap it near 10% on these workloads; allocation
+elimination under Pilot C's facts comes first), parser/code-cache work
+(startup already beats Node), and further opportunistic builtin fixes
+except profile-proven asymptotic defects.
+
+Validation protocol (all pilots)
+--------------------------------
+- Correctness: cargo test -p trust-js --lib (full), clippy all-targets
+  embed -Dwarnings, cargo fmt --check, git diff --check; focused Test262
+  scopes in interp/bytecode/jit; difftest seeds; differential fixtures
+  for every new guard (mutation between fill and hit is the test that
+  matters: defineProperty kind flips, proto swaps, freeze, accessor
+  replacement, Realm-crossing getters).
+- Performance: interleaved fresh-process pairs (9+), CPU 5, matched
+  fat-LTO artifacts copied to the same tmpfs dir, outputs/checksums
+  verified per run, wall + CPU + internal elapsed + peak RSS reported
+  separately; diagnostic switches excluded from acceptance runs.
+  Speedometer 3.1 segments in the TRust browser remain the acceptance
+  surface per benchmarks/README.md; the three fixtures here are
+  iteration controls, not a substitute when a pilot claims app impact.
+- x64 (secondary): sync sources to ruby@zombie:~/Programs/, run the
+  focused tests and clippy there with --features embed (note: x64 lib
+  tests without embed do not compile at 2f9447e1 -- jit_x64_property_tests
+  calls the embed-gated Engine::collect_garbage_at_idle; pre-existing,
+  untouched by Phase 0), plus one paired timing control when a pilot
+  touches shared cache state.
+
+Phase 0 validation record (this change)
+---------------------------------------
+Files: DIAGNOSTICS.md (index the existing tallies + PROPSTAT),
+crates/trust-js/src/bin/trust-js.rs (help), bytecode.rs (tally + hooks),
+interpreter.rs (propstat_classify), jit.rs (JitCtx flag), three test
+constructors, property_read_tests.rs (classifier + child-process tally
+tests). Both new tests pass on ARM64 and on zombie x86_64 (embed).
+Full ARM64 lib suite: 2056 passed / 0 failed / 3 ignored. Clippy
+all-targets embed -Dwarnings clean. Default-path paired timing vs the
+frozen baseline (9 pairs each): Vue -0.23%, Djot -0.95%, React -2.11%
+median ratios -- no regression from the disabled-by-default diagnostic.
+
+Pilot A result (implemented 2026-10-15, ARM64)
+----------------------------------------------
+Implemented as designed: emit_prop_way_probe routes IC_ACCESSOR depths 0-3
+through the same chain validation as data states; the load landing's
+descriptor-kind guard diverts to a validated accessor landing that
+publishes (holder Rc::as_ptr, slot) in JitCtx.accessor_holder/slot;
+jit_get_prop consumes and clears that publication on every entry and, when
+present, resolves via Interp::accessor_validated_get (live getter re-read,
+binding/record proofs, ordinary Call boundary) instead of re-deriving the
+resolution. Packed-receiver arms unpack lazily so non-accessor helper reads
+pay nothing. x64 never publishes the fields and keeps its checked path.
+One bug was caught by the new mutation fixtures + core dump: the first
+version published the stored RcBox-base pointer where Rc::as_ptr form was
+required (off by gc_data_off); fixed by publishing holder - refcell_value.
+
+Correctness: new tier-differential fixtures cover binding updates, getter
+replacement, accessor<->data conversion, delete, prototype-holder reads,
+prototype swaps, missing getters, throwing/reentrant getters and the
+method form (Node-verified); a test-only counter proves the landing is
+exercised on ARM64. Full ARM64 lib suite 2058 passed / 0 failed; clippy
+embed -Dwarnings and fmt clean; x64 mutation fixture passes on zombie
+(fast-forwarded to 2f9447e1 + this diff).
+
+Gate measurement (matched fat LTO, 11 interleaved pairs, CPU 5):
+  Vue internal -2.10% (all 11 pairs < 1.0), wall -1.72%
+  Djot internal +0.54%, wall +0.29%   React internal +0.00%, wall -0.49%
+Selected-Octane single control: 1787 vs baseline 1842 (DeltaBlue single-run
+variance observed 792-922 across diagnostic runs; not a gate workload).
+VERDICT: the pre-registered >=4% Vue gate is NOT met by the plumbing alone;
+the remaining accessor cost is the binding/record proof and the Call
+boundary, as the gate text anticipated. The landing + routing are the
+infrastructure step 2 (inline binding-scope guards) requires, and the
+change is a consistent ~2% Vue win with no measured regressions, so it is
+retained in-tree pending the user's keep/revert decision; do not extend
+accessor plumbing further without either step 2 or Pilot C facts.
+
+Pilot B status: prototype complete in an isolated worktree
+(.muse/worktrees/subagent-v2-...-01a13f70-aa3d..., 5 files +538/-86,
+uncommitted, base 2f9447e1 without Phase 0/Pilot A). All its tests green
+there (full lib 2058 passed on its base), native-template hits proven for
+Slot/Method/strict-this forms. Not yet merged: expected minor conflicts in
+emit_prop_way_probe and property_read_tests.rs; its >=2.5% Vue gate,
+Test262/difftest scopes and zombie x64 run remain outstanding. Merge order:
+land/revert Pilot A first, then rebase B onto the result and re-run both
+pilots' mutation fixtures (accessor states over wrapper holders compose
+through the same landing).
+
+Pilot C status: audit completed; no code. Three blockers refine the
+design above: (1) arguments_named_shapes (interpreter.rs:13374) inserts
+`callee` as data in its probe but strict arguments install an accessor
+callee reusing that shape -- the probe must split under class encoding;
+(2) freeze_object (eval.rs:4166) is the sole live class flip outside the
+insert funnel and needs an explicit (single) demote; (3) demote-on-
+get_mut must land only AFTER value-only sites migrate to set_value_at,
+otherwise IC stores demote on every hit and every closure shape goes
+unique via make_function template patching. Also: demote only for
+entries-backed named properties; add demotes at the two module
+extensible=false sites; replace_properties must preserve proto_flag
+(pre-existing epoch hole); global name ICs keep their live
+accessor/writable checks (x64 global TESTs likewise not droppable); a
+shape census (transitions.len()) must be exposed before the gate-(b)
+baseline can be measured. Estimated diff ~550 production + ~350 test
+lines in the checklist order recorded with this session's audit.
