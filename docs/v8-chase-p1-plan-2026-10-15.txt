@@ -1,0 +1,548 @@
+# Phase 1 plan: GC-managed object model (rearch/v8-chase)
+
+## Goal
+
+Replace the `Rc<RefCell<Object>>` object model and cycle collector with an
+engine-owned tracing GC heap and single-allocation objects with inline
+property slots, on branch `rearch/v8-chase`, so that Phase 3 (speculative
+optimizing tier) can be built on cheap allocation, stable engine-owned
+layouts, and freedom from per-copy refcount semantics. Program context and
+owner decisions are recorded in
+[docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt):
+target Node/V8 on framework workloads (ARM64 primary, x64 secondary),
+object model before tier, big-bang branch permitted, `main` stays shippable.
+
+## Revision notes (third-party review, 2026-10-15)
+
+Every checkable claim in the review was verified against the tree before
+adopting it (counts below are this session's greps). Disposition: items
+1–11 and all smaller notes accepted, with these nuances recorded so future
+agents don't re-litigate them:
+
+- (1) Rooting is now Key Decision 0, with conservative native-stack
+  scanning recommended — but a spike must prove it on this codebase first:
+  optimized Rust can hold derived/split references that naive scanning
+  misses, so S0 includes adversarial rooting tests and a recorded fallback
+  (hybrid handle scopes at native boundaries) if the spike fails.
+  Conservative retention also permanently forecloses moving collection
+  until rooting is revisited; accepted for P1 (non-moving by design).
+- (2) Stage order inverted as suggested: ownership switches for *all*
+  objects at once through the `Gc` seam; layout improves afterwards, one
+  family at a time. Cross-heap cycles and dual `Value::Obj` variants are
+  thereby designed out, not managed.
+- (5) Nuance: the fixtures existed in this workspace at Phase 0 and all
+  pilot A/Bs ran against them, but `benchmark-results/` is gitignored
+  (.gitignore:60) and the workspace copies are currently gone; the only
+  copies are in `/tmp/trust-js-review-controls-wnym0ybo/` (sha256:
+  vue `38b44c1a…8190cc`, react `1468db26…2f7bc`, djot `c41742a4…cd682`).
+  Preserving them into `benchmarks/` is step S0.0, before anything else.
+- (6) This file is `.txt` because `*.md` is gitignored (.gitignore:66);
+  the previous `.md` draft was deleted uncommitted.
+- Scale corrections from the review, verified: 86 non-test files /
+  ~174k lines mention `Value`; 1,377 non-test `Value::Obj` sites; 629
+  `Rc::as_ptr` sites; 136 address-keyed `Map<usize,…>`/`Set<usize>` tables.
+
+Second review (same day), all six points verified against code and
+accepted:
+
+- Scanning is a *contract*, not a construction proof (Decision 0 rewritten;
+  Boehm, https://hboehm.info/gc/issues.html: conservative collectors
+  "require mild restrictions on both the source code and the compiler").
+- Existing trace machinery is a starting inventory only: `HostGc`
+  explicitly permits omitted handles today
+  ([host.rs:47](/big/Code/trust-js/crates/trust-js/src/host.rs:47))
+  because refcounts retain them, and `GcEdgeSink::value`
+  ([gc_edges.rs:128](/big/Code/trust-js/crates/trust-js/src/gc_edges.rs:128))
+  follows objects only. Mandatory tracing + host-root API land at S2.
+- New invariant I9 (collection vs borrowing): code already borrows an
+  object mutably while constructing a string
+  ([builtins/mod.rs:3278](/big/Code/trust-js/crates/trust-js/src/builtins/mod.rs:3278)),
+  and today's collector panics on collection during a mutable borrow
+  ([interpreter.rs:11622](/big/Code/trust-js/crates/trust-js/src/interpreter.rs:11622)).
+- wasm32 needs a real sustained-allocation acceptance test, decided at S0.
+- JS string accumulation (`s += x`) replacement is selected and
+  scaling-tested at S0, not left to S4.
+- The new collector is measured under sustained allocation (refcounting
+  currently reclaims most short-lived objects before the cycle collector
+  ever runs, [interpreter.rs:11046](/big/Code/trust-js/crates/trust-js/src/interpreter.rs:11046));
+  and the generational note is corrected — non-moving generational
+  collection *is* compatible with conservative roots, merely deferred
+  with unproven value.
+
+## Success Criteria
+
+Phase 1 is done when its merge gates hold on `rearch/v8-chase`:
+
+- Full lib suite green and Test262 pass count at parity with `main`
+  (same subsets, no new failures; skips only where `main` skips).
+  Downstream crates (trust-js-host/runtime/web/node/wasm) build **and
+  their tests pass** — I5 teardown executes there, not in the engine.
+- Vue/React/Djot fixture elapsed times no worse than `main` beyond a bound
+  the owner explicitly accepts at the merge review (target: parity or
+  better; P1 is expected to be roughly elapsed-neutral).
+- Vue whole-process instructions reduced by at least the threshold fixed
+  at S0 exit from the ownership-cost bucket measurement (see S0; baseline
+  3.298e9 instructions, 22.49e6 cache-misses; Node 0.737e9 / 2.72e6),
+  paired runs, at equal-or-better elapsed. No "measurably below" vagueness
+  survives S0.
+- Peak RSS and GC time bounded: peak RSS on fixtures within the bound set
+  at S0 (mark-sweep without compaction is expected to raise it vs
+  refcounting — bound it explicitly, e.g. ≤ +25% unless re-justified),
+  total GC time ≤5% of fixture elapsed, max single pause recorded.
+- No `Rc<RefCell<Object>>`, cycle collector, refcounted `LStr`/symbol/
+  bigint payloads, or `PackedValue`/`Value`-enum dual representation
+  remains in production paths; one tagged execution word, one heap,
+  copying a tagged word is always free (no incref/decref anywhere,
+  including generated code).
+- Embed API (`feature = "embed"`) restored; x64 validated on zombie.
+- GC stress mode (collect on a small allocation budget) plus heap
+  verifier pass the lib suite (see Validation Plan for what each proves).
+- Sustained-allocation workload (large retained heap + repeated temporary
+  allocation) stays inside the S0-set RSS/pause bounds — the new collector
+  is judged on the churn refcounting used to absorb for free, not on the
+  old collector's 1%.
+- wasm32: sustained allocation inside a single evaluation stays within a
+  bounded memory budget in an actual wasm32 run (mechanism decided at S0;
+  native builds of the wasm crate do not count as evidence).
+
+## Approach
+
+### Where we start
+
+(Surveyed 2026-10-15 by direct reads after three delegated survey runs
+failed; re-verify citations when touching code.)
+
+- Two value representations: an ergonomic `Value` enum
+  ([value.rs:113](/big/Code/trust-js/crates/trust-js/src/value.rs:113)) for
+  execution and NaN-boxed `PackedValue` for storage
+  ([value.rs:166](/big/Code/trust-js/crates/trust-js/src/value.rs:166)),
+  with conversions between them. `Value::Obj(Gc)` is the *only* object
+  variant: functions, proxies, Maps, typed arrays, errors are all the one
+  `Object` struct discriminated by `call`/`exotic` fields — there are no
+  per-kind object types to migrate separately.
+- `Gc` is `repr(transparent)` over `Rc<RefCell<Object>>`, explicitly
+  designed as the seam where "the collector and memory-management policy
+  can observe the release of a final reference without changing any of the
+  thousands of handle users"
+  ([gc_handle.rs](/big/Code/trust-js/crates/trust-js/src/gc_handle.rs)).
+  `Object` ([value.rs:1858](/big/Code/trust-js/crates/trust-js/src/value.rs:1858))
+  carries an `Rc<GcState>` back-reference, `Props` (entries `Vec` + boxed
+  element buffers + shared layout `Rc`), and per-object GC fields — 2+
+  allocations and several pointer hops per object.
+- Collection today = refcounting + cycle collector (weak registry, root
+  classification by internal strong counts, edge snapshots in
+  [gc_edges.rs](/big/Code/trust-js/crates/trust-js/src/gc_edges.rs),
+  ephemerons, side-table sweep in
+  [gc_sweep.rs](/big/Code/trust-js/crates/trust-js/src/gc_sweep.rs)) plus a
+  non-moving nursery for young cycles
+  ([gc_generational.rs](/big/Code/trust-js/crates/trust-js/src/gc_generational.rs)).
+  The `trace_gc` edge functions in `gc_edges.rs`/`gc_native.rs` are the
+  best existing *starting* inventory of heap edges — not a complete
+  tracing contract: `HostGc` permits omitted handles (refcounts retain
+  them today), `GcEdgeSink::value` follows objects only (string/symbol/
+  bigint payloads have no edges yet), and opaque storage (native closure
+  captures, caches, `Box` payloads) is unaudited. Under tracing, omission
+  = use-after-free, so S0 audits opaque storage and S2 makes enumeration
+  mandatory with enforceable declarations (see Decision 2). Measured
+  collection cost is ~1% (Phase 0) — of a collector whose short-lived
+  garbage refcounting already reclaimed; it prices neither the new
+  collector nor generational collection's future value.
+  Refcounts are load-bearing outside GC: ownership heuristics read
+  `Rc::strong_count`
+  ([array_binding.rs:14](/big/Code/trust-js/crates/trust-js/src/array_binding.rs:14)),
+  and `LStr` performs unique-owner in-place append
+  ([lstr.rs:312](/big/Code/trust-js/crates/trust-js/src/lstr.rs:312)).
+- Strings are a custom refcounted thin pointer (`{strong, len, cap}`
+  header, strong count at offset 0; JIT reads `LEN_OFF`/`CAP_OFF`,
+  [lstr.rs:6](/big/Code/trust-js/crates/trust-js/src/lstr.rs:6)); symbols
+  and bigints are `Rc`. Until these migrate, tagged-word copies are not
+  free and `emit_exec_clone` cannot become a no-op.
+- Execution/threading facts (correcting the previous draft): every source
+  coroutine lowers to `VmCoro` "without reserving an OS thread"
+  ([coroutine.rs:4](/big/Code/trust-js/crates/trust-js/src/coroutine.rs:4)),
+  so generators/async always run the bytecode VM even at `--tier=interp`;
+  `GcHeap = Rc<GcState>` is not `Send`. The live complexity is *several
+  heaps/realms on one thread*: ShadowRealm, `ACTIVE_GC_HEAP` switching
+  ([value.rs:2505](/big/Code/trust-js/crates/trust-js/src/value.rs:2505)),
+  and heap selection from prototype at object creation. Remaining
+  `thread::spawn` uses (JIT/regex helpers) must be confirmed Value-free
+  in S0, but cross-thread object death is not the top risk.
+- 136 side tables are keyed by object address (`Map<usize,…>`): under a
+  free-list heap, a new object can reuse a freed address and inherit
+  stale entries (`class_info`, `construct_ics`, `array_buffers`,
+  `map_data` at
+  [interpreter.rs:3320](/big/Code/trust-js/crates/trust-js/src/interpreter.rs:3320),
+  …). Every such table needs a sweep hook from the first heap stage, and
+  several are payload-migration candidates with their own speed payoff
+  (Vue makes ~100k `Map.get/set` calls, each paying an address-hash
+  lookup before the real one).
+- Disconnected prior art to evaluate, not ignore:
+  [tagged.rs](/big/Code/trust-js/crates/trust-js/src/tagged.rs) (tagged
+  word, handle-table `HeapRef`, root/deopt scaffolding),
+  [heap.rs](/big/Code/trust-js/crates/trust-js/src/heap.rs) (checked
+  central-heap prototype), `heap-bridge` feature, and the trace machinery
+  above. Prior review
+  ([architecture-reassessment-20260928.md](/big/Code/trust-js/docs/architecture-reassessment-20260928.md)):
+  heap rewrite is a hypothesis — measure first, migrate fully-connected,
+  no permanent shadow heap. Census tooling exists
+  (`architecture-diagnostics`; see
+  [object-layout-inventory-20261006.txt](/big/Code/trust-js/docs/object-layout-inventory-20261006.txt)).
+  Both that review and
+  [node-compiler-comparison-2026-10-14.txt](/big/Code/trust-js/docs/node-compiler-comparison-2026-10-14.txt)
+  predate Pilot C (shapes now encode descriptor class; carried over).
+
+### Key decisions (recommended; S0 spike may overturn 0–1 with recorded evidence)
+
+0. **Rooting: conservative native-stack scanning + precise heap, under a
+   written scanning contract.** Rust locals holding `Value`/`Gc` are
+   found by scanning the native stack (including registered `stacker`
+   segments) and a spilled register snapshot at collection entry; page
+   metadata resolves interior pointers to cells. Rust-*heap* containers
+   (`Vec<Value>` buffers, side tables, `Box`/`Rc` payloads, VM operand
+   stacks) are traced explicitly or registered as root ranges — scanning
+   does not find those. **Scanning is not sound "by construction"**:
+   optimized code can retain enough information to reconstruct a pointer
+   without keeping a recognizable word, and conservative collectors
+   "require mild restrictions on both the source code and the compiler"
+   (Boehm, https://hboehm.info/gc/issues.html — most aggressive optimizing
+   compilers violate the restriction for some optimized code). S0 must
+   therefore produce, and S1 must encode, an explicit contract:
+   (a) supported compiler/ABI assumptions recorded (rustc/LLVM, targets,
+   codegen settings the engine ships);
+   (b) the recognized reference forms — raw cell pointers, tagged words
+   (tag-masked), interior pointers within cell bounds — and the source
+   rules that keep references in those forms across allocation points
+   (no hiding pointers via integer round-trips or offset arithmetic;
+   the 629 `Rc::as_ptr` sites and address-keyed `usize` tables are
+   inventoried against this in S0);
+   (c) the register-spill protocol at collection entry;
+   (d) how JIT frames comply (I7: registers never hold sole references).
+   Adversarial tests (only-reference-in-register, derived interior
+   pointers, split enum payloads) are *evidence for* contract compliance
+   on the shipped toolchain, never a substitute for the contract.
+   Fallback if the contract cannot be made credible: precise handle
+   scopes — where a scope roots *all* locals created inside the native
+   function (temporaries included, via a scope-registered handle stack),
+   not just entry arguments. wasm32 cannot scan its stack: S0 decides
+   the in-evaluation collection mechanism (task-boundary-only collection
+   is *not* assumed sufficient — see Success Criteria wasm32 test);
+   candidates are shadow stack or wasm-only handle scopes.
+1. **Tagged pointer values, non-moving mark-sweep v1.** One 64-bit word
+   (evolve `PackedValue`/`tagged.rs`; f64 numbers unchanged; heap payload
+   = direct pointer into GC pages). Rejected for v1: universal
+   handle-table `HeapRef` (indirection tax, 20-bit ≈1M-object cap);
+   moving/copying collection (incompatible with Decision 0). Non-moving
+   generational collection *is* compatible with conservative roots and
+   may be valuable once tracing inherits the short-lived churn
+   refcounting absorbs today; deferred beyond P1 because its value is
+   unmeasured (S0 sizes the churn), not because it is impossible.
+2. **Ownership switches for all objects at once via the `Gc` seam;
+   layout improves afterwards, family by family.** `Gc` becomes a `Copy`
+   pointer to a GC cell; cell payload initially keeps today's `Object`
+   layout behind a `GcCell` providing the existing `.borrow()` API, so
+   handle users compile unchanged. Trace descriptors start from
+   `gc_edges.rs`/`gc_native.rs` `trace_gc` functions (audit in S1
+   alongside `tagged.rs`/`heap.rs`/`gc_handle.rs`) but become a complete,
+   mandatory contract at S2: `HostGc` omission fallback deleted,
+   primitive-payload edges added, opaque storage (closure captures,
+   caches) traced via required callbacks or forbidden from holding
+   values. Where the type system can enforce declarations (descriptor
+   consts per cell kind, a registry every Rust-heap value container must
+   join), it must — a verifier walking the collector's own descriptors
+   cannot detect fields those descriptors omit, so completeness is
+   proven by registry audit against the S0 inventory, not by the walk.
+   The foundational host-root/trace API is an S2 deliverable; S6 embed
+   work is then only surface polish. No dual `Value::Obj` variants, no
+   cross-heap edges (I6 extended to edges).
+3. **Single-allocation layout (after ownership).** Header (shape,
+   prototype, flags incl. `ic_plain`, compact call/exotic tags) + inline
+   slots (count from S0 census) + overflow pointer; dense elements keep a
+   separate buffer. Shapes/Pilot C class encoding carry over; all layouts
+   engine-defined with stable offsets (JIT stops probing `Vec`/`RcBox`).
+4. **Strings/symbols/bigints migrate with ownership, not "later";
+   JS string accumulation is solved at S0, before ownership moves.**
+   `LStr` becomes a GC cell kind (header keeps len/cap offsets the JIT
+   reads; strong-count word retired). The hard part is JavaScript-level
+   `s += x`: today `LStr`'s uniqueness check
+   ([lstr.rs:311](/big/Code/trust-js/crates/trust-js/src/lstr.rs:311))
+   proves in-place append invisible to aliases; free tagged copies
+   destroy that proof, and a Rust-side builder alone does not preserve
+   amortized `+=`. S0 selects the concrete replacement (candidates:
+   builder-until-frozen with `+=` fast path on unshared builders,
+   rope/cons representation for accumulated strings, or a GC-supported
+   sole-reference proof) and validates it with scaling tests (increasing
+   input sizes, aliasing patterns — not one fixture) before S2 moves
+   string ownership. Quadratic copying discovered after S2 is a plan
+   failure, not a tuning item.
+5. **Reuse before rewrite; GC implemented in-crate** (engine core keeps
+   minimal dependencies; no external GC crate).
+
+### Invariants (review checklist for every stage)
+
+- I1. Any heap reference live across an allocation is discoverable by the
+  collector: on the scanned native stack/registers, in a traced heap
+  field, or in an explicitly registered root range (Decision 0). Rust-heap
+  containers holding values must be registered or traced — never scanned
+  by accident or assumed found.
+- I2. Every heap edge is traced via a per-family layout descriptor;
+  coverage enforced by GC stress + heap verifier (see Validation).
+- I3. WeakRef/FinalizationRegistry/WeakMap behavior preserved within
+  ECMA-262 §9.9 liveness freedom; ephemeron fixed point retained.
+- I4. Generated code and IC cells never cache raw interior pointers across
+  possible collections; they re-derive from tagged words.
+- I5. Host-resource teardown must not depend on `Drop` timing: audit every
+  `Drop` reachable from object fields; explicit finalization paths;
+  downstream-crate tests are the enforcement.
+- I6. One authoritative heap per family *and no edges between heaps*: from
+  S2 on there is exactly one object heap; bridge mechanisms are
+  within-stage only with named exits.
+- I7. JIT-produced values in registers are never sole references; the
+  canonical frame/operand slots are the owning roots (already true —
+  preserve it and test it under GC stress with JIT on).
+- I8. Every address-keyed side table has a sweep hook (or is re-keyed/
+  moved into payload) before the first stage that can free its keys;
+  address reuse must never resurrect stale entries.
+- I9. Collection never runs with an outstanding `GcCell` borrow, and
+  partially-initialized cells are always traceable. Preserving the
+  `.borrow()` API does not preserve allocation safety: existing code
+  borrows mutably while allocating (see Revision notes), and today's
+  collector panics if entered during a mutable borrow. Rules: allocation
+  points are explicit; inside a bounded no-GC region (the `tagged.rs`
+  `NoGcScope` scaffolding is prior art) allocation may proceed but
+  collection is deferred via a pending flag, honored at region exit;
+  debug builds assert on violation. Cells are allocated in a
+  descriptor-safe empty state and published only after initialization,
+  so a collection at any allocation point sees only well-formed cells.
+  Specified in S1, enforced from S2 — not retrofitted.
+
+## Steps
+
+One agent at a time, outside review at marked checkpoints. Never start a
+stage with the previous gate red. Commit prefix `P1-S<n>:`; update the
+stage status table in this file in the same commit that closes a stage;
+record deviations here *before* deviating.
+
+- **S0.0 — Preserve the gate fixtures (first action, before all else).**
+  Copy `vue.js`/`react.js`/`djot.js` from
+  `/tmp/trust-js-review-controls-wnym0ybo/` into `benchmarks/fixtures/`
+  with a provenance note; verify sha256 against the Revision notes above
+  and verify outputs (`observed=30016, invocations=12359` on Vue) match
+  Phase 0 records; commit. Until this lands, every gate in this plan is
+  un-runnable on a fresh checkout.
+- **S0 — Census, inventories, rooting spike, payoff bound (no behavior
+  change).** (a) `architecture-diagnostics` census on fixtures +
+  Speedometer smoke: allocations/bytes by family/site, lifetimes,
+  property-count distribution. (b) **Ownership-cost bucket**: attribute
+  Vue's 3.298e9 instructions into Rc inc/dec + drop glue, `RefCell`
+  borrow flags, `Props` indirection, registry upkeep (perf annotate /
+  targeted counters); the bucket sum is P1's realistic instruction
+  ceiling — fix the S6 instruction threshold and RSS bound from it.
+  (c) Inventories: root locations & Rust-heap value containers; **opaque
+  storage audit** (native closure captures, caches, `Box` payloads —
+  anything that can hold a `Value` without a trace callback today); all
+  136 address-keyed side tables with sweep-hook disposition; every
+  refcount-observable use (incl. `LStr` unique append and its Djot cost);
+  borrow-across-allocation sites (I9 retrofit list); pointer-hiding
+  patterns vs the scanning contract (integer round-trips among the 629
+  `Rc::as_ptr` sites); side-effectful `Drop`s; embed/downstream
+  touchpoints; confirm remaining thread spawns are Value-free;
+  multi-heap-per-thread paths (ShadowRealm/`ACTIVE_GC_HEAP`/
+  heap-from-prototype); short-lived churn sizing (what tracing inherits
+  from refcounting — prices future generational work). (d) **Decision 0
+  spike + contract draft**: stack+register scan prototype incl. `stacker`
+  segments; adversarial rooting tests as compliance evidence; scan cost +
+  false-retention measurement; the written contract (Decision 0 a–d);
+  **wasm32 in-evaluation collection mechanism decided here**, with a
+  prototype sustained-allocation run on real wasm32. (e) **String
+  accumulation decision** (Decision 4): replacement selected and
+  scaling/aliasing tests written against current `LStr` behavior as the
+  oracle. Exit gate: reports committed to
+  [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt);
+  Decisions 0–4 confirmed/revised; numeric S6 thresholds recorded;
+  **owner go/no-go before S1 code.**
+- **S1 — Heap core (additive; feature `gc-heap`, default off).** Audit
+  `tagged.rs`/`heap.rs`/`gc_handle.rs`/`gc_edges.rs`/`gc_native.rs`.
+  Implement: page allocator (size classes, free lists, page metadata for
+  interior-pointer lookup), mark-sweep collector, conservative scanner
+  per the Decision 0 contract, layout descriptors + container registry
+  (Decision 2), ephemeron/weak machinery, **I9 machinery** (no-GC regions
+  with pending-collect deferral, allocate-empty-then-publish protocol,
+  debug assertions), heap verifier (post-collection descriptor walk:
+  every edge → live cell) and freed-cell poisoning in debug builds,
+  GC stress knob, side-table sweep-hook registry. Nothing executes on
+  the new heap. Exit gate: heap
+  unit/stress/verifier tests green; scanner adversarial tests from S0
+  spike green in release; clippy clean with `--features embed,gc-heap`;
+  default build unchanged.
+- **S2 — Ownership switch: all objects + strings/symbols/bigints
+  (interp+bytecode tiers under `gc-heap`; JIT refuses admission).**
+  `Gc` becomes `Copy` pointer to GC cell; `Object` payload layout
+  unchanged inside a `GcCell` with today's `.borrow()` API; `LStr`/symbol/
+  bigint cells per Decision 4 (string accumulation per the S0-selected
+  replacement); **foundational host-root/trace API completed here**:
+  mandatory enumeration, `HostGc` omission fallback deleted, opaque
+  storage traced or value-free (Decision 2) — embedding is not an S6
+  afterthought; I9 enforced, with borrow-across-allocation sites from
+  the S0 list retrofitted to no-GC regions or publish-after-init;
+  cycle collector and nursery-over-Rc
+  disabled under the feature; VM frame/operand-stack and suspended
+  `VmCoro` state registered as root ranges (generators run the VM at
+  every tier — this cannot wait); all 136 side tables sweep-hooked (I8);
+  multi-heap-per-thread semantics defined (one GC heap per agent,
+  heap-from-prototype rule ported). Exit gate: lib suite green under
+  `gc-heap` at interp+bytecode tiers; Test262 `built-ins/{Object,Array,
+  Proxy,WeakMap,WeakRef,FinalizationRegistry,TypedArray}`,
+  `language/{expressions,statements,types}` at parity with `main`;
+  GC stress + verifier green over the suite; **perf tripwire**:
+  `object_alloc_bench` + a property-heavy microbenchmark, interp/bytecode,
+  `main` vs `gc-heap`, recorded (a layout/ownership regression must show
+  up here, not in S5). **Outside review checkpoint.**
+- **S3 — Layout A: single-allocation plain objects/arrays.** Inline
+  slots per Decision 3, shapes page-resident, `Props` indirection
+  removed for the common case; `map_data` and the hottest address-keyed
+  tables move into payloads (measured individually). Exit gate: S2 gates
+  stay green; tripwire shows the predicted bucket reduction direction on
+  microbenchmarks; RSS on fixtures recorded vs S0 bound.
+- **S4 — Layout B: environments, functions, exotics, remaining tables.**
+  `Env`/scope and function payloads as tailored cells; proxy/typed-array/
+  module-namespace state into payloads or re-keyed tables; I5 teardown
+  audit closed with downstream tests. Exit gate: full Test262 parity on interp+bytecode tiers;
+  no address-keyed table without sweep hook or payload home remains.
+- **S5 — JIT re-pointing.** Unify `Value`/`PackedValue` into the tagged
+  word in execution; `JitLayout` v2 (engine-owned offsets only; delete
+  RcBox/Vec probes); `emit_exec_clone` deleted (copies are free; any
+  site still needing ownership work is a bug to surface, not emulate);
+  IC probes/regions/templates re-based; allocation slow path may collect
+  (I7 tested under stress with JIT on). Use the engine binary
+  `target/release/trust-js` for `--tier=jit` (trust-js-cli accepts only
+  `interp|bytecode`). Exit gate: full lib suite at default tier;
+  difftest `--seed 7 --count 150` agrees; fixtures correct at jit tier.
+  **Outside review checkpoint.**
+- **S6 — Flip default, delete old model, embedding, x64, acceptance.**
+  Remove Rc object paths/cycle collector/`gc-heap`+`heap-bridge` flags;
+  embed API restored per S0 inventory (opaque rooted handles out);
+  downstream crates build **and tests pass**; zombie x64 pass; paired
+  fat-LTO A/B + `perf stat` + RSS/GC-time vs `main` and Node recorded
+  against S0 thresholds. Exit gate = all Success Criteria. **Merge
+  review with owner.**
+
+### Stage status
+
+| Stage | Status | Commit(s) | Gate evidence |
+| --- | --- | --- | --- |
+| S0.0 | not started | — | — |
+| S0 | not started | — | — |
+| S1 | not started | — | — |
+| S2 | not started | — | — |
+| S3 | not started | — | — |
+| S4 | not started | — | — |
+| S5 | not started | — | — |
+| S6 | not started | — | — |
+
+### Working agreements (all agents)
+
+- Branch `rearch/v8-chase` only; one agent at a time. **Syncing `main`
+  into the branch happens only at stage boundaries**, and each sync is
+  treated as a semantic merge (pilot commits depend on `JitLayout`/RcBox
+  meanings, so conflicts will be in meaning, not text): after every sync,
+  re-run the current stage's full gate before new work; record syncs in
+  the stage table. If sync cost exceeds value mid-P1, freeze syncs until
+  S6 and record that instead. Never force-push.
+- One stage per commit series; never mix stages. Follow
+  [AGENTS.md](/big/Code/trust-js/AGENTS.md) layering and
+  [DIAGNOSTICS.md](/big/Code/trust-js/DIAGNOSTICS.md) tooling; required
+  instructions must not depend on untracked docs (hence this file is
+  `.txt` and tracked).
+- Builds: incremental no-LTO
+  (`CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`);
+  fat LTO only for recorded acceptance pairs (benchmarks/README.md).
+  Fixture runs use the engine binary `target/release/trust-js`, CPU-pinned.
+- Every perf/memory claim records machine, revision, tier, flags,
+  workload in
+  [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt).
+- A stage gate failing twice for one root cause: stop, record blocker
+  here, surface for review; do not widen scope to work around it.
+
+### Non-goals for Phase 1
+
+Moving/compacting collection (incompatible with Decision 0) and
+generational collection (compatible in non-moving form; deferred until
+S0 churn numbers price it — a post-P1 program, not a P1 stage);
+concurrent marking; speculative tier
+(Phase 3); integer tagging changes; string *representation* redesign
+beyond ownership/builder split; Speedometer/browser acceptance beyond
+smoke; unrelated builtin algorithmics (`Array.prototype.shift` — separate
+track, may land on `main` independently; S3's `map_data` payload move is
+in-scope only because I8 forces touching that table anyway).
+
+## Validation Plan
+
+Standing commands (repo root; `<bin>` = `target/release/trust-js`):
+
+- `cargo test -p trust-js --lib --features embed` (add `,gc-heap` during
+  S1–S5); downstream: `cargo test -p trust-js-host -p trust-js-runtime
+  -p trust-js-web -p trust-js-node` at S4/S6 gates.
+- `cargo clippy --offline --locked -p trust-js --all-targets --features embed -- -Dwarnings`
+- `cargo run -q -p test262-runner -- <subsets per stage>` vs `main`,
+  identical subsets, zero new failures.
+- `cargo run -q -p trust-js-difftest -- --seed 7 --count 150`.
+- Fixtures from S0.0 onward: `taskset -c 5 <bin> --tier=jit
+  benchmarks/fixtures/{vue,react,djot}.js`; outputs identical to `main`
+  except `elapsed_ms`; paired fat-LTO A/B (≥11 alternating pairs,
+  internal medians) at S6, tripwire form at S2/S3.
+- `perf stat -e task-clock,cycles,instructions,cache-misses,branch-misses`
+  + peak RSS (`/usr/bin/time -v`) on Vue: branch vs `main` vs `node`,
+  at S0 (bucket), S3, S6.
+- **Sustained-allocation workload** (new fixture, S0.0-preserved style):
+  large retained heap + repeated temporary allocation; report post-GC
+  live bytes, fragmentation (allocated vs live pages), pause
+  distribution (existing GC pause histogram), total GC %. This, not the
+  old collector's 1%, is the new collector's exam. Mandatory S2→S6.
+- **wasm32 acceptance** (S2 and S6): real wasm32 execution of a
+  sustained-allocation script inside one evaluation, memory bounded per
+  the S0-decided mechanism. Native test runs of the wasm crate are not
+  evidence.
+- **GC stress + heap verifier + poisoned free cells** (S1 deliverables,
+  mandatory from S2): stress proves descriptor coverage on executed
+  paths; poisoning turns use-after-free into immediate failures. Two
+  honest limits: the verifier walks the collector's own descriptors, so
+  it cannot detect omitted fields (completeness comes from the
+  Decision 2 registry audit vs the S0 inventory); and no test proves
+  native-local rooting on unexecuted paths — that rests on the Decision 0
+  scanning *contract* (documented compiler/ABI/source restrictions),
+  with adversarial tests as compliance evidence only. **The S0 contract
+  + spike and the S2 stress/verifier/registry combination is the
+  highest-risk validation in the program.**
+
+## Risks / Open Questions
+
+- **Rooting completeness (top risk).** Conservative scanning rests on
+  restrictions the compiler does not guarantee (Boehm): optimized Rust
+  may keep sole references in registers, split enum payloads, or
+  reconstruct pointers from non-pointer data. The Decision 0 contract
+  (documented assumptions + source rules + recognized forms) is the
+  mitigation; tests are compliance evidence, not proof. Residual risk is
+  accepted knowingly at the S0 go/no-go, or the program re-plans around
+  precise handle scopes at their much larger cost. Related I9 risk:
+  borrow-across-allocation patterns are pervasive in idiomatic form
+  (`borrow_mut()` temporaries spanning allocating calls); the S0 retrofit
+  list sizes this before S2 commits to enforcement.
+- **Several heaps/realms on one thread.** ShadowRealm,
+  `ACTIVE_GC_HEAP` switching, heap-from-prototype creation: cross-heap
+  references must be impossible or explicitly handled before S2 (I6);
+  S0 inventories, S2 defines.
+- **Refcount-observable behavior.** `strong_count` heuristics,
+  `LStr` unique append, deterministic `Drop` teardown: each needs a
+  semantic replacement or proof of optimization-only status (S0).
+- **Scale.** ~174k lines mention `Value` across 86 non-test files; the
+  `Gc`-seam strategy exists precisely so most of them don't change in S2.
+  Layout stages then touch payloads family by family with measurements.
+- **Elapsed-neutral / memory-up outcome.** P1 may cut instructions while
+  fixture elapsed stays flat (builtin outliers) and RSS rises
+  (mark-sweep). Success Criteria bound both explicitly at S0 so the
+  merge review judges against numbers, not vibes.
+- Open questions for S0 (block their stage, not plan approval): inline
+  slot count/header budget; nuclei audit outcome (`tagged.rs`/`heap.rs`);
+  embed handle ergonomics for TRust host code. (String accumulation and
+  wasm32 collection moved from open questions to S0 *decisions* — see
+  Decisions 0/4.)
