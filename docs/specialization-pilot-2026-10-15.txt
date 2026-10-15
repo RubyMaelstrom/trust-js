@@ -267,16 +267,23 @@ change is a consistent ~2% Vue win with no measured regressions, so it is
 retained in-tree pending the user's keep/revert decision; do not extend
 accessor plumbing further without either step 2 or Pilot C facts.
 
-Pilot B status: prototype complete in an isolated worktree
-(.muse/worktrees/subagent-v2-...-01a13f70-aa3d..., 5 files +538/-86,
-uncommitted, base 2f9447e1 without Phase 0/Pilot A). All its tests green
-there (full lib 2058 passed on its base), native-template hits proven for
-Slot/Method/strict-this forms. Not yet merged: expected minor conflicts in
-emit_prop_way_probe and property_read_tests.rs; its >=2.5% Vue gate,
-Test262/difftest scopes and zombie x64 run remain outstanding. Merge order:
-land/revert Pilot A first, then rebase B onto the result and re-run both
-pilots' mutation fixtures (accessor states over wrapper holders compose
-through the same landing).
+Pilot B status: LANDED (commits c5d39b0b Pilot A, bf2a7a68 record,
+1ab141af Pilot B). The isolated-worktree prototype merged textually clean
+onto Pilot A; merged-tree validation: full lib 2062 passed / 0 failed,
+clippy embed -Dwarnings and fmt clean, both pilots' mutation fixtures
+green together, x64 tests green on zombie. One refinement during gate
+measurement: ordinary object receivers take a cheap top-16 Obj check
+before kind discrimination, so they pay nothing for the primitive cases.
+Gate measurement (matched fat LTO, 11 pairs vs the Pilot-A build):
+Vue internal -2.14% (first build -2.50%, at the >=2.5% gate), React
++0.00%, Djot wall +0.80% over 21 pairs (systematic ~1%, inside the 3%
+component rule of benchmarks/README.md). Cumulative Pilots A+B vs
+2f9447e1: Vue internal -4.37%, Djot +1.62%, React +0.00%. Outstanding
+from Pilot B's gate text: focused Test262 property/Number/Boolean/String
+scopes and a difftest seed run were not executed in this session.
+Shape-census baselines for Pilot C gate (b), now in PERF_METRICS as
+shape_transitions (active heap memoized edges at exit): Vue 1370,
+Djot 1548, React 1009.
 
 Pilot C status: audit completed; no code. Three blockers refine the
 design above: (1) arguments_named_shapes (interpreter.rs:13374) inserts
