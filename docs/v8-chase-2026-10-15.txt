@@ -354,3 +354,124 @@ stacker segment exact-bounds registration is API-only (engine wrapper
 lands at S2; unregistered segments stay no-GC regions); sweep-hook
 liveness set is O(live) memory per collection (tune later); verifier
 runs automatically only in debug builds.
+
+S1 review fixes (2026-10-15)
+----------------------------
+An outside review of 6b0b469c found defects in the S1 deliverables, each
+reproduced against a byte-identical copy of gc_core.rs before fixing:
+- Weak slots and ephemerons were registered globally and never pruned.
+  A reused weak-holder cell had an ordinary word zeroed by the collector
+  (memory corruption); a reused key cell next to a still-free value cell
+  made mark_ephemerons spin forever (mark_cell ignored the free cell but
+  `progress` was still set).
+- collect() on a stacker segment scanned [segment SP, entry stack top)
+  and crossed a guard page: SIGSEGV in debug and release, against the
+  contract's "defer, never scan blindly"; nothing implemented "unregistered
+  segments stay no-GC regions".
+- The spike's adversarial tests exercise the spike's own scan(), not
+  gc_core: the S1 suite passed with the register spill deleted.
+- Five tests asserted deaths after same-thread conservative collects;
+  sweep_hook_sees_liveness_for_side_tables failed at opt-level=1 and in a
+  fat-LTO standalone build.
+- Registrations were add-only safe fns over raw pointers; Heap had no
+  Drop; the I9 debug assertions were missing; a fixed 1 MiB trigger,
+  SipHash page lookups, a HashSet liveness set for sweep hooks, linear
+  large-object lookup and O(released x pages) page release would have
+  dominated the S2 GC-time and pause gates.
+
+Fixes (crates/trust-js/src/gc_core.rs):
+- Weak data is rediscovered every collection from reachable holders.
+  LayoutDesc.weak reports in-cell weak slots and ephemeron entries; edge
+  sources (Heap::add_edge_source) report side-table edges conditional on
+  an owner cell and, for ephemerons, a key. A conditional edge fires at
+  most once, when its conditions are marked (per-cell waiter bits), so
+  marking stays linear and a condition that is never marked (a free
+  cell) only leaves its edge unfired. Dead in-cell entries are zeroed;
+  side tables prune through sweep hooks. add_ephemeron/add_weak_slot are
+  gone. Unconditional trace roots are for true roots only: a side table
+  traced as a root would keep every cycle through it alive.
+- Native stack = per-thread chain of registered regions: the entry stack
+  (enter_native_stack, RAII) and stacker segments entered through
+  gc_core::grow. collect() defers when nothing is registered or SP is
+  outside the innermost region; collect_at_safepoint() collects with
+  registered roots only (wasm32 safepoints, task boundaries, tests).
+- Contract option (a) chosen for stacker: grow() spills callee-saved
+  registers into its own never-inlined frame, records that SP as the
+  previous region's scan start, and derives the segment's exact bounds
+  in the callback from stacker's limit (page-aligned base) and its
+  sizing rule (max(1, ceil(size/page)) pages, stacker 0.1.25). A
+  bounds-precision test compares the region with /proc/self/maps for
+  64 KiB, 100,000 B and 1 MiB segments; a mismatch yields an empty
+  region (collections inside defer) and panics in debug builds. Engine
+  grow call sites switch to it at S2.
+- Spill protocol encoded: Heap::mark_native_stack is #[inline(never)],
+  spills x19-x30/d8-d15 (aarch64) into its own frame, reads SP with asm
+  and scans [SP, top) per region. The x86_64 SysV spill/SP asm is written
+  but NOT compiled here (rustc's and the system LLVM have only the
+  AArch64 backend, `llc --version`): validate on zombie before x64
+  authority.
+- Registrations are RAII handles; a handle dropped from inside a
+  collector callback is skipped for the rest of that pass and removed
+  after it. Raw-pointer root ranges are unsafe fns and can be re-pointed
+  after their container reallocates.
+- Heap::drop finalizes the remaining cells and frees all memory (I5).
+- I9: Heap::borrow_scope is the hook for S2's GcCell; a collection
+  requested with a borrow outstanding panics in debug builds and defers
+  in release; debug_assert_quiescent catches leaked guards; re-entrant
+  collection asserts. Recorded deviation (see plan): a deferred
+  collection runs at the next allocation or request after the outermost
+  no-GC region exits, not at region exit (exit is not a safepoint).
+- Heap growth: the next collection is due when allocated bytes exceed
+  max(1 MiB, 2 x live) (set_heap_growth); allocation is charged at cell
+  size. Pages: stable slots, FxHash map keyed by page number (page
+  addresses would zero FxHash's low bits), per (descriptor, class)
+  current page + avail list rebuilt each sweep, O(1) release. Large
+  objects: BTreeMap by address plus span rejection. Sweep hooks read mark
+  bits directly. deferred_collections counts pending requests, not
+  allocations; deferred_native_stack added.
+
+Evidence (crystal aarch64, rustc 1.99.0):
+- gc_core: 33 tests in debug, 31 in release (+3 spike), 5 ignored timing
+  probes. Green in-tree under the no-LTO working build and the shipped
+  fat-LTO profile; a standalone copy is green at opt-level 0/1/2/3/s/z,
+  target-cpu=native and fat LTO.
+- Mutation check (standalone copy, release): removing the spill fails
+  reference_only_in_a_callee_saved_register_is_found (the only reference
+  sits in d8, which no frame on the collection path saves); dropping the
+  outer regions, a segment top one page short, unconditional ephemerons,
+  skipping dead-weak clearing, no mid-pass deferral, the old per-1-MiB
+  trigger, teardown without finalizers and no avail reuse are each caught
+  by their tests.
+- clippy -Dwarnings clean with --features embed and embed,gc-heap; fmt
+  clean; default build unchanged (gc_core.rs is the only source change).
+- Timing probes (gc_core::tests::perf_*; CPU 5 pinned; release, opt3, no
+  LTO; same standalone harness both sides; before = 6b0b469c):
+                                              before          after
+    alloc, 32 B cell                          69.7 ns         30 ns
+    16 MiB live chain + 1M x 16 B churn       2.46 s, 16 GCs  0.082 s, 1 GC
+    collect, 1M live cells                    150 ms          59 ms
+      ... with one no-op sweep hook           329 ms          59 ms
+    collect, 4000 x 8 KiB large + 32k words   121 ms          0.81 ms
+    release 1000/2000/4000 empty pages        21/62/215 ms    0.6/1.2/2.1 ms
+  Marking still costs ~59 ns per live cell (one FxHash page lookup per
+  edge); in-page headers or a page table are tuning, not S2 blockers.
+
+gc_native.rs audit (missing from the S1 record): NativeGcGraph is a
+transient mixed graph (host nodes; js->native edges activated when the JS
+owner is marked; native roots; old-domain prefixes for nursery
+collections) keyed by Rc::as_ptr addresses. It is the reference design for
+the S2 host-root API: JS identities re-key to cell pointers, and the
+js->native activation maps onto owner-conditional edge sources.
+
+wasm32 prototype run: still impossible on this box. Beyond the missing
+wasm-pack/wasmtime, this rustc's LLVM has no WebAssembly backend
+(`--target wasm32-unknown-unknown` fails on wasm llvm-args; llc lists only
+AArch64). Re-deferred to the S2 wasm32 acceptance gate, which needs a
+rustup toolchain with wasm32 std. The mechanism is encoded: on targets
+without a scanner collect() always defers, so the VM must call
+collect_at_safepoint() at its safepoints.
+
+Corrections to the S1 record above: release ran 10 of its 11 tests (the
+verifier test is debug-only), and "spike green in release" was evidence
+about the spike's scanner only. "Known S1 limits" is superseded except
+the x64 note (asm now written, still unvalidated).

@@ -4,33 +4,45 @@
 //!
 //! Design summary:
 //! - Cells live in 64 KiB pages segregated by (size class, descriptor);
-//!   page metadata is side table, so interior pointers resolve by masking
-//!   to the page base. Large cells (> 4 KiB) get dedicated allocations.
+//!   page metadata is a side table found by page number, so interior
+//!   pointers resolve by masking to the page base. Large cells (> 4 KiB)
+//!   get dedicated allocations, found by address range.
 //! - References are direct pointers (never handle-table indices); a
 //!   tagged execution word masks to the same pointer (payload mask).
 //! - Tracing is precise inside the heap (per-descriptor trace functions)
-//!   and conservative at the roots (native stack + register snapshot +
-//!   registered root ranges), per the Decision 0 scanning contract.
-//! - Collection honors I9: it never runs inside a no-GC region
-//!   (deferred via pending flag) and cells are allocated zeroed so a
-//!   descriptor can trace a not-yet-initialized cell safely.
-//! - Debug builds poison freed cells and can verify the marked graph.
+//!   and for registered Rust-heap roots, owner-conditional for side tables
+//!   (edge sources), and conservative only for the native stack and
+//!   registers, per the Decision 0 scanning contract (see `native`).
+//! - Weak slots and ephemerons are rediscovered every collection from
+//!   reachable holders. Nothing weak is registered globally, so a reused
+//!   cell address can neither revive a dead entry nor be clobbered by one.
+//! - Collection honors I9: it never runs inside a no-GC region or while a
+//!   GcCell borrow is outstanding (deferred via a pending flag; the borrow
+//!   case asserts in debug builds), and cells are allocated zeroed.
+//! - Every registration is an RAII handle. Dropping the heap finalizes
+//!   the remaining cells and frees all heap memory (I5 teardown).
+//! - Debug builds poison freed cells and verify the marked graph.
 
 // Until S2 wires execution to this heap, most of the surface is used
 // only from tests (same posture as heap.rs/tagged.rs).
 #![allow(dead_code)]
 
+use crate::fasthash::FastMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
-const PAGE_MASK: usize = !(PAGE_SIZE - 1);
+const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
 const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
-const LARGE_THRESHOLD: usize = 4096;
+/// Cells larger than the last class are large objects.
 const SIZE_CLASSES: [usize; 16] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 ];
+const DEFAULT_MIN_TRIGGER: usize = 1024 * 1024;
+const DEFAULT_GROWTH_PERCENT: usize = 100;
 #[cfg(debug_assertions)]
 const POISON: u64 = 0xdddd_dddd_dddd_dddd;
 
@@ -38,12 +50,43 @@ fn size_class(size: usize) -> Option<usize> {
     SIZE_CLASSES.iter().position(|&c| size <= c)
 }
 
-/// Trace callback: report every heap edge of the cell at `cell` by
-/// calling `visit(edge_target)`. Must tolerate a zeroed cell (I9:
-/// allocation returns zeroed memory; publication follows init).
+fn bit(bits: &[u64], index: usize) -> bool {
+    bits[index / 64] >> (index % 64) & 1 == 1
+}
+
+fn set_bit(bits: &mut [u64], index: usize, on: bool) {
+    let mask = 1u64 << (index % 64);
+    if on {
+        bits[index / 64] |= mask;
+    } else {
+        bits[index / 64] &= !mask;
+    }
+}
+
+fn page_layout() -> Layout {
+    Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("GC page layout")
+}
+
+fn large_layout(size: usize) -> Layout {
+    Layout::from_size_align(size, 16).expect("large GC cell layout")
+}
+
+/// Trace callback: report every strong heap edge of the cell at `cell` by
+/// calling `visit(edge)` with a cell pointer or tagged word. Must tolerate
+/// every state the cell can be in at an allocation point (I9): allocation
+/// returns zeroed memory, and a cell held only in a native local is traced
+/// (conservative roots) before it is published anywhere, so initialization
+/// must finish before the next allocation or write fields in an order in
+/// which each intermediate state traces safely.
 pub(crate) type TraceFn = fn(*const u8, &mut dyn FnMut(*const u8));
-/// Finalize callback for a dead cell, run during sweep. Must not
-/// allocate from this heap or resurrect the cell.
+/// Weak callback: report the cell's weak slots and ephemeron entries
+/// through the [`WeakSink`]. Called once per collection for each reachable
+/// cell of the descriptor; same state tolerance as [`TraceFn`].
+pub(crate) type WeakFn = fn(*mut u8, &mut WeakSink<'_>);
+/// Finalize callback for a dead cell, run during sweep or heap teardown.
+/// Must not allocate from this heap, resurrect the cell, or read other
+/// cells (they may already be finalized); same state tolerance as
+/// [`TraceFn`].
 pub(crate) type FinalizeFn = fn(*mut u8);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -52,7 +95,194 @@ pub(crate) struct DescId(pub(crate) u32);
 pub(crate) struct LayoutDesc {
     pub(crate) name: &'static str,
     pub(crate) trace: TraceFn,
+    pub(crate) weak: Option<WeakFn>,
     pub(crate) finalize: Option<FinalizeFn>,
+}
+
+/// Receives one reachable cell's weak data during marking.
+pub(crate) struct WeakSink<'a> {
+    weak_slots: &'a mut Vec<*mut u64>,
+    ephemerons: &'a mut Vec<(*mut u64, *mut u64)>,
+}
+
+impl WeakSink<'_> {
+    /// `slot`, a word inside the cell, holds a weak reference: it is zeroed
+    /// when its target does not survive the collection.
+    pub(crate) fn weak_slot(&mut self, slot: *mut u64) {
+        self.weak_slots.push(slot);
+    }
+
+    /// An ephemeron entry inside the cell: the value word is reachable only
+    /// while the key word's target is. When the key dies both words are
+    /// zeroed, so the holder reads the entry as empty. A zero key is an
+    /// empty entry; a key that is not a heap reference never dies.
+    pub(crate) fn ephemeron(&mut self, key: *mut u64, value: *mut u64) {
+        self.ephemerons.push((key, value));
+    }
+}
+
+/// Receives the edges an edge source keeps off-heap.
+pub(crate) struct EdgeSink<'a> {
+    edges: &'a mut Vec<SourceEdge>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceEdge {
+    owner: u64,
+    key: Option<u64>,
+    value: u64,
+}
+
+impl EdgeSink<'_> {
+    /// `value` is reachable while `owner` is: an ordinary strong edge whose
+    /// storage lives in a side table. A null owner makes it a root.
+    pub(crate) fn edge(&mut self, owner: *const u8, value: u64) {
+        self.edges.push(SourceEdge {
+            owner: owner as u64,
+            key: None,
+            value,
+        });
+    }
+
+    /// `value` is reachable only while both `owner` and `key` are (a WeakMap
+    /// entry). A zero key is an empty entry and is skipped. Pruning entries
+    /// whose key or owner died is the table's sweep hook's job.
+    pub(crate) fn ephemeron(&mut self, owner: *const u8, key: u64, value: u64) {
+        if key != 0 {
+            self.edges.push(SourceEdge {
+                owner: owner as u64,
+                key: Some(key),
+                value,
+            });
+        }
+    }
+}
+
+/// Registration table shared by the heap and the RAII handles that own its
+/// entries, so a handle can be dropped while the heap is borrowed elsewhere.
+struct Registry<T> {
+    entries: RefCell<Vec<Option<T>>>,
+    free: RefCell<Vec<usize>>,
+    /// Removals requested while the collector was iterating `entries`.
+    deferred: RefCell<Vec<usize>>,
+}
+
+impl<T> Default for Registry<T> {
+    fn default() -> Self {
+        Self {
+            entries: RefCell::new(Vec::new()),
+            free: RefCell::new(Vec::new()),
+            deferred: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl<T> Registry<T> {
+    fn insert(self: &Rc<Self>, entry: T) -> Registration<T> {
+        let mut entries = self
+            .entries
+            .try_borrow_mut()
+            .expect("GC registration added during collection");
+        let index = match self.free.borrow_mut().pop() {
+            Some(index) => {
+                entries[index] = Some(entry);
+                index
+            }
+            None => {
+                entries.push(Some(entry));
+                entries.len() - 1
+            }
+        };
+        Registration {
+            registry: Rc::clone(self),
+            index,
+        }
+    }
+
+    fn remove(&self, index: usize) {
+        if let Ok(mut entries) = self.entries.try_borrow_mut() {
+            entries[index] = None;
+            self.free.borrow_mut().push(index);
+        } else {
+            self.deferred.borrow_mut().push(index);
+        }
+    }
+
+    /// Visit live entries. An entry whose handle is dropped meanwhile (from
+    /// inside a callback) is skipped for the rest of the pass and removed
+    /// after it.
+    fn for_each(&self, mut f: impl FnMut(&mut T)) {
+        {
+            let mut entries = self.entries.borrow_mut();
+            for index in 0..entries.len() {
+                if self.deferred.borrow().contains(&index) {
+                    continue;
+                }
+                if let Some(entry) = entries[index].as_mut() {
+                    f(entry);
+                }
+            }
+        }
+        let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+        for index in deferred {
+            self.remove(index);
+        }
+    }
+}
+
+/// Owns one registration; dropping it unregisters.
+pub(crate) struct Registration<T> {
+    registry: Rc<Registry<T>>,
+    index: usize,
+}
+
+impl<T> Drop for Registration<T> {
+    fn drop(&mut self) {
+        self.registry.remove(self.index);
+    }
+}
+
+pub(crate) struct RootRangeEntry {
+    name: &'static str,
+    lo: *const u64,
+    hi: *const u64,
+}
+
+pub(crate) struct TraceRootEntry {
+    name: &'static str,
+    trace: Box<dyn FnMut(&mut dyn FnMut(*const u8))>,
+}
+
+pub(crate) struct EdgeSourceEntry {
+    name: &'static str,
+    report: Box<dyn FnMut(&mut EdgeSink<'_>)>,
+}
+
+pub(crate) struct SweepHookEntry {
+    name: &'static str,
+    hook: Box<dyn FnMut(&dyn Fn(*const u8) -> bool)>,
+}
+
+pub(crate) type RootRange = Registration<RootRangeEntry>;
+pub(crate) type TraceRoot = Registration<TraceRootEntry>;
+pub(crate) type EdgeSource = Registration<EdgeSourceEntry>;
+pub(crate) type SweepHook = Registration<SweepHookEntry>;
+
+impl Registration<RootRangeEntry> {
+    /// Re-point the range after its container reallocated.
+    ///
+    /// # Safety
+    /// As for [`Heap::add_root_range`].
+    pub(crate) unsafe fn set(&self, lo: *const u64, hi: *const u64) {
+        let mut entries = self
+            .registry
+            .entries
+            .try_borrow_mut()
+            .expect("root range re-pointed during collection");
+        let entry = entries[self.index].as_mut().expect("registered root range");
+        entry.lo = lo;
+        entry.hi = hi;
+    }
 }
 
 struct PageMeta {
@@ -60,11 +290,14 @@ struct PageMeta {
     cell_size: usize,
     cells: usize,
     desc: DescId,
+    class: usize,
     marks: Vec<u64>,
     /// Allocated (handed-out) cells. Conservative marking must ignore
     /// free cells: a stale stack word resolving into a free cell would
     /// otherwise "mark" free-list linkage and trace it as payload.
     allocated: Vec<u64>,
+    /// Cells a conditional edge is waiting on during this collection.
+    waiters: Vec<u64>,
     /// Index of first free cell, or -1. Free cells thread their next
     /// index+1 through their first word (0 = end).
     free_head: i32,
@@ -72,36 +305,81 @@ struct PageMeta {
 }
 
 impl PageMeta {
-    fn cell_ptr(&self, index: usize) -> *mut u8 {
-        (self.base + index * self.cell_size) as *mut u8
+    fn cell_ptr(&self, index: usize) -> usize {
+        self.base + index * self.cell_size
     }
-    fn marked(&self, index: usize) -> bool {
-        self.marks[index / 64] >> (index % 64) & 1 == 1
-    }
-    fn set_mark(&mut self, index: usize) {
-        self.marks[index / 64] |= 1u64 << (index % 64);
-    }
-    fn is_allocated(&self, index: usize) -> bool {
-        self.allocated[index / 64] >> (index % 64) & 1 == 1
-    }
-    fn set_allocated(&mut self, index: usize, yes: bool) {
-        if yes {
-            self.allocated[index / 64] |= 1u64 << (index % 64);
-        } else {
-            self.allocated[index / 64] &= !(1u64 << (index % 64));
+
+    fn take_free(&mut self) -> Option<*mut u8> {
+        if self.free_head < 0 {
+            return None;
         }
+        let index = self.free_head as usize;
+        let ptr = self.cell_ptr(index) as *mut u8;
+        // SAFETY: free cells hold their free-list link in word 0.
+        let next = unsafe { std::ptr::read(ptr as *const u64) };
+        debug_assert!(next as usize <= self.cells, "GC free list corrupted");
+        self.free_head = if next == 0 { -1 } else { (next - 1) as i32 };
+        set_bit(&mut self.allocated, index, true);
+        self.live += 1;
+        // SAFETY: the cell lies inside this page and is now owned by the caller.
+        unsafe { std::ptr::write_bytes(ptr, 0, self.cell_size) };
+        Some(ptr)
     }
+}
+
+/// Allocation state for one (descriptor, size class).
+#[derive(Default)]
+struct ClassPages {
+    current: Option<u32>,
+    /// Pages with free cells after the last sweep, other than `current`.
+    avail: Vec<u32>,
 }
 
 struct LargeObj {
-    ptr: *mut u8,
     size: usize,
     desc: DescId,
     marked: bool,
+    waiters: bool,
 }
 
-type TraceRootFn = Box<dyn FnMut(&mut dyn FnMut(*const u8))>;
-type SweepHookFn = Box<dyn FnMut(&dyn Fn(*const u8) -> bool)>;
+#[derive(Clone, Copy)]
+enum Loc {
+    Small { page: u32, index: u32 },
+    Large,
+}
+
+/// A resolved cell: start address, descriptor, and where its bits live.
+#[derive(Clone, Copy)]
+struct CellRef {
+    start: usize,
+    desc: DescId,
+    loc: Loc,
+}
+
+/// An edge whose value is reachable once its conditions are marked.
+struct CondEdge {
+    owner: Option<CellRef>,
+    key: Option<CellRef>,
+    value: u64,
+    fired: bool,
+    /// In-cell entry words to zero if the key dies (from a [`WeakFn`]).
+    slots: Option<(*mut u64, *mut u64)>,
+}
+
+/// Per-collection marking state. Built fresh every cycle, so nothing in it
+/// can outlive the cells it describes.
+#[derive(Default)]
+struct Marker {
+    worklist: Vec<(usize, DescId)>,
+    edges: Vec<CondEdge>,
+    /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
+    waiting: FastMap<usize, Vec<u32>>,
+    ready: Vec<u32>,
+    weak_slots: Vec<*mut u64>,
+    trace_scratch: Vec<*const u8>,
+    slot_scratch: Vec<*mut u64>,
+    pair_scratch: Vec<(*mut u64, *mut u64)>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcStats {
@@ -112,27 +390,40 @@ pub(crate) struct GcStats {
     pub(crate) pages_live: usize,
     pub(crate) live_cells: usize,
     pub(crate) live_bytes: usize,
+    /// Collections that were due but postponed, counted once per pending
+    /// request (not per allocation that found it still pending).
     pub(crate) deferred_collections: u64,
+    /// Subset of `deferred_collections` postponed because the native stack
+    /// could not be scanned soundly (see [`Heap::collect`]).
+    pub(crate) deferred_native_stack: u64,
+    /// Allocated bytes at which the next collection becomes due.
+    pub(crate) trigger_bytes: usize,
 }
 
 pub(crate) struct Heap {
     descs: Vec<LayoutDesc>,
-    pages: Vec<PageMeta>,
-    page_map: HashMap<usize, usize>,
-    current: HashMap<(usize, DescId), usize>,
-    larges: Vec<LargeObj>,
-    root_ranges: Vec<(String, *const u64, *const u64)>,
-    trace_roots: Vec<(String, TraceRootFn)>,
-    sweep_hooks: Vec<(String, SweepHookFn)>,
-    ephemerons: Vec<(*const u8, *const u8)>,
-    weak_slots: Vec<*mut u64>,
-    stack_top: Cell<usize>,
-    extra_stack_ranges: Vec<(usize, usize)>,
-    /// Shared with NoGcScope guards so a guard can be alive while
-    /// `alloc(&mut self)` runs inside the region.
-    control: std::rc::Rc<Control>,
-    bytes_since_gc: usize,
-    gc_threshold: usize,
+    /// Indexed by descriptor, then size class.
+    classes: Vec<[ClassPages; SIZE_CLASSES.len()]>,
+    /// Slots are reused after release, so page indices stay stable.
+    pages: Vec<Option<PageMeta>>,
+    free_page_slots: Vec<u32>,
+    /// Page number (address >> PAGE_SHIFT; page addresses would leave
+    /// FxHash's low bits zero) to index in `pages`.
+    page_map: FastMap<usize, u32>,
+    larges: BTreeMap<usize, LargeObj>,
+    /// Address span of all large objects: cheap rejection of stack words.
+    large_span: (usize, usize),
+    root_ranges: Rc<Registry<RootRangeEntry>>,
+    trace_roots: Rc<Registry<TraceRootEntry>>,
+    edge_sources: Rc<Registry<EdgeSourceEntry>>,
+    sweep_hooks: Rc<Registry<SweepHookEntry>>,
+    /// Shared with NoGcScope/BorrowScope guards so a guard can be alive
+    /// while `alloc(&mut self)` runs.
+    control: Rc<Control>,
+    allocated_bytes: usize,
+    trigger_bytes: usize,
+    min_trigger_bytes: usize,
+    growth_percent: usize,
     stress_every: usize,
     allocs_since_gc: usize,
     stats: GcStats,
@@ -148,20 +439,21 @@ impl Heap {
     pub(crate) fn new() -> Self {
         Self {
             descs: Vec::new(),
+            classes: Vec::new(),
             pages: Vec::new(),
-            page_map: HashMap::new(),
-            current: HashMap::new(),
-            larges: Vec::new(),
-            root_ranges: Vec::new(),
-            trace_roots: Vec::new(),
-            sweep_hooks: Vec::new(),
-            ephemerons: Vec::new(),
-            weak_slots: Vec::new(),
-            stack_top: Cell::new(0),
-            extra_stack_ranges: Vec::new(),
-            control: std::rc::Rc::new(Control::default()),
-            bytes_since_gc: 0,
-            gc_threshold: 1024 * 1024,
+            free_page_slots: Vec::new(),
+            page_map: FastMap::default(),
+            larges: BTreeMap::new(),
+            large_span: (usize::MAX, 0),
+            root_ranges: Rc::default(),
+            trace_roots: Rc::default(),
+            edge_sources: Rc::default(),
+            sweep_hooks: Rc::default(),
+            control: Rc::default(),
+            allocated_bytes: 0,
+            trigger_bytes: DEFAULT_MIN_TRIGGER,
+            min_trigger_bytes: DEFAULT_MIN_TRIGGER,
+            growth_percent: DEFAULT_GROWTH_PERCENT,
             stress_every: 0,
             allocs_since_gc: 0,
             stats: GcStats::default(),
@@ -171,263 +463,826 @@ impl Heap {
     pub(crate) fn register_desc(&mut self, desc: LayoutDesc) -> DescId {
         let id = DescId(self.descs.len() as u32);
         self.descs.push(desc);
+        self.classes
+            .push(std::array::from_fn(|_| ClassPages::default()));
         id
     }
 
-    pub(crate) fn set_stack_top(&self, top: *const u64) {
-        self.stack_top.set(top as usize);
-    }
-
-    /// Register an extra scannable stack range (e.g. a grown segment
-    /// with exact bounds from the segment registry). Bounds are the
-    /// caller's contract responsibility; never guess them.
-    pub(crate) fn register_stack_range(&mut self, lo: *const u64, hi: *const u64) {
-        self.extra_stack_ranges.push((lo as usize, hi as usize));
-    }
-
-    /// Register a Rust-heap root range of tagged words (VM operand
-    /// stacks, frame slot arrays). Scanned precisely-as-tagged.
-    pub(crate) fn register_root_range(&mut self, name: &str, lo: *const u64, hi: *const u64) {
-        self.root_ranges.push((name.to_string(), lo, hi));
+    /// Register a Rust-heap root range of tagged words (VM operand stacks,
+    /// frame slot arrays). Words are recognized like stack words: anything
+    /// whose payload addresses a cell, interior addresses included.
+    ///
+    /// # Safety
+    /// `[lo, hi)` must stay readable, u64-aligned memory until the handle is
+    /// dropped or re-pointed with `RootRange::set`.
+    pub(crate) unsafe fn add_root_range(
+        &self,
+        name: &'static str,
+        lo: *const u64,
+        hi: *const u64,
+    ) -> RootRange {
+        self.root_ranges.insert(RootRangeEntry { name, lo, hi })
     }
 
     /// Register a traced Rust-heap container root (Decision 2 registry).
-    pub(crate) fn register_trace_root(&mut self, name: &str, f: TraceRootFn) {
-        self.trace_roots.push((name.to_string(), f));
+    /// Its edges are unconditional; data owned by a cell belongs in an
+    /// edge source instead, or it would outlive (and leak) its owner.
+    pub(crate) fn add_trace_root(
+        &self,
+        name: &'static str,
+        trace: impl FnMut(&mut dyn FnMut(*const u8)) + 'static,
+    ) -> TraceRoot {
+        self.trace_roots.insert(TraceRootEntry {
+            name,
+            trace: Box::new(trace),
+        })
     }
 
-    /// Register a pre-sweep hook for address-keyed side tables (I8).
-    /// The hook receives `is_live(cell_ptr)` valid for this cycle.
-    pub(crate) fn register_sweep_hook(&mut self, name: &str, f: SweepHookFn) {
-        self.sweep_hooks.push((name.to_string(), f));
+    /// Register a side table whose edges are conditional on cells (Decision
+    /// 2): Map/Set data keyed by owner, WeakMap entries, FinalizationRegistry
+    /// held values. Reported once per collection, at the start of marking.
+    pub(crate) fn add_edge_source(
+        &self,
+        name: &'static str,
+        report: impl FnMut(&mut EdgeSink<'_>) + 'static,
+    ) -> EdgeSource {
+        self.edge_sources.insert(EdgeSourceEntry {
+            name,
+            report: Box::new(report),
+        })
     }
 
-    pub(crate) fn add_ephemeron(&mut self, key: *const u8, value: *const u8) {
-        self.ephemerons.push((key, value));
-    }
-
-    /// Register a weak slot: a word holding a tagged reference that the
-    /// collector zeroes when its target is unmarked.
-    pub(crate) fn add_weak_slot(&mut self, slot: *mut u64) {
-        self.weak_slots.push(slot);
+    /// Register a pre-sweep hook for address-keyed side tables (I8). The
+    /// hook receives `is_live(cell_start)`, valid for this collection.
+    pub(crate) fn add_sweep_hook(
+        &self,
+        name: &'static str,
+        hook: impl FnMut(&dyn Fn(*const u8) -> bool) + 'static,
+    ) -> SweepHook {
+        self.sweep_hooks.insert(SweepHookEntry {
+            name,
+            hook: Box::new(hook),
+        })
     }
 
     pub(crate) fn set_stress_every(&mut self, allocs: usize) {
         self.stress_every = allocs;
     }
 
+    /// The next collection is due once allocated bytes exceed
+    /// max(`min_bytes`, live × (1 + `growth_percent`/100)), so marking work
+    /// per allocated byte stays bounded as the live heap grows.
+    pub(crate) fn set_heap_growth(&mut self, min_bytes: usize, growth_percent: usize) {
+        self.min_trigger_bytes = min_bytes;
+        self.growth_percent = growth_percent;
+        self.trigger_bytes = min_bytes;
+    }
+
     pub(crate) fn stats(&self) -> GcStats {
         let mut s = self.stats;
-        s.pages_live = self.pages.len();
-        s.live_cells = self.pages.iter().map(|p| p.live).sum::<usize>() + self.larges.len();
-        s.live_bytes = self
-            .pages
-            .iter()
-            .map(|p| p.live * p.cell_size)
-            .sum::<usize>()
-            + self.larges.iter().map(|l| l.size).sum::<usize>();
+        let pages = self.pages.iter().flatten();
+        s.pages_live = pages.clone().count();
+        s.live_cells = pages.clone().map(|p| p.live).sum::<usize>() + self.larges.len();
+        s.live_bytes = pages.map(|p| p.live * p.cell_size).sum::<usize>()
+            + self.larges.values().map(|l| l.size).sum::<usize>();
+        s.trigger_bytes = self.trigger_bytes;
         s
     }
 
     /// Enter a bounded no-GC region (I9). Allocation proceeds inside;
-    /// collection is deferred until the outermost region exits *and* a
-    /// later allocation or explicit collect observes the pending flag.
+    /// collection requests are deferred, and a deferred collection runs at
+    /// the next allocation or collection request after the outermost
+    /// region exits, never at region exit itself (exit is not a safepoint).
     pub(crate) fn nogc(&self) -> NoGcScope {
         self.control
             .nogc_depth
             .set(self.control.nogc_depth.get() + 1);
         NoGcScope {
-            control: self.control.clone(),
+            control: Rc::clone(&self.control),
         }
     }
 
-    /// Allocate a zeroed cell for `desc`. May collect first (unless
-    /// inside a no-GC region, where the request is deferred).
-    /// The caller initializes, then publishes (I9).
+    /// I9 hook for S2's GcCell: hold one scope per outstanding Ref/RefMut.
+    /// A collection requested meanwhile asserts in debug builds and defers
+    /// in release builds.
+    pub(crate) fn borrow_scope(&self) -> BorrowScope {
+        self.control.borrows.set(self.control.borrows.get() + 1);
+        BorrowScope {
+            control: Rc::clone(&self.control),
+        }
+    }
+
+    /// Debug check for task boundaries and teardown: a leaked guard would
+    /// otherwise defer collection forever.
+    pub(crate) fn debug_assert_quiescent(&self) {
+        debug_assert_eq!(
+            self.control.nogc_depth.get(),
+            0,
+            "I9: no-GC region still open"
+        );
+        debug_assert_eq!(
+            self.control.borrows.get(),
+            0,
+            "I9: GcCell borrow still outstanding"
+        );
+        debug_assert!(!self.control.collecting.get(), "GC collection in progress");
+    }
+
+    /// A collection was requested but deferred; it runs at the next
+    /// allocation or explicit request (wasm32: the next VM safepoint).
+    pub(crate) fn collection_pending(&self) -> bool {
+        self.control.pending_collect.get()
+    }
+
+    /// Allocate a zeroed cell for `desc`. May first collect, conservatively
+    /// (see [`Heap::collect`]). The caller initializes, then publishes (I9).
     pub(crate) fn alloc(&mut self, desc: DescId, size: usize) -> *mut u8 {
-        self.maybe_collect_for_alloc(size);
-        let ptr = if size > LARGE_THRESHOLD {
-            self.alloc_large(desc, size)
-        } else {
-            self.alloc_small(desc, size)
+        debug_assert!(
+            (desc.0 as usize) < self.descs.len(),
+            "unregistered GC descriptor"
+        );
+        debug_assert!(
+            !self.control.collecting.get(),
+            "GC allocation during collection"
+        );
+        let class = size_class(size);
+        let cost = class.map_or(size, |class| SIZE_CLASSES[class]);
+        self.maybe_collect_for_alloc(cost);
+        let ptr = match class {
+            Some(class) => self.alloc_small(desc, class),
+            None => self.alloc_large(desc, size),
         };
         self.stats.allocations += 1;
-        self.bytes_since_gc += size;
+        self.allocated_bytes = self.allocated_bytes.saturating_add(cost);
         self.allocs_since_gc += 1;
-        if self.stress_every > 0 && self.allocs_since_gc >= self.stress_every {
-            // Stress: collect *after* handing out the cell would free it
-            // before the caller can root it; collect is armed for the
-            // next allocation instead (see maybe_collect_for_alloc).
-            self.control.pending_collect.set(true);
-        }
         ptr
     }
 
     fn maybe_collect_for_alloc(&mut self, upcoming: usize) {
+        // Stress collects *before* an allocation: collecting after handing
+        // out the cell would free it before the caller can root it.
         let due = self.control.pending_collect.get()
-            || self.bytes_since_gc + upcoming > self.gc_threshold
+            || self.allocated_bytes.saturating_add(upcoming) > self.trigger_bytes
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every);
-        if !due {
-            return;
+        if due {
+            self.collect();
         }
-        if self.control.nogc_depth.get() > 0 {
-            self.control.pending_collect.set(true);
-            self.stats.deferred_collections += 1;
-            return;
-        }
-        self.collect();
     }
 
-    fn alloc_small(&mut self, desc: DescId, size: usize) -> *mut u8 {
-        let class = size_class(size).expect("small size has a class");
-        let cell_size = SIZE_CLASSES[class];
-        let key = (class, desc);
-        if let Some(&meta_idx) = self.current.get(&key) {
-            if let Some(ptr) = self.take_free(meta_idx) {
+    fn alloc_small(&mut self, desc: DescId, class: usize) -> *mut u8 {
+        loop {
+            let pages = &mut self.classes[desc.0 as usize][class];
+            if pages.current.is_none() {
+                pages.current = pages.avail.pop();
+            }
+            let Some(index) = pages.current else {
+                break;
+            };
+            if let Some(ptr) = self.pages[index as usize]
+                .as_mut()
+                .and_then(PageMeta::take_free)
+            {
                 return ptr;
             }
+            self.classes[desc.0 as usize][class].current = None;
         }
-        // Reuse any non-current page of this (class, desc) with space,
-        // e.g. after a sweep freed cells in older pages.
-        for idx in 0..self.pages.len() {
-            if self.pages[idx].cell_size == cell_size && self.pages[idx].desc == desc {
-                if let Some(ptr) = self.take_free(idx) {
-                    self.current.insert(key, idx);
-                    return ptr;
-                }
-            }
-        }
-        let idx = self.new_page(cell_size, desc);
-        self.current.insert(key, idx);
-        self.take_free(idx).expect("fresh page has free cells")
+        let index = self.new_page(desc, class);
+        self.classes[desc.0 as usize][class].current = Some(index);
+        self.pages[index as usize]
+            .as_mut()
+            .and_then(PageMeta::take_free)
+            .expect("fresh page has free cells")
     }
 
-    fn take_free(&mut self, meta_idx: usize) -> Option<*mut u8> {
-        let page = &mut self.pages[meta_idx];
-        if page.free_head < 0 {
-            return None;
-        }
-        let index = page.free_head as usize;
-        let ptr = page.cell_ptr(index);
-        let next = unsafe { std::ptr::read(ptr as *const u64) };
-        page.free_head = if next == 0 { -1 } else { (next - 1) as i32 };
-        page.set_allocated(index, true);
-        page.live += 1;
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, page.cell_size);
-        }
-        Some(ptr)
-    }
-
-    fn new_page(&mut self, cell_size: usize, desc: DescId) -> usize {
-        let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
-        let base = unsafe { alloc_zeroed(layout) };
+    fn new_page(&mut self, desc: DescId, class: usize) -> u32 {
+        let cell_size = SIZE_CLASSES[class];
+        // SAFETY: non-zero size; null is checked below.
+        let base = unsafe { alloc_zeroed(page_layout()) };
         assert!(!base.is_null(), "GC page allocation failed");
         let cells = PAGE_SIZE / cell_size;
         // Thread the free list: cell i -> i+1 (stored as i+2), last -> 0.
         for i in 0..cells {
-            let p = unsafe { base.add(i * cell_size) } as *mut u64;
             let next = if i + 1 < cells { (i + 2) as u64 } else { 0 };
-            unsafe { std::ptr::write(p, next) };
+            // SAFETY: the cell lies inside the fresh page.
+            unsafe { std::ptr::write(base.add(i * cell_size) as *mut u64, next) };
         }
-        let idx = self.pages.len();
-        self.pages.push(PageMeta {
+        let words = cells.div_ceil(64);
+        let meta = PageMeta {
             base: base as usize,
             cell_size,
             cells,
             desc,
-            marks: vec![0; cells.div_ceil(64)],
-            allocated: vec![0; cells.div_ceil(64)],
+            class,
+            marks: vec![0; words],
+            allocated: vec![0; words],
+            waiters: vec![0; words],
             free_head: 0,
             live: 0,
-        });
-        self.page_map.insert(base as usize, idx);
-        idx
+        };
+        let index = match self.free_page_slots.pop() {
+            Some(index) => {
+                self.pages[index as usize] = Some(meta);
+                index
+            }
+            None => {
+                self.pages.push(Some(meta));
+                (self.pages.len() - 1) as u32
+            }
+        };
+        self.page_map.insert(base as usize >> PAGE_SHIFT, index);
+        index
     }
 
     fn alloc_large(&mut self, desc: DescId, size: usize) -> *mut u8 {
-        let layout = Layout::from_size_align(size, 16).unwrap();
-        let ptr = unsafe { alloc_zeroed(layout) };
+        // SAFETY: size > 4 KiB; null is checked below.
+        let ptr = unsafe { alloc_zeroed(large_layout(size)) };
         assert!(!ptr.is_null(), "GC large allocation failed");
-        self.larges.push(LargeObj {
-            ptr,
-            size,
-            desc,
-            marked: false,
-        });
+        let start = ptr as usize;
+        self.larges.insert(
+            start,
+            LargeObj {
+                size,
+                desc,
+                marked: false,
+                waiters: false,
+            },
+        );
+        self.large_span = (
+            self.large_span.0.min(start),
+            self.large_span.1.max(start + size),
+        );
         ptr
     }
 
-    /// Resolve a candidate word (raw pointer or tagged word) to the
-    /// start of its cell, accepting interior addresses. `None` for
-    /// non-heap words.
-    pub(crate) fn resolve(&self, word: u64) -> Option<*const u8> {
+    /// Resolve a candidate word (raw pointer or tagged word, interior
+    /// addresses included) to its cell. `None` for non-heap words.
+    fn locate(&self, word: u64) -> Option<CellRef> {
         let addr = (word & PAYLOAD_MASK) as usize;
         if addr < 4096 {
             return None;
         }
-        if let Some(&idx) = self.page_map.get(&(addr & PAGE_MASK)) {
-            let page = &self.pages[idx];
-            let offset = addr - page.base;
-            if offset < page.cells * page.cell_size {
-                return Some(page.cell_ptr(offset / page.cell_size) as *const u8);
-            }
+        if let Some(&index) = self.page_map.get(&(addr >> PAGE_SHIFT)) {
+            let page = self.pages[index as usize].as_ref()?;
+            let cell = (addr - page.base) / page.cell_size;
+            return (cell < page.cells).then(|| CellRef {
+                start: page.cell_ptr(cell),
+                desc: page.desc,
+                loc: Loc::Small {
+                    page: index,
+                    index: cell as u32,
+                },
+            });
+        }
+        if !(self.large_span.0..self.large_span.1).contains(&addr) {
             return None;
         }
-        for large in &self.larges {
-            let lo = large.ptr as usize;
-            if addr >= lo && addr < lo + large.size {
-                return Some(large.ptr as *const u8);
-            }
-        }
-        None
+        let (&start, large) = self.larges.range(..=addr).next_back()?;
+        (addr < start + large.size).then_some(CellRef {
+            start,
+            desc: large.desc,
+            loc: Loc::Large,
+        })
     }
 
-    fn is_marked(&self, cell: *const u8) -> bool {
-        let addr = cell as usize;
-        if let Some(&idx) = self.page_map.get(&(addr & PAGE_MASK)) {
-            let page = &self.pages[idx];
-            return page.marked((addr - page.base) / page.cell_size);
-        }
-        self.larges
-            .iter()
-            .any(|l| l.ptr as usize == addr && l.marked)
+    /// Resolve `ptr` to the start of its cell, accepting interior addresses.
+    pub(crate) fn resolve(&self, word: u64) -> Option<*const u8> {
+        self.locate(word).map(|cell| cell.start as *const u8)
     }
 
-    fn mark_cell(&mut self, cell: *const u8, worklist: &mut Vec<*const u8>) {
-        let addr = cell as usize;
-        if let Some(&idx) = self.page_map.get(&(addr & PAGE_MASK)) {
-            let page = &mut self.pages[idx];
-            let index = (addr - page.base) / page.cell_size;
-            if !page.is_allocated(index) {
-                return; // stale/conservative hit on a free cell: ignore
+    fn is_marked(&self, cell: &CellRef) -> bool {
+        match cell.loc {
+            Loc::Small { page, index } => self.pages[page as usize]
+                .as_ref()
+                .is_some_and(|p| bit(&p.marks, index as usize)),
+            Loc::Large => self.larges.get(&cell.start).is_some_and(|l| l.marked),
+        }
+    }
+
+    /// Set the mark of an allocated cell. `Some(has_waiters)` when newly
+    /// marked; `None` when already marked or free (conservative or stale
+    /// hits on free cells are ignored).
+    fn mark(&mut self, cell: &CellRef) -> Option<bool> {
+        match cell.loc {
+            Loc::Small { page, index } => {
+                let page = self.pages[page as usize].as_mut()?;
+                let index = index as usize;
+                if !bit(&page.allocated, index) || bit(&page.marks, index) {
+                    return None;
+                }
+                set_bit(&mut page.marks, index, true);
+                Some(bit(&page.waiters, index))
             }
-            if !page.marked(index) {
-                page.set_mark(index);
-                self.stats.cells_marked += 1;
-                worklist.push(page.cell_ptr(index) as *const u8);
+            Loc::Large => {
+                let large = self.larges.get_mut(&cell.start)?;
+                if large.marked {
+                    return None;
+                }
+                large.marked = true;
+                Some(large.waiters)
             }
+        }
+    }
+
+    fn mark_cell(&mut self, cell: CellRef, m: &mut Marker) {
+        if let Some(has_waiters) = self.mark(&cell) {
+            self.stats.cells_marked += 1;
+            m.worklist.push((cell.start, cell.desc));
+            if has_waiters {
+                if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
+                    m.ready.extend(edges);
+                }
+            }
+        }
+    }
+
+    fn mark_word(&mut self, word: u64, m: &mut Marker) {
+        if let Some(cell) = self.locate(word) {
+            self.mark_cell(cell, m);
+        }
+    }
+
+    /// Request a collection with conservative native roots (Decision 0):
+    /// registered roots plus this thread's registered native stack chain
+    /// and a register snapshot. Returns false when the request is deferred
+    /// (pending until the next allocation or request): inside a no-GC
+    /// region; while a GcCell borrow is outstanding (debug builds assert,
+    /// I9); or when the native stack cannot be scanned soundly — no stack
+    /// registered on this thread (see [`enter_native_stack`]), SP outside
+    /// every registered region (e.g. an unregistered `stacker::grow`
+    /// segment), or no scanner for this target (wasm32).
+    pub(crate) fn collect(&mut self) -> bool {
+        if self.blocked() {
+            return self.defer(false);
+        }
+        if !native::scannable(native::current_sp()) {
+            return self.defer(true);
+        }
+        self.run(true);
+        true
+    }
+
+    /// Collect at a precise safepoint: registered roots only, no native
+    /// stack or registers. The caller guarantees no heap reference is held
+    /// solely in native frames or registers (wasm32 VM safepoints per the
+    /// S0 decision, task boundaries, tests). Deferred like [`Heap::collect`]
+    /// inside no-GC regions and while borrows are outstanding.
+    pub(crate) fn collect_at_safepoint(&mut self) -> bool {
+        if self.blocked() {
+            return self.defer(false);
+        }
+        self.run(false);
+        true
+    }
+
+    fn blocked(&self) -> bool {
+        if self.control.nogc_depth.get() > 0 {
+            return true;
+        }
+        let borrows = self.control.borrows.get();
+        if borrows > 0 && cfg!(debug_assertions) {
+            panic!(
+                "I9 violation: collection requested with {borrows} outstanding GcCell \
+                 borrow(s); allocate inside a no-GC region or after the borrow ends"
+            );
+        }
+        borrows > 0
+    }
+
+    fn defer(&mut self, native_stack: bool) -> bool {
+        if !self.control.pending_collect.replace(true) {
+            self.stats.deferred_collections += 1;
+            if native_stack {
+                self.stats.deferred_native_stack += 1;
+            }
+        }
+        false
+    }
+
+    fn run(&mut self, native_roots: bool) {
+        assert!(
+            !self.control.collecting.replace(true),
+            "re-entrant GC collection"
+        );
+        self.control.pending_collect.set(false);
+        self.stats.collections += 1;
+        let mut m = Marker::default();
+        self.mark_root_ranges(&mut m);
+        self.mark_trace_roots(&mut m);
+        if native_roots {
+            self.mark_native_stack(&mut m);
+        }
+        self.add_source_edges(&mut m);
+        self.drain(&mut m);
+        self.clear_dead_weak(&m);
+        #[cfg(debug_assertions)]
+        self.verify(&m);
+        self.run_sweep_hooks();
+        let live_bytes = self.sweep();
+        self.allocated_bytes = live_bytes;
+        let budget =
+            live_bytes.saturating_add(live_bytes.saturating_mul(self.growth_percent) / 100);
+        self.trigger_bytes = self.min_trigger_bytes.max(budget);
+        self.allocs_since_gc = 0;
+        self.control.collecting.set(false);
+    }
+
+    fn mark_root_ranges(&mut self, m: &mut Marker) {
+        Rc::clone(&self.root_ranges).for_each(|range| {
+            let mut p = range.lo;
+            while p < range.hi {
+                // SAFETY: registered ranges are readable (add_root_range contract).
+                let word = unsafe { std::ptr::read(p) };
+                self.mark_word(word, m);
+                p = p.wrapping_add(1);
+            }
+        });
+    }
+
+    fn mark_trace_roots(&mut self, m: &mut Marker) {
+        let mut edges: Vec<*const u8> = Vec::new();
+        Rc::clone(&self.trace_roots).for_each(|root| (root.trace)(&mut |cell| edges.push(cell)));
+        for cell in edges {
+            self.mark_word(cell as u64, m);
+        }
+    }
+
+    /// Decision 0 spill protocol. Never inlined: callee-saved registers are
+    /// spilled into this frame, then the scan starts at this frame's SP, so
+    /// every value a caller keeps in a callee-saved register is in `regs`,
+    /// in a prologue save area above SP, or in a caller frame. Caller-saved
+    /// registers are dead or spilled by the caller at this call.
+    #[inline(never)]
+    fn mark_native_stack(&mut self, m: &mut Marker) {
+        let mut regs = [0u64; native::SPILL_WORDS];
+        native::spill_registers(&mut regs);
+        let sp = native::current_sp();
+        let ranges = native::scan_ranges(sp).expect("collect() checked the native stack");
+        for (lo, hi) in ranges {
+            let mut p = lo;
+            while p + 8 <= hi {
+                // SAFETY: registered stack regions are mapped (enter_native_stack
+                // and grow contracts); volatile keeps the compiler from reasoning
+                // about reads of other frames.
+                let word = unsafe { std::ptr::read_volatile(p as *const u64) };
+                self.mark_word(word, m);
+                p += 8;
+            }
+        }
+        std::hint::black_box(&regs);
+    }
+
+    fn add_source_edges(&mut self, m: &mut Marker) {
+        let mut reported = Vec::new();
+        Rc::clone(&self.edge_sources).for_each(|source| {
+            (source.report)(&mut EdgeSink {
+                edges: &mut reported,
+            })
+        });
+        for edge in reported {
+            // An owner or key outside this heap is not a condition.
+            let owner = self.locate(edge.owner);
+            let key = edge.key.and_then(|key| self.locate(key));
+            self.add_edge(
+                CondEdge {
+                    owner,
+                    key,
+                    value: edge.value,
+                    fired: false,
+                    slots: None,
+                },
+                m,
+            );
+        }
+    }
+
+    fn drain(&mut self, m: &mut Marker) {
+        loop {
+            while let Some((cell, desc)) = m.worklist.pop() {
+                let desc = &self.descs[desc.0 as usize];
+                let (trace, weak) = (desc.trace, desc.weak);
+                let mut edges = std::mem::take(&mut m.trace_scratch);
+                edges.clear();
+                trace(cell as *const u8, &mut |edge| edges.push(edge));
+                for &edge in &edges {
+                    self.mark_word(edge as u64, m);
+                }
+                m.trace_scratch = edges;
+                if let Some(weak) = weak {
+                    self.visit_weak(cell, weak, m);
+                }
+            }
+            let Some(edge) = m.ready.pop() else {
+                break;
+            };
+            self.try_fire(edge, m);
+        }
+    }
+
+    fn visit_weak(&mut self, cell: usize, weak: WeakFn, m: &mut Marker) {
+        let mut slots = std::mem::take(&mut m.slot_scratch);
+        let mut pairs = std::mem::take(&mut m.pair_scratch);
+        slots.clear();
+        pairs.clear();
+        weak(
+            cell as *mut u8,
+            &mut WeakSink {
+                weak_slots: &mut slots,
+                ephemerons: &mut pairs,
+            },
+        );
+        debug_assert!(
+            slots
+                .iter()
+                .chain(pairs.iter().flat_map(|(key, value)| [key, value]))
+                .all(|&slot| self.locate(slot as u64).is_some_and(|c| c.start == cell)),
+            "WeakFn reported a slot outside its cell"
+        );
+        m.weak_slots.extend_from_slice(&slots);
+        for &(key_slot, value_slot) in &pairs {
+            // SAFETY: the descriptor reported words inside this marked cell.
+            let (key, value) = unsafe { (std::ptr::read(key_slot), std::ptr::read(value_slot)) };
+            if key == 0 {
+                continue;
+            }
+            let key = self.locate(key);
+            self.add_edge(
+                CondEdge {
+                    owner: None,
+                    key,
+                    value,
+                    fired: false,
+                    slots: Some((key_slot, value_slot)),
+                },
+                m,
+            );
+        }
+        m.slot_scratch = slots;
+        m.pair_scratch = pairs;
+    }
+
+    fn add_edge(&mut self, edge: CondEdge, m: &mut Marker) {
+        let index = m.edges.len() as u32;
+        m.edges.push(edge);
+        self.try_fire(index, m);
+    }
+
+    /// Mark the edge's value if all its conditions are marked; otherwise
+    /// wait on the first unmarked one. Each edge waits at most twice and
+    /// fires at most once, so conditional marking is linear — no fixed-point
+    /// rescans, and a condition that can never be marked (a free cell) just
+    /// leaves its edge unfired.
+    fn try_fire(&mut self, index: u32, m: &mut Marker) {
+        let edge = &m.edges[index as usize];
+        if edge.fired {
             return;
         }
-        for large in &mut self.larges {
-            if large.ptr as usize == addr && !large.marked {
-                large.marked = true;
-                self.stats.cells_marked += 1;
-                worklist.push(cell);
+        let (conditions, value) = ([edge.owner, edge.key], edge.value);
+        for condition in conditions.into_iter().flatten() {
+            if !self.is_marked(&condition) {
+                self.wait_on(&condition, index, m);
                 return;
             }
         }
+        m.edges[index as usize].fired = true;
+        self.mark_word(value, m);
     }
 
-    fn desc_of(&self, cell: *const u8) -> Option<DescId> {
-        let addr = cell as usize;
-        if let Some(&idx) = self.page_map.get(&(addr & PAGE_MASK)) {
-            return Some(self.pages[idx].desc);
+    fn wait_on(&mut self, cell: &CellRef, edge: u32, m: &mut Marker) {
+        match cell.loc {
+            Loc::Small { page, index } => {
+                if let Some(page) = self.pages[page as usize].as_mut() {
+                    set_bit(&mut page.waiters, index as usize, true);
+                }
+            }
+            Loc::Large => {
+                if let Some(large) = self.larges.get_mut(&cell.start) {
+                    large.waiters = true;
+                }
+            }
         }
-        self.larges
-            .iter()
-            .find(|l| l.ptr as usize == addr)
-            .map(|l| l.desc)
+        m.waiting.entry(cell.start >> 4).or_default().push(edge);
+    }
+
+    /// After marking: zero weak slots whose targets died and in-cell
+    /// ephemeron entries whose keys died. Holders are marked, so the words
+    /// written belong to surviving cells, reported this cycle.
+    fn clear_dead_weak(&self, m: &Marker) {
+        for &slot in &m.weak_slots {
+            // SAFETY: reported by the WeakFn of a marked cell.
+            let word = unsafe { std::ptr::read(slot) };
+            if self.locate(word).is_some_and(|cell| !self.is_marked(&cell)) {
+                // SAFETY: as above.
+                unsafe { std::ptr::write(slot, 0) };
+            }
+        }
+        for edge in &m.edges {
+            if let (false, Some((key, value))) = (edge.fired, edge.slots) {
+                // SAFETY: as above.
+                unsafe {
+                    std::ptr::write(key, 0);
+                    std::ptr::write(value, 0);
+                }
+            }
+        }
+    }
+
+    /// Structural check: every strong edge of every marked cell, and the
+    /// value of every fired conditional edge, resolves to a marked cell.
+    /// Cannot detect descriptor *omissions* (that proof is the registry
+    /// audit vs the S0 inventory — Decision 2).
+    fn verify(&self, m: &Marker) {
+        let mut edges: Vec<*const u8> = Vec::new();
+        let mut check = |from: usize, desc: DescId| {
+            let desc = &self.descs[desc.0 as usize];
+            edges.clear();
+            (desc.trace)(from as *const u8, &mut |edge| edges.push(edge));
+            for &edge in &edges {
+                if edge.is_null() {
+                    continue;
+                }
+                match self.locate(edge as u64) {
+                    Some(cell) => assert!(
+                        self.is_marked(&cell),
+                        "heap verifier: marked cell {from:#x} ({}) references unmarked {:#x}",
+                        desc.name,
+                        cell.start
+                    ),
+                    None => panic!(
+                        "heap verifier: marked cell {from:#x} ({}) references non-heap {edge:p}",
+                        desc.name
+                    ),
+                }
+            }
+        };
+        for page in self.pages.iter().flatten() {
+            for i in 0..page.cells {
+                if bit(&page.marks, i) {
+                    check(page.cell_ptr(i), page.desc);
+                }
+            }
+        }
+        for (&start, large) in &self.larges {
+            if large.marked {
+                check(start, large.desc);
+            }
+        }
+        for edge in m.edges.iter().filter(|edge| edge.fired) {
+            if let Some(cell) = self.locate(edge.value) {
+                assert!(
+                    self.is_marked(&cell),
+                    "heap verifier: conditional edge references unmarked {:#x}",
+                    cell.start
+                );
+            }
+        }
+    }
+
+    /// Exact liveness for side-table keys: `addr` must be a cell start.
+    fn is_live(&self, addr: usize) -> bool {
+        self.locate(addr as u64)
+            .is_some_and(|cell| cell.start == addr && self.is_marked(&cell))
+    }
+
+    fn run_sweep_hooks(&self) {
+        Rc::clone(&self.sweep_hooks)
+            .for_each(|entry| (entry.hook)(&|cell| self.is_live(cell as usize)));
+    }
+
+    /// Finalize, poison (debug) and free unmarked cells, release empty
+    /// pages, clear marks. Returns the live bytes that remain.
+    fn sweep(&mut self) -> usize {
+        let mut live_bytes = 0usize;
+        let mut swept = 0u64;
+        for index in 0..self.pages.len() {
+            let Some(page) = self.pages[index].as_mut() else {
+                continue;
+            };
+            let finalize = self.descs[page.desc.0 as usize].finalize;
+            let mut head: i32 = -1;
+            let mut live = 0usize;
+            for i in 0..page.cells {
+                if bit(&page.marks, i) {
+                    live += 1;
+                    continue;
+                }
+                let cell = page.cell_ptr(i) as *mut u64;
+                if bit(&page.allocated, i) {
+                    swept += 1;
+                    if let Some(finalize) = finalize {
+                        finalize(cell as *mut u8);
+                    }
+                    set_bit(&mut page.allocated, i, false);
+                    #[cfg(debug_assertions)]
+                    for w in 1..page.cell_size / 8 {
+                        // SAFETY: the dead cell lies inside this page.
+                        unsafe { std::ptr::write(cell.add(w), POISON) };
+                    }
+                }
+                let link = if head < 0 { 0 } else { head as u64 + 1 };
+                // SAFETY: as above; word 0 of a free cell is its free-list link.
+                unsafe { std::ptr::write(cell, link) };
+                head = i as i32;
+            }
+            page.free_head = head;
+            page.live = live;
+            page.marks.fill(0);
+            page.waiters.fill(0);
+            let cell_size = page.cell_size;
+            if live == 0 {
+                self.release_page(index);
+            } else {
+                live_bytes += live * cell_size;
+            }
+        }
+        for class in self.classes.iter_mut().flatten() {
+            class.avail.clear();
+        }
+        for (index, page) in self.pages.iter().enumerate() {
+            let Some(page) = page else {
+                continue;
+            };
+            let class = &mut self.classes[page.desc.0 as usize][page.class];
+            if page.free_head >= 0 && class.current != Some(index as u32) {
+                class.avail.push(index as u32);
+            }
+        }
+        let descs = &self.descs;
+        self.larges.retain(|&start, large| {
+            if large.marked {
+                large.marked = false;
+                large.waiters = false;
+                live_bytes += large.size;
+                return true;
+            }
+            swept += 1;
+            if let Some(finalize) = descs[large.desc.0 as usize].finalize {
+                finalize(start as *mut u8);
+            }
+            #[cfg(debug_assertions)]
+            // SAFETY: the dead object spans `size` bytes from `start`.
+            unsafe {
+                std::ptr::write_bytes(start as *mut u8, 0xdd, large.size)
+            };
+            // SAFETY: allocated in alloc_large with this layout.
+            unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
+            false
+        });
+        self.large_span = match (self.larges.first_key_value(), self.larges.last_key_value()) {
+            (Some((&lo, _)), Some((&last, large))) => (lo, last + large.size),
+            _ => (usize::MAX, 0),
+        };
+        self.stats.cells_swept += swept;
+        live_bytes
+    }
+
+    fn release_page(&mut self, index: usize) {
+        let page = self.pages[index].take().expect("live page slot");
+        self.page_map.remove(&(page.base >> PAGE_SHIFT));
+        let class = &mut self.classes[page.desc.0 as usize][page.class];
+        if class.current == Some(index as u32) {
+            class.current = None;
+        }
+        self.free_page_slots.push(index as u32);
+        // SAFETY: allocated in new_page with this layout; no cell remains.
+        unsafe { dealloc(page.base as *mut u8, page_layout()) };
+    }
+
+    #[cfg(test)]
+    fn is_allocated_word(&self, word: u64) -> bool {
+        self.locate(word).is_some_and(|cell| match cell.loc {
+            Loc::Small { page, index } => self.pages[page as usize]
+                .as_ref()
+                .is_some_and(|p| bit(&p.allocated, index as usize)),
+            Loc::Large => true,
+        })
+    }
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.debug_assert_quiescent();
+        }
+        // I5 teardown: every remaining cell dies with its heap. Finalizers
+        // run in no particular order (see FinalizeFn).
+        for page in self.pages.iter().flatten() {
+            if let Some(finalize) = self.descs[page.desc.0 as usize].finalize {
+                for i in 0..page.cells {
+                    if bit(&page.allocated, i) {
+                        finalize(page.cell_ptr(i) as *mut u8);
+                    }
+                }
+            }
+            // SAFETY: allocated in new_page with this layout.
+            unsafe { dealloc(page.base as *mut u8, page_layout()) };
+        }
+        for (&start, large) in &self.larges {
+            if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
+                finalize(start as *mut u8);
+            }
+            // SAFETY: allocated in alloc_large with this layout.
+            unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
+        }
     }
 }
 
@@ -435,13 +1290,15 @@ impl Heap {
 pub(crate) struct Control {
     nogc_depth: Cell<u32>,
     pending_collect: Cell<bool>,
+    borrows: Cell<u32>,
+    collecting: Cell<bool>,
 }
 
 /// RAII no-GC region (I9). Collection requests inside are deferred.
 /// Holds only the shared control block, so `alloc(&mut Heap)` remains
 /// callable while the guard is alive.
 pub(crate) struct NoGcScope {
-    control: std::rc::Rc<Control>,
+    control: Rc<Control>,
 }
 
 impl Drop for NoGcScope {
@@ -452,326 +1309,337 @@ impl Drop for NoGcScope {
     }
 }
 
-/// Capture callee-saved registers into `buf` so the stack scan sees
-/// references the compiler kept in registers at the collection entry
-/// (Decision 0 spill protocol). Caller-saved registers need no capture:
-/// at the allocating call boundary they are dead or already spilled.
-#[cfg(target_arch = "aarch64")]
-fn spill_registers(buf: &mut [u64; 24]) {
-    unsafe {
-        std::arch::asm!(
-            "stp x19, x20, [x0]",
-            "stp x21, x22, [x0, #16]",
-            "stp x23, x24, [x0, #32]",
-            "stp x25, x26, [x0, #48]",
-            "stp x27, x28, [x0, #64]",
-            "stp x29, x30, [x0, #80]",
-            "stp d8, d9, [x0, #96]",
-            "stp d10, d11, [x0, #112]",
-            "stp d12, d13, [x0, #128]",
-            "stp d14, d15, [x0, #144]",
-            in("x0") buf.as_mut_ptr(),
-            options(nostack),
-        );
+/// An outstanding GcCell borrow (I9); see [`Heap::borrow_scope`].
+pub(crate) struct BorrowScope {
+    control: Rc<Control>,
+}
+
+impl Drop for BorrowScope {
+    fn drop(&mut self) {
+        self.control.borrows.set(self.control.borrows.get() - 1);
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn spill_registers(buf: &mut [u64; 24]) {
-    // No register capture on this target yet: stack scan only. The
-    // contract requires a per-target spill before this heap may become
-    // authoritative there (x64 is re-validated at S6 on zombie).
-    buf.fill(0);
-    std::hint::black_box(buf);
+/// Declares this thread's native stack, from the current frame up to a
+/// top, as holding heap references (Decision 0). Conservative collections
+/// on this thread scan it, plus segments entered through [`grow`]; without
+/// a declaration they defer. Nested declarations are no-ops.
+pub(crate) struct NativeStackScope {
+    registered: bool,
+    _thread: PhantomData<*const ()>,
 }
 
-impl Heap {
-    /// Run a full collection now. No-op (deferred) inside a no-GC region.
-    pub(crate) fn collect(&mut self) {
-        if self.control.nogc_depth.get() > 0 {
-            self.control.pending_collect.set(true);
-            self.stats.deferred_collections += 1;
-            return;
-        }
-        self.control.pending_collect.set(false);
-        self.stats.collections += 1;
-        let mut worklist: Vec<*const u8> = Vec::new();
-        self.mark_roots(&mut worklist);
-        self.drain(&mut worklist);
-        self.mark_ephemerons(&mut worklist);
-        self.clear_weak_slots();
-        #[cfg(debug_assertions)]
-        self.verify();
-        self.run_sweep_hooks();
-        self.sweep();
-        self.bytes_since_gc = 0;
-        self.allocs_since_gc = 0;
+/// # Safety
+/// `top` must lie in the current thread's stack mapping, at or above every
+/// frame that holds heap references across collections while the scope is
+/// alive, and the scope must be dropped on this thread outside any segment
+/// entered through [`grow`].
+pub(crate) unsafe fn enter_native_stack(top: *const u8) -> NativeStackScope {
+    NativeStackScope {
+        registered: native::enter(top as usize),
+        _thread: PhantomData,
     }
+}
 
-    fn mark_word(&mut self, word: u64, worklist: &mut Vec<*const u8>) {
-        if let Some(cell) = self.resolve(word) {
-            self.mark_cell(cell, worklist);
+impl Drop for NativeStackScope {
+    fn drop(&mut self) {
+        if self.registered {
+            native::exit();
         }
     }
+}
 
-    fn mark_roots(&mut self, worklist: &mut Vec<*const u8>) {
-        // Register snapshot first (Decision 0 spill protocol).
-        let mut regs = [0u64; 24];
+/// `stacker::grow` whose new segment is registered, with exact bounds, for
+/// conservative scanning on this thread (contract option (a)). From S2,
+/// every grow path that can allocate on this heap must use it; collections
+/// requested on an unregistered segment defer.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn grow<R, F: FnOnce() -> R>(stack_size: usize, f: F) -> R {
+    native::grow(stack_size, f)
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod native {
+    //! Conservative native-stack scanning: the Decision 0 contract, encoded.
+    //! - Only this thread's registered regions are scanned: the entry stack
+    //!   up to its declared top, plus stacker segments entered through
+    //!   `grow`. With SP outside the innermost region (an unregistered
+    //!   `stacker::grow` segment, a foreign stack) the heap defers instead
+    //!   of scanning blindly.
+    //! - A region below the innermost is scanned from the SP recorded when
+    //!   its successor was entered, after the same register spill as a
+    //!   collection: stacker's own frames below that SP are not scanned, and
+    //!   they may save and reuse callee-saved registers.
+    use std::cell::RefCell;
+
+    pub(super) const SPILL_WORDS: usize = 24;
+
+    #[derive(Clone, Copy)]
+    struct Region {
+        /// Lowest address SP can take in the region (membership test only).
+        lo: usize,
+        /// Exclusive scan bound: the region's top.
+        hi: usize,
+        /// SP in the previous region when this one was entered (0 for the
+        /// entry stack); the previous region is scanned from there.
+        resume_sp: usize,
+    }
+
+    thread_local! {
+        static REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(super) fn spill_registers(buf: &mut [u64; SPILL_WORDS]) {
+        // SAFETY: stores x19–x30 and d8–d15 into the first 20 words of `buf`.
+        unsafe {
+            std::arch::asm!(
+                "stp x19, x20, [{buf}]",
+                "stp x21, x22, [{buf}, #16]",
+                "stp x23, x24, [{buf}, #32]",
+                "stp x25, x26, [{buf}, #48]",
+                "stp x27, x28, [{buf}, #64]",
+                "stp x29, x30, [{buf}, #80]",
+                "stp d8, d9, [{buf}, #96]",
+                "stp d10, d11, [{buf}, #112]",
+                "stp d12, d13, [{buf}, #128]",
+                "stp d14, d15, [{buf}, #144]",
+                buf = in(reg) buf.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// System V callee-saved registers. Not compiled or run on the aarch64
+    /// development host (its LLVM has no x86 backend): validate on x64
+    /// before this heap is authoritative there (S6).
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(super) fn spill_registers(buf: &mut [u64; SPILL_WORDS]) {
+        // SAFETY: stores rbx, rbp, r12–r15 into the first 6 words of `buf`.
+        unsafe {
+            std::arch::asm!(
+                "mov [{buf}], rbx",
+                "mov [{buf} + 8], rbp",
+                "mov [{buf} + 16], r12",
+                "mov [{buf} + 24], r13",
+                "mov [{buf} + 32], r14",
+                "mov [{buf} + 40], r15",
+                buf = in(reg) buf.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    pub(super) fn current_sp() -> usize {
+        let sp: usize;
+        // SAFETY: reads SP only.
+        unsafe {
+            std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+        };
+        sp
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    pub(super) fn current_sp() -> usize {
+        let sp: usize;
+        // SAFETY: reads RSP only.
+        unsafe {
+            std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags))
+        };
+        sp
+    }
+
+    fn page_size() -> usize {
+        static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PAGE.get_or_init(|| {
+            unsafe extern "C" {
+                fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+            }
+            #[cfg(target_os = "linux")]
+            const SC_PAGESIZE: std::ffi::c_int = 30;
+            #[cfg(target_os = "macos")]
+            const SC_PAGESIZE: std::ffi::c_int = 29;
+            // SAFETY: sysconf has no preconditions.
+            let size = unsafe { sysconf(SC_PAGESIZE) };
+            usize::try_from(size)
+                .ok()
+                .filter(|size| size.is_power_of_two())
+                .expect("sysconf(_SC_PAGESIZE)")
+        })
+    }
+
+    pub(super) fn scannable(sp: usize) -> bool {
+        REGIONS.with(|regions| {
+            regions
+                .borrow()
+                .last()
+                .is_some_and(|region| (region.lo..region.hi).contains(&sp))
+        })
+    }
+
+    /// Ranges to scan for a collection whose deepest frame has stack
+    /// pointer `sp`, innermost first; `None` when `sp` is outside the
+    /// innermost registered region.
+    pub(super) fn scan_ranges(sp: usize) -> Option<Vec<(usize, usize)>> {
+        REGIONS.with(|regions| {
+            let regions = regions.borrow();
+            let current = regions
+                .last()
+                .filter(|region| (region.lo..region.hi).contains(&sp))?;
+            let mut ranges = vec![(sp, current.hi)];
+            for pair in regions.windows(2).rev() {
+                ranges.push((pair[1].resume_sp, pair[0].hi));
+            }
+            Some(ranges)
+        })
+    }
+
+    /// Register the entry stack; `false` (a no-op) when already registered.
+    pub(super) fn enter(top: usize) -> bool {
+        REGIONS.with(|regions| {
+            let mut regions = regions.borrow_mut();
+            if !regions.is_empty() {
+                return false;
+            }
+            let sp = current_sp();
+            debug_assert!(sp < top, "native stack top below the current frame");
+            // stacker knows this thread's stack limit. Without it no SP can be
+            // shown to lie on this stack, so conservative collection defers.
+            let lo = stacker::remaining_stack()
+                .map_or(usize::MAX, |remaining| sp.saturating_sub(remaining));
+            regions.push(Region {
+                lo,
+                hi: top,
+                resume_sp: 0,
+            });
+            true
+        })
+    }
+
+    pub(super) fn exit() {
+        REGIONS.with(|regions| {
+            let mut regions = regions.borrow_mut();
+            debug_assert_eq!(
+                regions.len(),
+                1,
+                "native stack scope dropped inside a grown segment"
+            );
+            regions.pop();
+        });
+    }
+
+    struct SegmentScope;
+
+    impl Drop for SegmentScope {
+        fn drop(&mut self) {
+            REGIONS.with(|regions| regions.borrow_mut().pop());
+        }
+    }
+
+    #[inline(never)]
+    pub(super) fn grow<R, F: FnOnce() -> R>(stack_size: usize, f: F) -> R {
+        if REGIONS.with(|regions| regions.borrow().is_empty()) {
+            // Nothing on this thread is scanned: a plain segment is equivalent.
+            return stacker::grow(stack_size, f);
+        }
+        let mut regs = [0u64; SPILL_WORDS];
         spill_registers(&mut regs);
-        // Registered tagged root ranges.
-        let ranges = self.root_ranges.clone();
-        for (_, lo, hi) in &ranges {
-            let mut p = *lo;
-            while p < *hi {
-                let word = unsafe { std::ptr::read(p) };
-                self.mark_word(word, worklist);
-                p = unsafe { p.add(1) };
-            }
-        }
-        // Traced container roots. The callbacks borrow disjoint root
-        // storage; collect their edges via a temporary buffer to avoid
-        // holding &mut self across the callback.
-        let mut edges: Vec<*const u8> = Vec::new();
-        let mut roots = std::mem::take(&mut self.trace_roots);
-        for (_, f) in &mut roots {
-            f(&mut |cell| edges.push(cell));
-        }
-        self.trace_roots = roots;
-        for cell in edges {
-            if let Some(start) = self.resolve(cell as u64) {
-                self.mark_cell(start, worklist);
-            }
-        }
-        // Conservative stack scan: [current SP approx, stack_top) plus
-        // registered extra ranges (grown segments with exact bounds).
-        let top = self.stack_top.get();
-        if top != 0 {
-            let marker = 0u64;
-            let bottom = &marker as *const u64 as usize;
-            self.scan_range(bottom, top, worklist);
-            let extra = self.extra_stack_ranges.clone();
-            for (lo, hi) in extra {
-                self.scan_range(lo, hi, worklist);
-            }
-        }
-        for word in regs {
-            self.mark_word(word, worklist);
-        }
+        let resume_sp = current_sp();
+        let out = stacker::grow(stack_size, move || {
+            let region = segment_region(stack_size, resume_sp);
+            REGIONS.with(|regions| regions.borrow_mut().push(region));
+            let _scope = SegmentScope;
+            f()
+        });
         std::hint::black_box(&regs);
+        out
     }
 
-    fn scan_range(&mut self, lo: usize, hi: usize, worklist: &mut Vec<*const u8>) {
-        let mut p = lo as *const u64;
-        let end = hi as *const u64;
-        while p < end {
-            let word = unsafe { std::ptr::read(p) };
-            self.mark_word(word, worklist);
-            p = unsafe { p.add(1) };
-        }
-    }
-
-    fn drain(&mut self, worklist: &mut Vec<*const u8>) {
-        let mut edges: Vec<*const u8> = Vec::new();
-        while let Some(cell) = worklist.pop() {
-            let Some(desc) = self.desc_of(cell) else {
-                continue;
-            };
-            edges.clear();
-            (self.descs[desc.0 as usize].trace)(cell, &mut |edge| edges.push(edge));
-            for i in 0..edges.len() {
-                let edge = edges[i];
-                if let Some(start) = self.resolve(edge as u64) {
-                    self.mark_cell(start, worklist);
+    /// Bounds of the stacker segment we are running on. stacker sets its
+    /// limit to the page-aligned segment base before switching, and the
+    /// usable area is max(1, ceil(size / page)) pages (stacker 0.1.25; the
+    /// bounds-precision test checks this against the mapping). A mismatch
+    /// yields an empty region: collections inside then defer.
+    fn segment_region(stack_size: usize, resume_sp: usize) -> Region {
+        let sp = current_sp();
+        let page = page_size();
+        let region = stacker::remaining_stack().map(|remaining| {
+            // remaining_stack measured SP a few frames below ours.
+            let lo = (sp.wrapping_sub(remaining) + page / 2) & !(page - 1);
+            Region {
+                lo,
+                hi: lo + stack_size.div_ceil(page).max(1) * page,
+                resume_sp,
+            }
+        });
+        match region {
+            Some(region) if (region.lo..region.hi).contains(&sp) => region,
+            _ => {
+                if cfg!(debug_assertions) {
+                    panic!("could not derive stacker segment bounds");
                 }
-            }
-        }
-    }
-
-    fn mark_ephemerons(&mut self, worklist: &mut Vec<*const u8>) {
-        // Fixed point: a value becomes live only if its key is live for
-        // reasons other than this ephemeron itself.
-        loop {
-            let mut progress = false;
-            for i in 0..self.ephemerons.len() {
-                let (key, value) = self.ephemerons[i];
-                let key_cell = self.resolve(key as u64);
-                let value_cell = self.resolve(value as u64);
-                if let (Some(k), Some(v)) = (key_cell, value_cell) {
-                    if self.is_marked(k) && !self.is_marked(v) {
-                        self.mark_cell(v, worklist);
-                        progress = true;
-                    }
-                }
-            }
-            if !progress {
-                break;
-            }
-            self.drain(worklist);
-        }
-    }
-
-    fn clear_weak_slots(&mut self) {
-        for i in 0..self.weak_slots.len() {
-            let slot = self.weak_slots[i];
-            let word = unsafe { std::ptr::read(slot) };
-            if word != 0 {
-                let live = self.resolve(word).is_some_and(|cell| self.is_marked(cell));
-                if !live {
-                    unsafe { std::ptr::write(slot, 0) };
+                Region {
+                    lo: usize::MAX,
+                    hi: 0,
+                    resume_sp,
                 }
             }
         }
     }
 
-    /// Structural check: every edge from every marked cell resolves to
-    /// a marked cell. Cannot detect descriptor *omissions* (that proof
-    /// is the registry audit vs the S0 inventory — Decision 2).
-    pub(crate) fn verify(&self) {
-        let mut edges: Vec<*const u8> = Vec::new();
-        let check = |heap: &Heap, from: *const u8, desc: DescId, edges: &mut Vec<*const u8>| {
-            edges.clear();
-            (heap.descs[desc.0 as usize].trace)(from, &mut |e| edges.push(e));
-            for &edge in edges.iter() {
-                if edge.is_null() {
-                    continue;
-                }
-                match heap.resolve(edge as u64) {
-                    Some(cell) => assert!(
-                        heap.is_marked(cell),
-                        "heap verifier: marked cell {from:p} ({}) references unmarked {cell:p}",
-                        heap.descs[desc.0 as usize].name
-                    ),
-                    None => panic!(
-                        "heap verifier: marked cell {from:p} ({}) references non-heap {edge:p}",
-                        heap.descs[desc.0 as usize].name
-                    ),
-                }
-            }
-        };
-        for page in &self.pages {
-            for i in 0..page.cells {
-                if page.marked(i) {
-                    check(self, page.cell_ptr(i) as *const u8, page.desc, &mut edges);
-                }
-            }
-        }
-        for large in &self.larges {
-            if large.marked {
-                check(self, large.ptr as *const u8, large.desc, &mut edges);
-            }
-        }
+    #[cfg(test)]
+    pub(super) fn innermost_region() -> Option<(usize, usize)> {
+        REGIONS.with(|regions| regions.borrow().last().map(|r| (r.lo, r.hi)))
+    }
+}
+
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+mod native {
+    //! No conservative scanner for this target (wasm32 cannot scan its
+    //! stack): `Heap::collect` always defers, and collections run only at
+    //! precise safepoints (`Heap::collect_at_safepoint`), per the S0 wasm32
+    //! decision.
+    pub(super) const SPILL_WORDS: usize = 1;
+
+    pub(super) fn spill_registers(_: &mut [u64; SPILL_WORDS]) {}
+
+    pub(super) fn current_sp() -> usize {
+        0
     }
 
-    fn run_sweep_hooks(&mut self) {
-        if self.sweep_hooks.is_empty() {
-            return;
-        }
-        // Hooks receive a liveness predicate over resolved cells.
-        let live_set: std::collections::HashSet<usize> = {
-            let mut set = std::collections::HashSet::new();
-            for page in &self.pages {
-                for i in 0..page.cells {
-                    if page.marked(i) {
-                        set.insert(page.cell_ptr(i) as usize);
-                    }
-                }
-            }
-            for large in &self.larges {
-                if large.marked {
-                    set.insert(large.ptr as usize);
-                }
-            }
-            set
-        };
-        let mut hooks = std::mem::take(&mut self.sweep_hooks);
-        for (_, hook) in &mut hooks {
-            hook(&|cell| live_set.contains(&(cell as usize)));
-        }
-        self.sweep_hooks = hooks;
+    pub(super) fn scannable(_: usize) -> bool {
+        false
     }
 
-    fn sweep(&mut self) {
-        let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
-        let mut release: Vec<usize> = Vec::new();
-        let mut swept: u64 = 0;
-        for (idx, page) in self.pages.iter_mut().enumerate() {
-            let finalize = self.descs[page.desc.0 as usize].finalize;
-            let mut head: i32 = -1;
-            let mut live = 0usize;
-            for i in 0..page.cells {
-                if page.marked(i) {
-                    live += 1;
-                }
-            }
-            // Dead allocated cells get finalized, poisoned (debug),
-            // and threaded onto the rebuilt free list.
-            for i in 0..page.cells {
-                if !page.marked(i) {
-                    if page.is_allocated(i) {
-                        swept += 1;
-                        if let Some(fin) = finalize {
-                            fin(page.cell_ptr(i));
-                        }
-                    }
-                    #[cfg(debug_assertions)]
-                    unsafe {
-                        let words = page.cell_ptr(i) as *mut u64;
-                        for w in 1..page.cell_size / 8 {
-                            std::ptr::write(words.add(w), POISON);
-                        }
-                    }
-                    page.set_allocated(i, false);
-                    let p = page.cell_ptr(i) as *mut u64;
-                    unsafe {
-                        std::ptr::write(p, if head < 0 { 0 } else { (head + 1) as u64 });
-                    }
-                    head = i as i32;
-                }
-            }
-            page.free_head = head;
-            page.live = live;
-            page.marks.iter_mut().for_each(|m| *m = 0);
-            if live == 0 {
-                release.push(idx);
-            }
-        }
-        // Release fully-empty pages (keep at most one spare per class
-        // would be a tuning choice; S1 returns all to the OS allocator).
-        release.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in release {
-            let page = self.pages.remove(idx);
-            self.page_map.remove(&page.base);
-            self.current.retain(|_, v| *v != idx);
-            for v in self.current.values_mut() {
-                if *v > idx {
-                    *v -= 1;
-                }
-            }
-            // Rebuild map indices after removal shifts.
-            for (i, p) in self.pages.iter().enumerate() {
-                self.page_map.insert(p.base, i);
-            }
-            unsafe { dealloc(page.base as *mut u8, layout) };
-        }
-        self.stats.cells_swept += swept;
-        // Large objects.
-        let mut i = 0;
-        while i < self.larges.len() {
-            if self.larges[i].marked {
-                self.larges[i].marked = false;
-                i += 1;
-            } else {
-                let large = self.larges.remove(i);
-                self.stats.cells_swept += 1;
-                if let Some(fin) = self.descs[large.desc.0 as usize].finalize {
-                    fin(large.ptr);
-                }
-                let layout = Layout::from_size_align(large.size, 16).unwrap();
-                unsafe { dealloc(large.ptr, layout) };
-            }
-        }
-        // Dead ephemerons/weak slots stay registered; their words were
-        // cleared or resolve to None in later cycles.
+    pub(super) fn scan_ranges(_: usize) -> Option<Vec<(usize, usize)>> {
+        None
+    }
+
+    pub(super) fn enter(_: usize) -> bool {
+        false
+    }
+
+    pub(super) fn exit() {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn grow<R, F: FnOnce() -> R>(stack_size: usize, f: F) -> R {
+        stacker::grow(stack_size, f)
+    }
+
+    #[cfg(test)]
+    pub(super) fn innermost_region() -> Option<(usize, usize)> {
+        None
     }
 }
 
@@ -779,8 +1647,13 @@ impl Heap {
 mod tests {
     use super::*;
     use std::hint::black_box;
+    use std::time::Instant;
 
     const TAG: u64 = 0xfff9_0000_0000_0000;
+
+    fn tagged(p: *const u8) -> u64 {
+        TAG | (p as u64 & PAYLOAD_MASK)
+    }
 
     fn trace_node(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
         let next = unsafe { std::ptr::read(cell as *const u64) };
@@ -788,10 +1661,26 @@ mod tests {
             visit((next & PAYLOAD_MASK) as *const u8);
         }
     }
-    fn trace_leaf(_: *const u8, _: &mut dyn FnMut(*const u8)) {}
-    thread_local! {
-        static FIN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    fn trace_none(_: *const u8, _: &mut dyn FnMut(*const u8)) {}
+
+    /// WeakRef-like cell: word 0 is a weak target slot.
+    fn weak_target(cell: *mut u8, sink: &mut WeakSink<'_>) {
+        sink.weak_slot(cell as *mut u64);
     }
+
+    /// WeakMap-like cell: four (key, value) ephemeron entries.
+    fn weak_entries(cell: *mut u8, sink: &mut WeakSink<'_>) {
+        let words = cell as *mut u64;
+        for entry in 0..4 {
+            unsafe { sink.ephemeron(words.add(2 * entry), words.add(2 * entry + 1)) };
+        }
+    }
+
+    thread_local! {
+        static FIN_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
     fn fin_count(_: *mut u8) {
         FIN_COUNT.with(|c| c.set(c.get() + 1));
     }
@@ -800,6 +1689,9 @@ mod tests {
         heap: Heap,
         node: DescId,
         leaf: DescId,
+        weakref: DescId,
+        table: DescId,
+        _roots: RootRange,
         roots: Box<[u64; 64]>,
     }
 
@@ -809,24 +1701,43 @@ mod tests {
             let node = heap.register_desc(LayoutDesc {
                 name: "node",
                 trace: trace_node,
+                weak: None,
                 finalize: None,
             });
             let leaf = heap.register_desc(LayoutDesc {
                 name: "leaf",
-                trace: trace_leaf,
+                trace: trace_none,
+                weak: None,
                 finalize: Some(fin_count),
             });
-            let roots = Box::new([0u64; 64]);
-            heap.register_root_range("test-roots", roots.as_ptr(), unsafe {
-                roots.as_ptr().add(64)
+            let weakref = heap.register_desc(LayoutDesc {
+                name: "weakref",
+                trace: trace_none,
+                weak: Some(weak_target),
+                finalize: None,
             });
+            let table = heap.register_desc(LayoutDesc {
+                name: "table",
+                trace: trace_none,
+                weak: Some(weak_entries),
+                finalize: None,
+            });
+            let roots = Box::new([0u64; 64]);
+            // SAFETY: `roots` is declared after `_roots`, so it outlives it.
+            let _roots = unsafe {
+                heap.add_root_range("test-roots", roots.as_ptr(), roots.as_ptr().add(64))
+            };
             Self {
                 heap,
                 node,
                 leaf,
+                weakref,
+                table,
+                _roots,
                 roots,
             }
         }
+
         fn alloc_node(&mut self, next: u64, val: u64) -> *mut u8 {
             let p = self.heap.alloc(self.node, 16);
             unsafe {
@@ -835,41 +1746,70 @@ mod tests {
             }
             p
         }
+
+        /// Chain of `n` nodes, head rooted in `roots[0]`.
+        fn build_chain(&mut self, n: u64) -> *mut u8 {
+            let mut head: *mut u8 = std::ptr::null_mut();
+            for i in 0..n {
+                let next = if head.is_null() { 0 } else { tagged(head) };
+                head = self.alloc_node(next, i);
+                self.roots[0] = tagged(head);
+            }
+            head
+        }
+
         fn val(&self, p: *const u8) -> u64 {
-            unsafe { std::ptr::read((p as *const u64).add(1)) }
+            word(p, 1)
         }
-        fn root(&mut self, slot: usize, p: *const u8) {
-            self.roots[slot] = TAG | (p as u64 & PAYLOAD_MASK);
+
+        /// Precise collection: native frames are not roots, so death
+        /// assertions do not depend on what registers happen to retain.
+        fn collect(&mut self) {
+            assert!(self.heap.collect_at_safepoint());
         }
-        /// Collect on a fresh thread: death assertions are meaningless
-        /// while this frame's registers/stack still hold the pointers
-        /// (conservative retention is correct behavior there).
-        fn collect_clean(&mut self) {
-            // SAFETY (test only): one thread at a time; joined before reuse.
-            let addr = &mut self.heap as *mut Heap as usize;
-            std::thread::spawn(move || {
-                let heap = unsafe { &mut *(addr as *mut Heap) };
-                heap.collect();
-            })
-            .join()
-            .expect("collector thread");
+
+        fn live(&self) -> usize {
+            self.heap.stats().live_cells
         }
+    }
+
+    fn word(p: *const u8, index: usize) -> u64 {
+        unsafe { std::ptr::read((p as *const u64).add(index)) }
+    }
+
+    fn set_word(p: *mut u8, index: usize, value: u64) {
+        unsafe { std::ptr::write((p as *mut u64).add(index), value) };
+    }
+
+    /// A stack top above the calling test's frame.
+    fn stack_top(marker: &u64) -> *const u8 {
+        (marker as *const u64).wrapping_add(256) as *const u8
+    }
+
+    /// Allocate where the caller never holds the plain pointer.
+    #[inline(never)]
+    fn alloc_hidden(heap: &mut Heap, desc: DescId, size: usize) -> u64 {
+        !(heap.alloc(desc, size) as u64)
+    }
+
+    /// Store a hidden pointer, unhidden, into a stack slot of the caller.
+    #[inline(never)]
+    fn stash(slot: &mut [u64; 2], hidden: u64) {
+        unsafe { std::ptr::write_volatile(&mut slot[0], !hidden) };
     }
 
     #[test]
     fn unreachable_cells_are_swept_and_chains_survive() {
         let mut fx = Fixture::new();
         let c = fx.alloc_node(0, 3);
-        let b = fx.alloc_node(TAG | (c as u64 & PAYLOAD_MASK), 2);
-        let a = fx.alloc_node(TAG | (b as u64 & PAYLOAD_MASK), 1);
+        let b = fx.alloc_node(tagged(c), 2);
+        let a = fx.alloc_node(tagged(b), 1);
         let _garbage = fx.alloc_node(0, 99);
-        fx.root(0, a as *const u8);
-        fx.heap.collect();
-        assert_eq!(fx.heap.stats().live_cells, 3);
-        assert_eq!(fx.val(a as *const u8), 1);
-        assert_eq!(fx.val(b as *const u8), 2);
-        assert_eq!(fx.val(c as *const u8), 3);
-        assert!(fx.heap.stats().cells_swept >= 1);
+        fx.roots[0] = tagged(a);
+        fx.collect();
+        assert_eq!(fx.live(), 3);
+        assert_eq!((fx.val(a), fx.val(b), fx.val(c)), (1, 2, 3));
+        assert_eq!(fx.heap.stats().cells_swept, 1);
     }
 
     #[test]
@@ -878,54 +1818,196 @@ mod tests {
         let a = fx.alloc_node(0, 7);
         // Root holds a tagged interior pointer (second word of the cell).
         fx.roots[0] = TAG | ((a as u64 + 8) & PAYLOAD_MASK);
-        fx.heap.collect();
-        assert_eq!(fx.heap.stats().live_cells, 1);
-        assert_eq!(fx.val(a as *const u8), 7);
+        fx.collect();
+        assert_eq!(fx.live(), 1);
+        assert_eq!(fx.val(a), 7);
     }
 
     #[test]
-    fn ephemeron_value_lives_only_with_key() {
+    fn in_cell_ephemerons_reach_a_fixed_point_and_clear_dead_entries() {
         let mut fx = Fixture::new();
-        let key = fx.alloc_node(0, 1);
-        let val = fx.alloc_node(0, 2);
-        let key2 = fx.alloc_node(0, 3);
-        let val2 = fx.alloc_node(0, 4);
-        fx.heap.add_ephemeron(key as *const u8, val as *const u8);
-        // Chain: val is itself the key for val2 (fixed point required).
-        fx.heap.add_ephemeron(val as *const u8, val2 as *const u8);
-        let val3 = fx.alloc_node(0, 5);
-        fx.heap.add_ephemeron(key2 as *const u8, val3 as *const u8);
-        fx.root(0, key as *const u8);
-        fx.collect_clean();
-        // key, val, val2 survive; key2 and its value do not.
-        assert_eq!(fx.heap.stats().live_cells, 3);
-        assert_eq!(fx.val(val2 as *const u8), 4);
+        let table = fx.heap.alloc(fx.table, 64);
+        let [k1, v1, v2, k3, v3] = [0; 5].map(|_| fx.heap.alloc(fx.leaf, 16));
+        // (k1 -> v1), (v1 -> v2): v1 is itself a key, so marking v2 needs
+        // the fixed point. (k3 -> v3) dies with k3.
+        for (entry, (key, value)) in [(k1, v1), (v1, v2), (k3, v3)].into_iter().enumerate() {
+            set_word(table, 2 * entry, tagged(key));
+            set_word(table, 2 * entry + 1, tagged(value));
+        }
+        fx.roots[0] = tagged(table);
+        fx.roots[1] = tagged(k1);
+        fx.collect();
+        assert_eq!(fx.live(), 4, "table, k1, v1, v2");
+        assert_eq!(word(table, 3), tagged(v2));
+        assert_eq!(
+            (word(table, 4), word(table, 5)),
+            (0, 0),
+            "dead-key entry cleared"
+        );
     }
 
     #[test]
-    fn weak_slots_clear_on_death_and_keep_on_life() {
+    fn unreachable_table_keeps_no_values_alive() {
         let mut fx = Fixture::new();
-        let live = fx.alloc_node(0, 1);
-        let dead = fx.alloc_node(0, 2);
-        fx.roots[0] = live as u64;
-        fx.roots[1] = dead as u64;
-        fx.heap.add_weak_slot(&mut fx.roots[0] as *mut u64);
-        fx.heap.add_weak_slot(&mut fx.roots[1] as *mut u64);
-        // roots[0] also a strong root via the range; make live reachable
-        // only strongly, dead only weakly: move dead out of the range.
-        let mut weak_dead = dead as u64;
-        fx.heap.add_weak_slot(&mut weak_dead as *mut u64);
+        let table = fx.heap.alloc(fx.table, 64);
+        let key = fx.heap.alloc(fx.leaf, 16);
+        let value = fx.heap.alloc(fx.leaf, 16);
+        set_word(table, 0, tagged(key));
+        set_word(table, 1, tagged(value));
+        fx.roots[0] = tagged(key);
+        fx.collect();
+        assert_eq!(fx.live(), 1, "only the rooted key survives a dead table");
+    }
+
+    #[test]
+    fn weak_slots_clear_dead_targets_and_keep_the_rest() {
+        let mut fx = Fixture::new();
+        let [dead_ref, live_ref, number_ref] = [0; 3].map(|_| fx.heap.alloc(fx.weakref, 16));
+        let dead = fx.heap.alloc(fx.leaf, 16);
+        let live = fx.heap.alloc(fx.leaf, 16);
+        let number = std::f64::consts::PI.to_bits();
+        set_word(dead_ref, 0, tagged(dead));
+        set_word(live_ref, 0, tagged(live));
+        set_word(number_ref, 0, number);
+        for (slot, cell) in [dead_ref, live_ref, number_ref, live]
+            .into_iter()
+            .enumerate()
+        {
+            fx.roots[slot] = tagged(cell);
+        }
+        fx.collect();
+        assert_eq!(word(dead_ref, 0), 0, "dead target cleared");
+        assert_eq!(word(live_ref, 0), tagged(live), "live target kept");
+        assert_eq!(word(number_ref, 0), number, "non-reference word untouched");
+    }
+
+    /// Fill the 4 KiB class (16 cells per page) until `target` is handed
+    /// out again; returns it rooted in `roots[slot]`.
+    fn reuse_cell(fx: &mut Fixture, desc: DescId, target: u64, slot: usize) -> *mut u8 {
+        for _ in 0..64 {
+            let p = fx.heap.alloc(desc, 4096);
+            if p as u64 == target {
+                fx.roots[slot] = tagged(p);
+                return p;
+            }
+        }
+        panic!("cell was not reused");
+    }
+
+    #[test]
+    fn reused_cells_are_unaffected_by_dead_weak_holders() {
+        // Formerly weak slots and ephemerons were registered globally and
+        // outlived their holders: a reused weak-holder cell had an ordinary
+        // word zeroed, and a reused key cell next to a free value cell made
+        // the ephemeron loop spin forever.
+        let mut fx = Fixture::new();
+        // Anchors keep both pages alive, so freed cells are reused in place.
+        let anchor = fx.heap.alloc(fx.leaf, 4096);
+        let anchor_ref = fx.heap.alloc(fx.weakref, 4096);
+        fx.roots[0] = tagged(anchor);
+        fx.roots[3] = tagged(anchor_ref);
+        let table = fx.heap.alloc(fx.table, 4096);
+        let value = fx.heap.alloc(fx.leaf, 4096);
+        let key = fx.heap.alloc(fx.leaf, 4096);
+        set_word(table, 0, tagged(key));
+        set_word(table, 1, tagged(value));
+        let holder = fx.heap.alloc(fx.weakref, 4096);
+        set_word(holder, 0, tagged(key));
+        let (key, holder) = (key as u64, holder as u64);
+        fx.collect();
+        assert_eq!(fx.live(), 2, "only the anchors survive");
+        let (leaf, weakref) = (fx.leaf, fx.weakref);
+        let new_key = reuse_cell(&mut fx, leaf, key, 1);
+        let new_holder = reuse_cell(&mut fx, weakref, holder, 2);
+        let number = std::f64::consts::PI.to_bits();
+        set_word(new_holder, 0, number);
+        fx.collect();
+        assert!(fx.heap.is_allocated_word(new_key as u64));
+        assert_eq!(word(new_holder, 0), number);
+    }
+
+    #[test]
+    fn edge_sources_trace_side_tables_through_their_owners() {
+        let mut fx = Fixture::new();
+        // Map-like side table: (owner, value), pruned by its sweep hook.
+        let table: Rc<RefCell<Vec<(usize, u64)>>> = Rc::default();
+        let entries = Rc::clone(&table);
+        let _source = fx.heap.add_edge_source("map-data", move |sink| {
+            for &(owner, value) in entries.borrow().iter() {
+                sink.edge(owner as *const u8, value);
+            }
+        });
+        let entries = Rc::clone(&table);
+        let _hook = fx.heap.add_sweep_hook("map-data", move |is_live| {
+            entries
+                .borrow_mut()
+                .retain(|&(owner, _)| is_live(owner as *const u8));
+        });
+        let owner = fx.alloc_node(0, 1);
+        // The value points back at its owner: a cycle through the table.
+        let value = fx.alloc_node(tagged(owner), 2);
+        table.borrow_mut().push((owner as usize, tagged(value)));
+        fx.roots[0] = tagged(owner);
+        fx.collect();
+        assert_eq!(fx.live(), 2);
+        fx.roots[0] = 0;
+        fx.collect();
+        assert_eq!(fx.live(), 0, "a cycle through a side table is collected");
+        assert!(table.borrow().is_empty());
+    }
+
+    #[test]
+    fn source_ephemerons_need_both_owner_and_key() {
+        let mut fx = Fixture::new();
+        let table: Rc<RefCell<Vec<(usize, u64, u64)>>> = Rc::default();
+        let entries = Rc::clone(&table);
+        let _source = fx.heap.add_edge_source("weak-collection", move |sink| {
+            for &(owner, key, value) in entries.borrow().iter() {
+                sink.ephemeron(owner as *const u8, key, value);
+            }
+        });
+        let [map, key, value, dead_map, key2, value2] = [0; 6].map(|_| fx.heap.alloc(fx.leaf, 16));
+        table.borrow_mut().extend([
+            (map as usize, tagged(key), tagged(value)),
+            (dead_map as usize, tagged(key2), tagged(value2)),
+        ]);
+        for (slot, cell) in [map, key, key2].into_iter().enumerate() {
+            fx.roots[slot] = tagged(cell);
+        }
+        fx.collect();
+        assert!(fx.heap.is_allocated_word(value as u64), "live map and key");
+        assert!(!fx.heap.is_allocated_word(value2 as u64), "dead map");
         fx.roots[1] = 0;
-        fx.collect_clean();
-        assert_ne!(fx.roots[0], 0, "live weak slot must keep its word");
-        let cleared = unsafe { std::ptr::read_volatile(&weak_dead) };
-        assert_eq!(cleared, 0, "dead weak slot must be cleared");
-        black_box(&fx.roots);
+        table.borrow_mut().truncate(1);
+        fx.collect();
+        assert!(!fx.heap.is_allocated_word(value as u64), "dead key");
+    }
+
+    /// A side table still holding a freed cell (a source bug) must not hang
+    /// marking, as the old ephemeron loop did; debug verification reports it.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "conditional edge references unmarked")
+    )]
+    fn source_value_in_a_free_cell_terminates() {
+        let mut fx = Fixture::new();
+        let anchor = fx.heap.alloc(fx.leaf, 16);
+        let freed = fx.heap.alloc(fx.leaf, 16) as u64;
+        fx.roots[0] = tagged(anchor);
+        fx.collect();
+        let _source = fx.heap.add_edge_source("stale", move |sink| {
+            sink.ephemeron(std::ptr::null(), tagged(anchor), freed);
+        });
+        fx.collect();
+        assert_eq!(fx.live(), 1);
     }
 
     #[test]
     fn nogc_region_defers_collection() {
         let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
         fx.heap.set_stress_every(1);
         let before = fx.heap.stats().collections;
         {
@@ -935,10 +2017,12 @@ mod tests {
                 black_box((p, i));
             }
             assert_eq!(fx.heap.stats().collections, before);
-            assert!(fx.heap.stats().deferred_collections > 0);
+            assert_eq!(fx.heap.stats().deferred_collections, 1);
+            assert!(fx.heap.collection_pending());
         }
         let _p = fx.heap.alloc(fx.leaf, 16);
         assert!(fx.heap.stats().collections > before, "deferred GC must run");
+        black_box(&top);
     }
 
     #[test]
@@ -947,7 +2031,7 @@ mod tests {
         let mut fx = Fixture::new();
         let _a = fx.heap.alloc(fx.leaf, 16);
         let _b = fx.heap.alloc(fx.leaf, 16);
-        fx.heap.collect();
+        fx.collect();
         assert_eq!(FIN_COUNT.with(|c| c.get()), 2);
     }
 
@@ -955,35 +2039,41 @@ mod tests {
     fn large_objects_allocate_and_collect() {
         let mut fx = Fixture::new();
         let big = fx.heap.alloc(fx.leaf, 8192);
-        unsafe { std::ptr::write(big as *mut u64, 42) };
-        fx.root(0, big as *const u8);
-        fx.heap.collect();
-        assert_eq!(unsafe { std::ptr::read(big as *const u64) }, 42);
+        set_word(big, 0, 42);
+        fx.roots[0] = tagged(big);
+        fx.collect();
+        assert_eq!(word(big, 0), 42);
         fx.roots[0] = 0;
-        fx.heap.collect();
-        assert_eq!(fx.heap.stats().live_cells, 0);
+        fx.collect();
+        assert_eq!(fx.live(), 0);
+    }
+
+    #[test]
+    fn large_objects_resolve_interior_but_not_past_the_end() {
+        let mut fx = Fixture::new();
+        let big = fx.heap.alloc(fx.leaf, 64 * 1024);
+        let other = fx.heap.alloc(fx.leaf, 8192);
+        fx.roots[0] = big as u64 + 40_000;
+        fx.roots[1] = other as u64 + 8192;
+        fx.collect();
+        assert!(fx.heap.is_allocated_word(big as u64));
+        assert!(!fx.heap.is_allocated_word(other as u64));
     }
 
     #[test]
     fn sweep_hook_sees_liveness_for_side_tables() {
-        use std::cell::RefCell;
-        use std::collections::HashMap;
-        use std::rc::Rc;
         let mut fx = Fixture::new();
         let live = fx.alloc_node(0, 1);
         let dead = fx.alloc_node(0, 2);
-        let table: Rc<RefCell<HashMap<usize, u64>>> = Rc::new(RefCell::new(HashMap::new()));
+        let table: Rc<RefCell<FastMap<usize, u64>>> = Rc::default();
         table.borrow_mut().insert(live as usize, 10);
         table.borrow_mut().insert(dead as usize, 20);
-        let t = table.clone();
-        fx.heap.register_sweep_hook(
-            "test-table",
-            Box::new(move |is_live| {
-                t.borrow_mut().retain(|addr, _| is_live(*addr as *const u8));
-            }),
-        );
-        fx.root(0, live as *const u8);
-        fx.heap.collect();
+        let t = Rc::clone(&table);
+        let _hook = fx.heap.add_sweep_hook("test-table", move |is_live| {
+            t.borrow_mut().retain(|&addr, _| is_live(addr as *const u8));
+        });
+        fx.roots[0] = tagged(live);
+        fx.collect();
         let t = table.borrow();
         assert_eq!(t.len(), 1);
         assert_eq!(t[&(live as usize)], 10);
@@ -992,24 +2082,26 @@ mod tests {
     #[test]
     fn stress_graph_survives_collect_every_alloc() {
         let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
         fx.heap.set_stress_every(1);
-        // Build a 200-node chain under stress, rooting the head and
-        // keeping every intermediate reachable through the chain.
+        // Build a 200-node chain under stress, rooting the head and keeping
+        // every intermediate reachable through the chain.
         let mut head: *mut u8 = fx.alloc_node(0, 0);
-        fx.root(0, head as *const u8);
+        fx.roots[0] = tagged(head);
         for i in 1..200u64 {
-            let n = fx.alloc_node(TAG | (head as u64 & PAYLOAD_MASK), i);
-            head = n;
-            fx.root(0, head as *const u8);
+            head = fx.alloc_node(tagged(head), i);
+            fx.roots[0] = tagged(head);
             let _garbage = fx.heap.alloc(fx.leaf, 16);
         }
-        fx.heap.collect();
-        assert_eq!(fx.heap.stats().live_cells, 200);
+        assert!(fx.heap.stats().collections >= 398);
+        fx.collect();
+        assert_eq!(fx.live(), 200);
         let mut p = head as *const u8;
         let mut expect = 199u64;
         loop {
             assert_eq!(fx.val(p), expect);
-            let next = unsafe { std::ptr::read(p as *const u64) };
+            let next = word(p, 0);
             if next == 0 {
                 break;
             }
@@ -1017,47 +2109,397 @@ mod tests {
             p = (next & PAYLOAD_MASK) as *const u8;
         }
         assert_eq!(expect, 0);
+        black_box(&top);
+    }
+
+    #[test]
+    fn conservative_collection_requires_a_registered_stack() {
+        let mut fx = Fixture::new();
+        assert!(!fx.heap.collect());
+        assert!(fx.heap.collection_pending());
+        assert_eq!(fx.heap.stats().deferred_native_stack, 1);
+        assert!(fx.heap.collect_at_safepoint());
+        assert!(!fx.heap.collection_pending());
     }
 
     #[inline(never)]
-    fn deep_collect(heap: &mut Heap, held: *const u8) {
-        // Spill the held reference as the safepoint protocol requires,
-        // then collect. The cell is reachable *only* from this frame.
+    fn deep_collect(heap: &mut Heap, held: *const u8) -> bool {
+        // Spill the held reference to this frame, then collect: the cell
+        // is reachable *only* from here.
         let mut spill = [0u64; 4];
         unsafe { std::ptr::write_volatile(&mut spill[0], held as u64) };
         black_box(&spill);
-        heap.collect();
+        let ran = heap.collect();
         black_box(&spill);
+        ran
     }
 
     #[test]
     fn stack_resident_reference_roots_cell() {
         let mut fx = Fixture::new();
         let a = fx.alloc_node(0, 5);
-        let top_marker = 0u64;
-        fx.heap
-            .set_stack_top(unsafe { (&top_marker as *const u64).add(256) });
-        deep_collect(&mut fx.heap, a as *const u8);
-        black_box(&top_marker);
-        assert_eq!(fx.heap.stats().live_cells, 1);
-        assert_eq!(fx.val(a as *const u8), 5);
-        // Death proof needs a stack that never held the pointer:
-        // conservative scanning legitimately retains via stale words
-        // and registers on this thread. Collect on a fresh thread.
-        // SAFETY (test only): the heap is used from one thread at a
-        // time; the spawned thread is joined before reuse.
-        let heap_addr = &mut fx.heap as *mut Heap as usize;
-        let live = std::thread::spawn(move || {
-            let heap = unsafe { &mut *(heap_addr as *mut Heap) };
-            let marker = 0u64;
-            heap.set_stack_top(unsafe { (&marker as *const u64).add(256) });
-            heap.collect();
-            black_box(&marker);
-            heap.stats().live_cells
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        assert!(deep_collect(&mut fx.heap, a));
+        assert_eq!(fx.live(), 1);
+        assert_eq!(fx.val(a), 5);
+        // Precise collections ignore native frames: deterministic death.
+        fx.collect();
+        assert_eq!(fx.live(), 0);
+        black_box(&top);
+    }
+
+    struct Holder {
+        field: *mut u8,
+    }
+
+    /// Stress collects before every allocation; each earlier cell is held
+    /// only by this frame, in one recognized form (Decision 0 (b)).
+    #[inline(never)]
+    fn hold_recognized_forms(fx: &mut Fixture) -> usize {
+        let raw = fx.heap.alloc(fx.node, 16);
+        let tag = tagged(fx.heap.alloc(fx.node, 16));
+        let interior = unsafe { fx.heap.alloc(fx.node, 32).add(24) };
+        let holder = Holder {
+            field: fx.heap.alloc(fx.node, 16),
+        };
+        let last = fx.heap.alloc(fx.node, 16);
+        let words = [
+            raw as u64,
+            tag,
+            interior as u64,
+            holder.field as u64,
+            last as u64,
+        ];
+        let survived = words
+            .iter()
+            .filter(|&&w| fx.heap.is_allocated_word(w))
+            .count();
+        black_box((raw, tag, interior, &holder, last));
+        survived
+    }
+
+    #[test]
+    fn recognized_forms_survive_allocation_triggered_collections() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        fx.heap.set_stress_every(1);
+        let before = fx.heap.stats().collections;
+        assert_eq!(hold_recognized_forms(&mut fx), 5);
+        assert!(fx.heap.stats().collections >= before + 4);
+        black_box(&top);
+    }
+
+    /// Ten references live across nine allocation-triggered collections;
+    /// optimized builds keep them in callee-saved registers.
+    #[inline(never)]
+    fn hold_ten_references(heap: &mut Heap, desc: DescId) -> usize {
+        let a = black_box(heap.alloc(desc, 16));
+        let b = black_box(heap.alloc(desc, 16));
+        let c = black_box(heap.alloc(desc, 16));
+        let d = black_box(heap.alloc(desc, 16));
+        let e = black_box(heap.alloc(desc, 16));
+        let f = black_box(heap.alloc(desc, 16));
+        let g = black_box(heap.alloc(desc, 16));
+        let h = black_box(heap.alloc(desc, 16));
+        let i = black_box(heap.alloc(desc, 16));
+        let j = black_box(heap.alloc(desc, 16));
+        [a, b, c, d, e, f, g, h, i, j]
+            .iter()
+            .filter(|&&p| heap.is_allocated_word(p as u64))
+            .count()
+    }
+
+    #[test]
+    fn register_held_references_survive_allocation_triggered_collections() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        fx.heap.set_stress_every(1);
+        assert_eq!(hold_ten_references(&mut fx.heap, fx.leaf), 10);
+        black_box(&top);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    extern "C" fn collect_trampoline(heap: *mut std::ffi::c_void) {
+        let heap = unsafe { &mut *(heap as *mut Heap) };
+        assert!(heap.collect());
+    }
+
+    /// Collect while the only reference sits in d8, a callee-saved register
+    /// no Rust frame on the collection path saves: only the register spill
+    /// can find it. Returns d8 after the call.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn collect_with_reference_only_in_d8(heap: &mut Heap, hidden: u64) -> u64 {
+        let found: u64;
+        unsafe {
+            std::arch::asm!(
+                "mvn x9, {hidden}",
+                "fmov d8, x9",
+                "bl {trampoline}",
+                "fmov x9, d8",
+                hidden = in(reg) hidden,
+                trampoline = sym collect_trampoline,
+                in("x0") heap as *mut Heap as *mut std::ffi::c_void,
+                lateout("x9") found,
+                out("d8") _,
+                clobber_abi("C"),
+            );
+        }
+        found
+    }
+
+    /// Overwrite stale stack below the caller so an old copy of a pointer
+    /// cannot retain it by accident.
+    #[inline(never)]
+    fn scrub_stack() {
+        let buf = [0u8; 16 * 1024];
+        black_box(&buf);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn reference_only_in_a_callee_saved_register_is_found() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+        scrub_stack();
+        let found = collect_with_reference_only_in_d8(&mut fx.heap, hidden);
+        assert_eq!(found, !hidden, "d8 is callee-saved");
+        assert_eq!(fx.heap.stats().collections, 1);
+        assert!(fx.heap.is_allocated_word(found), "register spill missed d8");
+        black_box(&top);
+    }
+
+    #[test]
+    fn collecting_on_registered_segments_scans_every_stack_below() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let mut entry_slot = [0u64; 2];
+        stash(&mut entry_slot, alloc_hidden(&mut fx.heap, fx.leaf, 16));
+        let live = grow(256 * 1024, || {
+            let mut segment_slot = [0u64; 2];
+            stash(&mut segment_slot, alloc_hidden(&mut fx.heap, fx.leaf, 16));
+            let live = grow(256 * 1024, || {
+                assert!(fx.heap.collect());
+                fx.heap.stats().live_cells
+            });
+            black_box(&segment_slot);
+            live
+        });
+        black_box((&entry_slot, &top));
+        assert_eq!(
+            live, 2,
+            "references held only on the entry stack and the outer segment"
+        );
+    }
+
+    #[test]
+    fn collecting_on_an_unregistered_segment_defers() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let ran = stacker::grow(256 * 1024, || fx.heap.collect());
+        assert!(
+            !ran,
+            "an unregistered segment must defer, not be scanned blindly"
+        );
+        assert_eq!(fx.heap.stats().deferred_native_stack, 1);
+        assert!(
+            fx.heap.collect(),
+            "back on the entry stack the collection runs"
+        );
+        black_box(&top);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mapping_containing(addr: usize) -> Option<(usize, usize)> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        maps.lines().find_map(|line| {
+            let (lo, hi) = line.split_whitespace().next()?.split_once('-')?;
+            let lo = usize::from_str_radix(lo, 16).ok()?;
+            let hi = usize::from_str_radix(hi, 16).ok()?;
+            (lo..hi).contains(&addr).then_some((lo, hi))
         })
-        .join()
-        .expect("collector thread");
-        assert_eq!(live, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn registered_segment_bounds_match_the_mapping() {
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        for size in [64 * 1024, 100_000, 1 << 20] {
+            let (region, mapping) = grow(size, || {
+                let sp = native::current_sp();
+                (native::innermost_region(), mapping_containing(sp))
+            });
+            assert!(region.is_some());
+            assert_eq!(region, mapping, "segment of {size} bytes");
+        }
+        black_box(&top);
+    }
+
+    #[test]
+    fn dropping_or_repointing_a_root_range_takes_effect() {
+        let mut fx = Fixture::new();
+        let a = fx.heap.alloc(fx.leaf, 16);
+        let first = Box::new([a as u64]);
+        let range = unsafe {
+            fx.heap
+                .add_root_range("r", first.as_ptr(), first.as_ptr().add(1))
+        };
+        fx.collect();
+        assert!(fx.heap.is_allocated_word(a as u64));
+        let b = fx.heap.alloc(fx.leaf, 16);
+        let second = Box::new([b as u64]);
+        unsafe { range.set(second.as_ptr(), second.as_ptr().add(1)) };
+        fx.collect();
+        assert!(!fx.heap.is_allocated_word(a as u64));
+        assert!(fx.heap.is_allocated_word(b as u64));
+        drop(range);
+        fx.collect();
+        assert_eq!(fx.live(), 0);
+    }
+
+    #[test]
+    fn dropped_trace_roots_and_sources_stop_rooting() {
+        let mut fx = Fixture::new();
+        let a = fx.heap.alloc(fx.leaf, 16) as u64;
+        let b = fx.heap.alloc(fx.leaf, 16) as u64;
+        let root = fx
+            .heap
+            .add_trace_root("a", move |visit| visit(a as *const u8));
+        let source = fx
+            .heap
+            .add_edge_source("b", move |sink| sink.edge(std::ptr::null(), b));
+        fx.collect();
+        assert_eq!(fx.live(), 2);
+        drop((root, source));
+        fx.collect();
+        assert_eq!(fx.live(), 0);
+    }
+
+    #[test]
+    fn a_hook_dropping_another_hook_mid_pass_is_deferred() {
+        let mut fx = Fixture::new();
+        let calls = Rc::new(Cell::new(0));
+        let victim: Rc<RefCell<Option<SweepHook>>> = Rc::default();
+        let slot = Rc::clone(&victim);
+        let _killer = fx.heap.add_sweep_hook("killer", move |_| {
+            slot.borrow_mut().take();
+        });
+        let counter = Rc::clone(&calls);
+        *victim.borrow_mut() = Some(fx.heap.add_sweep_hook("victim", move |_| {
+            counter.set(counter.get() + 1);
+        }));
+        fx.collect();
+        fx.collect();
+        assert_eq!(calls.get(), 0);
+        assert!(victim.borrow().is_none());
+    }
+
+    #[test]
+    fn dropping_the_heap_finalizes_every_remaining_cell() {
+        FIN_COUNT.with(|c| c.set(0));
+        {
+            let mut fx = Fixture::new();
+            let a = fx.heap.alloc(fx.leaf, 16);
+            fx.roots[0] = tagged(a);
+            fx.heap.alloc(fx.leaf, 16);
+            fx.heap.alloc(fx.leaf, 8192);
+        }
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 3);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "I9 violation")]
+    fn collecting_with_an_outstanding_borrow_asserts_in_debug() {
+        let mut heap = Heap::new();
+        let _borrow = heap.borrow_scope();
+        heap.collect_at_safepoint();
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn collecting_with_an_outstanding_borrow_defers_in_release() {
+        let mut heap = Heap::new();
+        let borrow = heap.borrow_scope();
+        assert!(!heap.collect_at_safepoint());
+        drop(borrow);
+        assert!(heap.collect_at_safepoint());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no-GC region still open")]
+    fn leaked_nogc_region_is_caught_at_quiescence() {
+        let heap = Heap::new();
+        std::mem::forget(heap.nogc());
+        heap.debug_assert_quiescent();
+    }
+
+    #[test]
+    fn collection_budget_grows_with_the_live_heap() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        fx.build_chain(1 << 18); // 4 MiB live
+        let before = fx.heap.stats().collections;
+        for _ in 0..1 << 19 {
+            black_box(fx.heap.alloc(fx.leaf, 16)); // 8 MiB of garbage
+        }
+        let during = fx.heap.stats().collections - before;
+        assert!(
+            during <= 3,
+            "8 MiB churn over a 4 MiB live heap took {during} collections"
+        );
+        black_box(&top);
+    }
+
+    #[test]
+    fn retained_large_allocations_do_not_collect_every_time() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        for slot in 0..16 {
+            let p = fx.heap.alloc(fx.leaf, 2 << 20);
+            fx.roots[slot] = tagged(p);
+        }
+        let collections = fx.heap.stats().collections;
+        assert!(
+            collections <= 6,
+            "16 retained 2 MiB allocations took {collections} collections"
+        );
+        black_box(&top);
+    }
+
+    #[test]
+    fn freed_cells_are_reused_before_new_pages_and_empty_pages_are_released() {
+        let mut fx = Fixture::new();
+        for i in 0..48 {
+            let p = fx.heap.alloc(fx.leaf, 4096);
+            if i % 2 == 0 {
+                fx.roots[i / 2] = tagged(p);
+            }
+        }
+        fx.collect();
+        assert_eq!((fx.heap.stats().pages_live, fx.live()), (3, 24));
+        for _ in 0..24 {
+            fx.heap.alloc(fx.leaf, 4096);
+        }
+        assert_eq!(fx.heap.stats().pages_live, 3, "freed cells reused first");
+        fx.heap.alloc(fx.leaf, 4096);
+        assert_eq!(fx.heap.stats().pages_live, 4);
+        fx.roots.fill(0);
+        fx.collect();
+        assert_eq!(fx.heap.stats().pages_live, 0, "empty pages released");
+        let p = fx.heap.alloc(fx.leaf, 4096);
+        assert!(fx.heap.is_allocated_word(p as u64));
     }
 
     #[test]
@@ -1066,7 +2508,137 @@ mod tests {
     fn verifier_rejects_dangling_edge_in_debug() {
         let mut fx = Fixture::new();
         let a = fx.alloc_node(0x0000_0000_00de_ad00, 1);
-        fx.root(0, a as *const u8);
-        fx.heap.collect();
+        fx.roots[0] = tagged(a);
+        fx.collect();
+    }
+
+    // Timing probes behind the S1 review numbers, run with
+    // `cargo test --release -p trust-js --lib --features embed,gc-heap
+    //  gc_core::tests::perf_ -- --ignored --nocapture --test-threads=1`.
+
+    fn perf_heap() -> (Heap, DescId, DescId) {
+        let mut heap = Heap::new();
+        let node = heap.register_desc(LayoutDesc {
+            name: "node",
+            trace: trace_node,
+            weak: None,
+            finalize: None,
+        });
+        let blob = heap.register_desc(LayoutDesc {
+            name: "blob",
+            trace: trace_none,
+            weak: None,
+            finalize: None,
+        });
+        (heap, node, blob)
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_churn_over_a_live_heap() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let start = Instant::now();
+        fx.build_chain(1 << 20);
+        let build = start.elapsed();
+        let before = fx.heap.stats().collections;
+        let start = Instant::now();
+        for _ in 0..1 << 20 {
+            black_box(fx.heap.alloc(fx.node, 16));
+        }
+        eprintln!(
+            "perf churn: 1M-node live chain built in {build:?}; 1M x 16 B churn {:?}, {} collections",
+            start.elapsed(),
+            fx.heap.stats().collections - before
+        );
+        black_box(&top);
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_collect_with_sweep_hook() {
+        let mut fx = Fixture::new();
+        {
+            let _scope = fx.heap.nogc();
+            fx.build_chain(1 << 20);
+        }
+        fx.collect();
+        let start = Instant::now();
+        fx.collect();
+        let bare = start.elapsed();
+        let _hook = fx.heap.add_sweep_hook("noop", |is_live| {
+            black_box(is_live(std::ptr::null()));
+        });
+        let start = Instant::now();
+        fx.collect();
+        eprintln!(
+            "perf collect, 1M live cells: no hooks {bare:?}, one no-op hook {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_large_objects_and_scanned_words() {
+        for (label, size) in [("large 8 KiB", 8192usize), ("small 4 KiB", 4096)] {
+            for count in [1000usize, 2000, 4000] {
+                let (mut heap, _, blob) = perf_heap();
+                let objects: Vec<u64> = {
+                    let _scope = heap.nogc();
+                    (0..count).map(|_| heap.alloc(blob, size) as u64).collect()
+                };
+                let noise: Vec<u64> = (0..32768u64).map(|i| i * 0x9e37_79b9).collect();
+                let _objects = unsafe {
+                    heap.add_root_range("objects", objects.as_ptr(), objects.as_ptr().add(count))
+                };
+                let _noise = unsafe {
+                    heap.add_root_range("noise", noise.as_ptr(), noise.as_ptr().add(noise.len()))
+                };
+                heap.collect_at_safepoint();
+                let start = Instant::now();
+                heap.collect_at_safepoint();
+                eprintln!(
+                    "perf {label} x {count} + 32k words: collect {:?}",
+                    start.elapsed()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_page_release() {
+        for pages in [1000usize, 2000, 4000] {
+            let (mut heap, _, blob) = perf_heap();
+            {
+                let _scope = heap.nogc();
+                for _ in 0..pages * 16 {
+                    black_box(heap.alloc(blob, 4096));
+                }
+            }
+            let start = Instant::now();
+            heap.collect_at_safepoint();
+            eprintln!(
+                "perf release {pages} empty pages: collect {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_alloc_fast_path() {
+        const N: usize = 1 << 20;
+        let (mut heap, _, blob) = perf_heap();
+        let _scope = heap.nogc();
+        let start = Instant::now();
+        for _ in 0..N {
+            black_box(heap.alloc(blob, 32));
+        }
+        eprintln!(
+            "perf alloc: {:.1} ns per 32 B cell",
+            start.elapsed().as_nanos() as f64 / N as f64
+        );
     }
 }
