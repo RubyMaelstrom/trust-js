@@ -947,8 +947,9 @@ fn actual_default_hot_object_branch_executes_and_null_getter_misses_retire() {
         // Use the finalized structural minimum, including its one Object guard
         // debit, and the exact full-source literal scan/filter price. No fused
         // comparisons or extra value solver/group attempt exist in this body.
-        let work =
-            string_literals::analysis_work_with_filter(primary.jit_ops().len(), true).unwrap();
+        let work = string_literals::analysis_work_with_filter(primary.jit_ops().len(), true)
+            .unwrap()
+            + native_pcs::analysis_work(primary.jit_ops().len()).unwrap();
         let target =
             generic_admission::admission_entries_with_work(primary, structural.minimum_tests, work)
                 .unwrap()

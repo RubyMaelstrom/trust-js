@@ -294,7 +294,12 @@ fn original_frame_and_labels_and_every_cut_pay_work_without_vm_tail_credit() {
     );
     let frame = frame::FramePlan::build(&hot, &cfg, true).unwrap();
     let work = large_regions::work(&hot, &cfg, &stack, &frame, &regions).unwrap();
-    assert_eq!(work.original_labels, (hot.jit_ops().len() as u64 + 6) * 2);
+    assert_eq!(
+        work.original_labels,
+        (hot.jit_ops().len() as u64 + 6) * 2
+            + native_pcs::analysis_work(hot.jit_ops().len()).unwrap(),
+        "retain full original label work plus selected-graph certificate analysis"
+    );
     assert!(work.original_frame > 0);
     assert!(work.cold_recovery >= regions.cut_blocks as u64 * 16);
     let opportunity =
@@ -468,6 +473,7 @@ fn large_work_arithmetic_overflow_is_declined_without_wrapping_or_dividing_zero(
         call_imports: 0,
         literal_analysis: 0,
         literal_dispatch_lowering: 0,
+        borrowed_operands: 0,
     };
     assert!(work.total().is_none());
     assert!(work.admission_entries(1).is_none());
@@ -480,6 +486,7 @@ fn large_work_arithmetic_overflow_is_declined_without_wrapping_or_dividing_zero(
         call_imports: 0,
         literal_analysis: 0,
         literal_dispatch_lowering: 0,
+        borrowed_operands: 0,
     };
     assert_eq!(work.total(), Some(u64::MAX));
     assert!(work.admission_entries(1).is_none());

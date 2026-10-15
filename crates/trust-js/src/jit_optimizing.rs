@@ -143,6 +143,8 @@ mod strict_null;
 #[path = "jit_optimizing_string_literals.rs"]
 mod string_literals;
 
+#[path = "jit_optimizing_borrowed_operands.rs"]
+mod borrowed_operands;
 #[path = "jit_optimizing_string_dispatch.rs"]
 mod string_dispatch;
 #[path = "jit_optimizing_values.rs"]
@@ -404,7 +406,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         chunk.optimizing_remaining.set(0);
         return;
     }
-    let numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
+    let mut numeric = (std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0"))
         .then(|| specialization::Plan::build(chunk, &cfg, &stack, &inputs, &properties))
         .flatten();
     // An omitted field read cannot supply a native Object guard. Select both
@@ -445,14 +447,44 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
     let literal_values = try_literal_values
         .then(|| value_facts::ValuePlan::build(chunk, &cfg, &stack))
         .flatten();
+    let values = *(&*ctx.interp)
+        .jit_layout
+        .get_or_init(|| crate::value::jit_layout(&(&*ctx.interp).object_proto));
+    let borrowed = crate::value::jit_packed_owners_supported(&values)
+        .then(|| {
+            borrowed_operands::Plan::build(
+                chunk,
+                &cfg,
+                &stack,
+                regions.as_ref(),
+                object_plan.as_ref().map(|plan| plan.reachable.as_slice()),
+                configured_deopt(chunk),
+                NativeEntryKind::FreshFrame,
+                object_plan
+                    .as_ref()
+                    .map(|plan| &plan.values)
+                    .or_else(|| numeric.as_ref().map(|plan| &plan.values))
+                    .or(literal_values.as_ref()),
+            )
+        })
+        .flatten();
+    if let (Some(borrowed), Some(numeric)) = (&borrowed, &mut numeric) {
+        borrowed.remove_numeric_credit(numeric);
+    }
+    let borrowed_work =
+        borrowed_operands::analysis_work(chunk.jit_ops().len()).and_then(|analysis| {
+            analysis.checked_add(
+                borrowed
+                    .as_ref()
+                    .map_or(Some(0), |plan| plan.lowering_work(chunk, &stack))?,
+            )
+        });
     let literal_read_values = object_plan
         .as_ref()
         .map(|plan| &plan.values)
         .or_else(|| numeric.as_ref().map(|plan| &plan.values))
         .or(literal_values.as_ref());
-    let values = *(&*ctx.interp)
-        .jit_layout
-        .get_or_init(|| crate::value::jit_layout(&(&*ctx.interp).object_proto));
+
     let literals = crate::value::jit_packed_owners_supported(&values)
         .then(|| {
             string_literals::Plan::build(
@@ -501,6 +533,10 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             });
     let literal_compiler_work =
         literal_analysis.and_then(|work| work.checked_add(dispatch_lowering?));
+    let compiler_work = literal_compiler_work.and_then(|work| {
+        work.checked_add(borrowed_work?)?
+            .checked_add(native_pcs::analysis_work(chunk.jit_ops().len())?)
+    });
     let estimated_entries = if large {
         let regions = regions.as_ref().expect("large certificate");
         let frame = frame::FramePlan::build(
@@ -510,6 +546,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
         );
         frame.and_then(|frame| {
             let mut work = large_regions::work_with_literals(chunk, &cfg, &stack, &frame, regions)?;
+            work.borrowed_operands = borrowed_work?;
             work.literal_analysis = literal_analysis?;
             work.literal_dispatch_lowering = dispatch_lowering?;
             let saved = if literals.is_some() {
@@ -522,8 +559,8 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             }
             work.admission_entries(saved)
         })
-    } else if literals.is_some() {
-        generic_admission::minimum_saved_work(
+    } else if literals.is_some() || borrowed.is_some() {
+        generic_admission::minimum_saved_work_with_borrowed(
             chunk,
             &cfg,
             numeric.as_ref(),
@@ -532,9 +569,10 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             regions.as_ref(),
             literals.as_ref(),
             literal_read_values,
+            borrowed.as_ref(),
         )
         .and_then(|saved| {
-            generic_admission::admission_entries_with_work(chunk, saved, literal_compiler_work?)
+            generic_admission::admission_entries_with_work(chunk, saved, compiler_work?)
         })
     } else if let Some(regions) = &regions {
         regions
@@ -547,7 +585,7 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
             )
             .and_then(|saved| {
                 let old = generic_admission::admission_entries(chunk, saved, 0)?;
-                generic_admission::add_analysis_work(old, saved, literal_compiler_work?)
+                generic_admission::add_analysis_work(old, saved, compiler_work?)
             })
     } else if let Some(structural) = &structural {
         let numeric_saved = numeric.as_ref().map_or(0, |plan| plan.saved_tests);
@@ -556,17 +594,20 @@ pub(super) unsafe extern "C" fn request_hot_upgrade(ctx: *mut JitCtx) {
                 generic_admission::add_analysis_work(
                     old,
                     numeric_saved.checked_add(structural.minimum_tests)?,
-                    literal_compiler_work?,
+                    compiler_work?,
                 )
             })
     } else {
-        numeric.as_ref().and_then(|plan| {
-            generic_admission::add_analysis_work(
-                plan.admission_entries(chunk),
-                plan.saved_tests,
-                literal_compiler_work?,
-            )
-        })
+        numeric
+            .as_ref()
+            .filter(|plan| plan.saved_tests != 0)
+            .and_then(|plan| {
+                generic_admission::add_analysis_work(
+                    plan.admission_entries(chunk),
+                    plan.saved_tests,
+                    compiler_work?,
+                )
+            })
     };
     let Some(estimated_entries) = estimated_entries else {
         return;
@@ -1005,6 +1046,7 @@ struct Lowering<'a, 'b> {
     generic_own_plan: Option<&'b generic_own::Plan>,
     string_literals: Option<&'b string_literals::Plan>,
     string_dispatch: Option<&'b string_dispatch::Plan>,
+    borrowed_operands: Option<&'b borrowed_operands::Plan>,
     object_plan: Option<&'b object_facts::Plan>,
     property_results: &'b [(u32, value_facts::Types)],
     loop_facts: Option<&'b loop_facts::Plan>,
@@ -1032,8 +1074,11 @@ struct Lowering<'a, 'b> {
     sp: Variable,
     helper_sig: SigRef,
     owner_leaf_sig: Option<SigRef>,
+    owner_leaf_callees: [Option<Value>; 2],
     string_literal_sig: Option<SigRef>,
     string_dispatch_sig: Option<SigRef>,
+    borrowed_sig: Option<SigRef>,
+    borrowed_words: Option<cranelift_codegen::ir::StackSlot>,
     read_guard_sig: Option<SigRef>,
     read_guard_result: Option<cranelift_codegen::ir::StackSlot>,
     read_guard_layout: Option<&'static crate::value::JitLayout>,
@@ -1739,6 +1784,37 @@ impl Lowering<'_, '_> {
     }
 
     fn lower(&mut self, pc: usize, op: &Op) {
+        // These operations have no ordinary fallthrough. Their actual target
+        // whitelist was checked before IR; never demand a fabricated pc+1 label.
+        match op {
+            Op::Jump(target) => {
+                self.jump_normal(self.pc_block(*target as usize));
+                return;
+            }
+            Op::Return | Op::ReturnBare => {
+                self.direct_return(matches!(op, Op::Return));
+                return;
+            }
+            Op::ReturnUndef => {
+                self.direct_return(false);
+                return;
+            }
+            Op::ResumeReturn | Op::AbruptJump(..) | Op::ResumeJump => {
+                let target = self.helper(bytecode::jit_complete_pc, pc as u32);
+                self.b
+                    .ins()
+                    .brif(target, self.dispatch, &[target.into()], self.ok, &[]);
+                return;
+            }
+            Op::Throw | Op::IterAbortL(_) | Op::IterAbortIfNotDoneL(..) => {
+                // Both iterator abort operations always rethrow the incoming
+                // completion after IteratorClose; they have no normal successor.
+                self.helper(exec, pc as u32);
+                self.b.ins().jump(self.unwind, &[]);
+                return;
+            }
+            _ => {}
+        }
         let next = self.pc_block(pc + 1);
         if self.object_comparison(pc, next) {
             return;
@@ -1891,9 +1967,6 @@ impl Lowering<'_, '_> {
                     self.slow(pc, slow, next);
                 }
             }
-            Op::Jump(target) => {
-                self.jump_normal(self.pc_block(*target as usize));
-            }
             Op::InlineGuard(target, fallback) => {
                 self.inline_guard(*target, self.pc_block(*fallback as usize), next);
             }
@@ -1904,14 +1977,6 @@ impl Lowering<'_, '_> {
                 let target = self.pc_block(*target as usize);
                 self.conditional_jump(op, target, next);
             }
-            Op::Return | Op::ReturnBare => self.direct_return(matches!(op, Op::Return)),
-            Op::ResumeReturn | Op::AbruptJump(..) | Op::ResumeJump => {
-                let target = self.helper(bytecode::jit_complete_pc, pc as u32);
-                self.b
-                    .ins()
-                    .brif(target, self.dispatch, &[target.into()], self.ok, &[]);
-            }
-            Op::ReturnUndef => self.direct_return(false),
             Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..) => {
                 self.helper(push_handler, pc as u32);
                 self.reload_stack(self.stack_plan.after[pc]);
@@ -1921,10 +1986,6 @@ impl Lowering<'_, '_> {
                 self.helper(pop_handler, 0);
                 self.reload_stack(self.stack_plan.after[pc]);
                 self.jump_normal(next);
-            }
-            Op::Throw => {
-                self.helper(exec, pc as u32);
-                self.b.ins().jump(self.unwind, &[]);
             }
             Op::Call(argc, cache) | Op::CallWithThis(argc, cache) => {
                 self.call(pc, *argc, *cache, matches!(op, Op::CallWithThis(..)), next);
@@ -2225,17 +2286,13 @@ fn prepare_entry_with_limits(
     if regions.is_some() && !bytecode::native_deopt::supported(chunk) {
         return Err(CompileError::Unsupported);
     }
-    // Validate every physical target before generating any native control flow,
-    // including cold completion pads and the end boundary. Original analyses and
-    // recovery continue to use the unchanged full bytecode PC space.
-    let native_pcs = native_pcs::Plan::build(ops, &cfg, entry_pc, regions.as_ref())?;
     if let (Some(record), Some(plan)) = (&diagnostic, &regions) {
         record.set_regions(plan.source_version, plan.native_ops, plan.cut_blocks);
     }
     // A failed/budget-exhausted value proof retains all dynamic guards, not a less
     // capable function or a different execution tier. The switch also skips analysis cost.
     let use_facts = std::env::var("TRUST_JS_OPT_JIT_VALUE_FACTS").as_deref() != Ok("0");
-    let specialization = (use_facts && continuation.is_none())
+    let mut specialization = (use_facts && continuation.is_none())
         .then(|| {
             specialization::Plan::build(
                 chunk,
@@ -2291,6 +2348,37 @@ fn prepare_entry_with_limits(
     {
         return Err(CompileError::Unsupported);
     }
+    let owners_valid = crate::value::jit_packed_owners_supported(values);
+    let borrowed_operands = (owners_valid && continuation.is_none())
+        .then(|| {
+            borrowed_operands::Plan::build(
+                chunk,
+                &cfg,
+                &stack_plan,
+                regions.as_ref(),
+                object_plan.as_ref().map(|plan| plan.reachable.as_slice()),
+                deopt_at,
+                NativeEntryKind::FreshFrame,
+                object_plan
+                    .as_ref()
+                    .map(|plan| &plan.values)
+                    .or_else(|| specialization.as_ref().map(|plan| &plan.values))
+                    .or(generic_values.as_ref()),
+            )
+        })
+        .flatten();
+    if let (Some(borrowed), Some(numeric)) = (&borrowed_operands, &mut specialization) {
+        borrowed.remove_numeric_credit(numeric);
+    }
+    let borrowed_work = borrowed_operands::analysis_work(ops.len())
+        .and_then(|analysis| {
+            analysis.checked_add(
+                borrowed_operands
+                    .as_ref()
+                    .map_or(Some(0), |plan| plan.lowering_work(chunk, &stack_plan))?,
+            )
+        })
+        .ok_or(CompileError::Unsupported)?;
     let value_plan = object_plan.as_ref().map(|plan| &plan.values).or_else(|| {
         loop_facts
             .as_ref()
@@ -2375,7 +2463,7 @@ fn prepare_entry_with_limits(
                 }
             })
             .flatten();
-    let owners_valid = crate::value::jit_packed_owners_supported(values);
+
     let string_literals = (owners_valid && continuation.is_none())
         .then(|| string_literals::Plan::build(chunk, &cfg, &stack_plan, regions.as_ref(), deopt_at))
         .flatten()
@@ -2393,11 +2481,46 @@ fn prepare_entry_with_limits(
             literals,
         )
     });
+    // Validate actual emitted edges only after the final, reachable-filtered
+    // fusion certificates. Original semantic tables and recovery PCs stay full.
+    let native_pcs = native_pcs::Plan::build(
+        ops,
+        &cfg,
+        &stack_plan,
+        entry_pc,
+        regions.as_ref(),
+        deopt_at,
+        native_pcs::Selected {
+            borrowed: borrowed_operands.as_ref(),
+            dispatch: string_dispatch.as_ref(),
+            literals: string_literals.as_ref(),
+        },
+    )?;
     if !chunk.optimizing_structural.is_empty() && generic_own_plan.is_none()
         || chunk.optimizing_candidate
             && specialization.is_none()
             && structural_admission.is_none()
             && string_literals.is_none()
+    {
+        return Err(CompileError::Unsupported);
+    }
+    if chunk.optimizing_candidate
+        && ops.len() <= 256
+        && (borrowed_operands.is_some() || string_literals.is_some())
+        && generic_admission::minimum_saved_work_with_borrowed(
+            chunk,
+            &cfg,
+            specialization.as_ref(),
+            structural_admission.as_ref(),
+            object_plan
+                .as_ref()
+                .filter(|_| structural_admission.is_some()),
+            regions.as_ref(),
+            string_literals.as_ref(),
+            value_plan,
+            borrowed_operands.as_ref(),
+        )
+        .is_none()
     {
         return Err(CompileError::Unsupported);
     }
@@ -2417,6 +2540,7 @@ fn prepare_entry_with_limits(
         .ok_or(CompileError::Unsupported)?;
         let mut work = large_regions::work_with_literals(chunk, &cfg, &stack_plan, &frame, regions)
             .ok_or(CompileError::Unsupported)?;
+        work.borrowed_operands = borrowed_work;
         work.literal_analysis =
             string_literals::analysis_work_with_filter(ops.len(), object_plan.is_some())
                 .and_then(|work| {
@@ -2442,6 +2566,7 @@ fn prepare_entry_with_limits(
                     work.call_imports,
                     work.literal_analysis,
                     work.literal_dispatch_lowering,
+                    work.borrowed_operands,
                 ],
             );
         }
@@ -2477,23 +2602,6 @@ fn prepare_entry_with_limits(
                 .as_ref()
                 .map_or(0, |plan| plan.payload_bytes()),
         );
-    }
-    if chunk.optimizing_candidate
-        && ops.len() <= 256
-        && string_literals.is_some()
-        && generic_admission::minimum_saved_work(
-            chunk,
-            &cfg,
-            specialization.as_ref(),
-            structural_admission.as_ref(),
-            object_plan.as_ref(),
-            regions.as_ref(),
-            string_literals.as_ref(),
-            value_plan,
-        )
-        .is_none()
-    {
-        return Err(CompileError::Unsupported);
     }
     if chunk.optimizing_candidate
         && ops.len() <= 256
@@ -2724,6 +2832,7 @@ fn prepare_entry_with_limits(
             generic_own_plan: generic_own_plan.as_ref(),
             string_literals: string_literals.as_ref(),
             string_dispatch: string_dispatch.as_ref(),
+            borrowed_operands: borrowed_operands.as_ref(),
             object_plan: object_plan.as_ref(),
             property_results: object_plan
                 .as_ref()
@@ -2760,8 +2869,11 @@ fn prepare_entry_with_limits(
             sp,
             helper_sig,
             owner_leaf_sig,
+            owner_leaf_callees: [None; 2],
             string_literal_sig,
             string_dispatch_sig,
+            borrowed_sig: None,
+            borrowed_words: None,
             read_guard_sig: None,
             read_guard_result: None,
             read_guard_layout,
@@ -2874,9 +2986,7 @@ fn prepare_entry_with_limits(
                 _ if deopt_at == Some(pc) => {
                     lower.deopt_before(pc, error);
                 }
-                _ if lower.string_dispatch.is_some_and(|plan| plan.interior(pc))
-                    || lower.string_literals.is_some_and(|plan| plan.interior(pc)) =>
-                {
+                _ if native_pcs.kind(pc) == native_pcs::Kind::Interior => {
                     // Preserve the original sparse-label certificate. Fusion interiors
                     // have no semantic entry and are not workload-unseen regions.
                     lower.b.ins().jump(error, &[]);
@@ -2886,7 +2996,10 @@ fn prepare_entry_with_limits(
                     if observed_regions::TEST_CAPTURE.with(std::cell::Cell::get) {
                         observed_regions::TEST_LOWERED.with(|pcs| pcs.borrow_mut().push(pc));
                     }
-                    if let Some(site) = lower.string_dispatch.and_then(|plan| plan.site(pc)) {
+                    if let Some(site) = lower.borrowed_operands.and_then(|plan| plan.site(pc)) {
+                        lower.borrowed_operands(site, instruction_limit, block_limit)?;
+                    } else if let Some(site) = lower.string_dispatch.and_then(|plan| plan.site(pc))
+                    {
                         lower.string_case_dispatch(pc, site, instruction_limit, block_limit)?;
                     } else if let Some(site) = lower.string_literals.and_then(|plan| plan.site(pc))
                     {
@@ -2897,19 +3010,21 @@ fn prepare_entry_with_limits(
                 }
             }
         }
-        let end = lower.pc_block(ops.len());
-        lower.b.switch_to_block(end);
-        if stack_plan.reachable[ops.len()] {
-            lower.pc = ops.len();
-            lower.stack_state = stack_plan.at[ops.len()];
-            lower.dirty = &frame.written;
-            if deopt_at == Some(ops.len()) {
-                lower.deopt_before(ops.len(), error);
+        if native_pcs.emits_end() {
+            let end = lower.pc_block(ops.len());
+            lower.b.switch_to_block(end);
+            if stack_plan.reachable[ops.len()] {
+                lower.pc = ops.len();
+                lower.stack_state = stack_plan.at[ops.len()];
+                lower.dirty = &frame.written;
+                if deopt_at == Some(ops.len()) {
+                    lower.deopt_before(ops.len(), error);
+                } else {
+                    lower.direct_return(false);
+                }
             } else {
-                lower.direct_return(false);
+                lower.b.ins().jump(error, &[]);
             }
-        } else {
-            lower.b.ins().jump(error, &[]);
         }
         lower.emit_loop_validation();
         lower.emit_terminal_recoveries();
@@ -2923,16 +3038,7 @@ fn prepare_entry_with_limits(
         lower.b.switch_to_block(dispatch);
         let target = lower.b.block_params(dispatch)[0];
         let mut switch = Switch::new();
-        let mut destinations = std::collections::BTreeSet::new();
-        for root in cfg.handler_roots() {
-            destinations.insert(cfg.blocks()[root.target.0 as usize].start);
-        }
-        for op in ops {
-            if let Op::AbruptJump(target, _) = op {
-                destinations.insert(*target as usize);
-            }
-        }
-        let destinations: Vec<_> = destinations
+        let destinations: Vec<_> = native_pcs::dispatch_destinations(ops, &cfg)
             .into_iter()
             .map(|pc| {
                 let landing = lower.b.create_block();

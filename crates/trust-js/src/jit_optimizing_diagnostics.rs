@@ -189,7 +189,7 @@ pub(super) struct Code {
     region_native_ops: Cell<usize>,
     region_cut_blocks: Cell<usize>,
     large_semantic_opportunity_work: Cell<u32>,
-    large_work: Cell<[u64; 7]>,
+    large_work: Cell<[u64; 8]>,
     literal_sites: Cell<usize>,
     literal_emitted_sites: Cell<usize>,
     literal_analysis_work: Cell<u64>,
@@ -257,7 +257,7 @@ impl Code {
                 region_native_ops: Cell::new(chunk.jit_ops().len()),
                 region_cut_blocks: Cell::new(0),
                 large_semantic_opportunity_work: Cell::new(0),
-                large_work: Cell::new([0; 7]),
+                large_work: Cell::new([0; 8]),
                 literal_sites: Cell::new(0),
                 literal_emitted_sites: Cell::new(0),
                 literal_analysis_work: Cell::new(0),
@@ -441,7 +441,7 @@ impl Code {
             .set(self.emitted_string_dispatch_groups.get() + 1);
     }
 
-    pub(super) fn set_large_policy(&self, opportunities: u32, work: [u64; 7]) {
+    pub(super) fn set_large_policy(&self, opportunities: u32, work: [u64; 8]) {
         self.large_semantic_opportunity_work.set(opportunities);
         self.large_work.set(work);
     }
@@ -464,9 +464,9 @@ impl Code {
         }
         result.push('}');
         if self.large_semantic_opportunity_work.get() != 0 {
-            let [native, original_labels, frame, recovery, imports, literal_analysis, dispatch_lowering] =
+            let [native, original_labels, frame, recovery, imports, literal_analysis, dispatch_lowering, borrowed_operands] =
                 self.large_work.get();
-            let _ = write!(result, ",\"large_region_policy\":{{\"kind\":\"observed_native_opportunity_heuristic\",\"semantic_opportunity_work\":{},\"units\":\"combined conservative removed-test and net constant-owner work\",\"work\":{{\"native_expansion\":{native},\"original_labels\":{original_labels},\"original_frame\":{frame},\"cold_recovery\":{recovery},\"call_imports\":{imports},\"literal_analysis\":{literal_analysis},\"literal_dispatch_lowering\":{dispatch_lowering}}},\"provisional_work_coefficient\":32,\"minimum_calls\":4096,\"frequency_or_minimum_claim\":false}}", self.large_semantic_opportunity_work.get());
+            let _ = write!(result, ",\"large_region_policy\":{{\"kind\":\"observed_native_opportunity_heuristic\",\"semantic_opportunity_work\":{},\"units\":\"combined conservative removed-test and net constant-owner work\",\"work\":{{\"native_expansion\":{native},\"original_labels\":{original_labels},\"original_frame\":{frame},\"cold_recovery\":{recovery},\"call_imports\":{imports},\"literal_analysis\":{literal_analysis},\"literal_dispatch_lowering\":{dispatch_lowering},\"borrowed_operands\":{borrowed_operands}}},\"provisional_work_coefficient\":32,\"minimum_calls\":4096,\"frequency_or_minimum_claim\":false}}", self.large_semantic_opportunity_work.get());
         }
         if self.literal_sites.get() != 0 || self.literal_analysis_work.get() != 0 {
             let _ = write!(result, ",\"literal_fusion\":{{\"selected_native_sites\":{},\"emitted_sites\":{},\"emitted_sites_scope\":\"single comparisons; grouped cases counted separately\",\"constant_owner_operations_removed_per_site\":2,\"borrowed_tag_debit_per_site\":1,\"net_semantic_owner_work_per_site\":1,\"site_count_is_not_path_minimum\":true,\"provisional_original_certificate_analysis_work\":{},\"temporary_retained_plan_payload_bytes\":{}}}",
@@ -502,7 +502,7 @@ impl Code {
             .join(",");
         let sites = self.sites.borrow();
         let rows = sites.iter().enumerate().map(|(index, site)| format!("{{\"pc\":{},\"position_token\":{},\"source_byte_offset\":{},\"op\":{},\"key\":{},\"key_truncated\":{},\"kind\":{},\"native_fast_successes\":{},\"saturated\":{}}}", site.pc, site.position, if site.position == crate::stack_trace::NO_POSITION || crate::stack_trace::is_inline_position(site.position) {"null".into()} else {site.position.to_string()}, quote(&site.op), quote(&site.key), site.key_truncated, quote(site.kind), self.counters[SITE_BASE+index].get(), self.counters[SITE_BASE+index].get()==u64::MAX)).collect::<Vec<_>>().join(",");
-        let _ = write!(result, ",\"runtime_counters\":{},\"counter_mode\":{},\"tracked_counter_labels\":[{}],\"saturated_counter_labels\":[{}],\"source_start\":{},\"source_bytes\":{},\"slots\":[{}],\"slot_label_limit_chars\":32,\"slot_label_count_limit\":4,\"slot_labels_truncated\":{:?},\"key_label_limit_chars\":64,\"entry_kind\":{},\"execution_scope\":\"physical optimizing-native entries; normal exits include terminal VM completions; native-control-flow normal completions = normal_exits - terminal_vm_normal_completions, except saturated counters; checked helpers and author calls may execute within native control flow\",\"execution_counters_saturate\":{},\"sites\":[{}],\"site_selection\":\"first eight emitted committed data-read/existing-property-overwrite fast-success, literal-comparison or ordered literal-case-dispatch PCs; one dispatch event counts the group, not skipped comparisons; creation, loop-scalar field operations, element accesses and other operation families excluded; no estimate for omitted sites\",\"site_limit\":{},\"omitted_site_count\":{},\"omitted_pcs\":{:?},\"omitted_pc_list_truncated\":{}}}", self.runtime_counters || self.execution_counters, quote(mode), tracked, saturated, self.source_origin.0, self.source_origin.1, self.slots.iter().map(|slot|quote(slot)).collect::<Vec<_>>().join(","), self.slot_truncated, quote(if self.continuation.get() {"loop_continuation"} else {"whole_function"}), self.execution_counters, rows, MAX_SITES, self.omitted_sites.get(), self.omitted_pcs.borrow(), self.omitted_sites.get()>self.omitted_pcs.borrow().len());
+        let _ = write!(result, ",\"runtime_counters\":{},\"counter_mode\":{},\"tracked_counter_labels\":[{}],\"saturated_counter_labels\":[{}],\"source_start\":{},\"source_bytes\":{},\"slots\":[{}],\"slot_label_limit_chars\":32,\"slot_label_count_limit\":4,\"slot_labels_truncated\":{:?},\"key_label_limit_chars\":64,\"entry_kind\":{},\"execution_scope\":\"physical optimizing-native entries; normal exits include terminal VM completions; native-control-flow normal completions = normal_exits - terminal_vm_normal_completions, except saturated counters; checked helpers and author calls may execute within native control flow\",\"execution_counters_saturate\":{},\"sites\":[{}],\"site_selection\":\"first eight emitted committed data-read/existing-property-overwrite fast-success, literal-comparison, ordered literal-case-dispatch or borrowed-owner-window commit PCs; one dispatch event counts the group, not skipped comparisons; one borrowed event counts a committed local copy or call-input materialization, not its loads or call completion; creation, loop-scalar field operations, element accesses and other operation families excluded; no estimate for omitted sites\",\"site_limit\":{},\"omitted_site_count\":{},\"omitted_pcs\":{:?},\"omitted_pc_list_truncated\":{}}}", self.runtime_counters || self.execution_counters, quote(mode), tracked, saturated, self.source_origin.0, self.source_origin.1, self.slots.iter().map(|slot|quote(slot)).collect::<Vec<_>>().join(","), self.slot_truncated, quote(if self.continuation.get() {"loop_continuation"} else {"whole_function"}), self.execution_counters, rows, MAX_SITES, self.omitted_sites.get(), self.omitted_pcs.borrow(), self.omitted_sites.get()>self.omitted_pcs.borrow().len());
         result
     }
 

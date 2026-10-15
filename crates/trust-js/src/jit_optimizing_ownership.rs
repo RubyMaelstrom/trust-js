@@ -6,6 +6,13 @@
 //! No safepoint may separate a native refcount change from its corresponding SSA/stack move.
 
 use super::*;
+use cranelift_codegen::cursor::Cursor;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_CALLEE_CACHE:std::cell::Cell<bool>=const{std::cell::Cell::new(true)};
+    pub(super) static TEST_CALLEE_CONSTANTS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};
+}
 use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
 
 #[cfg(test)]
@@ -31,6 +38,49 @@ fn record_owner_ir(kind: usize, before: (usize, usize), after: (usize, usize)) {
 }
 
 impl Lowering<'_, '_> {
+    /// The two scalar leaf functions are immutable engine code, with no Realm or
+    /// JS owner. Insert a pure constant before the existing entry prologue only
+    /// when its call is actually emitted. That definition dominates every native
+    /// branch, handler and loop without adding unused constants to numeric bodies.
+    /// FunctionBuilder::cursor permits SSA insertion that touches no locals/CFG;
+    /// every inserted instruction remains charged to the ordinary DFG budget.
+    fn owner_leaf_callee(&mut self, retain: bool) -> Value {
+        let address = if retain {
+            owner_leaf::retain
+        } else {
+            owner_leaf::release
+        } as usize as i64;
+        #[cfg(test)]
+        if !TEST_CALLEE_CACHE.with(std::cell::Cell::get) {
+            return self.b.ins().iconst(types::I64, address);
+        }
+        let index = usize::from(retain);
+        if let Some(callee) = self.owner_leaf_callees[index] {
+            return callee;
+        }
+        let first = self
+            .b
+            .func
+            .layout
+            .entry_block()
+            .and_then(|entry| self.b.func.layout.first_inst(entry));
+        let Some(first) = first else {
+            // The normal lowering always has an entry prologue. A future caller
+            // lacking it retains the complete original per-call emission.
+            return self.b.ins().iconst(types::I64, address);
+        };
+        let callee = self
+            .b
+            .cursor()
+            .at_inst(first)
+            .ins()
+            .iconst(types::I64, address);
+        self.owner_leaf_callees[index] = Some(callee);
+        #[cfg(test)]
+        TEST_CALLEE_CONSTANTS.with(|count| count.set(count.get() + 1));
+        callee
+    }
+
     pub(super) fn owner_leaf_count(&mut self, counter: usize, amount: Value) {
         if let Some(record) = self.diagnostics.filter(|record| record.runtime_counters) {
             let address = self
@@ -57,11 +107,6 @@ impl Lowering<'_, '_> {
         let Some(signature) = self.owner_leaf_sig else {
             return false;
         };
-        let helper = if retain {
-            owner_leaf::retain
-        } else {
-            owner_leaf::release
-        };
         if let Some(record) = self.diagnostics {
             record.emitted_helpers.set(record.emitted_helpers.get() + 1);
             record
@@ -75,7 +120,7 @@ impl Lowering<'_, '_> {
             let one = self.b.ins().iconst(types::I64, 1);
             self.owner_leaf_count(diagnostics::OWNER_LEAF, one);
         }
-        let callee = self.b.ins().iconst(types::I64, helper as usize as i64);
+        let callee = self.owner_leaf_callee(retain);
         let call = self.b.ins().call_indirect(signature, callee, &[value]);
         let status = self.b.inst_results(call)[0];
         if self

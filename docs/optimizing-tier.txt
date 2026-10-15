@@ -1,4 +1,4 @@
-Optimizing tier — development record, 2026-10-14
+Optimizing tier — development record, 2026-10-15
 ================================================================
 
 Current implementation and decision
@@ -51,6 +51,61 @@ hot-compilation budget; this static result does not establish application repaym
 Release compilation validates finalized CLIF once before code generation instead of
 repeating internal development checks. Debug/tests and TRUST_JS_OPT_JIT_VERIFY=1 keep
 those repeated checks. Invalid input IR is still rejected before executable allocation.
+
+Selected native PCs and bounded borrowed operands (2026-10-15)
+--------------------------------------------------------------
+TRUST_JS_OPT_JIT_BORROWED_OPERANDS=1 explicitly opts into borrowed operand windows.
+Unset or 0 keeps them off, independently of the optional optimizing backend's own
+feature and runtime controls. Eligible fresh ordinary entries can combine one private
+LoadLocal; StoreLocal copy, or at most eight trailing consecutive LoadLocal inputs
+immediately before an actual CallWithThis. Earlier call inputs remain ordinary owning
+stack values. Prepared/resumable entries and continuations are excluded, as are inline
+source positions, interior control-flow entries, polls and stress recovery boundaries.
+Every consumed operation must be selected Native in the same original CFG block with
+the certified stack depth and opaque floor. Other cases retain the established path.
+
+During the borrowed phase, canonical or SSA source homes keep their owners. Each
+original load retains its TDZ check unless its exact existing initialization proof
+already removes it; checks and inputs stay in source order. Preparation validates the
+running packed-owner ABI. A nonobserving bounded leaf checks the live owner words,
+aliases, counts, overflow and last-owner conditions before committing any ownership
+change. It neither allocates nor invokes GC, author code or final destruction. Failure
+resumes the VM before the first selected load with its original owning prefix and dirty homes,
+so original TDZ/error positions and effects are preserved. Success installs the owned
+copy or materializes owning call inputs before invoking the unchanged call lowering at
+its actual CallWithThis PC. No borrow crosses that call or another effect. Compiled artifacts retain no JavaScript
+objects or extra owning value tables; runtime copies and call inputs retain their required owners.
+
+The optional compiler builds its physical native-PC plan only after the final filtered
+borrowed, literal-comparison and ordered-dispatch plans. It revalidates their exact
+original operations and successor endpoints rather than retaining dead independent
+labels for every bytecode. Actual entry, handler/resumption, abrupt-completion and
+forced-deopt roots and the original end-PC mapping remain. A borrowed call preserves
+its original call operation and endpoint+1 continuation. Cold cuts terminate in the
+same invocation's VM before the original operation; they gain no fabricated native
+outgoing edge. Consumed fusion interiors are not workload-unseen blocks. The original
+Chunk, semantic CFG, stack/frame plans, positions and VM continuation metadata remain
+complete. Invalid or conflicting certificates decline native compilation. Production
+uses selected labels; the dense-label ablation is test-only, not a runtime switch.
+
+Admission charges full original-graph scans, declined analysis attempts, bounded
+minimum-path work and actual window/helper/recovery preparation. Replaced numeric
+owner-check opportunities are removed; borrowing and omitted labels gain no new
+semantic saved-work credit. Immutable owner-helper addresses are hoisted lazily only
+when emitted, with their instructions still charged by the normal IR budget. Existing
+entry guards, body bounds, configured thresholds, admission floors, prior cost coefficients
+and hard IR/block caps remain unchanged. Admission distance is recomputed from the charged
+estimate: selected-PC preparation adds 64 * (original_ops + 1) estimated work units, and
+borrowed-window analysis/lowering/recovery adds its work when enabled. Targets and
+eligibility can therefore change without a configured threshold override. Smaller graphs
+or earlier compiler eligibility do not establish framework native entry,
+compilation repayment or application performance acceptance.
+
+Normative basis: ECMA-262 e28783d5fc9dc12b3de905961e2c71410b38a202,
+GetValue, PutValue and ArgumentListEvaluation preserve reference and argument order:
+https://tc39.es/ecma262/#sec-getvalue
+https://tc39.es/ecma262/#sec-putvalue
+https://tc39.es/ecma262/#sec-runtime-semantics-argumentlistevaluation
 
 Current acceptance direction (user instruction, October 14): prioritize Speedometer
 3.1 segments and actual browser pages using widely used frameworks. Selected suites
@@ -1031,8 +1086,11 @@ and retirement preserves active native leases. See background-codegen-experiment
 the complete queue, retry, shutdown and memory-accounting contract. It remains off by default.
 
 TRUST_JS_OPT_JIT_DIAGNOSTICS=execution observes physical optimizing-native entries, exits,
-terminal VM recoveries, specialization misses/retirement and at most eight emitted committed
-named-property fast-success PCs. It excludes the broader Full-mode helper/owner instrumentation.
+terminal VM recoveries, specialization misses/retirement and the first eight emitted committed
+data-property read/existing-overwrite, literal-comparison, ordered-case-dispatch or borrowed
+owner-window PCs. One dispatch event counts the group, not skipped comparisons; a borrowed
+event counts a committed local copy or owning call-input materialization, not its loads or
+call completion. It excludes the broader Full-mode helper/owner instrumentation.
 Whole-function and loop-continuation retirement use their respective live miss state. A normal
 native ABI exit may include a completed VM recovery; subtract terminal VM normal completions
 to identify normal exits through native control flow, except when counters saturate. Checked

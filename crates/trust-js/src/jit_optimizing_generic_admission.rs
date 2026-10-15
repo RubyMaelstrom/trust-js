@@ -321,6 +321,7 @@ pub(super) fn minimum_path(
         objects,
         regions,
         None,
+        None,
     )
 }
 
@@ -334,6 +335,7 @@ fn minimum_path_with_values(
     objects: Option<&super::object_facts::Plan>,
     regions: Option<&observed_regions::Plan>,
     values: Option<&super::value_facts::ValuePlan>,
+    borrowed: Option<&super::borrowed_operands::Plan>,
 ) -> Option<u32> {
     let ops = chunk.jit_ops();
     let blocks = cfg.blocks();
@@ -408,6 +410,12 @@ fn minimum_path_with_values(
         }
         let mut prefix = distance[id].checked_sub(weights[id])?;
         for pc in block.start..block.end {
+            if borrowed.is_some_and(|plan| plan.site(pc).is_some()) {
+                // A count/layout/TDZ failure resumes BEFORE this unchanged owner
+                // window. It may happen on every entry and does not retire code;
+                // later numeric/literal/field savings cannot pay this exit.
+                minimum = minimum.min(prefix);
+            }
             if let Some(credit) = per_pc[pc] {
                 prefix = prefix.checked_add(credit)?;
             } else if may_throw(chunk, pc, objects, values) {
@@ -483,6 +491,7 @@ pub(super) fn admission_entries(
 /// This remains the original <=256-op/no-handler path bound; large bodies use their named
 /// ordinary-reachable branch-union heuristic instead. Every emitted category guard is debited
 /// once. Literal owner work is not an exact count of removed type tests.
+#[cfg(test)] // Tests retain the original-op-only bound as an explicit negative control.
 #[allow(clippy::too_many_arguments)] // One combined certificate; no owning proof state.
 pub(super) fn minimum_saved_work(
     chunk: &Chunk,
@@ -493,6 +502,25 @@ pub(super) fn minimum_saved_work(
     regions: Option<&observed_regions::Plan>,
     literals: Option<&super::string_literals::Plan>,
     values: Option<&super::value_facts::ValuePlan>,
+) -> Option<u32> {
+    minimum_saved_work_with_borrowed(
+        chunk, cfg, numeric, structural, objects, regions, literals, values, None,
+    )
+}
+
+/// Includes exact before-window terminal owner failures, without assuming the
+/// ownership transaction succeeds or granting the window any new saved work.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn minimum_saved_work_with_borrowed(
+    chunk: &Chunk,
+    cfg: &Cfg,
+    numeric: Option<&super::specialization::Plan>,
+    structural: Option<&Plan>,
+    objects: Option<&super::object_facts::Plan>,
+    regions: Option<&observed_regions::Plan>,
+    literals: Option<&super::string_literals::Plan>,
+    values: Option<&super::value_facts::ValuePlan>,
+    borrowed: Option<&super::borrowed_operands::Plan>,
 ) -> Option<u32> {
     if chunk.jit_ops().len() > 256 {
         return None;
@@ -534,6 +562,7 @@ pub(super) fn minimum_saved_work(
         objects,
         regions,
         values,
+        borrowed,
     )?;
     let guards = numeric.map_or(0, |plan| plan.inputs.len() + plan.properties.len());
     let guards = u32::try_from(guards)

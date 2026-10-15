@@ -29,12 +29,20 @@ pub(super) struct Site {
 }
 
 impl Site {
-    fn end(self) -> usize {
+    pub(super) fn end(self) -> usize {
         self.start + self.count * 5
     }
 
-    fn branch(self, index: usize) -> usize {
+    pub(super) fn branch(self, index: usize) -> usize {
         self.start + index * 5 + 3
+    }
+
+    pub(super) fn count(self) -> usize {
+        self.count
+    }
+
+    pub(super) fn native_identity(self) -> (usize, u16, usize, usize) {
+        (self.start, self.slot, self.first_load, self.count)
     }
 
     /// The same conservative switch/helper/publication price used before IR emission.

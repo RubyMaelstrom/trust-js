@@ -178,8 +178,11 @@ compilation/static counts and emits the ordinary uninstrumented body. Instrument
 IR is larger and still subject
 to the same compiler limits; diagnostic runs cannot be acceptance timings.
 `TRUST_JS_OPT_JIT_DIAGNOSTICS=execution` separately records physical optimized entries,
-normal/error exits, terminal VM recoveries, specialization retirement and up to eight
-committed named-property fast-success sites. Normal exits include recovered VM completions;
+normal/error exits, terminal VM recoveries, specialization retirement and the first eight
+emitted committed data-property read/existing-overwrite, literal-comparison, ordered-case
+or borrowed-owner-window sites. One dispatch event counts its group; one borrowed event
+counts a local copy or owning call-input materialization, not its loads or call completion.
+Normal exits include recovered VM completions;
 native control flow may still call checked helpers or author code. Loop-continuation and
 whole-function retirement use separate miss states. Creation, computed elements and scalar
 loop-field accesses are outside the site counters. Execution counters saturate; the legacy
@@ -203,6 +206,17 @@ Neither compiler eligibility nor forced fixture execution establishes real-frame
 `TRUST_JS_OPT_JIT_SHARED_OWNERS=1` separately moves single-owner retain/release checks into
 validated scalar native leaves with no allocation, GC, callbacks or final destruction.
 It is off by default; alias-aware multi-owner transactions retain their existing guarded implementation.
+`TRUST_JS_OPT_JIT_BORROWED_OPERANDS=1` explicitly enables bounded borrowed operands in
+fresh ordinary optimizing entries; unset or `0` keeps it off. It selects one private
+`LoadLocal; StoreLocal` copy or up to eight consecutive trailing `LoadLocal` inputs
+immediately before an actual `CallWithThis`. Source homes keep their owners; original
+TDZ checks and input order remain. All alias/count/layout/last-owner checks precede one
+owner transaction, and misses resume before the first selected load with the original
+owning prefix and dirty local state. Call inputs become owned before the unchanged call;
+no callback, GC, poll or other effect occurs during the borrowed phase. Prepared,
+resumable, continuation and inline-position windows retain ordinary lowering. This adds
+no semantic benefit credit, and displaced numeric owner-check opportunities are removed.
+See `docs/optimizing-tier.txt` for selection and compiler-work boundaries.
 `TRUST_JS_OPT_JIT_SHARED_RECOVERY=0` disables shared terminal recovery blocks, whose grouping
 preserves exact dirty locals, owning stack suffixes and the originating before-effect PC.
 `TRUST_JS_OPT_JIT_BACKGROUND=1` experiments with bounded worker code generation in hot mode,
@@ -286,12 +300,24 @@ objects. The control is off by default and its implementation compiles out witho
 only for reachable blocks unobserved in the collection window. Such a path resumes the
 same invocation in the VM before its first operation. Entered and Unknown blocks retain
 native lowering; all original frame, CFG, handler and unsupported-operation checks remain.
-Certified cold-block interiors have no native labels; their original block-entry cuts,
-exception destinations and complete VM frame still remain. Forced-deopt and loop-continuation
-compilation retain every required original PC. Ordinary VM exits do not count as
+Certified cold-block interiors have no native labels. Native-reachable cuts still resume
+before the original block entry; a Cut leader with no native predecessor or required root
+can also omit its independent label. Original exception destinations and complete VM
+metadata remain. Forced-deopt and loop-continuation compilation retain every required
+original PC. Ordinary VM exits do not count as
 specialization misses. This experiment retains the 256-operation hot admission limit
 unless the separate large-region policy below is enabled, and is off by default; see
 `docs/observed-regions-experiment.txt` for recovery and cost-accounting contracts.
+Within the optional compiler, native-PC planning follows the final selected borrowed,
+literal and dispatch certificates. It omits only independent native labels with no
+required native entry; it does not renumber bytecode or shorten the original Chunk,
+semantic CFG, stack/frame tables or source positions. Original entry, handler, resume,
+abrupt-completion and stress destinations and the end-PC mapping remain. VM cuts finish
+the same invocation before their original operation; fusion interiors are not classified
+as unobserved workload. Dense-label comparison is test-only. Full original-graph planning
+and selected-window lowering/recovery work remain charged to admission; labels earn no
+semantic credit. Existing configured thresholds, floors, prior cost coefficients and
+compiler caps remain unchanged; added work can change recomputed admission distances.
 `TRUST_JS_OPT_JIT_LARGE_REGIONS=1` separately admits observed parts of ordinary bodies
 with 257 through 4096 bytecodes in normal hot mode. It requires coverage and observed
 regions, a frozen entered entry and a reachable cold cut; unknown or missing feedback

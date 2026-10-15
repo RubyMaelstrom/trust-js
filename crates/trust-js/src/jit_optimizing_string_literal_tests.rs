@@ -1190,7 +1190,8 @@ fn ordinary_hot_literal_only_and_zero_formal_bodies_publish_without_threshold_ov
         )
         .unwrap();
         assert_eq!(credit, 1);
-        let mut work = analysis_work(baseline.jit_ops().len()).unwrap();
+        let mut work = analysis_work(baseline.jit_ops().len()).unwrap()
+            + native_pcs::analysis_work(baseline.jit_ops().len()).unwrap();
         // Group construction is attempted even when this source has no contiguous
         // switch chain; the original scan must not be free merely because it fails.
         work += string_dispatch::analysis_work(baseline.jit_ops().len()).unwrap();

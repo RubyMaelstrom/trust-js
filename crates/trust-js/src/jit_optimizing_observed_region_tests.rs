@@ -1123,8 +1123,9 @@ fn real_hot_background_publication_uses_frozen_regions_and_keeps_the_256_op_gate
     // comparisons. Price the possible Object reachability filter conservatively;
     // this fixture does not inject category samples to force a particular plan.
     assert!(string_literals::Plan::build(&primary, &cfg, &stack, Some(&regions), None).is_none());
-    let literal_work =
-        string_literals::analysis_work_with_filter(primary.jit_ops().len(), true).unwrap();
+    let literal_work = string_literals::analysis_work_with_filter(primary.jit_ops().len(), true)
+        .unwrap()
+        + native_pcs::analysis_work(primary.jit_ops().len()).unwrap();
     let distance = generic_admission::admission_entries_with_work(&primary, saved, literal_work)
         .unwrap()
         .max(4096);

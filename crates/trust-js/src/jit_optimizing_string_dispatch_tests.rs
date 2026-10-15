@@ -172,7 +172,8 @@ fn ordinary_hot_grouped_switch_publishes_with_full_work_and_real_native_dispatch
             true,
         )
         .unwrap()
-        + group.lowering_work(&stack).unwrap();
+        + group.lowering_work(&stack).unwrap()
+        + native_pcs::analysis_work(baseline.jit_ops().len()).unwrap();
     let target = generic_admission::admission_entries_with_work(&baseline, saved, work)
         .unwrap()
         .max(4096);

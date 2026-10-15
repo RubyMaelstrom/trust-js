@@ -80,6 +80,7 @@ pub(super) struct Work {
     pub(super) call_imports: u64,
     pub(super) literal_analysis: u64,
     pub(super) literal_dispatch_lowering: u64,
+    pub(super) borrowed_operands: u64,
 }
 
 impl Work {
@@ -90,7 +91,8 @@ impl Work {
             .checked_add(self.cold_recovery)?
             .checked_add(self.call_imports)?
             .checked_add(self.literal_analysis)?
-            .checked_add(self.literal_dispatch_lowering)
+            .checked_add(self.literal_dispatch_lowering)?
+            .checked_add(self.borrowed_operands)
     }
 
     pub(super) fn admission_entries(&self, opportunities: u32) -> Option<u64> {
@@ -161,7 +163,8 @@ pub(super) fn work(
     }
     let original_labels = u64::try_from(chunk.jit_ops().len().checked_add(6)?)
         .ok()?
-        .checked_mul(2)?;
+        .checked_mul(2)?
+        .checked_add(super::native_pcs::analysis_work(chunk.jit_ops().len())?)?;
     let frame_words = frame.tracked.len().div_ceil(64).max(1);
     let original_frame = u64::try_from(
         chunk
@@ -180,6 +183,7 @@ pub(super) fn work(
         call_imports,
         literal_analysis: 0,
         literal_dispatch_lowering: 0,
+        borrowed_operands: 0,
     })
 }
 
