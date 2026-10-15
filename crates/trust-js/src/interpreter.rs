@@ -9662,7 +9662,9 @@ impl Interp {
     /// The parameter name a still-mapped `arguments[key]` aliases, if any.
     pub(crate) fn mapped_arg_name(&self, ptr: usize, key: &str) -> Option<String> {
         let (_, names) = self.mapped_arguments.get(&ptr)?;
-        let idx: usize = key.parse().ok()?;
+        // ParameterMap keys are exact array-index strings, not every spelling
+        // accepted by an unsigned integer parser (for example, "00" or "+0").
+        let idx = crate::value::canonical_index(key)? as usize;
         names.get(idx)?.clone()
     }
 
@@ -9708,8 +9710,8 @@ impl Interp {
     /// Unmap an `arguments` index (delete / defineProperty severs the parameter alias).
     pub(crate) fn unmap_argument(&mut self, ptr: usize, key: &str) {
         if let Some((_, names)) = self.mapped_arguments.get_mut(&ptr) {
-            if let Ok(idx) = key.parse::<usize>() {
-                if let Some(slot) = names.get_mut(idx) {
+            if let Some(idx) = crate::value::canonical_index(key) {
+                if let Some(slot) = names.get_mut(idx as usize) {
                     *slot = None;
                 }
             }
@@ -9808,12 +9810,12 @@ impl Interp {
         receiver: Value,
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
     ) -> Result<bool, Abrupt> {
-        // A mapped `arguments` index aliases its parameter binding: writes update the parameter
-        // (and the own property, so unmapped reads and enumeration stay consistent).
+        // Arguments [[Set]] updates its ParameterMap only when the arguments object
+        // itself is Receiver. A proxy forwarding to it must preserve a distinct Receiver.
         if !self.mapped_arguments.is_empty() {
-            if let Value::Obj(o) = base {
+            if let (Value::Obj(o), Value::Obj(r)) = (base, &receiver) {
                 let ptr = Rc::as_ptr(o) as usize;
-                if self.mapped_arg_write(ptr, key, &value) {
+                if Rc::ptr_eq(o, r) && self.mapped_arg_write(ptr, key, &value) {
                     // Update the own property's value in place — its attributes (e.g. a
                     // configurable:false from defineProperty) must survive.
                     let mut b = o.borrow_mut();
@@ -9936,6 +9938,21 @@ impl Interp {
         };
 
         let ptr = Rc::as_ptr(&obj) as usize;
+        if matches!(obj.borrow().exotic, Exotic::Arguments) {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record(
+                    crate::feedback::PropertyOutcome::Exotic,
+                    Some(obj.borrow().props.shape()),
+                    0,
+                    None,
+                );
+            }
+            // The mapped same-receiver case above keeps its direct write. Every
+            // other Arguments [[Set]] uses OrdinarySet with the original Receiver,
+            // including proxy forwarding and primitive or rejecting receivers.
+            return crate::builtins::reflect_ordinary_set(self, base, key, value, &receiver)
+                .map_err(Abrupt::Throw);
+        }
         // A module namespace exotic object's [[Set]] always fails: in strict code (all module code
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
         // property is resolved first, so a binding still in its TDZ throws ReferenceError instead.
@@ -10240,9 +10257,10 @@ impl Interp {
                     }
                     return Ok(false);
                 }
-                // A proxy receiver gets the write as CreateDataProperty through its
-                // [[DefineOwnProperty]] trap.
-                if self.proxies.contains_key(&rptr) {
+                // Proxy and arguments receivers require their [[DefineOwnProperty]]:
+                // observable traps and live parameter mappings must not be bypassed.
+                let arguments_receiver = matches!(r.borrow().exotic, Exotic::Arguments);
+                if arguments_receiver || self.proxies.contains_key(&rptr) {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
                             crate::feedback::PropertyOutcome::Exotic,

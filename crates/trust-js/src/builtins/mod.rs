@@ -48,6 +48,10 @@ mod weakrefs;
 mod array_length_tests;
 
 #[cfg(test)]
+#[path = "../arguments_set_tests.rs"]
+mod arguments_set_tests;
+
+#[cfg(test)]
 #[path = "../array_shift_tests.rs"]
 mod array_shift_tests;
 
@@ -1478,8 +1482,8 @@ fn global_fn(it: &Interp, name: &str, len: usize, f: NativeFn) {
 
 /// OrdinarySet(target, key, value, receiver): walks target's prototype chain to find the controlling
 /// descriptor, then applies the result on `receiver` (which may differ from `target`). Returns the
-/// success boolean. Proxies on the chain fall back to the receiver-less [[Set]].
-fn reflect_ordinary_set(
+/// success boolean. Proxies on the chain receive the original Receiver through their [[Set]].
+pub(crate) fn reflect_ordinary_set(
     i: &mut Interp,
     target: &Value,
     key: &str,
@@ -1499,7 +1503,13 @@ fn reflect_ordinary_set(
     loop {
         if proxy_pair(i, &current).is_some() {
             // A proxy's [[Set]] returns its own success boolean (via the trap or a forwarded [[Set]]).
-            return ab(i.set_member_recv(&current, key, value, receiver.clone()));
+            // [[Set]] itself reports rejection as false even when the calling script is
+            // strict. PutValue's caller applies strictness after this internal operation.
+            let strict = i.strict;
+            i.strict = false;
+            let result = i.set_member_recv(&current, key, value, receiver.clone());
+            i.strict = strict;
+            return ab(result);
         }
         // Integer-indexed exotic [[Set]] — applies to the target or any TypedArray reached along
         // the prototype chain. With the TypedArray itself as receiver, TypedArraySetElement
@@ -1636,7 +1646,7 @@ pub(crate) fn reflect_define_on_receiver(
     // OrdinarySetWithOwnDescriptor calls the receiver's [[DefineOwnProperty]], not [[Set]].
     // Re-running [[Set]] here would invoke its own/inherited setter instead of defining a
     // data property, and would repeat the prototype search on the wrong object.
-    if matches!(ro.borrow().exotic, Exotic::Array) {
+    if matches!(ro.borrow().exotic, Exotic::Array | Exotic::Arguments) {
         let mut descriptor = PartialDesc {
             value: Some(value),
             ..PartialDesc::default()
@@ -1650,7 +1660,9 @@ pub(crate) fn reflect_define_on_receiver(
                 descriptor.configurable = Some(true);
             }
         }
-        return ab(define_own_property_ordinary(i, &ro, key, &descriptor));
+        // Arguments [[DefineOwnProperty]] also updates a live parameter map. A raw
+        // property write here would leave the mapped binding (and subsequent Get) stale.
+        return ab(define_own_property_record(i, &ro, key, &descriptor));
     }
     match existing {
         Some(ep) if ep.accessor() || !ep.writable() => Ok(false),

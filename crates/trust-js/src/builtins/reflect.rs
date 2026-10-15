@@ -109,6 +109,12 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
+            if matches!(o.borrow().exotic, Exotic::Arguments) {
+                // Arguments [[Delete]] severs a parameter mapping only after a
+                // successful ordinary deletion. Share the delete operator's path;
+                // a proxy trap that merely reports success never reaches this branch.
+                return ab(i.delete_prop_with(Value::Obj(o), &key, false));
+            }
             // A TypedArray integer index can't be deleted; a canonical-numeric non-index reports true.
             if let Some(info) = ta_info(i, &o) {
                 match i.ta_index_kind(&info, &key) {
