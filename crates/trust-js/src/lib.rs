@@ -88,6 +88,8 @@ mod gc_edges;
 mod gc_generational;
 mod gc_handle;
 mod gc_native;
+#[cfg(test)]
+mod gc_scan_spike;
 mod gc_sweep;
 #[cfg(test)]
 mod group_by_tests;

@@ -431,7 +431,7 @@ record deviations here *before* deviating.
 | Stage | Status | Commit(s) | Gate evidence |
 | --- | --- | --- | --- |
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
-| S0 | not started | — | — |
+| S0 | awaiting owner go/no-go | 97b40245 + spike commit | census/bucket/inventories recorded; spike 3/3 release tests pass; string oracle passes; wasm32 run deferred to S1 (no toolchain) |
 | S1 | not started | — | — |
 | S2 | not started | — | — |
 | S3 | not started | — | — |

@@ -625,6 +625,41 @@ mod tests {
         assert_eq!(s.as_str(), "abcdabcd");
     }
 
+    /// P1-S0e oracle: JS `s += x` accumulation must stay amortized after
+    /// the GC string migration (plan Decision 4). Geometric capacity
+    /// growth is the observable proxy: a quadratic replacement that
+    /// reallocates exact-size per append fails the capacity bound, and a
+    /// uniqueness-based one fails the aliasing assertions above.
+    #[test]
+    fn accumulation_scaling_oracle_geometric_capacity_and_aliasing() {
+        let chunk = LStr::from("abcdefgh");
+        let mut s = LStr::from("");
+        let mut alias_at_1k = None;
+        for i in 0..10_000 {
+            s = s.concat_owned(&chunk);
+            if i == 999 {
+                alias_at_1k = Some(s.clone());
+            }
+        }
+        assert_eq!(s.len(), 80_000);
+        assert!(s.as_str().starts_with("abcdefgh"));
+        assert!(s.as_str().ends_with("abcdefgh"));
+        let cap = (s.hdr().cap.get() & !ASCII_HINT) as usize;
+        assert!(
+            cap <= 4 * s.len(),
+            "capacity {cap} not geometric vs len {}",
+            s.len()
+        );
+        let alias = alias_at_1k.unwrap();
+        assert_eq!(alias.len(), 8_000, "alias must not observe later appends");
+        // Doubling self-append through an alias stays correct.
+        let a = LStr::from("xy");
+        let b = a.clone();
+        let a = a.concat_owned(&b);
+        assert_eq!(a.as_str(), "xyxy");
+        assert_eq!(b.as_str(), "xy");
+    }
+
     #[test]
     fn owned_concat_retains_conservative_hints_and_clears_for_unicode() {
         let s = LStr::alloc_with_hint("abc", 3, false);

@@ -223,3 +223,92 @@ S0c inventories (counts are non-test greps unless noted):
 Pending in S0: (d) rooting spike + written scanning contract + wasm32
 mechanism decision; (e) string accumulation replacement selection +
 scaling tests. Owner go/no-go after those land.
+
+S0d rooting spike + scanning contract draft (2026-10-15)
+--------------------------------------------------------
+Spike code: crates/trust-js/src/gc_scan_spike.rs (test-only, cfg(test)).
+Toolchain: rustc 1.99.0 (b940084d7 2026-09-28), aarch64, release opt.
+All results below are this toolchain only.
+
+Results (cargo test --release, 3 passed):
+1. Recognized forms, with safepoint spill: raw pointer, tagged word
+   (tag-masked), interior pointer (+3 words), struct-field pointer all
+   found through a call boundary + volatile spill area.
+2. Without spill, same-frame scan in optimized code found only
+   {arena-base, struct-field} of {raw, tagged, interior, struct-field}:
+   the compiler kept sole references in registers. The register-spill
+   step at collection entry is therefore mandatory, exactly as Boehm
+   warns; scanning is a contract, not a construction.
+3. stacker segments are invisible to a main-stack scan and visible in
+   their own range. Guessing bounds around a segment local segfaulted
+   twice during the spike (guard pages both sides): segment bounds
+   must come from a registry with exact ranges.
+4. Scan cost: 100 scans of 1 MiB in 24ms with volatile reads
+   (~0.24 ms/MiB, an upper bound; production plain reads are faster).
+   At typical live stack depths (<=256 KiB scanned) this is tens of
+   microseconds per collection — acceptable, will re-measure in S1.
+
+Scanning contract (draft, for S1 to encode; owner-approved at go/no-go):
+- Supported: rustc/LLVM as recorded above, aarch64 (+x64 re-validation
+  on zombie at S6), shipped codegen settings. Re-run spike tests on
+  every toolchain bump (they are compliance evidence, not proof).
+- Recognized forms across any allocation point: raw cell pointer;
+  tagged word (recognized after payload masking); interior pointer
+  within cell bounds (page metadata). FORBIDDEN as sole reference:
+  integer-cast addresses (as_ptr as usize round-trips — 68 sites
+  inventoried), XOR/offset-obscured pointers, references reconstructable
+  only from non-pointer data.
+- Safepoint protocol: collection entered only via allocation slow
+  path (a call); entry captures a register snapshot (S1 chooses asm
+  capture vs setjmp-style buffer) and scans snapshot + stack ranges +
+  registered root ranges. Rust-heap containers are traced/registered,
+  never scanned.
+- stacker: grown segments are no-GC regions (I9 pending-collect) until
+  registered with exact bounds. S1's first task chooses: (a) wrapper
+  deriving exact bounds, validated by a bounds-precision test, or
+  (b) replace stacker::grow on GC-relevant paths with an engine-owned
+  mmap grow with known bounds. Until then, collecting allocation
+  inside an unregistered segment defers, never scans blindly.
+- JIT frames comply via I7 (registers never hold sole references;
+  canonical slots are stack-resident and scanned).
+
+wasm32 decision: no stack scanning possible; no wasm toolchain exists
+on this box (no rustup/wasm-pack/wasmtime; system rustc only), so the
+prototype run is DEFERRED to S1 with tooling installation as its
+prerequisite — recorded honestly rather than faked. Mechanism decided:
+collection at (i) task boundaries, (ii) bytecode-VM loop safepoints
+where state is canonical in CompactFrame slots (precisely rootable,
+no Rust-local sole references at those points by VM design — S2 must
+prove per-safepoint), (iii) native call entry/exit, never mid-native.
+Long JS evaluations therefore stay bounded; a single long native
+builtin allocating unboundedly is the residual risk, accepted for the
+playground-scoped wasm crate and revisited if that changes. The S2
+wasm32 sustained-allocation acceptance test remains mandatory.
+
+S0e string accumulation decision (2026-10-15)
+---------------------------------------------
+Current mechanism: concat_owned(self) consumes the handle;
+append_in_place only when strong==1 (lstr.rs:311-326);
+append_prop_fast (interpreter.rs:8783) takes the slot value out,
+drops the stack copy to manufacture uniqueness, grow-copies once if
+aliased, then appends amortized. Oracle test added:
+lstr::tests::accumulation_scaling_oracle_geometric_capacity_and_aliasing
+(10k appends, capacity <= 4x len, alias at 1k unaffected) — passes.
+
+Decision: builder-cell typestate. GC strings are immutable flat
+cells. A distinct builder cell kind holds a geometric buffer and
+exists ONLY inside the single slot being accumulated: first += on a
+flat string converts it (one copy) to a builder in that slot;
+subsequent += appends in place; ANY other read of the slot freezes
+(builder -> flat copy handed out; builder may persist in the slot).
+Builders never escape as Values, so uniqueness holds by construction
+with no refcount and no sole-reference proof. Aliasing cost = one
+freeze copy per aliasing read, matching today's grow-copy-once
+behavior class. concat_owned maps directly (flat->builder convert or
+builder append). Cons/rope rejected for P1: every string consumer
+would need rope-aware reads; builder/freeze confines complexity to
+the existing += fast paths (AppendProp, eval Add, builtins concat).
+
+S0 status: a/b/c/d/e complete except wasm32 prototype run (deferred,
+above) and Speedometer smoke (not run; fixtures only). Proposed S6
+thresholds in S0b section. Awaiting owner go/no-go for S1.
