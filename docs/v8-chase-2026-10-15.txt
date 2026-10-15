@@ -1,0 +1,108 @@
+Chasing V8: re-architecture program (2026-10-15)
+================================================
+
+Decisions (owner, 2026-10-15)
+-----------------------------
+1. Target: V8 is the reference embeddable engine; "credible" means
+   chasing it. Acceptance surface: framework workloads (Vue/React/Djot
+   fixtures, Speedometer 3.1) compared against Node/V8 on this ARM64
+   machine. x64 (zombie) remains secondary.
+2. Direction: GC-managed object model first, then a speculative
+   optimizing tier (inlining, type speculation, deoptimization).
+3. Continuity: a big-bang branch is allowed. This work lives on
+   `rearch/v8-chase`; `main` stays shippable and keeps receiving the
+   incremental pilot line. The branch may break embedding/tests while
+   the new object model is under construction, but must return to full
+   gates before any merge.
+
+Why object model first when GC collection is ~1%?
+-------------------------------------------------
+Collection pauses really are ~1% (measured below); nobody should sell
+this phase as "fixing GC time". The argument is the representation tax
+plus sequencing:
+
+- Every object today is Rc<RefCell<ObjData>> plus a separately
+  allocated property Vec (Props entries). That is 2+ allocations per
+  object, incref/decref traffic on every Value copy in the
+  interpreter, bytecode VM, templates, and regions, RefCell borrow
+  checks on hot paths, and pointer-chasing layout (RcBox -> ObjData
+  -> Props -> entries Vec -> entry). None of that appears as "GC" in
+  a profile; it is spread across every operation.
+- Value/object layout is baked into every JIT template and region via
+  JitLayout offsets. A speculative tier built first would hardcode
+  RcBox layout, exact refcount maintenance at every deopt point, and
+  allocation shapes that a GC heap would invalidate; the tier would
+  be built twice. The removed Cranelift tier (4.5x kernels, ~0 on
+  apps) is the standing warning about optimizing on this substrate.
+- Escape analysis / allocation sinking / cross-call load elimination
+  (the optimizations that actually close app-level gaps) require
+  cheap bump allocation and freedom from per-copy refcount semantics.
+
+Phase 0 measurements (2026-10-15, crystal aarch64, CPU 5)
+---------------------------------------------------------
+Method: /tmp/spec-pilot/trust-js-R1-lto (main e3310993, fat LTO),
+fixtures in benchmark-results/engine-optimization-20260929/,
+TRUST_JS_PERF_METRICS=1, perf stat whole-process counters, Node
+v24.21.0 same fixtures. Single runs; treat as attribution, not gates.
+
+Vue (elapsed_ms trust 642 this run / ~550 paired-median; node 117):
+- gc_pause 6.8ms (~1.1% of elapsed), 2 collections, 19,677 objects
+  seen by the cycle collector. Collection is NOT the problem.
+- native builtin time 0.369s total. Top: Array.prototype.shift
+  0.231s across only 671 calls (~343us each), push 0.041s/1425,
+  Map.set 0.038s/23796, Map.get 0.019s/78747, isArray 0.012s/140601.
+- 26,480 user functions created (25,446 arrows); jit inline 9/38.
+React (72ms vs node 17): native_s ~0.000; virtually all time is JS
+execution (interp/bytecode/templates/regions), 4,502 functions
+created. This is the substrate/call-cost fixture.
+Djot: native 0.042s led by RegExp exec 0.025s/27412 and string ops;
+JIT compile 0.038s is material at this scale.
+
+perf stat, Vue whole process:
+                task-clock  instructions  cache-misses  branch-misses
+  trust-js        649ms       3.298e9        22.49e6        1.61e6
+  node            168ms       0.737e9         2.72e6        2.98e6
+We execute ~4.5x the instructions with ~8.3x the cache misses, and
+fewer branch misses than V8. Read: too much generic code per
+operation, and a cache-hostile object graph. That is exactly the
+signature the object model + tier program targets; it is not a
+"one hot function" profile.
+
+Independent finding: Array.prototype.shift at ~343us/call on Vue is
+an algorithmic/builtin problem (spec-ordered generic per-element
+moves on large arrays, presumably) that no tier or GC change will
+fix by itself. Such builtin work is branch-independent and may land
+on main at any time; Phase 1 success metrics must not silently
+depend on it.
+
+Phases and gates
+----------------
+P0 (done): decisions + attribution above; branch created.
+P1: GC heap + object model on this branch. Deliverables: tracing GC
+  (mark-sweep first, generational later only if measured), handle/
+  root discipline replacing Rc<RefCell<ObjData>>, single-allocation
+  objects with inline property slots + out-of-line overflow, shapes
+  carried over (incl. Pilot C descriptor-class encoding), string
+  representation review. Design doc for P1 must be recorded and
+  owner-approved before code. Exit gates to merge: full lib suite +
+  Test262 parity with main; framework fixtures no slower than main
+  beyond an explicitly accepted bound; Vue instructions and
+  cache-misses measurably improved at equal or better elapsed;
+  embed API restored.
+P2: Baseline strengthening: call path (frame/argument costs),
+  feedback completeness for the future tier, builtin algorithmics
+  (shift class), RegExp.
+P3: Speculative optimizing tier: inlining, type speculation with
+  deopt, global load elimination, escape analysis/allocation
+  sinking, range analysis. Reuse Pilot A-C/R1 guard infrastructure
+  (class shapes, landing, region facts) as the proof layer.
+P4: Long-tail parity: strings, JSON, collections, startup snapshots.
+
+Expectation setting: P1 alone is expected to be roughly
+performance-neutral-to-modestly-positive on elapsed time (its payoff
+is enabling P3 and cutting instructions/cache misses); V8-class
+ratios only become reachable after P3. If P1 measurements contradict
+this (no instruction/cache movement), stop and re-plan before P2.
+
+Status: P0 complete. Next action: P1 design record (heap/layout/
+handle migration plan) for owner approval before code.
