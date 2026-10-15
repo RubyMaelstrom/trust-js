@@ -5521,6 +5521,7 @@ fn emit_prop_load_inline(
     let slow = a.new_label();
     let done = a.new_label();
     let load = a.new_label();
+    let load_data = a.new_label();
     let load_kc = a.new_label();
     let absent_hit = a.new_label();
     // 1. receiver must be an Obj (tag 8); x10 = its stored Rc pointer, kept live for the final
@@ -5760,7 +5761,10 @@ fn emit_prop_load_inline(
             a.b_cond(C_NE, miss);
         }
         a.mov_imm64(13, st.slot as u64);
-        a.b(load);
+        // Baked states are data-only by construction and their shapes now encode the
+        // descriptor class, so the validated slot is provably a data property: take
+        // the guard-free landing.
+        a.b(load_data);
     };
     let generic_entry = a.new_label();
     for (index, st) in baked.iter().enumerate() {
@@ -5818,19 +5822,28 @@ fn emit_prop_load_inline(
     //    stale cache would be memory-unsafe, so verify), then entry = entries + slot*size;
     //    data property; non-BigInt
     let val = a.new_label();
+    let val_body = a.new_label();
     let accessor_hit = a.new_label();
+    let emit_entry = |a: &mut asm::Asm| {
+        a.ldr_imm(16, 11, en_len);
+        a.cmp_reg_x(13, 16);
+        a.b_cond(C_HS, slow);
+        a.ldr_imm(15, 11, en);
+        a.mov_imm64(16, es);
+        a.madd(15, 13, 16, 15);
+    };
+    // Baked (data-only, shape-proven-class) hits skip the descriptor-kind guard.
+    a.bind(load_data);
+    emit_entry(a);
+    a.b(val_body);
     a.bind(load);
-    a.ldr_imm(16, 11, en_len);
-    a.cmp_reg_x(13, 16);
-    a.b_cond(C_HS, slow);
-    a.ldr_imm(15, 11, en);
-    a.mov_imm64(16, es);
-    a.madd(15, 13, 16, 15);
+    emit_entry(a);
     a.bind(val);
     // An accessor at the validated slot is not a miss: the chain shapes, holder and slot
     // are already proven, so record them for the helper's validated accessor path instead
     // of discarding the validation and re-deriving the resolution in Rust.
     guard_prop_data(a, 9, 15, ea, accessor_hit);
+    a.bind(val_body);
     if layout.entry_accessor == layout.entry_value + 8 {
         // Heap and execution words share the encoding; clone only the actual owner.
         a.ldur(12, 15, ev);

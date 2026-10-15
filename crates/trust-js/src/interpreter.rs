@@ -8436,7 +8436,11 @@ impl Interp {
                         rb.props.property_at(st.slot as usize)
                     };
                     if let Some(p) = property {
-                        if p.accessor() == accessor {
+                        // Shapes encode descriptor class and every production mutation
+                        // path demotes on class change, so a shape-matched slot's kind
+                        // is the recorded one; only key-checked (array-holder) states,
+                        // whose slot is not shape-proven, still compare live.
+                        if p.accessor() == accessor || !keychk {
                             return self.snapshot_cached_get(
                                 p,
                                 name,
@@ -8487,7 +8491,7 @@ impl Interp {
                             hb.props.property_at(st.slot as usize)
                         };
                         if let Some(p) = property {
-                            if p.accessor() == accessor {
+                            if p.accessor() == accessor || !keychk {
                                 return self.snapshot_cached_get(
                                     p,
                                     name,
