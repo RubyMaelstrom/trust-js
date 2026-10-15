@@ -106,3 +106,120 @@ this (no instruction/cache movement), stop and re-plan before P2.
 
 Status: P0 complete. Next action: P1 design record (heap/layout/
 handle migration plan) for owner approval before code.
+
+Phase 1 S0 findings (2026-10-15, crystal aarch64, CPU 5)
+=========================================================
+Plan: docs/v8-chase-p1-plan-2026-10-15.txt (a9e20f0f). S0.0 fixtures
+preserved at 73c9d135. Census binary: main e3310993 + feature
+architecture-diagnostics, no LTO (diagnostics are not acceptance
+timings). Bucket binary: /tmp/spec-pilot/trust-js-R1-lto (= e3310993
+fat LTO), perf record -F 4000 cycles, 8 Vue runs, ~20k samples.
+
+S0a allocation census ([allocation-diagnostic] final report per fixture;
+raw JSON in /tmp/spec-pilot/census-{vue,react,djot}.json):
+- Vue: 154,075 object allocations; 2,969 live at first collection
+  (98.1% dead). Families by allocation: ordinary 89,787; array 38,197;
+  wrapper 26,091 (primitive wrappers, builtins/mod.rs:10104). Top sites:
+  interpreter.rs:7635 function creation 26,480 (= PERF_METRICS function
+  creations), interpreter.rs:6731 make_array_from_raw 25,793,
+  interpreter.rs:5936 new_object 23,918, builtins/mod.rs:4961 23,095.
+- React: 29,931 allocs, 1,020 live (96.6% dead); ordinary 25,421.
+- Djot: 122,278 allocs, 1,305 live (98.9% dead); ordinary 69,715
+  (eval.rs:7388 alone 54,539), array 49,747.
+- 100% of tracked deaths on all three fixtures are
+  deaths_before_completed_collection: the cycle collector reclaims
+  approximately nothing in these workloads; refcounting does all of it.
+  A tracing collector inherits the full churn (30k-154k cells per run
+  to mark/reclaim), which is small in absolute terms but must be
+  measured under sustained allocation, per plan.
+- Lifetimes (allocation-ordinal buckets): Vue 85k/151k deaths within 16
+  allocations of birth, long tail (7.9k > 65k); Djot more uniform.
+  Infant mortality is high everywhere -> non-moving generational
+  collection has plausible future value; S0 prices it as: worth
+  revisiting post-P1 with nursery candidates = ordinary+array families.
+- Live property shape: named entries per live object 1.79 (Vue), 3.01
+  (React), 2.99 (Djot); entries capacity/length 2.48x-3.44x
+  (over-reservation); 25% of live Vue objects have zero named entries.
+  Eligible-vec histograms cover only the all-default subset (<=4 entries:
+  783/796 on Vue) and do not directly give the general distribution.
+  Working hypothesis for S3: 4 inline slots; MUST be confirmed by an
+  overflow-rate measurement during S3, not assumed.
+
+S0b ownership-cost bucket (sampled cycles self-time, Vue; symbols
+classified in /tmp/spec-pilot/bucket.py over /tmp/spec-pilot/vue-report.txt):
+- ownership drop/clone glue 9.05% (top: drop_glue<Value> 2.56%,
+  PackedValue::drop 2.44%, drop_glue<LStr> 1.12%)
+- PackedValue pack/unpack conversions 4.96% (pack 3.87%)
+- Props indirection 3.88% (Props::get 2.33%)
+- GC registry/edges 0.76%
+- Rust alloc/Vec growth 4.70% (partly P1-addressable: fewer, larger
+  allocations; not counted in the threshold proposal)
+- call path 7.84% (Phase 2/3 territory, not P1)
+P1-addressable lower bound ~= 18.7% of sampled cycles. Caveats: cycles,
+not instructions; inline Rc increfs inside other symbols are invisible
+to sampling (true ownership share is higher); tracing adds marking cost
+back. Proposed S6 thresholds for owner go/no-go: (i) Vue whole-process
+instructions -10% or better vs e3310993 (3.298e9 -> <=2.97e9), paired
+perf stat; (ii) sampled ownership-bucket share at least halved under
+the same bucket script; (iii) peak RSS <= +25% vs e3310993 on fixtures;
+(iv) total GC time <=5% on fixtures and on the sustained-allocation
+workload (to be added in S1/S2).
+
+S0c inventories (counts are non-test greps unless noted):
+- Roots: Interp has ~167 pub(crate) fields in the sampled range; root
+  categories: intrinsics/prototypes (Gc fields), vm_pool
+  Vec<CompactFrame>, native_arg_pool Vec<Vec<Value>>, stub/property-key/
+  regex caches (ByteLru with LStr values), global_env_pins (Weak),
+  gc_pins FastMap<usize, Gc> (existing explicit pinning),
+  shadow_realms FastMap<usize, Box<Interp>> (nested agents on one
+  thread), job_script_contexts, realm/promise/temporal state. Full
+  per-field root registration list is S1/S2 implementation work against
+  this struct; no field may be assumed scanned (Rust-heap containers).
+- Address-keyed tables: 136 total (56 in interpreter.rs alone), incl.
+  class_info, construct_ics, map_data (ordered_collection),
+  weak_collection_data, array_buffers(+versions/dirty/immutable/
+  host_keyed), typed_arrays, data_views, regexps, proxies, promises,
+  unhandled_rejections, temporal(+cal), realms, gc_pins, ta_buffer.
+  All need I8 sweep hooks at S2; map_data/typed_arrays/array_buffers
+  are payload-move candidates (S3/S4).
+- Opaque storage: NativeClosure = dyn Fn(&mut Interp, Value, &[Value])
+  (value.rs:88), Callable::Opaque(Rc<NativeClosure>) (value.rs:1722) —
+  captures are arbitrary Rust state and may hold Values untraceably
+  today; wall_clock and two host hooks are Rc<dyn Fn> with non-Value
+  signatures. NativeClosure needs a mandatory trace companion or a
+  no-Values-in-captures rule at S2 (Decision 2).
+- Refcount-observable: 194 strong_count/get_mut/is_unique sites
+  non-test (incl. tests in same files). Production-semantic ones to
+  disposition individually in S2: array_binding.rs ownership heuristics,
+  value.rs:550/620/660-681/727 (pack/unpack owner counting),
+  value.rs:3906 Rc::get_mut on shared layout (copy-on-write),
+  parser.rs:3746 Rc::get_mut (AST, unaffected), jit_cache.rs strong
+  counts on code objects (not JS heap), lstr unique append (Decision 4).
+- I9 surface: 737 borrow_mut() call sites non-test; cross-allocation
+  subset unknown (idiomatic temporary-borrow pattern confirmed at
+  builtins/mod.rs:3278). Sizing requires the S2 retrofit pass with
+  debug assertions on — plan assumes worst case (pervasive).
+- Side-effectful Drop impls to disposition for I5: Object (value.rs:2074,
+  registry removal), Gc (gc_handle.rs:103), PackedValue, Property,
+  InlinePacked, LStr, SymbolData, WeakMetadata, JsonRecord; AST/regex/
+  snapshot Drops are compiler-side, unaffected.
+- Pointer-hiding vs scanning contract: 68 into_raw/as_ptr-as-usize
+  round-trip sites non-test; 629 Rc::as_ptr sites total. Address-keyed
+  usize tables hold addresses as integers (false-retention risk only,
+  while a real handle exists elsewhere; sole-ownership-via-usize sites
+  must be found in the S0d contract audit).
+- Threads: production thread::spawn uses are test-only except a regex
+  test canceller carrying Arc<RuntimeInterrupt> (no Values); execution
+  is single-threaded per agent. stacker::grow is used on execution
+  paths (interpreter.rs:4123 eval, regex, snapshot) -> scanner must
+  enumerate grown segments; stacker exposes no segment-list API, so S0d
+  must wrap grow calls with our own segment registry or scan from a
+  recorded stack base per segment. This is the spike's hardest sub-item.
+- Downstream: trust-js-host re-exports trust_js::embed (curated);
+  borrow-pattern mentions in trust-js-web (lib.rs, wasm/exec.rs) and
+  trust-js-node (napi.rs) need the S6 audit; nothing found that reaches
+  Object internals outside the embed surface in host/runtime crates.
+
+Pending in S0: (d) rooting spike + written scanning contract + wasm32
+mechanism decision; (e) string accumulation replacement selection +
+scaling tests. Owner go/no-go after those land.

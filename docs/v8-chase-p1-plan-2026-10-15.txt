@@ -430,7 +430,7 @@ record deviations here *before* deviating.
 
 | Stage | Status | Commit(s) | Gate evidence |
 | --- | --- | --- | --- |
-| S0.0 | not started | — | — |
+| S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | not started | — | — |
 | S1 | not started | — | — |
 | S2 | not started | — | — |
