@@ -8777,6 +8777,77 @@ fn typeof_tdz() {
 }
 
 #[test]
+fn named_property_assignment_checks_receiver_tdz_before_rhs() {
+    // ECMA-262 e28783d5, Property Accessors / Assignment Operators:
+    // GetValue of the receiver precedes evaluation of the assignment RHS.
+    let bodies = [
+        "receiver.x = rhs(); let receiver = {};",
+        "receiver.x = rhs(); const receiver = {};",
+        "receiver.x = rhs(); class receiver {}",
+        "'use strict'; receiver.x = rhs(); let receiver = {};",
+        "var receiver = {}; { receiver.x = rhs(); let receiver = {}; }",
+        "receiver.x += rhs(); let receiver = {};",
+        "receiver[key()] = rhs(); let receiver = {};",
+    ];
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        for body in bodies {
+            let declaration = format!("function subject(){{{body}}}");
+            let ast = crate::parser::parse_script(&declaration, false)
+                .ok()
+                .expect("TDZ fixture parses");
+            let crate::ast::Stmt::FuncDecl(function) = &ast[0] else {
+                panic!("function declaration");
+            };
+            assert!(crate::bytecode::compile(function).is_some(), "{body}");
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            let source = format!(
+                "var trace=''; function rhs(){{trace+='rhs';throw 'rhs';}}\n\
+                 function key(){{trace+='key';return 'x';}}\n\
+                 {declaration}\n\
+                 for(var i=0;i<8;i++){{try{{subject();trace+='missing';}}\n\
+                 catch(e){{trace+=e.name+';';}}}}trace"
+            );
+            assert_eq!(
+                run_in(&mut engine, &source),
+                "ReferenceError;".repeat(8),
+                "{tier:?}: {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn initialized_receivers_keep_named_store_fast_paths() {
+    for source in [
+        "function subject(receiver){receiver.x=42;}",
+        "function subject(){var receiver={};receiver.x=42;}",
+        "function subject(){this.x=42;}",
+    ] {
+        let ast = crate::parser::parse_script(source, false)
+            .ok()
+            .expect("named-store control parses");
+        let crate::ast::Stmt::FuncDecl(function) = &ast[0] else {
+            panic!("function declaration");
+        };
+        let chunk = crate::bytecode::compile(function).unwrap();
+        assert!(
+            chunk.jit_ops().iter().any(|op| matches!(
+                op,
+                crate::bytecode::Op::SetPropLocalDrop(..)
+                    | crate::bytecode::Op::SetPropThisDrop(..)
+            )),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn typeof_name_preserves_getter_exceptions_and_their_identity() {
     // ECMA-262 typeof only special-cases an unresolvable Reference. Abrupt
     // completions from GetValue must propagate, even ReferenceError/undefined.

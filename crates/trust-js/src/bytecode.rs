@@ -13588,8 +13588,8 @@ impl Compiler {
                 }
             },
             // Receiver-direct statement stores: `this.x = v` (always safe — `this` can't be
-            // reassigned) and `slotlocal.x = v` when the RHS provably can't reassign the local
-            // (the receiver is read at set time, after the RHS — evaluation order must agree).
+            // reassigned) and `slotlocal.x = v` when reading the local cannot throw and the RHS
+            // provably can't reassign it (the receiver is read at set time, after the RHS).
             Expr::Member {
                 obj: mobj,
                 prop,
@@ -13600,7 +13600,9 @@ impl Compiler {
                 && match &**mobj {
                     Expr::This => !self.lexical_this && !self.derived_constructor,
                     Expr::Ident(name, _) => {
-                        matches!(self.home(name), Some(Home::Slot(..))) && no_assign_to(value, name)
+                        matches!(self.home(name), Some(Home::Slot(slot, _))
+                            if !self.tdz_slots.contains(&slot))
+                            && no_assign_to(value, name)
                     }
                     _ => false,
                 } =>
