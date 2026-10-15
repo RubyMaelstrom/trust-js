@@ -95,3 +95,10 @@ The [borrowed-operands comparison](review-borrowed-operands-react-2026-10-15.txt
 records a separate native x86-64 React SSR result: 2.65% less rendering-and-equality
 time with 2.44% higher peak RSS. It covers the exact frozen compiler probe and
 keeps the optional optimization disabled by default.
+
+The [held activation and native-call candidate](review-activation-native-calls-validation-2026-10-15.json)
+passed scoped correctness checks but retains four Vue component concerns in a descriptive
+three-pair browser screen. The combined engine source remains isolated and is not promoted
+to main; preserving a review checkpoint does not change that decision.
+The [43-component paired results](review-activation-speedometer-components-2026-10-15.csv)
+retain all three baseline/candidate values and cost ratios without editing the frozen CSV.

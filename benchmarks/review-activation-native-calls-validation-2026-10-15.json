@@ -1,0 +1,406 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-15",
+  "status": "HOLD: combined default candidate is isolated and not promoted to main",
+  "integration_decision": {
+    "decision": "HOLD",
+    "production_promoted": false,
+    "review_checkpoint_branch": "review/activation-native-calls-20261015",
+    "checkpoint_meaning": "The separate local review checkpoint preserves tested work; preservation does not promote production changes or authorize a merge to main.",
+    "reason": "Four Vue component concerns remain in the fixed descriptive browser screen; scoped correctness passes do not establish default-candidate performance acceptance.",
+    "wind_down": "No further browser experiment is planned during wind-down. Retain the fixed cohort and all original failures; the separate own-read experiment remains separate.",
+    "main_engine_revision_at_measurement": "d43ac048fc592ad35f6674e76028dd0e2b7a33ab"
+  },
+  "isolated_candidate_changes": [
+    "Logical mapped activations and guarded strict fresh-closure context inlining preserve actual callees, environments, full source positions and canonical recovery.",
+    "ARM64/x86-64 shared calls preserve the full call-site token; x86-64 includes pooled-frame direct calls and registered Windows unwind metadata.",
+    "Formal observer barriers, captured receiver/reference ownership, scalar compiler pooling and opt-in atomic shared-owner batches compose with selected native PCs and bounded operand borrowing."
+  ],
+  "isolated_candidate_defaults": "In the isolated candidate, optimizing runtime policy, context inlining and shared owners remain opt-in. No threshold or compiler cap was raised. The candidate also changes default template/reflection and x86-64 direct-call implementation; none of this cumulative engine patch is promoted to main.",
+  "source": {
+    "validated_engine_inventory": {
+      "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/source-before.json",
+      "sha256": "fea68e7d1d1fadd2986798774fc52d36680dd53ba69731fbe3c873b440a059d7",
+      "bytes": 131437
+    },
+    "validated_source_files": 853,
+    "final_test_only_delta": {
+      "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/v3-test-only.patch",
+      "sha256": "3975311a469472b2e0bbfc69f375180bad4ddc57438a42b6bc1b9a90f1d45825",
+      "bytes": 2575
+    },
+    "production_identity": "The final escaped-Arguments fixture changes one cfg(test) file from V3; the other 852 files, including all production/build inputs, are byte-identical. The isolated review checkout preserves d43 documentation and adds documentation only.",
+    "excluded": "The separate borrowed own-read experiment is outside this candidate.",
+    "source_scope": "Candidate code lives in isolated source snapshots and the authenticated patches below. Main engine source remains d43; this report is documentation of held work.",
+    "engine_reproduction": {
+      "base_commit": "1b87397ca9e6886ac5c66eca33ab73fd8c065fe2",
+      "cumulative_patch": {
+        "path": "target/compiler-review-20261015/activation-selected-borrowed-composition-v3/main-relative.patch",
+        "sha256": "9fbf62f2fc9de0054dcbc389b1b938f589e304b83cd5ee7e6d4c3fab47f4c62b",
+        "bytes": 956104
+      },
+      "final_test_only_patch": {
+        "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/v3-test-only.patch",
+        "sha256": "3975311a469472b2e0bbfc69f375180bad4ddc57438a42b6bc1b9a90f1d45825",
+        "bytes": 2575
+      },
+      "expected_inventory": {
+        "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/source-before.json",
+        "sha256": "fea68e7d1d1fadd2986798774fc52d36680dd53ba69731fbe3c873b440a059d7",
+        "bytes": 131437
+      },
+      "procedure": "In a separate checkout at the base, apply the cumulative patch then the final test-only patch and verify all 853 inventory entries. Do not replace main or discard its d43 documentation. The named local review checkpoint is for preservation only."
+    },
+    "isolated_engine_identity_proof": {
+      "path": "target/compiler-review-20261015/activation-promotion-review-v1/source-identity-proof.json",
+      "sha256": "d24ca1dab12ea82cbb08d67d6eb4e1f830e2855a988b410475f23a06d0da74c2",
+      "bytes": 3069
+    },
+    "review_base": "d43ac048fc592ad35f6674e76028dd0e2b7a33ab"
+  },
+  "root_correctness_gate": {
+    "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/root-correctness-gate.json",
+    "sha256": "cb294461207b9726f5c648e54bc25520d2c3ea3903f508a0fddb8aa7c78fb74c",
+    "bytes": 4475
+  },
+  "historical_incomplete_broad_run": {
+    "status": "Incomplete earlier broad run; never a completed full-suite pass",
+    "timeout_seconds": 1800,
+    "observed_output": {
+      "exact_test_list_name_pass_rows": 2063,
+      "additional_decorated_should_panic_success_rows": 1,
+      "failed_selectors": 33,
+      "ignored_rows": 3,
+      "outer_summary_present": false
+    },
+    "count_qualification": "The extra successful row is the harness-decorated resource-ID should-panic test. These are observed output rows, not final full-suite totals.",
+    "broad_result": {
+      "path": "target/compiler-review-20261015/activation-main-integration-v1/broad-results.json",
+      "sha256": "66dfb955153531930096bf832d033d1e6e2cb22399f3ef86d891356e8f978472",
+      "bytes": 5797
+    },
+    "raw_stdout": {
+      "path": "target/compiler-review-20261015/activation-main-integration-v1/broad.stdout",
+      "sha256": "98735196138fb811dba6642f2f88be805a8d0e98e120f1defbe00874685f0391",
+      "bytes": 198335
+    },
+    "later_failure_mapping": {
+      "path": "target/compiler-review-20261015/activation-promotion-readiness-peer-v1/historical-33-classification.json",
+      "sha256": "830308853d13e11908dc0303bb9f91e591b40c69b054afcdffec58bb48501887",
+      "bytes": 84185
+    },
+    "later_selected_evidence": {
+      "failed_selectors_with_subsequent_passes": 33,
+      "passes_in_earlier_335_configuration_cohort": 30,
+      "passes_in_affected_24_parent_successor": 3,
+      "unchanged_original_test_segments": 26,
+      "documented_test_corrections": {
+        "inventory": 1,
+        "route_eligibility": 1,
+        "actual_compiler_work_oracles": 5
+      },
+      "unresolved_among_these_33": 0
+    },
+    "scope": "All 33 historical failure selectors later passed in selected scopes. This does not complete the timed-out broad run, prove all unexecuted cases, or create a fresh full-suite, 335-configuration or 390-parent result.",
+    "root_rehash_audit": {
+      "path": "target/compiler-review-20261015/activation-promotion-readiness-peer-v1/root-historical-failure-audit.json",
+      "sha256": "4c55b7ffbe580b90a013e82923bd2dc91e38daade57dbaf73432c411908f38d0",
+      "bytes": 437
+    }
+  },
+  "arm64": {
+    "earlier_broad_cohort": {
+      "configurations": 335,
+      "passed": 326,
+      "failures_retained": 9,
+      "audit": {
+        "path": "target/compiler-review-20261015/activation-selected-borrowed-composed-validation-v1/root-original-cohort-audit.json",
+        "sha256": "be81252dd5f9577db3fe73689f1758d195dc203da7c3f2ec35612f0adcd98042",
+        "bytes": 1997
+      }
+    },
+    "test_only_successor": {
+      "affected_parents": 24,
+      "passed": 23,
+      "escaped_arguments_cleanup_assertion_retained": 1,
+      "audit": {
+        "path": "target/compiler-review-20261015/activation-selected-borrowed-composed-validation-v2/root-selected-raw-audit.json",
+        "sha256": "d4ef618e6fceb4e0149fe1c627c5b80b9090a6880da751c64018bc8ccf805fe6",
+        "bytes": 776
+      }
+    },
+    "fresh_final_corrected_fixture": {
+      "parents": 1,
+      "successful_children": 4,
+      "modes": "shared calls 0/1 \u00d7 Full/Execution",
+      "actual_full_test_list": 2723,
+      "artifact_sha256": "94759c652fc191b9ba312e2d7fdbd3388d1c39b5bd2154ae32d92f86132ada3d",
+      "audit": {
+        "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-v1/root-fresh-arm-result-audit.json",
+        "sha256": "21dfd3398554a021d8f6479f9b5bfcb80c1b4122cc1de4c351a7c0ca25d55664",
+        "bytes": 823
+      }
+    },
+    "carry_scope": "311 unaffected passing configurations retain the earlier source provenance. The other 23 affected parents passed on production-identical V3; the corrected parent freshly verifies native/recovery/full-site/retirement assertions and real escaped AO/environment reclamation. No fresh run of all 335 configurations on the final source is claimed.",
+    "strict_checks": "V3 optional-feature all-target Clippy with -D warnings and default all-target check passed. These remain labeled V3; the final fixture-only successor was freshly built and executed.",
+    "strict_checks_audit": {
+      "path": "target/compiler-review-20261015/activation-selected-borrowed-composed-validation-v2/root-strict-checks-audit.json",
+      "sha256": "bd1d17c50f28811aa95dbea1928985f12a029717ff9ab33061241737dbcd8890",
+      "bytes": 402
+    }
+  },
+  "x86_64": {
+    "carried_v3_parents": {
+      "GNU_Linux_default": "13/13",
+      "GNU_Linux_optional": "178/179",
+      "MSVC_under_Wine_default": "13/13",
+      "MSVC_under_Wine_optional": "184/185"
+    },
+    "prior_failures": "The same escaped-Arguments lifetime assertion failed on both optional variants; both failures remain retained.",
+    "prior_raw_audit": {
+      "path": "target/compiler-review-20261015/activation-combined-native-execution-v1/root-raw-native-audit.json",
+      "sha256": "3d9e62b6bcbeb43caa50a3cbf7e0ff01c8ae0a001fb40863323042f36847b36a",
+      "bytes": 1989
+    },
+    "fresh_corrected_fixture": "One parent freshly passed all four modes on GNU/Linux and on MSVC under Wine; this is not a rerun of all 390 parents.",
+    "fresh_corrected_audit": {
+      "path": "target/compiler-review-20261015/borrowed-activation-arguments-cleanup-native-execution-v1/root-raw-native-audit.json",
+      "sha256": "6438d0570e42f61b6bf0be75a72a3555921cfc1a18fb7918f82fad8ce2fff3a0",
+      "bytes": 958
+    },
+    "platform_scope": "GNU/Linux executes native x86-64. MSVC executables ran under Wine, not on a physical Windows installation."
+  },
+  "scoped_test262": {
+    "source": "V3 ARM64 release; final cfg(test)-only fixture delta leaves the release engine unchanged.",
+    "suite_revision": "d86b2294eb0a17eaa281ff12c73c473ec864c72f",
+    "stages": 10,
+    "file_outcomes": 4086,
+    "distinct_suite_files": 1910,
+    "failures": 0,
+    "skips": 0,
+    "audit": {
+      "path": "target/compiler-review-20261015/activation-selected-borrowed-conformance-v2-results/root-raw-conformance-audit.json",
+      "sha256": "d76a594cbaac7be27b846d19ddeda6331864c1b14c7a26b8fe60f2385143b469",
+      "bytes": 1024
+    },
+    "scope": "Totals and uncapped summaries were checked. This is affected conformance, not the full suite or proof that every file executed optimizing/native/borrowed code."
+  },
+  "existing_SSR_evidence": {
+    "report": {
+      "path": "benchmarks/review-borrowed-operands-react-2026-10-15.txt",
+      "bytes": 14044,
+      "sha256": "2300c1db254e4e3a35865cee4d38a55dd26c5bdb859fe0e3fddd04d8a82bcb30"
+    },
+    "scope": "Existing d43 evidence from a separate frozen 826-file native x86-64 React 19.2.7 SSR probe, not this activation composition.",
+    "observations": "Seven alternating pairs: renderer-and-equality time 2.65% lower, peak RSS 2.44% higher; dashboard-static time 1.76% higher. Exact cases, controls and invalid attempts remain in that report.",
+    "interpretation": "No activation gain or isolated compilation repayment is inferred from the earlier borrowing result."
+  },
+  "browser_build": {
+    "browser_revision": "4ea9b42bf48b29f0298576df527c28bdd5b962d9",
+    "fixture_revision": "1386415be8fef2f6b6bbdbe1828872471c5d802a",
+    "verified_engine_files": 853,
+    "verified_browser_files": 1337,
+    "candidate_sha256": "b8eefab06684dd779480f799e82947e748f1b54e031ddcbf75544fea3d77ae0a",
+    "candidate_bytes": 108597208,
+    "elf_machine": 62,
+    "profile": {
+      "opt_level": 3,
+      "lto": false,
+      "codegen_units": 64,
+      "incremental": true,
+      "strip": "none"
+    },
+    "runtime_engine_features": [
+      "default",
+      "embed",
+      "intl",
+      "optimizing-jit"
+    ],
+    "browser_features": [
+      "default",
+      "mimalloc"
+    ],
+    "fresh_compilation": "Raw Cargo runtime-engine and browser artifacts both have fresh:false; source bindings and the sealed executable were verified.",
+    "compiler_warnings": 4,
+    "compiler_errors": 0,
+    "sealed_inventory": {
+      "path": "target/compiler-review-20261015/activation-browser-final-bound-payload-v1/native-sealed-v1/evidence/final-evidence-inventory.json",
+      "sha256": "0551bb27c6d1a1a35b8a220067206759e7918abdd2c76d6ba01d4f18056c4639",
+      "bytes": 10287
+    },
+    "root_build_audit": {
+      "path": "target/compiler-review-20261015/activation-browser-final-bound-payload-v1/native-sealed-v1/root-build-review.json",
+      "sha256": "e305bb844f5226e2a0867a88f5e5be84dc2c2877f7cb7dfc0cb131d6f5c1dbf3",
+      "bytes": 1204
+    },
+    "scope": "Completed build provenance for the held candidate. Functional and screen evidence are recorded separately below."
+  },
+  "browser_screen": {
+    "status": "Completed fixed three-pair descriptive screen; not performance acceptance",
+    "functionals": {
+      "baseline_exact_Todo_states": 12,
+      "candidate_exact_Todo_states": 12,
+      "ordered_labels_and_states_match": true,
+      "JavaScript_errors": 0,
+      "root_audit": {
+        "path": "target/compiler-review-20261015/activation-browser-final-bound-payload-v1/functionals-sealed-v1/root-functionals-review.json",
+        "sha256": "43d19ff3370d8c42777e996c03605f84a14c00ed245303f4db6938f3510adae3",
+        "bytes": 954
+      },
+      "scope": "Two untimed functional companions; diagnostic timings excluded."
+    },
+    "analysis": {
+      "path": "target/compiler-review-20261015/activation-browser-screen-analysis-v2/current-fixed9-analysis-v1/analysis.json",
+      "sha256": "2c6414d1c85fd0d4f3fd89f79b446e0c14253651af658a8397707764ba8c9d55",
+      "bytes": 286488
+    },
+    "components_csv": {
+      "path": "target/compiler-review-20261015/activation-browser-screen-analysis-v2/current-fixed9-analysis-v1/components.csv",
+      "sha256": "3357aa91ad20ad41e6d18acb25fdbea834f12334f6aecfc105d2c51b8a8d0afe",
+      "bytes": 32210
+    },
+    "analysis_tool_source_freeze": {
+      "path": "target/compiler-review-20261015/activation-browser-screen-analysis-v2/source-freeze.json",
+      "sha256": "b60afbea1d7cc65d858abb443948f9b02bec49f0f55877baa105529615ef0f68",
+      "bytes": 2504
+    },
+    "analysis_tool_peer_source_review": {
+      "path": "target/compiler-review-20261015/activation-browser-screen-analysis-peer-review-v2/review.json",
+      "sha256": "1df40f19bba61ff424db57542ec7e7ff28229f340213d521db3f707c4a5d7c92",
+      "bytes": 9675
+    },
+    "peer_scope": "Tool-source review before current-data analysis, not an independent performance acceptance certificate.",
+    "raw_screen_report": {
+      "path": "target/compiler-review-20261015/activation-browser-measurement-v1/evidence/screen-default-v1/report.json",
+      "sha256": "60d81da582a819793af63314f3cf59d2a4ae6402c7b1bd6c6adbd0bdd9f36b79",
+      "bytes": 416458
+    },
+    "comparison": {
+      "baseline_engine": "6ffb311a727dd949fbbf639e2d0de51cbe5d6732",
+      "candidate": "Combined isolated 853-file engine, not activation-only.",
+      "optimizer_runtime": "TRUST_JS_OPT_JIT=0 for both baseline and candidate",
+      "workload": "Pinned four-suite Speedometer 3.1 headless subset: React, Angular, Vue and jQuery; one cold-to-warm iteration per fresh process.",
+      "processes": "Three Phase0 baseline checks plus three fixed baseline/candidate pairs: nine measured processes; no samples discarded or rerun.",
+      "independent_units": 3,
+      "baseline_ELF_sha256": "18d68b1a4e618896782d9f4afb3de37543a7adf3a8d87d259e6e302f1a5573d2",
+      "baseline_ELF_bytes": 108420632,
+      "profile": "Baseline and candidate both use opt3, no LTO, 64 codegen units, incremental enabled and strip none; exact profile is retained in browser_build.",
+      "runtime_controls": {
+        "baseline_TRUST_JS_OPT_JIT": "0",
+        "candidate_TRUST_JS_OPT_JIT": "0"
+      }
+    },
+    "paired_median_cost_change_percent": {
+      "subset_geomean": 1.555,
+      "React": 0.976,
+      "Angular": 1.89,
+      "Vue": 2.504,
+      "jQuery": 0.633
+    },
+    "resources": {
+      "sampled_process_CPU_change_percent": 1.279,
+      "per_process_peak_RSS_change_percent": -1.481,
+      "scope": "CPU is sampled lower-bound accounting; peak RSS is process memory, not post-GC managed retained memory.",
+      "peak_RSS_pair_ratio_range": [
+        0.8981800903445852,
+        1.0200532504015785
+      ],
+      "peak_RSS_precision": "The three RSS pairs have broad spread and include both directions; the median is not a managed-heap improvement claim."
+    },
+    "Vue_component_concerns": [
+      {
+        "metric": "TodoMVC-Vue/Adding100Items/Sync",
+        "paired_median_cost_increase_percent": 4.005,
+        "phase0_noise_flag": true,
+        "all_three_pairs_slower": false,
+        "all_three_pairs_above_3_percent_cost": false
+      },
+      {
+        "metric": "TodoMVC-Vue/CompletingAllItems/Async",
+        "paired_median_cost_increase_percent": 5.366,
+        "phase0_noise_flag": false,
+        "all_three_pairs_slower": true,
+        "all_three_pairs_above_3_percent_cost": true
+      },
+      {
+        "metric": "TodoMVC-Vue/DeletingAllItems",
+        "paired_median_cost_increase_percent": 3.177,
+        "phase0_noise_flag": false,
+        "all_three_pairs_slower": true,
+        "all_three_pairs_above_3_percent_cost": false
+      },
+      {
+        "metric": "TodoMVC-Vue/DeletingAllItems/Async",
+        "paired_median_cost_increase_percent": 4.938,
+        "phase0_noise_flag": false,
+        "all_three_pairs_slower": true,
+        "all_three_pairs_above_3_percent_cost": true
+      }
+    ],
+    "inference_limit": "N=3 is descriptive. There is no informative distribution-free 95% population-median interval; the observed min/max range is not a 95% interval. Correlated actions and 43 metrics are not extra independent samples. This does not establish speedup, equivalence or absence of regressions.",
+    "attribution_limit": "This compares the 6ff baseline with the combined default candidate at OPT0. It does not isolate activation changes, opt-in optimizer effects, logical execution frequency or the separate React 19 SSR result.",
+    "decision": "HOLD the combined default candidate; no further browser experiment during wind-down.",
+    "root_raw_analysis_audit": {
+      "path": "target/compiler-review-20261015/activation-browser-measurement-v1/root-analysis-review.json",
+      "bytes": 960,
+      "sha256": "9411aefd1eda2b864699cd08de2d7dc888c880d87e8999692efa59f6a6192d79"
+    },
+    "owner_analysis_handoff": {
+      "path": "target/compiler-review-20261015/activation-browser-screen-analysis-v2/current-fixed9-analysis-v1/analysis-handoff.json",
+      "bytes": 62327,
+      "sha256": "007b2da9fdbcf4e1fc2ee6bdaf4a6c4421fe915845186454f16e086e253a4b0b"
+    },
+    "machine": {
+      "host": "zombie",
+      "CPU_model": "Intel(R) Core(TM) i7-6700HQ CPU @ 2.60GHz",
+      "OS": "Linux x86-64",
+      "kernel": "7.2.9-2-cachyos",
+      "physical_cores": 4,
+      "logical_CPUs": 8,
+      "browser_CPU": 5,
+      "controller_CPU": 4,
+      "SMT_sibling_pairs": [
+        [
+          0,
+          4
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          2,
+          6
+        ],
+        [
+          3,
+          7
+        ]
+      ],
+      "browser_core_and_sibling": "CPU 5 is core 1 and shares with CPU 1.",
+      "controller_core_and_sibling": "CPU 4 is core 0 and shares with CPU 0; it is not the browser sibling.",
+      "scaling_governor": "powersave",
+      "scaling_min_kHz": 800000,
+      "scaling_max_kHz": 3500000,
+      "frequency_scope": "Recorded policy limits, not a fixed-frequency or turbo-stability claim.",
+      "sealed_metadata": {
+        "path": "target/compiler-review-20261015/activation-browser-measurement-v1/evidence/machine-before-timing.json",
+        "sha256": "2c0bb28503049aba8453551e248be96dbb454b633a45ce9f908251d32d80616a",
+        "bytes": 14886
+      }
+    },
+    "tracked_components_csv": {
+      "path": "benchmarks/review-activation-speedometer-components-2026-10-15.csv",
+      "sha256": "3357aa91ad20ad41e6d18acb25fdbea834f12334f6aecfc105d2c51b8a8d0afe",
+      "bytes": 32210
+    },
+    "tracked_csv_scope": "Byte-identical copy of the frozen 43-row components.csv, including all three baseline/candidate numbers and loss ratios. No statistic or pair was edited; the log-t column remains sensitivity-only, not a median acceptance certificate."
+  },
+  "limits": [
+    "The root gate reports no unresolved failure in the required selected correctness scope; original failures and their corrections remain traceable.",
+    "This report is not full-suite, whole-workspace, physical-Windows or wasm validation.",
+    "Optional compiler switches remain off by default; native entries and diagnostic counters do not establish application repayment.",
+    "Raw local artifacts are retained evidence, not build dependencies. The separate own-read experiment is excluded.",
+    "The combined default candidate is held outside main. A local review checkpoint and passed correctness gates are not production promotion."
+  ]
+}
