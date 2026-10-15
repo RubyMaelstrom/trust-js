@@ -66,6 +66,7 @@ cachegrind.out.*
 *.md
 !README.md
 !/AGENTS.md
+!/DIAGNOSTICS.md
 !/crates/trust-js-web/src/js/STREAMS_UPSTREAM.md
 !/docs/architecture-outcome-20260929.md
 !/docs/architecture-reassessment-20260928.md
