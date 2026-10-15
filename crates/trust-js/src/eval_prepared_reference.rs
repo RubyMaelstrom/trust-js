@@ -437,9 +437,9 @@ impl Interp {
                     // Revalidate AFTER the RHS / coercions. Writable is a live descriptor
                     // check, not a capture assumption; rejected writes retain their errors.
                     let mut body = reference.object.as_ref().unwrap().borrow_mut();
-                    let (_, property) = body.props.entry_at_mut(reference.slot).unwrap();
+                    let (_, property) = body.props.entry_at(reference.slot).unwrap();
                     if property.writable() {
-                        property.set_value(value);
+                        body.props.set_value_at(reference.slot, value);
                         #[cfg(test)]
                         record_reference_own_path(3);
                         return Ok(());

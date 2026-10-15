@@ -240,6 +240,48 @@ fn class_changing_insert_demotes_but_class_preserving_insert_keeps_shape() {
 }
 
 #[test]
+fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
+    let engine = Engine::new();
+    engine.interp.activate_gc_heap();
+    let mut props = Props::new();
+    props.insert("pc_k", Property::plain(Value::Num(1.0)));
+    let shared = props.shape();
+    assert!(props.set_value("pc_k", Value::Num(2.0)));
+    assert_eq!(props.shape(), shared, "value-only write by key");
+    assert!(props.set_value_at(0, Value::Num(3.0)));
+    assert_eq!(props.shape(), shared, "value-only write by slot");
+    assert!(matches!(props.take_value("pc_k"), Some(Value::Num(n)) if n == 3.0));
+    assert_eq!(props.shape(), shared, "value-only take");
+    assert!(props.set_value("pc_k", Value::Num(4.0)));
+    // Acquiring &mut Property demotes even before any descriptor is touched: the
+    // caller *could* flip the class behind the shape's back.
+    let _ = props.get_mut("pc_k").unwrap();
+    assert_ne!(props.shape(), shared, "mutable escape acquisition demotes");
+
+    // Freeze demotes exactly when a writable data entry flips class.
+    let mut frozen = Props::new();
+    frozen.insert("pc_k", Property::plain(Value::Num(1.0)));
+    let frozen_shape = frozen.shape();
+    frozen.freeze_descriptors();
+    assert_ne!(
+        frozen.shape(),
+        frozen_shape,
+        "freeze flips writable -> demote"
+    );
+    assert!(!frozen.get("pc_k").unwrap().writable());
+    let mut accessor_only = Props::new();
+    accessor_only.insert("pc_k", Property::accessor_prop(None, None, false, true));
+    let accessor_shape = accessor_only.shape();
+    accessor_only.freeze_descriptors();
+    assert_eq!(
+        accessor_only.shape(),
+        accessor_shape,
+        "configurable-only freeze keeps the shape"
+    );
+    assert!(!accessor_only.get("pc_k").unwrap().configurable());
+}
+
+#[test]
 fn replace_properties_preserves_live_prototype_flag() {
     let mut engine = Engine::new();
     let obj = value(&mut engine, "({keep: 1})");

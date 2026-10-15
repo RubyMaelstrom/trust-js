@@ -5,7 +5,6 @@
 use crate::bytecode::Tier;
 use crate::value::{Property, Props, Value};
 use crate::{Completion, Engine};
-use std::rc::Rc;
 
 fn check(source: &str, expected: &str) {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -139,11 +138,14 @@ fn named_copy_shares_only_keys_and_normalizes_flags() {
     source.insert("length", Property::plain(Value::Num(3.0)));
     let mut target = Props::new();
     assert!(target.try_copy_named_data_from(&source));
-    assert_eq!(source.shape(), target.shape());
-    assert!(Rc::ptr_eq(
-        source.shared_layout().unwrap(),
-        target.shared_layout().unwrap()
-    ));
+    // Shapes encode descriptor class: the source `a` is non-writable while the copy is
+    // plain, so only the key layout is shared content-wise and the shape must differ.
+    assert_ne!(source.shape(), target.shape());
+    assert_eq!(source.keys(), target.keys());
+    // A second identical copy reconverges on the same all-writable chain.
+    let mut target2 = Props::new();
+    assert!(target2.try_copy_named_data_from(&source));
+    assert_eq!(target2.shape(), target.shape());
     let property = target.get("a").unwrap();
     assert!(property.writable() && property.enumerable() && property.configurable());
     target.insert("a", Property::plain(Value::lstr("changed")));

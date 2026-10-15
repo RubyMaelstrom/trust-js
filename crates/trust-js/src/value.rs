@@ -3869,9 +3869,6 @@ impl NamedEntries {
     fn get(&self, slot: usize) -> Option<(&Rc<str>, &Property)> {
         Some((self.keys().get(slot)?, self.fields.get(slot)?))
     }
-    fn get_mut(&mut self, slot: usize) -> Option<(&Rc<str>, &mut Property)> {
-        Some((self.layout.as_ref()?.get(slot)?, self.fields.get_mut(slot)?))
-    }
     fn push(&mut self, (key, property): (Rc<str>, Property)) {
         let len = self.len();
         // A template/constructor's predicted next key is already owned once by the layout.
@@ -4580,10 +4577,20 @@ impl Props {
         if source.entries.is_empty() {
             return true;
         }
-        if self.entries.is_empty() && self.elems.0.is_none() && !self.elem_mode.get() {
-            // Shapes encode keys, not attributes. Share the complete live key prefix and shape,
-            // but create independently owned values with CreateDataProperty's default flags.
-            // In particular a frozen source must not produce frozen copied properties.
+        if self.entries.is_empty()
+            && self.elems.0.is_none()
+            && !self.elem_mode.get()
+            && source
+                .entries
+                .fields
+                .iter()
+                .all(|property| property.class() == PropClass::DataWritable)
+        {
+            // Shapes encode (key, class): sharing the source shape is sound only when
+            // every copied field's class matches its plain replacement (all data
+            // writable). Otherwise the per-key insert path below rebuilds the correct
+            // all-writable chain. In particular a frozen source must not produce frozen
+            // copied properties — nor may its non-writable shape be reused for them.
             self.note_structural();
             self.entries.layout = source.entries.layout.clone();
             self.entries.fields.reserve_exact(source.entries.len());
@@ -4789,6 +4796,15 @@ impl Props {
         I: ExactSizeIterator<Item = PackedValue>,
     {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
+        // The copied shape records the template's classes; the instantiated fields are
+        // all plain (data writable), so the template must be too.
+        debug_assert!(
+            self.entries
+                .fields
+                .iter()
+                .all(|property| property.class() == PropClass::DataWritable),
+            "plain object template with a non-writable or accessor field"
+        );
         let entries = NamedEntries {
             fields: values.map(Property::plain_packed).collect(),
             layout: self.entries.layout.clone(),
@@ -5927,6 +5943,11 @@ impl Props {
     pub(crate) fn prototype_slot(&self) -> Option<u32> {
         self.find("prototype").map(|slot| slot as u32)
     }
+    /// Test-only mutable escape (mirror/descriptor fixtures simulate descriptor edits
+    /// through it). Production descriptor changes go through `insert`; value-only writes
+    /// go through `set_value`/`set_value_at`. Acquisition still demotes, matching the
+    /// contract those fixtures must not accidentally rely on.
+    #[cfg(test)]
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Property> {
         if let Some(n) = canonical_index(key) {
             if self
@@ -5946,8 +5967,166 @@ impl Props {
             self.mirror_invalidate(); // could be an element (see `mirror`)
         }
         match self.find(key) {
-            Some(i) => Some(&mut self.entries.fields[i]),
+            Some(i) => {
+                // Handing out `&mut Property` can change the descriptor class behind the
+                // shape's back, so acquiring one for a shape-tracked entry demotes the
+                // shape (array element entries are exempt, as in `remove`). Value-only
+                // writers use `set_value`/`set_value_at` and pay nothing.
+                if !(self.elem_mode.get() && canonical_index(key).is_some()) {
+                    self.demote_shape();
+                }
+                Some(&mut self.entries.fields[i])
+            }
             None => None,
+        }
+    }
+    /// Mint a fresh unique shape: no inline cache recorded against the old id can hit
+    /// again, so any proof it carried (slot, and eventually class) is abandoned.
+    pub(crate) fn demote_shape(&mut self) {
+        self.shape = shape_fresh();
+    }
+    /// Value-only write to an existing property (the caller has established it is a
+    /// writable data property): the descriptor — and therefore the shape class — is
+    /// untouched, so no demotion. Routes to packed element storage exactly like
+    /// `get_mut`. Returns false when the key is absent.
+    pub(crate) fn set_value(&mut self, key: &str, v: Value) -> bool {
+        if let Some(n) = canonical_index(key) {
+            if self
+                .elems
+                .packed_ref()
+                .and_then(|p| p.get(n as usize))
+                .is_some_and(|p| !p.is_empty())
+            {
+                self.mirror_invalidate();
+                return self
+                    .elems
+                    .packed_slice_mut()
+                    .and_then(|p| p.get_mut(n as usize))
+                    .is_some_and(|p| {
+                        p.set_value(v);
+                        true
+                    });
+            }
+        }
+        if key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            self.mirror_invalidate();
+        }
+        match self.find(key) {
+            Some(i) => {
+                self.entries.fields[i].set_value(v);
+                true
+            }
+            None => false,
+        }
+    }
+    /// Value-only write at an already-resolved entries slot (the IC-store form of
+    /// `set_value`). The caller has shape/key-validated the slot and established a
+    /// writable data descriptor there.
+    pub(crate) fn set_value_at(&mut self, slot: usize, v: Value) -> bool {
+        if self
+            .entries
+            .get(slot)
+            .is_some_and(|(k, _)| k.as_bytes().first().is_some_and(|b| b.is_ascii_digit()))
+        {
+            self.mirror_invalidate();
+        }
+        match self.entries.fields.get_mut(slot) {
+            Some(p) => {
+                p.set_value(v);
+                true
+            }
+            None => false,
+        }
+    }
+    /// Move an existing property's value out (leaving `Empty`), descriptor untouched:
+    /// the value-only counterpart used by the string-concatenation store path, which
+    /// immediately writes a replacement value back through `set_value`.
+    pub(crate) fn take_value(&mut self, key: &str) -> Option<Value> {
+        if let Some(n) = canonical_index(key) {
+            if self
+                .elems
+                .packed_ref()
+                .and_then(|p| p.get(n as usize))
+                .is_some_and(|p| !p.is_empty())
+            {
+                self.mirror_invalidate();
+                return self
+                    .elems
+                    .packed_slice_mut()
+                    .and_then(|p| p.get_mut(n as usize))
+                    .map(Property::take_value);
+            }
+        }
+        if key.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            self.mirror_invalidate();
+        }
+        let i = self.find(key)?;
+        Some(self.entries.fields[i].take_value())
+    }
+    /// Merge `get`/`set` into an EXISTING accessor descriptor at `key` (the
+    /// `__defineGetter__`/`__defineSetter__` and accessor-merge paths): the class stays
+    /// Accessor, so no demotion. Returns false when there is no entry or it is a data
+    /// descriptor — the caller then takes its ordinary insert path, which demotes.
+    pub(crate) fn merge_accessor(
+        &mut self,
+        key: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) -> bool {
+        let Some(i) = self.find(key) else {
+            return false;
+        };
+        let p = &mut self.entries.fields[i];
+        if !p.accessor() {
+            return false;
+        }
+        if get.is_some() {
+            p.set_getter(get);
+        }
+        if set.is_some() {
+            p.set_setter(set);
+        }
+        true
+    }
+    /// Install the deferred function-`prototype` thunk at a resolved slot: a value-only
+    /// replacement (the `prototype` descriptor itself never changes), so no demotion.
+    pub(crate) fn defer_function_prototype_at(
+        &mut self,
+        slot: usize,
+        owner: &Gc,
+        parent: Gc,
+        template: &Props,
+    ) -> bool {
+        match self.entries.fields.get_mut(slot) {
+            Some(p) => {
+                p.defer_function_prototype(owner, parent, template);
+                true
+            }
+            None => false,
+        }
+    }
+    /// `Object.freeze`'s descriptor pass: every own data property becomes non-writable
+    /// and every own property non-configurable. Demotes once when a shape-tracked
+    /// entry actually flips class (writable -> non-writable).
+    pub(crate) fn freeze_descriptors(&mut self) {
+        if let Some(packed) = self.elems.packed_slice_mut() {
+            for p in packed.iter_mut() {
+                if !p.is_empty() {
+                    p.set_writable(false);
+                    p.set_configurable(false);
+                }
+            }
+        }
+        let mut class_changed = false;
+        for p in self.entries.fields.iter_mut() {
+            if !p.accessor() && p.writable() {
+                class_changed = true;
+            }
+            p.set_writable(false);
+            p.set_configurable(false);
+        }
+        if class_changed {
+            self.demote_shape();
         }
     }
     pub(crate) fn contains(&self, key: &str) -> bool {
@@ -5970,18 +6149,6 @@ impl Props {
     #[inline]
     pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
         self.entries.fields.get(slot)
-    }
-    /// Mutable [`entry_at`], for the property write inline cache.
-    #[inline]
-    pub(crate) fn entry_at_mut(&mut self, slot: usize) -> Option<(&Rc<str>, &mut Property)> {
-        if self
-            .entries
-            .get(slot)
-            .is_some_and(|(k, _)| k.as_bytes().first().is_some_and(|b| b.is_ascii_digit()))
-        {
-            self.mirror_invalidate(); // could be an element (see `mirror`)
-        }
-        self.entries.get_mut(slot)
     }
     /// Drop every property (used by the GC to break a garbage object's reference cycles).
     pub(crate) fn clear(&mut self) {

@@ -20046,9 +20046,9 @@ impl Chunk {
                 if matches!(g.exotic, crate::value::Exotic::None)
                     && g.props.shape() == (ic.binding >> 32) as u32
                 {
-                    if let Some((_, p)) = g.props.entry_at_mut(ic.binding as u32 as usize) {
+                    if let Some((_, p)) = g.props.entry_at(ic.binding as u32 as usize) {
                         if !p.accessor() && p.writable() {
-                            p.set_value(value);
+                            g.props.set_value_at(ic.binding as u32 as usize, value);
                             return Ok(());
                         }
                     }

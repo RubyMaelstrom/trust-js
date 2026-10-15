@@ -717,9 +717,7 @@ pub(super) fn re_sym_match_discard_direct(
     if global {
         obj.borrow_mut()
             .props
-            .get_mut("lastIndex")
-            .expect("direct match lastIndex guard")
-            .set_value(Value::Num(0.0));
+            .set_value("lastIndex", Value::Num(0.0));
     }
     loop {
         let matched = regexp_exec_discard_direct(i, obj, re, input)?;
@@ -739,9 +737,7 @@ pub(super) fn re_sym_match_discard_direct(
             let next = advance_string_index(li, input, unicode);
             obj.borrow_mut()
                 .props
-                .get_mut("lastIndex")
-                .expect("direct match lastIndex guard")
-                .set_value(Value::Num(next as f64));
+                .set_value("lastIndex", Value::Num(next as f64));
         }
     }
     Ok(Value::Undefined)
@@ -782,9 +778,7 @@ pub(super) fn re_sym_replace_discard_direct(
     if global {
         obj.borrow_mut()
             .props
-            .get_mut("lastIndex")
-            .expect("direct replace lastIndex guard")
-            .set_value(Value::Num(0.0));
+            .set_value("lastIndex", Value::Num(0.0));
     }
     loop {
         let matched = regexp_exec_discard_direct(i, obj, re, input)?;
@@ -804,9 +798,7 @@ pub(super) fn re_sym_replace_discard_direct(
             let next = advance_string_index(li, input, unicode);
             obj.borrow_mut()
                 .props
-                .get_mut("lastIndex")
-                .expect("direct replace lastIndex guard")
-                .set_value(Value::Num(next as f64));
+                .set_value("lastIndex", Value::Num(next as f64));
         }
     }
     Ok(Value::Undefined)
@@ -920,9 +912,7 @@ fn re_sym_replace_impl(
                         let next = advance_string_index(li, &s, unicode);
                         obj.borrow_mut()
                             .props
-                            .get_mut("lastIndex")
-                            .expect("discard matcher guarded lastIndex")
-                            .set_value(Value::Num(next as f64));
+                            .set_value("lastIndex", Value::Num(next as f64));
                     }
                 }
                 return Ok(Value::Undefined);
@@ -1045,9 +1035,7 @@ fn re_sym_replace_direct(
     let set_last = |obj: &Gc, n: usize| {
         obj.borrow_mut()
             .props
-            .get_mut("lastIndex")
-            .expect("direct replace lastIndex guard")
-            .set_value(Value::Num(n as f64));
+            .set_value("lastIndex", Value::Num(n as f64));
     };
     let text = i.re_text(re.unicode, s);
     let size = text.unit_index(text.len());

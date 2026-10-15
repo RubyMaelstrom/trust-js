@@ -7972,12 +7972,7 @@ mod direct_call_tests {
                 Ok(Value::Num(17.0))
             ));
             for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
-                holder
-                    .borrow_mut()
-                    .props
-                    .get_mut(&key)
-                    .unwrap()
-                    .set_value(value.clone());
+                holder.borrow_mut().props.set_value(&key, value.clone());
                 let owners = key.strong_count();
                 let mut operands = [
                     PackedValue::pack(receiver.clone()),

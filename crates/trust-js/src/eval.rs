@@ -2834,11 +2834,12 @@ impl Interp {
         // Global code: the var binding lives as a global-object property (re-created when a
         // deletable eval-made one was deleted).
         let mut g = self.global.borrow_mut();
-        if let Some(p) = g.props.get_mut(name) {
-            if p.writable() && !p.accessor() {
-                p.set_value(val);
-            }
-        } else if g.extensible {
+        if g.props
+            .get(name)
+            .is_some_and(|p| p.writable() && !p.accessor())
+        {
+            g.props.set_value(name, val);
+        } else if g.props.get(name).is_none() && g.extensible {
             g.props.insert(name, Property::data(val, true, true, true));
         }
     }
@@ -3135,9 +3136,9 @@ impl Interp {
         {
             return Err(value);
         }
-        match object.props.get_mut(text.as_str()) {
+        match object.props.get(text.as_str()) {
             Some(property) if !property.accessor() && property.writable() => {
-                property.set_value(value);
+                object.props.set_value(text.as_str(), value);
                 Ok(())
             }
             _ => Err(value),
@@ -4108,16 +4109,8 @@ impl Interp {
         set: Option<Value>,
     ) {
         let mut b = obj.borrow_mut();
-        if let Some(p) = b.props.get_mut(key) {
-            if p.accessor() {
-                if get.is_some() {
-                    p.set_getter(get);
-                }
-                if set.is_some() {
-                    p.set_setter(set);
-                }
-                return;
-            }
+        if b.props.merge_accessor(key, get.clone(), set.clone()) {
+            return;
         }
         b.props
             .insert(key, Property::accessor_prop(get, set, true, true));
@@ -4160,14 +4153,9 @@ impl Interp {
     /// Freeze an object in place (non-extensible, all own props non-writable/non-configurable).
     pub(crate) fn freeze_object(&self, v: &Value) {
         if let Value::Obj(o) = v {
-            o.borrow_mut().extensible = false;
-            let keys = o.borrow().props.keys();
-            for k in keys {
-                if let Some(p) = o.borrow_mut().props.get_mut(&k) {
-                    p.set_writable(false);
-                    p.set_configurable(false);
-                }
-            }
+            let mut b = o.borrow_mut();
+            b.extensible = false;
+            b.props.freeze_descriptors();
         }
     }
 
@@ -5828,9 +5816,7 @@ impl Interp {
             Some((false, true)) => {
                 // A pre-existing non-configurable data property keeps its attributes; only its value
                 // is replaced.
-                if let Some(p) = self.global.borrow_mut().props.get_mut(name) {
-                    p.set_value(value);
-                }
+                self.global.borrow_mut().props.set_value(name, value);
             }
             _ => {
                 self.global
@@ -6673,21 +6659,23 @@ impl Interp {
         set: Option<Value>,
     ) {
         let mut b = target.borrow_mut();
-        let existing = if key.is_private() {
-            b.internal_slots_mut().get_mut(key)
-        } else {
-            b.props.get_mut(key)
-        };
-        if let Some(p) = existing {
-            if p.accessor() {
-                if get.is_some() {
-                    p.set_getter(get);
+        if key.is_private() {
+            if let Some(p) = b.internal_slots_mut().get_mut(key) {
+                if p.accessor() {
+                    if get.is_some() {
+                        p.set_getter(get);
+                    }
+                    if set.is_some() {
+                        p.set_setter(set);
+                    }
+                    return;
                 }
-                if set.is_some() {
-                    p.set_setter(set);
-                }
-                return;
             }
+        } else if b
+            .props
+            .merge_accessor(key.as_str(), get.clone(), set.clone())
+        {
+            return;
         }
         let property = Property::accessor_prop(get, set, false, true);
         if key.is_private() {

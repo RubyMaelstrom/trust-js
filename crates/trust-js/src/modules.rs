@@ -1062,7 +1062,11 @@ impl Interp {
                 Property::data(Value::lstr("Module".to_string()), false, false, false),
             );
         }
-        ns.borrow_mut().extensible = false;
+        {
+            let mut b = ns.borrow_mut();
+            b.extensible = false;
+            b.props.demote_shape();
+        }
         ns.borrow().ic_plain.set(false);
         // `module_ns` is keyed only by object address. Pin the namespace until
         // the cycle collector can evict the side-table entry atomically; a
@@ -1102,6 +1106,7 @@ impl Interp {
                 dst.props.insert(k.clone(), p);
             }
             dst.extensible = false;
+            dst.props.demote_shape();
         }
         if let Some(live) = self.module_ns.get(&(Rc::as_ptr(base_o) as usize)).cloned() {
             dns.borrow().ic_plain.set(false);

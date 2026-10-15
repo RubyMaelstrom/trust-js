@@ -384,9 +384,10 @@ impl DeepNameIc {
                 if !matches!(global.exotic, Exotic::None) || global.props.shape() != shape {
                     return false;
                 }
-                if let Some((_, property)) = global.props.entry_at_mut(slot) {
+                if let Some((_, property)) = global.props.entry_at(slot) {
                     if !property.accessor() && property.writable() {
-                        property.set_value(value.take().unwrap());
+                        let value = value.take().unwrap();
+                        global.props.set_value_at(slot, value);
                         return true;
                     }
                 }

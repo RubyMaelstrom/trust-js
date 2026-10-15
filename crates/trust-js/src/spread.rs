@@ -75,11 +75,12 @@ impl Interp {
                 .props
                 .insert(index.to_string(), Property::plain(value));
         }
-        object
-            .props
-            .get_mut("length")
-            .expect("fresh Array has length")
-            .set_value(Value::Num(index as f64 + 1.0));
+        assert!(
+            object
+                .props
+                .set_value("length", Value::Num(index as f64 + 1.0)),
+            "fresh Array has length"
+        );
         Ok(())
     }
 

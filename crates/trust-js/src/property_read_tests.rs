@@ -428,12 +428,13 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
     }
     assert_eq!(calls.get(), 6);
     let shape = object.borrow().props.shape();
+    // Clearing the getter through the insert funnel is a class-preserving
+    // (accessor -> accessor) replacement, so the shape is retained and the cached
+    // accessor state must still observe the live (now missing) getter.
     object
         .borrow_mut()
         .props
-        .get_mut("cached")
-        .unwrap()
-        .set_getter(None);
+        .insert("cached", Property::accessor_prop(None, None, false, true));
     assert_eq!(object.borrow().props.shape(), shape);
     assert!(matches!(
         engine.interp.get_prop_ic(&base, "cached", &cache[0]),

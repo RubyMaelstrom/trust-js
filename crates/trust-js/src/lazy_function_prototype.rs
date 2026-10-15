@@ -4,7 +4,7 @@
 //! one stable object with its creation realm's intrinsic parent and the correct constructor.
 //! Collector and memory traversal must not count as value observations.
 
-use super::{Exotic, Gc, Object, Property, PropertyLayout, Props};
+use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
@@ -25,6 +25,17 @@ pub(super) struct LazyFunctionPrototype {
 
 impl LazyFunctionPrototype {
     pub(super) fn new(owner: &Gc, parent: Gc, template: &Props) -> Self {
+        // Materialization pushes a `Property::builtin` constructor field and reuses the
+        // template shape: sound only while the template's field classes are the
+        // builtin/plain data-writable ones that replay produces.
+        debug_assert!(
+            template
+                .entries
+                .fields
+                .iter()
+                .all(|property| property.class() == PropClass::DataWritable),
+            "lazy prototype template with a non-writable or accessor field"
+        );
         Self {
             owner: Rc::downgrade(owner),
             state: RefCell::new(State::Parent(parent)),

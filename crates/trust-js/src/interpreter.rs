@@ -3110,7 +3110,7 @@ pub struct Interp {
     /// The shape chain of an arguments object's named properties (`length`, @@iterator,
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
-    pub(crate) arguments_shapes: Option<([Rc<str>; 3], [u32; 3])>,
+    pub(crate) arguments_shapes: Option<([Rc<str>; 3], [u32; 3], u32)>,
     /// Pre-shaped property maps of FromPropertyDescriptor results: `[data, accessor]`, built by
     /// ordinary insertion on first use. Keys and shape only; every result object is fresh and
     /// takes the active Realm's %Object.prototype%.
@@ -7611,11 +7611,10 @@ impl Interp {
                     }
                     _ => {
                         let mut props = maps.function.clone();
-                        props
-                            .entry_at_mut(1)
-                            .expect("function name slot")
-                            .1
-                            .set_value(Value::lstr(name.to_string()));
+                        assert!(
+                            props.set_value_at(1, Value::lstr(name.to_string())),
+                            "function name slot"
+                        );
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
                         }
@@ -7650,16 +7649,15 @@ impl Interp {
                 _ => None,
             }
             .or_else(|| Some(self.object_proto.clone()));
-            obj.borrow_mut()
-                .props
-                .entry_at_mut(2)
-                .expect("prototype slot")
-                .1
-                .defer_function_prototype(
+            assert!(
+                obj.borrow_mut().props.defer_function_prototype_at(
+                    2,
                     &obj,
                     proto_parent.expect("function prototype intrinsic parent"),
                     proto_map.as_ref().expect("prototype template"),
-                );
+                ),
+                "prototype slot"
+            );
         }
         if !is_arrow && !is_method && !is_async && !is_generator {
             obj.borrow_mut().is_constructor = true;
@@ -8799,7 +8797,7 @@ impl Interp {
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
             return Err(lval);
         }
-        let Some(p) = b.props.get_mut(name) else {
+        let Some(p) = b.props.get(name) else {
             return Err(lval);
         };
         if p.accessor() || !p.writable() {
@@ -8811,12 +8809,14 @@ impl Interp {
         }
         // Take the slot's handle and release the stack copy: unique unless shared elsewhere
         // (then the grow-copy path runs once and the rebuilt handle is unique from here on).
-        let cur = match p.take_value() {
-            Value::Str(s) => s,
+        // The object stays borrowed throughout, so the checked descriptor cannot change
+        // between the read above and the value-only take/store below.
+        let cur = match b.props.take_value(name) {
+            Some(Value::Str(s)) => s,
             _ => unreachable!("checked above"),
         };
         drop(lval);
-        p.set_value(Value::Str(cur.concat_owned(x)));
+        b.props.set_value(name, Value::Str(cur.concat_owned(x)));
         Ok(())
     }
 
@@ -8842,11 +8842,7 @@ impl Interp {
             if st.depth == 0 && b.props.shape() == st.recv_shape {
                 if let Some(p) = b.props.property_at(st.slot as usize) {
                     if !p.accessor() && p.writable() {
-                        b.props
-                            .entry_at_mut(st.slot as usize)
-                            .unwrap()
-                            .1
-                            .set_value(v.clone());
+                        b.props.set_value_at(st.slot as usize, v.clone());
                         return true;
                     }
                 }
@@ -8862,11 +8858,7 @@ impl Interp {
                 if e.st.recv_shape == shape && e.st.depth == 0 {
                     if let Some(p) = b.props.property_at(e.st.slot as usize) {
                         if !p.accessor() && p.writable() {
-                            b.props
-                                .entry_at_mut(e.st.slot as usize)
-                                .unwrap()
-                                .1
-                                .set_value(v.clone());
+                            b.props.set_value_at(e.st.slot as usize, v.clone());
                             self.ic_insert(cache, e.st);
                             return true;
                         }
@@ -8908,7 +8900,7 @@ impl Interp {
                     return false; // setter, or non-writable (strict-throw) — slow path
                 }
                 let shape = b.props.shape();
-                b.props.entry_at_mut(slot).unwrap().1.set_value(v.clone());
+                b.props.set_value_at(slot, v.clone());
                 let st = crate::bytecode::IcState {
                     depth: 0,
                     slot: slot as u32,
@@ -9914,9 +9906,7 @@ impl Interp {
                     // Update the own property's value in place — its attributes (e.g. a
                     // configurable:false from defineProperty) must survive.
                     let mut b = o.borrow_mut();
-                    if let Some(p) = b.props.get_mut(key) {
-                        p.set_value(value);
-                    } else {
+                    if !b.props.set_value(key, value.clone()) {
                         b.props
                             .insert(key, crate::value::Property::data(value, true, true, true));
                     }
@@ -10470,9 +10460,7 @@ impl Interp {
                     }
                     return Ok(false);
                 }
-                if let Some(p) = obj.borrow_mut().props.get_mut(key) {
-                    p.set_value(value);
-                }
+                obj.borrow_mut().props.set_value(key, value.clone());
                 if let Some(trace) = trace.as_deref_mut() {
                     let b = obj.borrow();
                     trace.record(
@@ -10550,9 +10538,7 @@ impl Interp {
         }
         // An existing element keeps its attributes; [[Set]] only updates the value.
         if obj.borrow().props.contains(key) {
-            if let Some(p) = obj.borrow_mut().props.get_mut(key) {
-                p.set_value(value);
-            }
+            obj.borrow_mut().props.set_value(key, value);
         } else {
             obj.borrow_mut().props.insert(key, Property::plain(value));
         }
@@ -13375,13 +13361,19 @@ impl Interp {
         {
             let mut object = ao.borrow_mut();
             match (shapes, iterator, callee) {
-                (Some((keys, shapes)), Some(iterator), Some(callee)) => {
+                (Some((keys, shapes, accessor_callee_shape)), Some(iterator), Some(callee)) => {
                     // Known-absent keys landing on the recorded child shapes: no existence scan,
-                    // index parse, or transition lookup.
+                    // index parse, or transition lookup. The callee child shape records its
+                    // descriptor class, so the poison accessor and the data callee diverge.
+                    let callee_shape = if callee.accessor() {
+                        accessor_callee_shape
+                    } else {
+                        shapes[2]
+                    };
                     let [length_key, iterator_key, callee_key] = keys;
                     object.props.append_new(length_key, length, shapes[0]);
                     object.props.append_new(iterator_key, iterator, shapes[1]);
-                    object.props.append_new(callee_key, callee, shapes[2]);
+                    object.props.append_new(callee_key, callee, callee_shape);
                 }
                 (_, iterator, callee) => {
                     object.props.insert("length", length);
@@ -13423,8 +13415,10 @@ impl Interp {
     }
 
     /// The recorded shape chain for an arguments object's `length`, @@iterator and `callee`
-    /// properties (see `Interp::arguments_shapes`), derived on first use.
-    fn arguments_named_shapes(&mut self) -> Option<([Rc<str>; 3], [u32; 3])> {
+    /// properties (see `Interp::arguments_shapes`), derived on first use. The third return
+    /// value is the callee child shape when `callee` is the strict poison ACCESSOR: since
+    /// shapes encode descriptor class, the data probe's chain must not be reused for it.
+    fn arguments_named_shapes(&mut self) -> Option<([Rc<str>; 3], [u32; 3], u32)> {
         if self.arguments_shapes.is_none() {
             let iterator = self.iterator_sym.clone()?;
             let keys: [Rc<str>; 3] = [
@@ -13441,13 +13435,27 @@ impl Interp {
                 );
                 shapes[index] = probe.shape();
             }
+            // Replay the shared prefix, then take the accessor transition for `callee`.
+            let mut strict_probe = Props::new();
+            for key in &keys[..2] {
+                strict_probe.insert(
+                    key.clone(),
+                    Property::data(Value::Undefined, true, false, true),
+                );
+            }
+            strict_probe.insert(
+                keys[2].clone(),
+                Property::accessor_prop(None, None, false, false),
+            );
+            let accessor_callee_shape = strict_probe.shape();
             if !shapes
                 .iter()
+                .chain([&accessor_callee_shape])
                 .all(|&shape| crate::value::is_cacheable_shape(shape))
             {
                 return None;
             }
-            self.arguments_shapes = Some((keys, shapes));
+            self.arguments_shapes = Some((keys, shapes, accessor_callee_shape));
         }
         self.arguments_shapes.clone()
     }
@@ -16909,9 +16917,10 @@ impl Interp {
                         .insert(name, Property::data(binding.value, true, true, false));
                 }
                 Some((true, _)) if is_func => {
-                    if let Some(p) = self.global.borrow_mut().props.get_mut(name) {
-                        p.set_value(binding.value);
-                    }
+                    self.global
+                        .borrow_mut()
+                        .props
+                        .set_value(name, binding.value.clone());
                 }
                 _ => {}
             }

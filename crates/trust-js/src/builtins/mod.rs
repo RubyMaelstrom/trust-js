@@ -186,11 +186,12 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
             && i.ordinary_get_ptr(Rc::as_ptr(o) as usize)
         {
             let mut b = o.borrow_mut();
-            if let Some(p) = b.props.get_mut(key) {
-                if !p.accessor() && p.writable() {
-                    p.set_value(value);
-                    return Ok(());
-                }
+            if b.props
+                .get(key)
+                .is_some_and(|p| !p.accessor() && p.writable())
+            {
+                b.props.set_value(key, value);
+                return Ok(());
             }
         }
     }
@@ -676,7 +677,11 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
                 return Ok(false);
             }
         }
-        o.borrow_mut().extensible = false;
+        let mut b = o.borrow_mut();
+        b.extensible = false;
+        // Conservative Pilot C demote: shapes do not encode extensibility, and no
+        // consumer may treat a pre-existing shape as a creation proof for this object.
+        b.props.demote_shape();
     }
     Ok(true)
 }
@@ -1667,7 +1672,7 @@ pub(crate) fn reflect_define_on_receiver(
     match existing {
         Some(ep) if ep.accessor() || !ep.writable() => Ok(false),
         Some(_) => {
-            ro.borrow_mut().props.get_mut(key).unwrap().set_value(value);
+            ro.borrow_mut().props.set_value(key, value);
             Ok(true)
         }
         None => {
@@ -2556,8 +2561,10 @@ pub(crate) fn regexp_exec_discard_direct(
     let last_units = if use_last { read_units } else { 0 };
     let set_last = |n: usize| {
         let mut b = obj.borrow_mut();
-        let p = b.props.get_mut("lastIndex").expect("guarded lastIndex");
-        p.set_value(Value::Num(n as f64));
+        assert!(
+            b.props.set_value("lastIndex", Value::Num(n as f64)),
+            "guarded lastIndex"
+        );
     };
     if last_units > text.unit_index(text.len()) {
         if use_last {
@@ -5201,9 +5208,7 @@ fn define_own_property_record(
     let mapped = i.mapped_arg_name(args_ptr, key).is_some();
     if mapped {
         if let Some(cur) = i.mapped_arg_value(args_ptr, key) {
-            if let Some(p) = o.borrow_mut().props.get_mut(key) {
-                p.set_value(cur);
-            }
+            o.borrow_mut().props.set_value(key, cur);
         }
         let allowed = define_own_property_ordinary(i, o, key, d)?;
         if !allowed {
@@ -6032,11 +6037,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
                              Some(Value::Num(n)) if n == len as f64)
                 {
                     let s = b.props.slot_of("length").unwrap();
-                    b.props
-                        .entry_at_mut(s)
-                        .unwrap()
-                        .1
-                        .set_value(Value::Num(len as f64));
+                    b.props.set_value_at(s, Value::Num(len as f64));
                 }
                 if ok {
                     return Ok(Value::Num(len as f64));
@@ -6080,11 +6081,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
         if let Some(len) = len {
             if let Some(v) = b.props.pop_last_element(len - 1) {
                 let s = b.props.slot_of("length").unwrap();
-                b.props
-                    .entry_at_mut(s)
-                    .unwrap()
-                    .1
-                    .set_value(Value::Num((len - 1) as f64));
+                b.props.set_value_at(s, Value::Num((len - 1) as f64));
                 return Ok(v);
             }
         }
@@ -6170,11 +6167,7 @@ pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
     }
     let value = b.props.pop_last_element(len - 1)?;
     let slot = b.props.slot_of("length").unwrap();
-    b.props
-        .entry_at_mut(slot)
-        .unwrap()
-        .1
-        .set_value(Value::Num((len - 1) as f64));
+    b.props.set_value_at(slot, Value::Num((len - 1) as f64));
     Some(value)
 }
 
