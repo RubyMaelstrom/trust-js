@@ -868,6 +868,10 @@ mod packed_value_tests {
     }
 
     #[cfg(feature = "heap-bridge")]
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn object_allocations_attach_and_release_central_handles() {
         let object = Object::new(None);
@@ -2838,8 +2842,9 @@ pub(crate) mod layout_census {
 }
 
 // S3: the header and its inline named slots fill the 192 B size class exactly; growing either
-// moves every object into the 256 B class.
-#[cfg(feature = "gc-heap")]
+// moves every object into the 256 B class. The migration-test `heap-bridge` field is outside
+// the production layout and exempt.
+#[cfg(all(feature = "gc-heap", not(feature = "heap-bridge")))]
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).

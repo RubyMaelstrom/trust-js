@@ -235,8 +235,9 @@ impl HiddenAddress {
         map.contains_key(&!self.0)
     }
 
-    /// The address itself, for a check in a helper frame.
+    /// The address itself, for a check in a helper frame (its callers are `embed` tests).
     #[inline(never)]
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
     pub(crate) fn get(self) -> usize {
         !self.0
     }
