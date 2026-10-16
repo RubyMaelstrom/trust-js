@@ -865,16 +865,17 @@ bytecode.
   and computed keys on shape-stable objects), the new sustained-
   allocation workload and the Vue/React/Djot fixtures, at interp and
   bytecode. Outputs are identical to main everywhere (fixtures modulo
-  elapsed_ms). The branch's default build is within -5.3%..+0.6% of
-  main's wall time and +-4% of its peak RSS: the S2 seams cost the
-  counted build nothing measurable. gc-heap against main, wall time
-  (peak RSS, MiB, main -> gc-heap):
+  elapsed_ms). On these JS workloads the branch's default build is
+  within -4.1%..+0.6% of main's wall time and +-6% of its peak RSS (one
+  object_alloc_bench component regresses; see the review fixes below).
+  gc-heap against main, wall time (peak RSS, MiB, main -> gc-heap),
+  re-measured after the review fixes:
                          interp                 bytecode
-    property access      +3.6%  (13 -> 47)      +1.2%  (13 -> 38)
-    sustained alloc.     +0.2%  (180 -> 233)    +5.0%  (152 -> 215)
-    Vue                  +18.1% (26 -> 69)      -9.1%  (27 -> 42)
-    React                +20.1% (13 -> 53)      -15.6% (13 -> 41)
-    Djot                 +17.0% (37 -> 59)      -1.8%  (31 -> 41)
+    property access      +4.2%  (12 -> 46)      -3.0%  (13 -> 42)
+    sustained alloc.     +3.6%  (179 -> 218)    +7.4%  (147 -> 206)
+    Vue                  +18.5% (27 -> 68)      -9.2%  (28 -> 42)
+    React                +20.7% (13 -> 52)      -13.2% (13 -> 40)
+    Djot                 +17.9% (36 -> 58)      -4.6%  (32 -> 41)
   The first run had the step-3c byte-budget floor of 64 MiB and peak RSS
   up to 333 MiB on these workloads (Vue at interp: +1187%; React at
   interp, 322 MiB: +2337%). Environment records are cells but not
@@ -908,20 +909,75 @@ bytecode.
   an explicit THP policy is an S3 item.
 - Sustained-allocation workload (benchmarks/sustained-allocation.js:
   200k retained objects, 400k short-lived objects, arrays and closures,
-  40k retained replacements; TRUST_JS_PERF_METRICS=1 and
-  TRUST_JS_GC_LOG=1, 3 runs): post-GC live bytes 44.2 MiB in 727-729
-  small-cell pages (45.4-45.6 MiB, 97% occupied: no fragmentation at
-  this scale); 19-20 collections, most pauses 25-63 ms, max 63 ms interp
-  / 47 ms bytecode (main: 87 / 67 ms); GC share of wall 32% interp / 40%
-  bytecode (main: 26% / 29%). Both builds are far from the S6 target of
-  5%. gc-heap inherits the counted build's object threshold, live +
-  max(live/8, 100k), which suits a nursery: a full collection every 100k
-  objects here re-marks the retained heap, and on larger heaps the 1/8
-  rule marks up to 8 objects per object allocated. A doubling rule would
-  about halve this workload's collections but let garbage reach live
-  size, against the S6 peak-RSS bound of +25%; that trade, or a nursery
-  over the cell heap, is for S3/S6 with the owner.
+  40k retained replacements whose displaced originals die after
+  surviving collections; TRUST_JS_PERF_METRICS=1 and TRUST_JS_GC_LOG=1,
+  3 runs, re-measured after the review fixes): post-GC live bytes 36.8
+  MiB in 621-622 small-cell pages (38.8-38.9 MiB, 95% occupied: no
+  fragmentation at this scale); 20 collections, most pauses 25-60 ms,
+  max 60 ms interp / 47 ms bytecode (main: 81 / 62 ms); GC share of wall
+  32% interp / 40% bytecode (main: 25% / 28%). Both builds are far from
+  the S6 target of 5%. gc-heap inherits the counted build's object
+  threshold, live + max(live/8, 100k), which suits a nursery: a full
+  collection every 100k objects here re-marks the retained heap, and on
+  larger heaps the 1/8 rule marks up to 8 objects per object allocated.
+  A doubling rule would about halve this workload's collections but let
+  garbage reach live size, against the S6 peak-RSS bound of +25%; that
+  trade, or a nursery over the cell heap, is for S3/S6 with the owner.
 - wasm32 acceptance: blocked (see the plan's S2 deviations): this
   rustc's LLVM rejects the wasm llvm-args for a no_std cdylib, and no
   wasm32 std is installed.
 - Outside review checkpoint: pending (owner).
+
+S2 review fixes (outside review of dcde3ef6, 2026-10-16)
+-------------------------------------------------------
+- [P1] Class Symbol keys were not traced. ClassInfo's trace skipped
+  FieldInit.key (classified "not cells" before Symbols became cells), so
+  an explicit collection dropped a class's [Symbol('x')] field from
+  later instances. PreparedClassEvaluation's gc-heap trace went through
+  an adapter (trace_direct) that reported objects and environments only:
+  a suspended class evaluation lost its computed Symbol keys, and its
+  decorator receivers when not objects (`@a.b` with a string `a`: the
+  decorator then saw another string's bytes, a use-after-free). Both
+  now trace every cell; PreparedReferenceSlot got a native exhaustive
+  trace and trace_direct is deleted. An audit of every `field: _` in
+  the exhaustive destructurings whose declared type can hold a cell
+  found no other stale classification; GcEdgeSink's object-only
+  value() serves only the counted collector and diagnostics. Test
+  (both tiers, collections between separate evaluations so no stale
+  stack word keeps a cell): payload_cell_tests::class_definitions_keep_
+  symbol_keys_and_decorator_receivers; without the field-key trace the
+  field is lost, without the key and receiver traces the test aborts on
+  a poisoned string.
+- [P1] The runtime ran callback batches from an unrooted Vec: it moved
+  the traced CallbackQueue out, so a collection in one callback freed
+  the ones after it (SIGBUS/SIGSEGV). Unhandled rejections taken from
+  the engine for reporting had the same shape. Both batches now live in
+  traced host slots (RunningCallbacks, ReportingRejections) and are
+  popped one at a time; Interp::call roots a popped entry's arguments.
+  The error-reporting shims are rooted in a host slot as well
+  (fire_rejection has no JavaScript holder, and a boxed Runtime is not
+  on the scanned stack). Timers were already safe: begin_task validates
+  a due task against its traced entry before the handler is touched;
+  wasm run_func moves only weak host-function handles and a store
+  without JavaScript values. Tests (trust-js-runtime): queued_callbacks_
+  survive_a_collection_inside_their_batch and unhandled_rejection_batch_
+  survives_a_collection_in_its_handler; with the batches untraced, the
+  first crashes (SIGSEGV) and the second trips the heap verifier.
+- [P2] benchmarks/sustained-allocation.js kept 39,999 of its 40,000
+  displaced originals reachable: each replacement linked to the next
+  slot's original, not yet replaced. Replacements now link to the
+  previous slot, already replaced; a WeakRef probe reclaims 400 of 400
+  sampled originals (1 of 400 before). Its evidence in the exit gate
+  above is re-measured, with the other JS workloads.
+- [P2] The default build's parity holds for the JS workloads only:
+  object_alloc_bench's "templated {x,y} + drop" is +8.9% there (115.1 vs
+  105.7 ns/op, non-overlapping samples). Object layouts are identical
+  and S2 left the templated path's source unchanged, so this is a
+  codegen or drop-path effect; left open.
+- Validation: gc-heap lib suite 1836/0/116; trust-js-runtime 182/0/1
+  in both builds; at GC stress interval 1 the 124 class, decorator,
+  prepared-reference, payload-cell and Symbol tests (118 pass, 6
+  ignored as in the suite) and both new runtime tests pass; the
+  reviewer's reproductions (class field, suspended computed method,
+  setImmediate after $262.gc()) pass at interp and bytecode; clippy and
+  fmt clean for the engine and the runtime in both builds.

@@ -50,6 +50,52 @@ pub struct Runtime {
     fire_rejection: Value,
 }
 
+/// The callback batch the loop is running. A pass takes everything queued so far out of the
+/// [`CallbackQueue`] (callbacks queued meanwhile wait for the next pass); each stays rooted here,
+/// like the queue, until it starts, so a collection inside one callback cannot reclaim the rest.
+#[derive(Default)]
+struct RunningCallbacks(std::collections::VecDeque<(Value, Vec<Value>)>);
+
+impl trust_js_host::HostTrace for RunningCallbacks {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for (callback, args) in &self.0 {
+            visitor.root(callback);
+            for arg in args {
+                visitor.root(arg);
+            }
+        }
+    }
+}
+
+/// Unhandled rejections being reported, taken from the engine in one batch: each (promise,
+/// reason) pair stays rooted here until its report starts, since `onunhandledrejection` runs
+/// script (and may collect) between reports.
+#[derive(Default)]
+struct ReportingRejections(std::collections::VecDeque<(Value, Value)>);
+
+impl trust_js_host::HostTrace for ReportingRejections {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for (promise, reason) in &self.0 {
+            visitor.root(promise);
+            visitor.root(reason);
+        }
+    }
+}
+
+/// The error-reporting shims: no JavaScript reference keeps `fire_rejection` alive once its
+/// global is deleted, and the `Runtime` that holds both may live where no scan looks.
+struct ReportingShims {
+    fire_error: Value,
+    fire_rejection: Value,
+}
+
+impl trust_js_host::HostTrace for ReportingShims {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        visitor.root(&self.fire_error);
+        visitor.root(&self.fire_rejection);
+    }
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -213,6 +259,13 @@ impl Runtime {
             )
             .expect("shim cleanup");
         engine.set_interrupt_handle(interrupt);
+        let state = engine.ctx().op_state();
+        state.put(ReportingShims {
+            fire_error: fire_error.clone(),
+            fire_rejection: fire_rejection.clone(),
+        });
+        state.put(RunningCallbacks::default());
+        state.put(ReportingRejections::default());
         Runtime {
             engine,
             _dedicated: dedicated,
@@ -351,7 +404,8 @@ impl Runtime {
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
-                for (cb, args) in self.take_queued_callbacks() {
+                self.start_callback_batch();
+                while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
@@ -453,7 +507,8 @@ impl Runtime {
             self.report_unhandled_rejections();
             loop {
                 let mut progressed = false;
-                for (cb, args) in self.take_queued_callbacks() {
+                self.start_callback_batch();
+                while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
@@ -517,11 +572,28 @@ impl Runtime {
         !callbacks_queued && !timers_pending && !tasks_pending
     }
 
-    fn take_queued_callbacks(&mut self) -> Vec<(Value, Vec<Value>)> {
-        match self.engine.ctx().host_mut::<CallbackQueue>() {
-            Some(q) => std::mem::take(&mut q.queue).into(),
-            None => Vec::new(),
-        }
+    /// Start a pass's callback batch: move everything queued so far into [`RunningCallbacks`].
+    fn start_callback_batch(&mut self) {
+        let state = self.engine.ctx().op_state();
+        let queued = match state.get_mut::<CallbackQueue>() {
+            Some(q) if !q.queue.is_empty() => std::mem::take(&mut q.queue),
+            _ => return,
+        };
+        state
+            .get_mut::<RunningCallbacks>()
+            .expect("installed in new()")
+            .0
+            .extend(queued);
+    }
+
+    /// The batch's next callback. It leaves the rooted batch only as it starts: the call roots
+    /// its callee and arguments from then on.
+    fn next_batch_callback(&mut self) -> Option<(Value, Vec<Value>)> {
+        self.engine
+            .ctx()
+            .host_mut::<RunningCallbacks>()?
+            .0
+            .pop_front()
     }
 
     fn take_due_timers(&mut self) -> Vec<trust_js_timers::TimerTask> {
@@ -661,7 +733,12 @@ impl Runtime {
     /// Report promises rejected without a handler (Node prints `Uncaught (in promise) …`). Called
     /// after each microtask checkpoint; a rejection handled in the same checkpoint won't appear.
     fn report_unhandled_rejections(&mut self) {
-        for (promise, reason) in self.engine.take_unhandled_rejections_full() {
+        let taken = self.engine.take_unhandled_rejections_full();
+        if taken.is_empty() {
+            return;
+        }
+        self.reporting_rejections().0.extend(taken);
+        while let Some((promise, reason)) = self.reporting_rejections().0.pop_front() {
             // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
             // suppresses the default report.
             let fire = self.fire_rejection.clone();
@@ -671,12 +748,23 @@ impl Runtime {
                 &[promise, reason.clone()],
             ) {
                 Ok(Value::Bool(true)) => continue,
-                Err(EvalError::Interrupted(_)) => return,
+                Err(EvalError::Interrupted(_)) => {
+                    // An interruption abandons the rest of the batch.
+                    self.reporting_rejections().0.clear();
+                    return;
+                }
                 _ => {}
             }
             let text = console::describe_error(self.engine.ctx(), &reason);
             console::write_err_line(self.engine.ctx(), format!("Uncaught (in promise) {text}"));
         }
+    }
+
+    fn reporting_rejections(&mut self) -> &mut ReportingRejections {
+        self.engine
+            .ctx()
+            .host_mut::<ReportingRejections>()
+            .expect("installed in new()")
     }
 }
 

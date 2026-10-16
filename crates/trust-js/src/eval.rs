@@ -10235,9 +10235,36 @@ impl crate::gc_trace::GcTrace for PreparedDecoratorValue {
     }
 }
 
+/// Every cell the suspended evaluation holds. Unlike the counted build's walk, which sees only
+/// objects and environments, this includes the Symbols of computed keys and decorator receivers
+/// of any type (`@a.b` captures `a`, which may be a string).
 #[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PreparedClassEvaluation {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        crate::gc_trace::trace_direct(sink, |edges| PreparedClassEvaluation::trace_gc(self, edges));
+        let Self {
+            outer_class_env,
+            class_env,
+            proto_parent,
+            ctor_parent,
+            derived: _,
+            keys,
+            decorator_values,
+        } = self;
+        sink.env(outer_class_env);
+        sink.env(class_env);
+        if let Some(parent) = proto_parent {
+            sink.object(parent);
+        }
+        if let Some(parent) = ctor_parent {
+            sink.value(parent);
+        }
+        for key in keys.iter().flatten() {
+            key.trace_gc(sink);
+        }
+        if let Some(PreparedDecoratorValues { class, members }) = decorator_values {
+            for decorator in class.iter().chain(members.iter().flatten()) {
+                decorator.trace_gc(sink);
+            }
+        }
     }
 }

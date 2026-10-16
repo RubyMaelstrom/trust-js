@@ -23,9 +23,12 @@ function churn(rounds, retained) {
             sum = (sum + read() + point.y) | 0;
         }
         // Replace a slice of the retained set so old objects die after surviving collections.
+        // Each replacement links to the slot before it, already replaced in ascending order, so
+        // nothing still references the original it displaces.
         for (let i = 0; i < 2000; i++) {
             const slot = (r * 2000 + i) % retained.length;
-            retained[slot] = { id: slot, round: r, next: retained[(slot + 1) % retained.length] };
+            const previous = retained[(slot + retained.length - 1) % retained.length];
+            retained[slot] = { id: slot, round: r, next: previous };
         }
     }
     return sum;

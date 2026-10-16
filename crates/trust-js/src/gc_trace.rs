@@ -457,10 +457,11 @@ impl GcTrace for crate::interpreter::ClassInfo {
         } = self;
         for field in fields.iter() {
             let crate::interpreter::FieldInit {
-                key: _, // names and symbols, not cells
+                key, // a computed key may be a Symbol, which is a cell
                 init: _,
                 transforms,
             } = field;
+            key.trace_gc(sink);
             transforms.trace_gc(sink);
         }
         field_env.trace_gc(sink);
@@ -551,25 +552,5 @@ impl GcTrace for crate::coroutine::Coroutine {
                 GcTrace::trace_gc(coroutine, sink)
             }
         }
-    }
-}
-
-/// Report the edges an old-collector `trace_gc(&mut DirectGcEdges)` walk finds. Only for walks
-/// that do not unpack packed values (unpacking can materialize a prototype, i.e. allocate).
-pub(crate) fn trace_direct(
-    sink: &mut dyn GcSink,
-    walk: impl FnOnce(&mut crate::gc_edges::DirectGcEdges<'_>),
-) {
-    let mut objects = Vec::new();
-    let mut scopes = Vec::new();
-    walk(&mut crate::gc_edges::DirectGcEdges {
-        objects: &mut objects,
-        scopes: &mut scopes,
-    });
-    for object in &objects {
-        sink.object(object);
-    }
-    for scope in &scopes {
-        sink.env(scope);
     }
 }

@@ -178,6 +178,50 @@ fn next_tick_and_set_immediate_run_before_timers() {
     assert_eq!(out.lines(), ["immediate", "tick 42", "timer"]);
 }
 
+/// A callback batch stays rooted while it runs: a collection inside its first callback must not
+/// reclaim the callbacks and arguments queued behind it, which only the batch still holds.
+#[test]
+fn queued_callbacks_survive_a_collection_inside_their_batch() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        setImmediate(() => $262.gc());
+        setImmediate((text) => console.log("second", text), "arg-".repeat(3));
+        setImmediate(() => console.log("third"));
+        "#,
+    );
+    assert_eq!(out.lines(), ["second arg-arg-arg-", "third"]);
+}
+
+/// Unhandled rejections are reported one at a time from a rooted batch: a collection inside the
+/// `onunhandledrejection` handler of the first must not reclaim the later promises and reasons.
+#[test]
+fn unhandled_rejection_batch_survives_a_collection_in_its_handler() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        onunhandledrejection = (event) => {
+            $262.gc();
+            console.log("rejection", event.reason, event.promise instanceof Promise);
+            event.preventDefault();
+        };
+        Promise.reject("first-".repeat(2));
+        Promise.reject("second-".repeat(2));
+        Promise.reject("third-".repeat(2));
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "rejection first-first- true",
+            "rejection second-second- true",
+            "rejection third-third- true",
+        ]
+    );
+}
+
 #[test]
 fn timer_args_pass_through_and_nested_timers_work() {
     let (mut rt, out, _err) = test_runtime();

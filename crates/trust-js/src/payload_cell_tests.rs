@@ -159,6 +159,71 @@ fn symbols_survive_collections_in_every_holder() {
     }
 }
 
+/// Class definitions keep the cells of the elements they have evaluated: a computed field key
+/// lives in the class's field records until each instance is created, and a class evaluation
+/// suspended in a computed name keeps the Symbol keys and decorator receivers evaluated so far.
+/// Each is set up by its own evaluation, whose frames are gone (and scrubbed) before the
+/// collections, so the class's records are the only holders left.
+#[test]
+fn class_definitions_keep_symbol_keys_and_decorator_receivers() {
+    for tier in [Tier::Interp, Tier::Bytecode] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            globalThis.Field = class { [Symbol('field')] = 1; };
+            globalThis.methods = (function* () {
+                class Method { [Symbol('method')]() { return 7; } [yield 'paused']() { return 8; } }
+                return Method;
+            })();
+            methods.next();
+            globalThis.receiver = 'unset';
+            String.prototype.mark = function (value) { receiver = String(this); return value; };
+            globalThis.decorators = (function* () {
+                let holder = 'receiver-'.repeat(3);
+                class Decorated { @holder.mark [(holder = null, yield 'paused')]() {} }
+                return Decorated;
+            })();
+            decorators.next();
+            true
+            "#,
+        );
+        for _ in 0..2 {
+            engine.interp.gc_collect();
+            eval(
+                &mut engine,
+                "for (let i = 0; i < 2000; i++) Symbol('filler' + i), ('filler-' + i).repeat(2); true",
+            );
+        }
+        engine.interp.gc_collect();
+        let result = eval(
+            &mut engine,
+            r#"
+            const instance = new Field();
+            const field = Object.getOwnPropertySymbols(instance);
+            const Method = methods.next('named').value;
+            const method = Object.getOwnPropertySymbols(Method.prototype);
+            decorators.next('decorated');
+            // A running class evaluation keeps its keys too (Rooted, or the VM frame's state).
+            class Running { [Symbol('first')]() { return 1; } [($262.gc(), 'second')]() { return 2; } }
+            const running = Object.getOwnPropertySymbols(Running.prototype);
+            [
+                field.map(String) + ':' + instance[field[0]],
+                method.map(String) + ':' + new Method()[method[0]](),
+                receiver,
+                running.map(String) + ':' + new Running()[running[0]](),
+            ].join('|')
+            "#,
+        );
+        assert_eq!(
+            result, "Symbol(field):1|Symbol(method):7|receiver-receiver-receiver-|Symbol(first):1",
+            "{tier:?}"
+        );
+    }
+}
+
 /// Symbols nothing holds are reclaimed; a WeakRef to one clears, a WeakMap entry keyed by one
 /// goes (its value with it), and a FinalizationRegistry cell targeting one is cleaned up.
 #[test]

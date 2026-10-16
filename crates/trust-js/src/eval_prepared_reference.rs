@@ -489,7 +489,23 @@ impl Interp {
 impl crate::gc_trace::GcTrace for PreparedReferenceSlot {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         for reference in self {
-            crate::gc_trace::trace_direct(sink, |edges| reference.trace_gc(edges));
+            let PreparedReference {
+                kind: _,
+                strict: _,
+                name: _, // an Rc<str>, not a cell
+                scope,
+                object,
+                generation: _,
+                shape: _,
+                binding: _, // points into `scope`'s storage
+                slot: _,
+            } = reference;
+            if let Some(scope) = scope {
+                sink.env(scope);
+            }
+            if let Some(object) = object {
+                sink.object(object);
+            }
         }
     }
 }
