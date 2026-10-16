@@ -231,22 +231,27 @@ fn ordered_collection_iterator_gc_edges_and_exhaustion_release() {
             false,
         )
         .unwrap();
-    let global = Value::Obj(engine.interp.global.clone());
-    let value = engine
-        .interp
-        .member_get(&global, "collection")
-        .unwrap_or_else(|_| panic!("collection lookup"));
-    let weak = engine.interp.downgrade_object_value(&value).unwrap();
-    drop(value);
+    // Strong handles live only in this helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let global = Value::Obj(engine.interp.global.clone());
+        let value = engine
+            .interp
+            .member_get(&global, "collection")
+            .unwrap_or_else(|_| panic!("collection lookup"));
+        engine.interp.downgrade_object_value(&value).unwrap()
+    });
     engine.eval("collection = null", false).unwrap();
     engine.interp.gc_collect();
-    assert!(weak.upgrade().is_some(), "live iterator retains collection");
+    assert!(
+        crate::gc_test::alive(&weak),
+        "live iterator retains collection"
+    );
     engine
         .eval("iterator.next(); iterator.next();", false)
         .unwrap();
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_none(),
+        !crate::gc_test::alive(&weak),
         "completed iterator releases collection"
     );
     assert_eq!(engine.interp.collection_iterators.len(), 1);
@@ -259,16 +264,18 @@ fn ordered_collection_iterator_gc_edges_and_exhaustion_release() {
 fn ordered_collection_iterator_cycle_is_collectable() {
     let mut engine = Engine::new();
     engine.eval("var collection = new Map(); var iterator = collection.values(); collection.set(iterator, iterator);", false).unwrap();
-    let global = Value::Obj(engine.interp.global.clone());
-    let value = engine
-        .interp
-        .member_get(&global, "collection")
-        .unwrap_or_else(|_| panic!("collection lookup"));
-    let weak = engine.interp.downgrade_object_value(&value).unwrap();
-    drop(value);
+    // Strong handles live only in this helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let global = Value::Obj(engine.interp.global.clone());
+        let value = engine
+            .interp
+            .member_get(&global, "collection")
+            .unwrap_or_else(|_| panic!("collection lookup"));
+        engine.interp.downgrade_object_value(&value).unwrap()
+    });
     engine.eval("collection = iterator = null", false).unwrap();
     engine.interp.gc_collect();
-    assert!(weak.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak));
     assert!(engine.interp.map_data.is_empty());
     assert!(engine.interp.collection_iterators.is_empty());
 }

@@ -288,7 +288,9 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
             ),
             "{tier:?}"
         );
-        if tier == Tier::Jit && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        if tier.admitted() == Tier::Jit
+            && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
+        {
             let maker = object(&mut engine, "make");
             let maker = maker.borrow();
             let Callable::User(user) = &maker.call else {
@@ -312,6 +314,10 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
     let mut engine = Engine::new();
@@ -451,6 +457,10 @@ fn warmed_descriptors_accessors_and_proxies_remain_instance_local() {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
     let mut engine = Engine::new();

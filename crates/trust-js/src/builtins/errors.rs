@@ -231,7 +231,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         }
         install_error_cause(i, &err, a.get(2))?;
         let errors = ab(i.iterate(&arg(a, 0)))?;
-        let arr = i.make_array(errors);
+        let arr = i.make_array(errors.into_vec());
         // `errors` is { writable:true, enumerable:false, configurable:true }.
         if let Some(o) = err.as_obj() {
             o.borrow_mut()

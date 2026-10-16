@@ -26,6 +26,18 @@ pub(crate) struct CachedForInKeys {
     layouts: EnumerationLayouts,
 }
 
+/// The cached key backing is a cell the cache owns (layouts are Rust-heap shape data).
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for CachedForInKeys {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let CachedForInKeys {
+            keys: ForInKeys(keys),
+            layouts: _,
+        } = self;
+        sink.object(keys);
+    }
+}
+
 impl CachedForInKeys {
     fn retained_layout_bytes(&self) -> usize {
         self.layouts.iter().flatten().fold(0usize, |bytes, layout| {
@@ -959,7 +971,7 @@ impl Interp {
                                 Err(Abrupt::Return(self.call_at(position, f, t, &a)?))
                             }
                             TailEval::Tail(f, t, a, _) => {
-                                self.pending_tail = Some(Box::new((f, t, a)));
+                                self.pending_tail = Some(Box::new((f, t, a.into_vec())));
                                 Err(Abrupt::Return(Value::Undefined))
                             }
                             TailEval::Val(v) => Err(Abrupt::Return(v)),
@@ -2061,7 +2073,9 @@ impl Interp {
     /// Collect every value an iterable yields. Strings and ordinary arrays use a fast path only
     /// while their intrinsic iterator methods are provably unmodified; otherwise this follows
     /// GetIterator (call `@@iterator`, then drain `.next()`) exactly.
-    pub(crate) fn iterate(&mut self, v: &Value) -> Result<Vec<Value>, Abrupt> {
+    /// The values `v` yields. Rooted while author code runs (I1), and returned rooted: callers
+    /// usually run more author code before consuming them.
+    pub(crate) fn iterate(&mut self, v: &Value) -> Result<crate::rooting::RootedVec, Abrupt> {
         match v {
             Value::Str(s) if crate::builtins::intrinsic_string_iterator_is_unmodified(self) => {
                 let perf_started = crate::jit::perf_stage_start();
@@ -2093,7 +2107,7 @@ impl Interp {
             }
             Value::Obj(o) if crate::builtins::array_iterator_fast_path_is_safe(self, v) => {
                 let perf_started = crate::jit::perf_stage_start();
-                let result: Result<Vec<Value>, Abrupt> = (|| {
+                let result: Result<crate::rooting::RootedVec, Abrupt> = (|| {
                     // %ArrayIteratorPrototype%.next performs LengthOfArrayLike followed by
                     // Get(array, ToString(index)) (ECMA-262 §23.1.5.2.1).  A dense ordinary
                     // array whose indexed entries are all own plain data properties has no
@@ -2101,10 +2115,11 @@ impl Interp {
                     // helper deliberately returns None for holes/accessors and those arrays
                     // retain the checked property path below.
                     if let Some(values) = crate::builtins::dense_array_snapshot(self, v) {
-                        return Ok(values);
+                        return Ok(crate::rooting::RootedVec::from_vec(values));
                     }
                     let len = self.checked_array_len(o)?;
-                    let mut out = Vec::with_capacity(len.min(1024));
+                    let mut out =
+                        crate::rooting::RootedVec::from_vec(Vec::with_capacity(len.min(1024)));
                     for i in 0..len {
                         out.push(self.get_member_key(v, &i.to_string())?);
                     }
@@ -2127,9 +2142,13 @@ impl Interp {
 
     /// Drive the iterator protocol on `v` using an already-resolved `@@iterator` method `itfn`
     /// (so callers that fetched it via GetMethod don't re-read the property).
-    pub(crate) fn iterate_with(&mut self, v: &Value, itfn: Value) -> Result<Vec<Value>, Abrupt> {
+    pub(crate) fn iterate_with(
+        &mut self,
+        v: &Value,
+        itfn: Value,
+    ) -> Result<crate::rooting::RootedVec, Abrupt> {
         let perf_started = crate::jit::perf_stage_start();
-        let result: Result<Vec<Value>, Abrupt> = (|| {
+        let result: Result<crate::rooting::RootedVec, Abrupt> = (|| {
             let iter = self.call(itfn, v.clone(), &[])?;
             // GetIteratorFromMethod rejects a primitive result before creating an Iterator Record;
             // there is therefore nothing to close in this case.
@@ -2144,7 +2163,7 @@ impl Interp {
                 self.iterator_close(&iter);
                 return Err(error);
             }
-            let mut out = Vec::new();
+            let mut out = crate::rooting::RootedVec::new();
             loop {
                 let step = self.iterator_step(&iter, &next);
                 match step {
@@ -2998,7 +3017,11 @@ impl Interp {
 
     /// CreateListFromArrayLike: read `obj.length` then elements `0..length` into a Vec (used by the
     /// Proxy `ownKeys` trap, which returns an array-like, not an iterable).
-    pub(crate) fn create_list_from_arraylike(&mut self, obj: &Value) -> Result<Vec<Value>, Abrupt> {
+    /// CreateListFromArrayLike, rooted while getters run and returned rooted (I1).
+    pub(crate) fn create_list_from_arraylike(
+        &mut self,
+        obj: &Value,
+    ) -> Result<crate::rooting::RootedVec, Abrupt> {
         let len_v = self.get_member_key(obj, "length")?;
         let len = self.to_number(&len_v)?;
         let len = if len.is_nan() || len < 0.0 {
@@ -3010,7 +3033,7 @@ impl Interp {
         if len > crate::interpreter::MAX_ARRAY_OP_LEN {
             return Err(self.throw("RangeError", "array length exceeds engine limit"));
         }
-        let mut out = Vec::with_capacity(len.min(1024));
+        let mut out = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len.min(1024)));
         for k in 0..len {
             out.push(self.get_member_key(obj, &k.to_string())?);
         }
@@ -4132,8 +4155,14 @@ impl Interp {
         }
     }
 
-    fn eval_args(&mut self, args: &[ArrayElem], env: &Env) -> Result<Vec<Value>, Abrupt> {
-        let mut out = Vec::new();
+    /// ArgumentListEvaluation. The list is rooted while later arguments evaluate (I1), and the
+    /// caller keeps it rooted through the call.
+    fn eval_args(
+        &mut self,
+        args: &[ArrayElem],
+        env: &Env,
+    ) -> Result<crate::rooting::RootedVec, Abrupt> {
+        let mut out = crate::rooting::RootedVec::new();
         for a in args {
             match a {
                 ArrayElem::Item(e) => {
@@ -4176,7 +4205,7 @@ impl Interp {
         let strings = self
             .template_object(site_id, quasis)
             .map_err(|error| self.placed_error(error, position))?;
-        let mut argv = vec![strings];
+        let mut argv = crate::rooting::RootedVec::from_vec(vec![strings]);
         for s in subs {
             let value = self
                 .eval(s, env)
@@ -4305,7 +4334,7 @@ impl Interp {
         &mut self,
         e: &Expr,
         env: &Env,
-    ) -> Result<Option<(Value, Value, Vec<Value>)>, Abrupt> {
+    ) -> Result<Option<(Value, Value, crate::rooting::RootedVec)>, Abrupt> {
         let Expr::Call {
             callee,
             args,
@@ -4338,7 +4367,7 @@ impl Interp {
         &mut self,
         e: &Expr,
         env: &Env,
-    ) -> Result<Option<(Value, Value, Vec<Value>)>, Abrupt> {
+    ) -> Result<Option<(Value, Value, crate::rooting::RootedVec)>, Abrupt> {
         let Expr::TaggedTemplate {
             tag,
             site,
@@ -4351,7 +4380,7 @@ impl Interp {
         };
         let (func, this) = self.eval_callee_reference(tag, env)?;
         let strings = self.template_object(*site, quasis)?;
-        let mut argv = vec![strings];
+        let mut argv = crate::rooting::RootedVec::from_vec(vec![strings]);
         for s in subs {
             argv.push(self.eval(s, env)?);
         }
@@ -5143,7 +5172,8 @@ impl Interp {
             let mut resolved_any = self.settle_async_waits();
             // Fire due host timers ($262.agent.setTimeout), earliest first.
             let now = std::time::Instant::now();
-            let mut due: Vec<Value> = Vec::new();
+            // Removed from `pending_timers`: rooted until each has run (I1).
+            let mut due = crate::rooting::RootedVec::new();
             self.pending_timers.retain(|(f, deadline)| {
                 if *deadline <= now {
                     due.push(f.clone());
@@ -5152,7 +5182,7 @@ impl Interp {
                     true
                 }
             });
-            for f in due {
+            for f in due.iter().cloned() {
                 if let Err(Abrupt::Interrupt(reason)) = self.call(f, Value::Undefined, &[]) {
                     self.clear_kept_objects();
                     return Err(reason);
@@ -5876,7 +5906,9 @@ impl Interp {
     fn eval_class(&mut self, class: &Rc<Class>, env: &Env) -> Result<Value, Abrupt> {
         // The decorators proposal evaluates class decorator expressions before
         // ClassDefinitionEvaluation (and therefore before the class name's TDZ and heritage).
-        let mut class_decorators = Vec::with_capacity(class.decorators.len());
+        // Evaluated decorators stay rooted while later expressions run author code (I1).
+        let mut class_decorators =
+            crate::rooting::Rooted::new(Vec::with_capacity(class.decorators.len()));
         for decorator in &class.decorators {
             class_decorators.push(self.eval_decorator_expression(decorator, env)?);
         }
@@ -5893,17 +5925,20 @@ impl Interp {
         &mut self,
         class: &Rc<Class>,
         env: &Env,
-        class_decorators: Vec<PreparedDecoratorValue>,
+        class_decorators: crate::rooting::Rooted<Vec<PreparedDecoratorValue>>,
     ) -> Result<Value, Abrupt> {
-        let mut prepared = self.begin_class_evaluation(class, env);
-        for decorator in class_decorators {
+        // Rooted through heritage, decorator and computed-key evaluation and the decorator
+        // application that finishes the class (I1).
+        let mut prepared = crate::rooting::Rooted::new(self.begin_class_evaluation(class, env));
+        for decorator in class_decorators.iter() {
             self.prepare_class_decorator(
                 &mut prepared,
                 None,
-                decorator.callback,
-                decorator.this_value,
+                decorator.callback.clone(),
+                decorator.this_value.clone(),
             );
         }
+        drop(class_decorators);
         let parent = match &class.superclass {
             Some(expression) => Some(self.eval(expression, &prepared.outer_class_env)?),
             None => None,
@@ -6115,12 +6150,12 @@ impl Interp {
     pub(crate) fn finish_class_evaluation(
         &mut self,
         class: &Rc<Class>,
-        mut prepared: PreparedClassEvaluation,
+        mut prepared: crate::rooting::Rooted<PreparedClassEvaluation>,
     ) -> Result<Value, Abrupt> {
-        let outer_class_env = prepared.outer_class_env;
-        let class_env = prepared.class_env;
-        let proto_parent = prepared.proto_parent;
-        let ctor_parent = prepared.ctor_parent;
+        let outer_class_env = prepared.outer_class_env.clone();
+        let class_env = prepared.class_env.clone();
+        let proto_parent = prepared.proto_parent.clone();
+        let ctor_parent = prepared.ctor_parent.clone();
         let derived = prepared.derived;
 
         let proto = Object::new(proto_parent.clone());
@@ -6214,7 +6249,10 @@ impl Interp {
             }
         }
 
-        // Methods, accessors and fields.
+        // Methods, accessors and fields. Values entering these Rust-side lists stay rooted
+        // until the class is complete: later members run decorators and static elements run
+        // author code (I1).
+        let mut roots = crate::rooting::ValueRoots::new();
         let mut inst_fields: Vec<FieldInit> = Vec::new();
         // Instance private methods/accessors: stamped onto each instance when `this` is created
         // (PrivateMethodOrAccessorAdd), not placed on the prototype — so brand checks, double
@@ -6229,8 +6267,8 @@ impl Interp {
             Vec<Value>,
         );
         let mut static_els: Vec<StaticEl> = Vec::new();
-        let mut instance_inits: Vec<Value> = Vec::new();
-        let mut static_inits: Vec<Value> = Vec::new();
+        let mut instance_inits = crate::rooting::RootedVec::new();
+        let mut static_inits = crate::rooting::RootedVec::new();
         for (member_index, m) in class.members.iter().enumerate() {
             if m.kind == MemberKind::Constructor {
                 continue;
@@ -6302,7 +6340,12 @@ impl Interp {
                         setter = s;
                         transforms = t;
                     }
+                    for transform in &transforms {
+                        roots.keep(transform);
+                    }
                     if is_private && !m.is_static {
+                        roots.keep(&getter);
+                        roots.keep(&setter);
                         priv_members.push((
                             key.to_string(),
                             Property::accessor_prop(Some(getter), Some(setter), false, false),
@@ -6366,6 +6409,7 @@ impl Interp {
                         Property::builtin(f)
                     };
                     if is_private && !m.is_static {
+                        roots.keep(&prop.value());
                         priv_members.push((key.into_string(), prop));
                     } else if is_private {
                         target
@@ -6424,6 +6468,9 @@ impl Interp {
                         (None, Some(f))
                     };
                     if is_private && !m.is_static {
+                        for accessor in get.iter().chain(set.iter()) {
+                            roots.keep(accessor);
+                        }
                         if let Some((_, p)) = priv_members
                             .iter_mut()
                             .find(|(k, _)| k.as_str() == key.as_str())
@@ -6460,6 +6507,9 @@ impl Interp {
                         };
                         self.decorate_field(decorators, &key, m.is_static, is_private, sink)?
                     };
+                    for transform in &transforms {
+                        roots.keep(transform);
+                    }
                     if m.is_static {
                         static_els.push((None, key, m.value.clone(), transforms));
                     } else {
@@ -6504,7 +6554,7 @@ impl Interp {
                 fields: inst_fields.into(),
                 field_env: inst_env,
                 derived,
-                instance_initializers: instance_inits,
+                instance_initializers: instance_inits.into_vec(),
                 private_members: priv_members,
             },
         );
@@ -6807,7 +6857,8 @@ impl Interp {
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Vec<Value>, Abrupt> {
-        let mut transforms = Vec::new();
+        // Rooted across the later decorators' calls (I1).
+        let mut transforms = crate::rooting::RootedVec::new();
         for decorator in decorators.iter().rev() {
             if !decorator.callback.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
@@ -6830,7 +6881,7 @@ impl Interp {
                 }
             }
         }
-        Ok(transforms)
+        Ok(transforms.into_vec())
     }
 
     /// Apply accessor decorators, threading the `{get, set}` pair and collecting `init` transforms.
@@ -6845,7 +6896,8 @@ impl Interp {
         inits: &mut Vec<Value>,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
         let is_private = key.is_private();
-        let mut transforms = Vec::new();
+        // Rooted across the later decorators' calls (I1).
+        let mut transforms = crate::rooting::RootedVec::new();
         for decorator in decorators.iter().rev() {
             if !decorator.callback.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
@@ -6888,7 +6940,7 @@ impl Interp {
                 }
             }
         }
-        Ok((get, set, transforms))
+        Ok((get, set, transforms.into_vec()))
     }
 
     /// Run a constructor's body against an already-allocated `this`, used by both `construct` and
@@ -10165,6 +10217,25 @@ fn string_to_bigint_bounded(
 /// The outcome of evaluating a `return` operand: a pending proper tail call, or a plain value.
 enum TailEval {
     /// A call in tail position: callee, `this`, arguments and the call's source position.
-    Tail(Value, Value, Vec<Value>, u32),
+    Tail(Value, Value, crate::rooting::RootedVec, u32),
     Val(Value),
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for PreparedDecoratorValue {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let PreparedDecoratorValue {
+            callback,
+            this_value,
+        } = self;
+        sink.value(callback);
+        sink.value(this_value);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for PreparedClassEvaluation {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        crate::gc_trace::trace_direct(sink, |edges| PreparedClassEvaluation::trace_gc(self, edges));
+    }
 }

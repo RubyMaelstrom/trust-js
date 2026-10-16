@@ -37,6 +37,10 @@ fn pair(reader: &mut Engine) -> (Engine, Engine) {
     (first, second)
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: no edges between Agent heaps (I6); objects shared across Engines are out of contract"
+)]
 #[test]
 fn property_shapes_foreign_own_absent_computed_and_prototype_reads() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -55,6 +59,10 @@ fn property_shapes_foreign_own_absent_computed_and_prototype_reads() {
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: no edges between Agent heaps (I6); objects shared across Engines are out of contract"
+)]
 #[test]
 fn property_shapes_foreign_writes_preserve_key_and_descriptor_selection() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {

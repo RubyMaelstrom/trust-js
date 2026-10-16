@@ -252,31 +252,32 @@ mod tests {
     fn lazy_prototype_drops_without_a_cycle_and_materialized_escape_keeps_constructor() {
         let mut engine = Engine::new();
         eval(&mut engine, "var F=function(){}, G=function(){};");
-        let function = object(&mut engine, "F");
-        let weak = Gc::downgrade(&function);
-        assert_eq!(
-            function
-                .borrow()
-                .props
-                .get("prototype")
-                .unwrap()
-                .packed
-                .tag(),
-            PACK_LAZY_PROTO
-        );
-        drop(function);
+        // Strong handles live in helper frames: the conservative stack scan (gc-heap) would
+        // keep a handle in this frame alive after `drop`.
+        let weak = crate::gc_test::in_frame(|| {
+            let function = object(&mut engine, "F");
+            assert_eq!(
+                function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .unwrap()
+                    .packed
+                    .tag(),
+                PACK_LAZY_PROTO
+            );
+            Gc::downgrade(&function)
+        });
         eval(&mut engine, "F=null;");
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none());
-        let g = object(&mut engine, "G");
-        let weak_g = Gc::downgrade(&g);
-        drop(g);
+        assert!(!crate::gc_test::alive(&weak));
+        let weak_g = crate::gc_test::in_frame(|| Gc::downgrade(&object(&mut engine, "G")));
         eval(&mut engine, "var escaped=G.prototype;G=null;");
         engine.interp.gc_collect();
-        assert!(weak_g.upgrade().is_some());
+        assert!(crate::gc_test::alive(&weak_g));
         assert_eq!(eval(&mut engine, "typeof escaped.constructor"), "function");
         eval(&mut engine, "delete escaped.constructor;");
         engine.interp.gc_collect();
-        assert!(weak_g.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak_g));
     }
 }

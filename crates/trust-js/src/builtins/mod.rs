@@ -468,7 +468,7 @@ pub(crate) fn proxy_own_keys(
         }
     }
     if extensible_target && nonconfigurable_keys.is_empty() {
-        return Ok(keys);
+        return Ok(keys.into_vec());
     }
     for key in &nonconfigurable_keys {
         if !unchecked.remove(key.as_str()) {
@@ -479,7 +479,7 @@ pub(crate) fn proxy_own_keys(
         }
     }
     if extensible_target {
-        return Ok(keys);
+        return Ok(keys.into_vec());
     }
     for key in &configurable_keys {
         if !unchecked.remove(key.as_str()) {
@@ -495,7 +495,7 @@ pub(crate) fn proxy_own_keys(
             "ownKeys trap added a key to a non-extensible target",
         ));
     }
-    Ok(keys)
+    Ok(keys.into_vec())
 }
 
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
@@ -1357,7 +1357,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             return Ok(i.make_array(out));
         }
     }
-    let mut out = Vec::new();
+    // Rooted across the getters and traps each later key runs (I1).
+    let mut out = crate::rooting::RootedVec::new();
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let Value::Str(ks) = &k {
@@ -1466,7 +1467,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
             });
         }
     }
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }
 
 #[cfg(test)]
@@ -2068,7 +2069,9 @@ fn object_define_properties(
             .collect()
     };
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
+    // They stay rooted through later getters and the defines' descriptor reads (I1).
     let mut descs: Vec<(crate::value::PropertyKey, Value)> = Vec::new();
+    let mut roots = crate::rooting::ValueRoots::new();
     for key in keys {
         let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
             let d = proxy_gopd_value(i, &t, &h, &key)?;
@@ -2094,6 +2097,7 @@ fn object_define_properties(
         };
         if enumerable {
             let desc_obj = ab(i.get_member_key(&props, &key))?;
+            roots.keep(&desc_obj);
             descs.push((key, desc_obj));
         }
     }
@@ -2124,11 +2128,12 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
     };
     let len = ab(i.to_length(&o))?;
     check_argument_count(i, len)?;
-    let mut out = Vec::with_capacity(len.min(1024));
+    // Rooted across the getters later reads run (I1).
+    let mut out = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len.min(1024)));
     for k in 0..len {
         out.push(array_get_index(i, &o, v, k)?);
     }
-    Ok(out)
+    Ok(out.into_vec())
 }
 
 /// The RangeError for an argument list longer than [`MAX_ARGUMENTS_LEN`], raised before any
@@ -4466,12 +4471,16 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "groupBy", 2, |i, _this, args| {
         let mut groups: Vec<(crate::value::PropertyKey, Vec<Value>)> = Vec::new();
         let mut group_index: crate::fasthash::FastMap<String, usize> = Default::default();
+        // The groups are Rust-heap state across callback calls (I1).
+        let mut roots = crate::rooting::ValueRoots::new();
         group_by(
             i,
             &arg(args, 0),
             &arg(args, 1),
             "Object.groupBy",
             |i, key_v, el| {
+                roots.keep(&key_v);
+                roots.keep(&el);
                 let key = ab(i.to_property_key(&key_v))?;
                 if let Some(&offset) = group_index.get(key.as_str()) {
                     groups[offset].1.push(el);
@@ -6672,7 +6681,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
         // SortIndexedProperties: read only the present indices (holes are skipped, not read).
-        let mut items = Vec::new();
+        // The items stay rooted through getters, comparator calls and the write-back (I1).
+        let mut items = crate::rooting::RootedVec::new();
         for k in 0..len {
             let key = k.to_string();
             if ab(i.js_has_property(&ov, &key))? {
@@ -6682,7 +6692,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let item_count = items.len();
         merge_sort(i, &mut items, &cmp)?;
         // Set(O, k, v, true): a failed write (non-writable element) always throws.
-        for (k, v) in items.into_iter().enumerate() {
+        for (k, v) in items.iter().cloned().enumerate() {
             let ok = ab(i.set_member_recv(&ov, &k.to_string(), v, ov.clone()))?;
             if !ok {
                 return Err(i.make_error(
@@ -6712,12 +6722,13 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // Elements are read from the end down (from = len - k - 1) into ascending targets.
-        let mut items = Vec::with_capacity(len);
+        // Elements are read from the end down (from = len - k - 1) into ascending targets,
+        // rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len));
         for k in 0..len {
             items.push(array_get_index(i, &o, &ov, len - k - 1)?);
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "toSorted", 1, |i, this, args| {
         // The comparator is validated before the receiver is read.
@@ -6729,17 +6740,19 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let ov = Value::Obj(o.clone());
         let len = ab(i.checked_array_len(&o))?;
         if len <= MAX_ARRAY_OP_LEN {
-            if let Some(mut items) = dense_array_snapshot(i, &ov) {
+            if let Some(items) = dense_array_snapshot(i, &ov) {
+                // Rooted through comparator calls, which may empty the source (I1).
+                let mut items = crate::rooting::RootedVec::from_vec(items);
                 merge_sort(i, &mut items, &cmp)?;
-                return Ok(i.make_array(items));
+                return Ok(i.make_array(items.into_vec()));
             }
         }
-        let mut items = Vec::with_capacity(len);
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len));
         for k in 0..len {
             items.push(array_get_index(i, &o, &ov, k)?);
         }
         merge_sort(i, &mut items, &cmp)?;
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "with", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -6762,8 +6775,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // The replaced index is never read.
-        let mut items = Vec::with_capacity(len as usize);
+        // The replaced index is never read. Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(len as usize));
         for k in 0..len {
             if k == idx {
                 items.push(arg(args, 1));
@@ -6771,7 +6784,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 items.push(array_get_index(i, &o, &ov, k as usize)?);
             }
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "toSpliced", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -6808,8 +6821,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Ok(i.make_array(items));
             }
         }
-        // The discarded span is never read.
-        let mut items = Vec::with_capacity(new_len as usize);
+        // The discarded span is never read. Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::from_vec(Vec::with_capacity(new_len as usize));
         for k in 0..start {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
@@ -6817,7 +6830,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         for k in (start + del)..len {
             items.push(array_get_index(i, &o, &ov, k as usize)?);
         }
-        Ok(i.make_array(items))
+        Ok(i.make_array(items.into_vec()))
     });
     it.def_method(&ap, "copyWithin", 2, |i, this, args| {
         let o = arr_to_object(i, &this)?;
@@ -7207,8 +7220,11 @@ fn flatten_into(
         && flatten_dense_target_safe(i, target, source)
     {
         if let Some(values) = dense_array_snapshot(i, source) {
+            // A nested element's `length` Get can still reach a proxy trap: keep the snapshot
+            // rooted (I1).
+            let values = crate::rooting::RootedVec::from_vec(values);
             let mut target_index = start;
-            for element in values {
+            for element in values.iter().cloned() {
                 if depth > 0 && json_is_array(i, &element)? {
                     let len_val = ab(i.get_member_key(&element, "length"))?;
                     let el_len = to_length_val(i, &len_val)?;
@@ -7615,11 +7631,12 @@ fn install_iterator(it: &mut Interp) {
     it.def_method(&proto, "toArray", 0, |i, this, _| {
         require_iterator_object(i, &this)?;
         let next = ab(i.get_member_key(&this, "next"))?;
-        let mut out = Vec::new();
+        // Rooted across the author code each step runs (I1).
+        let mut out = crate::rooting::RootedVec::new();
         while let Some(v) = step_iter_with(i, &this, &next)? {
             out.push(v);
         }
-        Ok(i.make_array(out))
+        Ok(i.make_array(out.into_vec()))
     });
     it.def_method(&proto, "forEach", 1, |i, this, a| {
         require_iterator_object(i, &this)?;
@@ -7843,8 +7860,9 @@ fn install_iterator(it: &mut Interp) {
             .clone()
             .map(|s| Interp::sym_key(&s))
             .unwrap_or_default();
-        let mut items = Vec::new();
-        let mut methods = Vec::new();
+        // Rooted across the getters later reads run (I1).
+        let mut items = crate::rooting::RootedVec::new();
+        let mut methods = crate::rooting::RootedVec::new();
         for v in a {
             if !matches!(v, Value::Obj(_)) {
                 return Err(i.make_error("TypeError", "Iterator.concat argument is not an object"));
@@ -7857,8 +7875,8 @@ fn install_iterator(it: &mut Interp) {
             methods.push(m);
         }
         let obj = Object::new(i.extra_protos.get("%IteratorPrototype%").cloned());
-        let items_arr = i.make_array(items);
-        let methods_arr = i.make_array(methods);
+        let items_arr = i.make_array(items.into_vec());
+        let methods_arr = i.make_array(methods.into_vec());
         set_internal_slot(&obj, "#\u{0}cc_items", items_arr);
         set_internal_slot(&obj, "#\u{0}cc_methods", methods_arr);
         set_internal_slot(&obj, "#\u{0}cc_idx", Value::Num(0.0));
@@ -9261,10 +9279,11 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     } else {
         Value::Undefined
     };
-    // Open the inputs in order, GetIteratorFlattenable each as it is read.
+    // Open the inputs in order, GetIteratorFlattenable each as it is read. The lists are
+    // rooted across the author code each step runs (I1).
     let mut keys: Vec<crate::value::PropertyKey> = Vec::new();
-    let mut iters: Vec<Value> = Vec::new();
-    let mut nexts: Vec<Value> = Vec::new();
+    let mut iters = crate::rooting::RootedVec::new();
+    let mut nexts = crate::rooting::RootedVec::new();
     let open_one = |i: &mut Interp,
                     v: &Value,
                     iters: &mut Vec<Value>,
@@ -9372,7 +9391,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     let n_iters = iters.len();
     // `longest` padding, aligned with the inputs: zip iterates the padding iterable at most
     // iterCount times (it may be infinite); zipKeyed reads padding[key] per input key.
-    let mut padding = vec![Value::Undefined; n_iters];
+    let mut padding = crate::rooting::RootedVec::from_vec(vec![Value::Undefined; n_iters]);
     if mode == "longest" && !matches!(padding_value, Value::Undefined) {
         if keyed {
             for (j, k) in keys.iter().enumerate() {
@@ -9423,15 +9442,15 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             .or_else(|| i.extra_protos.get("%IteratorPrototype%"))
             .cloned(),
     );
-    set_internal_slot(&obj, "#\u{0}zip_iters", i.make_array(iters));
-    set_internal_slot(&obj, "#\u{0}zip_nexts", i.make_array(nexts));
+    set_internal_slot(&obj, "#\u{0}zip_iters", i.make_array(iters.into_vec()));
+    set_internal_slot(&obj, "#\u{0}zip_nexts", i.make_array(nexts.into_vec()));
     set_internal_slot(
         &obj,
         "#\u{0}zip_state",
         i.make_array(vec![Value::Bool(false); n_iters]),
     );
     set_internal_slot(&obj, "#\u{0}zip_mode", Value::lstr(mode.clone()));
-    set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding));
+    set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding.into_vec()));
     set_internal_slot(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
         let karr = i.make_array(keys.into_iter().map(|key| key.into_value()).collect());
@@ -9940,13 +9959,16 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
             }
             let size = ab(i.get_internal_slot(&this, "#\u{0}ih_size"))?;
             let size = ab(i.to_number(&size))? as usize;
-            let mut buffer = Vec::with_capacity(size.min(1024));
+            // Rooted across the author code each step runs (I1).
+            let mut buffer =
+                crate::rooting::RootedVec::from_vec(Vec::with_capacity(size.min(1024)));
             loop {
                 match step_iter_with(i, &src, &inext)? {
                     Some(value) => {
                         buffer.push(value);
                         if buffer.len() == size {
-                            return Ok(iter_result(i, i.make_array(buffer), false));
+                            let chunk = i.make_array(buffer.into_vec());
+                            return Ok(iter_result(i, chunk, false));
                         }
                     }
                     None => {
@@ -9958,7 +9980,8 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                         return if buffer.is_empty() {
                             Ok(iter_result(i, Value::Undefined, true))
                         } else {
-                            Ok(iter_result(i, i.make_array(buffer), false))
+                            let chunk = i.make_array(buffer.into_vec());
+                            Ok(iter_result(i, chunk, false))
                         };
                     }
                 }
@@ -9987,12 +10010,15 @@ fn iter_helper_step(i: &mut Interp, this: Value) -> Result<Value, Value> {
                 }
                 _ => VecDeque::new(),
             };
+            // Values stepped into the window are rooted across later steps (I1).
+            let mut roots = crate::rooting::ValueRoots::new();
             loop {
                 match step_iter_with(i, &src, &inext)? {
                     Some(value) => {
                         if buffer.len() == size {
                             buffer.pop_front();
                         }
+                        roots.keep(&value);
                         buffer.push_back(value);
                         if buffer.len() == size {
                             let window = buffer.iter().cloned().collect::<Vec<_>>();
@@ -12437,4 +12463,11 @@ fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
         format!("{}.{}", &ds[..1], &ds[1..])
     };
     format!("{sign}{m}{}", fmt_exp(exp))
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for FromAsyncCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.visit_values(|value| sink.value(value));
+    }
 }

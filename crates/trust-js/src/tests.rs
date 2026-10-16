@@ -851,6 +851,10 @@ fn legacy_function_reflection_diagnostics_preserve_lazy_materialization() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
     for mode in [1, 2] {
@@ -981,6 +985,10 @@ fn megamorphic_direct_call_can_grow_the_secondary_cache_in_a_nested_call() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn megamorphic_cache_does_not_keep_discarded_functions_alive() {
     let mut engine = Engine::new();
@@ -1373,31 +1381,31 @@ fn embedder_indexed_property_side_table_does_not_pin_dead_objects() {
         .eval_value("index => index")
         .expect("getter parses")
         .unwrap_or_else(|_| panic!("getter evaluates"));
-    let target = Value::Obj(engine.ctx().new_object());
-    let pointer = target
-        .as_obj()
-        .map(|object| crate::value::Gc::as_ptr(object) as usize)
-        .expect("target is an object");
-    engine
-        .ctx()
-        .install_readonly_indexed_properties(&target, 2, getter)
-        .unwrap_or_else(|_| panic!("indexed properties install"));
     let global = engine.ctx().global_this();
-    engine
-        .ctx()
-        .member_set(&global, "temporaryIndexedObject", target.clone())
-        .unwrap_or_else(|_| panic!("temporary object is published"));
-    assert!(engine.ctx().host_indexed.contains_key(&pointer));
+    // The target lives only in this helper frame (gc-heap scans the stack).
+    let pointer = crate::gc_test::in_frame(|| {
+        let target = Value::Obj(engine.ctx().new_object());
+        let pointer = crate::gc_test::HiddenAddress::of(&target);
+        engine
+            .ctx()
+            .install_readonly_indexed_properties(&target, 2, getter)
+            .unwrap_or_else(|_| panic!("indexed properties install"));
+        engine
+            .ctx()
+            .member_set(&global, "temporaryIndexedObject", target.clone())
+            .unwrap_or_else(|_| panic!("temporary object is published"));
+        pointer
+    });
+    assert!(pointer.in_map(&engine.ctx().host_indexed));
 
     engine
         .ctx()
         .member_set(&global, "temporaryIndexedObject", Value::Undefined)
         .unwrap_or_else(|_| panic!("temporary object is released"));
-    drop(target);
     engine.ctx().collect_garbage_for_host();
 
-    assert!(!engine.ctx().host_indexed.contains_key(&pointer));
-    assert!(!engine.ctx().gc_pins.contains_key(&pointer));
+    assert!(!pointer.in_map(&engine.ctx().host_indexed));
+    assert!(!pointer.in_map(&engine.ctx().gc_pins));
 }
 
 #[cfg(feature = "embed")]
@@ -3570,6 +3578,22 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         _ => panic!("child marker was retained"),
     };
 
+    // gc-heap: a ShadowRealm allocates in its parent's (its Agent's) heap, so both markers
+    // live in the one heap; the caller's heap is still the active one afterwards.
+    if cfg!(feature = "gc-heap") {
+        assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
+        let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        for marker in [&parent_object, &child_object] {
+            assert!(snapshot
+                .iter()
+                .any(|object| crate::value::Gc::ptr_eq(object, marker)));
+        }
+        assert!(std::rc::Rc::ptr_eq(
+            &crate::value::active_gc_heap(),
+            &engine.interp.gc_heap
+        ));
+        return;
+    }
     let parent_snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
     let child_snapshot = crate::value::heap_gc_snapshot(&child.gc_heap);
     assert!(parent_snapshot
@@ -4518,11 +4542,6 @@ fn job_callback_source_realms_are_traced_and_collectable() {
             engine.set_job_callback_script_caller_capture(true);
             engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
             let main = engine.global_this();
-            let child = engine.ctx().create_embed_realm();
-            engine
-                .ctx()
-                .member_set(&child, "main", main.clone())
-                .unwrap_or_else(|_| panic!("parent"));
             // The callback itself belongs to the main Realm. Only its HostDefined source
             // retains the child, whose global also owns the pending promise / registry.
             let source = if kind == "promise" {
@@ -4530,10 +4549,17 @@ fn job_callback_source_realms_are_traced_and_collectable() {
             } else {
                 "globalThis.saved = new main.FinalizationRegistry(main.nothing); main.kept = saved;"
             };
-            engine
-                .with_embed_realm(&child, |engine| run_in(engine, source))
-                .unwrap_or_else(|_| panic!("register"));
-            drop(child);
+            // The child Realm handle lives only in this helper frame (gc-heap scans the stack).
+            crate::gc_test::in_frame(|| {
+                let child = engine.ctx().create_embed_realm();
+                engine
+                    .ctx()
+                    .member_set(&child, "main", main.clone())
+                    .unwrap_or_else(|_| panic!("parent"));
+                engine
+                    .with_embed_realm(&child, |engine| run_in(engine, source))
+                    .unwrap_or_else(|_| panic!("register"));
+            });
             engine.interp.gc_collect();
             assert_eq!(
                 engine.interp.realms.len(),
@@ -4559,20 +4585,23 @@ fn job_callback_queued_source_is_a_temporary_root() {
     engine.set_job_callback_script_caller_capture(true);
     engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
     let main = engine.global_this();
-    let child = engine.ctx().create_embed_realm();
-    engine
-        .ctx()
-        .member_set(&child, "main", main)
-        .unwrap_or_else(|_| panic!("parent"));
-    engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| {
-            let result =
-                ctx.eval_classic_script_interruptible("main.Promise.resolve().then(main.nothing);");
-            assert!(result.is_ok_and(|completion| completion.is_ok()));
-        })
-        .unwrap_or_else(|_| panic!("queue child callback"));
-    drop(child);
+    // The child Realm handle lives only in this helper frame (gc-heap scans the stack).
+    crate::gc_test::in_frame(|| {
+        let child = engine.ctx().create_embed_realm();
+        engine
+            .ctx()
+            .member_set(&child, "main", main)
+            .unwrap_or_else(|_| panic!("parent"));
+        engine
+            .ctx()
+            .with_embed_realm(&child, |ctx| {
+                let result = ctx.eval_classic_script_interruptible(
+                    "main.Promise.resolve().then(main.nothing);",
+                );
+                assert!(result.is_ok_and(|completion| completion.is_ok()));
+            })
+            .unwrap_or_else(|_| panic!("queue child callback"));
+    });
     engine.interp.gc_collect();
     assert_eq!(
         engine.interp.realms.len(),
@@ -4761,20 +4790,22 @@ fn suspended_context_realm_is_traced_but_not_permanently_rooted() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        let child = engine.ctx().create_embed_realm();
-        engine.with_embed_realm(&child, |engine| {
-            run_in(engine, "globalThis.saved = (function* () { yield Object.getPrototypeOf([]) === Array.prototype; })()");
-        }).unwrap_or_else(|_| panic!("initialize child continuation"));
-        let continuation = engine
-            .ctx()
-            .member_get(&child, "saved")
-            .unwrap_or_else(|_| panic!("read continuation"));
-        let main = engine.global_this();
-        engine
-            .ctx()
-            .member_set(&main, "kept", continuation)
-            .unwrap_or_else(|_| panic!("retain continuation"));
-        drop(child);
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        crate::gc_test::in_frame(|| {
+            let child = engine.ctx().create_embed_realm();
+            engine.with_embed_realm(&child, |engine| {
+                run_in(engine, "globalThis.saved = (function* () { yield Object.getPrototypeOf([]) === Array.prototype; })()");
+            }).unwrap_or_else(|_| panic!("initialize child continuation"));
+            let continuation = engine
+                .ctx()
+                .member_get(&child, "saved")
+                .unwrap_or_else(|_| panic!("read continuation"));
+            let main = engine.global_this();
+            engine
+                .ctx()
+                .member_set(&main, "kept", continuation)
+                .unwrap_or_else(|_| panic!("retain continuation"));
+        });
         engine.interp.gc_collect();
         assert_eq!(
             engine.interp.realms.len(),
@@ -5855,6 +5886,10 @@ fn gc_reclaims_cycles() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+)]
 #[cfg(feature = "embed")]
 #[test]
 fn task_pressure_collects_the_nursery_and_released_documents_the_whole_heap() {
@@ -5913,6 +5948,10 @@ fn task_pressure_collects_the_nursery_and_released_documents_the_whole_heap() {
 #[cfg(feature = "embed")]
 #[test]
 fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
+    // GC stress collects at every safepoint, so no pressure is left pending.
+    if crate::gc_test::stress_active() {
+        return;
+    }
     // ECMA-262 #sec-liveness / #sec-clear-kept-objects and HTML
     // #perform-a-microtask-checkpoint: collection is optional; completing
     // jobs and ending WeakRef read consistency at their boundary are not.
@@ -6124,7 +6163,10 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
             matches!(result, crate::value::Value::Num(1000.0)),
             "{tier:?}"
         );
-        assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
+        // A GC stress collection sets a new threshold.
+        if !crate::gc_test::stress_active() {
+            assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
+        }
         assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
     }
 }
@@ -6242,6 +6284,10 @@ fn host_weak_map_lookup_uses_intrinsic_brand_and_storage() {
     assert!(engine.ctx().map_get(&set, &key).is_err());
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+)]
 #[cfg(feature = "embed")]
 #[test]
 fn transient_tasks_avoid_full_heap_scans_and_small_cycles_stay_bounded() {
@@ -6617,6 +6663,10 @@ fn gc_keeps_reachable_cycles() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+)]
 #[test]
 fn gc_registry_reuses_dead_object_slots() {
     let (slots_before, _) = crate::value::gc_registry_stats();
@@ -9290,7 +9340,7 @@ fn jit_numeric_packed_overwrites_stay_in_native_code() {
 #[cfg(target_arch = "aarch64")]
 fn jit_small_packed_array_reads_and_writes_stay_native() {
     let mut engine = Engine::new();
-    engine.interp.tier = crate::bytecode::Tier::Jit;
+    engine.interp.tier = crate::bytecode::Tier::Jit.admitted();
     engine.interp.tier_threshold = 0;
     assert_eq!(
         run_in(
@@ -9328,7 +9378,7 @@ fn jit_small_packed_array_reads_and_writes_stay_native() {
 #[cfg(target_arch = "aarch64")]
 fn jit_packed_numeric_chains_do_not_replay_element_helpers() {
     let mut engine = Engine::new();
-    engine.interp.tier = crate::bytecode::Tier::Jit;
+    engine.interp.tier = crate::bytecode::Tier::Jit.admitted();
     engine.interp.tier_threshold = 0;
     assert_eq!(
         run_in(
@@ -10329,7 +10379,7 @@ fn bytecode_property_inline_cache() {
     // run the getter, not read a raw slot), own-shadows-proto + delete falling back to the proto,
     // and writes through the SetProp cache.
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
     e.interp.tier_threshold = 0; // compile on first call so the caches are exercised
     let src = r#"
       function readXY(o){ return o.x + "," + o.y; }
@@ -10369,7 +10419,7 @@ fn compiled_parameterless_arguments_object() {
     "#;
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10425,7 +10475,7 @@ fn compiled_strict_arguments_preserve_parameters_and_escaping_identity() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         let got = match e.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -10514,7 +10564,7 @@ fn jit_construct_arguments_apply_forwarder_preserves_live_guards() {
 fn compiled_typeof_unresolved_name() {
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         let got = match e
             .eval(
@@ -10549,7 +10599,7 @@ fn compiled_update_free_name() {
     "#;
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10648,7 +10698,7 @@ fn compiled_regexp_literal_is_fresh() {
     assert!(crate::bytecode::compile(&func).is_some());
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10710,7 +10760,7 @@ fn compiled_comma_prefixes_preserve_getters_coercions_and_abrupt_completions() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         let result = match engine.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -10796,7 +10846,7 @@ fn bytecode_labelled_loops_match_interp() {
     // both tiers (threshold 0 forces immediate compilation) and require identical results.
     fn on_tier(src: &str, tier: crate::bytecode::Tier) -> String {
         let mut e = Engine::new();
-        e.interp.tier = tier;
+        e.interp.tier = tier.admitted();
         e.interp.tier_threshold = 0;
         match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10824,7 +10874,7 @@ fn bytecode_async_vm() {
     // coroutine. Checks the awaited value flows back, `await` in a loop accumulates, the return
     // value is delivered, and `await` still yields a microtask tick (ordering "123", not "132").
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
     e.interp.tier_threshold = 0; // compile every function so the VM async path is taken
     let src = r#"
       var out = "";
@@ -10853,7 +10903,7 @@ fn bytecode_try_catch() {
     // the outer catch, `return` inside try still returns, and — the reason Hono's async `compose`
     // now compiles — a rejected `await` inside a `try` lands in its `catch`.
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode;
+    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
     e.interp.tier_threshold = 0;
     let src = r#"
       function f(x){ try { if (x<0) throw "neg"+x; return "ok"+x; } catch(e){ return "c:"+e; } }
@@ -12026,7 +12076,7 @@ fn projected_class_defaults_preserve_the_derived_constructor_this_environment() 
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12116,7 +12166,7 @@ fn for_of_returns_run_inner_finalizers_before_iterator_close() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12173,7 +12223,7 @@ fn arrow_super_properties_capture_the_enclosing_receiver_without_explicit_this()
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12232,7 +12282,7 @@ fn loop_fallback_fusions_preserve_mixed_values_and_getter_effects() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12265,7 +12315,7 @@ fn discarded_local_reads_preserve_every_value_kind_and_tdz() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12333,7 +12383,7 @@ fn compiled_lexical_assignments_check_tdz_after_rhs_and_close_iterators() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12415,7 +12465,7 @@ fn direct_eval_from_with_keeps_lexical_scope_and_argument_order() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -14274,6 +14324,10 @@ fn for_head_no_in_function_boundaries_execute() {
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn loop_free_functions_earn_native_code_through_vm_runs() {
     // A loop-free body runs `jit_admit_runs` times on the bytecode VM before it is compiled to
@@ -18531,6 +18585,9 @@ fn finalization_registry_retention_and_cleanup_jobs() {
         )
         .expect("setup parses");
     engine.eval("$262.gc()", false).expect("collection parses");
+    // The cleanup job ran after that collection; a tracing heap (gc-heap) reclaims the held
+    // value at the next one, where reference counting freed it as the callback returned.
+    engine.eval("$262.gc()", false).expect("collection parses");
     assert!(matches!(
         engine
             .eval(
@@ -19925,7 +19982,9 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
         .modules
         .keys()
         .any(|key| crate::modules::module_map_context(key) == 61));
-    let retired_namespace = {
+    // Kept hidden: the conservative stack scan (gc-heap) would take the plain address for a
+    // reference to the namespace.
+    let retired_namespace = crate::gc_test::HiddenAddress::from_fn(|| {
         let ctx = engine.ctx();
         let namespace = ctx
             .modules
@@ -19935,8 +19994,8 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
             .expect("retired settings module has a namespace");
         ctx.object_addr(namespace)
             .expect("module namespace is an object")
-    };
-    assert!(engine.ctx().gc_pins.contains_key(&retired_namespace));
+    });
+    assert!(retired_namespace.in_map(&engine.ctx().gc_pins));
     assert!(engine
         .ctx()
         .microtasks
@@ -19969,8 +20028,8 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
     engine.run_microtasks();
     assert_eq!(run_in(&mut engine, "retiredJobRan"), "false");
     engine.collect_garbage_at_idle();
-    assert!(!engine.ctx().module_ns.contains_key(&retired_namespace));
-    assert!(!engine.ctx().gc_pins.contains_key(&retired_namespace));
+    assert!(!retired_namespace.in_map(&engine.ctx().module_ns));
+    assert!(!retired_namespace.in_map(&engine.ctx().gc_pins));
     engine.ctx().set_host_job_context(61);
     assert_eq!(engine.ctx().host_job_context, 0);
 }
@@ -19982,46 +20041,53 @@ fn retired_settings_request_boundary_collection_without_allocation_pressure() {
     // reachable. Retirement requests a scan; it must not forcibly destroy a
     // retained Realm or interrupt the synchronous job (ECMA-262 §9.9).
     let mut engine = Engine::new();
-    let abandoned = engine.ctx().create_embed_realm();
-    let retained = engine.ctx().create_embed_realm();
-    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
-    let retained_ptr = engine.ctx().object_addr(&retained).unwrap();
-    for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
-        assert!(engine
-            .ctx()
-            .with_embed_realm(realm, |ctx| ctx.set_host_job_context(context))
-            .is_ok());
-    }
-    // Reset allocation pressure while both Realms are explicitly rooted.
+    // Realm handles live only in helper frames (gc-heap scans the stack).
+    let retained_ptr = crate::gc_test::in_frame(|| {
+        let (abandoned_ptr, retained) = crate::gc_test::in_frame(|| {
+            let abandoned = engine.ctx().create_embed_realm();
+            let retained = engine.ctx().create_embed_realm();
+            // Addresses are kept hidden: the conservative stack scan (gc-heap) would take a plain
+            // address for a reference.
+            let abandoned_ptr = crate::gc_test::HiddenAddress::of(&abandoned);
+            for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
+                assert!(engine
+                    .ctx()
+                    .with_embed_realm(realm, |ctx| ctx.set_host_job_context(context))
+                    .is_ok());
+            }
+            (abandoned_ptr, retained)
+        });
+        let retained_ptr = crate::gc_test::HiddenAddress::of(&retained);
+        // Reset allocation pressure while both Realms are explicitly rooted.
+        engine.collect_garbage_at_idle();
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert!(!engine.ctx().release_host_job_context(0));
+        assert!(!engine.has_pending_task_garbage_collection());
+
+        engine.defer_task_garbage_collection(true);
+        assert!(engine.ctx().release_host_job_context(81));
+        assert!(engine.ctx().release_host_job_context(82));
+        assert!(engine.has_pending_task_garbage_collection());
+        assert!(abandoned_ptr.in_map(&engine.ctx().realms));
+        engine.run_microtasks();
+        assert!(engine.has_pending_task_garbage_collection());
+        assert!(abandoned_ptr.in_map(&engine.ctx().realms));
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+        engine.defer_task_garbage_collection(false);
+        assert!(engine.collect_pending_task_garbage() > 0);
+        assert!(!abandoned_ptr.in_map(&engine.ctx().realms));
+        assert!(retained_ptr.in_map(&engine.ctx().realms));
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert!(!engine.ctx().release_host_job_context(81));
+        assert!(!engine.ctx().release_host_job_context(82));
+        assert!(!engine.has_pending_task_garbage_collection());
+        assert_eq!(engine.collect_pending_task_garbage(), 0);
+
+        retained_ptr
+    });
     engine.collect_garbage_at_idle();
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert!(!engine.ctx().release_host_job_context(0));
-    assert!(!engine.has_pending_task_garbage_collection());
-
-    engine.defer_task_garbage_collection(true);
-    assert!(engine.ctx().release_host_job_context(81));
-    assert!(engine.ctx().release_host_job_context(82));
-    drop(abandoned);
-    assert!(engine.has_pending_task_garbage_collection());
-    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
-    engine.run_microtasks();
-    assert!(engine.has_pending_task_garbage_collection());
-    assert!(engine.ctx().realms.contains_key(&abandoned_ptr));
-    assert_eq!(engine.collect_pending_task_garbage(), 0);
-
-    engine.defer_task_garbage_collection(false);
-    assert!(engine.collect_pending_task_garbage() > 0);
-    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
-    assert!(engine.ctx().realms.contains_key(&retained_ptr));
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert!(!engine.ctx().release_host_job_context(81));
-    assert!(!engine.ctx().release_host_job_context(82));
-    assert!(!engine.has_pending_task_garbage_collection());
-    assert_eq!(engine.collect_pending_task_garbage(), 0);
-
-    drop(retained);
-    engine.collect_garbage_at_idle();
-    assert!(!engine.ctx().realms.contains_key(&retained_ptr));
+    assert!(!retained_ptr.in_map(&engine.ctx().realms));
 }
 
 #[cfg(feature = "embed")]
@@ -20032,30 +20098,32 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
     // switch must replace the bootstrap GlobalEnv rather than leave an
     // unreachable `(realm, 0)` HostSettingsState as a Rust GC root.
     let mut engine = Engine::new();
-    let child = engine.ctx().create_embed_realm();
-    let child_ptr = engine
-        .ctx()
-        .object_addr(&child)
-        .expect("embed Realm global is an object");
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&child, |ctx| ctx.set_host_job_context(71))
-        .is_ok());
+    // The Realm handle lives only in this helper frame (gc-heap scans the stack).
+    let child_ptr = crate::gc_test::in_frame(|| {
+        let child = engine.ctx().create_embed_realm();
+        // Kept hidden: the conservative stack scan (gc-heap) would take the plain address for
+        // a reference.
+        let child_ptr = crate::gc_test::HiddenAddress::of(&child);
+        assert!(engine
+            .ctx()
+            .with_embed_realm(&child, |ctx| ctx.set_host_job_context(71))
+            .is_ok());
+        child_ptr
+    });
     assert!(!engine
         .ctx()
         .host_settings_states
         .keys()
-        .any(|(realm, context)| *realm == child_ptr && *context == 0));
+        .any(|(realm, context)| *realm == child_ptr.get() && *context == 0));
     assert!(engine
         .ctx()
         .host_settings_states
         .keys()
-        .any(|(realm, context)| *realm == child_ptr && *context == 71));
+        .any(|(realm, context)| *realm == child_ptr.get() && *context == 71));
 
     engine.ctx().release_host_job_context(71);
-    drop(child);
     engine.ctx().collect_garbage_for_host();
-    assert!(!engine.ctx().realms.contains_key(&child_ptr));
+    assert!(!child_ptr.in_map(&engine.ctx().realms));
 }
 
 #[cfg(feature = "embed")]
@@ -21360,7 +21428,7 @@ fn for_in_cached_shapes_preserve_live_enumeration() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         assert_eq!(run_in(&mut engine, source), "ok");
         let (entries, bytes) = engine.interp.enumeration_keys.stats();
@@ -26637,7 +26705,7 @@ fn host_snapshots_keep_source_policy_without_changing_execution_or_author_code()
     ] {
         for (snapshot, opaque) in [(&ordinary, false), (&host, true)] {
             let mut engine = Engine::new();
-            engine.interp.tier = tier;
+            engine.interp.tier = tier.admitted();
             engine.interp.tier_threshold = 0;
             assert!(matches!(
                 engine.eval_snapshot(snapshot, false).unwrap(),
@@ -28331,7 +28399,7 @@ fn jit_local_store_pairs_preserve_owned_values_and_throw_state() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         let result = match engine.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -28370,7 +28438,7 @@ fn deep_property_caches_preserve_absence_accessors_and_prototype_swaps() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier;
+        engine.interp.tier = tier.admitted();
         engine.interp.tier_threshold = 0;
         assert_eq!(run_in(&mut engine, source), "ok");
     }
@@ -29221,6 +29289,10 @@ fn jit_function_call_intrinsic_preserves_target_and_receiver_guards() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn interp_layout_probes() {
     // The asm call thunk's foundation: every probed Interp offset must resolve, and the Vec
@@ -29508,21 +29580,25 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                     ),
                 );
                 let env = engine.interp.global_env.clone();
-                let value = engine
-                    .interp
-                    .get_var("o", &env)
-                    .unwrap_or_else(|_| panic!("o"));
-                let weak = crate::value::Gc::downgrade(value.as_obj().unwrap());
-                drop(value);
+                // The object lives only in this helper frame (gc-heap scans the stack).
+                let weak = crate::gc_test::in_frame(|| {
+                    let value = engine
+                        .interp
+                        .get_var("o", &env)
+                        .unwrap_or_else(|_| panic!("o"));
+                    crate::value::Gc::downgrade(value.as_obj().unwrap())
+                });
                 run_in(&mut engine, "o = null;");
-                if !needs_home {
+                // Without a cycle the last reference count frees it at once; a tracing heap
+                // (gc-heap) reclaims it at the collection below.
+                if !needs_home && !cfg!(feature = "gc-heap") {
                     assert!(
-                        weak.upgrade().is_none(),
+                        !crate::gc_test::alive(&weak),
                         "tier {tier:?} threshold {threshold}: {source}"
                     );
                 }
                 engine.interp.gc_collect();
-                assert!(weak.upgrade().is_none(), "tier {tier:?}: {source}");
+                assert!(!crate::gc_test::alive(&weak), "tier {tier:?}: {source}");
             }
         }
     }

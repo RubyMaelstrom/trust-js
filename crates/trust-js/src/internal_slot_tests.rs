@@ -231,28 +231,31 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
         "#,
         );
         let env = engine.interp.global_env.clone();
-        let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
-        let weak = crate::value::Gc::downgrade(cycle.as_obj().unwrap());
-        drop(cycle);
+        // Strong handles live only in helper frames (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
+            crate::value::Gc::downgrade(cycle.as_obj().unwrap())
+        });
         engine.interp.collect_garbage_for_host();
         assert_eq!(eval(&mut engine, "live.get().marker"), "alive", "{tier:?}");
         eval(&mut engine, "cycle = null; compare = null; live = null;");
         engine.interp.collect_garbage_for_host();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "{tier:?}: slot/bound-function cycle retained"
         );
         eval(
             &mut engine,
             "cycle = new Intl.Collator('en-US'); compare = cycle.compare;",
         );
-        let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
-        let weak = crate::value::Gc::downgrade(cycle.as_obj().unwrap());
-        drop(cycle);
+        let weak = crate::gc_test::in_frame(|| {
+            let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
+            crate::value::Gc::downgrade(cycle.as_obj().unwrap())
+        });
         drop(env);
         drop(engine);
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "{tier:?}: slots retained at teardown"
         );
     }

@@ -23,10 +23,10 @@ fn assert_osr(tier: Tier) {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
-    if matches!(tier, Tier::Jit) {
+    if matches!(tier.admitted(), Tier::Jit) {
         assert!(entries > 0, "must enter actual borrowed native code");
     }
-    if !matches!(tier, Tier::Jit) {
+    if !matches!(tier.admitted(), Tier::Jit) {
         assert_eq!(entries, 0);
     }
 }
@@ -275,24 +275,29 @@ fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
         .ok()
         .expect("GC fixture parses");
         reset_counts();
-        let result = engine
-            .interp
-            .run_program(&body)
-            .ok()
-            .expect("GC fixture completes");
-        assert_osr(tier);
-        let Value::Obj(object) = &result else {
-            panic!("completion is owned object");
-        };
-        assert!(matches!(
-            object.borrow().props.get("k").unwrap().value(),
-            Value::Num(1999.0)
-        ));
-        let weak = crate::value::Gc::downgrade(object);
-        drop(result);
+        // The completion lives only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let result = engine
+                .interp
+                .run_program(&body)
+                .ok()
+                .expect("GC fixture completes");
+            assert_osr(tier);
+            let Value::Obj(object) = &result else {
+                panic!("completion is owned object");
+            };
+            assert!(matches!(
+                object.borrow().props.get("k").unwrap().value(),
+                Value::Num(1999.0)
+            ));
+            crate::value::Gc::downgrade(object)
+        });
         drop(body);
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none(), "completion leaked after {tier:?}");
+        assert!(
+            !crate::gc_test::alive(&weak),
+            "completion leaked after {tier:?}"
+        );
     }
 }
 

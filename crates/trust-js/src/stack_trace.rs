@@ -1037,6 +1037,10 @@ fn function_frame(
 mod tests {
     use super::*;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    )]
     #[test]
     fn shared_inline_sites_keep_positions_live_until_the_last_chunk() {
         let engine = crate::Engine::new();

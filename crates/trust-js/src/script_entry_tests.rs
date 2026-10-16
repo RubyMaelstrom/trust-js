@@ -28,7 +28,7 @@ fn check(source: &str, expected: &str) {
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if matches!(tier, Tier::Jit) {
+        if matches!(tier.admitted(), Tier::Jit) {
             assert!(native > 0, "must enter native Script code: {source}");
         }
     }
@@ -278,24 +278,26 @@ fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
         let body = crate::parser::parse_script(
             "try {(function(){var result={n:42};result.self=result;return result;})();} finally {collect();}",
             false).ok().expect("GC script parses");
-        let result = engine
-            .interp
-            .run_program(&body)
-            .ok()
-            .expect("GC script completes");
-        let Value::Obj(object) = &result else {
-            panic!("completion lost on {tier:?}");
-        };
-        assert!(matches!(
-            object.borrow().props.get("n").unwrap().value(),
-            Value::Num(42.0)
-        ));
-        let weak = crate::value::Gc::downgrade(object);
-        drop(result);
+        // The completion lives only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let result = engine
+                .interp
+                .run_program(&body)
+                .ok()
+                .expect("GC script completes");
+            let Value::Obj(object) = &result else {
+                panic!("completion lost on {tier:?}");
+            };
+            assert!(matches!(
+                object.borrow().props.get("n").unwrap().value(),
+                Value::Num(42.0)
+            ));
+            crate::value::Gc::downgrade(object)
+        });
         drop(body);
         engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "hidden Script completion retained on {tier:?}"
         );
     }

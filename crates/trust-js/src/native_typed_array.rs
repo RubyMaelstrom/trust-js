@@ -240,6 +240,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    )]
     #[test]
     fn native_typed_array_writes_publish_versions_ranges_and_survive_throws() {
         let mut engine = Engine::new();
@@ -361,23 +365,30 @@ mod tests {
             &mut engine,
             "var buffer = new ArrayBuffer(64); var a = new Uint8Array(buffer); a.self = a;",
         );
-        let buffer = engine
-            .eval_value("buffer")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read buffer"));
-        let ptr = Gc::as_ptr(buffer.as_obj().unwrap()) as usize;
-        let storage = Rc::downgrade(engine.interp.local_buffer(ptr).unwrap());
-        drop(buffer);
+        // The buffer and its address live only in this helper frame (gc-heap scans the stack).
+        let (ptr, storage) = crate::gc_test::in_frame(|| {
+            let buffer = engine
+                .eval_value("buffer")
+                .unwrap()
+                .unwrap_or_else(|_| panic!("read buffer"));
+            let ptr = crate::gc_test::HiddenAddress::of(&buffer);
+            let storage = Rc::downgrade(engine.interp.local_buffer(ptr.get()).unwrap());
+            (ptr, storage)
+        });
         eval(&mut engine, "a = null; buffer = null;");
         engine.interp.gc_collect();
-        assert!(!engine.interp.native_buffers.contains_key(&ptr));
+        assert!(!ptr.in_map(&engine.interp.native_buffers));
         assert!(
-            storage.upgrade().is_none(),
+            !crate::gc_test::alive(&storage),
             "native metadata must not root dead byte storage"
         );
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: an object handle does not outlive its Agent's heap under gc-heap (I5)"
+    )]
     fn native_typed_array_teardown_releases_backing_even_with_external_wrapper() {
         let mut engine = Engine::new();
         eval(&mut engine, "var a = new Uint8Array(64);");
@@ -398,7 +409,7 @@ mod tests {
         drop(buffer);
         drop(engine);
         assert!(view.as_obj().unwrap().borrow().native_typed_array.is_none());
-        assert!(storage.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&storage));
     }
 
     #[test]

@@ -33,6 +33,10 @@ fn check(source: &str, expected: &str) {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn object_literal_builders_have_real_native_entries() {
     use crate::value::Callable;

@@ -5,15 +5,15 @@ use crate::{bytecode::Tier, Completion, Engine};
 fn enable_callback(tier: Tier) -> crate::value::NativeFn {
     match tier {
         Tier::Interp => |i, _, _| {
-            i.tier = Tier::Interp;
+            i.tier = Tier::Interp.admitted();
             Ok(crate::value::Value::Undefined)
         },
         Tier::Bytecode => |i, _, _| {
-            i.tier = Tier::Bytecode;
+            i.tier = Tier::Bytecode.admitted();
             Ok(crate::value::Value::Undefined)
         },
         Tier::Jit => |i, _, _| {
-            i.tier = Tier::Jit;
+            i.tier = Tier::Jit.admitted();
             Ok(crate::value::Value::Undefined)
         },
     }
@@ -43,7 +43,7 @@ fn check(source: &str, expected: &str, minimum_fragments: usize, native: bool) {
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if native && tier == Tier::Jit {
+        if native && tier.admitted() == Tier::Jit {
             assert!(
                 crate::jit::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
                 "actual native fragment entry required: {source}"

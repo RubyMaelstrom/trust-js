@@ -274,9 +274,15 @@ fn visit_scope_edges(scope: &Env, sink: &mut impl GcEdgeSink) {
 impl Interp {
     pub(crate) fn gc_collect_young(&mut self, cause: crate::value::GcCause) {
         // P1 S2: the refcount nursery must never see cell handles; gc-heap collects in full.
-        if cfg!(feature = "gc-heap") {
-            return self.gc_collect_with_cause(cause);
-        }
+        // A thin entry (the nursery's frame is large): see `Interp::gc_heap_collect_explicit`.
+        #[cfg(feature = "gc-heap")]
+        return self.gc_collect_with_cause(cause);
+        #[cfg(not(feature = "gc-heap"))]
+        self.gc_collect_young_rc(cause)
+    }
+
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
+    fn gc_collect_young_rc(&mut self, cause: crate::value::GcCause) {
         let (objects, scopes) = crate::value::heap_young_snapshot(&self.gc_heap);
         if objects.len() >= SCOPE_EDGE as usize || scopes.len() >= SCOPE_EDGE as usize {
             // Edge identities are 31-bit; such a nursery is far beyond any live-object limit.
@@ -459,6 +465,10 @@ mod tests {
         interp.gc_collect_young(GcCause::Explicit);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn nursery_collects_new_cycles_without_snapshotting_retained_old_objects() {
         let mut engine = Engine::new();
@@ -496,6 +506,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn nursery_preserves_old_to_young_edges_and_major_collects_cross_generation_cycles() {
         let mut engine = Engine::new();
@@ -525,6 +539,10 @@ mod tests {
         assert!(child_weak.upgrade().is_none());
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn nursery_acyclic_churn_does_not_accumulate_weak_allocation_headers() {
         let mut engine = Engine::new();

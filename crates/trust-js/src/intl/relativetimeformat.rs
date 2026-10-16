@@ -164,7 +164,8 @@ fn format(
         )));
     }
 
-    let mut output = Vec::new();
+    // Rooted across the formatToParts call and part reads (I1).
+    let mut output = crate::rooting::RootedVec::new();
     let push_literal = |i: &mut Interp, output: &mut Vec<Value>, text: &str| {
         if text.is_empty() {
             return;
@@ -190,7 +191,7 @@ fn format(
         output.push(Value::Obj(part));
     }
     push_literal(i, &mut output, &pattern[marker + 3..]);
-    Ok(i.make_array(output))
+    Ok(i.make_array(output.into_vec()))
 }
 
 fn new_service(i: &mut Interp, service: &str, locale: &str, options: Gc) -> Result<Value, Value> {

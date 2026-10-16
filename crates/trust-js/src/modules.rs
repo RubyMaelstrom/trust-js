@@ -2377,3 +2377,64 @@ fn exported_decl_names(inner: &Stmt) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for ModuleCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self { body, key: _ } = self;
+        crate::gc_trace::GcTrace::trace_gc(body, sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for ModuleRec {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            body: _,
+            source: _,
+            env,
+            ns,
+            meta,
+            dep_keys: _,
+            resolved: _,
+            local_exports: _,
+            imports: _,
+            indirect: _,
+            star_as: _,
+            stars: _,
+            linked: _,
+            evaluated: _,
+            evaluating: _,
+            eval_error,
+            deferred_deps: _,
+            top_promise,
+            started: _,
+            pending_async: _,
+            async_order: _,
+            async_parents: _,
+            dfs_index: _,
+            dfs_anc: _,
+            on_stack: _,
+            cycle_root: _,
+        } = self;
+        env.trace_gc(sink);
+        ns.trace_gc(sink);
+        meta.trace_gc(sink);
+        eval_error.trace_gc(sink);
+        top_promise.trace_gc(sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for PendingDynamicImport {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            promise,
+            specifier: _,
+            attr_type: _,
+            defer: _,
+            host_context: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(promise, sink);
+    }
+}

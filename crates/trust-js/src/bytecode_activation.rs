@@ -273,7 +273,7 @@ mod tests {
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
-            if tier == Tier::Jit {
+            if tier.admitted() == Tier::Jit {
                 assert!(crate::jit::TEST_PACKED_ENV_ENTRIES.with(|entries| entries.get()) > 0);
             }
         }

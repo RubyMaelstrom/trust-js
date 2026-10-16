@@ -427,6 +427,10 @@ fn trace_bound_array_state(call_id: u64, phase: &str, value: Option<&Value>) {
 mod bound_trace_tests {
     use super::*;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn native_previews_are_bounded_and_do_not_retain_objects() {
         let object = Object::new(None);
@@ -458,6 +462,10 @@ mod bound_trace_tests {
         assert_eq!(trace.history.back().map(String::as_str), Some("399"));
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn array_state_previews_skip_accessors_and_do_not_retain_values() {
         let owner = Object::new(None);
@@ -1956,6 +1964,10 @@ impl VarMap {
 mod binding_layout_tests {
     use super::*;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn cold_import_cells_keep_independent_environment_owners_and_shared_names() {
         #[cfg(target_pointer_width = "64")]
@@ -1993,36 +2005,38 @@ mod binding_layout_tests {
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             let global = engine.interp.global_env.clone();
-            let exporter = new_scope(Some(global.clone()));
-            let object = engine.interp.new_object();
-            object
-                .borrow_mut()
-                .props
-                .insert("n", crate::value::Property::plain(Value::Num(7.)));
-            exporter
-                .borrow_mut()
-                .vars
-                .insert("source", Binding::data(Value::Obj(object), true, true));
-            let mut import = Binding::data(Value::Undefined, false, true);
-            import.set_import_reference(Some((exporter.clone(), "source".into())));
-            global.borrow_mut().vars.insert("coldLeft", import.clone());
-            global.borrow_mut().vars.insert("coldRight", import);
-            let weak = Env::downgrade(&exporter);
-            drop(exporter);
+            // Strong handles live only in helper frames (gc-heap scans the stack).
+            let weak = crate::gc_test::in_frame(|| {
+                let exporter = new_scope(Some(global.clone()));
+                let object = engine.interp.new_object();
+                object
+                    .borrow_mut()
+                    .props
+                    .insert("n", crate::value::Property::plain(Value::Num(7.)));
+                exporter
+                    .borrow_mut()
+                    .vars
+                    .insert("source", Binding::data(Value::Obj(object), true, true));
+                let mut import = Binding::data(Value::Undefined, false, true);
+                import.set_import_reference(Some((exporter.clone(), "source".into())));
+                global.borrow_mut().vars.insert("coldLeft", import.clone());
+                global.borrow_mut().vars.insert("coldRight", import);
+                Env::downgrade(&exporter)
+            });
             assert_eq!(evaluate(&mut engine, "function readCold(){return coldLeft.n+coldRight.n;}for(var k=0;k<40;k++)readCold();readCold()"), "14");
             engine.interp.gc_collect();
-            let exporter = weak
-                .upgrade()
-                .expect("rooted imports retain their exporter");
-            let value = exporter.borrow().vars.get("source").unwrap().value.clone();
-            value
-                .as_obj()
-                .unwrap()
-                .borrow_mut()
-                .props
-                .insert("n", crate::value::Property::plain(Value::Num(9.)));
-            drop(value);
-            drop(exporter);
+            crate::gc_test::in_frame(|| {
+                let exporter = weak
+                    .upgrade()
+                    .expect("rooted imports retain their exporter");
+                let value = exporter.borrow().vars.get("source").unwrap().value.clone();
+                value
+                    .as_obj()
+                    .unwrap()
+                    .borrow_mut()
+                    .props
+                    .insert("n", crate::value::Property::plain(Value::Num(9.)));
+            });
             assert_eq!(evaluate(&mut engine, "readCold()"), "18", "{tier:?}");
             global.borrow_mut().vars.remove("coldLeft");
             engine.interp.gc_collect();
@@ -2030,7 +2044,7 @@ mod binding_layout_tests {
             global.borrow_mut().vars.remove("coldRight");
             engine.interp.gc_collect();
             assert!(
-                weak.upgrade().is_none(),
+                !crate::gc_test::alive(&weak),
                 "removed imports release their exporter"
             );
         }
@@ -2828,6 +2842,10 @@ mod constructor_transfer_tests;
 mod computed_key_cache_tests {
     use super::*;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn computed_key_stub_cache_owns_text_and_rejects_reused_addresses() {
         let mut engine = crate::Engine::new();
@@ -3796,7 +3814,8 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 168);
+    // gc-heap adds `heap_release`.
+    assert_eq!(names.len(), 168 + usize::from(cfg!(feature = "gc-heap")));
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3828,9 +3847,17 @@ impl Drop for Interp {
         // The whole Agent is ending, not merely reaching a GC safepoint. Its global,
         // intrinsics and environment roots are still live during Drop, so an ordinary
         // collection here would preserve their cycles and then orphan the heap forever.
+        // (gc-heap: the heap's owner releases every cell once all other fields have dropped,
+        // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.)
+        #[cfg(not(feature = "gc-heap"))]
         crate::value::destroy_gc_heap(&self.gc_heap);
         // Do not let a driver thread retain this Agent's weak object/scope registries after its
         // interpreter dies. Objects already carry their own owner through the ensuing field drops.
+        // A ShadowRealm sharing its parent's heap and symbols has the parent's Agent identity.
+        #[cfg(feature = "gc-heap")]
+        if !self.gc_heap_root() {
+            return;
+        }
         crate::value::deactivate_agent_if(&self.gc_heap, &self.symbol_agent);
     }
 }
@@ -3968,6 +3995,10 @@ macro_rules! gc_side_slot_tables {
         )
     };
 }
+
+#[cfg(feature = "gc-heap")]
+#[path = "gc_collect.rs"]
+pub(crate) mod gc_collect;
 
 /// A Realm's named intrinsic table. Shared, not copied, between the active Realm fields and
 /// its saved `RealmState`: a cross-Realm call swaps Realms by reference count instead of
@@ -4123,6 +4154,18 @@ pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
     }
 }
 
+/// `stacker::grow` for paths that run JavaScript. Under gc-heap the new segment is registered,
+/// with exact bounds, for conservative scanning (Decision 0, option (a)); a collection requested
+/// on an unregistered segment would defer instead.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn grow_stack<R>(stack_size: usize, f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "gc-heap")]
+    return crate::gc_core::grow(stack_size, f);
+    #[cfg(not(feature = "gc-heap"))]
+    stacker::grow(stack_size, f)
+}
+
 #[inline]
 pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
     #[cfg(not(target_arch = "wasm32"))]
@@ -4146,7 +4189,7 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
                     segments.set(segments.get() + 1);
                 });
                 let _guard = SegmentGuard;
-                return stacker::grow(EXECUTION_STACK_SEGMENT, f);
+                return grow_stack(EXECUTION_STACK_SEGMENT, f);
             }
         }
     }
@@ -4189,7 +4232,7 @@ pub(crate) fn ast_stack_low() -> bool {
 pub(crate) fn with_ast_stack<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(not(target_arch = "wasm32"))]
     if ast_stack_low() {
-        return stacker::grow(AST_STACK_SEGMENT, f);
+        return grow_stack(AST_STACK_SEGMENT, f);
     }
     f()
 }
@@ -4241,7 +4284,7 @@ pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
             }
             EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() + 1));
             let _guard = SegmentGuard;
-            return Some(stacker::grow(EXECUTION_STACK_SEGMENT, f));
+            return Some(grow_stack(EXECUTION_STACK_SEGMENT, f));
         }
         Some(f())
     }
@@ -4331,6 +4374,10 @@ impl Default for BufferPressure {
 #[cfg(test)]
 #[test]
 fn buffer_gc_trigger_grows_with_retained_shared_data_blocks() {
+    // The expected trigger assumes exactly the two collections described above.
+    if crate::gc_test::stress_active() {
+        return;
+    }
     for constructor in ["ArrayBuffer", "SharedArrayBuffer"] {
         let mut engine = crate::Engine::new();
         let source = format!(
@@ -5097,7 +5144,32 @@ impl Interp {
     /// an isolated global/object heap, but ECMA-262 §20.4 requires its global and well-known
     /// Symbols to retain Agent-wide identity.
     pub(crate) fn new_with_symbol_agent(symbol_agent: crate::value::SymbolAgent) -> Interp {
-        let gc_heap = crate::value::new_gc_heap();
+        Self::new_in_heap(symbol_agent, crate::value::new_gc_heap(), true)
+    }
+
+    /// A ShadowRealm's implementation interpreter: same Agent (Symbols), isolated globals and
+    /// intrinsics. Under gc-heap it allocates in its parent's heap — one heap per Agent, so no
+    /// edge between the two realms' objects ever crosses heaps (I6) — and the root of the
+    /// ShadowRealm tree collects for all of it.
+    pub(crate) fn new_shadow(parent: &Interp) -> Interp {
+        #[cfg(feature = "gc-heap")]
+        return Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
+        #[cfg(not(feature = "gc-heap"))]
+        Self::new_with_symbol_agent(parent.symbol_agent.clone())
+    }
+
+    fn new_in_heap(
+        symbol_agent: crate::value::SymbolAgent,
+        gc_heap: crate::value::GcHeap,
+        owns_heap: bool,
+    ) -> Interp {
+        #[cfg(not(feature = "gc-heap"))]
+        debug_assert!(owns_heap, "only gc-heap interpreters share a heap");
+        // Decision 0: every engine frame on this thread lies below the scanned stack top.
+        #[cfg(feature = "gc-heap")]
+        crate::gc_core::register_thread_native_stack();
+        #[cfg(all(test, feature = "gc-heap", target_os = "linux"))]
+        crate::gc_test::install_crash_backtrace();
         crate::value::activate_agent(&gc_heap, &symbol_agent);
         let object_proto = Object::new(None);
         let function_proto = Object::new(Some(object_proto.clone()));
@@ -5294,7 +5366,11 @@ impl Interp {
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
             #[cfg(feature = "gc-heap")]
-            heap_release: crate::value::HeapRelease::new(&gc_heap),
+            heap_release: if owns_heap {
+                crate::value::HeapRelease::new(&gc_heap)
+            } else {
+                crate::value::HeapRelease::shared()
+            },
         };
         crate::builtins::install(&mut interp);
         // `this` at the top level is the global object (sloppy mode).
@@ -6784,6 +6860,8 @@ impl Interp {
     ) -> Result<Value, Abrupt> {
         self.interrupt_poll_force()?;
         let perf_started = crate::jit::perf_stage_start();
+        // I1: the arguments often live in the caller's Rust-heap buffer.
+        let _arguments = crate::rooting::root_slice(args);
         let result = match call {
             Callable::Native(f) => f(self, this, args),
             Callable::NativeData(data) => match &data.body {
@@ -6792,6 +6870,9 @@ impl Interp {
                     f(self, this, args)
                 }
                 crate::value::NativeCallableBody::Captured { function, captures } => {
+                    // An active invocation keeps its captures alive (I1): its function object
+                    // may become unreachable while it runs.
+                    let _captures = crate::rooting::root_slice(captures);
                     function(self, this, args, captures)
                 }
             },
@@ -6838,7 +6919,8 @@ impl Interp {
     ///
     /// Captures are immutable as a list; captured objects retain normal mutable
     /// JavaScript behavior. A live function, active invocation, or Rust callable
-    /// lease keeps its captures alive. Unreachable captured cycles can be reclaimed.
+    /// lease keeps its captures alive (under gc-heap a lease alone does not: hold the
+    /// function). Unreachable captured cycles can be reclaimed.
     /// This does not change the ordinary function's receiver or argument list.
     pub fn new_native_fn_with_captures(
         &self,
@@ -10974,6 +11056,10 @@ impl Interp {
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
+        #[cfg(feature = "gc-heap")]
+        if gc_collect::gc_stress() != 0 {
+            return self.gc_check();
+        }
         if self.gc_tick & GC_CALL_POLL_MASK == 0 {
             self.gc_check()
         } else {
@@ -10982,8 +11068,7 @@ impl Interp {
     }
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
-        // P1 S2 step 2b: the gc-heap object model runs no collection yet.
-        if self.gc_suppressed != 0 || cfg!(feature = "gc-heap") {
+        if self.gc_suppressed != 0 {
             return Ok(());
         }
         self.gc_weak_metadata_safepoint(false);
@@ -10993,7 +11078,16 @@ impl Interp {
             let live = crate::value::gc_scope_registry_prune(&self.gc_heap);
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
         }
-        if crate::value::heap_live_objects(&self.gc_heap) <= self.gc_next {
+        // Only a collection the live-object threshold makes due enforces the limit: GC stress and
+        // the cell heap's byte budget also collect here, and must not throw again inside the
+        // handler the re-armed threshold below leaves room for.
+        let threshold_due = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
+        #[cfg(not(feature = "gc-heap"))]
+        if !threshold_due {
+            return Ok(());
+        }
+        #[cfg(feature = "gc-heap")]
+        if !threshold_due && !self.gc_heap_due() {
             return Ok(());
         }
         self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
@@ -11008,7 +11102,7 @@ impl Interp {
                 self.generators.len()
             );
         }
-        if live > self.live_object_limit {
+        if threshold_due && live > self.live_object_limit {
             // Leave the handler that catches this error room to allocate (its error object,
             // messages, cleanup) before the next safepoint collects again. Without re-arming,
             // the very first allocation in the `catch` block would rerun the full collection
@@ -11016,8 +11110,11 @@ impl Interp {
             self.gc_next = live.saturating_add(GC_TRIGGER);
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
-        // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit].
-        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+        // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit]. A
+        // collection the threshold did not trigger keeps the threshold the collector left.
+        if threshold_due {
+            self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+        }
         Ok(())
     }
 
@@ -11545,7 +11642,44 @@ impl Interp {
         crate::gc_sweep::map(&mut self.gc_pins, garbage_objects);
     }
 
+    /// Raw-address inline-cache maps carry weak allocation pins. Prune expired entries so the
+    /// pin itself does not retain allocator headers (gc-heap: reserved dead cells) forever; a
+    /// live cache identity remains ABA-safe because its pin still owns that allocation.
+    pub(crate) fn gc_prune_dead_pins(&mut self) {
+        self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
+        self.construct_ics
+            .retain(|_, entry| entry.pin.strong_count() != 0);
+        self.call_overflow.prune_dead();
+        if let Some(cache) = &self.native_callback_cache {
+            cache.prune_dead();
+        }
+        if let Some(caches) = &self.proxy_trap_caches {
+            caches.prune_dead();
+        }
+        self.construct_capacity_hints
+            .retain(|_, (pin, _)| pin.strong_count() != 0);
+        if self
+            .global_env_pins
+            .iter()
+            .any(|pin| pin.strong_count() == 0)
+        {
+            // Call/construct/overflow entries can outlive a host settings environment,
+            // especially when their callee is native or their AST serves another Realm.
+            // Fence every raw genv comparison BEFORE releasing allocation-header pins.
+            crate::bytecode::invalidate_call_caches();
+            self.global_env_pins.retain(|pin| pin.strong_count() != 0);
+        }
+        self.htmldda.retain(|_, pin| pin.strong_count() != 0);
+        self.symbol_agent
+            .borrow_mut()
+            .symbols
+            .retain(|_, symbol| symbol.strong_count() != 0);
+    }
+
     pub(crate) fn gc_collect(&mut self) {
+        #[cfg(feature = "gc-heap")]
+        return self.gc_heap_collect_explicit();
+        #[cfg(not(feature = "gc-heap"))]
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
     }
 
@@ -11591,9 +11725,14 @@ impl Interp {
 
     pub(crate) fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
         self.buffer_gc.since_gc = 0;
-        // P1 S2 step 2b: the gc-heap object model runs no collection yet; the refcount cycle
-        // collector below must never see cell handles.
+        // P1 S2: the refcount cycle collector below must never see cell handles.
         if cfg!(feature = "gc-heap") {
+            #[cfg(feature = "gc-heap")]
+            if matches!(cause, crate::value::GcCause::Explicit) {
+                self.gc_heap_collect_explicit();
+            } else {
+                self.gc_heap_collect(cause);
+            }
             return;
         }
         // Allocation and task-boundary pressure usually visit only newly allocated objects,
@@ -11620,10 +11759,19 @@ impl Interp {
         cause: crate::value::GcCause,
         edge_budget: usize,
     ) {
-        // P1 S2: the refcount cycle collector must never see cell handles.
-        if cfg!(feature = "gc-heap") {
-            return self.gc_collect_with_cause(cause);
+        // P1 S2: the refcount cycle collector must never see cell handles. A thin entry (the
+        // cycle collector's frame is large): see `Interp::gc_heap_collect_explicit`.
+        #[cfg(feature = "gc-heap")]
+        {
+            let _ = edge_budget;
+            self.gc_collect_with_cause(cause)
         }
+        #[cfg(not(feature = "gc-heap"))]
+        self.gc_collect_with_edge_budget_rc(cause, edge_budget)
+    }
+
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
+    fn gc_collect_with_edge_budget_rc(&mut self, cause: crate::value::GcCause, edge_budget: usize) {
         // Read-only collector passes touch every object's scratch cells. Borrowing through the
         // RefCell flag would write (and dirty) each object's header twice per pass; the
         // collector holds no mutable object borrow during these passes, so read the cells
@@ -12451,37 +12599,7 @@ impl Interp {
                 b.with_obj = None;
             }
         }
-        // Raw-address inline-cache maps carry Weak allocation pins. Prune expired entries so the
-        // Weak itself does not retain allocator headers forever; a live cache identity remains
-        // ABA-safe because its Weak still owns that header.
-        self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
-        self.construct_ics
-            .retain(|_, entry| entry.pin.strong_count() != 0);
-        self.call_overflow.prune_dead();
-        if let Some(cache) = &self.native_callback_cache {
-            cache.prune_dead();
-        }
-        if let Some(caches) = &self.proxy_trap_caches {
-            caches.prune_dead();
-        }
-        self.construct_capacity_hints
-            .retain(|_, (pin, _)| pin.strong_count() != 0);
-        if self
-            .global_env_pins
-            .iter()
-            .any(|pin| pin.strong_count() == 0)
-        {
-            // Call/construct/overflow entries can outlive a host settings environment,
-            // especially when their callee is native or their AST serves another Realm.
-            // Fence every raw genv comparison BEFORE releasing allocation-header pins.
-            crate::bytecode::invalidate_call_caches();
-            self.global_env_pins.retain(|pin| pin.strong_count() != 0);
-        }
-        self.htmldda.retain(|_, pin| pin.strong_count() != 0);
-        self.symbol_agent
-            .borrow_mut()
-            .symbols
-            .retain(|_, symbol| symbol.strong_count() != 0);
+        self.gc_prune_dead_pins();
         // Release the snapshot handles first: only then do swept objects and their property
         // buffers reach the allocator's free lists. A high threshold confines the expensive
         // platform pressure-relief call to phase changes, not ordinary generational churn.
@@ -12670,6 +12788,8 @@ impl Interp {
     }
 
     pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
+        // I1: callers often hold the argument list in a Rust-heap buffer.
+        let _arguments = crate::rooting::root_slice(args);
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
@@ -12686,6 +12806,7 @@ impl Interp {
             match self.pending_tail.take() {
                 Some(bx) => {
                     let (f, t, a) = *bx;
+                    let _tail_arguments = crate::rooting::root_slice(&a);
                     if let Err(e) = self.gc_check_amortized() {
                         r = Err(e);
                         break;
@@ -12990,7 +13111,8 @@ impl Interp {
                 }
                 let host_result = (|| -> Result<Result<Value, Abrupt>, ()> {
                     let _agent = host.enter_agent();
-                    let mut out_args = Vec::with_capacity(args.len());
+                    // Wrapping copies name/length, which can run getters (I1).
+                    let mut out_args = crate::rooting::RootedVec::new();
                     for a in args {
                         if a.is_callable() {
                             out_args
@@ -13229,7 +13351,8 @@ impl Interp {
         // re-enter this realm; other objects throw.
         let result = {
             let _agent = sub.enter_agent();
-            let mut inner_args = Vec::with_capacity(args.len());
+            // Rooted while later wrappers are made (I1).
+            let mut inner_args = crate::rooting::RootedVec::new();
             for a in args {
                 if a.is_callable() {
                     inner_args.push(sub.make_wrapped_cross(realm, parent_ptr, a.clone()));
@@ -14171,6 +14294,8 @@ impl Interp {
         let native_result = match self.interrupt_poll_force() {
             Ok(()) => unsafe {
                 crate::execution_storage::with_moved_values(args, argc, |arguments| {
+                    // I1: past four arguments they live in a Rust-heap buffer.
+                    let _arguments = crate::rooting::root_slice(arguments);
                     let native_result = with_execution_stack(self.depth, || {
                         let perf_started = crate::jit::perf_stage_start();
                         let result = nf(self, (&*this_slot).unpack(), arguments);
@@ -16419,6 +16544,8 @@ impl Interp {
         args: &[Value],
         new_target: Value,
     ) -> Result<Value, Abrupt> {
+        // I1: callers often hold the argument list in a Rust-heap buffer.
+        let _arguments = crate::rooting::root_slice(args);
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;

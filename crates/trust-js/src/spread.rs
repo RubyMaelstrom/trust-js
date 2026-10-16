@@ -28,9 +28,11 @@ impl Interp {
         done: &mut bool,
         limit: usize,
     ) -> Result<Vec<Value>, Abrupt> {
-        let mut values = Vec::new();
+        // Rooted while the iterator runs author code (I1); the caller consumes the result
+        // before its next safepoint.
+        let mut values = crate::rooting::RootedVec::new();
         if *done {
-            return Ok(values);
+            return Ok(values.into_vec());
         }
         self.interrupt_poll_force()?;
         if crate::builtins::inert_array_iterator_remaining(self, iterator, next)
@@ -45,7 +47,7 @@ impl Interp {
             }
             *done = true;
             let Some(value) = self.iterator_step(iterator, next)? else {
-                return Ok(values);
+                return Ok(values.into_vec());
             };
             *done = false;
             if values.len() >= limit {
@@ -84,15 +86,21 @@ impl Interp {
         Ok(())
     }
 
+    /// The list (prefix and yielded values) is rooted while the iterator runs author code (I1);
+    /// the caller consumes it, normally by calling with it, before its next safepoint.
     pub(crate) fn append_spread_arguments(
         &mut self,
         spread: &Value,
         arguments: &mut Vec<Value>,
     ) -> Result<(), Abrupt> {
-        self.expand_spread_bounded(spread, arguments.len(), MAX_ARGUMENTS_LEN, |_, value| {
-            arguments.push(value);
-            Ok(())
-        })
+        let mut rooted = crate::rooting::RootedVec::from_vec(std::mem::take(arguments));
+        let result =
+            self.expand_spread_bounded(spread, rooted.len(), MAX_ARGUMENTS_LEN, |_, value| {
+                rooted.push(value);
+                Ok(())
+            });
+        *arguments = rooted.into_vec();
+        result
     }
 
     pub(crate) fn append_argument(
@@ -240,7 +248,7 @@ mod tests {
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
-            if matches!(tier, Tier::Jit) {
+            if matches!(tier.admitted(), Tier::Jit) {
                 assert!(native > 0, "spread fixture must execute native Script");
             }
         }

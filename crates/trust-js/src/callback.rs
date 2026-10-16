@@ -461,6 +461,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn shared_callback_cache_is_weak_and_large_arguments_transfer_exactly_once() {
         let mut engine = Engine::new();

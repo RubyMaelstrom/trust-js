@@ -484,3 +484,12 @@ impl Interp {
         result
     }
 }
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for PreparedReferenceSlot {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        for reference in self {
+            crate::gc_trace::trace_direct(sink, |edges| reference.trace_gc(edges));
+        }
+    }
+}

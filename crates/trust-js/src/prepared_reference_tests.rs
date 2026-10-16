@@ -196,6 +196,10 @@ fn prepared_reference_object_record_get_and_set_repeat_has_not_unscopables() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
     let mut slot = PreparedReferenceSlot::default();
@@ -207,7 +211,7 @@ fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
         .insert("x", Binding::data(Value::Num(1.0), true, true));
     let weak = Env::downgrade(&scope);
     slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
-    assert!(weak.upgrade().is_some());
+    assert!(crate::gc_test::alive(&weak));
     let next = new_scope(None);
     next.borrow_mut()
         .vars
@@ -215,7 +219,7 @@ fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
     let next_weak = Env::downgrade(&next);
     slot.set(PreparedReference::scope(Rc::from("x"), next, true));
     assert!(
-        weak.upgrade().is_none(),
+        !crate::gc_test::alive(&weak),
         "old Reference released exactly once"
     );
     let mut objects = Vec::new();
@@ -230,7 +234,7 @@ fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
     scopes.clear();
     drop(slot);
     assert!(
-        next_weak.upgrade().is_none(),
+        !crate::gc_test::alive(&next_weak),
         "slot Drop releases its live Reference"
     );
 }

@@ -300,6 +300,10 @@ fn positioned_operations_keep_original_source_offsets_after_prefix_removal() {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
     for (tier, strict) in [
@@ -397,7 +401,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
             0,
             "the splice must execute"
         );
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             let code = chunk.jit.get().flatten().expect("native inline body");
             let (active, referenced) = code.test_residency_marks(false);
             assert!(referenced > 0);

@@ -54,7 +54,7 @@ fn dense_array_bindings_retain_captured_values_and_use_the_closed_prefix() {
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             let native = super::array_binding::TEST_JIT_ARRAY_BINDING_OPENS
                 .with(std::cell::Cell::get)
                 - native_before;
@@ -128,6 +128,10 @@ fn array_bindings_preserve_holes_exhaustion_defaults_and_observable_initializati
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn array_binding_declines_final_old_slot_owners_without_effects() {
     let mut engine = Engine::new();
@@ -260,6 +264,10 @@ fn array_binding_declines_final_old_slot_owners_without_effects() {
     engine.interp.gc_tick = prior;
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn array_binding_slot_replacement_runs_final_host_owners_before_the_next_read() {
     use crate::value::{Gc, Property, Value};

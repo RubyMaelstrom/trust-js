@@ -92,6 +92,22 @@ mod function_realm_identity_tests;
 mod function_realm_lifetime_tests;
 #[cfg(feature = "gc-heap")]
 mod gc_core;
+#[cfg(test)]
+mod gc_test;
+mod rooting;
+
+/// Run an embedder entry (a script, a microtask checkpoint) between two stack scrubs (gc-heap):
+/// its frames start without stale cell addresses below the entry, and leave none behind for
+/// whatever the embedder calls next, such as an explicit collection. Free without gc-heap.
+#[inline(never)]
+fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+    gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
+    let result = f();
+    #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+    gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
+    result
+}
 mod gc_diagnostics;
 mod gc_edges;
 mod gc_generational;
@@ -635,6 +651,15 @@ impl Engine {
     /// `origin` (a file path or URL, with the text's starting line and column), or
     /// `<anonymous>` when None.
     pub fn eval_interruptible_with_origin(
+        &mut self,
+        src: &str,
+        strict: bool,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<ExecutionOutcome, ParseError> {
+        scrubbed(|| self.eval_interruptible_with_origin_inner(src, strict, origin))
+    }
+
+    fn eval_interruptible_with_origin_inner(
         &mut self,
         src: &str,
         strict: bool,
@@ -1242,6 +1267,14 @@ impl Engine {
         src: &str,
         origin: Option<&SourceOrigin<'_>>,
     ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+        scrubbed(|| self.eval_value_interruptible_with_origin_inner(src, origin))
+    }
+
+    fn eval_value_interruptible_with_origin_inner(
+        &mut self,
+        src: &str,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
         let (body, source) = parse_host_script_from(src, false, origin)?;
         let directive_strict = matches!(
             body.first(),
@@ -1398,6 +1431,10 @@ impl Engine {
     /// Run a microtask checkpoint while preserving host interruption as control flow. Pending jobs
     /// are discarded when a running job is killed; they must not be resumed as a later task.
     pub fn run_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
+        scrubbed(|| self.run_microtasks_interruptible_inner())
+    }
+
+    fn run_microtasks_interruptible_inner(&mut self) -> Result<(), crate::InterruptReason> {
         self.interp.activate_gc_heap();
         if let Err(reason) = self.interp.drain_microtasks_interruptible() {
             self.interp.gc_task_boundary();

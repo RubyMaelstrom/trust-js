@@ -371,6 +371,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn compact_storage_preserves_scalar_bits_and_heap_ownership() {
         assert_eq!(std::mem::size_of::<PackedValue>(), 8);
@@ -415,6 +419,10 @@ mod tests {
         assert!(matches!(slots.read_value(0), Value::Undefined));
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn compact_storage_decodes_only_argument_owners_with_exact_lifetime() {
         let object = crate::value::Object::new(None);
@@ -440,6 +448,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn compact_native_arguments_move_without_refcount_churn_and_stay_live_for_the_call() {
         let object = crate::value::Object::new(None);
@@ -502,6 +514,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn committed_native_arguments_remain_rooted_across_collection_callback_throw_and_tail() {
         let mut interp = crate::interpreter::Interp::new();
@@ -587,6 +603,10 @@ mod tests {
         BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = None);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
         let object = crate::value::Object::new(None);
@@ -615,6 +635,10 @@ mod tests {
         assert_eq!(weak.strong_count(), 0);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
         let first = crate::value::Object::new(None);
@@ -640,6 +664,10 @@ mod tests {
         assert_eq!(second_weak.strong_count(), 0);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn compact_storage_raw_literals_move_packed_owners_without_refcount_churn() {
         let mut interp = crate::interpreter::Interp::new();

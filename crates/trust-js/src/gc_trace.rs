@@ -132,6 +132,12 @@ impl<A: GcTrace, B: GcTrace> GcTrace for (A, B) {
     }
 }
 
+/// Rust strings are not GC cells (side-table names and labels).
+impl GcTrace for String {
+    #[inline]
+    fn trace_gc(&self, _: &mut dyn GcSink) {}
+}
+
 /// Values of a map; keys are traced by the map's owner when they are values.
 impl<K, V: GcTrace, S> GcTrace for std::collections::HashMap<K, V, S> {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
@@ -187,5 +193,370 @@ impl GcTrace for crate::interpreter::Binding {
         if let Some(import) = import_ref {
             sink.env(&import.0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// State Rust frames keep on the Rust heap while they run (I1): the stack scan sees the frames'
+// pointers to it, never its contents, so the owners register it for the duration.
+
+/// One active `drive_vm` activation's frame state (slots, operand stack, references, class
+/// evaluation and disposal state); the buffers live on the Rust heap.
+pub(crate) struct VmFrameRoots {
+    pub(crate) env: *const Env,
+    pub(crate) cap_env: *const Env,
+    pub(crate) slots: *const [PackedValue],
+    pub(crate) stack: *const crate::execution_storage::ValueStack<PackedValue>,
+    pub(crate) references: *const [crate::eval::PreparedReferenceSlot],
+    pub(crate) this_val: *const Value,
+    pub(crate) disposal_frames: *const Vec<Vec<crate::interpreter::Disposable>>,
+    pub(crate) class_states: *const [Option<crate::eval::PreparedClassEvaluation>],
+}
+
+thread_local! {
+    static VM_FRAMES: std::cell::RefCell<Vec<VmFrameRoots>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Coroutines removed from their owner's table while they run.
+    static RUNNING_COROUTINES: std::cell::RefCell<Vec<*const crate::coroutine::Coroutine>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Unregisters a [`VmFrameRoots`] (also on unwind).
+#[must_use]
+pub(crate) struct VmFrameGuard;
+
+impl Drop for VmFrameGuard {
+    fn drop(&mut self) {
+        VM_FRAMES.with(|frames| frames.borrow_mut().pop());
+    }
+}
+
+/// Register a running VM activation's frame state. The referents must outlive the guard.
+pub(crate) fn enter_vm_frame(roots: VmFrameRoots) -> VmFrameGuard {
+    VM_FRAMES.with(|frames| frames.borrow_mut().push(roots));
+    VmFrameGuard
+}
+
+/// Unregisters a running coroutine (also on unwind).
+#[must_use]
+pub(crate) struct CoroutineGuard;
+
+impl Drop for CoroutineGuard {
+    fn drop(&mut self) {
+        RUNNING_COROUTINES.with(|running| running.borrow_mut().pop());
+    }
+}
+
+/// Register a coroutine for the duration of its resumption; it must outlive the guard.
+pub(crate) fn enter_coroutine(coroutine: *const crate::coroutine::Coroutine) -> CoroutineGuard {
+    RUNNING_COROUTINES.with(|running| running.borrow_mut().push(coroutine));
+    CoroutineGuard
+}
+
+/// Trace this thread's registered VM frames, rooted value buffers and running coroutines.
+pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
+    VM_FRAMES.with(|frames| {
+        for frame in frames.borrow().iter() {
+            // SAFETY: a frame is registered only while drive_vm holds its referents.
+            unsafe {
+                (*frame.env).trace_gc(sink);
+                (*frame.cap_env).trace_gc(sink);
+                (*frame.slots).trace_gc(sink);
+                (*frame.stack).trace_gc(sink);
+                (*frame.references).trace_gc(sink);
+                (*frame.this_val).trace_gc(sink);
+                (*frame.disposal_frames).trace_gc(sink);
+                (*frame.class_states).trace_gc(sink);
+            }
+        }
+    });
+    crate::rooting::trace_rooted(sink);
+    RUNNING_COROUTINES.with(|running| {
+        for &coroutine in running.borrow().iter() {
+            // SAFETY: registered only while `Coroutine::resume` borrows it.
+            unsafe { GcTrace::trace_gc(&*coroutine, sink) };
+        }
+    });
+}
+
+impl GcTrace for crate::execution_storage::ValueStack<PackedValue> {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        self.raw_slice().trace_gc(sink);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Engine types with public fields. Each destructures exhaustively.
+
+impl GcTrace for crate::interpreter::RealmState {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::RealmState {
+            global,
+            global_env,
+            global_var_names: _,
+            host_job_context: _,
+            object_proto,
+            function_proto,
+            array_proto,
+            array_ctor,
+            string_proto,
+            number_proto,
+            boolean_proto,
+            symbol_proto,
+            error_protos,
+            eval_fn,
+            extra_protos,
+        } = self;
+        for object in [
+            global,
+            object_proto,
+            function_proto,
+            array_proto,
+            string_proto,
+            number_proto,
+            boolean_proto,
+            symbol_proto,
+        ] {
+            sink.object(object);
+        }
+        global_env.trace_gc(sink);
+        array_ctor.trace_gc(sink);
+        error_protos.trace_gc(sink);
+        eval_fn.trace_gc(sink);
+        extra_protos.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::PromiseState {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::PromiseState {
+            status: _,
+            value,
+            reactions,
+            handled: _,
+            outstanding: _,
+        } = self;
+        value.trace_gc(sink);
+        for (fulfilled, rejected, result, _) in reactions {
+            fulfilled.trace_gc(sink);
+            rejected.trace_gc(sink);
+            result.trace_gc(sink);
+        }
+    }
+}
+
+impl GcTrace for crate::interpreter::JobCallback {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::JobCallback {
+            callback,
+            script_caller,
+            active_script: _,
+            internal: _, // realm identities and flags only
+        } = self;
+        callback.trace_gc(sink);
+        script_caller.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::Job {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::Job {
+            handler,
+            result,
+            value,
+            fulfilled: _,
+            realm: _,
+            host_context: _,
+        } = self;
+        handler.trace_gc(sink);
+        result.trace_gc(sink);
+        value.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::FnFrame {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::FnFrame {
+            fn_ptr,
+            call_site: _,
+            strict: _,
+            construct: _,
+            extra,
+        } = self;
+        // The callee's address: FnFrame::callee() turns it back into a handle.
+        sink.word(*fn_ptr as u64);
+        if let Some(extra) = extra {
+            let crate::interpreter::FrameExtra { args_obj, lazy } = &**extra;
+            args_obj.trace_gc(sink);
+            if let Some((_, arguments, env)) = lazy {
+                arguments.trace_gc(sink);
+                env.trace_gc(sink);
+            }
+        }
+    }
+}
+
+impl GcTrace for crate::interpreter::Disposable {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::Disposable {
+            value,
+            method,
+            kind_is_async: _,
+            method_is_async: _,
+        } = self;
+        value.trace_gc(sink);
+        method.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::AsyncWait {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::AsyncWait {
+            promise,
+            token: _,
+            id: _,
+            block: _,
+            index: _,
+            deadline: _,
+        } = self;
+        promise.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::HostSettingsState {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::HostSettingsState {
+            global_env,
+            global_var_names: _,
+        } = self;
+        global_env.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::ClassInfo {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::ClassInfo {
+            fields,
+            field_env,
+            derived: _,
+            instance_initializers,
+            private_members,
+        } = self;
+        for field in fields.iter() {
+            let crate::interpreter::FieldInit {
+                key: _, // names and symbols, not cells
+                init: _,
+                transforms,
+            } = field;
+            transforms.trace_gc(sink);
+        }
+        field_env.trace_gc(sink);
+        instance_initializers.trace_gc(sink);
+        for (_, property) in private_members {
+            property.trace_gc(sink);
+        }
+    }
+}
+
+impl GcTrace for crate::interpreter::HostIndexedProperties {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::HostIndexedProperties {
+            length: _,
+            getter,
+            live,
+        } = self;
+        getter.trace_gc(sink);
+        if let Some(live) = live {
+            let crate::interpreter::HostIndexedLive {
+                state,
+                length: _,
+                names: _,
+                named_getter,
+            } = &**live;
+            state.trace_gc(sink);
+            named_getter.trace_gc(sink);
+        }
+    }
+}
+
+impl GcTrace for crate::interpreter::FinalizationState {
+    /// The held values are the registry's strong edges; targets and tokens are weak.
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::interpreter::FinalizationState {
+            cleanup_callback,
+            cells,
+            cleanup_scheduled: _,
+        } = self;
+        cleanup_callback.trace_gc(sink);
+        for cell in cells.iter() {
+            cell.held_value.trace_gc(sink);
+        }
+    }
+}
+
+impl GcTrace for crate::modules::NsBinding {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            crate::modules::NsBinding::Live(env, _) => env.trace_gc(sink),
+            crate::modules::NsBinding::Static(value) => value.trace_gc(sink),
+        }
+    }
+}
+
+impl GcTrace for crate::ordered_collection::CollectionIterator {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        let crate::ordered_collection::CollectionIterator {
+            target,
+            cursor: _,
+            kind: _,
+            brand: _,
+        } = self;
+        target.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::coroutine::Resume {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            crate::coroutine::Resume::Next(value)
+            | crate::coroutine::Resume::Return(value)
+            | crate::coroutine::Resume::Throw(value) => value.trace_gc(sink),
+            crate::coroutine::Resume::Terminate => {}
+        }
+    }
+}
+
+impl GcTrace for crate::coroutine::Coroutine {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            crate::coroutine::Coroutine::Vm(coroutine) => GcTrace::trace_gc(&**coroutine, sink),
+            crate::coroutine::Coroutine::Module(coroutine) => GcTrace::trace_gc(&**coroutine, sink),
+            crate::coroutine::Coroutine::FromAsync(coroutine) => {
+                GcTrace::trace_gc(&**coroutine, sink)
+            }
+            crate::coroutine::Coroutine::Unavailable(coroutine) => {
+                GcTrace::trace_gc(coroutine, sink)
+            }
+        }
+    }
+}
+
+/// Report the edges an old-collector `trace_gc(&mut DirectGcEdges)` walk finds. Only for walks
+/// that do not unpack packed values (unpacking can materialize a prototype, i.e. allocate).
+pub(crate) fn trace_direct(
+    sink: &mut dyn GcSink,
+    walk: impl FnOnce(&mut crate::gc_edges::DirectGcEdges<'_>),
+) {
+    let mut objects = Vec::new();
+    let mut scopes = Vec::new();
+    walk(&mut crate::gc_edges::DirectGcEdges {
+        objects: &mut objects,
+        scopes: &mut scopes,
+    });
+    for object in &objects {
+        sink.object(object);
+    }
+    for scope in &scopes {
+        sink.env(scope);
     }
 }

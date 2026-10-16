@@ -1908,7 +1908,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
                     && intrinsic_array_iterator_is_unmodified(i)
                 {
                     match dense_array_snapshot(i, other) {
-                        Some(items) => items,
+                        Some(items) => crate::rooting::RootedVec::from_vec(items),
                         None => ab(i.iterate_with(other, iter_method))?,
                     }
                 } else {
@@ -2814,7 +2814,8 @@ fn ta_from(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> 
         let len_args = [Value::Num(items.len() as f64)];
         let ta = ab(i.construct(this, &len_args))?;
         let ta = ta_validate_created(i, ta, &len_args, true)?;
-        for (k, v) in items.into_iter().enumerate() {
+        // `items` stays rooted while mapping and stores run author code (I1).
+        for (k, v) in items.iter().cloned().enumerate() {
             let val = if let Some(mapfn) = &mapfn {
                 ab(mapfn.call(i, this_arg.clone(), [v, Value::Num(k as f64)]))?
             } else {

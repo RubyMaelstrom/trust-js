@@ -298,6 +298,10 @@ struct PageMeta {
     allocated: Vec<u64>,
     /// Cells a conditional edge is waiting on during this collection.
     waiters: Vec<u64>,
+    /// Dead cells already finalized but still pinned by weak handles: like the allocation
+    /// behind `std::rc::Weak`, the address is not reused while a weak handle may compare it.
+    /// Never marked or traced; freed once no weak handle pins it.
+    zombies: Vec<u64>,
     /// Index of first free cell, or -1. Free cells thread their next
     /// index+1 through their first word (0 = end).
     free_head: i32,
@@ -340,6 +344,8 @@ struct LargeObj {
     desc: DescId,
     marked: bool,
     waiters: bool,
+    /// See `PageMeta::zombies`.
+    zombie: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -360,16 +366,68 @@ struct CellRef {
 struct CondEdge {
     owner: Option<CellRef>,
     key: Option<CellRef>,
-    value: u64,
+    value: EdgeValue,
     fired: bool,
     /// In-cell entry words to zero if the key dies (from a [`WeakFn`]).
     slots: Option<(*mut u64, *mut u64)>,
+}
+
+#[derive(Clone, Copy)]
+enum EdgeValue {
+    /// A cell address or tagged word.
+    Word(u64),
+    /// Ask the [`MarkClient`] for the side-table edges of this owner.
+    SideSlots(usize),
+}
+
+/// The embedder's part of marking (S2: the interpreter, whose state the heap cannot see).
+/// Called while the heap is mutably borrowed: implementations report words and must neither
+/// allocate on this heap nor mutate engine state.
+pub(crate) trait MarkClient {
+    /// Strong roots: engine state, active VM frames, host roots.
+    fn roots(&self, sink: &mut dyn FnMut(u64));
+    /// Owners whose side-table edges are traced once (and only if) the owner is marked —
+    /// owner-keyed tables would otherwise keep every cycle through them alive.
+    fn side_slot_owners(&self, owners: &mut dyn FnMut(usize));
+    /// The side-table edges of `owner`, which has just been marked.
+    fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64));
+    /// Ephemeron entries kept in side tables (WeakMap/WeakSet data).
+    fn ephemerons(&self, sink: &mut EdgeSink<'_>);
+}
+
+/// The client of a collection driven by the heap itself (registered roots only).
+struct NoClient;
+
+impl MarkClient for NoClient {
+    fn roots(&self, _: &mut dyn FnMut(u64)) {}
+    fn side_slot_owners(&self, _: &mut dyn FnMut(usize)) {}
+    fn trace_side_slots(&self, _: usize, _: &mut dyn FnMut(u64)) {}
+    fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
+}
+
+/// Why a cell was marked: retention diagnostics (see [`Heap::set_retention_tracing`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum MarkSource {
+    /// A registered root range or trace root, or the embedder's roots.
+    #[default]
+    Root,
+    /// The native stack word (or spilled register) at this address.
+    Stack(usize),
+    /// An edge of the cell starting at this address.
+    Cell(usize),
+    /// A side-table slot of this owner.
+    SideSlots(usize),
+    /// A conditional edge (ephemeron, side-table edge source) and its conditions.
+    Conditional { owner: usize, key: usize },
 }
 
 /// Per-collection marking state. Built fresh every cycle, so nothing in it
 /// can outlive the cells it describes.
 #[derive(Default)]
 struct Marker {
+    /// What is marking now, and (when retention tracing) each cell's first marker.
+    source: MarkSource,
+    parents: Option<FastMap<usize, MarkSource>>,
     worklist: Vec<(usize, DescId)>,
     edges: Vec<CondEdge>,
     /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
@@ -431,6 +489,12 @@ pub(crate) struct Heap {
     /// roots the heap cannot see (the interpreter's state).
     collect_on_alloc: bool,
     stats: GcStats,
+    retention_tracing: bool,
+    /// The last traced collection's mark sources, by cell start.
+    last_parents: FastMap<usize, MarkSource>,
+    /// The last traced collection's frame-pointer chain, (frame record, return address), from
+    /// the collector's frame outwards (aarch64 retention diagnostics).
+    last_frames: Vec<(usize, usize)>,
 }
 
 impl Default for Heap {
@@ -441,6 +505,8 @@ impl Default for Heap {
 
 impl Heap {
     pub(crate) fn new() -> Self {
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        crate::gc_test::scrub_stack_at_thread_exit();
         Self {
             descs: Vec::new(),
             classes: Vec::new(),
@@ -462,6 +528,9 @@ impl Heap {
             allocs_since_gc: 0,
             collect_on_alloc: true,
             stats: GcStats::default(),
+            retention_tracing: false,
+            last_parents: FastMap::default(),
+            last_frames: Vec::new(),
         }
     }
 
@@ -528,6 +597,51 @@ impl Heap {
             name,
             hook: Box::new(hook),
         })
+    }
+
+    /// Record why each cell is marked, for [`Heap::retention_path`] (diagnostics: costs a map
+    /// entry per marked cell).
+    pub(crate) fn set_retention_tracing(&mut self, on: bool) {
+        self.retention_tracing = on;
+        self.last_parents = FastMap::default();
+    }
+
+    /// For the last collection with retention tracing on: what marked the cell containing
+    /// `addr`, then what marked that, back to a root or the native stack. Empty when the cell
+    /// was not marked.
+    pub(crate) fn retention_path(&self, addr: usize) -> Vec<(usize, &'static str, MarkSource)> {
+        let mut path = Vec::new();
+        let mut next = addr;
+        while path.len() < 10_000 {
+            let Some(cell) = self.locate(next as u64) else {
+                break;
+            };
+            let Some(&source) = self.last_parents.get(&cell.start) else {
+                break;
+            };
+            path.push((cell.start, self.descs[cell.desc.0 as usize].name, source));
+            next = match source {
+                MarkSource::Cell(parent) | MarkSource::SideSlots(parent) => parent,
+                MarkSource::Conditional { owner, .. } if owner != 0 => owner,
+                _ => break,
+            };
+        }
+        path
+    }
+
+    /// The function owning the native-stack word at `addr` in the last traced collection: the
+    /// return address its callee saved (symbolize with addr2line against the binary). `None`
+    /// when no frame record covers `addr`.
+    /// The return address into the function whose frame holds stack word `addr` in the last
+    /// traced collection, and how far below that frame's record the word lies.
+    pub(crate) fn frame_return_address(&self, addr: usize) -> Option<(usize, usize)> {
+        // A frame record sits at the top of its frame: the owner of `addr` has the lowest
+        // record at or above it; the record below that one holds the return into the owner.
+        let index = self.last_frames.iter().position(|&(fp, _)| fp >= addr)?;
+        let owner = self.last_frames[index].0;
+        index
+            .checked_sub(1)
+            .map(|below| (self.last_frames[below].1, owner - addr))
     }
 
     pub(crate) fn set_stress_every(&mut self, allocs: usize) {
@@ -614,22 +728,32 @@ impl Heap {
 
     /// Allocate a zeroed cell for `desc`. May first collect, conservatively
     /// (see [`Heap::collect`]). The caller initializes, then publishes (I9).
+    ///
+    /// Between [`Heap::start_marking`] and [`Heap::finish_collection`] the
+    /// cell is allocated marked (black): marking is over, so the cell survives
+    /// this sweep untraced. Code running in that window must not store a
+    /// reference to an unmarked cell into a new or surviving one.
     pub(crate) fn alloc(&mut self, desc: DescId, size: usize) -> *mut u8 {
         debug_assert!(
             (desc.0 as usize) < self.descs.len(),
             "unregistered GC descriptor"
         );
-        debug_assert!(
-            !self.control.collecting.get(),
-            "GC allocation during collection"
-        );
         let class = size_class(size);
         let cost = class.map_or(size, |class| SIZE_CLASSES[class]);
-        self.maybe_collect_for_alloc(cost);
+        let collecting = self.control.collecting.get();
+        if !collecting {
+            self.maybe_collect_for_alloc(cost);
+        }
         let ptr = match class {
             Some(class) => self.alloc_small(desc, class),
             None => self.alloc_large(desc, size),
         };
+        if collecting {
+            let cell = self
+                .locate(ptr as u64)
+                .expect("a fresh cell resolves to itself");
+            self.mark(&cell);
+        }
         self.stats.allocations += 1;
         self.allocated_bytes = self.allocated_bytes.saturating_add(cost);
         self.allocs_since_gc += 1;
@@ -694,6 +818,7 @@ impl Heap {
             marks: vec![0; words],
             allocated: vec![0; words],
             waiters: vec![0; words],
+            zombies: vec![0; words],
             free_head: 0,
             live: 0,
         };
@@ -723,6 +848,7 @@ impl Heap {
                 desc,
                 marked: false,
                 waiters: false,
+                zombie: false,
             },
         );
         self.large_span = (
@@ -784,7 +910,10 @@ impl Heap {
             Loc::Small { page, index } => {
                 let page = self.pages[page as usize].as_mut()?;
                 let index = index as usize;
-                if !bit(&page.allocated, index) || bit(&page.marks, index) {
+                if !bit(&page.allocated, index)
+                    || bit(&page.zombies, index)
+                    || bit(&page.marks, index)
+                {
                     return None;
                 }
                 set_bit(&mut page.marks, index, true);
@@ -792,7 +921,7 @@ impl Heap {
             }
             Loc::Large => {
                 let large = self.larges.get_mut(&cell.start)?;
-                if large.marked {
+                if large.marked || large.zombie {
                     return None;
                 }
                 large.marked = true;
@@ -803,6 +932,9 @@ impl Heap {
 
     fn mark_cell(&mut self, cell: CellRef, m: &mut Marker) {
         if let Some(has_waiters) = self.mark(&cell) {
+            if let Some(parents) = &mut m.parents {
+                parents.insert(cell.start, m.source);
+            }
             self.stats.cells_marked += 1;
             m.worklist.push((cell.start, cell.desc));
             if has_waiters {
@@ -835,7 +967,8 @@ impl Heap {
         if !native::scannable(native::current_sp()) {
             return self.defer(true);
         }
-        self.run(true);
+        self.mark_phase(true, &NoClient);
+        self.sweep_phase(&|_| false);
         true
     }
 
@@ -848,8 +981,63 @@ impl Heap {
         if self.blocked() {
             return self.defer(false);
         }
-        self.run(false);
+        self.mark_phase(false, &NoClient);
+        self.sweep_phase(&|_| false);
         true
+    }
+
+    /// Phase 1 of an embedder-driven collection: mark from the registered roots, `client`
+    /// and, when `native_roots`, this thread's native stack (deferred as for
+    /// [`Heap::collect`] when it cannot be scanned soundly). Marks stay set until
+    /// [`Heap::finish_collection`]; meanwhile the embedder sweeps its own tables using
+    /// [`Heap::dead_cells`] and [`Heap::is_dead_target`]. Returns false when deferred, in
+    /// which case `finish_collection` must not be called.
+    pub(crate) fn start_marking(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
+        if self.blocked() {
+            return self.defer(false);
+        }
+        if native_roots && !native::scannable(native::current_sp()) {
+            return self.defer(true);
+        }
+        self.mark_phase(native_roots, client);
+        true
+    }
+
+    /// Phase 2: run sweep hooks, finalize the newly dead cells and free them, except those
+    /// whose address `pinned` reports still held by a weak handle (they become zombies until
+    /// a later collection finds them unpinned).
+    pub(crate) fn finish_collection(&mut self, pinned: &dyn Fn(usize) -> bool) {
+        assert!(
+            self.control.collecting.get(),
+            "finish_collection without start_marking"
+        );
+        self.sweep_phase(pinned);
+    }
+
+    /// The allocated cells of `desc` the current marking left unmarked (between
+    /// [`Heap::start_marking`] and [`Heap::finish_collection`]).
+    pub(crate) fn dead_cells(&self, desc: DescId) -> Vec<usize> {
+        let mut dead = Vec::new();
+        for page in self.pages.iter().flatten().filter(|page| page.desc == desc) {
+            for i in 0..page.cells {
+                if bit(&page.allocated, i) && !bit(&page.marks, i) && !bit(&page.zombies, i) {
+                    dead.push(page.cell_ptr(i));
+                }
+            }
+        }
+        for (&start, large) in &self.larges {
+            if large.desc == desc && !large.marked && !large.zombie {
+                dead.push(start);
+            }
+        }
+        dead
+    }
+
+    /// Whether `addr` (interior addresses included) lies in a cell of this heap that the
+    /// current marking left unmarked: a weak reference to it must be cleared.
+    pub(crate) fn is_dead_target(&self, addr: usize) -> bool {
+        self.locate(addr as u64)
+            .is_some_and(|cell| !self.is_marked(&cell))
     }
 
     fn blocked(&self) -> bool {
@@ -876,26 +1064,52 @@ impl Heap {
         false
     }
 
-    fn run(&mut self, native_roots: bool) {
+    fn mark_phase(&mut self, native_roots: bool, client: &dyn MarkClient) {
         assert!(
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
         self.control.pending_collect.set(false);
         self.stats.collections += 1;
-        let mut m = Marker::default();
+        let mut m = Marker {
+            parents: self.retention_tracing.then(FastMap::default),
+            ..Marker::default()
+        };
         self.mark_root_ranges(&mut m);
         self.mark_trace_roots(&mut m);
+        client.roots(&mut |word| self.mark_word(word, &mut m));
         if native_roots {
             self.mark_native_stack(&mut m);
         }
-        self.add_source_edges(&mut m);
-        self.drain(&mut m);
+        m.source = MarkSource::Root;
+        self.add_source_edges(&mut m, client);
+        client.side_slot_owners(&mut |owner| {
+            // An owner outside this heap is not a condition: its slots are traced now.
+            let condition = self.locate(owner as u64);
+            self.add_edge(
+                CondEdge {
+                    owner: condition,
+                    key: None,
+                    value: EdgeValue::SideSlots(owner),
+                    fired: false,
+                    slots: None,
+                },
+                &mut m,
+                client,
+            );
+        });
+        self.drain(&mut m, client);
         self.clear_dead_weak(&m);
         #[cfg(debug_assertions)]
         self.verify(&m);
+        if let Some(parents) = m.parents.take() {
+            self.last_parents = parents;
+        }
+    }
+
+    fn sweep_phase(&mut self, pinned: &dyn Fn(usize) -> bool) {
         self.run_sweep_hooks();
-        let live_bytes = self.sweep();
+        let live_bytes = self.sweep(pinned);
         self.allocated_bytes = live_bytes;
         let budget =
             live_bytes.saturating_add(live_bytes.saturating_mul(self.growth_percent) / 100);
@@ -934,6 +1148,29 @@ impl Heap {
         let mut regs = [0u64; native::SPILL_WORDS];
         native::spill_registers(&mut regs);
         let sp = native::current_sp();
+        #[cfg(target_arch = "aarch64")]
+        if self.retention_tracing {
+            self.last_frames.clear();
+            let mut fp: usize;
+            // SAFETY: reads x29 only.
+            unsafe {
+                std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
+            };
+            while fp > sp && fp.is_multiple_of(8) && self.last_frames.len() < 4096 {
+                // SAFETY: a frame record of this thread's stack: [saved x29, saved x30].
+                let (next, lr) = unsafe {
+                    (
+                        std::ptr::read(fp as *const usize),
+                        std::ptr::read((fp + 8) as *const usize),
+                    )
+                };
+                self.last_frames.push((fp, lr));
+                if next <= fp {
+                    break;
+                }
+                fp = next;
+            }
+        }
         let ranges = native::scan_ranges(sp).expect("collect() checked the native stack");
         for (lo, hi) in ranges {
             let mut p = lo;
@@ -942,6 +1179,7 @@ impl Heap {
                 // and grow contracts); volatile keeps the compiler from reasoning
                 // about reads of other frames.
                 let word = unsafe { std::ptr::read_volatile(p as *const u64) };
+                m.source = MarkSource::Stack(p);
                 self.mark_word(word, m);
                 p += 8;
             }
@@ -949,12 +1187,15 @@ impl Heap {
         std::hint::black_box(&regs);
     }
 
-    fn add_source_edges(&mut self, m: &mut Marker) {
+    fn add_source_edges(&mut self, m: &mut Marker, client: &dyn MarkClient) {
         let mut reported = Vec::new();
         Rc::clone(&self.edge_sources).for_each(|source| {
             (source.report)(&mut EdgeSink {
                 edges: &mut reported,
             })
+        });
+        client.ephemerons(&mut EdgeSink {
+            edges: &mut reported,
         });
         for edge in reported {
             // An owner or key outside this heap is not a condition.
@@ -964,18 +1205,20 @@ impl Heap {
                 CondEdge {
                     owner,
                     key,
-                    value: edge.value,
+                    value: EdgeValue::Word(edge.value),
                     fired: false,
                     slots: None,
                 },
                 m,
+                client,
             );
         }
     }
 
-    fn drain(&mut self, m: &mut Marker) {
+    fn drain(&mut self, m: &mut Marker, client: &dyn MarkClient) {
         loop {
             while let Some((cell, desc)) = m.worklist.pop() {
+                m.source = MarkSource::Cell(cell);
                 let desc = &self.descs[desc.0 as usize];
                 let (trace, weak) = (desc.trace, desc.weak);
                 let mut edges = std::mem::take(&mut m.trace_scratch);
@@ -986,17 +1229,17 @@ impl Heap {
                 }
                 m.trace_scratch = edges;
                 if let Some(weak) = weak {
-                    self.visit_weak(cell, weak, m);
+                    self.visit_weak(cell, weak, m, client);
                 }
             }
             let Some(edge) = m.ready.pop() else {
                 break;
             };
-            self.try_fire(edge, m);
+            self.try_fire(edge, m, client);
         }
     }
 
-    fn visit_weak(&mut self, cell: usize, weak: WeakFn, m: &mut Marker) {
+    fn visit_weak(&mut self, cell: usize, weak: WeakFn, m: &mut Marker, client: &dyn MarkClient) {
         let mut slots = std::mem::take(&mut m.slot_scratch);
         let mut pairs = std::mem::take(&mut m.pair_scratch);
         slots.clear();
@@ -1027,21 +1270,22 @@ impl Heap {
                 CondEdge {
                     owner: None,
                     key,
-                    value,
+                    value: EdgeValue::Word(value),
                     fired: false,
                     slots: Some((key_slot, value_slot)),
                 },
                 m,
+                client,
             );
         }
         m.slot_scratch = slots;
         m.pair_scratch = pairs;
     }
 
-    fn add_edge(&mut self, edge: CondEdge, m: &mut Marker) {
+    fn add_edge(&mut self, edge: CondEdge, m: &mut Marker, client: &dyn MarkClient) {
         let index = m.edges.len() as u32;
         m.edges.push(edge);
-        self.try_fire(index, m);
+        self.try_fire(index, m, client);
     }
 
     /// Mark the edge's value if all its conditions are marked; otherwise
@@ -1049,7 +1293,7 @@ impl Heap {
     /// fires at most once, so conditional marking is linear — no fixed-point
     /// rescans, and a condition that can never be marked (a free cell) just
     /// leaves its edge unfired.
-    fn try_fire(&mut self, index: u32, m: &mut Marker) {
+    fn try_fire(&mut self, index: u32, m: &mut Marker, client: &dyn MarkClient) {
         let edge = &m.edges[index as usize];
         if edge.fired {
             return;
@@ -1062,7 +1306,22 @@ impl Heap {
             }
         }
         m.edges[index as usize].fired = true;
-        self.mark_word(value, m);
+        let start = |cell: Option<CellRef>| cell.map_or(0, |cell| cell.start);
+        let saved = m.source;
+        match value {
+            EdgeValue::Word(word) => {
+                m.source = MarkSource::Conditional {
+                    owner: start(conditions[0]),
+                    key: start(conditions[1]),
+                };
+                self.mark_word(word, m);
+            }
+            EdgeValue::SideSlots(owner) => {
+                m.source = MarkSource::SideSlots(owner);
+                client.trace_side_slots(owner, &mut |word| self.mark_word(word, m));
+            }
+        }
+        m.source = saved;
     }
 
     fn wait_on(&mut self, cell: &CellRef, edge: u32, m: &mut Marker) {
@@ -1145,7 +1404,10 @@ impl Heap {
             }
         }
         for edge in m.edges.iter().filter(|edge| edge.fired) {
-            if let Some(cell) = self.locate(edge.value) {
+            let EdgeValue::Word(value) = edge.value else {
+                continue;
+            };
+            if let Some(cell) = self.locate(value) {
                 assert!(
                     self.is_marked(&cell),
                     "heap verifier: conditional edge references unmarked {:#x}",
@@ -1167,8 +1429,9 @@ impl Heap {
     }
 
     /// Finalize, poison (debug) and free unmarked cells, release empty
-    /// pages, clear marks. Returns the live bytes that remain.
-    fn sweep(&mut self) -> usize {
+    /// pages, clear marks. Dead cells `pinned` by weak handles stay allocated
+    /// as zombies. Returns the live bytes that remain.
+    fn sweep(&mut self, pinned: &dyn Fn(usize) -> bool) -> usize {
         let mut live_bytes = 0usize;
         let mut swept = 0u64;
         for index in 0..self.pages.len() {
@@ -1185,16 +1448,26 @@ impl Heap {
                 }
                 let cell = page.cell_ptr(i) as *mut u64;
                 if bit(&page.allocated, i) {
-                    swept += 1;
-                    if let Some(finalize) = finalize {
-                        finalize(cell as *mut u8);
+                    let pin = pinned(cell as usize);
+                    if !bit(&page.zombies, i) {
+                        swept += 1;
+                        if let Some(finalize) = finalize {
+                            finalize(cell as *mut u8);
+                        }
+                        #[cfg(debug_assertions)]
+                        for w in 1..page.cell_size / 8 {
+                            // SAFETY: the dead cell lies inside this page.
+                            unsafe { std::ptr::write(cell.add(w), POISON) };
+                        }
                     }
+                    if pin {
+                        // Finalized, but its address stays reserved for weak handles.
+                        set_bit(&mut page.zombies, i, true);
+                        live += 1;
+                        continue;
+                    }
+                    set_bit(&mut page.zombies, i, false);
                     set_bit(&mut page.allocated, i, false);
-                    #[cfg(debug_assertions)]
-                    for w in 1..page.cell_size / 8 {
-                        // SAFETY: the dead cell lies inside this page.
-                        unsafe { std::ptr::write(cell.add(w), POISON) };
-                    }
                 }
                 let link = if head < 0 { 0 } else { head as u64 + 1 };
                 // SAFETY: as above; word 0 of a free cell is its free-list link.
@@ -1232,15 +1505,22 @@ impl Heap {
                 live_bytes += large.size;
                 return true;
             }
-            swept += 1;
-            if let Some(finalize) = descs[large.desc.0 as usize].finalize {
-                finalize(start as *mut u8);
+            large.waiters = false;
+            if !large.zombie {
+                swept += 1;
+                if let Some(finalize) = descs[large.desc.0 as usize].finalize {
+                    finalize(start as *mut u8);
+                }
+                #[cfg(debug_assertions)]
+                // SAFETY: the dead object spans `size` bytes from `start`.
+                unsafe {
+                    std::ptr::write_bytes(start as *mut u8, 0xdd, large.size)
+                };
             }
-            #[cfg(debug_assertions)]
-            // SAFETY: the dead object spans `size` bytes from `start`.
-            unsafe {
-                std::ptr::write_bytes(start as *mut u8, 0xdd, large.size)
-            };
+            if pinned(start) {
+                large.zombie = true;
+                return true;
+            }
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
             false
@@ -1284,7 +1564,7 @@ impl Heap {
         for page in std::mem::take(&mut self.pages).into_iter().flatten() {
             if let Some(finalize) = self.descs[page.desc.0 as usize].finalize {
                 for i in 0..page.cells {
-                    if bit(&page.allocated, i) {
+                    if bit(&page.allocated, i) && !bit(&page.zombies, i) {
                         finalize(page.cell_ptr(i) as *mut u8);
                     }
                 }
@@ -1294,7 +1574,9 @@ impl Heap {
         }
         for (start, large) in std::mem::take(&mut self.larges) {
             if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
-                finalize(start as *mut u8);
+                if !large.zombie {
+                    finalize(start as *mut u8);
+                }
             }
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
@@ -1379,6 +1661,102 @@ impl Drop for NativeStackScope {
             native::exit();
         }
     }
+}
+
+/// Register this thread's whole native stack, from the current frame up to the top of its
+/// mapping, as a permanent entry region (idempotent). Interpreters call this at creation so
+/// every engine frame on the thread lies below the scanned top. Returns false where the
+/// stack bounds cannot be read; conservative collection then defers on this thread.
+pub(crate) fn register_thread_native_stack() -> bool {
+    native::enter_thread()
+}
+
+/// Native stack an embedder entry (a script evaluation, a microtask checkpoint) zeroes before
+/// running JavaScript, so the frames it builds hold no stale cell addresses from earlier jobs.
+/// Debug frames are several times larger than optimized ones.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const ENTRY_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
+    1 << 20
+} else {
+    128 << 10
+};
+
+/// Zero up to `bytes` of native stack below the caller's stack pointer, within the current stack
+/// or segment. Frames built there afterwards (a collection's own, or the next job's) then start
+/// without stale cell addresses, which the conservative scan would otherwise take as roots:
+/// false retention, never unsoundness. Inlined, so the zeroing leaf runs straight from the
+/// caller's frame: a scrubbing frame of its own would leave its unwritten slots stale for the
+/// caller's next callee.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub(crate) fn scrub_stack(bytes: usize) {
+    let available = stacker::remaining_stack()
+        .unwrap_or(0)
+        .saturating_sub(128 * 1024);
+    let bytes = bytes.min(available) & !15;
+    if bytes > 0 {
+        // SAFETY: the zeroed range lies below the stack pointer, above this stack's limit
+        // with 128 KiB to spare, and holds no live data.
+        unsafe { zero_below_sp(bytes) };
+    }
+}
+
+/// Zero `bytes` (a multiple of 16) below the caller's stack pointer. A leaf with no frame, so
+/// nothing of its own is left in the zeroed range.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn zero_below_sp(bytes: usize) {
+    std::arch::naked_asm!(
+        "mov x9, sp",
+        "sub x10, x9, x0",
+        "2:",
+        "cmp x10, x9",
+        "b.hs 3f",
+        "stp xzr, xzr, [x10], #16",
+        "b 2b",
+        "3:",
+        "ret",
+    )
+}
+
+/// Zero `bytes` (a multiple of 16) below the caller's stack pointer, sparing the return address
+/// the call pushed. A leaf with no frame, so nothing of its own is left in the zeroed range.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn zero_below_sp(bytes: usize) {
+    std::arch::naked_asm!(
+        "lea rcx, [rsp + 8]",
+        "sub rcx, rdi",
+        "2:",
+        "cmp rcx, rsp",
+        "jae 3f",
+        "mov qword ptr [rcx], 0",
+        "add rcx, 8",
+        "jmp 2b",
+        "3:",
+        "ret",
+    )
+}
+
+/// Portable fallback: zero from frames of its own (whose own slots may stay stale).
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+)))]
+unsafe fn zero_below_sp(bytes: usize) {
+    const CHUNK: usize = 4096;
+    #[inline(never)]
+    fn zero(chunks: usize) {
+        let mut chunk = [0u8; CHUNK];
+        std::hint::black_box(&mut chunk);
+        if chunks > 1 {
+            zero(chunks - 1);
+        }
+        // Used after the call, so the frame cannot be reused for it.
+        std::hint::black_box(&chunk);
+    }
+    zero(bytes / CHUNK);
 }
 
 /// `stacker::grow` whose new segment is registered, with exact bounds, for
@@ -1568,6 +1946,58 @@ mod native {
         });
     }
 
+    /// Permanently register the current thread's stack up to its mapping's top.
+    pub(super) fn enter_thread() -> bool {
+        if REGIONS.with(|regions| !regions.borrow().is_empty()) {
+            return true;
+        }
+        match thread_stack_top() {
+            // Never popped: the region lives as long as the thread.
+            Some(top) => enter(top) || REGIONS.with(|regions| !regions.borrow().is_empty()),
+            None => false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread_stack_top() -> Option<usize> {
+        // Opaque pthread_attr_t: 56 bytes (glibc x86_64) / 64 bytes (aarch64); 128 covers both.
+        #[repr(C, align(16))]
+        struct Attr([u8; 128]);
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_getattr_np(thread: usize, attr: *mut Attr) -> std::ffi::c_int;
+            fn pthread_attr_getstack(
+                attr: *const Attr,
+                addr: *mut *mut std::ffi::c_void,
+                size: *mut usize,
+            ) -> std::ffi::c_int;
+            fn pthread_attr_destroy(attr: *mut Attr) -> std::ffi::c_int;
+        }
+        let mut attr = Attr([0; 128]);
+        let mut addr = std::ptr::null_mut();
+        let mut size = 0usize;
+        // SAFETY: `attr` outlives every call; getattr initializes it and destroy releases it.
+        unsafe {
+            if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
+                return None;
+            }
+            let status = pthread_attr_getstack(&attr, &mut addr, &mut size);
+            pthread_attr_destroy(&mut attr);
+            (status == 0 && size != 0).then(|| addr as usize + size)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn thread_stack_top() -> Option<usize> {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_get_stackaddr_np(thread: usize) -> *mut std::ffi::c_void;
+        }
+        // SAFETY: no preconditions; the result is the top (highest address) of the stack.
+        let top = unsafe { pthread_get_stackaddr_np(pthread_self()) } as usize;
+        (top != 0).then_some(top)
+    }
+
     struct SegmentScope;
 
     impl Drop for SegmentScope {
@@ -1663,6 +2093,10 @@ mod native {
     }
 
     pub(super) fn exit() {}
+
+    pub(super) fn enter_thread() -> bool {
+        false
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn grow<R, F: FnOnce() -> R>(stack_size: usize, f: F) -> R {
@@ -2035,6 +2469,250 @@ mod tests {
         assert_eq!(fx.live(), 1);
     }
 
+    /// An embedder (S2: the interpreter) supplying roots and owner-keyed side tables.
+    struct TableClient {
+        roots: Vec<u64>,
+        side_slots: Vec<(usize, u64)>,
+    }
+
+    impl MarkClient for TableClient {
+        fn roots(&self, sink: &mut dyn FnMut(u64)) {
+            for &root in &self.roots {
+                sink(root);
+            }
+        }
+
+        fn side_slot_owners(&self, owners: &mut dyn FnMut(usize)) {
+            for &(owner, _) in &self.side_slots {
+                owners(owner);
+            }
+        }
+
+        fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
+            for &(entry_owner, value) in &self.side_slots {
+                if entry_owner == owner {
+                    sink(value);
+                }
+            }
+        }
+
+        fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
+    }
+
+    #[test]
+    fn embedder_marking_traces_side_slots_of_marked_owners_only() {
+        let mut fx = Fixture::new();
+        let [owner, value, dead_owner, dead_value] =
+            [0; 4].map(|_| fx.heap.alloc(fx.leaf, 16) as usize);
+        let client = TableClient {
+            roots: vec![tagged(owner as *const u8)],
+            // The dead owner's table entry points back at it: a cycle through the table.
+            side_slots: vec![
+                (owner, value as u64),
+                (dead_owner, dead_value as u64),
+                (dead_value, dead_owner as u64),
+            ],
+        };
+        assert!(fx.heap.start_marking(false, &client));
+        let dead = fx.heap.dead_cells(fx.leaf);
+        assert_eq!(dead.len(), 2);
+        assert!(dead.contains(&dead_owner) && dead.contains(&dead_value));
+        assert!(
+            fx.heap.is_dead_target(dead_value + 8),
+            "interior addresses resolve"
+        );
+        assert!(!fx.heap.is_dead_target(value));
+        fx.heap.finish_collection(&|_| false);
+        assert_eq!(fx.live(), 2);
+    }
+
+    #[test]
+    fn cells_allocated_between_the_phases_survive_that_sweep() {
+        // The embedder sweeps its own tables between the phases and may allocate there.
+        let mut fx = Fixture::new();
+        let dead = fx.heap.alloc(fx.leaf, 16) as usize;
+        let client = TableClient {
+            roots: Vec::new(),
+            side_slots: Vec::new(),
+        };
+        assert!(fx.heap.start_marking(false, &client));
+        let small = fx.heap.alloc(fx.leaf, 16) as usize;
+        let large = fx.heap.alloc(fx.leaf, 8192) as usize;
+        assert_eq!(fx.heap.dead_cells(fx.leaf), vec![dead]);
+        fx.heap.finish_collection(&|_| false);
+        assert!(!fx.heap.is_allocated_word(dead as u64));
+        assert!(fx.heap.is_allocated_word(small as u64), "allocated black");
+        assert!(fx.heap.is_allocated_word(large as u64), "allocated black");
+        assert_eq!(fx.live(), 2);
+    }
+
+    #[inline(never)]
+    fn leave_word_below(word: u64) -> usize {
+        let mut slot = [0u64; 64];
+        slot[17] = word;
+        std::hint::black_box(&mut slot);
+        std::ptr::from_ref(&slot[17]) as usize
+    }
+
+    #[test]
+    fn scrub_stack_clears_stale_words_below_the_caller() {
+        let marker = 0x5afe_c0de_dead_beef;
+        let addr = leave_word_below(marker);
+        let here = 0u64;
+        assert!(
+            addr < std::ptr::from_ref(&here) as usize,
+            "the stale word is below"
+        );
+        // SAFETY: a dead frame's slot in this thread's mapped stack, read before any call
+        // reuses it (and again after the scrub).
+        let before = unsafe { std::ptr::read_volatile(addr as *const u64) };
+        assert_eq!(before, marker, "the dead frame still holds the word");
+        super::scrub_stack(256 * 1024);
+        // SAFETY: as above.
+        let after = unsafe { std::ptr::read_volatile(addr as *const u64) };
+        assert_ne!(after, marker);
+    }
+
+    /// Fill `bytes` (a multiple of 16) below the caller's stack pointer with `marker`.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn fill_below_sp(bytes: usize, marker: u64) {
+        std::arch::naked_asm!(
+            "mov x9, sp",
+            "sub x10, x9, x0",
+            "2:",
+            "cmp x10, x9",
+            "b.hs 3f",
+            "stp x1, x1, [x10], #16",
+            "b 2b",
+            "3:",
+            "ret",
+        )
+    }
+
+    /// The nonzero words among the `bytes` below the caller's stack pointer.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn nonzero_below_sp(bytes: usize) -> usize {
+        std::arch::naked_asm!(
+            "mov x9, sp",
+            "sub x10, x9, x0",
+            "mov x0, xzr",
+            "2:",
+            "cmp x10, x9",
+            "b.hs 3f",
+            "ldr x11, [x10], #8",
+            "cmp x11, #0",
+            "cinc x0, x0, ne",
+            "b 2b",
+            "3:",
+            "ret",
+        )
+    }
+
+    /// Fill `bytes` (a multiple of 16) below the caller's stack pointer with `marker`, sparing
+    /// the return address.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn fill_below_sp(bytes: usize, marker: u64) {
+        std::arch::naked_asm!(
+            "lea rcx, [rsp + 8]",
+            "sub rcx, rdi",
+            "2:",
+            "cmp rcx, rsp",
+            "jae 3f",
+            "mov qword ptr [rcx], rsi",
+            "add rcx, 8",
+            "jmp 2b",
+            "3:",
+            "ret",
+        )
+    }
+
+    /// The nonzero words among the `bytes` below the caller's stack pointer, but for the
+    /// return address of this call.
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn nonzero_below_sp(bytes: usize) -> usize {
+        std::arch::naked_asm!(
+            "lea rcx, [rsp + 8]",
+            "sub rcx, rdi",
+            "xor eax, eax",
+            "2:",
+            "cmp rcx, rsp",
+            "jae 3f",
+            "cmp qword ptr [rcx], 0",
+            "je 4f",
+            "inc rax",
+            "4:",
+            "add rcx, 8",
+            "jmp 2b",
+            "3:",
+            "ret",
+        )
+    }
+
+    /// The scrub leaves the range entirely zero, right below the caller included: a scrubber
+    /// with a frame of its own left that frame's unwritten slots stale, and the collector's
+    /// next frame inherited a dead cell's address from one of them.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn scrub_stack_leaves_no_word_right_below_the_caller() {
+        const BYTES: usize = 16 * 1024;
+        // SAFETY: these touch dead stack below the stack pointer, far above this stack's limit.
+        unsafe { fill_below_sp(BYTES, 0x5afe_c0de_0bad_f00d) };
+        super::scrub_stack(64 * 1024);
+        let left = unsafe { nonzero_below_sp(BYTES) };
+        assert_eq!(left, 0, "nonzero words below the caller after the scrub");
+    }
+
+    #[test]
+    fn weakly_pinned_dead_cells_stay_reserved_until_unpinned() {
+        // Like the allocation behind `std::rc::Weak`: a dead cell a weak handle may still
+        // compare by address is finalized once and not reused until that handle is gone.
+        FIN_COUNT.with(|c| c.set(0));
+        let mut fx = Fixture::new();
+        let anchor = fx.heap.alloc(fx.leaf, 4096);
+        fx.roots[0] = tagged(anchor);
+        let pinned = fx.heap.alloc(fx.leaf, 4096) as usize;
+        let client = TableClient {
+            roots: Vec::new(),
+            side_slots: Vec::new(),
+        };
+        assert!(fx.heap.start_marking(false, &client));
+        assert_eq!(fx.heap.dead_cells(fx.leaf), vec![pinned]);
+        fx.heap.finish_collection(&|addr| addr == pinned);
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 1, "finalized when it died");
+        assert!(
+            fx.heap.is_allocated_word(pinned as u64),
+            "address still reserved"
+        );
+        for _ in 0..14 {
+            assert_ne!(
+                fx.heap.alloc(fx.leaf, 4096) as usize,
+                pinned,
+                "no reuse while pinned"
+            );
+        }
+        assert!(fx.heap.start_marking(false, &client));
+        assert!(
+            fx.heap.dead_cells(fx.leaf).len() >= 14,
+            "zombies are not reported as newly dead"
+        );
+        assert!(!fx.heap.dead_cells(fx.leaf).contains(&pinned));
+        assert!(fx.heap.is_dead_target(pinned));
+        fx.heap.finish_collection(&|_| false);
+        assert!(
+            !fx.heap.is_allocated_word(pinned as u64),
+            "freed once unpinned"
+        );
+        assert_eq!(
+            FIN_COUNT.with(|c| c.get()),
+            15,
+            "a zombie is never finalized twice"
+        );
+    }
+
     #[test]
     fn nogc_region_defers_collection() {
         let mut fx = Fixture::new();
@@ -2164,6 +2842,21 @@ mod tests {
         let ran = heap.collect();
         black_box(&spill);
         ran
+    }
+
+    #[test]
+    fn thread_stack_registration_covers_every_frame() {
+        std::thread::spawn(|| {
+            assert!(register_thread_native_stack());
+            assert!(register_thread_native_stack(), "idempotent");
+            let mut fx = Fixture::new();
+            let a = fx.alloc_node(0, 9);
+            assert!(deep_collect(&mut fx.heap, a));
+            assert!(fx.heap.is_allocated_word(a as u64));
+            assert_eq!(fx.val(a), 9);
+        })
+        .join()
+        .expect("collector thread");
     }
 
     #[test]

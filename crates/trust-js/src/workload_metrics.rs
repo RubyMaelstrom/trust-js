@@ -197,6 +197,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn workload_name_classifier_tracks_depth_tdz_import_and_shadowing() {
         let outer = new_scope(None);

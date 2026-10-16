@@ -2595,22 +2595,30 @@ mod tests {
         let weak_layout = Rc::downgrade(&layout);
         let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>();
-        let mut props = Props::with_layout(1, Some(layout.clone()));
-        props.append_initialized_field(&layout[0], crate::value::Property::plain(Value::Undefined));
-        let source = Value::Obj(crate::value::Object::new_with_parts(
-            None,
-            props,
-            Exotic::None,
-        ));
-        let weak_source = Gc::downgrade(source.as_obj().unwrap());
-        let _keys = engine
-            .interp
-            .for_in_keys(&source)
-            .ok()
-            .expect("ordinary keys");
-        drop(source);
+        // The source lives only in this helper frame (gc-heap scans the stack).
+        let (weak_source, _keys) = crate::gc_test::in_frame(|| {
+            let mut props = Props::with_layout(1, Some(layout.clone()));
+            props.append_initialized_field(
+                &layout[0],
+                crate::value::Property::plain(Value::Undefined),
+            );
+            let source = Value::Obj(crate::value::Object::new_with_parts(
+                None,
+                props,
+                Exotic::None,
+            ));
+            let weak_source = Gc::downgrade(source.as_obj().unwrap());
+            let keys = engine
+                .interp
+                .for_in_keys(&source)
+                .ok()
+                .expect("ordinary keys");
+            (weak_source, keys)
+        });
         drop(layout);
-        assert!(weak_source.upgrade().is_none());
+        // A tracing heap (gc-heap) reclaims the dropped source at a collection.
+        engine.interp.gc_collect();
+        assert!(!crate::gc_test::alive(&weak_source));
         assert_eq!(
             weak_layout.strong_count(),
             1,
@@ -3820,6 +3828,10 @@ mod tests {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn borrowed_osr_cache_metadata_is_counted_once_and_released_with_chunk() {
         let mut engine = crate::Engine::new();

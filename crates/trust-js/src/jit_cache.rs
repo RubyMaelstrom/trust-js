@@ -444,7 +444,7 @@ pub(crate) unsafe fn lease_raw(code: *const JitCode) -> Rc<JitCode> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn eviction_count() -> u64 {
     REGISTRY.with(|registry| registry.borrow().evictions)
 }

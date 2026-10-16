@@ -82,6 +82,10 @@ impl Coroutine {
 
     #[inline]
     pub(crate) fn resume(&mut self, i: &mut Interp, signal: Resume) -> Suspend {
+        // P1 S2: removed from its owner's table while it runs, the continuation is reachable
+        // only from Rust frames; register it so collections in the body trace it.
+        #[cfg(feature = "gc-heap")]
+        let _running = crate::gc_trace::enter_coroutine(self);
         match self {
             Coroutine::Vm(c) => c.resume(i, signal),
             Coroutine::Module(c) => c.resume(i, signal),
@@ -195,6 +199,18 @@ pub fn coroutine_yield(i: &mut Interp, _value: Value) -> Resume {
 
 pub fn coroutine_await(i: &mut Interp, _value: Value) -> Resume {
     Resume::Throw(i.make_error("Error", VM_UNAVAILABLE_MSG))
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for UnavailableCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let UnavailableCoro {
+            reason,
+            done: _,
+            started: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(reason, sink);
+    }
 }
 
 #[cfg(test)]

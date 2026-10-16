@@ -116,6 +116,10 @@ fn ordinary_data_read_all_value_kinds_owned_and_traced() {
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
     let mut engine = Engine::new();
@@ -163,7 +167,7 @@ fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
         assert!(matches!(marker, Value::Num(37.0)));
         drop(result);
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak));
 
         let symbol = engine.interp.new_symbol(Some(Rc::from("sole symbol")));
         let Value::Sym(symbol_ref) = &symbol else {
@@ -189,7 +193,7 @@ fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
         assert!(matches!(&result, Value::Sym(s) if s.id == id));
         assert_eq!(weak_symbol.strong_count(), 1);
         drop(result);
-        assert!(weak_symbol.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak_symbol));
 
         for payload in [
             Value::lstr("last string λ"),
@@ -330,57 +334,61 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
     for traced in [false, true] {
         let mut engine = Engine::new();
         run(&mut engine, "var F=function(){};");
-        let function = object(&mut engine, "F");
-        let weak_function = Gc::downgrade(&function);
-        let holder_shape = function.borrow().props.shape();
-        let before = crate::value::heap_live_objects(&engine.interp.gc_heap);
-        let (first, trace) = read(
-            &mut engine.interp,
-            &function,
-            "prototype",
-            &Value::Obj(function.clone()),
-            traced,
-        );
-        assert_eq!(
-            crate::value::heap_live_objects(&engine.interp.gc_heap),
-            before + 1
-        );
-        let (second, _) = read(
-            &mut engine.interp,
-            &function,
-            "prototype",
-            &Value::Obj(function.clone()),
-            traced,
-        );
-        assert!(crate::builtins::same_value_pub(&first, &second));
-        assert_eq!(
-            crate::value::heap_live_objects(&engine.interp.gc_heap),
-            before + 1
-        );
-        if traced {
-            assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
-            assert_eq!(trace.holder_shape, Some(holder_shape));
-        }
-        run(&mut engine, "F=null;");
-        drop(function);
-        drop(second);
+        // Strong handles live only in helper frames (gc-heap scans the stack): the outer one
+        // keeps the returned prototype, the inner one the function.
+        let weak_function = crate::gc_test::in_frame(|| {
+            let (weak_function, first) = crate::gc_test::in_frame(|| {
+                let function = object(&mut engine, "F");
+                let weak_function = Gc::downgrade(&function);
+                let holder_shape = function.borrow().props.shape();
+                let before = crate::value::heap_live_objects(&engine.interp.gc_heap);
+                let (first, trace) = read(
+                    &mut engine.interp,
+                    &function,
+                    "prototype",
+                    &Value::Obj(function.clone()),
+                    traced,
+                );
+                assert_eq!(
+                    crate::value::heap_live_objects(&engine.interp.gc_heap),
+                    before + 1
+                );
+                let (second, _) = read(
+                    &mut engine.interp,
+                    &function,
+                    "prototype",
+                    &Value::Obj(function.clone()),
+                    traced,
+                );
+                assert!(crate::builtins::same_value_pub(&first, &second));
+                assert_eq!(
+                    crate::value::heap_live_objects(&engine.interp.gc_heap),
+                    before + 1
+                );
+                if traced {
+                    assert_eq!(trace.outcome, Some(PropertyOutcome::Data));
+                    assert_eq!(trace.holder_shape, Some(holder_shape));
+                }
+                (weak_function, first)
+            });
+            run(&mut engine, "F=null;");
+            engine.interp.gc_collect();
+            let constructor = first
+                .as_obj()
+                .unwrap()
+                .borrow()
+                .props
+                .get("constructor")
+                .unwrap()
+                .value();
+            assert!(Gc::ptr_eq(
+                constructor.as_obj().unwrap(),
+                &weak_function.upgrade().unwrap()
+            ));
+            weak_function
+        });
         engine.interp.gc_collect();
-        let constructor = first
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .props
-            .get("constructor")
-            .unwrap()
-            .value();
-        assert!(Gc::ptr_eq(
-            constructor.as_obj().unwrap(),
-            &weak_function.upgrade().unwrap()
-        ));
-        drop(constructor);
-        drop(first);
-        engine.interp.gc_collect();
-        assert!(weak_function.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak_function));
     }
 }
 

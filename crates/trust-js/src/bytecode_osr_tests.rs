@@ -44,6 +44,10 @@ fn operand_owner_loop(i: &mut Interp) -> (Rc<Chunk>, Value) {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     let mut engine = crate::Engine::new();
@@ -74,6 +78,10 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn osr_compile_unavailable_keeps_exact_baseline_state_without_replay() {
     let mut engine = crate::Engine::new();

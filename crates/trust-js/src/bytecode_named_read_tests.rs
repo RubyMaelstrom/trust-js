@@ -309,6 +309,10 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
     values.clear();
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
     let mut engine = Engine::new();
@@ -338,17 +342,17 @@ fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
     drop(prefix);
     assert!(outcome.error.is_none());
     assert!(
-        weak_receiver.upgrade().is_none(),
+        !crate::gc_test::alive(&weak_receiver),
         "the local slot was released"
     );
 
     engine.interp.gc_collect();
     assert!(
-        weak_prefix.upgrade().is_some(),
+        crate::gc_test::alive(&weak_prefix),
         "the packed prefix remains rooted"
     );
     assert!(
-        weak_result.upgrade().is_some(),
+        crate::gc_test::alive(&weak_result),
         "the packed result owns its value after the receiver and property are gone"
     );
     assert!(outcome.packed(0).with_object(|_| ()).is_some());
@@ -357,8 +361,8 @@ fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
     outcome.drop_slot(0);
     outcome.drop_slot(1);
     engine.interp.gc_collect();
-    assert!(weak_prefix.upgrade().is_none());
-    assert!(weak_result.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak_prefix));
+    assert!(!crate::gc_test::alive(&weak_result));
 }
 
 fn collect_named_read(
@@ -388,6 +392,10 @@ fn assert_prefix(outcome: &mut Invocation, expected_prefix: &Value, engine: &mut
     prefix.clear();
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner() {
     let mut engine = Engine::new();
@@ -443,17 +451,17 @@ fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner()
         drop(expected_prefix);
         engine.interp.gc_collect();
         assert!(
-            weak_prefix.upgrade().is_none(),
+            !crate::gc_test::alive(&weak_prefix),
             "the consumed prefix was released"
         );
         assert_eq!(
-            weak_receiver.upgrade().is_some(),
+            crate::gc_test::alive(&weak_receiver),
             kind.is_method(),
             "only GetMethod keeps its borrowed receiver until exceptional unwind"
         );
         drop(outcome);
         assert!(
-            weak_receiver.upgrade().is_none(),
+            !crate::gc_test::alive(&weak_receiver),
             "the receiver owner was released"
         );
     }

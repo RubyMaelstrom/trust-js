@@ -174,6 +174,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn native_graph_traces_mixed_cycles_without_strong_handles() {
         let left = Value::Obj(Object::new(None));
@@ -320,29 +324,33 @@ mod tests {
     fn mixed_native_heap_and_ephemerons_share_the_full_collector_fixed_point() {
         let mut engine = crate::Engine::new();
         engine.eval("var key={}, bridge={}, payload={n:42}, owner={}; var map = new WeakMap([[key,bridge]]);", false).unwrap();
-        let global = Value::Obj(engine.interp.global.clone());
-        let mut values = Vec::new();
-        for name in ["owner", "key", "bridge", "payload"] {
-            values.push(
-                engine
-                    .interp
-                    .member_get(&global, name)
-                    .unwrap_or_else(|_| panic!("global")),
-            );
-        }
-        let weak: Vec<_> = values
-            .iter()
-            .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
-            .collect();
-        engine.interp.op_state().put(MixedHost {
-            values,
-            root: true,
-            live_native: Vec::new(),
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let weak: Vec<_> = crate::gc_test::in_frame(|| {
+            let global = Value::Obj(engine.interp.global.clone());
+            let mut values = Vec::new();
+            for name in ["owner", "key", "bridge", "payload"] {
+                values.push(
+                    engine
+                        .interp
+                        .member_get(&global, name)
+                        .unwrap_or_else(|_| panic!("global")),
+                );
+            }
+            let weak = values
+                .iter()
+                .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
+                .collect();
+            engine.interp.op_state().put(MixedHost {
+                values,
+                root: true,
+                live_native: Vec::new(),
+            });
+            weak
         });
         engine.interp.op_state().register_gc::<MixedHost>();
         engine.eval("key=bridge=payload=owner=null", false).unwrap();
         engine.interp.gc_collect();
-        assert!(weak.iter().all(|v| v.upgrade().is_some()));
+        assert!(weak.iter().all(|v| crate::gc_test::alive(&v)));
         assert_eq!(
             engine
                 .interp
@@ -359,7 +367,7 @@ mod tests {
             .unwrap()
             .root = false;
         engine.interp.gc_collect();
-        assert!(weak.iter().all(|v| v.upgrade().is_none()));
+        assert!(weak.iter().all(|v| !crate::gc_test::alive(&v)));
         assert_eq!(
             engine
                 .interp
@@ -372,6 +380,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount collector's nursery, disabled under gc-heap"
+    )]
     fn mixed_native_nursery_preserves_old_js_owner_edges_and_sweeps_unrooted_young_islands() {
         let mut engine = crate::Engine::new();
         let owner = Value::Obj(Object::new(None));
@@ -393,11 +405,11 @@ mod tests {
             .interp
             .gc_collect_young(crate::value::GcCause::Explicit);
         assert!(
-            weak[0].upgrade().is_some(),
+            crate::gc_test::alive(&weak[0]),
             "old owner logically roots young target"
         );
-        assert!(weak[1].upgrade().is_none());
-        assert!(weak[2].upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak[1]));
+        assert!(!crate::gc_test::alive(&weak[2]));
         assert_eq!(
             engine
                 .interp
@@ -409,7 +421,7 @@ mod tests {
         );
         engine.interp.gc_collect();
         assert!(
-            weak[0].upgrade().is_none(),
+            !crate::gc_test::alive(&weak[0]),
             "major revisits the unrooted old owner"
         );
     }

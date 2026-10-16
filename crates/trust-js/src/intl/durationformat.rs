@@ -588,7 +588,8 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
         Value::Num(n) => n as usize,
         _ => 0,
     };
-    let mut out: Vec<Value> = Vec::new();
+    // Rooted across the part reads, which can run getters (I1).
+    let mut out = crate::rooting::RootedVec::new();
     let mut giter = groups.drain(..);
     for k in 0..len {
         let el = ab(i.get_member_key(&list_parts, &k.to_string()))?;
@@ -616,7 +617,7 @@ fn format_to_parts(i: &mut Interp, this: &Value, dur: &Value) -> Result<Value, V
             out.push(Value::Obj(ob));
         }
     }
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }
 
 /// The fractional seconds/ms/us value combining sub-second fields, truncated as a decimal string

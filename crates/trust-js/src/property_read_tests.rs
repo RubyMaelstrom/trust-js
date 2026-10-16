@@ -172,7 +172,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
             "{tier:?}"
         );
         let entries = property_read::TEST_RECORD_GETTERS.with(Cell::get) - before;
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             assert!(
                 entries > 100,
                 "warm closed getters execute their structural plan"
@@ -182,7 +182,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
         }
         engine.interp.gc_collect();
         assert_eq!(evaluate(&mut engine, "read(source).index"), "7");
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             let env = engine.interp.global_env.clone();
             let source = engine
                 .interp
@@ -260,6 +260,10 @@ fn record_getter_specialization_retains_foreign_async_class_and_proxy_calls() {
     );
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn getter_cache_owned_snapshot_stays_two_words_and_retains_exactly_one_owner() {
     assert_eq!(std::mem::size_of::<CachedGet>(), 16);
@@ -284,46 +288,51 @@ fn getter_cache_owned_snapshot_stays_two_words_and_retains_exactly_one_owner() {
         .unwrap();
     assert_eq!(weak.strong_count(), 1);
     drop(value);
-    assert!(weak.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak));
 }
 
 #[test]
 fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_drops() {
     let mut engine = Engine::new();
-    let function = engine
-        .interp
-        .eval_in_realm(&engine.interp.global_this(), "(function Snapshot(){})")
-        .ok()
-        .unwrap();
-    let read = {
-        let object = function.as_obj().unwrap().borrow();
-        engine
+    // Strong handles live only in helper frames (gc-heap scans the stack): the outer one keeps
+    // the snapshot, the inner one the function.
+    let weak = crate::gc_test::in_frame(|| {
+        let (read, weak) = crate::gc_test::in_frame(|| {
+            let function = engine
+                .interp
+                .eval_in_realm(&engine.interp.global_this(), "(function Snapshot(){})")
+                .ok()
+                .unwrap();
+            let read = {
+                let object = function.as_obj().unwrap().borrow();
+                engine
+                    .interp
+                    .snapshot_cached_get(
+                        object.props.get("prototype").unwrap(),
+                        "prototype",
+                        0,
+                        0,
+                        false,
+                    )
+                    .unwrap()
+            };
+            (read, Gc::downgrade(function.as_obj().unwrap()))
+        });
+        engine.interp.gc_collect();
+        let prototype = read.data().unwrap();
+        let constructor = engine
             .interp
-            .snapshot_cached_get(
-                object.props.get("prototype").unwrap(),
-                "prototype",
-                0,
-                0,
-                false,
-            )
-            .unwrap()
-    };
-    let weak = Gc::downgrade(function.as_obj().unwrap());
-    drop(function);
+            .get_member_key(&prototype, "constructor")
+            .ok()
+            .unwrap();
+        assert!(Gc::ptr_eq(
+            constructor.as_obj().unwrap(),
+            &weak.upgrade().unwrap()
+        ));
+        weak
+    });
     engine.interp.gc_collect();
-    let prototype = read.data().unwrap();
-    let constructor = engine
-        .interp
-        .get_member_key(&prototype, "constructor")
-        .ok()
-        .unwrap();
-    assert!(Gc::ptr_eq(
-        constructor.as_obj().unwrap(),
-        &weak.upgrade().unwrap()
-    ));
-    drop((prototype, constructor));
-    engine.interp.gc_collect();
-    assert!(weak.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak));
 }
 
 #[test]
@@ -332,20 +341,24 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
     for depth in 0..=6 {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         let holder = Object::new(None);
-        let getter = engine.interp.new_native_fn(
-            "get cached",
-            0,
-            Rc::new(|_, this, args| {
-                assert!(args.is_empty());
-                let object = this.as_obj().unwrap().borrow();
-                Ok(object.props.get("id").unwrap().value())
-            }),
-        );
-        let weak = Gc::downgrade(getter.as_obj().unwrap());
-        holder.borrow_mut().props.insert(
-            "cached",
-            Property::accessor_prop(Some(getter), None, true, true),
-        );
+        // The getter lives only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let getter = engine.interp.new_native_fn(
+                "get cached",
+                0,
+                Rc::new(|_, this, args| {
+                    assert!(args.is_empty());
+                    let object = this.as_obj().unwrap().borrow();
+                    Ok(object.props.get("id").unwrap().value())
+                }),
+            );
+            let weak = Gc::downgrade(getter.as_obj().unwrap());
+            holder.borrow_mut().props.insert(
+                "cached",
+                Property::accessor_prop(Some(getter), None, true, true),
+            );
+            weak
+        });
         let mut receiver = holder.clone();
         for _ in 0..depth {
             receiver = Object::new(Some(receiver));
@@ -382,7 +395,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
             .insert("cached", Property::plain(Value::Num(23.0)));
         engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "layout caches must not pin getter values"
         );
         assert!(matches!(
@@ -509,6 +522,10 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacement() {
     let mut engine = Engine::new();
@@ -557,7 +574,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         .unwrap();
     assert!(Gc::ptr_eq(result.as_obj().unwrap(), &object));
     assert_eq!(called.get(), 1);
-    assert!(weak.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak));
     assert!(matches!(
         engine.interp.get_computed_property(&base, &key),
         Ok(Value::Num(47.0))
@@ -973,6 +990,10 @@ fn propstat_classify_buckets_match_template_guards_without_running_getters() {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn propstat_diagnostic_tallies_helper_reasons_at_exit() {
     if std::env::var_os("TRUST_JS_PROPSTAT_CHILD").is_none() {
@@ -1035,6 +1056,10 @@ fn validated_accessor_reads_observe_live_mutations_in_every_tier() {
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn validated_accessor_landing_is_exercised_by_jit_reads() {
     let before = property_read::TEST_VALIDATED_ACCESSORS.with(Cell::get);

@@ -162,6 +162,10 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
     }
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn dense_shift_storage_moves_reference_owners_without_retain_or_loss() {
     for (packed, reverse, named, len) in [
@@ -342,6 +346,10 @@ fn packed_creation_and_prepend_do_not_certify_holes_or_nonplain_descriptors() {
     assert!(descriptor.shift_dense_array(3).is_none());
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn tiny_prepends_retain_inline_owners_before_promoting_once() {
     let owners: Vec<_> = (0..12).map(|_| Object::new(None)).collect();

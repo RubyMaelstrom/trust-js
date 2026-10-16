@@ -678,7 +678,8 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         return regexp_exec_abstract(i, &this, s);
     }
     set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
-    let mut results: Vec<Value> = Vec::new();
+    // Rooted across later exec calls (I1).
+    let mut results = crate::rooting::RootedVec::new();
     loop {
         let result = regexp_exec_abstract(i, &this, s.clone())?;
         if matches!(result, Value::Null) {
@@ -697,7 +698,7 @@ pub(super) fn re_sym_match(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
     if results.is_empty() {
         Ok(Value::Null)
     } else {
-        Ok(i.make_array(results))
+        Ok(i.make_array(results.into_vec()))
     }
 }
 
@@ -920,7 +921,8 @@ fn re_sym_replace_impl(
         }
     }
     // Collect every match (RegExpExec advances lastIndex; empty matches step forward manually).
-    let mut results: Vec<Value> = Vec::new();
+    // The results stay rooted through later exec calls and the replacement pass (I1).
+    let mut results = crate::rooting::RootedVec::new();
     loop {
         let result = regexp_exec_abstract(i, &this, s.clone())?;
         if matches!(result, Value::Null) {
@@ -1568,17 +1570,18 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         Value::Undefined => u32::MAX as usize,
         v => to_uint32(ab(i.to_number(&v))?) as usize,
     };
-    let mut out: Vec<Value> = Vec::new();
+    // Rooted across the exec calls and captures' getters (I1).
+    let mut out = crate::rooting::RootedVec::new();
     if limit == 0 {
-        return Ok(i.make_array(out));
+        return Ok(i.make_array(out.into_vec()));
     }
     if size == 0 {
         let z = regexp_exec_abstract(i, &splitter, s.clone())?;
         if !matches!(z, Value::Null) {
-            return Ok(i.make_array(out));
+            return Ok(i.make_array(out.into_vec()));
         }
         out.push(Value::Str(s));
-        return Ok(i.make_array(out));
+        return Ok(i.make_array(out.into_vec()));
     }
     let mut p = 0usize;
     let mut q = 0usize;
@@ -1597,7 +1600,7 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
         }
         out.push(Value::lstr(crate::jstr::from_units(&sunits[p..q])));
         if out.len() == limit {
-            return Ok(i.make_array(out));
+            return Ok(i.make_array(out.into_vec()));
         }
         p = e;
         let len_v = ab(i.get_member_key(&z, "length"))?;
@@ -1606,11 +1609,11 @@ pub(super) fn re_sym_split(i: &mut Interp, this: Value, a: &[Value]) -> Result<V
             let cap = ab(i.get_member_key(&z, &n.to_string()))?;
             out.push(cap);
             if out.len() == limit {
-                return Ok(i.make_array(out));
+                return Ok(i.make_array(out.into_vec()));
             }
         }
         q = p;
     }
     out.push(Value::lstr(crate::jstr::from_units(&sunits[p..size])));
-    Ok(i.make_array(out))
+    Ok(i.make_array(out.into_vec()))
 }

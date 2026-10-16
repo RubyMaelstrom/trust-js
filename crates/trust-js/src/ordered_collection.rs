@@ -415,6 +415,23 @@ impl From<Vec<(Value, Value)>> for OrderedCollection {
     }
 }
 
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for OrderedCollection {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            kind: _,
+            entries,
+            index: _,
+            live_len: _,
+            cursors: _, // positions only
+        } = self;
+        for (key, value) in entries.iter().flatten() {
+            sink.value(key);
+            sink.value(value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +618,10 @@ mod tests {
         assert!(data.index.is_empty());
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn ordered_collection_single_probe_preserves_key_and_releases_replaced_values() {
         let key = crate::value::Object::new(None);

@@ -570,6 +570,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_already_dead_subscription_counts_each_queue_once() {
         for symbol in [false, true] {
@@ -581,7 +585,7 @@ mod tests {
             };
             let target = WeakTarget::of(&value).unwrap();
             drop(value);
-            assert!(target.upgrade().is_none());
+            assert!(!crate::gc_test::alive(&target));
             let mut first = WeakMetadata::default();
             let mut second = WeakMetadata::default();
             first.subscribe(target.clone(), Subscriber::WeakRef(1));
@@ -650,6 +654,10 @@ mod tests {
         assert!(engine.interp.pending_finalization_cleanup.is_empty());
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_empty_queue_does_not_skip_kept_objects_or_host_job_hooks() {
         struct JobRoots {
@@ -679,7 +687,7 @@ mod tests {
         engine.interp.gc_weak_metadata_safepoint(true);
         assert_eq!(calls.get(), 0);
         assert!(
-            target.upgrade().is_some(),
+            crate::gc_test::alive(&target),
             "safepoints do not end synchronous work"
         );
         assert_eq!(engine.interp.kept_alive.len(), 1);
@@ -687,7 +695,7 @@ mod tests {
         engine.interp.gc_task_boundary();
         assert_eq!(calls.get(), 1);
         assert!(engine.interp.kept_alive.is_empty());
-        assert!(target.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&target));
         assert!(engine.interp.weak_refs[&(Gc::as_ptr(&owner) as usize)].is_none());
         assert_eq!(queue.pending_len(), 0);
         // Even an entirely empty subsequent checkpoint must notify the host exactly once.
@@ -774,13 +782,16 @@ mod tests {
                     }
                 );
                 eval(&mut engine, &source, "true");
+                // Reference counting frees the acyclic target as the job ends; a tracing heap
+                // (gc-heap) reclaims it at a collection.
+                engine.interp.gc_collect();
                 assert!(
                     engine
                         .interp
                         .weak_refs
                         .values()
                         .flatten()
-                        .all(|target| target.upgrade().is_none()),
+                        .all(|target| !crate::gc_test::alive(&target)),
                     "WeakSet retained its acyclic target"
                 );
                 assert!(engine
@@ -851,6 +862,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_acyclic_ephemeron_value_deaths_drain_to_fixed_point() {
         for symbol in [false, true] {
@@ -887,6 +902,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_symbol_only_churn_is_bounded_inside_one_job() {
         let mut engine = Engine::new();
@@ -952,7 +971,14 @@ mod tests {
         engine.interp.gc_suppressed -= 1;
         engine.interp.gc_weak_metadata_safepoint(true);
         assert!(engine.interp.weak_refs[&(Gc::as_ptr(&reference) as usize)].is_none());
+        // Under GC stress a collection inside the loop finds targets dead while the registry
+        // is still live and enqueues its cleanup job, which keeps the registry alive and runs at
+        // the evaluation's own checkpoint: only the kept registry's final results are timing-free.
+        let stress = crate::gc_test::stress_active();
         for keep_owner in [false, true] {
+            if !keep_owner && stress {
+                continue;
+            }
             let mut engine = Engine::new();
             let source = format!(
                 r#"
@@ -965,10 +991,12 @@ mod tests {
                 if keep_owner { "registry=owner;" } else { "" }
             );
             eval(&mut engine, &source, "0");
-            assert_eq!(
-                !engine.interp.pending_finalization_cleanup.is_empty(),
-                keep_owner
-            );
+            if !stress {
+                assert_eq!(
+                    !engine.interp.pending_finalization_cleanup.is_empty(),
+                    keep_owner
+                );
+            }
             eval(&mut engine, "true", "true");
             eval(
                 &mut engine,
@@ -978,6 +1006,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_object_and_symbol_notify_separate_observer_heaps() {
         for symbol in [false, true] {
@@ -1025,6 +1057,10 @@ mod tests {
         assert!(second.interp.weak_refs[&(Gc::as_ptr(&other_owner) as usize)].is_none());
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_kept_target_and_owner_retirement_preserve_job_semantics() {
         let mut engine = Engine::new();
@@ -1035,7 +1071,7 @@ mod tests {
         drop(target);
         engine.interp.gc_collect_young(GcCause::Explicit);
         assert!(
-            weak.upgrade().is_some(),
+            crate::gc_test::alive(&weak),
             "same-job KeptAlive target was cleared"
         );
         engine.interp.clear_kept_objects();
@@ -1051,7 +1087,7 @@ mod tests {
             .weak_metadata
             .targets
             .contains_key(&other_weak.key()));
-        assert!(other_weak.upgrade().is_some());
+        assert!(crate::gc_test::alive(&other_weak));
     }
 
     #[test]

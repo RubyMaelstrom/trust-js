@@ -61,7 +61,7 @@ fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool
                 );
             }
             if native
-                && matches!(tier, Tier::Jit)
+                && matches!(tier.admitted(), Tier::Jit)
                 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
             {
                 assert!(
@@ -389,47 +389,50 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
             ),
             "true"
         );
-        let env = engine.interp.global_env.clone();
-        let value = engine
-            .interp
-            .get_var("named", &env)
-            .unwrap_or_else(|_| panic!("missing named function"));
-        let crate::value::Value::Obj(object) = value else {
-            panic!("missing function")
-        };
-        let weak = crate::value::Gc::downgrade(&object);
-        {
-            let borrowed = object.borrow();
-            let crate::value::Callable::User(user) = &borrowed.call else {
-                panic!("not a function")
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let env = engine.interp.global_env.clone();
+            let value = engine
+                .interp
+                .get_var("named", &env)
+                .unwrap_or_else(|_| panic!("missing named function"));
+            let crate::value::Value::Obj(object) = value else {
+                panic!("missing function")
             };
-            let closure = user.env.borrow();
-            let binding = closure
-                .vars
-                .get("self")
-                .expect("self binding exists at closure creation");
-            assert!(!binding.mutable && binding.initialized && !binding.strict_immutable);
-            assert!(
-                matches!(&binding.value, crate::value::Value::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
-            );
-            if !matches!(tier, Tier::Interp) {
+            let weak = crate::value::Gc::downgrade(&object);
+            {
+                let borrowed = object.borrow();
+                let crate::value::Callable::User(user) = &borrowed.call else {
+                    panic!("not a function")
+                };
+                let closure = user.env.borrow();
+                let binding = closure
+                    .vars
+                    .get("self")
+                    .expect("self binding exists at closure creation");
+                assert!(!binding.mutable && binding.initialized && !binding.strict_immutable);
                 assert!(
-                    !user
-                        .func
-                        .code
-                        .get()
-                        .and_then(Option::as_ref)
-                        .unwrap()
-                        .prepared_entry
+                    matches!(&binding.value, crate::value::Value::Obj(bound) if crate::value::Gc::ptr_eq(bound, &object))
                 );
+                if !matches!(tier, Tier::Interp) {
+                    assert!(
+                        !user
+                            .func
+                            .code
+                            .get()
+                            .and_then(Option::as_ref)
+                            .unwrap()
+                            .prepared_entry
+                    );
+                }
             }
-        }
-        drop(object);
+            weak
+        });
         evaluate(&mut engine, "named=null");
         // The function/prototype/self-environment cycle must not become a permanent root.
         engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "unreachable named function survived collection"
         );
     }
@@ -444,34 +447,39 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
         assert_eq!(evaluate(&mut engine,
             "var named=function unused(value){return value+1};[named.name,named.length,named(3)].join('|')"),
             "unused|1|4");
-        let env = engine.interp.global_env.clone();
-        let value = engine
-            .interp
-            .get_var("named", &env)
-            .unwrap_or_else(|_| panic!("named"));
-        let object = value.as_obj().unwrap();
-        let weak = crate::value::Gc::downgrade(object);
         let enabled = std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0");
-        {
-            let borrowed = object.borrow();
-            let crate::value::Callable::User(user) = &borrowed.call else {
-                panic!("user function")
-            };
-            assert_eq!(user.env.borrow().vars.get("unused").is_none(), enabled);
-            // Activation scans run after creation; their cache must not erase the self query.
-            user.func.scan_flags();
-            assert_eq!(user.func.needs_self_environment(), !enabled);
-        }
-        drop(value);
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let env = engine.interp.global_env.clone();
+            let value = engine
+                .interp
+                .get_var("named", &env)
+                .unwrap_or_else(|_| panic!("named"));
+            let object = value.as_obj().unwrap();
+            let weak = crate::value::Gc::downgrade(object);
+            {
+                let borrowed = object.borrow();
+                let crate::value::Callable::User(user) = &borrowed.call else {
+                    panic!("user function")
+                };
+                assert_eq!(user.env.borrow().vars.get("unused").is_none(), enabled);
+                // Activation scans run after creation; their cache must not erase the self query.
+                user.func.scan_flags();
+                assert_eq!(user.func.needs_self_environment(), !enabled);
+            }
+            weak
+        });
         evaluate(&mut engine, "named=null;");
-        if enabled {
+        // Without a cycle the last reference count releases it at once; a tracing heap
+        // (gc-heap) reclaims it at the next collection, checked below.
+        if enabled && !cfg!(feature = "gc-heap") {
             assert!(
-                weak.upgrade().is_none(),
+                !crate::gc_test::alive(&weak),
                 "unused self binding kept a cycle alive"
             );
         }
         engine.interp.gc_collect();
-        assert!(weak.upgrade().is_none());
+        assert!(!crate::gc_test::alive(&weak));
     }
 }
 

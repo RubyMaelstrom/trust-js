@@ -326,6 +326,10 @@ mod tests {
     use crate::{Completion, Engine};
     use std::rc::Rc;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn snapshot_target_index_preserves_requested_identities_and_ownership() {
         let live: Vec<_> = (0..128).map(|_| Object::new(None)).collect();
@@ -521,6 +525,10 @@ mod tests {
         assert!(!engine.interp.gc_can_skip_unpinned_slots(count));
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn gc_internal_slot_kinds_share_unpinned_owners_without_deduplicating_handles() {
         for budget in [0, EDGE_CACHE_BYTES] {
@@ -580,6 +588,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn gc_internal_slot_owner_outside_snapshot_stays_conservative() {
         for budget in [0, EDGE_CACHE_BYTES] {
@@ -616,6 +628,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn cached_and_uncached_collectors_agree_on_strong_and_weak_graphs() {
         for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -713,6 +729,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn cache_does_not_root_finalization_targets_or_truncate_ephemeron_chains() {
         for budget in [0, EDGE_CACHE_BYTES] {
@@ -747,6 +767,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn cache_records_identities_without_owners_and_falls_back_within_its_budget() {
         let object = Object::new(None);
@@ -772,6 +796,10 @@ mod tests {
         assert_eq!(Gc::strong_count(&object), count);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
+    )]
     #[test]
     fn zero_budget_never_retains_edges() {
         let object = Object::new(None);

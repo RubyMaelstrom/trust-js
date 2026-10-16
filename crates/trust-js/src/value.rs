@@ -476,6 +476,10 @@ mod packed_value_tests {
 
     /// The JIT backends read wide Values as (tag word, payload word) and a Bool as bit 0 of the
     /// payload word. Pin that representation.
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn wide_value_layout_is_tag_word_then_payload_word() {
         assert_eq!(std::mem::size_of::<Value>(), 16);
@@ -515,6 +519,10 @@ mod packed_value_tests {
         );
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
         for number in [
@@ -614,6 +622,10 @@ mod packed_value_tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
@@ -626,6 +638,10 @@ mod packed_value_tests {
         assert_eq!(Gc::strong_count(&obj), before);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
         for value in [
@@ -721,6 +737,10 @@ mod packed_value_tests {
         assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
@@ -2274,6 +2294,7 @@ fn new_cell_heap() -> (
 ) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
+    crate::interpreter::gc_collect::configure_heap(&mut core);
     let object_desc = core.register_desc(crate::gc_core::LayoutDesc {
         name: "object",
         trace: trace_object_cell,
@@ -2395,6 +2416,15 @@ impl crate::gc_trace::GcTrace for Object {
 }
 
 #[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for Props {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        for property in self.values() {
+            crate::gc_trace::GcTrace::trace_gc(property, sink);
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Property {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.with_object_edge(|object| sink.object(object));
@@ -2461,22 +2491,35 @@ pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
 /// other field (anything that might still read an object) has dropped. Finalizes every remaining
 /// object, clears weak handles into the heap and frees its memory.
 #[cfg(feature = "gc-heap")]
-pub(crate) struct HeapRelease(GcHeap);
+pub(crate) struct HeapRelease(Option<GcHeap>);
 
 #[cfg(feature = "gc-heap")]
 impl HeapRelease {
+    /// The heap's owner: the interpreter that collects it and releases it when dropped.
     pub(crate) fn new(heap: &GcHeap) -> Self {
-        Self(heap.clone())
+        Self(Some(heap.clone()))
+    }
+
+    /// A ShadowRealm interpreter's: the heap belongs to the root of its ShadowRealm tree.
+    pub(crate) fn shared() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn owns_heap(&self) -> bool {
+        self.0.is_some()
     }
 }
 
 #[cfg(feature = "gc-heap")]
 impl Drop for HeapRelease {
     fn drop(&mut self) {
-        let heap = &self.0;
+        let Some(heap) = &self.0 else {
+            return;
+        };
         {
             let core = heap.core.borrow();
-            crate::gc_handle::clear_dead_weak_cells(|ptr| core.resolve(ptr as u64).is_some());
+            let _ =
+                crate::gc_handle::clear_dead_weak_cells(|ptr| core.resolve(ptr as u64).is_some());
         }
         heap.core.borrow_mut().release_all();
     }
@@ -2948,6 +2991,10 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
 mod jit_heap_tests {
     use super::*;
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    )]
     #[test]
     fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
         // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
@@ -3107,6 +3154,8 @@ pub(crate) fn gc_major_due(heap: &GcHeap, nursery_floor: i64) -> bool {
 /// ECMA-262 #sec-agents and #sec-weakref-execution (snapshot e28783d5fc9d): there
 /// are no remaining execution contexts, and shutdown need not run finalizers.
 /// This is Agent teardown, never the destruction of one still-accessible child Realm.
+/// (gc-heap: `HeapRelease` finalizes and frees the cells instead.)
+#[cfg(not(feature = "gc-heap"))]
 pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
     // Pin both sets before removing any edge. This bounds native stack use even for
     // deep prototype/environment chains, and keeps all RefCells alive while their

@@ -240,7 +240,8 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // GetKeysIterator (keys() call + `next` get) precedes the [[SetData]] copy, so mutations
         // those getters make to the receiver are visible in the result.
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
-        let mut vals = set_values(i, &this)?;
+        // The result is rooted across the other set's `next` calls (I1).
+        let mut vals = crate::rooting::RootedVec::from_vec(set_values(i, &this)?);
         let mut result_index = crate::fasthash::FastMap::default();
         for (offset, value) in vals.iter().enumerate() {
             result_index
@@ -251,12 +252,13 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         while let Some(k) = set_like_next(i, &iter, &next)? {
             result_index_insert(&mut vals, &mut result_index, k);
         }
-        Ok(new_set(i, vals))
+        Ok(new_set(i, vals.into_vec()))
     });
     it.def_method(&sp, "intersection", 1, |i, this, a| {
         let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
-        let mut out = Vec::new();
+        // The result is rooted across the other set's `has`/`next` calls (I1).
+        let mut out = crate::rooting::RootedVec::new();
         let mut result_index = crate::fasthash::FastMap::default();
         if (coll_live_len(i, ptr) as f64) <= other_size {
             // Walk this Set LIVE, probing the other's `has` — the callback may delete
@@ -276,27 +278,28 @@ pub(super) fn install_set_methods(it: &mut Interp) {
                 }
             }
         }
-        Ok(new_set(i, out))
+        Ok(new_set(i, out.into_vec()))
     });
     it.def_method(&sp, "difference", 1, |i, this, a| {
         coll_ptr_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
-        let vals = set_values(i, &this)?;
+        // The snapshot and result are rooted across the other set's calls (I1).
+        let vals = crate::rooting::RootedVec::from_vec(set_values(i, &this)?);
         if (vals.len() as f64) <= other_size {
             // Iterate this Set, dropping elements the other's `has` reports.
-            let mut out = Vec::new();
-            for v in vals {
+            let mut out = crate::rooting::RootedVec::new();
+            for v in vals.iter().cloned() {
                 if !set_like_has(i, &has, &arg(a, 0), &v)? {
                     out.push(v);
                 }
             }
-            Ok(new_set(i, out))
+            Ok(new_set(i, out.into_vec()))
         } else {
             // Remove through the same collision-safe index as ordinary Sets, not one full result
             // scan per key. The result snapshot precedes GetIteratorFromMethod, per the standard.
             let mut result = OrderedCollection::with_capacity(CollectionKind::Set, vals.len());
-            for value in vals {
-                result.insert(value.clone(), value);
+            for value in vals.iter() {
+                result.insert(value.clone(), value.clone());
             }
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(key) = set_like_next(i, &iter, &next)? {
@@ -316,6 +319,11 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // the result (only in other). Removal empties the slot (order is preserved).
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         let mut result: Vec<Option<Value>> = set_values(i, &this)?.into_iter().map(Some).collect();
+        // Every value entering the result is rooted across the other set's `next` calls (I1).
+        let mut roots = crate::rooting::ValueRoots::new();
+        for value in result.iter().flatten() {
+            roots.keep(value);
+        }
         let mut result_index = crate::fasthash::FastMap::default();
         for (offset, value) in result.iter().enumerate() {
             if let Some(value) = value {
@@ -333,6 +341,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
                     option_result_index_remove(&mut result_index, &k, offset);
                 }
             } else if result_offset.is_none() {
+                roots.keep(&k);
                 option_result_index_insert(&mut result, &mut result_index, k);
             }
         }
@@ -660,7 +669,11 @@ pub(super) fn install_map_like(
             // hash, avoiding a separate bucket allocation per distinct key. Only appends occur,
             // so offsets stay valid and the vector still supplies first-encounter output order.
             let mut group_index: crate::fasthash::FastMap<u64, usize> = Default::default();
+            // The groups are Rust-heap state across callback calls (I1).
+            let mut roots = crate::rooting::ValueRoots::new();
             group_by(i, &arg(a, 0), &arg(a, 1), "Map.groupBy", |_i, key, el| {
+                roots.keep(&key);
+                roots.keep(&el);
                 let entry = group_index.entry(collection_key_hash(&key));
                 let head = match &entry {
                     Entry::Occupied(entry) => *entry.get(),

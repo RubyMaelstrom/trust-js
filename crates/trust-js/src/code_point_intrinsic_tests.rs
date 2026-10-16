@@ -76,6 +76,10 @@ fn code_point_indices_and_method_replacement_keep_coercion_order() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")

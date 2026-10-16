@@ -251,26 +251,26 @@ fn iterator_results_private_target_is_traced_and_collectable() {
     for budget in [0, usize::MAX] {
         let mut engine = Engine::new();
         eval(&mut engine, "var target=[{answer:42}];target.push(target);var iterator=target.values();target=null;");
-        let iterator = global(&mut engine, "iterator");
-        let target = {
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let target = crate::gc_test::in_frame(|| {
+            let iterator = global(&mut engine, "iterator");
             let object = iterator.as_obj().unwrap().borrow();
             let crate::value::Exotic::ArrayIterator(state) = &object.exotic else {
                 panic!("private iterator slots")
             };
             crate::value::Gc::downgrade(state.target.as_obj().unwrap())
-        };
+        });
         engine
             .interp
             .gc_collect_with_edge_budget(crate::value::GcCause::Explicit, budget);
-        assert!(target.upgrade().is_some());
+        assert!(crate::gc_test::alive(&target));
         assert_eq!(eval(&mut engine, "iterator.next().value.answer"), "42");
         eval(&mut engine, "iterator=null;");
-        drop(iterator);
         engine
             .interp
             .gc_collect_with_edge_budget(crate::value::GcCause::Explicit, budget);
         assert!(
-            target.upgrade().is_none(),
+            !crate::gc_test::alive(&target),
             "unreachable cycle retained, budget={budget}"
         );
     }

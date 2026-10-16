@@ -103,6 +103,13 @@ comment/example in the same change.
 - `TRUST_JS_GC_LOG=1` logs collections; `TRUST_JS_GC_DUMP=1` dumps external-root shapes
   (bounded by `TRUST_JS_GC_DUMP_MIN_OBJECTS`/`TRUST_JS_GC_DUMP_ROOT_LIMIT`), and
   `TRUST_JS_GC_RETAINING_PATHS=1` adds retaining paths.
+- With the `gc-heap` feature (P1): `TRUST_JS_GC_STRESS=N` collects at the first safepoint
+  after every N cell allocations and polls at every call (N=1 finds unrooted values; run
+  each test in its own process, since a use-after-free can take down the whole run).
+  `TRUST_JS_GC_WHY=1` records why each cell was marked; tests print the path with
+  `gc_test::why`/`why_address` (a stack root names its frame's return address, for
+  `addr2line`, and its depth below that frame's record). In test builds,
+  `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.
 - On GNU/Linux, `TRUST_JS_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

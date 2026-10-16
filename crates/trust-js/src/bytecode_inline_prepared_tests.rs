@@ -126,7 +126,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
             "9:8:8:99|1|coerce,finally",
             "{tier:?}"
         );
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             let code = chunk
                 .jit
                 .get()

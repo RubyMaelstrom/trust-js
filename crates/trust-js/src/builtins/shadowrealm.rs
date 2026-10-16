@@ -20,7 +20,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         // The realm lives in a pointer-keyed internal-slot table. Pin the owner against allocator
         // address reuse; the cycle collector evicts the Box before releasing the pin.
         i.gc_pin(&obj);
-        let realm = Interp::new_with_symbol_agent(i.symbol_agent.clone());
+        let realm = Interp::new_shadow(i);
         i.shadow_realms.insert(p, Box::new(realm));
         // Constructing the isolated implementation heap activates it while its intrinsics are
         // allocated. The constructor itself continues in the caller's surrounding Agent.

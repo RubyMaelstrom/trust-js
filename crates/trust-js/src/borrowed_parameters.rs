@@ -128,11 +128,35 @@ impl Drop for Scope<'_> {
     }
 }
 
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for Registry {
+    /// Aliased homes' environments; the aliased slots belong to registered VM frames.
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        for alias in self
+            .0
+            .try_borrow()
+            .expect("borrowed parameter registry mutably borrowed at a safepoint (I9)")
+            .iter()
+        {
+            let Alias {
+                environment,
+                name: _,
+                slot: _,
+            } = alias;
+            sink.env(environment);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interpreter::{new_scope, Binding};
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn transferred_owners_and_binding_attributes_restore_on_unwind() {
         let environment = new_scope(None);

@@ -375,39 +375,46 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         assert_eq!(paths()[2], 2);
         assert_eq!(paths()[3], 1);
     }
-    let child = Object::new(None);
-    child
-        .borrow_mut()
-        .props
-        .insert("value", Property::plain(Value::Num(29.0)));
-    let weak_child = Gc::downgrade(&child);
-    let owner = Object::new(None);
-    owner
-        .borrow_mut()
-        .props
-        .insert("value", Property::plain(Value::Obj(child)));
-    let weak_owner = Gc::downgrade(&owner);
-    let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
-    let returned = engine
-        .interp
-        .read_prepared_reference(&mut reference)
-        .ok()
-        .unwrap();
+    // Strong handles live only in helper frames (gc-heap scans the stack): the outer frame
+    // holds the returned value, the inner one the reference.
+    let weak_child = crate::gc_test::in_frame(|| {
+        let (weak_owner, weak_child, returned) = crate::gc_test::in_frame(|| {
+            let child = Object::new(None);
+            child
+                .borrow_mut()
+                .props
+                .insert("value", Property::plain(Value::Num(29.0)));
+            let weak_child = Gc::downgrade(&child);
+            let owner = Object::new(None);
+            owner
+                .borrow_mut()
+                .props
+                .insert("value", Property::plain(Value::Obj(child)));
+            let weak_owner = Gc::downgrade(&owner);
+            let mut reference = PreparedReference::object(Rc::from("value"), owner, false);
+            let returned = engine
+                .interp
+                .read_prepared_reference(&mut reference)
+                .ok()
+                .unwrap();
+            engine.interp.gc_collect();
+            assert!(
+                crate::gc_test::alive(&weak_owner),
+                "saved base is a strong external owner"
+            );
+            (weak_owner, weak_child, returned)
+        });
+        engine.interp.gc_collect();
+        assert!(!crate::gc_test::alive(&weak_owner));
+        assert!(
+            crate::gc_test::alive(&weak_child),
+            "returned Value owns the last child"
+        );
+        drop(returned);
+        weak_child
+    });
     engine.interp.gc_collect();
-    assert!(
-        weak_owner.upgrade().is_some(),
-        "saved base is a strong external owner"
-    );
-    drop(reference);
-    engine.interp.gc_collect();
-    assert!(weak_owner.upgrade().is_none());
-    assert!(
-        weak_child.upgrade().is_some(),
-        "returned Value owns the last child"
-    );
-    drop(returned);
-    engine.interp.gc_collect();
-    assert!(weak_child.upgrade().is_none());
+    assert!(!crate::gc_test::alive(&weak_child));
 }
 
 #[test]

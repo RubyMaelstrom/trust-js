@@ -29,6 +29,10 @@ fn owned_value(engine: &mut Engine, source: &str) -> Value {
         .expect("evaluate")
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: no edges between Agent heaps (I6); objects shared across Engines are out of contract"
+)]
 #[test]
 #[cfg(feature = "embed")]
 fn for_in_cache_distinguishes_foreign_heaps_and_mixed_prototypes() {
@@ -113,33 +117,39 @@ fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Valu
 #[test]
 fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     let mut engine = Engine::new();
-    let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
-    let weak_layout = Rc::downgrade(&layout);
-    let a = predicted_object(&layout, 1);
-    let b = predicted_object(&layout, 2);
-    let weak_a = crate::value::Gc::downgrade(a.as_obj().unwrap());
-    let first = backing(&mut engine, &a);
-    let second = backing(&mut engine, &b);
-    assert_eq!(key_at(&first, 0), "a");
-    assert_eq!(key_at(&second, 1), "b");
+    // Receivers live only in this helper frame (gc-heap scans the stack).
+    let (weak_layout, weak_a, first, second) = crate::gc_test::in_frame(|| {
+        let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
+        let weak_layout = Rc::downgrade(&layout);
+        let a = predicted_object(&layout, 1);
+        let b = predicted_object(&layout, 2);
+        let weak_a = crate::value::Gc::downgrade(a.as_obj().unwrap());
+        let first = backing(&mut engine, &a);
+        let second = backing(&mut engine, &b);
+        assert_eq!(key_at(&first, 0), "a");
+        assert_eq!(key_at(&second, 1), "b");
+        assert!(
+            !crate::value::Gc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
+            "live prefix participates in proof"
+        );
+        let references = Rc::strong_count(&layout);
+        for _ in 0..10 {
+            backing(&mut engine, &a);
+            backing(&mut engine, &b); // leave stale recency entries for both pinned layouts.
+        }
+        assert_eq!(
+            Rc::strong_count(&layout),
+            references,
+            "recency keys must not retain layout pins"
+        );
+        (weak_layout, weak_a, first, second)
+    });
+    // A tracing heap (gc-heap) reclaims the dropped receivers at a collection.
+    engine.interp.gc_collect();
     assert!(
-        !crate::value::Gc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
-        "live prefix participates in proof"
+        !crate::gc_test::alive(&weak_a),
+        "cache does not root receiver"
     );
-    let references = Rc::strong_count(&layout);
-    for _ in 0..10 {
-        backing(&mut engine, &a);
-        backing(&mut engine, &b); // leave stale recency entries for both pinned layouts.
-    }
-    assert_eq!(
-        Rc::strong_count(&layout),
-        references,
-        "recency keys must not retain layout pins"
-    );
-    drop(a);
-    drop(b);
-    drop(layout);
-    assert!(weak_a.upgrade().is_none(), "cache does not root receiver");
     assert!(
         weak_layout.upgrade().is_some(),
         "live cache entries own layout proof"
@@ -214,42 +224,46 @@ fn key_at(backing: &Value, index: u32) -> String {
 fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
     let mut engine = Engine::new();
     engine.interp.activate_gc_heap();
-    let prototype = Object::new(None);
-    prototype
-        .borrow_mut()
-        .props
-        .insert("inherited", Property::plain(Value::Num(1.0)));
-    let object = Object::new(Some(prototype.clone()));
-    object
-        .borrow_mut()
-        .props
-        .insert("own", Property::plain(Value::Num(2.0)));
-    let weak_object = crate::value::Gc::downgrade(&object);
-    let weak_proto = crate::value::Gc::downgrade(&prototype);
-    let source = Value::Obj(object);
-    let keys = backing(&mut engine, &source);
-    let allocated = heap_allocated_objects(&engine.interp.gc_heap);
-    for _ in 0..1000 {
-        let next = backing(&mut engine, &source);
-        assert!(crate::value::Gc::ptr_eq(
-            keys.as_obj().unwrap(),
-            next.as_obj().unwrap()
-        ));
-    }
-    assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
-    {
-        let object = keys.as_obj().unwrap().borrow();
-        assert!(object.proto.is_none());
-        assert!(!object.extensible);
-        for index in 0..2 {
-            let property = object.props.get_index(index).unwrap();
-            assert!(!property.writable() && !property.configurable());
+    // Sources live only in this helper frame (gc-heap scans the stack).
+    let (weak_object, weak_proto, keys) = crate::gc_test::in_frame(|| {
+        let prototype = Object::new(None);
+        prototype
+            .borrow_mut()
+            .props
+            .insert("inherited", Property::plain(Value::Num(1.0)));
+        let object = Object::new(Some(prototype.clone()));
+        object
+            .borrow_mut()
+            .props
+            .insert("own", Property::plain(Value::Num(2.0)));
+        let weak_object = crate::value::Gc::downgrade(&object);
+        let weak_proto = crate::value::Gc::downgrade(&prototype);
+        let source = Value::Obj(object);
+        let keys = backing(&mut engine, &source);
+        let allocated = heap_allocated_objects(&engine.interp.gc_heap);
+        for _ in 0..1000 {
+            let next = backing(&mut engine, &source);
+            assert!(crate::value::Gc::ptr_eq(
+                keys.as_obj().unwrap(),
+                next.as_obj().unwrap()
+            ));
         }
-    }
-    drop(source);
-    drop(prototype);
-    assert!(weak_object.upgrade().is_none());
-    assert!(weak_proto.upgrade().is_none());
+        assert_eq!(heap_allocated_objects(&engine.interp.gc_heap), allocated);
+        {
+            let object = keys.as_obj().unwrap().borrow();
+            assert!(object.proto.is_none());
+            assert!(!object.extensible);
+            for index in 0..2 {
+                let property = object.props.get_index(index).unwrap();
+                assert!(!property.writable() && !property.configurable());
+            }
+        }
+        (weak_object, weak_proto, keys)
+    });
+    // A tracing heap (gc-heap) reclaims the dropped sources at a collection.
+    engine.interp.gc_collect();
+    assert!(!crate::gc_test::alive(&weak_object));
+    assert!(!crate::gc_test::alive(&weak_proto));
     engine.interp.gc_collect();
     assert_eq!(key_at(&keys, 0), "own");
 }

@@ -16,7 +16,7 @@ fn check_all_tiers(source: &str, native_functions: &[&str]) {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
         }
-        if tier == Tier::Jit
+        if tier.admitted() == Tier::Jit
             && cfg!(all(
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(

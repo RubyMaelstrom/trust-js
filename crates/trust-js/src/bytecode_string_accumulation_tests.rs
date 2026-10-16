@@ -288,7 +288,7 @@ fn actual_react_push_callback_commits_vm_and_native_transactions() {
         if tier == Tier::Bytecode {
             assert!(TEST_VM_HITS.with(Cell::get) > vm);
         }
-        if tier == Tier::Jit
+        if tier.admitted() == Tier::Jit
             && cfg!(all(
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(
@@ -314,6 +314,10 @@ fn actual_react_push_callback_commits_vm_and_native_transactions() {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn opstat_diagnostic_retains_original_checked_operation_observations() {
     if std::env::var_os("TRUST_JS_STRING_ACCUMULATION_OPSTAT_CHILD").is_none() {
@@ -405,7 +409,7 @@ fn accumulation_success_and_observer_fallback_preserve_live_numeric_locals() {
         engine.set_tier_threshold(0);
         let hits = TEST_NATIVE_HITS.with(Cell::get);
         assert_eq!(eval(&mut engine, source), expected, "{tier:?}");
-        if tier == Tier::Jit
+        if tier.admitted() == Tier::Jit
             && cfg!(all(
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(
@@ -622,6 +626,10 @@ fn every_original_vm_interior_stop_exposes_ordinary_state_before_commit() {
     assert_eq!(result(&holder).as_engine_text().unwrap(), "AB");
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     let mut engine = Engine::new();
@@ -690,6 +698,10 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix() {
     for interior in 1..=4 {
@@ -738,6 +750,10 @@ fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield() {
     let mut engine = Engine::new();
@@ -799,6 +815,10 @@ fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield()
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn actual_checked_numeric_chain_h_exec_replay_commits_string_transaction() {
     if std::env::var_os("TRUST_JS_STRING_ACCUMULATION_REPLAY_CHILD").is_none() {

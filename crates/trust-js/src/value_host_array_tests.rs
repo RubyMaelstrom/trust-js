@@ -3,6 +3,10 @@
 use super::*;
 use crate::{bytecode::Tier, Completion, Engine};
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+)]
 #[test]
 fn host_arrays_move_owners_and_preserve_descriptors_at_storage_boundaries() {
     let engine = Engine::new();

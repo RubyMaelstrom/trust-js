@@ -303,6 +303,10 @@ fn has_native_code(function: &crate::ast::Function) -> bool {
 /// A static snapshot's run-once bootstrap function (`Function::run_once`) runs once per Realm,
 /// so its bytecode stays on the VM: it never gets native code. The functions it defines keep
 /// their tiering, and so does the same source when it is parsed.
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+)]
 #[test]
 fn run_once_bootstrap_functions_never_get_native_code() {
     const SOURCE: &str = r#"(function () {

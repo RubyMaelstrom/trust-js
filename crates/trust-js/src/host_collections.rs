@@ -287,14 +287,16 @@ mod tests {
     #[test]
     fn live_collections53_state_and_getters_are_traced_without_pinning_cycles() {
         let mut engine = setup(Tier::Jit);
-        let target = value(&mut engine, "liveCollection");
-        let pointer = Gc::as_ptr(target.as_obj().unwrap()) as usize;
+        // The target lives only in this helper frame (gc-heap scans the stack).
+        let pointer = crate::gc_test::in_frame(|| {
+            let target = value(&mut engine, "liveCollection");
+            crate::gc_test::HiddenAddress::of(&target)
+        });
         run(
             &mut engine,
             "collectionState.owner=liveCollection;collectionState=null;liveCollection=null",
         );
-        drop(target);
         engine.ctx().collect_garbage_for_host();
-        assert!(!engine.ctx().host_indexed.contains_key(&pointer));
+        assert!(!pointer.in_map(&engine.ctx().host_indexed));
     }
 }

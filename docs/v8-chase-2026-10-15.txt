@@ -578,3 +578,97 @@ exhaustively (gc_trace.rs GcTrace), so a new field or variant does not
 compile until classified. Default suite unchanged (2149/0/3); clippy clean
 on both feature sets. gc-heap suite 1747/435/8: the 9 newly failing tests
 assert refcount-timed environment releases (expected until collection).
+
+Step 3c, collection at safepoints (gc-heap): the heap collects. Entry points
+are the interpreter's safepoints — gc_check (live objects over the old
+policy's gc_next threshold, the cell heap's byte budget of max(64 MiB,
+2x live), a stress interval or a deferred request), task boundaries,
+buffer pressure and explicit requests; allocation never collects.
+- Marking (gc_collect.rs). Interp::trace_gc_roots destructures Interp
+  exhaustively: each of the 169 fields is a root, an owner-conditional
+  side slot, a Realm-group member, an ephemeron, weak, or value-free, and
+  a new field does not compile until classified. The heap's MarkClient
+  reports roots (interpreter fields; registered VM frames, running
+  coroutines and rooted buffers; host roots and native-graph roots), side
+  slots traced once their owner is marked (the 12 owner-keyed tables,
+  generator continuations, native-graph JS owners, and Realm groups: a
+  Realm is not a root, any marked member activates its whole group and
+  its template cache), and ephemerons (WeakMap/WeakSet entries, symbol
+  keys conservatively; the [[Realm]] edge of built-ins; host edges).
+- Two-phase collection: mark, then the engine evicts the dead from its
+  tables (the shared gc_sweep_dead_objects over dead_cells) while every
+  cell is intact and new cells are allocated marked (gc_core: allocate
+  black between the phases), weak handles are cleared (a dead cell a weak
+  handle still names stays reserved, finalized, until the handle goes:
+  inline-cache address compares stay ABA-safe), and finish frees.
+- ShadowRealm interpreters share their parent's heap (one heap per Agent,
+  I6: no edge crosses heaps). Only the root of the ShadowRealm tree
+  collects, over the whole tree; a child never releases or detaches the
+  shared heap.
+- I1 rooting. drive_vm registers its frame state (slots, operand stack,
+  references, class and disposal state, environments) for the call;
+  Interp::call, construct, dispatch_native and the native fast path root
+  their argument slices; a native invocation roots its captures. Rust-heap
+  value containers live across a safepoint use rooting.rs: RootedVec
+  (growable), root_slice (borrowed), Rooted<T> (any GcTrace state) and
+  ValueRoots (values kept beside an opaque structure); all are plain
+  buffers without gc-heap. Applied to argument evaluation, spread, rest,
+  tail calls, groupBy, Iterator.zip/concat/toArray/chunks/windows, class
+  definitions and decorators (both tiers), sort/toSorted/toReversed/with/
+  toSpliced/flat, Set methods, Object.values/defineProperties, RegExp
+  match/replace/split, Reflect.apply/construct, TypedArray.from, wrapped
+  ShadowRealm calls, timers and Intl formatToParts. Found by GC stress
+  (every lib test run in its own process with TRUST_JS_GC_STRESS=1:
+  spread, Iterator.zip, toArray/chunks, and class decorators crashed or
+  failed the heap verifier) and by a source audit of value buffers built
+  across calls into JavaScript.
+- Stack hygiene. Conservative false retention was dominated by stale cell
+  addresses in reused stack memory, including the collector's own: its
+  setup enumerated every Realm member and host value in frames the marker
+  then reused, and its sweep handled dead addresses that later matched
+  new cells. The client is built out of line and the stack scrubbed
+  before marking; marking and sweeping are sibling calls; explicit
+  collections and embedder entries (script evaluation, microtask
+  checkpoints) scrub below themselves on entry and exit (1 MiB debug,
+  128 KiB release). The scrub is inlined into its caller and zeroes from
+  a frameless asm leaf: a scrubbing frame of its own left its unwritten
+  slots stale, and the collector's next frame inherited a dead cell's
+  address from one of them (six collectability tests failed once an
+  unrelated edit moved the collector's frame layout). Retention diagnostics: TRUST_JS_GC_WHY=1 records why
+  each cell was marked (root, stack word with its owning frame, cell,
+  side slot, conditional edge).
+- Stack growth on execution paths goes through gc_core::grow (registered
+  segments); a thread registers its whole stack when it creates an
+  interpreter.
+- Test triage under gc-heap: JIT test modules are gated off (the JIT is
+  refused until S5) and tier-looping tests assert JIT facts only for an
+  admitted JIT; tests observing reference counts, refcount release timing,
+  eager death notification, the refcount collector or its nursery,
+  cross-Agent object edges, the HostGc omission fallback or handles that
+  outlive their Agent are ignored with that reason; collectability tests
+  keep strong handles and cell addresses out of the test frame
+  (gc_test::in_frame / alive / HiddenAddress), since the stack scan
+  retains whatever a frame still holds. Test builds also zero a thread's
+  stack when it exits: libtest runs each test on a new thread, glibc
+  hands it a cached stack with the previous test's words in slots not yet
+  written, and a new heap whose pages land at the old heap's addresses
+  took them for roots (an intermittent WeakSet collectability failure).
+- GC stress over the suite: every lib test in its own process with
+  TRUST_JS_GC_STRESS=1 (a collection at every safepoint; debug build, so
+  the heap verifier and freed-cell poisoning run at each). Tests asserting
+  when collections or cleanup jobs happen skip those assertions under
+  stress (gc_test::stress_active). Tests of deep recursion, long chains
+  and allocation loops exceed the 15-minute limit at interval 1 (each
+  collection rescans the whole stack and heap) and run at interval 100,
+  the three heaviest at 1000. Stress found one engine bug here: a stress
+  or byte-budget collection reset the live-object threshold to the limit,
+  so the handler of the limit's RangeError threw again at its first
+  safepoint; only a threshold collection now enforces the limit or
+  re-arms the threshold, and collections keep the handler's headroom.
+Results: gc-heap lib suite 1825 passed / 0 failed / 114 ignored (six
+consecutive runs clean). Default suite unchanged (2149/0/3). Stress,
+each of the 1939 lib tests in its own process: 1806 pass at interval 1,
+the 19 slow ones at interval 100 (16) or 1000 (3), 114 are the suite's
+gc-heap ignores; none fail. gc_core unit tests cover allocate-black and
+stack scrubbing (debug, and release with fat LTO). Clippy clean on both
+feature sets; the workspace and its tests build.

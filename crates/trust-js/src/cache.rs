@@ -370,6 +370,12 @@ where
         (self.entries.len(), self.bytes)
     }
 
+    /// The cached values, in no particular order.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.values().map(|entry| &entry.value)
+    }
+
     /// Visit live values and report storage owned by the table and recency queue. HashMap bucket
     /// capacity is not exposed by std, so the entry portion is a review-visible lower bound.
     pub(crate) fn scan_retained_memory(&self, mut visit: impl FnMut(&V)) -> (usize, bool) {

@@ -150,12 +150,12 @@ pub(super) extern "C" fn record_local_array_legacy_get() {
 }
 
 /// Register regions entered so far on this thread (tests only).
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn executed_regions() -> u64 {
     EXECUTED_REGIONS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn local_array_hits() -> [u64; 5] {
     LOCAL_ARRAY_HITS.with(std::cell::Cell::get)
 }
@@ -179,7 +179,7 @@ extern "C" fn record_tdz_array_pair_slot() {
     record_tdz_array_pair_hit(1);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn tdz_array_pair_hits() -> [u64; 2] {
     TDZ_ARRAY_PAIR_HITS.with(std::cell::Cell::get)
 }
@@ -193,7 +193,7 @@ extern "C" fn record_tdz_effect_path(kind: usize) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn tdz_effect_paths() -> [u64; 5] {
     TDZ_EFFECT_PATHS.with(std::cell::Cell::get)
 }
@@ -235,7 +235,7 @@ extern "C" fn record_independent_effect_live_home(kind: usize) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(super) fn independent_effect_live_home_paths() -> [u64; 2] {
     INDEPENDENT_EFFECT_LIVE_HOMES.with(std::cell::Cell::get)
 }
@@ -4090,31 +4090,31 @@ fn emit_effect(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_region_predicate_tests.rs"]
 mod predicate_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_native_operations_tests.rs"]
 mod native_operations_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_region_result_tests.rs"]
 mod result_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_region_scalar_tests.rs"]
 mod scalar_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_region_edge_tests.rs"]
 mod edge_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 #[path = "jit_region_effect_tests.rs"]
 mod effect_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "gc-heap")))]
 mod tests {
     use super::*;
 

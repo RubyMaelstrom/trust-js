@@ -120,6 +120,10 @@ fn invoke(
     (values, ctx.error.take())
 }
 
+#[cfg_attr(
+    feature = "gc-heap",
+    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+)]
 #[test]
 fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
     let mut engine = Engine::new();
@@ -164,12 +168,12 @@ fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
                 _ => assert!(engine.interp.strict_equals(value, actual)),
             }
             assert_eq!(
-                weak.upgrade().is_some(),
+                crate::gc_test::alive(&weak),
                 matches!(op, Op::GetMethodElem),
                 "only a method Reference retains its consumed receiver"
             );
             drop(result);
-            assert!(weak.upgrade().is_none());
+            assert!(!crate::gc_test::alive(&weak));
         }
     }
 }
@@ -264,7 +268,7 @@ fn all_tiers(source: &str, expected: &str, required_shapes: &[usize], continuati
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if tier == Tier::Jit {
+        if tier.admitted() == Tier::Jit {
             let counts = TEST_JIT_GET_ELEM_HELPERS.with(std::cell::Cell::get);
             for &shape in required_shapes {
                 assert!(

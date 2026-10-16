@@ -50,7 +50,7 @@ fn setup(tier: Tier) -> Engine {
 }
 
 fn assert_native_hit(tier: Tier, forwarded: bool, before: usize) {
-    if tier == Tier::Jit
+    if tier.admitted() == Tier::Jit
         && cfg!(all(
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(
@@ -146,11 +146,13 @@ fn constructor_transfer_sole_object_owner_survives_gc_then_releases() {
                 &format!("var retained={maker}({{marker:71}}, Symbol('retained'));"),
             );
             let env = engine.interp.global_env.clone();
-            let retained = engine.interp.get_var("retained", &env).ok().unwrap();
-            let object = retained.as_obj().unwrap();
-            let payload = object.borrow().props.get("value").unwrap().value();
-            let weak = Gc::downgrade(payload.as_obj().unwrap());
-            drop(payload);
+            // Strong handles live only in this helper frame (gc-heap scans the stack).
+            let weak = crate::gc_test::in_frame(|| {
+                let retained = engine.interp.get_var("retained", &env).ok().unwrap();
+                let object = retained.as_obj().unwrap();
+                let payload = object.borrow().props.get("value").unwrap().value();
+                Gc::downgrade(payload.as_obj().unwrap())
+            });
             engine.interp.gc_collect();
             assert_eq!(
                 eval(
@@ -160,10 +162,9 @@ fn constructor_transfer_sole_object_owner_survives_gc_then_releases() {
                 "71|Symbol(retained)"
             );
             eval(&mut engine, "retained=null;");
-            drop(retained);
             engine.interp.gc_collect();
             assert!(
-                weak.upgrade().is_none(),
+                !crate::gc_test::alive(&weak),
                 "{tier:?}, {maker}: no stale argument owner"
             );
         }

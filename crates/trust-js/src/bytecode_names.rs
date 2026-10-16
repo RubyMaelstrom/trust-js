@@ -564,74 +564,78 @@ mod tests {
     #[test]
     fn deep_names_reuse_fresh_layouts_but_read_live_cells_and_links() {
         let (mut engine, chunk, name, cache) = reader();
-        let layouts = [
-            new_binding_layout_id(),
-            new_binding_layout_id(),
-            new_binding_layout_id(),
-        ];
-        let holder = scope(None, "outer", 11.0, layouts[0]);
-        let middle = scope(Some(holder.clone()), "middle", 0.0, layouts[1]);
-        let first = scope(Some(middle), "local", 0.0, layouts[2]);
-        assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &first, name, cache),
-            Ok(Value::Num(11.0))
-        ));
-        assert_eq!(chunk.name_caches[cache as usize].get().env, DEEP_NAME_IC);
-        // Every scope is fresh, including the holder. Matching layout never reuses old values.
-        let holder2 = scope(None, "outer", 29.0, layouts[0]);
-        let middle2 = scope(Some(holder2.clone()), "middle", 0.0, layouts[1]);
-        let second = scope(Some(middle2.clone()), "local", 0.0, layouts[2]);
-        assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &second, cache),
-            Some(Value::Num(29.0))
-        ));
-        assert!(chunk
-            .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(37.0))
-            .is_ok());
-        assert!(matches!(
-            holder2.borrow().vars.get("outer").unwrap().value,
-            Value::Num(37.0)
-        ));
-        assert!(matches!(
-            holder.borrow().vars.get("outer").unwrap().value,
-            Value::Num(11.0)
-        ));
-        holder2
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .initialized = false;
-        assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
-        holder2
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .initialized = true;
-        holder2.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
-        holder2
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .strict_immutable = true;
-        assert!(chunk
-            .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.0))
-            .is_err());
-        middle2
-            .borrow_mut()
-            .vars
-            .insert("outer", Binding::data(Value::Num(43.0), true, true));
-        assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
-        assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &second, name, cache),
-            Ok(Value::Num(43.0))
-        ));
-        let weak = Env::downgrade(&first);
-        drop(first);
+        // Scopes live only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let layouts = [
+                new_binding_layout_id(),
+                new_binding_layout_id(),
+                new_binding_layout_id(),
+            ];
+            let holder = scope(None, "outer", 11.0, layouts[0]);
+            let middle = scope(Some(holder.clone()), "middle", 0.0, layouts[1]);
+            let first = scope(Some(middle), "local", 0.0, layouts[2]);
+            assert!(matches!(
+                chunk.load_name_ic(&mut engine.interp, &first, name, cache),
+                Ok(Value::Num(11.0))
+            ));
+            assert_eq!(chunk.name_caches[cache as usize].get().env, DEEP_NAME_IC);
+            // Every scope is fresh, including the holder. Matching layout never reuses old values.
+            let holder2 = scope(None, "outer", 29.0, layouts[0]);
+            let middle2 = scope(Some(holder2.clone()), "middle", 0.0, layouts[1]);
+            let second = scope(Some(middle2.clone()), "local", 0.0, layouts[2]);
+            assert!(matches!(
+                chunk.name_ic_hit(&engine.interp, &second, cache),
+                Some(Value::Num(29.0))
+            ));
+            assert!(chunk
+                .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(37.0))
+                .is_ok());
+            assert!(matches!(
+                holder2.borrow().vars.get("outer").unwrap().value,
+                Value::Num(37.0)
+            ));
+            assert!(matches!(
+                holder.borrow().vars.get("outer").unwrap().value,
+                Value::Num(11.0)
+            ));
+            holder2
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .initialized = false;
+            assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
+            holder2
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .initialized = true;
+            holder2.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
+            holder2
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .strict_immutable = true;
+            assert!(chunk
+                .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(99.0))
+                .is_err());
+            middle2
+                .borrow_mut()
+                .vars
+                .insert("outer", Binding::data(Value::Num(43.0), true, true));
+            assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
+            assert!(matches!(
+                chunk.load_name_ic(&mut engine.interp, &second, name, cache),
+                Ok(Value::Num(43.0))
+            ));
+            Env::downgrade(&first)
+        });
+        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "cache must not retain environments"
         );
     }
@@ -720,47 +724,51 @@ mod tests {
     #[test]
     fn resolution_cache_captures_tdz_const_and_fresh_layouts_without_reading() {
         let (mut engine, chunk, name, _) = reader();
-        let layout = new_binding_layout_id();
-        let holder = scope(None, "outer", 5.0, layout);
-        holder
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .initialized = false;
-        let mut reference = chunk
-            .resolve_name_reference(&mut engine.interp, &holder, name)
-            .ok()
-            .unwrap();
-        assert!(engine
-            .interp
-            .read_prepared_reference(&mut reference)
-            .is_err());
-        drop(reference); // Release the explicitly captured strong owner before testing cache pins.
-        let fresh = scope(None, "outer", 31.0, layout);
-        let mut reference = chunk
-            .resolve_name_reference(&mut engine.interp, &fresh, name)
-            .ok()
-            .unwrap();
-        assert!(matches!(
-            engine.interp.read_prepared_reference(&mut reference),
-            Ok(Value::Num(31.0))
-        ));
-        fresh.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
-        fresh
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .strict_immutable = true;
-        assert!(engine
-            .interp
-            .write_prepared_reference(&mut reference, Value::Num(37.0))
-            .is_err());
-        let weak = Env::downgrade(&holder);
-        drop(holder);
+        // Scopes live only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let layout = new_binding_layout_id();
+            let holder = scope(None, "outer", 5.0, layout);
+            holder
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .initialized = false;
+            let mut reference = chunk
+                .resolve_name_reference(&mut engine.interp, &holder, name)
+                .ok()
+                .unwrap();
+            assert!(engine
+                .interp
+                .read_prepared_reference(&mut reference)
+                .is_err());
+            drop(reference); // Release the explicitly captured strong owner before testing cache pins.
+            let fresh = scope(None, "outer", 31.0, layout);
+            let mut reference = chunk
+                .resolve_name_reference(&mut engine.interp, &fresh, name)
+                .ok()
+                .unwrap();
+            assert!(matches!(
+                engine.interp.read_prepared_reference(&mut reference),
+                Ok(Value::Num(31.0))
+            ));
+            fresh.borrow_mut().vars.get_mut("outer").unwrap().mutable = false;
+            fresh
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .strict_immutable = true;
+            assert!(engine
+                .interp
+                .write_prepared_reference(&mut reference, Value::Num(37.0))
+                .is_err());
+            Env::downgrade(&holder)
+        });
+        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "resolution caches hold weak scope pins only"
         );
     }

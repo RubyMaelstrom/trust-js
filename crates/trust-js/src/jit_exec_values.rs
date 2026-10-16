@@ -719,6 +719,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn native_owner_clone_drop_all_kinds_and_last_owner_fallback() {
         let mut interp = crate::interpreter::Interp::new();
@@ -806,6 +810,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn native_owner_clone_roots_cycles_until_last_execution_owner_is_released() {
         let mut interp = crate::interpreter::Interp::new();

@@ -334,20 +334,24 @@ mod binding_layout_cache_tests {
             env.borrow_mut().vars.publish_layout(layout);
             env
         };
-        let first = make(17.);
-        let second = make(29.);
-        for (env, expected) in [(&first, 17.), (&second, 29.)] {
-            assert!(
-                matches!(chunk.load_name_ic(&mut engine.interp, env, name, cache),
-                Ok(Value::Num(value)) if value==expected)
-            );
-        }
-        assert_eq!(chunk.name_caches[cache as usize].get().env, FIXED_NAME_IC);
-        assert!(chunk.name_pins.borrow()[cache as usize].is_none());
-        let weak = Env::downgrade(&first);
-        drop(first);
+        // The first activation lives only in this helper frame (gc-heap scans the stack).
+        let (second, weak) = crate::gc_test::in_frame(|| {
+            let first = make(17.);
+            let second = make(29.);
+            for (env, expected) in [(&first, 17.), (&second, 29.)] {
+                assert!(
+                    matches!(chunk.load_name_ic(&mut engine.interp, env, name, cache),
+                    Ok(Value::Num(value)) if value==expected)
+                );
+            }
+            assert_eq!(chunk.name_caches[cache as usize].get().env, FIXED_NAME_IC);
+            assert!(chunk.name_pins.borrow()[cache as usize].is_none());
+            (second, Env::downgrade(&first))
+        });
+        // A tracing heap (gc-heap) reclaims the activation at a collection.
+        engine.interp.gc_collect();
         assert!(
-            weak.upgrade().is_none(),
+            !crate::gc_test::alive(&weak),
             "slot proof must not retain an activation"
         );
         assert!(matches!(
@@ -414,105 +418,109 @@ mod binding_layout_cache_tests {
                 _ => None,
             })
             .unwrap();
-        let parent = new_scope(None);
-        parent
-            .borrow_mut()
-            .vars
-            .insert("outer", Binding::data(Value::Num(17.0), true, true));
-        let layout = new_binding_layout_id();
-        let make_child = |parent: &Env, key: &str, layout| {
-            let child = new_scope(Some(parent.clone()));
-            child
+        // Activations live only in this helper frame (gc-heap scans the stack).
+        let weak_parent = crate::gc_test::in_frame(|| {
+            let parent = new_scope(None);
+            parent
                 .borrow_mut()
                 .vars
-                .insert(key, Binding::data(Value::Num(99.0), true, true));
-            child.borrow_mut().vars.publish_layout(layout);
-            child
-        };
-        let first = make_child(&parent, "padding", layout);
-        assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &first, name, cache),
-            Ok(Value::Num(17.0))
-        ));
-        assert_eq!(chunk.name_caches[cache as usize].get().env & 7, 6);
-        let second = make_child(&parent, "padding", layout);
-        assert!(!Env::ptr_eq(&first, &second));
-        assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &second, cache),
-            Some(Value::Num(17.0))
-        ));
-        parent.borrow_mut().vars.get_mut("outer").unwrap().value = Value::Num(23.0);
-        assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &second, cache),
-            Some(Value::Num(23.0))
-        ));
-        parent
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .initialized = false;
-        assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
-        parent
-            .borrow_mut()
-            .vars
-            .get_mut("outer")
-            .unwrap()
-            .initialized = true;
+                .insert("outer", Binding::data(Value::Num(17.0), true, true));
+            let layout = new_binding_layout_id();
+            let make_child = |parent: &Env, key: &str, layout| {
+                let child = new_scope(Some(parent.clone()));
+                child
+                    .borrow_mut()
+                    .vars
+                    .insert(key, Binding::data(Value::Num(99.0), true, true));
+                child.borrow_mut().vars.publish_layout(layout);
+                child
+            };
+            let first = make_child(&parent, "padding", layout);
+            assert!(matches!(
+                chunk.load_name_ic(&mut engine.interp, &first, name, cache),
+                Ok(Value::Num(17.0))
+            ));
+            assert_eq!(chunk.name_caches[cache as usize].get().env & 7, 6);
+            let second = make_child(&parent, "padding", layout);
+            assert!(!Env::ptr_eq(&first, &second));
+            assert!(matches!(
+                chunk.name_ic_hit(&engine.interp, &second, cache),
+                Some(Value::Num(17.0))
+            ));
+            parent.borrow_mut().vars.get_mut("outer").unwrap().value = Value::Num(23.0);
+            assert!(matches!(
+                chunk.name_ic_hit(&engine.interp, &second, cache),
+                Some(Value::Num(23.0))
+            ));
+            parent
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .initialized = false;
+            assert!(chunk.name_ic_hit(&engine.interp, &second, cache).is_none());
+            parent
+                .borrow_mut()
+                .vars
+                .get_mut("outer")
+                .unwrap()
+                .initialized = true;
 
-        // Same mutation count is not the same key layout.
-        let shadow = make_child(&parent, "outer", new_binding_layout_id());
-        assert_eq!(
-            shadow.borrow().vars.generation(),
-            second.borrow().vars.generation()
-        );
-        assert!(chunk.name_ic_hit(&engine.interp, &shadow, cache).is_none());
-        assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &shadow, name, cache),
-            Ok(Value::Num(99.0))
-        ));
-        // Refill the layout entry and exercise its write path.
-        chunk
-            .load_name_ic(&mut engine.interp, &second, name, cache)
-            .unwrap_or_else(|_| panic!("layout cache refill threw"));
-        chunk
-            .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.0))
-            .unwrap_or_else(|_| panic!("layout cache write threw"));
-        assert!(matches!(
-            parent.borrow().vars.get("outer").unwrap().value,
-            Value::Num(31.0)
-        ));
-        // The parent identity is still mandatory even for equal child layouts.
-        let different_parent = new_scope(None);
-        different_parent
-            .borrow_mut()
-            .vars
-            .insert("outer", Binding::data(Value::Num(47.0), true, true));
-        let other = make_child(&different_parent, "padding", layout);
-        assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
-        // Reparenting is detected too; a layout identity describes keys, not links.
-        other.borrow_mut().parent = Some(parent.clone());
-        assert!(matches!(
-            chunk.name_ic_hit(&engine.interp, &other, cache),
-            Some(Value::Num(31.0))
-        ));
-        other
-            .borrow_mut()
-            .vars
-            .insert("outer", Binding::data(Value::Num(53.0), true, true));
-        assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
-        assert!(matches!(
-            chunk.load_name_ic(&mut engine.interp, &other, name, cache),
-            Ok(Value::Num(53.0))
-        ));
+            // Same mutation count is not the same key layout.
+            let shadow = make_child(&parent, "outer", new_binding_layout_id());
+            assert_eq!(
+                shadow.borrow().vars.generation(),
+                second.borrow().vars.generation()
+            );
+            assert!(chunk.name_ic_hit(&engine.interp, &shadow, cache).is_none());
+            assert!(matches!(
+                chunk.load_name_ic(&mut engine.interp, &shadow, name, cache),
+                Ok(Value::Num(99.0))
+            ));
+            // Refill the layout entry and exercise its write path.
+            chunk
+                .load_name_ic(&mut engine.interp, &second, name, cache)
+                .unwrap_or_else(|_| panic!("layout cache refill threw"));
+            chunk
+                .store_name_ic(&mut engine.interp, &second, name, cache, Value::Num(31.0))
+                .unwrap_or_else(|_| panic!("layout cache write threw"));
+            assert!(matches!(
+                parent.borrow().vars.get("outer").unwrap().value,
+                Value::Num(31.0)
+            ));
+            // The parent identity is still mandatory even for equal child layouts.
+            let different_parent = new_scope(None);
+            different_parent
+                .borrow_mut()
+                .vars
+                .insert("outer", Binding::data(Value::Num(47.0), true, true));
+            let other = make_child(&different_parent, "padding", layout);
+            assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
+            // Reparenting is detected too; a layout identity describes keys, not links.
+            other.borrow_mut().parent = Some(parent.clone());
+            assert!(matches!(
+                chunk.name_ic_hit(&engine.interp, &other, cache),
+                Some(Value::Num(31.0))
+            ));
+            other
+                .borrow_mut()
+                .vars
+                .insert("outer", Binding::data(Value::Num(53.0), true, true));
+            assert!(chunk.name_ic_hit(&engine.interp, &other, cache).is_none());
+            assert!(matches!(
+                chunk.load_name_ic(&mut engine.interp, &other, name, cache),
+                Ok(Value::Num(53.0))
+            ));
 
-        chunk
-            .load_name_ic(&mut engine.interp, &second, name, cache)
-            .unwrap_or_else(|_| panic!("layout cache refill threw"));
-        let weak_parent = Env::downgrade(&parent);
-        drop((first, second, shadow, other, parent));
+            chunk
+                .load_name_ic(&mut engine.interp, &second, name, cache)
+                .unwrap_or_else(|_| panic!("layout cache refill threw"));
+            Env::downgrade(&parent)
+        });
+        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        engine.interp.gc_collect();
         assert!(
-            weak_parent.upgrade().is_none(),
+            !crate::gc_test::alive(&weak_parent),
             "cache pins allocation, not scope liveness"
         );
     }
@@ -1372,6 +1380,10 @@ mod call_overflow_tests {
         );
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    )]
     #[test]
     fn secondary_cache_guards_epochs_realms_and_owns_only_weak_pins() {
         let mut cache = CallOverflow::default();
@@ -15076,6 +15088,19 @@ fn drive_vm(
     defer_source_return: bool,
     mut tiering: Option<&mut crate::tiering::VmTiering>,
 ) -> Result<VmStep, Abrupt> {
+    // I1: this activation's frame state lives on the Rust heap (or in a suspended coroutine);
+    // the conservative stack scan sees only pointers to it, so register it for the call.
+    #[cfg(feature = "gc-heap")]
+    let _frame = crate::gc_trace::enter_vm_frame(crate::gc_trace::VmFrameRoots {
+        env: std::ptr::from_ref(&*env),
+        cap_env: std::ptr::from_ref(cap_env),
+        slots: std::ptr::from_ref(slots),
+        stack: std::ptr::from_ref(&*stack),
+        references: std::ptr::from_ref(&*references),
+        this_val: std::ptr::from_ref(this_val),
+        disposal_frames: std::ptr::from_ref(&*disposal_frames),
+        class_states: std::ptr::from_ref(&*class_states),
+    });
     let mut native = if chunk.resumable && matches!(i.tier, Tier::Jit) {
         crate::jit::continuation_code(i, chunk)
     } else {
@@ -16242,7 +16267,8 @@ fn run_vm_inner<S: StoredValue>(
                 let class_plan = &chunk.class_plans[plan as usize];
                 let saved_name =
                     std::mem::replace(&mut i.pending_fn_name, class_plan.inferred_name.clone());
-                let result = i.finish_class_evaluation(&class_plan.class, state);
+                let result = i
+                    .finish_class_evaluation(&class_plan.class, crate::rooting::Rooted::new(state));
                 i.pending_fn_name = saved_name;
                 i.strict = if class_states.iter().any(Option::is_some) {
                     true
@@ -26075,6 +26101,10 @@ mod return_slot_tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn jit_return_moves_owners_into_empty_and_occupied_slots() {
         for occupied in [false, true] {
@@ -26100,6 +26130,10 @@ mod return_slot_tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn jit_return_preserves_aliases_and_bare_return_drops_the_old_owner() {
         let object = crate::value::Object::new(None);
@@ -26153,6 +26187,10 @@ mod return_slot_tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
+    )]
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
@@ -26187,5 +26225,87 @@ mod return_slot_tests {
             wide_ptr
         );
         assert_eq!(weak.strong_count(), 0);
+    }
+}
+
+/// The gc-heap walk of a suspended (or running, see `gc_trace::enter_coroutine`) continuation:
+/// [`VmCoro::trace_gc`]'s inventory, reading packed slots without unpacking them (unpacking can
+/// materialize a deferred prototype, which allocates).
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for VmCoro {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            chunk: _,
+            realm,
+            host_job_context: _,
+            cap_env,
+            env,
+            references,
+            this_val,
+            slots,
+            stack,
+            pc: _,
+            handlers: _,
+            disposal_frames,
+            class_states,
+            is_generator: _,
+            is_async_generator: _,
+            awaiting_yield_value: _,
+            awaiting_return_value: _,
+            awaiting_body_return: _,
+            delegation,
+            async_close,
+            disposal,
+            done: _,
+            started: _,
+            frame: _,
+        } = self;
+        sink.object(realm);
+        cap_env.trace_gc(sink);
+        env.trace_gc(sink);
+        this_val.trace_gc(sink);
+        slots.trace_gc(sink);
+        stack.trace_gc(sink);
+        references.trace_gc(sink);
+        class_states.trace_gc(sink);
+        disposal_frames.trace_gc(sink);
+        if let Some(VmDelegate {
+            iterator,
+            next,
+            from_sync: _,
+            async_mode: _,
+            stage: _,
+        }) = delegation
+        {
+            iterator.trace_gc(sink);
+            next.trace_gc(sink);
+        }
+        if let Some(VmAsyncClose {
+            _iterator,
+            swallow_error: _,
+            stage: _,
+        }) = async_close
+        {
+            _iterator.trace_gc(sink);
+        }
+        if let Some(VmDispose {
+            resources,
+            output,
+            needs_await: _,
+            has_awaited: _,
+            pending_resource,
+        }) = disposal
+        {
+            resources.trace_gc(sink);
+            pending_resource.trace_gc(sink);
+            match output {
+                DisposeCompletion::Throw(value)
+                | DisposeCompletion::SourceReturn(value)
+                | DisposeCompletion::ResumeReturn(value) => value.trace_gc(sink),
+                DisposeCompletion::Normal
+                | DisposeCompletion::BareReturn
+                | DisposeCompletion::Jump { .. } => {}
+            }
+        }
     }
 }
