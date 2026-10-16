@@ -1087,3 +1087,39 @@ its JIT probes.
   module_ns lookup in generic [[Get]] and the receiver classification
   of element feedback) measured as no change in instructions or cycles
   and were dropped.
+
+S3 exit gate (2026-10-16)
+-------------------------
+Builds: main = e3310993; branch = b24a522c plus this commit (records
+only). crystal aarch64, rustc 1.99.0; release = fat LTO.
+- Lib suite: gc-heap 1839/0/116, default 2149/0/3; trust-js-runtime
+  182/0/1 in both builds; the workspace builds.
+- Test262 (release runners from b24a522c, gc-heap and default,
+  TRUST_JS_TIER=interp and =bytecode, the S2 subsets, 29029 files):
+  29028 pass, 0 fail, 1 skip in each run; all twelve reports (S2's and
+  S3's) are byte-identical. Parity.
+- GC stress + verifier + poisoning (debug b24a522c, every test
+  in its own process, 900 s each): 1839 pass, 116 ignored, 0 fail;
+  1819 at interval 1, 16 at 100 and 4 at 1000. Three interval-1 tests
+  timed out in the parallel run (12 processes on the slower cluster's
+  10 cores) and pass alone in 779-803 s, as S2's binary does in
+  775-796 s; they join the slow list.
+- Tripwire, predicted direction: object creation with properties gets
+  cheaper and nothing else regresses beyond noise. object_alloc_bench
+  (ns/op, medians of 5 interleaved runs, gc-heap S2 -> S3, main):
+  templated {x,y} + drop 121.9 -> 108.3 (main 105.5);
+  Object::new + drop 98.9 -> 102.9 and Props::new 5.8 -> 6.3 (a
+  112 B Props to write instead of 64 B). JS workloads by cycles: see
+  step 2-3 (sustained allocation -10.1/-5.5%, others -1.8..+1.3%).
+- RSS on the gate fixtures against the S0 bound (peak RSS, MiB, main
+  -> gc-heap S3, wall-time runs at b24a522c's binaries):
+                         interp           bytecode
+    Vue                  27 -> 70         27 -> 41 (+52%)
+    React                13 -> 50         14 -> 38 (+171%)
+    Djot                 36 -> 57         32 -> 45 (+41%)
+  The bound (+25%, checked at S6 on the default tier, which under
+  gc-heap is bytecode) is not met: small programs carry 10-25 MiB
+  more, mostly garbage awaiting collection (the byte budget's 8 MiB
+  floor) and page granularity. Open for S6 (budget policy, or a
+  nursery over the cell heap).
+- wasm32 acceptance: still blocked (see the S2 deviation).
