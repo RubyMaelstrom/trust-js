@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, (this commit) | steps 1–3c: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and a buffer audit. Default suite 2149/0/3 unchanged; gc-heap lib suite 1825/0/114 (ignores carry their reason); per-test GC stress + verifier: 1825 pass (19 slow ones at interval 100/1000), 0 fail |
+| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, (this commit) | steps 1–4b: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and a buffer audit; BigInt payloads as cells. Default suite 2149/0/3 unchanged; gc-heap lib suite 1827/0/114 (ignores carry their reason); per-test GC stress + verifier at step 3c: 1825 pass (19 slow ones at interval 100/1000), 0 fail |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |

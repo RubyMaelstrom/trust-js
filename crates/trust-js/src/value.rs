@@ -444,6 +444,8 @@ impl Clone for PackedValue {
         // here rather than accidentally admitting a thunk into execution storage.
         unsafe {
             match self.tag() {
+                // A BigInt cell (gc-heap) needs no retain.
+                #[cfg(not(feature = "gc-heap"))]
                 PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
                 PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
                 PACK_SYM => std::mem::forget(self.clone_word::<Rc<SymbolData>>()),
@@ -2281,33 +2283,57 @@ pub(crate) struct GcState {
     pub(crate) object_desc: crate::gc_core::DescId,
     #[cfg(feature = "gc-heap")]
     pub(crate) scope_desc: crate::gc_core::DescId,
+    /// BigInt payload cells.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) bigint_desc: crate::gc_core::DescId,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
 
-/// The cell heap behind a [`GcState`] and its object and environment descriptors.
+/// The descriptors of a [`GcState`]'s cell kinds.
 #[cfg(feature = "gc-heap")]
-fn new_cell_heap() -> (
-    crate::gc_core::Heap,
-    crate::gc_core::DescId,
-    crate::gc_core::DescId,
-) {
+struct CellDescs {
+    object: crate::gc_core::DescId,
+    scope: crate::gc_core::DescId,
+    bigint: crate::gc_core::DescId,
+}
+
+/// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
+#[cfg(feature = "gc-heap")]
+fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
     crate::interpreter::gc_collect::configure_heap(&mut core);
-    let object_desc = core.register_desc(crate::gc_core::LayoutDesc {
+    let object = core.register_desc(crate::gc_core::LayoutDesc {
         name: "object",
         trace: trace_object_cell,
         weak: None,
         finalize: Some(finalize_object_cell),
     });
-    let scope_desc = core.register_desc(crate::gc_core::LayoutDesc {
+    let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
         weak: None,
         finalize: Some(finalize_scope_cell),
     });
-    (core, object_desc, scope_desc)
+    let bigint = core.register_desc(crate::bigint::cell_layout());
+    (
+        core,
+        CellDescs {
+            object,
+            scope,
+            bigint,
+        },
+    )
+}
+
+/// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
+#[cfg(feature = "gc-heap")]
+pub(crate) fn alloc_payload_cell(
+    desc: fn(&GcState) -> crate::gc_core::DescId,
+    size: usize,
+) -> *mut u8 {
+    with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(desc(heap), size))
 }
 
 /// Strong edges an object holds itself. Edges kept for it in the interpreter's owner-keyed
@@ -2380,13 +2406,13 @@ impl crate::gc_trace::GcTrace for Object {
         }
         match exotic {
             Exotic::ArrayIterator(state) => sink.value(&state.target),
+            Exotic::BigIntWrap(bigint) => sink.word(bigint.cell_word()),
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
             | Exotic::StrWrap(_)
             | Exotic::SymWrap(_)
-            | Exotic::BigIntWrap(_)
             | Exotic::Error(_) // frames hold names and sources, not values
             | Exotic::Arguments
             | Exotic::StringIterator(_) => {}
@@ -2427,7 +2453,7 @@ impl crate::gc_trace::GcTrace for Props {
 #[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Property {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        self.with_object_edge(|object| sink.object(object));
+        self.packed.trace_gc_edges(sink);
         if let Some(getter) = self.getter() {
             sink.value(getter);
         }
@@ -2465,9 +2491,13 @@ impl crate::gc_trace::GcTrace for NativeCallable {
 
 #[cfg(feature = "gc-heap")]
 impl PackedValue {
-    /// Report this word's strong object edge: an object, or a deferred prototype's edge.
+    /// Report this word's strong edge: a payload cell, an object, or a deferred prototype's
+    /// edge.
     pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        self.with_object_edge(|object| sink.object(object));
+        match self.tag() {
+            PACK_BIGINT => sink.word(self.0.get() & PACK_PAYLOAD),
+            _ => self.with_object_edge(|object| sink.object(object)),
+        }
     }
 }
 
@@ -2811,7 +2841,7 @@ thread_local! {
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     #[cfg(feature = "gc-heap")]
-    let (core, object_desc, scope_desc) = new_cell_heap();
+    let (core, descs) = new_cell_heap();
     Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "architecture-diagnostics")]
@@ -2830,9 +2860,11 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         #[cfg(feature = "gc-heap")]
         core: RefCell::new(core),
         #[cfg(feature = "gc-heap")]
-        object_desc,
+        object_desc: descs.object,
         #[cfg(feature = "gc-heap")]
-        scope_desc,
+        scope_desc: descs.scope,
+        #[cfg(feature = "gc-heap")]
+        bigint_desc: descs.bigint,
     })
 }
 

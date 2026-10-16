@@ -2270,7 +2270,8 @@ pub struct Chunk {
     jit_needs_activation_state: bool,
     /// Shared call/constructor eligibility also depends on this immutable body property.
     has_tail_calls: bool,
-    consts: Vec<Value>,
+    /// Literal values (strings, BigInts), roots for as long as the chunk lives (gc-heap).
+    consts: crate::rooting::RootedVec,
     names: Vec<Rc<str>>,
     n_slots: usize,
     /// Slot names, for TDZ ReferenceError messages.
@@ -7202,7 +7203,7 @@ fn finish_chunk(
         ops: c.ops,
         jit_needs_activation_state,
         has_tail_calls,
-        consts: c.consts,
+        consts: crate::rooting::RootedVec::from_vec(c.consts),
         names: c.names,
         n_slots: c.slot_names.len(),
         slot_names: c.slot_names,
@@ -13532,7 +13533,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::BigInt(n) => {
-                let i = self.const_idx(Value::BigInt(n.clone()));
+                let i = self.const_idx(Value::BigInt(n.value()));
                 self.emit(Op::Const(i));
                 Ok(())
             }

@@ -296,7 +296,7 @@ pub enum Expr {
     /// transparently.
     Paren(P<Expr>),
     Num(f64),
-    BigInt(crate::bigint::JsBigInt),
+    BigInt(crate::bigint::BigIntLiteral),
     Str(Rc<str>),
     /// A template-literal substitution: evaluate the inner expression and apply ToString (which uses
     /// the `string` hint — toString before valueOf — unlike `+` which uses the `default` hint).
@@ -1072,7 +1072,7 @@ impl RetainedAst<'_> {
             | Expr::Super
             | Expr::ImportMeta
             | Expr::NewTarget => {}
-            Expr::BigInt(value) => self.visitor.bigint(value),
+            Expr::BigInt(value) => self.visitor.bigint_literal(value),
             Expr::Str(value) => self.rc_str(value),
             Expr::Ident(name, _) => self.string(name),
             Expr::Regex { body, flags } => {

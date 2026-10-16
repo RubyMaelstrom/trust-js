@@ -522,6 +522,15 @@ impl Visitor {
         }
     }
 
+    /// A BigInt literal's digits, held by source code.
+    pub(crate) fn bigint_literal(&mut self, value: &crate::bigint::BigIntLiteral) {
+        if self.bigints.insert(value.allocation_identity()) {
+            self.strings_symbols_bigints = self
+                .strings_symbols_bigints
+                .saturating_add(value.retained_requested_bytes());
+        }
+    }
+
     /// A shared source record: its own bytes and the text it keeps alive, once per record.
     pub(crate) fn script_source(&mut self, source: &Rc<crate::stack_trace::ScriptSource>) {
         let identity = Rc::as_ptr(source) as usize;

@@ -3294,7 +3294,7 @@ impl Interp {
         }
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
-            Expr::BigInt(n) => Ok(Value::BigInt(n.clone())),
+            Expr::BigInt(n) => Ok(Value::BigInt(n.value())),
             Expr::Str(s) => Ok(Value::Str(s.clone().into())),
             Expr::ToStr(inner) => {
                 let v = self.eval(inner, env)?;

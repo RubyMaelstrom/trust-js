@@ -672,3 +672,26 @@ the 19 slow ones at interval 100 (16) or 1000 (3), 114 are the suite's
 gc-heap ignores; none fail. gc_core unit tests cover allocate-black and
 stack scrubbing (debug, and release with fat LTO). Clippy clean on both
 feature sets; the workspace and its tests build.
+
+Step 4 plan (2026-10-16): strings, symbols and BigInts become cells in
+the Agent heap, in the order 4b BigInt, 4c Symbol, 4d String (the
+largest: string accumulation per Decision 4, per-heap caches for the
+thread-wide one-unit and index string tables). Each sub-step keeps the
+default build unchanged and is stressed per test on the code it moves;
+the full per-test stress run repeats at the end of step 4.
+
+Step 4b, BigInt payloads as cells (gc-heap): JsBigInt's digits live in
+a cell of the active Agent heap (gc_box::GcBox: the cell's address,
+Copy, no count; a per-heap "bigint" descriptor with no edges whose
+finalizer frees the digits). Values, packed property words and BigInt
+wrapper objects report the cell. Source literals stay outside any heap:
+tokens, the AST and snapshots hold a BigIntLiteral (Rust-heap digits,
+shared by every evaluation) and evaluation makes the value. Compiled
+chunks root their constants (RootedVec) for as long as the chunk lives.
+New payload_cell_tests: BigInts survive collections in every holder
+(array elements, Map keys, wrappers, typed arrays, closures, literals),
+and dead ones are reclaimed. The survival test fails, under stress, with
+BigInt tracing removed. Results: gc-heap lib suite 1827/0/114, default
+2149/0/3; the 234 BigInt-, typed-array-, literal- and parser-related
+tests pass per test at stress interval 1 (11 ignored as in the suite);
+clippy clean on both feature sets; the workspace builds.

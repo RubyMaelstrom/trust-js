@@ -789,6 +789,7 @@ mod tests {
         let copied = packed.clone();
         let packed = native_drop(&release, packed).expect_err("BigInt needs checked drop");
         drop(packed);
+        #[cfg_attr(feature = "gc-heap", allow(clippy::drop_non_drop))]
         drop(integer);
         assert!(
             native_clone(&clone, &copied).is_none(),

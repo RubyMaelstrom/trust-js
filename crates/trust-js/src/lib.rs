@@ -91,9 +91,13 @@ mod function_realm_identity_tests;
 #[cfg(test)]
 mod function_realm_lifetime_tests;
 #[cfg(feature = "gc-heap")]
+mod gc_box;
+#[cfg(feature = "gc-heap")]
 mod gc_core;
 #[cfg(test)]
 mod gc_test;
+#[cfg(all(test, feature = "gc-heap"))]
+mod payload_cell_tests;
 mod rooting;
 
 /// Run an embedder entry (a script, a microtask checkpoint) between two stack scrubs (gc-heap):

@@ -1197,7 +1197,7 @@ impl Lexer<'_> {
                 .collect();
             if self.peek() == Some('n') {
                 self.bump();
-                let n = crate::bigint::JsBigInt::parse_radix(&digits, radix)
+                let n = crate::bigint::BigIntLiteral::parse_radix(&digits, radix)
                     .ok_or_else(|| self.err("invalid BigInt literal"))?;
                 self.push(Tok::BigInt(n));
                 return Ok(());
@@ -1249,7 +1249,7 @@ impl Lexer<'_> {
                 .filter(|c| *c != '_')
                 .collect();
             self.bump(); // n
-            let n = crate::bigint::JsBigInt::parse_radix(&text, 10)
+            let n = crate::bigint::BigIntLiteral::parse_radix(&text, 10)
                 .ok_or_else(|| self.err("invalid BigInt literal"))?;
             self.push(Tok::BigInt(n));
             return Ok(());
