@@ -1040,14 +1040,17 @@ short-lived plain object on Vue, React and the sustained workload and
 its dying plain objects). Decision: 4 inline named slots, S0's
 hypothesis, now measured.
 
-Measurement note (S3): on this machine the big cores' delivered clock
-follows the shared CPU/GPU power budget (the owner's GPU services run
-alongside). CPU 5 averaged about 1.35 GHz under load while cpufreq
-reported 3.9 GHz, and wall times turned bimodal. Interleaving keeps
-wall-time comparisons unbiased but leaves a few percent of noise, so
-from S3 step 2 on comparisons use user-mode cycles and instructions
-(perf stat, unmultiplexed, CPU 5), which the clock does not move; wall
-time and peak RSS are still recorded.
+Measurement note (S3, corrected 2026-10-17): this machine's cores run
+far below their nominal clocks. A chain of dependent register adds
+(one cycle each) times the X925 cores at 1.37 GHz and the A725 cores at
+1.0 GHz, with the PMU's cycle count agreeing exactly, while cpufreq
+reports up to 3.9 / 2.8 GHz; no platform profile is set and the cores
+sit near 53 C. The cap holds with the GPU idle, so it is not the
+owner's GPU services, as first assumed. Wall times turned bimodal while
+those services ran and are steady without them. Comparisons from S3
+step 2 on use user-mode cycles and instructions (perf stat,
+unmultiplexed, CPU 5), which no clock moves; wall time and peak RSS
+are still recorded.
 
 Step 2-3, inline named slots (gc-heap): a property map's values live in
 an InlineVec (inline_vec.rs) with 4 slots in the cell; a fifth spills
@@ -1123,3 +1126,8 @@ only). crystal aarch64, rustc 1.99.0; release = fat LTO.
   floor) and page granularity. Open for S6 (budget policy, or a
   nursery over the cell heap).
 - wasm32 acceptance: still blocked (see the S2 deviation).
+- Recheck (2026-10-17, GPU idle, 7 interleaved rounds, wall time and
+  cycles together): the clock held at 1.36-1.37 GHz in every run;
+  gc-heap S3 against S2 is -9.5/-5.9% cycles on the sustained workload
+  and -1.5..+0.9% elsewhere, wall time now agreeing with cycles; the
+  default build is within -1.2..+1.1% of main's cycles.
