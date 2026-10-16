@@ -714,7 +714,7 @@ mod tests {
         match value {
             Value::Obj(object) => crate::value::Gc::strong_count(object),
             Value::Str(string) => string.strong_count(),
-            Value::Sym(symbol) => Rc::strong_count(symbol),
+            Value::Sym(symbol) => crate::value::symbol_strong_count(symbol),
             _ => panic!("expected a shared reference"),
         }
     }
@@ -756,7 +756,7 @@ mod tests {
         ] {
             let object_weak = value.as_obj().map(crate::value::Gc::downgrade);
             let symbol_weak = if let Value::Sym(symbol) = &value {
-                Some(Rc::downgrade(symbol))
+                Some(crate::value::symbol_downgrade(symbol))
             } else {
                 None
             };

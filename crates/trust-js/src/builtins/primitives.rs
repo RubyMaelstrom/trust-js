@@ -476,7 +476,7 @@ fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 }
 
 /// thisSymbolValue: a Symbol primitive or Symbol wrapper object, else TypeError.
-fn this_symbol(i: &mut Interp, this: &Value) -> Result<Rc<SymbolData>, Value> {
+fn this_symbol(i: &mut Interp, this: &Value) -> Result<crate::value::SymbolRef, Value> {
     match this {
         Value::Sym(s) => Ok(s.clone()),
         Value::Obj(o) => match &o.borrow().exotic {

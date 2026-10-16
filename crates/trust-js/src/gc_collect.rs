@@ -261,14 +261,10 @@ impl crate::gc_core::MarkClient for Marking<'_> {
                     let Some(value) = value_word(value) else {
                         continue;
                     };
-                    match key.upgrade() {
-                        Some(Value::Obj(key)) => {
-                            sink.ephemeron(owner as *const u8, Gc::as_ptr(&key) as u64, value)
-                        }
-                        // Symbols are not collected yet: a live collection keeps the value of
-                        // a still-existing symbol key, as the old collector did.
-                        Some(_) => sink.edge(owner as *const u8, value),
-                        None => {}
+                    // An object or Symbol key: the value lives while both the collection and
+                    // the key do.
+                    if let Some(key) = key.upgrade().as_ref().and_then(Value::cell_word) {
+                        sink.ephemeron(owner as *const u8, key, value);
                     }
                 }
             }
@@ -484,7 +480,7 @@ impl Interp {
     fn trace_gc_roots(&self, sink: &mut dyn GcSink) {
         let Interp {
             gc_heap: _,
-            symbol_agent: _, // symbols are not cells yet
+            symbol_agent,
             global,
             global_env,
             object_proto,
@@ -551,7 +547,7 @@ impl Interp {
             self_hosted: _,
             shared_snapshots: _,         // parsed source
             construct_capacity_hints: _, // weak pins
-            iterator_sym: _,
+            iterator_sym,
             wk_syms,
             short_circuit: _,
             import_meta,
@@ -686,6 +682,20 @@ impl Interp {
         }
         for (_, symbol, _) in wk_syms {
             symbol.trace_gc(sink);
+        }
+        if let Some(symbol) = iterator_sym {
+            sink.word(crate::value::symbol_identity(symbol) as u64);
+        }
+        // The Agent's registered (Symbol.for) and well-known Symbols live as long as it does.
+        {
+            let agent = symbol_agent.borrow();
+            for symbol in agent
+                .global_by_key
+                .values()
+                .chain(agent.well_known.values())
+            {
+                sink.word(crate::value::symbol_identity(symbol) as u64);
+            }
         }
         import_meta.trace_gc(sink);
         modules.trace_gc(sink);

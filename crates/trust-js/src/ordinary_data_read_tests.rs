@@ -173,7 +173,7 @@ fn ordinary_data_read_returned_last_owner_survives_removal_and_gc() {
         let Value::Sym(symbol_ref) = &symbol else {
             unreachable!()
         };
-        let weak_symbol = Rc::downgrade(symbol_ref);
+        let weak_symbol = crate::value::symbol_downgrade(symbol_ref);
         let id = symbol_ref.id;
         let holder = Object::new(None);
         holder

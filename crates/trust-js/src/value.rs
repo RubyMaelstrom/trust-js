@@ -5,7 +5,7 @@
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 #[path = "dense_deque.rs"]
 mod dense_deque;
 pub(crate) use dense_deque::DenseDeque;
@@ -130,7 +130,7 @@ pub enum Value {
     /// [`Value::as_engine_text`] and `Ctx::coerce_engine_text`, rather than reading or building
     /// this payload directly.
     Str(crate::lstr::LStr) = 6,
-    Sym(Rc<SymbolData>) = 7,
+    Sym(SymbolRef) = 7,
     Obj(Gc) = 8,
 }
 
@@ -142,6 +142,7 @@ impl Value {
         match self {
             Value::Obj(object) => Some(Gc::as_ptr(object) as u64),
             Value::BigInt(bigint) => Some(bigint.cell_word()),
+            Value::Sym(symbol) => Some(symbol_identity(symbol) as u64),
             _ => None,
         }
     }
@@ -461,7 +462,9 @@ impl Clone for PackedValue {
                 #[cfg(not(feature = "gc-heap"))]
                 PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
                 PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
-                PACK_SYM => std::mem::forget(self.clone_word::<Rc<SymbolData>>()),
+                // A Symbol cell (gc-heap) needs no retain.
+                #[cfg(not(feature = "gc-heap"))]
+                PACK_SYM => std::mem::forget(self.clone_word::<SymbolRef>()),
                 PACK_OBJ => std::mem::forget(self.clone_word::<Gc>()),
                 PACK_LAZY_PROTO => return PackedValue::pack(self.unpack()),
                 _ => {}
@@ -477,7 +480,7 @@ impl Drop for PackedValue {
         match self.tag() {
             PACK_BIGINT => unsafe { self.drop_word::<crate::bigint::JsBigInt>() },
             PACK_STR => unsafe { self.drop_word::<crate::lstr::LStr>() },
-            PACK_SYM => unsafe { self.drop_word::<Rc<SymbolData>>() },
+            PACK_SYM => unsafe { self.drop_word::<SymbolRef>() },
             PACK_OBJ => unsafe { self.drop_word::<Gc>() },
             PACK_LAZY_PROTO => unsafe { self.drop_word::<Rc<LazyFunctionPrototype>>() },
             _ => {}
@@ -690,14 +693,14 @@ mod packed_value_tests {
         let before = [
             Gc::strong_count(&object),
             string.strong_count(),
-            Rc::strong_count(&symbol),
+            symbol_strong_count(&symbol),
         ];
         let copies = original.clone();
         assert_eq!(
             [
                 Gc::strong_count(&object),
                 string.strong_count(),
-                Rc::strong_count(&symbol)
+                symbol_strong_count(&symbol)
             ],
             before.map(|n| n + 1)
         );
@@ -709,7 +712,7 @@ mod packed_value_tests {
             [
                 Gc::strong_count(&object),
                 string.strong_count(),
-                Rc::strong_count(&symbol)
+                symbol_strong_count(&symbol)
             ],
             before
         );
@@ -887,6 +890,106 @@ impl Drop for SymbolData {
     }
 }
 
+/// A Symbol value's handle: reference-counted without `gc-heap`; with it, a cell in the Agent
+/// heap that was active when the Symbol was minted (P1 S2). Identity is the handle's address
+/// ([`symbol_ptr_eq`]), equivalently the `id`.
+#[cfg(not(feature = "gc-heap"))]
+pub type SymbolRef = Rc<SymbolData>;
+#[cfg(feature = "gc-heap")]
+pub type SymbolRef = crate::gc_box::GcBox<SymbolData>;
+
+/// A weak Symbol handle (see [`symbol_downgrade`]).
+#[cfg(not(feature = "gc-heap"))]
+pub(crate) type WeakSymbol = std::rc::Weak<SymbolData>;
+
+/// A weak Symbol handle: it upgrades until a collection (or the heap's teardown) finds the
+/// Symbol dead and clears the shared weak cell.
+#[cfg(feature = "gc-heap")]
+#[derive(Clone, Default)]
+pub(crate) struct WeakSymbol(crate::gc_handle::WeakRef);
+
+#[cfg(feature = "gc-heap")]
+impl WeakSymbol {
+    #[inline]
+    pub(crate) fn upgrade(&self) -> Option<SymbolRef> {
+        // SAFETY: the alive flag is cleared before the target's cell is freed.
+        self.0
+            .live_ptr()
+            .map(|ptr| unsafe { crate::gc_box::GcBox::from_raw(ptr as *const SymbolData) })
+    }
+
+    /// 1 while the Symbol is alive, 0 after it died.
+    #[inline]
+    pub(crate) fn strong_count(&self) -> usize {
+        usize::from(self.0.live_ptr().is_some())
+    }
+}
+
+/// Mint the handle of a new Symbol (in the active Agent's heap with `gc-heap`).
+pub(crate) fn new_symbol_ref(data: SymbolData) -> SymbolRef {
+    #[cfg(not(feature = "gc-heap"))]
+    return Rc::new(data);
+    #[cfg(feature = "gc-heap")]
+    crate::gc_box::new(data)
+}
+
+#[inline]
+pub(crate) fn symbol_ptr_eq(a: &SymbolRef, b: &SymbolRef) -> bool {
+    #[cfg(not(feature = "gc-heap"))]
+    return Rc::ptr_eq(a, b);
+    #[cfg(feature = "gc-heap")]
+    crate::gc_box::GcBox::ptr_eq(a, b)
+}
+
+/// The Symbol's allocation address, for identity-keyed diagnostics.
+#[inline]
+pub(crate) fn symbol_identity(symbol: &SymbolRef) -> usize {
+    #[cfg(not(feature = "gc-heap"))]
+    let identity = Rc::as_ptr(symbol);
+    #[cfg(feature = "gc-heap")]
+    let identity = crate::gc_box::GcBox::as_ptr(symbol);
+    identity as usize
+}
+
+#[inline]
+pub(crate) fn symbol_downgrade(symbol: &SymbolRef) -> WeakSymbol {
+    #[cfg(not(feature = "gc-heap"))]
+    return Rc::downgrade(symbol);
+    #[cfg(feature = "gc-heap")]
+    WeakSymbol(crate::gc_handle::WeakRef::to(symbol_identity(symbol)))
+}
+
+/// Tests observing reference counts: the Symbol's strong count (none under gc-heap).
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn symbol_strong_count(symbol: &SymbolRef) -> usize {
+    #[cfg(not(feature = "gc-heap"))]
+    return Rc::strong_count(symbol);
+    #[cfg(feature = "gc-heap")]
+    {
+        let _ = symbol;
+        panic!("symbol_strong_count: gc-heap Symbols have no reference counts")
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_box::Payload for SymbolData {
+    fn desc(heap: &GcState) -> crate::gc_core::DescId {
+        heap.symbol_desc
+    }
+}
+
+/// The descriptor of Symbol cells: no edges; the finalizer delivers death notifications.
+#[cfg(feature = "gc-heap")]
+fn symbol_cell_layout() -> crate::gc_core::LayoutDesc {
+    crate::gc_core::LayoutDesc {
+        name: "symbol",
+        trace: crate::gc_box::trace_none,
+        weak: None,
+        finalize: Some(crate::gc_box::finalize::<SymbolData>),
+    }
+}
+
 /// An ECMAScript Property Key produced by `ToPropertyKey`. TRust JS's object maps use a compact
 /// encoded string for Symbol keys, but the key itself must keep the Symbol identity alive until
 /// an object property map can take ownership of it. This mirrors the specification's actual
@@ -894,7 +997,7 @@ impl Drop for SymbolData {
 #[derive(Clone)]
 pub(crate) struct PropertyKey {
     text: String,
-    symbol: Option<Rc<SymbolData>>,
+    symbol: Option<SymbolRef>,
     private: bool,
 }
 
@@ -931,7 +1034,7 @@ impl PropertyKey {
         }
     }
 
-    pub(crate) fn symbol(symbol: Rc<SymbolData>) -> Self {
+    pub(crate) fn symbol(symbol: SymbolRef) -> Self {
         Self {
             text: Interp::sym_key(&symbol),
             symbol: Some(symbol),
@@ -1032,10 +1135,10 @@ pub(crate) struct SymbolAgentState {
     /// Process-local diagnostic identity. Shared by every realm implementation in this Agent.
     pub(crate) agent_id: u64,
     pub(crate) next_id: u64,
-    pub(crate) symbols: crate::fasthash::FastMap<u64, Weak<SymbolData>>,
-    pub(crate) global_by_key: crate::fasthash::FastMap<Rc<str>, Rc<SymbolData>>,
+    pub(crate) symbols: crate::fasthash::FastMap<u64, WeakSymbol>,
+    pub(crate) global_by_key: crate::fasthash::FastMap<Rc<str>, SymbolRef>,
     pub(crate) global_key_by_id: crate::fasthash::FastMap<u64, Rc<str>>,
-    pub(crate) well_known: crate::fasthash::FastMap<&'static str, Rc<SymbolData>>,
+    pub(crate) well_known: crate::fasthash::FastMap<&'static str, SymbolRef>,
     /// Post-collection diagnostics keyed by the independently collected heap implementation.
     /// ShadowRealms share this Agent state but currently own distinct collector registries.
     pub(crate) memory_snapshots: crate::fasthash::FastMap<u64, crate::memory::Snapshot>,
@@ -1861,7 +1964,7 @@ pub enum Exotic {
     BoolWrap(bool),
     NumWrap(f64),
     StrWrap(Box<crate::lstr::LStr>),
-    SymWrap(Rc<SymbolData>),
+    SymWrap(SymbolRef),
     BigIntWrap(Box<crate::bigint::JsBigInt>),
     /// An error object. Carries the stack frames captured at construction (see
     /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
@@ -2299,6 +2402,9 @@ pub(crate) struct GcState {
     /// BigInt payload cells.
     #[cfg(feature = "gc-heap")]
     pub(crate) bigint_desc: crate::gc_core::DescId,
+    /// Symbol cells.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) symbol_desc: crate::gc_core::DescId,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -2309,6 +2415,7 @@ struct CellDescs {
     object: crate::gc_core::DescId,
     scope: crate::gc_core::DescId,
     bigint: crate::gc_core::DescId,
+    symbol: crate::gc_core::DescId,
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
@@ -2330,12 +2437,14 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         finalize: Some(finalize_scope_cell),
     });
     let bigint = core.register_desc(crate::bigint::cell_layout());
+    let symbol = core.register_desc(symbol_cell_layout());
     (
         core,
         CellDescs {
             object,
             scope,
             bigint,
+            symbol,
         },
     )
 }
@@ -2417,15 +2526,16 @@ impl crate::gc_trace::GcTrace for Object {
         for property in props.values().chain(self.internal_slots().values()) {
             property.trace_gc(sink);
         }
+        props.trace_symbol_keys(sink);
         match exotic {
             Exotic::ArrayIterator(state) => sink.value(&state.target),
             Exotic::BigIntWrap(bigint) => sink.word(bigint.cell_word()),
+            Exotic::SymWrap(symbol) => sink.word(symbol_identity(symbol) as u64),
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
             | Exotic::StrWrap(_)
-            | Exotic::SymWrap(_)
             | Exotic::Error(_) // frames hold names and sources, not values
             | Exotic::Arguments
             | Exotic::StringIterator(_) => {}
@@ -2459,6 +2569,33 @@ impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         for property in self.values() {
             crate::gc_trace::GcTrace::trace_gc(property, sink);
+        }
+        self.trace_symbol_keys(sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl Props {
+    /// The Symbols of Symbol-valued keys, which the encoded keys only name by id.
+    pub(crate) fn trace_symbol_keys(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        if let Some(symbols) = &self.elems.symbols {
+            for symbol in symbols.values() {
+                sink.word(symbol_identity(symbol) as u64);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for PropertyKey {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let PropertyKey {
+            text: _,
+            symbol,
+            private: _,
+        } = self;
+        if let Some(symbol) = symbol {
+            sink.word(symbol_identity(symbol) as u64);
         }
     }
 }
@@ -2508,7 +2645,7 @@ impl PackedValue {
     /// edge.
     pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self.tag() {
-            PACK_BIGINT => sink.word(self.0.get() & PACK_PAYLOAD),
+            PACK_BIGINT | PACK_SYM => sink.word(self.0.get() & PACK_PAYLOAD),
             _ => self.with_object_edge(|object| sink.object(object)),
         }
     }
@@ -2878,6 +3015,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         scope_desc: descs.scope,
         #[cfg(feature = "gc-heap")]
         bigint_desc: descs.bigint,
+        #[cfg(feature = "gc-heap")]
+        symbol_desc: descs.symbol,
     })
 }
 
@@ -2943,7 +3082,7 @@ pub(crate) fn enter_agent(heap: &GcHeap, symbols: &SymbolAgent) -> AgentActivati
     }
 }
 
-fn active_symbol(id: u64) -> Option<Rc<SymbolData>> {
+fn active_symbol(id: u64) -> Option<SymbolRef> {
     ACTIVE_SYMBOL_AGENT.with(|active| {
         active
             .borrow()
@@ -3886,7 +4025,7 @@ struct DenseBuffers {
     mirror: DenseDeque<f64>,
     /// Strong ownership for Symbol-valued property keys. String keys stay inline in `entries`;
     /// this cold sidecar exists only for objects that actually acquire a Symbol key.
-    symbols: Option<Box<crate::fasthash::FastMap<u64, Rc<SymbolData>>>>,
+    symbols: Option<Box<crate::fasthash::FastMap<u64, SymbolRef>>>,
     internal_slots: InternalSlots,
 }
 
@@ -5077,7 +5216,7 @@ impl Props {
             }
             if dense.symbols.is_some() {
                 bytes = bytes.saturating_add(std::mem::size_of::<
-                    crate::fasthash::FastMap<u64, Rc<SymbolData>>,
+                    crate::fasthash::FastMap<u64, SymbolRef>,
                 >());
                 exact = false;
             }

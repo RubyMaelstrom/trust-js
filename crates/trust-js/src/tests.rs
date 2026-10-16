@@ -3404,11 +3404,11 @@ fn symbol_registry_is_agent_owned_and_shared_by_realms() {
         .eval("Symbol.for('agent-key')", false)
         .expect("second registry insertion parses");
     let second_symbol = second.interp.symbol_agent.borrow().global_by_key["agent-key"].clone();
-    assert!(!std::rc::Rc::ptr_eq(&first_symbol, &second_symbol));
+    assert!(!crate::value::symbol_ptr_eq(&first_symbol, &second_symbol));
     first
         .eval("Symbol.for('agent-key')", false)
         .expect("first registry remains usable");
-    assert!(std::rc::Rc::ptr_eq(
+    assert!(crate::value::symbol_ptr_eq(
         &first_symbol,
         &first.interp.symbol_agent.borrow().global_by_key["agent-key"]
     ));
@@ -3621,21 +3621,23 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
             false,
         )
         .expect("symbol-key setup parses");
-    let held = engine
-        .interp
-        .symbol_agent
-        .borrow()
-        .symbols
-        .values()
-        .filter_map(std::rc::Weak::upgrade)
-        .find(|symbol| symbol.description.as_deref() == Some("property-only"))
-        .expect("symbol property key owns its identity");
-    let weak = std::rc::Rc::downgrade(&held);
-    drop(held);
+    // The strong handle stays in a helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let held = engine
+            .interp
+            .symbol_agent
+            .borrow()
+            .symbols
+            .values()
+            .filter_map(|weak| weak.upgrade())
+            .find(|symbol| symbol.description.as_deref() == Some("property-only"))
+            .expect("symbol property key owns its identity");
+        crate::value::symbol_downgrade(&held)
+    });
 
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_some(),
+        crate::gc_test::alive(&weak),
         "live property key lost its Symbol"
     );
     assert!(matches!(
@@ -3657,7 +3659,7 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
         .expect("symbol-key release parses");
     engine.interp.gc_collect();
     assert!(
-        weak.upgrade().is_none(),
+        !crate::gc_test::alive(&weak),
         "deleted property retained its Symbol"
     );
 
@@ -3673,10 +3675,11 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
     engine
         .eval("Symbol.for('registry-kept')", false)
         .expect("registered symbol parses");
-    let registered =
-        std::rc::Rc::downgrade(&engine.interp.symbol_agent.borrow().global_by_key["registry-kept"]);
+    let registered = crate::value::symbol_downgrade(
+        &engine.interp.symbol_agent.borrow().global_by_key["registry-kept"],
+    );
     engine.interp.gc_collect();
-    assert!(registered.upgrade().is_some());
+    assert!(crate::gc_test::alive(&registered));
     assert_eq!(
         run("Symbol.keyFor(Symbol.for('registry-kept'))"),
         "registry-kept"

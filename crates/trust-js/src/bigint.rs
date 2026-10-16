@@ -91,7 +91,7 @@ fn payload(data: BigIntData) -> Payload {
     #[cfg(not(feature = "gc-heap"))]
     return Rc::new(data);
     #[cfg(feature = "gc-heap")]
-    crate::gc_box::GcBox::new(data)
+    crate::gc_box::new(data)
 }
 
 #[cfg(feature = "gc-heap")]

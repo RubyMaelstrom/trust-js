@@ -701,3 +701,27 @@ a BigInt held only there was freed. Every value-to-edge conversion now
 goes through Value::cell_word; a new test covers WeakMap values and
 FinalizationRegistry held values (it fails without the fix). gc-heap
 lib suite 1828/0/114.
+
+Step 4c, Symbols as cells (gc-heap): a Symbol value's handle (SymbolRef:
+an Rc without gc-heap) is a cell in the Agent heap that minted it, with
+a "symbol" descriptor whose finalizer runs SymbolData's drop, which
+journals the death for WeakRefs, WeakMaps and FinalizationRegistries
+(gc-heap journals deaths when a collection finds them, not when a last
+handle drops). Weak handles (WeakSymbol) share the weak-cell table with
+objects. Roots: the Agent's Symbol.for registry and well-known Symbols,
+the interpreter's cached Symbol.iterator. Edges: values, packed property
+words, Symbol wrapper objects, Symbol-keyed properties' per-object
+sidecar (traced from object cells), class-evaluation property keys; a
+Symbol key of a WeakMap is now an ephemeron key like an object's. The
+Agent's id-to-Symbol index names each Symbol weakly, so a dead Symbol's
+cell stays reserved until the index drops its entry right after the
+collection that found it dead, and is freed by the next one. New tests:
+Symbols survive collections in every holder; dead ones are reclaimed and
+their WeakRef, WeakMap entry and FinalizationRegistry cell are cleared.
+Removing Symbol value tracing, or the registry roots, fails the survival
+test. Two weak_metadata tests asserting eager Symbol death notification
+are ignored with that reason; a third keeps its collection-based half.
+Results: gc-heap lib suite 1828/0/116, default 2149/0/3; 291 Symbol-,
+weak-collection-, property-key-, class- and ShadowRealm-related tests per
+test at stress interval 1: 268 pass, 23 ignored as in the suite; clippy
+clean on both feature sets; the workspace builds.

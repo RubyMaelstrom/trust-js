@@ -74,6 +74,19 @@ impl<T> WeakCell for std::rc::Weak<T> {
     }
 }
 
+/// A Symbol cell (gc-heap).
+#[cfg(feature = "gc-heap")]
+impl WeakCell for crate::value::WeakSymbol {
+    fn live_address(&self) -> Option<usize> {
+        self.upgrade()
+            .map(|symbol| crate::value::symbol_identity(&symbol))
+    }
+
+    fn heap(&self) -> Option<crate::value::GcHeap> {
+        None
+    }
+}
+
 impl WeakCell for crate::interpreter::WeakTarget {
     fn live_address(&self) -> Option<usize> {
         match self {

@@ -5593,7 +5593,7 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::BigInt(x), Value::BigInt(y)) => x == y,
-        (Value::Sym(x), Value::Sym(y)) => Rc::ptr_eq(x, y),
+        (Value::Sym(x), Value::Sym(y)) => crate::value::symbol_ptr_eq(x, y),
         (Value::Obj(x), Value::Obj(y)) => Gc::ptr_eq(x, y),
         _ => false,
     }

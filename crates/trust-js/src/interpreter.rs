@@ -799,14 +799,17 @@ impl WeakKey {
 #[derive(Clone)]
 pub(crate) enum WeakTarget {
     Object(crate::value::WeakGc),
-    Symbol(std::rc::Weak<SymbolData>, u64),
+    Symbol(crate::value::WeakSymbol, u64),
 }
 
 impl WeakTarget {
     pub(crate) fn of(value: &Value) -> Option<Self> {
         match value {
             Value::Obj(object) => Some(Self::Object(Gc::downgrade(object))),
-            Value::Sym(symbol) => Some(Self::Symbol(Rc::downgrade(symbol), symbol.id)),
+            Value::Sym(symbol) => Some(Self::Symbol(
+                crate::value::symbol_downgrade(symbol),
+                symbol.id,
+            )),
             _ => None,
         }
     }
@@ -3283,7 +3286,7 @@ pub struct Interp {
     pub(crate) construct_capacity_hints:
         crate::fasthash::FastMap<usize, (crate::value::WeakGc, crate::value::PropertyLayout)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
-    pub(crate) iterator_sym: Option<Rc<SymbolData>>,
+    pub(crate) iterator_sym: Option<crate::value::SymbolRef>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
     /// them so `@@iterator` etc. have the same identity cross-realm, as the spec requires.
     /// Well-known symbol descriptors and their internal property-map keys. The key is formatted
@@ -5792,12 +5795,14 @@ impl Interp {
             .next_id
             .checked_add(1)
             .expect("ECMAScript Agent exhausted its Symbol identity space");
-        let data = Rc::new(SymbolData {
+        let data = crate::value::new_symbol_ref(SymbolData {
             id: agent.next_id,
             description,
             weak_observers: RefCell::new(None),
         });
-        agent.symbols.insert(data.id, Rc::downgrade(&data));
+        agent
+            .symbols
+            .insert(data.id, crate::value::symbol_downgrade(&data));
         // Symbol-only churn does not advance the object collector's allocation trigger. Prune
         // expired identity entries geometrically so a script that repeatedly calls Symbol()
         // remains bounded without making an all-live workload quadratic.
@@ -5808,7 +5813,7 @@ impl Interp {
     }
 
     /// ECMA-262 §20.4.2.2 Symbol.for, backed by the surrounding Agent Record.
-    pub(crate) fn symbol_for(&mut self, key: String) -> Rc<SymbolData> {
+    pub(crate) fn symbol_for(&mut self, key: String) -> crate::value::SymbolRef {
         if let Some(symbol) = self
             .symbol_agent
             .borrow()
@@ -5830,17 +5835,17 @@ impl Interp {
 
     /// ECMA-262 §20.4.5.2 KeyForSymbol. The reverse Agent index makes the normative registry
     /// identity lookup O(1), with a pointer check guarding values from an unrelated Agent.
-    pub(crate) fn symbol_key_for(&self, symbol: &Rc<SymbolData>) -> Option<String> {
+    pub(crate) fn symbol_key_for(&self, symbol: &crate::value::SymbolRef) -> Option<String> {
         let agent = self.symbol_agent.borrow();
         let key = agent.global_key_by_id.get(&symbol.id)?;
         agent
             .global_by_key
             .get(key)
-            .is_some_and(|registered| Rc::ptr_eq(registered, symbol))
+            .is_some_and(|registered| crate::value::symbol_ptr_eq(registered, symbol))
             .then(|| key.to_string())
     }
 
-    pub(crate) fn symbol_is_registered(&self, symbol: &Rc<SymbolData>) -> bool {
+    pub(crate) fn symbol_is_registered(&self, symbol: &crate::value::SymbolRef) -> bool {
         self.symbol_key_for(symbol).is_some()
     }
 

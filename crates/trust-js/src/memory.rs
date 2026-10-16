@@ -550,8 +550,8 @@ impl Visitor {
         }
     }
 
-    pub(crate) fn symbol(&mut self, value: &Rc<SymbolData>) {
-        let identity = Rc::as_ptr(value) as usize;
+    pub(crate) fn symbol(&mut self, value: &crate::value::SymbolRef) {
+        let identity = crate::value::symbol_identity(value);
         if self.symbols.insert(identity) {
             self.strings_symbols_bigints = self
                 .strings_symbols_bigints
@@ -2304,12 +2304,12 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
         agent
             .symbols
             .len()
-            .saturating_mul(size_of::<(u64, std::rc::Weak<SymbolData>)>())
+            .saturating_mul(size_of::<(u64, crate::value::WeakSymbol)>())
             .saturating_add(
                 agent
                     .global_by_key
                     .len()
-                    .saturating_mul(size_of::<(Rc<str>, Rc<SymbolData>)>()),
+                    .saturating_mul(size_of::<(Rc<str>, crate::value::SymbolRef)>()),
             )
             .saturating_add(
                 agent
@@ -2321,7 +2321,7 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
                 agent
                     .well_known
                     .len()
-                    .saturating_mul(size_of::<(&'static str, Rc<SymbolData>)>()),
+                    .saturating_mul(size_of::<(&'static str, crate::value::SymbolRef)>()),
             ),
     );
     totals

@@ -614,6 +614,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_empty_safepoints_do_not_borrow_and_preserve_ready_cleanup() {
         let mut engine = Engine::new();
@@ -960,17 +964,22 @@ mod tests {
 
     #[test]
     fn weak_metadata_safepoint_honors_suppression_and_validates_cleanup_owners() {
-        let mut engine = Engine::new();
-        let value = engine.interp.new_symbol(None);
-        let target = WeakTarget::of(&value).unwrap();
-        let reference = reference(&mut engine.interp, &target);
-        drop(value);
-        engine.interp.gc_suppressed += 1;
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 1);
-        engine.interp.gc_suppressed -= 1;
-        engine.interp.gc_weak_metadata_safepoint(true);
-        assert!(engine.interp.weak_refs[&(Gc::as_ptr(&reference) as usize)].is_none());
+        // Reference counting journals a Symbol's death as its last handle drops, for the next
+        // unsuppressed safepoint; gc-heap journals and drains deaths within a collection.
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            let mut engine = Engine::new();
+            let value = engine.interp.new_symbol(None);
+            let target = WeakTarget::of(&value).unwrap();
+            let reference = reference(&mut engine.interp, &target);
+            drop(value);
+            engine.interp.gc_suppressed += 1;
+            engine.interp.gc_weak_metadata_safepoint(true);
+            assert_eq!(engine.interp.weak_metadata.deaths.pending_len(), 1);
+            engine.interp.gc_suppressed -= 1;
+            engine.interp.gc_weak_metadata_safepoint(true);
+            assert!(engine.interp.weak_refs[&(Gc::as_ptr(&reference) as usize)].is_none());
+        }
         // Under GC stress a collection inside the loop finds targets dead while the registry
         // is still live and enqueues its cleanup job, which keeps the registry alive and runs at
         // the evaluation's own checkpoint: only the kept registry's final results are timing-free.
@@ -991,6 +1000,10 @@ mod tests {
                 if keep_owner { "registry=owner;" } else { "" }
             );
             eval(&mut engine, &source, "0");
+            // The registered Symbols die at once under reference counting; a tracing heap
+            // finds them, with a dead registry's cells, at a collection.
+            #[cfg(feature = "gc-heap")]
+            engine.interp.gc_collect();
             if !stress {
                 assert_eq!(
                     !engine.interp.pending_finalization_cleanup.is_empty(),
@@ -1185,13 +1198,17 @@ mod tests {
         assert!(engine.interp.weak_metadata.targets.is_empty());
     }
 
+    #[cfg_attr(
+        feature = "gc-heap",
+        ignore = "P1 S2: asserts eager (reference-count) death notification; gc-heap notifies at collections"
+    )]
     #[test]
     fn weak_metadata_symbol_destruction_does_not_reborrow_its_agent() {
         let mut engine = Engine::new();
         let Value::Sym(symbol) = engine.interp.new_symbol(None) else {
             unreachable!()
         };
-        let target = WeakTarget::Symbol(Rc::downgrade(&symbol), symbol.id);
+        let target = WeakTarget::Symbol(crate::value::symbol_downgrade(&symbol), symbol.id);
         let owner = reference(&mut engine.interp, &target);
         let agent = engine.interp.symbol_agent.clone();
         let borrowed = agent.borrow_mut();
