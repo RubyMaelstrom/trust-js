@@ -171,6 +171,7 @@ fn assignment_store_retains_new_host_owners_and_releases_final_old_owners() {
                         let _keep = &witness;
                         Ok(Value::Undefined)
                     }),
+                    crate::value::NativeCaptures::None,
                 )))
             });
         eval(&mut engine, "function put(o,v){return o.field=v;}var o={field:0};for(var warm=0;warm<160;warm++)put(o,warm);");

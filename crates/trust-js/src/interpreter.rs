@@ -6896,25 +6896,16 @@ impl Interp {
 
     /// A function `Value` backed by a data-carrying native closure — the embedder API for host
     /// functions that must capture state (N-API callbacks carrying a C fn pointer + `void*`).
+    /// `captures` declares the closure's JavaScript values (none, or a reporter for them, which
+    /// also takes part in managed-memory diagnostics and may share the closure's state).
     pub fn new_native_fn(
         &self,
         name: &str,
         len: usize,
         f: std::rc::Rc<crate::value::NativeClosure>,
+        captures: crate::value::NativeCaptures,
     ) -> Value {
-        Value::Obj(self.make_native_closure(name, len, f))
-    }
-
-    /// A data-carrying native function whose captured ownership participates in managed-memory
-    /// diagnostics. The callable and reporter may share one `Rc` state allocation.
-    pub fn new_native_fn_with_retained_memory(
-        &self,
-        name: &str,
-        len: usize,
-        f: std::rc::Rc<crate::value::NativeClosure>,
-        retained: std::rc::Rc<dyn crate::value::NativeCallableRetained>,
-    ) -> Value {
-        Value::Obj(self.make_native_closure_with_retained_memory(name, len, f, retained))
+        Value::Obj(self.make_native_closure(name, len, f, captures))
     }
 
     /// A native function whose JavaScript captures are owned and traced by the
@@ -6946,38 +6937,20 @@ impl Interp {
     }
 
     /// A function object backed by a data-carrying native closure (see [`NativeClosure`]). Like
-    /// [`make_native`], but the callable can capture host state (used for N-API functions).
+    /// [`make_native`], but the callable can capture host state (used for N-API functions);
+    /// `captures` declares its JavaScript values (see [`Self::new_native_fn`]).
     pub fn make_native_closure(
         &self,
         name: &str,
         len: usize,
         f: std::rc::Rc<crate::value::NativeClosure>,
-    ) -> Gc {
-        self.make_native_closure_impl(name, len, f, None)
-    }
-
-    pub fn make_native_closure_with_retained_memory(
-        &self,
-        name: &str,
-        len: usize,
-        f: std::rc::Rc<crate::value::NativeClosure>,
-        retained: std::rc::Rc<dyn crate::value::NativeCallableRetained>,
-    ) -> Gc {
-        self.make_native_closure_impl(name, len, f, Some(retained))
-    }
-
-    fn make_native_closure_impl(
-        &self,
-        name: &str,
-        len: usize,
-        f: std::rc::Rc<crate::value::NativeClosure>,
-        retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
+        captures: crate::value::NativeCaptures,
     ) -> Gc {
         self.make_native_callable(
             name,
             len,
             crate::value::NativeCallableBody::Opaque(f),
-            retained,
+            captures.into_reporter(),
         )
     }
 

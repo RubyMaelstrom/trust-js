@@ -988,15 +988,21 @@ impl Engine {
     }
 }
 
+/// Paths the exported macros (`value_free!`) expand to.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::host::{HostGcVisitor, HostTrace};
+}
+
 /// The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
 /// APIs) built on top of the engine. Gated because everything here is a semver commitment on a
 /// published crate; it stabilizes together with the `trust-js-host`/`trust-js-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
     pub use crate::host::{
-        HostGc, HostGcVisitor, HostRetainedMemoryVisitor, NativeGcId, OpState, ResourceId,
-        ResourceTable, RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory,
-        RetainedMemory,
+        HostGc, HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, NativeGcId, OpState,
+        ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
+        RetainedExternalMemory, RetainedMemory,
     };
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
@@ -1004,13 +1010,12 @@ pub mod embed {
     /// JS values. Matching/constructing the primitive variants is supported API; object
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
-    /// [`Ctx::new_native_fn`] when the host function must capture state, or with
-    /// [`Ctx::new_native_fn_with_retained_memory`] when that state must participate in managed
-    /// memory diagnostics. For JavaScript captures, prefer
+    /// [`Ctx::new_native_fn`] when the host function must capture state, declaring its
+    /// JavaScript captures ([`NativeCaptures`]). For JavaScript captures, prefer
     /// [`Ctx::new_native_fn_with_captures`]: memory reporting alone does not make
     /// opaque Rust captures collectable cycles.
     pub use crate::value::{
-        NativeCallableRetained, NativeCaptureFn, NativeClosure, NativeFn,
+        NativeCallableRetained, NativeCaptureFn, NativeCaptures, NativeClosure, NativeFn,
         NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value,
     };
 

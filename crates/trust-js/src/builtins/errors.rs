@@ -356,7 +356,11 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
         }
         _ => Skip::None,
     };
-    let trace = std::cell::RefCell::new(i.capture_stack_trace(skip));
+    // The frames' names are engine strings the getter reports as its captures.
+    let captured = Rc::new(CapturedTrace(std::cell::RefCell::new(
+        i.capture_stack_trace(skip),
+    )));
+    let trace = captured.clone();
     // The getter answers only for the object it was installed on, which it must not keep alive.
     let holder = Gc::downgrade(&target);
     let getter = i.make_native_closure(
@@ -365,12 +369,13 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
         Rc::new(move |i: &mut Interp, this: Value, _: &[Value]| {
             let installed = matches!(&this, Value::Obj(object)
                 if std::ptr::eq(Gc::as_ptr(object), holder.as_ptr()));
-            let lines = match trace.borrow_mut().as_deref_mut() {
+            let lines = match trace.0.borrow_mut().as_deref_mut() {
                 Some(trace) if installed => trace.lines(),
                 _ => return Ok(Value::Undefined),
             };
             stack_string(i, &this, &lines)
         }),
+        crate::value::NativeCaptures::Reported(captured),
     );
     // Assignment replaces the accessor with an ordinary data property.
     let setter = i.make_native_closure(
@@ -383,6 +388,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
             }
             Ok(Value::Undefined)
         }),
+        crate::value::NativeCaptures::None,
     );
     let desc = i.new_object();
     set_data(&desc, "get", Value::Obj(getter));
@@ -464,4 +470,15 @@ pub(super) fn install_error_cause(
         }
     }
     Ok(())
+}
+
+/// An `Error.captureStackTrace` getter's frames, whose names it holds.
+struct CapturedTrace(std::cell::RefCell<Option<Box<crate::stack_trace::StackTrace>>>);
+
+impl crate::value::NativeCallableRetained for CapturedTrace {
+    fn scan_retained_memory(&self, visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor) {
+        if let Some(trace) = self.0.borrow().as_deref() {
+            trace.for_each_name(|name| visitor.value(&Value::Str(name.clone())));
+        }
+    }
 }

@@ -668,8 +668,11 @@ mod tests {
             calls: Rc<Cell<usize>>,
             held: Option<Value>,
         }
-        impl crate::host::HostGc for JobRoots {
+        impl crate::host::HostTrace for JobRoots {
             fn trace_gc(&self, _: &mut dyn crate::host::HostGcVisitor) {}
+        }
+
+        impl crate::host::HostGc for JobRoots {
             fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {}
             fn end_job(&mut self) {
                 self.calls.set(self.calls.get() + 1);

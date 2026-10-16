@@ -2469,6 +2469,14 @@ mod tests {
         requested_bytes: usize,
     }
 
+    crate::value_free!(ReportedHostState, ExternalWasmState);
+
+    impl crate::host::HostTrace for ReportedManagedHostState {
+        fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
+            visitor.root(&self.value);
+        }
+    }
+
     impl RetainedBytes for ReportedHostState {
         fn retained_bytes(&self) -> usize {
             self.0.capacity()
@@ -2932,7 +2940,8 @@ mod tests {
                 Ok(Value::Undefined)
             },
         );
-        let object = interp.make_native_closure("capturing", 0, closure);
+        let object =
+            interp.make_native_closure("capturing", 0, closure, crate::value::NativeCaptures::None);
         let snapshot = measure(&interp, &[object], &[]);
 
         assert!(!snapshot.callable_metadata.coverage_complete);
@@ -3006,18 +3015,18 @@ mod tests {
             )
         };
         let (first_callable, first_reporter) = make_closure();
-        let first = interp.make_native_closure_with_retained_memory(
+        let first = interp.make_native_closure(
             "first",
             0,
             first_callable,
-            first_reporter,
+            crate::value::NativeCaptures::Reported(first_reporter),
         );
         let (second_callable, second_reporter) = make_closure();
-        let second = interp.make_native_closure_with_retained_memory(
+        let second = interp.make_native_closure(
             "second",
             0,
             second_callable,
-            second_reporter,
+            crate::value::NativeCaptures::Reported(second_reporter),
         );
         let snapshot = measure(&interp, &[first, second], &[]);
 
@@ -3057,6 +3066,7 @@ mod tests {
             "registeredOperation",
             0,
             Rc::new(|_i, _this, _args| Ok(Value::Undefined)),
+            crate::value::NativeCaptures::None,
         );
         callable.borrow_mut().props.insert(
             "name",

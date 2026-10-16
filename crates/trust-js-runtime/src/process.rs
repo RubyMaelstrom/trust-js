@@ -15,6 +15,8 @@ use crate::console::ConsoleOut;
 /// Process-start monotonic reference for `hrtime()`.
 struct ProcStart(Instant);
 
+trust_js_host::value_free!(ProcStart);
+
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "process",

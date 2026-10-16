@@ -217,6 +217,9 @@ pub struct NetRegistry {
     servers: HashMap<u64, ServerEntry>,
 }
 
+// Sockets and servers (events dispatch through queued callbacks): no JavaScript values.
+trust_js_host::value_free!(NetRegistry, DgramRegistry);
+
 struct UdpEntry {
     socket: Arc<UdpSocket>,
     closed: Arc<AtomicBool>,

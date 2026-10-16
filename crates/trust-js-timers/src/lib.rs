@@ -71,6 +71,20 @@ pub struct Timers {
     current_nesting: u32,
 }
 
+/// Armed timers' handler functions and arguments run later: roots until cleared or run.
+impl trust_js_host::HostTrace for Timers {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.entries.values() {
+            if let TimerHandler::Function(handler) = &entry.handler {
+                visitor.root(handler);
+            }
+            for arg in &entry.args {
+                visitor.root(arg);
+            }
+        }
+    }
+}
+
 impl Timers {
     fn allocate_id(&mut self) -> u32 {
         assert!(

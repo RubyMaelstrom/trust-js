@@ -251,3 +251,15 @@ pub(crate) fn stress_active() -> bool {
     #[cfg(not(feature = "gc-heap"))]
     false
 }
+
+/// The JavaScript values a test's native closure captures, reported for it
+/// (`NativeCaptures::Reported`).
+pub(crate) struct CapturedValues(pub(crate) Vec<crate::value::Value>);
+
+impl crate::value::NativeCallableRetained for CapturedValues {
+    fn scan_retained_memory(&self, visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor) {
+        for value in &self.0 {
+            visitor.value(value);
+        }
+    }
+}

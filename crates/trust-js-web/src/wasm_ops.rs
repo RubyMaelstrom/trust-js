@@ -29,6 +29,16 @@ pub(crate) struct WasmStore {
     memory_buffers: HashMap<usize, MemoryBuffer>,
 }
 
+/// Each memory's JavaScript ArrayBuffer, kept for as long as the store maps it. Host
+/// functions are held weakly.
+impl trust_js_host::HostTrace for WasmStore {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for memory in self.memory_buffers.values() {
+            visitor.root(&memory.buffer);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WasmRoot {
     Module(u32),

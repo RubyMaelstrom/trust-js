@@ -134,6 +134,15 @@ struct FfiState {
     callbacks: Vec<Vec<Option<CbEntry>>>,
 }
 
+/// Registered JSCallbacks' JavaScript functions: roots while registered.
+impl trust_js_host::HostTrace for FfiState {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.callbacks.iter().flatten().flatten() {
+            visitor.root(&entry.func);
+        }
+    }
+}
+
 fn ffi_state(ctx: &mut Ctx) -> &mut FfiState {
     if ctx.host_mut::<FfiState>().is_none() {
         let st = FfiState {

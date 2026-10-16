@@ -35,6 +35,9 @@ pub struct ChildRegistry {
     procs: HashMap<u32, ChildProc>,
 }
 
+// Child processes and their pipes: no JavaScript values.
+trust_js_host::value_free!(ChildRegistry);
+
 impl Drop for ChildRegistry {
     fn drop(&mut self) {
         for process in self.procs.values() {

@@ -293,7 +293,7 @@ mod tests {
         live_native: Vec<bool>,
     }
 
-    impl crate::host::HostGc for MixedHost {
+    impl crate::host::HostTrace for MixedHost {
         fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
             assert!(visitor.supports_native());
             for (id, value) in self.values.iter().enumerate() {
@@ -309,6 +309,9 @@ mod tests {
                 visitor.native_root(node(5, 0));
             }
         }
+    }
+
+    impl crate::host::HostGc for MixedHost {
         fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {
             panic!("mixed collector must supply native liveness");
         }

@@ -17,6 +17,10 @@ trust-js-node = { path = "../trust-js-node" }
 trust-js-timers = { path = "../trust-js-timers" }
 trust-js-web = { path = "../trust-js-web" }
 
+[features]
+# P1 S2: run on the engine's tracing heap.
+gc-heap = ["trust-js-host/gc-heap"]
+
 [lints]
 workspace = true
 

@@ -22,6 +22,9 @@ struct ForeignArrayDropState {
     drops: Rc<Cell<usize>>,
 }
 
+// The foreign Engine is a separate Agent: none of this Agent's values.
+crate::value_free!(ForeignArrayDropState);
+
 impl Drop for ForeignArrayWriteOnDrop {
     fn drop(&mut self) {
         let mut engine = self.engine.borrow_mut();
@@ -61,9 +64,11 @@ fn make_foreign_array_dropper(
     let state = interp
         .host::<ForeignArrayDropState>()
         .expect("foreign array dropper state");
+    let receiver = args.first().cloned().unwrap_or(Value::Undefined);
+    let captures = Rc::new(crate::gc_test::CapturedValues(vec![receiver.clone()]));
     let payload = ForeignArrayWriteOnDrop {
         engine: state.engine.clone(),
-        receiver: args.first().cloned().unwrap_or(Value::Undefined),
+        receiver,
         drops: state.drops.clone(),
     };
     Ok(Value::Obj(interp.make_native_closure(
@@ -73,6 +78,7 @@ fn make_foreign_array_dropper(
             let _keep_payload = &payload;
             Ok(Value::Undefined)
         }),
+        crate::value::NativeCaptures::Reported(captures),
     )))
 }
 
@@ -127,6 +133,7 @@ fn engine(tier: Tier) -> Engine {
                     let _keep_alive = &witness;
                     Ok(crate::value::Value::Undefined)
                 }),
+                crate::value::NativeCaptures::None,
             )))
         },
     );

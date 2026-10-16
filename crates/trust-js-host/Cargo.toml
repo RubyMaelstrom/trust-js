@@ -13,5 +13,9 @@ publish = false
 [dependencies]
 trust-js = { path = "../trust-js", features = ["embed"] }
 
+[features]
+# P1 S2: run on the engine's tracing heap (see docs/v8-chase-p1-plan-2026-10-15.txt).
+gc-heap = ["trust-js/gc-heap"]
+
 [lints]
 workspace = true

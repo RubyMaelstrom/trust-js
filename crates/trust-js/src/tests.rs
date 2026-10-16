@@ -6481,6 +6481,7 @@ fn promise_jobs_restore_their_embedder_settings_context() {
         entered: Vec<u64>,
         leaves: usize,
     }
+    crate::value_free!(ContextTrace);
 
     fn set_context(
         ctx: &mut crate::embed::Ctx,
@@ -6554,6 +6555,7 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
         entered: Vec<(u64, String)>,
         leaves: usize,
     }
+    crate::value_free!(ContextTrace);
 
     fn set_context(
         ctx: &mut crate::embed::Ctx,
@@ -7044,6 +7046,16 @@ fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup
     let calls = Rc::new(Cell::new(0));
     let captured = Rc::new(RefCell::new(Value::Undefined));
     let weak_capture = Rc::downgrade(&captured);
+    /// The callback's captured cell, reported for it.
+    struct CapturedCell(Rc<RefCell<Value>>);
+    impl crate::value::NativeCallableRetained for CapturedCell {
+        fn scan_retained_memory(
+            &self,
+            visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor,
+        ) {
+            visitor.value(&self.0.borrow());
+        }
+    }
     let callback = engine.ctx().new_native_fn(
         "recordCleanup",
         0,
@@ -7055,6 +7067,7 @@ fn engine_teardown_releases_native_capture_cycles_without_running_author_cleanup
                 Ok(captured.borrow().clone())
             }
         }),
+        crate::value::NativeCaptures::Reported(Rc::new(CapturedCell(captured.clone()))),
     );
     *captured.borrow_mut() = callback.clone();
     engine

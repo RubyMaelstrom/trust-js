@@ -273,6 +273,9 @@ struct SqliteState {
     stmts: HashMap<u32, Stmt>,
 }
 
+// The SQLite library, databases and statements: no JavaScript values.
+trust_js_host::value_free!(SqliteState);
+
 impl SqliteState {
     fn next_id(&mut self) -> u32 {
         self.next += 1;

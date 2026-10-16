@@ -77,6 +77,9 @@ pub struct TlsRegistry {
     listeners: std::collections::HashMap<u64, ListenerEntry>,
 }
 
+// TLS sockets and listeners: no JavaScript values.
+trust_js_host::value_free!(TlsRegistry);
+
 struct ListenerEntry {
     listener: Arc<TcpListener>,
     closed: Arc<AtomicBool>,

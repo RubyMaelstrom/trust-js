@@ -44,13 +44,63 @@ pub trait RetainedMemory {
     fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor);
 }
 
-/// Native caches can own JavaScript references without making them permanent roots.
-/// Implementations must enumerate each owned strong handle exactly once with `internal`,
-/// then describe the logical edges that keep it alive. Omitted handles remain ordinary
-/// conservative roots, which is the safe fallback when a native store is currently borrowed.
-/// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
-pub trait HostGc {
+/// What every value an Agent keeps for its host declares (P1 S2, Decision 2): the JavaScript
+/// values it holds, so the type system, not review, enforces that host state is enumerated.
+/// [`OpState::put`] and [`ResourceTable::add`] require it. Report each strong handle once with
+/// `internal`, then each value that must stay alive with `root`, or with `edge` from the
+/// JavaScript owner that keeps it alive. A tracing collector (`gc-heap`) keeps alive exactly
+/// what this reports; reference counting also keeps unreported handles alive (the counted
+/// build's conservative fallback, which retires with it). A type that holds no JavaScript
+/// values declares so with [`value_free!`](crate::value_free). These callbacks must not execute
+/// JavaScript, allocate JS objects, or re-enter collection.
+pub trait HostTrace {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
+}
+
+/// Declare host types that hold no JavaScript values ([`HostTrace`] with nothing to report):
+/// `trust_js::value_free!(Config, Counter);`.
+#[macro_export]
+macro_rules! value_free {
+    ($($host:ty),+ $(,)?) => {
+        $(
+            impl $crate::__private::HostTrace for $host {
+                #[inline]
+                fn trace_gc(&self, _: &mut dyn $crate::__private::HostGcVisitor) {}
+            }
+        )+
+    };
+}
+
+value_free!(
+    (),
+    bool,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i32,
+    i64,
+    f64,
+    String,
+    Vec<u8>,
+    std::time::Instant,
+    std::time::Duration,
+    std::path::PathBuf,
+    Rc<std::cell::Cell<usize>>,
+    Rc<std::cell::Cell<bool>>,
+    std::fs::File,
+    std::cell::RefCell<std::fs::File>,
+    std::net::TcpStream,
+    std::net::TcpListener,
+    std::net::UdpSocket,
+);
+
+/// Native caches can own JavaScript references without making them permanent roots: beside the
+/// [`HostTrace`] enumeration (whose unreported handles the cache does not keep alive), they
+/// release job-scoped roots and evict dead handles. Register with [`OpState::register_gc`].
+/// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
+pub trait HostGc: HostTrace {
     /// Release temporary native roots at the same synchronous-job boundary as ClearKeptObjects.
     /// This may update native bookkeeping only: no JavaScript, JS allocation or collection.
     /// Persistent async work must own explicit roots rather than relying on a job lease.
@@ -116,8 +166,23 @@ pub trait HostGcVisitor {
     fn native_root(&mut self, _id: NativeGcId) {}
 }
 
+/// A host value's [`HostTrace`], recorded when it is stored (gc-heap).
+#[cfg(feature = "gc-heap")]
+type HostTracer = fn(&dyn Any, &mut dyn HostGcVisitor);
+
+#[cfg(feature = "gc-heap")]
+fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisitor) {
+    value
+        .downcast_ref::<T>()
+        .expect("host tracer must match its stored value type")
+        .trace_gc(visitor);
+}
+
 #[derive(Clone, Copy)]
 struct GcReporter {
+    /// The counted build's cycle collector traces registered caches only (gc-heap traces every
+    /// slot through its `HostTrace`).
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
     trace: fn(&dyn Any, &mut dyn HostGcVisitor),
     end_job: fn(&mut dyn Any),
     sweep_native: fn(&mut dyn Any, &dyn Fn(&Value) -> bool, &dyn Fn(NativeGcId) -> bool),
@@ -258,14 +323,24 @@ pub struct OpState {
     managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
     gc_reporters: HashMap<TypeId, GcReporter>,
+    /// Every slot's [`HostTrace`] (gc-heap: the host roots of a collection).
+    #[cfg(feature = "gc-heap")]
+    tracers: crate::fasthash::FastMap<TypeId, HostTracer>,
     pub resources: ResourceTable,
 }
 
 impl OpState {
-    /// Install (or replace) the `T` slot.
-    pub fn put<T: Any>(&mut self, value: T) {
+    /// Store `value` in the `T` slot with its [`HostTrace`].
+    fn insert<T: Any + HostTrace>(&mut self, value: T) -> TypeId {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
+        #[cfg(feature = "gc-heap")]
+        self.tracers.insert(type_id, host_tracer::<T>);
+        type_id
+    }
+    /// Install (or replace) the `T` slot.
+    pub fn put<T: Any + HostTrace>(&mut self, value: T) {
+        let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
@@ -273,9 +348,8 @@ impl OpState {
     /// Install a slot whose owned heap storage participates in retained-memory diagnostics and
     /// which retains no separately allocated external backing. Use
     /// [`Self::put_retained_with_external_memory`] when both kinds are present.
-    pub fn put_retained<T: Any + RetainedBytes>(&mut self, value: T) {
-        let type_id = TypeId::of::<T>();
-        self.map.insert(type_id, Box::new(value));
+    pub fn put_retained<T: Any + HostTrace + RetainedBytes>(&mut self, value: T) {
+        let type_id = self.insert(value);
         self.retained_reporters
             .insert(type_id, report_retained::<T>);
         self.managed_reporters.remove(&type_id);
@@ -283,30 +357,29 @@ impl OpState {
     }
     /// Install a slot whose shared allocations and JavaScript roots participate in the
     /// identity-aware Agent-wide retained-memory visit and which owns no external backing.
-    pub fn put_retained_memory<T: Any + RetainedMemory>(&mut self, value: T) {
-        let type_id = TypeId::of::<T>();
-        self.map.insert(type_id, Box::new(value));
+    pub fn put_retained_memory<T: Any + HostTrace + RetainedMemory>(&mut self, value: T) {
+        let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters
             .insert(type_id, managed_reporter::<T>());
         self.external_reporters.remove(&type_id);
     }
     /// Install a slot that reports external backing while leaving its host metadata unavailable.
-    pub fn put_external_memory<T: Any + RetainedExternalMemory>(&mut self, value: T) {
-        let type_id = TypeId::of::<T>();
-        self.map.insert(type_id, Box::new(value));
+    pub fn put_external_memory<T: Any + HostTrace + RetainedExternalMemory>(&mut self, value: T) {
+        let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
         self.external_reporters
             .insert(type_id, report_external::<T>);
     }
     /// Install a slot that reports both host metadata and external backing.
-    pub fn put_retained_with_external_memory<T: Any + RetainedBytes + RetainedExternalMemory>(
+    pub fn put_retained_with_external_memory<
+        T: Any + HostTrace + RetainedBytes + RetainedExternalMemory,
+    >(
         &mut self,
         value: T,
     ) {
-        let type_id = TypeId::of::<T>();
-        self.map.insert(type_id, Box::new(value));
+        let type_id = self.insert(value);
         self.retained_reporters
             .insert(type_id, report_retained::<T>);
         self.managed_reporters.remove(&type_id);
@@ -315,13 +388,12 @@ impl OpState {
     }
     /// Install a slot with identity-aware managed-memory and external-backing reporters.
     pub fn put_retained_memory_with_external_memory<
-        T: Any + RetainedMemory + RetainedExternalMemory,
+        T: Any + HostTrace + RetainedMemory + RetainedExternalMemory,
     >(
         &mut self,
         value: T,
     ) {
-        let type_id = TypeId::of::<T>();
-        self.map.insert(type_id, Box::new(value));
+        let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters
             .insert(type_id, managed_reporter::<T>());
@@ -340,6 +412,8 @@ impl OpState {
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
+        #[cfg(feature = "gc-heap")]
+        self.tracers.remove(&type_id);
         Some(*value.downcast().ok()?)
     }
     pub fn has<T: Any>(&self) -> bool {
@@ -364,7 +438,20 @@ impl OpState {
         );
     }
 
+    /// Report the host's JavaScript values: every slot's and resource's [`HostTrace`] (gc-heap:
+    /// these are the host roots), or the registered [`HostGc`] caches' (reference counting
+    /// keeps every other host handle alive).
     pub(crate) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        #[cfg(feature = "gc-heap")]
+        {
+            for (key, tracer) in &self.tracers {
+                if let Some(value) = self.map.get(key) {
+                    tracer(value.as_ref(), visitor);
+                }
+            }
+            self.resources.trace_gc(visitor);
+        }
+        #[cfg(not(feature = "gc-heap"))]
         for (key, reporter) in &self.gc_reporters {
             if let Some(value) = self.map.get(key) {
                 (reporter.trace)(value.as_ref(), visitor);
@@ -484,37 +571,45 @@ pub struct ResourceTable {
     retained_reporters: HashMap<ResourceId, RetainedReporter>,
     managed_reporters: HashMap<ResourceId, ManagedReporter>,
     external_reporters: HashMap<ResourceId, ExternalReporter>,
+    /// Every resource's [`HostTrace`] (gc-heap).
+    #[cfg(feature = "gc-heap")]
+    tracers: HashMap<ResourceId, HostTracer>,
 }
 
 impl ResourceTable {
     /// Store `resource` under a fresh id. Ids are never reused, so once ids 0..u32::MAX have been
     /// handed out the id space is exhausted and this panics rather than recycle an id a script
     /// may still hold.
-    pub fn add<T: Any>(&mut self, resource: T) -> ResourceId {
+    pub fn add<T: Any + HostTrace>(&mut self, resource: T) -> ResourceId {
         let rid = self.next;
         self.next = rid
             .checked_add(1)
             .expect("ResourceTable id space exhausted; ids are never reused");
         self.map.insert(rid, Rc::new(resource));
+        #[cfg(feature = "gc-heap")]
+        self.tracers.insert(rid, host_tracer::<T>);
         rid
     }
     /// Add a resource whose owned heap storage participates in retained-memory diagnostics and
     /// which retains no separately allocated external backing. Use
     /// [`Self::add_retained_with_external_memory`] when both kinds are present.
-    pub fn add_retained<T: Any + RetainedBytes>(&mut self, resource: T) -> ResourceId {
+    pub fn add_retained<T: Any + HostTrace + RetainedBytes>(&mut self, resource: T) -> ResourceId {
         let rid = self.add(resource);
         self.retained_reporters.insert(rid, report_retained::<T>);
         rid
     }
     /// Add a resource whose shared allocations and JavaScript roots participate in the
     /// identity-aware Agent-wide retained-memory visit.
-    pub fn add_retained_memory<T: Any + RetainedMemory>(&mut self, resource: T) -> ResourceId {
+    pub fn add_retained_memory<T: Any + HostTrace + RetainedMemory>(
+        &mut self,
+        resource: T,
+    ) -> ResourceId {
         let rid = self.add(resource);
         self.managed_reporters.insert(rid, managed_reporter::<T>());
         rid
     }
     /// Add a resource that reports external backing while leaving its host metadata unavailable.
-    pub fn add_external_memory<T: Any + RetainedExternalMemory>(
+    pub fn add_external_memory<T: Any + HostTrace + RetainedExternalMemory>(
         &mut self,
         resource: T,
     ) -> ResourceId {
@@ -523,7 +618,9 @@ impl ResourceTable {
         rid
     }
     /// Add a resource that reports both host metadata and external backing.
-    pub fn add_retained_with_external_memory<T: Any + RetainedBytes + RetainedExternalMemory>(
+    pub fn add_retained_with_external_memory<
+        T: Any + HostTrace + RetainedBytes + RetainedExternalMemory,
+    >(
         &mut self,
         resource: T,
     ) -> ResourceId {
@@ -533,7 +630,7 @@ impl ResourceTable {
     }
     /// Add a resource with identity-aware managed-memory and external-backing reporters.
     pub fn add_retained_memory_with_external_memory<
-        T: Any + RetainedMemory + RetainedExternalMemory,
+        T: Any + HostTrace + RetainedMemory + RetainedExternalMemory,
     >(
         &mut self,
         resource: T,
@@ -541,6 +638,15 @@ impl ResourceTable {
         let rid = self.add_retained_memory(resource);
         self.external_reporters.insert(rid, report_external::<T>);
         rid
+    }
+    /// Report every open resource's JavaScript values (gc-heap).
+    #[cfg(feature = "gc-heap")]
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        for (rid, tracer) in &self.tracers {
+            if let Some(resource) = self.map.get(rid) {
+                tracer(resource.as_ref(), visitor);
+            }
+        }
     }
     pub fn get<T: Any>(&self, rid: ResourceId) -> Option<Rc<T>> {
         Rc::downcast(self.map.get(&rid)?.clone()).ok()
@@ -555,6 +661,8 @@ impl ResourceTable {
         self.retained_reporters.remove(&rid);
         self.managed_reporters.remove(&rid);
         self.external_reporters.remove(&rid);
+        #[cfg(feature = "gc-heap")]
+        self.tracers.remove(&rid);
         value
     }
     /// Live handle count — the event loop stays alive while this is non-zero.
@@ -647,7 +755,7 @@ mod tests {
         busy: bool,
     }
 
-    impl HostGc for NativeCache {
+    impl HostTrace for NativeCache {
         fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
             if self.busy {
                 return;
@@ -662,6 +770,9 @@ mod tests {
                 visitor.root(&self.values[root]);
             }
         }
+    }
+
+    impl HostGc for NativeCache {
         fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
             // Keep indices stable in this synthetic cache.
             for value in &mut self.values {
@@ -862,6 +973,7 @@ mod tests {
     struct Reported(Vec<u8>);
 
     struct External(crate::interpreter::ArrayBufferBytes);
+    crate::value_free!(Reported, External);
 
     impl RetainedBytes for Reported {
         fn retained_bytes(&self) -> usize {
@@ -943,5 +1055,154 @@ mod resource_id_tests {
         assert_eq!(table.add(()), u32::MAX - 1);
         // Ids 0..=u32::MAX - 1 are all spent: the next addition refuses to wrap.
         table.add(());
+    }
+}
+
+/// P1 S2: under gc-heap a host's JavaScript values live exactly as its [`HostTrace`] reports.
+#[cfg(all(test, feature = "gc-heap"))]
+mod host_trace_tests {
+    use super::*;
+    use crate::value::Object;
+
+    /// Reports `root` as a root and `target` as an edge from `owner`; `hidden` goes unreported.
+    struct Slots {
+        root: Value,
+        owner: Value,
+        target: Value,
+    }
+
+    impl HostTrace for Slots {
+        fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+            visitor.root(&self.root);
+            visitor.edge(&self.owner, &self.target);
+        }
+    }
+
+    struct Resource(Value);
+
+    impl HostTrace for Resource {
+        fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+            visitor.root(&self.0);
+        }
+    }
+
+    fn marker(value: f64) -> Value {
+        let object = Object::new(None);
+        object
+            .borrow_mut()
+            .props
+            .insert("n", crate::value::Property::plain(Value::Num(value)));
+        Value::Obj(object)
+    }
+
+    fn n(value: &Value) -> f64 {
+        let object = value.as_obj().expect("an object").borrow();
+        object
+            .props
+            .get("n")
+            .and_then(|property| property.value().as_num_opt())
+            .expect("marker number")
+    }
+
+    #[test]
+    fn host_slots_and_resources_keep_what_they_report() {
+        let mut engine = crate::Engine::new();
+        // The handles live in host state only (and in this helper's frame while it runs).
+        let (owner_weak, target_weak, rid) = crate::gc_test::in_frame(|| {
+            let owner = marker(2.0);
+            let target = marker(3.0);
+            engine.interp.op_state().put(Slots {
+                root: marker(1.0),
+                owner: owner.clone(),
+                target: target.clone(),
+            });
+            let rid = engine
+                .interp
+                .op_state()
+                .resources
+                .add(Resource(marker(4.0)));
+            (
+                crate::value::Gc::downgrade(owner.as_obj().unwrap()),
+                crate::value::Gc::downgrade(target.as_obj().unwrap()),
+                rid,
+            )
+        });
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        let slots = engine.interp.op_state().get::<Slots>().expect("slots");
+        assert_eq!(n(&slots.root), 1.0, "a root survives");
+        let resource = engine
+            .interp
+            .op_state()
+            .resources
+            .get::<Resource>(rid)
+            .expect("resource");
+        assert_eq!(n(&resource.0), 4.0, "a resource's root survives");
+        // Nothing keeps the edge's owner alive, so neither it nor its target survives; the
+        // slot's handles are dead and must not be used.
+        assert!(
+            !crate::gc_test::alive(&owner_weak),
+            "an unrooted owner dies"
+        );
+        assert!(
+            !crate::gc_test::alive(&target_weak),
+            "its edge target dies with it"
+        );
+    }
+
+    #[test]
+    fn host_edges_keep_targets_while_their_owner_lives() {
+        let mut engine = crate::Engine::new();
+        let target_weak = crate::gc_test::in_frame(|| {
+            let owner = marker(2.0);
+            let target = marker(3.0);
+            // The owner is reachable from the global object.
+            engine
+                .interp
+                .global
+                .borrow_mut()
+                .props
+                .insert("owner", crate::value::Property::plain(owner.clone()));
+            engine.interp.op_state().put(Slots {
+                root: Value::Undefined,
+                owner,
+                target: target.clone(),
+            });
+            crate::value::Gc::downgrade(target.as_obj().unwrap())
+        });
+        engine.interp.gc_collect();
+        assert!(
+            crate::gc_test::alive(&target_weak),
+            "a live owner keeps its target"
+        );
+        let slots = engine.interp.op_state().get::<Slots>().expect("slots");
+        assert_eq!(n(&slots.target), 3.0);
+    }
+
+    #[test]
+    fn reported_native_closure_captures_survive() {
+        let mut engine = crate::Engine::new();
+        crate::gc_test::in_frame(|| {
+            let captured = marker(5.0);
+            let reporter = Rc::new(crate::gc_test::CapturedValues(vec![captured.clone()]));
+            let read = engine.interp.new_native_fn(
+                "readCaptured",
+                0,
+                Rc::new(move |_, _, _| Ok(Value::Num(n(&captured)))),
+                crate::value::NativeCaptures::Reported(reporter),
+            );
+            engine
+                .interp
+                .global
+                .borrow_mut()
+                .props
+                .insert("readCaptured", crate::value::Property::plain(read));
+        });
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        match engine.eval("readCaptured()", false).expect("parses") {
+            crate::Completion::Value(value) => assert_eq!(value, "5"),
+            crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
     }
 }

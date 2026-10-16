@@ -5912,7 +5912,12 @@ mod feedback_layout_tests {
     fn profiled_named_get_records_accessor_at_the_canonical_lookup() {
         let mut interp = Interp::new();
         let object = Value::Obj(interp.new_object());
-        let getter = interp.new_native_fn("get value", 0, Rc::new(|_, _, _| Ok(Value::Num(17.0))));
+        let getter = interp.new_native_fn(
+            "get value",
+            0,
+            Rc::new(|_, _, _| Ok(Value::Num(17.0))),
+            crate::value::NativeCaptures::None,
+        );
         interp.define_accessor_value(&object, "value", Some(getter), None, true);
         let caches = (0..PROP_IC_WAYS)
             .map(|_| std::cell::Cell::new(IcState::EMPTY))
@@ -6034,6 +6039,7 @@ mod feedback_layout_tests {
                 setter_calls.set(setter_calls.get() + 1);
                 Ok(Value::Undefined)
             }),
+            crate::value::NativeCaptures::None,
         );
         interp.define_accessor_value(&object, "value", None, Some(setter), true);
         let name: Rc<str> = Rc::from("value");
@@ -6185,7 +6191,12 @@ mod feedback_layout_tests {
         let proxy = interp
             .eval_in_realm(&global, "new Proxy(function target() {}, {})")
             .unwrap_or_else(|_| panic!("proxy function construction must complete"));
-        let native = interp.new_native_fn("native", 0, Rc::new(|_, _, _| Ok(Value::Undefined)));
+        let native = interp.new_native_fn(
+            "native",
+            0,
+            Rc::new(|_, _, _| Ok(Value::Undefined)),
+            crate::value::NativeCaptures::None,
+        );
         let ordinary = Value::Obj(interp.new_object());
 
         assert_eq!(interp.call_target_kind(&user), CallTargetKind::UserFunction);
@@ -6233,6 +6244,7 @@ mod feedback_layout_tests {
                 setter_calls.set(setter_calls.get() + 1);
                 Err(Value::lstr("setter failed"))
             }),
+            crate::value::NativeCaptures::None,
         );
         interp.define_accessor_value(&object, "value", None, Some(setter), true);
         let name: Rc<str> = Rc::from("value");

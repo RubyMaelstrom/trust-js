@@ -31,6 +31,7 @@ fn native_global_callable_from_js() {
 #[test]
 fn extension_installs_state_globals_and_namespaces() {
     struct Counter(u32);
+    trust_js::value_free!(Counter);
     fn bump(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
         let c = ctx.host_mut::<Counter>().expect("state_init ran");
         c.0 += 1;

@@ -92,13 +92,32 @@ pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, V
 /// graph. The final slice contains the immutable registration-time captures.
 pub type NativeCaptureFn = fn(&mut Interp, Value, &[Value], &[Value]) -> Result<Value, Value>;
 
-/// Optional retained-memory companion for a [`NativeClosure`].
+/// Retained-memory and capture companion for a [`NativeClosure`].
 ///
 /// The reporter is stored separately so the established `Rc<NativeClosure>` call surface remains
 /// source-compatible. It must enumerate every allocation below its own inline payload and every
-/// captured JavaScript value.
+/// captured JavaScript value: a tracing collector (`gc-heap`) keeps exactly those alive.
 pub trait NativeCallableRetained {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
+}
+
+/// What an opaque [`NativeClosure`] captures (P1 S2, Decision 2): the engine cannot see into
+/// a Rust closure, so its JavaScript captures are declared where it is registered.
+pub enum NativeCaptures {
+    /// The closure holds no JavaScript values.
+    None,
+    /// Its captured JavaScript values (and managed allocations) are reported by this companion,
+    /// which may share the closure's state allocation.
+    Reported(Rc<dyn NativeCallableRetained>),
+}
+
+impl NativeCaptures {
+    pub(crate) fn into_reporter(self) -> Option<Rc<dyn NativeCallableRetained>> {
+        match self {
+            NativeCaptures::None => None,
+            NativeCaptures::Reported(reporter) => Some(reporter),
+        }
+    }
 }
 
 /// The engine value. `repr(u64)` with fixed discriminants gives it a *defined* layout — a full

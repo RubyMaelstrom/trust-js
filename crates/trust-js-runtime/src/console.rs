@@ -33,6 +33,9 @@ pub struct ConsoleOut {
     pub err: Box<dyn Write>,
 }
 
+// Output streams: no JavaScript values.
+trust_js_host::value_free!(ConsoleOut);
+
 impl Default for ConsoleOut {
     fn default() -> Self {
         ConsoleOut {

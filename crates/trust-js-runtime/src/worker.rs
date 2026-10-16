@@ -62,6 +62,15 @@ pub(crate) struct WorkerRegistry {
     workers: HashMap<u64, WorkerEntry>,
 }
 
+/// Each live worker's main-side dispatch function: a root while the worker is registered.
+impl trust_js_host::HostTrace for WorkerRegistry {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for worker in self.workers.values() {
+            visitor.root(&worker.dispatch);
+        }
+    }
+}
+
 struct WorkerEntry {
     /// `None` once terminated (dropping the sender unblocks the worker's inbox receive).
     to_worker: Option<Sender<ToWorker>>,
@@ -341,6 +350,9 @@ struct WorkerSelf {
     keep_alive: bool,
     inbox_task: Option<TaskId>,
 }
+
+// The worker side's channel and flags: no JavaScript values.
+trust_js_host::value_free!(WorkerSelf);
 
 /// The worker thread's whole lifecycle: build a realm, run the entry, then pump the loop until
 /// stopped (or, node mode, idle), bridging messages both ways.

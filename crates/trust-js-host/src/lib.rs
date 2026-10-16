@@ -56,11 +56,12 @@ fn install_task_panic_hook() {
 
 pub use trust_js::bytecode::Tier;
 pub use trust_js::embed::{
-    ArrayBufferBytes, Ctx, EvalError, HostRetainedMemoryVisitor, NativeCallableRetained,
-    NativeClosure, NativeFn, NativeRetainedMemoryVisitor, OpState, ResourceId, ResourceTable,
-    RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation,
-    RetainedMemory, Value, WeakValue,
+    ArrayBufferBytes, Ctx, EvalError, HostGcVisitor, HostRetainedMemoryVisitor, HostTrace,
+    NativeCallableRetained, NativeCaptures, NativeClosure, NativeFn, NativeRetainedMemoryVisitor,
+    OpState, ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
+    RetainedExternalMemory, RetainedManagedAllocation, RetainedMemory, Value, WeakValue,
 };
+pub use trust_js::value_free;
 pub use trust_js::{
     Completion, Engine, ExecutionOutcome, InterruptReason, ParseError, RuntimeInterrupt,
 };
@@ -195,6 +196,18 @@ impl TaskFailure {
 #[derive(Default)]
 pub struct CallbackQueue {
     pub queue: VecDeque<(Value, Vec<Value>)>,
+}
+
+/// Queued callbacks and their arguments run on a later turn: roots until then.
+impl HostTrace for CallbackQueue {
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        for (callback, args) in &self.queue {
+            visitor.root(callback);
+            for arg in args {
+                visitor.root(arg);
+            }
+        }
+    }
 }
 
 impl CallbackQueue {
@@ -591,6 +604,21 @@ impl Default for TaskRegistry {
         Self::with_canceller(TaskCanceller::default())
     }
 }
+
+/// An in-flight task's settlement callbacks run when it completes: roots until then.
+impl HostTrace for TaskRegistry {
+    fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
+        for entry in self.map.values() {
+            visitor.root(&entry.on_ok);
+            if let Some(on_err) = &entry.on_err {
+                visitor.root(on_err);
+            }
+        }
+    }
+}
+
+// Executor handles carry native work and completions, never JavaScript values.
+value_free!(SpawnHandle, CompletionSender);
 
 /// How to settle one in-flight task: success callback, optional failure callback (a promise's
 /// reject — when absent, a decode error is reported as an uncaught exception), and the

@@ -53,6 +53,15 @@ pub(crate) struct ServerRegistry {
     servers: HashMap<u64, ServerEntry>,
 }
 
+/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
+impl trust_js_host::HostTrace for ServerRegistry {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.servers.values() {
+            visitor.root(&entry.dispatch);
+        }
+    }
+}
+
 struct ServerEntry {
     listener: Arc<TcpListener>,
     local_addr: SocketAddr,

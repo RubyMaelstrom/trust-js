@@ -162,13 +162,13 @@ fn to_int32(n: f64) -> i32 {
 fn make_callback_fn(interp: &mut Ctx, name: &str, cb: napi_callback, data: *mut c_void) -> Value {
     let state = Rc::new(NapiCallbackClosure { callback: cb, data });
     let callable_state = state.clone();
-    interp.new_native_fn_with_retained_memory(
+    interp.new_native_fn(
         name,
         0,
         Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
             callable_state.call(interp, this, args)
         }) as Rc<NativeClosure>,
-        state,
+        trust_js_host::NativeCaptures::Reported(state),
     )
 }
 
@@ -277,6 +277,9 @@ pub struct AddonRegistry {
     libs: Vec<DynLib>,
 }
 
+// Loaded addon libraries: no JavaScript values.
+trust_js_host::value_free!(AddonRegistry);
+
 /// Persistent N-API state that outlives individual calls: references (values kept alive past a
 /// handle scope), object wraps (native pointers attached to JS objects), promise deferreds, and
 /// registered async work. Lives in `OpState`, reached from an [`Env`] via the engine pointer.
@@ -289,6 +292,20 @@ struct NapiState {
     wraps: std::collections::HashMap<usize, *mut c_void>,
     deferreds: Vec<Option<Deferred>>,
     async_works: Vec<Option<AsyncWork>>,
+}
+
+/// N-API references and deferreds' resolve/reject functions. A reference's value is a root
+/// whatever its count, as the handle it keeps did under reference counting.
+impl trust_js_host::HostTrace for NapiState {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.refs.iter().flatten() {
+            visitor.root(&entry.value);
+        }
+        for deferred in self.deferreds.iter().flatten() {
+            visitor.root(&deferred.resolve);
+            visitor.root(&deferred.reject);
+        }
+    }
 }
 
 struct RefEntry {
@@ -1293,13 +1310,13 @@ pub unsafe extern "C" fn napi_define_class(
         data,
     });
     let callable_state = state.clone();
-    let ctor = interp.new_native_fn_with_retained_memory(
+    let ctor = interp.new_native_fn(
         &name,
         0,
         Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
             callable_state.call(interp, this, args)
         }) as Rc<NativeClosure>,
-        state,
+        trust_js_host::NativeCaptures::Reported(state),
     );
     interp.set_constructor_prototype(&ctor, &proto);
 
@@ -1396,13 +1413,13 @@ pub unsafe extern "C" fn napi_create_promise(
     )));
     let state = Rc::new(NapiPromiseExecutor { slot: slot.clone() });
     let callable_state = state.clone();
-    let executor = interp.new_native_fn_with_retained_memory(
+    let executor = interp.new_native_fn(
         "",
         2,
         Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
             callable_state.call(interp, this, args)
         }) as Rc<NativeClosure>,
-        state,
+        trust_js_host::NativeCaptures::Reported(state),
     );
 
     let p = match interp.construct_value(promise_ctor, &[executor]) {

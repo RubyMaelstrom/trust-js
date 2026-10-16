@@ -609,6 +609,15 @@ pub(crate) struct WsRegistry {
     socks: HashMap<u64, WsEntry>,
 }
 
+/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
+impl trust_js_host::HostTrace for WsRegistry {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.socks.values() {
+            visitor.root(&entry.dispatch);
+        }
+    }
+}
+
 struct WsEntry {
     /// Write half; `None` until the handshake completes.
     writer: Option<SharedStream>,

@@ -306,6 +306,7 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
                     }));
                 Ok(crate::value::Value::Obj(object))
             }),
+            crate::value::NativeCaptures::None,
         );
         engine.interp.global.borrow_mut().props.insert(
             "makeVoidTemp",

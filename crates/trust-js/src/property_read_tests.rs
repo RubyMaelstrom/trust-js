@@ -351,6 +351,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
                     let object = this.as_obj().unwrap().borrow();
                     Ok(object.props.get("id").unwrap().value())
                 }),
+                crate::value::NativeCaptures::None,
             );
             let weak = Gc::downgrade(getter.as_obj().unwrap());
             holder.borrow_mut().props.insert(
@@ -422,6 +423,7 @@ fn getter_cache_same_shape_replacement_and_kind_changes_are_live() {
                 calls.set(calls.get() + 1);
                 Ok(Value::Num(expected))
             }),
+            crate::value::NativeCaptures::None,
         );
         object.borrow_mut().props.insert(
             "cached",
@@ -560,6 +562,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
             interp.gc_collect();
             Ok(this)
         }),
+        crate::value::NativeCaptures::None,
     );
     let weak = Gc::downgrade(getter.as_obj().unwrap());
     object.borrow_mut().props.insert(

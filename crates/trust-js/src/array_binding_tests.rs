@@ -298,6 +298,9 @@ fn array_binding_slot_replacement_runs_final_host_owners_before_the_next_read() 
         let source = source.as_obj().unwrap().clone();
         let drops = Rc::new(Cell::new(0usize));
         let count = drops.clone();
+        let captured = Rc::new(crate::gc_test::CapturedValues(vec![Value::Obj(
+            source.clone(),
+        )]));
         let maker = engine.interp.make_native_closure(
             "makeBindingWitness",
             0,
@@ -306,6 +309,9 @@ fn array_binding_slot_replacement_runs_final_host_owners_before_the_next_read() 
                     source: source.clone(),
                     drops: count.clone(),
                 };
+                let captures = Rc::new(crate::gc_test::CapturedValues(vec![Value::Obj(
+                    witness.source.clone(),
+                )]));
                 let object = i.make_native_closure(
                     "bindingWitness",
                     0,
@@ -313,9 +319,11 @@ fn array_binding_slot_replacement_runs_final_host_owners_before_the_next_read() 
                         let _ = &witness;
                         Ok(Value::Undefined)
                     }),
+                    crate::value::NativeCaptures::Reported(captures),
                 );
                 Ok(Value::Obj(object))
             }),
+            crate::value::NativeCaptures::Reported(captured),
         );
         engine.interp.global.borrow_mut().props.insert(
             "makeBindingWitness",

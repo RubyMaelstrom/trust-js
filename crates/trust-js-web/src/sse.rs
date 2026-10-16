@@ -30,6 +30,15 @@ pub(crate) struct SseRegistry {
     conns: HashMap<u64, SseEntry>,
 }
 
+/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
+impl trust_js_host::HostTrace for SseRegistry {
+    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for entry in self.conns.values() {
+            visitor.root(&entry.dispatch);
+        }
+    }
+}
+
 struct SseEntry {
     closed: Arc<AtomicBool>,
     cancel: Arc<Mutex<Option<Arc<TcpStream>>>>,

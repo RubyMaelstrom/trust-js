@@ -186,6 +186,9 @@ struct WebState {
     http: http::HttpClient,
 }
 
+// Clocks, entropy, HTTP connections and codec state: no JavaScript values.
+trust_js_host::value_free!(WebState, CodecRegistry, TextDecoderRegistry);
+
 #[derive(Default)]
 struct CodecRegistry {
     next_id: u64,

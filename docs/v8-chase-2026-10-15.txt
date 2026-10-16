@@ -773,3 +773,37 @@ per-test GC stress with the verifier: 1813 pass at interval 1, the 19
 slow ones at interval 100 (15) or 1000 (4: the live-object-limit handler
 test now needs more than 15 minutes at 100), 116 ignored as in the
 suite, none fail; clippy clean on both feature sets; the workspace builds.
+
+Step 5, mandatory host enumeration (Decision 2): every value an Agent
+keeps for its host declares its JavaScript values at the type level.
+- HostTrace (trace_gc reporting root / edge / internal) is required by
+  OpState::put and its retained-memory variants and by ResourceTable::
+  add; value_free!(T, ...) declares types that hold none (common std
+  types are declared in trust-js). HostGc is now HostTrace plus the
+  sweep and end-of-job hooks of caches. Under gc-heap every slot and
+  resource is traced and a host keeps alive exactly what it reports; the
+  counted build still traces registered caches only.
+- Opaque native closures declare their captures (NativeCaptures::None or
+  Reported(reporter)); the *_with_retained_memory constructors merged
+  into new_native_fn / make_native_closure. This found one gc-heap bug:
+  Error.captureStackTrace's getter captured a stack trace whose frame
+  names are string cells; it now reports them.
+- Downstream: trust-js-host's CallbackQueue and TaskRegistry report their
+  callbacks, arguments and settlement functions; timers their handlers
+  and arguments; web servers, WebSockets and SSE their dispatch functions
+  and wasm stores their memory buffers; node its FFI callbacks, N-API
+  references (rooted whatever their count, as before) and deferreds; the
+  runtime its workers' dispatch functions. The other registries, the
+  console, process and fs resources are declared value-free.
+  trust-js-host and trust-js-runtime gain a gc-heap feature that forwards
+  to the engine.
+- Tests (gc-heap): host slots, resources and reported closure captures
+  survive collections; an edge target lives while its owner does and dies
+  with it (mutation-checked: without tracing the slots the tests fail).
+Results: gc-heap lib suite 1835/0/116, default 2149/0/3; downstream
+crates (counted build) 334/0/2; the runtime on a gc-heap engine passes
+its tests (180/0/1), and per test at GC stress interval 10 its unit tests
+(all but the BigInt-heavy crypto ones) pass 103 of 105 with one ignored:
+the failure asserts a worker terminates promptly, which took 227 s at that
+interval (a timing assertion; it passes without stress). Clippy clean on
+both feature sets and the workspace.

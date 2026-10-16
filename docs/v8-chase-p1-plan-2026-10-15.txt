@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, (this commit) | steps 1–4d: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation). Default suite 2149/0/3 unchanged; gc-heap lib suite 1832/0/116 (ignores carry their reason); per-test GC stress + verifier: 1832 pass (19 slow ones at interval 100/1000), 0 fail |
+| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, b91d5154, (this commit) | steps 1–5: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation); mandatory host enumeration (HostTrace, declared native closure captures). Default suite 2149/0/3 unchanged; gc-heap lib suite 1835/0/116 (ignores carry their reason); per-test GC stress + verifier: 1832 pass (19 slow ones at interval 100/1000), 0 fail |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |
@@ -491,6 +491,12 @@ Recorded deviations (S2, 2026-10-16; details in the program record):
   every slot kind (locals, captures, properties and their hundreds of
   readers) would have to freeze builders, and one missed path would make
   an in-place append visible through an alias.
+- The HostGc omission fallback is gone from gc-heap, where a host keeps
+  alive exactly what its mandatory HostTrace reports, and the type system
+  requires that enumeration in both builds (OpState::put, ResourceTable::
+  add, opaque native closures). The counted build's cycle collector still
+  treats an unreported handle as a root; that fallback retires with it at
+  S6 rather than being emulated there.
 - "GC stress + verifier green over the suite" runs each lib test in its
   own process at stress interval 1 (debug build: verifier and poisoning
   at every collection). Assertions about *when* collections or cleanup

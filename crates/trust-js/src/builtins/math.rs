@@ -259,11 +259,11 @@ pub(super) fn install_math(it: &mut Interp) {
     it.def_method(&math, "imul", 2, imul_fn);
     let random_stream = Rc::new(RandomStream::new());
     let captured = random_stream.clone();
-    let random = it.new_native_fn_with_retained_memory(
+    let random = it.new_native_fn(
         "random",
         0,
         Rc::new(move |_i, _t, _a| Ok(Value::Num(captured.next()))),
-        random_stream,
+        crate::value::NativeCaptures::Reported(random_stream),
     );
     math.borrow_mut()
         .props

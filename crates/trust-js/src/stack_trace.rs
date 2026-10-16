@@ -547,6 +547,15 @@ pub(crate) struct StackTrace {
 }
 
 impl StackTrace {
+    /// Each frame's name (engine strings: GC edges under gc-heap).
+    pub(crate) fn for_each_name(&self, mut f: impl FnMut(&LStr)) {
+        for frame in &self.frames {
+            if let Some(name) = &frame.name {
+                f(name);
+            }
+        }
+    }
+
     /// The `\n    at …` lines.
     pub(crate) fn lines(&mut self) -> Rc<str> {
         if let Some(lines) = &self.lines {
