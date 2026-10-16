@@ -1131,3 +1131,52 @@ only). crystal aarch64, rustc 1.99.0; release = fat LTO.
   gc-heap S3 against S2 is -9.5/-5.9% cycles on the sustained workload
   and -1.5..+0.9% elsewhere, wall time now agreeing with cycles; the
   default build is within -1.2..+1.1% of main's cycles.
+
+S4 Layout B (started 2026-10-17; owner: go after the S3 fix)
+------------------------------------------------------------
+Stage boundary: main has no commits past the merge base e3310993.
+
+Plan, recorded before the work (gc-heap scope as in S3; shared fixes
+land in both builds). A read-only survey of environments, functions,
+exotic state, teardown and address-keyed tables found, besides the
+planned layout work, four gate blockers:
+- trust-js-node's NapiState.wraps is keyed by object address with no
+  sweep, so napi_unwrap can return a stale pointer once a wrapped
+  object's address is reused.
+- WrappedShadow/WrappedCross callables name their ShadowRealm by raw
+  address without holding it.
+- A dead ShadowRealm's Interp is dropped inside the sweep, running its
+  coroutine teardown mid-collection.
+- The native super() graft does not move temporal_cal (to verify).
+Steps:
+- Step 1, baselines: full Test262 for main and gc-heap, and the
+  downstream suites (host, runtime, web, node) under gc-heap, which
+  S2/S3 recorded for the runtime only.
+- Step 2, the blockers above, each with a test that fails without the
+  fix.
+- Step 3, environment cells: retire the scope registry under gc-heap
+  (diagnostics walk the live environment cells instead) and keep a
+  measured number of bindings in the cell; measured mainly at the
+  interp tier, whose collections are dominated by dead environments.
+- Step 4, function payloads: no reference-counted per-closure state
+  where a cell edge serves, and no self-pinning weak handle in the lazy
+  prototype (a dead constructor pins its own cell for a collection).
+- Step 5, exotic payloads: a payload home in the cell for state owned
+  by one object for its whole life (map_data first, then proxies,
+  typed-array and module-namespace state), each measured; tables that
+  stay get their unguarded hot-path probes guarded where measurable.
+- Exit gate: full Test262 parity at interp and bytecode; downstream
+  suites under gc-heap; no address-keyed table without a sweep step or
+  payload home; S2 gates and the tripwire recorded.
+
+Step 1, baselines (gc-heap at f736f563; release runners, T262_WORKERS=6):
+- Full Test262 (annexB, built-ins, harness, intl402, language, staging;
+  53,872 files): main and gc-heap both pass 53,575 of 53,575 executed
+  at interp and at bytecode; the four reports are byte-identical. S4
+  must keep this.
+- Downstream suites: trust-js-web, -node, -timers and -fs gain a
+  gc-heap feature forwarding to trust-js-host's. Under gc-heap and in
+  the default build alike: host 36/0/0, timers 5/0/0, fs no tests, web
+  61/0/1, node 40/0/0, runtime 182/0/1.
+- The temporal_cal graft gap does not reproduce: a PlainDate subclass
+  with a non-ISO calendar keeps it in both builds.
