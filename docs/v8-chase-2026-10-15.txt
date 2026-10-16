@@ -834,3 +834,94 @@ panics when traced (try_borrow_unguarded in object cells, the GcTrace of
 RefCell); per-test GC stress, which collects at every safepoint of every
 test, found none.
 Results: gc-heap lib suite 1835/0/116, default 2149/0/3; clippy clean.
+
+S2 exit gate (2026-10-16)
+-------------------------
+Builds: main = e3310993 (the branch's merge base; main has no later
+commits); branch = d6ef1e66 plus this commit. crystal aarch64
+(Cortex-X925 + A725), rustc 1.99.0; release = opt-level 3, fat LTO,
+codegen-units 1, panic=abort. Under gc-heap Tier::Jit is admitted as
+bytecode.
+- Lib suite: gc-heap 1835/0/116 (each ignore carries its reason);
+  default 2149/0/3 unchanged (gc_collect.rs, the only engine file this
+  commit touches, is gc-heap-only).
+- Test262 (release runners for main, branch default and branch gc-heap;
+  TRUST_JS_TIER=interp and =bytecode): built-ins/{Object,Array,Proxy,
+  WeakMap,WeakRef,FinalizationRegistry,TypedArray} and language/
+  {expressions,statements,types}, 29029 files. Every run: 29028 pass,
+  0 fail, 1 skip (upstream: missing immutable exclusion); the eight
+  summary.json reports (six, plus gc-heap again after the floor change
+  below) are byte-identical. Parity.
+- GC stress + verifier + poisoning (debug, the final binary, every test
+  in its own process, 900 s each): 1835 pass, 116 ignored, 0 fail;
+  1815 at interval 1, 16 at 100 and 4 at 1000 per the recorded policy.
+  One interval-1 test (a_dropped_realm_that_ran_shared_unresolvable_
+  lookups_is_collected: three child Realms at each of three tiers) needs
+  854 s alone and timed out in a loaded parallel run; it now runs at
+  100.
+- Perf tripwire (benchmarks/p1-s2-tripwire-2026-10-16.json): fresh
+  processes pinned to CPU 5, 11 interleaved rounds; object_alloc_bench,
+  benchmarks/property-access.js (new: named reads/writes, method calls
+  and computed keys on shape-stable objects), the new sustained-
+  allocation workload and the Vue/React/Djot fixtures, at interp and
+  bytecode. Outputs are identical to main everywhere (fixtures modulo
+  elapsed_ms). The branch's default build is within -5.3%..+0.6% of
+  main's wall time and +-4% of its peak RSS: the S2 seams cost the
+  counted build nothing measurable. gc-heap against main, wall time
+  (peak RSS, MiB, main -> gc-heap):
+                         interp                 bytecode
+    property access      +3.6%  (13 -> 47)      +1.2%  (13 -> 38)
+    sustained alloc.     +0.2%  (180 -> 233)    +5.0%  (152 -> 215)
+    Vue                  +18.1% (26 -> 69)      -9.1%  (27 -> 42)
+    React                +20.1% (13 -> 53)      -15.6% (13 -> 41)
+    Djot                 +17.0% (37 -> 59)      -1.8%  (31 -> 41)
+  The first run had the step-3c byte-budget floor of 64 MiB and peak RSS
+  up to 333 MiB on these workloads (Vue at interp: +1187%; React at
+  interp, 322 MiB: +2337%). Environment records are cells but not
+  objects, so the object-count trigger never saw scope churn; up to 64
+  MiB of them and their binding vectors accumulated before the first
+  collection. A floor sweep (4-64 MiB, in the record) showed, at 8 MiB
+  against 64, bytecode-tier time flat with peak RSS 1-4x lower, and
+  interp-tier peak RSS 4-6x lower for up to 6.5% more time (more
+  collections, each with fixed costs). The floor is now 8 MiB;
+  TRUST_JS_GC_MIN_HEAP_BYTES overrides it for tuning (DIAGNOSTICS.md).
+  The remaining interp-tier cost is mostly sweeping dead environment
+  records: the tree-walker creates one per call and per loop iteration
+  with a heap-allocated binding vector, which the counted build frees at
+  once into fastalloc's per-thread cache and gc-heap frees in batches
+  that overflow it into glibc (profile: Vec<(Rc<str>, Binding)> drop
+  glue, _int_free, unlink_chunk). S4's tailored environment cells own
+  that. The bytecode tier keeps non-captured bindings in frame slots.
+- object_alloc_bench (no safepoints run in it, so gc-heap reclaims
+  nothing during the bench), ns/op main -> gc-heap: Object::new + drop
+  61 -> 99 (allocation without reclamation), templated {x,y} 106 -> 121,
+  Gc::downgrade + drop 9.4 -> 94 (each gc-heap weak handle allocates an
+  Rc<WeakCell> and registers it in a thread-local list), Props::new 7.6
+  -> 5.8. "Object::new retained" (the heap at ~15M cells, 5.4-5.8 GB)
+  runs 2-4 us/op and varies between runs: gc-heap's user time (2.0 s) is
+  below main's (2.25 s), its system time 10-33 s. This machine's glibc
+  2.44 defaults glibc.malloc.hugetlb=1, so malloc madvises its heaps for
+  transparent huge pages, and THP defrag=madvise compacts memory
+  synchronously at each huge-page fault (memory here is fragmented: 861k
+  compaction stalls since boot). GC pages are 64 KiB alloc_zeroed blocks
+  from glibc; giving the page allocator its own chunked mmap source with
+  an explicit THP policy is an S3 item.
+- Sustained-allocation workload (benchmarks/sustained-allocation.js:
+  200k retained objects, 400k short-lived objects, arrays and closures,
+  40k retained replacements; TRUST_JS_PERF_METRICS=1 and
+  TRUST_JS_GC_LOG=1, 3 runs): post-GC live bytes 44.2 MiB in 727-729
+  small-cell pages (45.4-45.6 MiB, 97% occupied: no fragmentation at
+  this scale); 19-20 collections, most pauses 25-63 ms, max 63 ms interp
+  / 47 ms bytecode (main: 87 / 67 ms); GC share of wall 32% interp / 40%
+  bytecode (main: 26% / 29%). Both builds are far from the S6 target of
+  5%. gc-heap inherits the counted build's object threshold, live +
+  max(live/8, 100k), which suits a nursery: a full collection every 100k
+  objects here re-marks the retained heap, and on larger heaps the 1/8
+  rule marks up to 8 objects per object allocated. A doubling rule would
+  about halve this workload's collections but let garbage reach live
+  size, against the S6 peak-RSS bound of +25%; that trade, or a nursery
+  over the cell heap, is for S3/S6 with the owner.
+- wasm32 acceptance: blocked (see the plan's S2 deviations): this
+  rustc's LLVM rejects the wasm llvm-args for a no_std cdylib, and no
+  wasm32 std is installed.
+- Outside review checkpoint: pending (owner).

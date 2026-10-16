@@ -18,9 +18,12 @@ use crate::gc_native::NativeGcGraph;
 use crate::gc_trace::{GcSink, GcTrace};
 use crate::host::{HostGcVisitor, NativeGcId};
 
-/// Live-heap bytes below which byte pressure alone never collects: object counts drive
-/// collection (see `gc_check`); the byte budget bounds environment and large-object churn.
-const GC_MIN_HEAP_BYTES: usize = 64 << 20;
+/// The byte budget's floor: below half of it live, a collection is due once this much has been
+/// allocated. Object counts also drive collection (see `gc_check`), but environment records
+/// are cells, not objects, so this budget alone bounds scope churn. On the gate fixtures, S2's
+/// tripwire measured peak RSS up to 6x higher at 64 MiB than at 8 MiB, with bytecode-tier time
+/// unchanged (docs/v8-chase-2026-10-15.txt, S2 exit gate).
+const GC_MIN_HEAP_BYTES: usize = 8 << 20;
 
 /// Native stack zeroed below a collection's entry before marking (see `gc_core::scrub_stack`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,9 +45,21 @@ pub(crate) fn gc_stress() -> usize {
     })
 }
 
+/// `TRUST_JS_GC_MIN_HEAP_BYTES=N` (diagnostic): the byte-budget floor instead of
+/// [`GC_MIN_HEAP_BYTES`], for collector tuning.
+fn gc_min_heap_bytes() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("TRUST_JS_GC_MIN_HEAP_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(GC_MIN_HEAP_BYTES)
+    })
+}
+
 /// Collection settings for a new Agent heap.
 pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
-    core.set_heap_growth(GC_MIN_HEAP_BYTES, 100);
+    core.set_heap_growth(gc_min_heap_bytes(), 100);
     core.set_stress_every(gc_stress());
     // `TRUST_JS_GC_WHY=1`: record retention paths (see `gc_test::why`).
     if std::env::var_os("TRUST_JS_GC_WHY").is_some() {
@@ -345,8 +360,12 @@ impl Interp {
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             let stats = heap.core.borrow().stats();
             eprintln!(
-                "[gc-heap] cause={cause:?} objects={objects_before}->{live} cells={} bytes={} collections={} deferred={}",
-                stats.live_cells, stats.live_bytes, stats.collections, stats.deferred_collections
+                "[gc-heap] cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} collections={} deferred={}",
+                stats.live_cells,
+                stats.live_bytes,
+                stats.pages_live,
+                stats.collections,
+                stats.deferred_collections
             );
         }
         #[cfg(not(target_arch = "wasm32"))]

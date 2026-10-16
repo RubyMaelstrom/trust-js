@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, b91d5154, dcf723f4, (this commit) | steps 1–7: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation); mandatory host enumeration (HostTrace, declared native closure captures); I8 sweep inventory; I9 by safepoint-only collection. Default suite 2149/0/3 unchanged; gc-heap lib suite 1835/0/116 (ignores carry their reason); per-test GC stress + verifier: 1832 pass (19 slow ones at interval 100/1000), 0 fail |
+| S2 | gate met; outside review pending | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, b91d5154, dcf723f4, d6ef1e66, (this commit) | steps 1–7: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation); mandatory host enumeration (HostTrace, declared native closure captures); I8 sweep inventory; I9 by safepoint-only collection. Exit gate (this commit): default suite 2149/0/3 unchanged; gc-heap lib suite 1835/0/116 (ignores carry their reason); Test262 subsets 29028/0/1 on main, branch default and gc-heap at interp and bytecode, reports byte-identical; per-test GC stress + verifier 1835 pass (20 slow ones at interval 100/1000), 0 fail; perf tripwire recorded (benchmarks/p1-s2-tripwire-2026-10-16.json): outputs identical, default build at main's speed, gc-heap -16%..+5% wall at bytecode and +0%..+20% at interp, peak RSS higher (byte-budget floor lowered from 64 to 8 MiB); wasm32 acceptance blocked (deviation) |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |
@@ -503,6 +503,10 @@ Recorded deviations (S2, 2026-10-16; details in the program record):
   jobs happen are skipped under stress; tests whose cost is quadratic at
   interval 1 (deep recursion, long chains, allocation loops) run at
   interval 100 instead (1000 for the heaviest four).
+- The S2 wasm32 acceptance run is blocked as at S0 and S1: this box's
+  rustc/LLVM still has no WebAssembly backend and no wasm32 std. It
+  moves to the S6 wasm32 acceptance gate, with a wasm32-capable
+  toolchain as its prerequisite (owner).
 
 ### Working agreements (all agents)
 
