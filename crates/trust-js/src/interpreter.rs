@@ -11592,36 +11592,227 @@ impl Interp {
         // ordinary function/prototype makes closure churn pay for unrelated platform state.
         // Small dead sets keep directed removal; dense churn scans each table only once.
         // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
-        crate::gc_sweep::map(&mut self.class_info, garbage_objects);
-        crate::gc_sweep::set(&mut self.eval_realm_fns, garbage_objects);
-        crate::gc_sweep::map(&mut self.module_ns, garbage_objects);
-        crate::gc_sweep::map(&mut self.realms, garbage_objects);
-        crate::gc_sweep::map(&mut self.map_data, garbage_objects);
-        crate::gc_sweep::map(&mut self.collection_iterators, garbage_objects);
-        crate::gc_sweep::map(&mut self.typed_arrays, garbage_objects);
-        crate::gc_sweep::map(&mut self.data_views, garbage_objects);
-        crate::gc_sweep::map(&mut self.regexps, garbage_objects);
-        crate::gc_sweep::map(&mut self.proxies, garbage_objects);
-        crate::gc_sweep::map(&mut self.host_indexed, garbage_objects);
-        crate::gc_sweep::map(&mut self.promises, garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal, garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffers, garbage_objects);
-        crate::gc_sweep::map(&mut self.native_buffers, garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_versions, garbage_objects);
-        crate::gc_sweep::map(&mut self.array_buffer_dirty_ranges, garbage_objects);
-        crate::gc_sweep::map(&mut self.ta_buffer, garbage_objects);
-        crate::gc_sweep::map(&mut self.shadow_realms, garbage_objects);
-        crate::gc_sweep::set(&mut self.immutable_buffers, garbage_objects);
-        crate::gc_sweep::set(&mut self.host_keyed_buffers, garbage_objects);
-        crate::gc_sweep::map(&mut self.generators, garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gens, garbage_objects);
-        crate::gc_sweep::set(&mut self.async_gen_busy, garbage_objects);
-        crate::gc_sweep::map(&mut self.async_gen_queue, garbage_objects);
-        crate::gc_sweep::map(&mut self.mapped_arguments, garbage_objects);
-        crate::gc_sweep::map(&mut self.deferred_ns, garbage_objects);
-        crate::gc_sweep::map(&mut self.promise_forward, garbage_objects);
-        crate::gc_sweep::map(&mut self.temporal_cal, garbage_objects);
-        crate::gc_sweep::map(&mut self.gc_pins, garbage_objects);
+        self.gc_evict_dead_owners(garbage_objects);
+    }
+
+    /// I8: every interpreter field, classified by what it keeps about objects that may die, so
+    /// a new field does not compile until it is classified. A table keyed by an object's
+    /// address evicts a dead object's entries here: a later object at the same address must
+    /// not inherit them. Every other field keeps its keys alive, pins them weakly, is swept by
+    /// an earlier step, or is not keyed by object addresses. Shared by both collectors.
+    fn gc_evict_dead_owners(&mut self, dead: &crate::fasthash::FastSet<usize>) {
+        let Interp {
+            // Keyed by an object's address: evicted below.
+            class_info,
+            eval_realm_fns,
+            module_ns,
+            realms,
+            map_data,
+            collection_iterators,
+            typed_arrays,
+            data_views,
+            regexps,
+            proxies,
+            host_indexed,
+            promises,
+            temporal,
+            array_buffers,
+            native_buffers,
+            array_buffer_versions,
+            array_buffer_dirty_ranges,
+            ta_buffer,
+            shadow_realms,
+            immutable_buffers,
+            host_keyed_buffers,
+            generators,
+            async_gens,
+            async_gen_busy,
+            async_gen_queue,
+            mapped_arguments,
+            deferred_ns,
+            promise_forward,
+            temporal_cal,
+            gc_pins,
+            // Swept by the steps above: host caches, Realm templates, [[Realm]] pins, weak targets
+            // and weak owners.
+            host_state: _,
+            template_cache: _,
+            native_function_realms: _,
+            weak_refs: _,
+            weak_collection_data: _,
+            weak_collection_index: _,
+            weak_metadata: _,
+            finalization_registries: _,
+            // Weak pins, pruned after the collection (gc_prune_dead_pins). A dead address a pin
+            // still names stays reserved, so no new object takes it meanwhile.
+            creation_pins: _,
+            construct_ics: _,
+            call_overflow: _,
+            native_callback_cache: _,
+            proxy_trap_caches: _,
+            construct_capacity_hints: _,
+            global_env_pins: _,
+            htmldda: _,
+            symbol_agent: _,
+            // Proofs naming addresses through weak pins (reserved, as above).
+            ta_accessor_protector: _,
+            array_iteration_protector: _,
+            // Keyed by values they keep alive (roots, string pins): no key dies while present.
+            unhandled_rejections: _,
+            host_settings_states: _,
+            computed_reads: _,
+            property_key_strings: _,
+            str_units: _,
+            re_texts: _,
+            re_text_ascii_hot: _,
+            // Keyed weakly; a dead key misses on lookup.
+            fragment_cache: _,
+            // Not keyed by object addresses: intrinsics and roots, execution state, counters, and
+            // tables keyed by shapes, names, ids, source text or AST nodes.
+            gc_heap: _,
+            global: _,
+            global_env: _,
+            object_proto: _,
+            function_proto: _,
+            array_proto: _,
+            array_ctor: _,
+            string_proto: _,
+            number_proto: _,
+            boolean_proto: _,
+            symbol_proto: _,
+            error_protos: _,
+            console: _,
+            wall_clock: _,
+            runtime_interrupt: _,
+            interrupt_poll_tick: _,
+            ast_tick: _,
+            strict: _,
+            tier: _,
+            tier_threshold: _,
+            jit_admit_runs: _,
+            tagged_arithmetic: _,
+            vm_pool: _,
+            native_arg_pool: _,
+            stub_cache: _,
+            stub_cache_names: _,
+            arguments_shapes: _,
+            descriptor_maps: _,
+            iter_result_map: _,
+            enumeration_keys: _,
+            frame_pool: _,
+            call_site: _,
+            code_frames: _,
+            job_script_contexts: _,
+            host_resolution_marker: _,
+            jit_helpers: _,
+            jit_layout: _,
+            interp_layout: _,
+            inline_ic_safe: _,
+            regexp_dependency_cache: _,
+            regexp_last: _,
+            depth: _,
+            direct_call_depth: _,
+            proxy_forward_depth: _,
+            eval_fn: _,
+            elems_protector: _,
+            species_protector: _,
+            self_hosted: _,
+            shared_snapshots: _,
+            iterator_sym: _,
+            wk_syms: _,
+            short_circuit: _,
+            import_meta: _,
+            import_base: _,
+            modules: _,
+            module_recs: _,
+            module_loader: _,
+            dynamic_module_loader: _,
+            pending_dynamic_imports: _,
+            next_dynamic_import_id: _,
+            extra_protos: _,
+            can_block: _,
+            pending_async_waits: _,
+            async_wait_inbox: _,
+            pending_timers: _,
+            agent: _,
+            global_var_names: _,
+            regexp_programs: _,
+            new_target: _,
+            pending_new_target: _,
+            ctor_caller_realm: _,
+            next_unhandled_rejection: _,
+            handled_rejections: _,
+            microtasks: _,
+            host_job_context: _,
+            script_entry: _,
+            host_entry_realm: _,
+            capture_job_script_caller: _,
+            retired_host_job_contexts: _,
+            host_job_context_enter: _,
+            host_job_context_leave: _,
+            kept_alive: _,
+            gc_next: _,
+            live_object_limit: _,
+            gc_suppressed: _,
+            buffer_gc: _,
+            gc_tick: _,
+            gc_task_allocated: _,
+            gc_task_live: _,
+            gc_task_deferred: _,
+            gc_task_pending: _,
+            gc_task_major: _,
+            scope_gc_next: _,
+            constructing: _,
+            super_call_ok: _,
+            fn_frames: _,
+            module_async_seq: _,
+            yield_raw_result: _,
+            in_async_gen_body: _,
+            pending_fn_name: _,
+            pending_tail: _,
+            tco_ok: _,
+            in_field_init_code: _,
+            using_stack: _,
+            accessor_seq: _,
+            decorator_initializers: _,
+            annexb_fn_sync: _,
+            deferred_ns_objs: _,
+            borrowed_parameters: _,
+            module_source_objs: _,
+            pending_finalization_cleanup: _,
+            #[cfg(feature = "gc-heap")]
+                heap_release: _,
+        } = self;
+        crate::gc_sweep::map(class_info, dead);
+        crate::gc_sweep::set(eval_realm_fns, dead);
+        crate::gc_sweep::map(module_ns, dead);
+        crate::gc_sweep::map(realms, dead);
+        crate::gc_sweep::map(map_data, dead);
+        crate::gc_sweep::map(collection_iterators, dead);
+        crate::gc_sweep::map(typed_arrays, dead);
+        crate::gc_sweep::map(data_views, dead);
+        crate::gc_sweep::map(regexps, dead);
+        crate::gc_sweep::map(proxies, dead);
+        crate::gc_sweep::map(host_indexed, dead);
+        crate::gc_sweep::map(promises, dead);
+        crate::gc_sweep::map(temporal, dead);
+        crate::gc_sweep::map(array_buffers, dead);
+        crate::gc_sweep::map(native_buffers, dead);
+        crate::gc_sweep::map(array_buffer_versions, dead);
+        crate::gc_sweep::map(array_buffer_dirty_ranges, dead);
+        crate::gc_sweep::map(ta_buffer, dead);
+        crate::gc_sweep::map(shadow_realms, dead);
+        crate::gc_sweep::set(immutable_buffers, dead);
+        crate::gc_sweep::set(host_keyed_buffers, dead);
+        crate::gc_sweep::map(generators, dead);
+        crate::gc_sweep::set(async_gens, dead);
+        crate::gc_sweep::set(async_gen_busy, dead);
+        crate::gc_sweep::map(async_gen_queue, dead);
+        crate::gc_sweep::map(mapped_arguments, dead);
+        crate::gc_sweep::map(deferred_ns, dead);
+        crate::gc_sweep::map(promise_forward, dead);
+        crate::gc_sweep::map(temporal_cal, dead);
+        crate::gc_sweep::map(gc_pins, dead);
     }
 
     /// Raw-address inline-cache maps carry weak allocation pins. Prune expired entries so the

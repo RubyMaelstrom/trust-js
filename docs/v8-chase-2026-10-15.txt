@@ -807,3 +807,30 @@ its tests (180/0/1), and per test at GC stress interval 10 its unit tests
 the failure asserts a worker terminates promptly, which took 227 s at that
 interval (a timing assertion; it passes without stress). Clippy clean on
 both feature sets and the workspace.
+
+Step 6, I8 sweep inventory: Interp::gc_evict_dead_owners destructures
+the interpreter exhaustively, like trace_gc_roots for marking, so a new
+field does not compile until classified by what it keeps about objects
+that may die. 30 tables keyed by an object's address evict a dead
+object's entries there (the batch formerly listed by hand); 8 are swept
+by the steps before it (host caches through HostGc, Realm templates,
+[[Realm]] pins, weak targets and owners, FinalizationRegistry readiness);
+9 hold weak pins pruned after the collection, a pinned dead address
+staying reserved (zombie) meanwhile, and 2 proofs name addresses through
+such pins; 7 are keyed by values they keep alive (rejection tracking,
+host settings, the string caches' pins); 1 is keyed weakly and checked
+on use; the other 111 are not keyed by object addresses. Outside the
+interpreter, WeakMetadata's ready-registry set is swept with the weak
+owners; per-heap tables are released by the cells' finalizers; the
+gc_core sweep-hook registry stays unused, since the engine sweeps
+between the collector's two phases instead. Shared by both collectors.
+
+Step 7, I9 (no collection with an outstanding borrow): collections run
+only at interpreter safepoints and allocation never collects, so a
+RefCell borrow held across an allocation cannot meet a collection, and
+the S0 borrow-across-allocation list needs no no-GC regions. A safepoint
+reached while an engine cell or a traced container is mutably borrowed
+panics when traced (try_borrow_unguarded in object cells, the GcTrace of
+RefCell); per-test GC stress, which collects at every safepoint of every
+test, found none.
+Results: gc-heap lib suite 1835/0/116, default 2149/0/3; clippy clean.
