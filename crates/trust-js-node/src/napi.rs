@@ -37,7 +37,7 @@ use std::rc::Rc;
 
 use trust_js_host::{
     Ctx, NativeCallableRetained, NativeClosure, NativeRetainedMemoryVisitor,
-    RetainedManagedAllocation, Value,
+    RetainedManagedAllocation, Value, WeakValue,
 };
 
 use crate::dylib::DynLib;
@@ -85,28 +85,29 @@ const NAPI_AUTO_LENGTH: usize = usize::MAX;
 /// boxed values that keeps every [`napi_value`] alive for the duration of the call.
 pub struct Env {
     interp: *mut Ctx,
-    // The `Box` is load-bearing, not redundant: a napi_value is a raw pointer into this arena, so
-    // each value needs a stable heap address that survives the Vec growing. (clippy::vec_box.)
-    #[allow(clippy::vec_box)]
-    handles: Vec<Box<Value>>,
+    /// Where this call's handles start in [`NapiState::handles`]; dropping the env releases
+    /// them (calls nest, so envs drop in reverse order of creation).
+    scope_start: usize,
     /// An exception raised by the addon (`napi_throw*`), surfaced to JS once the call returns.
     pending: Option<Value>,
 }
 
 impl Env {
     fn new(interp: *mut Ctx) -> Env {
-        Env {
+        let mut env = Env {
             interp,
-            handles: Vec::new(),
+            scope_start: 0,
             pending: None,
-        }
+        };
+        env.scope_start = unsafe { env.napi_state() }.handles.len();
+        env
     }
 
-    /// Box a value into the arena and return a stable `napi_value` handle to it.
+    /// Box a value into the handle arena and return a stable `napi_value` handle to it.
     fn handle(&mut self, v: Value) -> napi_value {
         let boxed = Box::new(v);
         let ptr = (&*boxed as *const Value) as *mut c_void;
-        self.handles.push(boxed);
+        unsafe { self.napi_state() }.handles.push(boxed);
         ptr
     }
 
@@ -114,6 +115,15 @@ impl Env {
     #[allow(clippy::mut_from_ref)]
     unsafe fn interp<'a>(&self) -> &'a mut Ctx {
         &mut *self.interp
+    }
+}
+
+impl Drop for Env {
+    /// Release this call's handles; an enclosing call's stay.
+    fn drop(&mut self) {
+        unsafe { self.napi_state() }
+            .handles
+            .truncate(self.scope_start);
     }
 }
 
@@ -285,19 +295,58 @@ trust_js_host::value_free!(AddonRegistry);
 /// registered async work. Lives in `OpState`, reached from an [`Env`] via the engine pointer.
 #[derive(Default)]
 struct NapiState {
+    /// The values behind the `napi_value`s of the calls in progress, innermost call last. The
+    /// `Box` is load-bearing: a napi_value is a raw pointer into this arena, so each value needs
+    /// a stable heap address that survives the Vec growing (clippy::vec_box).
+    #[allow(clippy::vec_box)]
+    handles: Vec<Box<Value>>,
     refs: Vec<Option<RefEntry>>,
     ref_free: Vec<usize>,
-    /// object heap-address → wrapped native pointer (`napi_wrap`). Finalizers are not run:
-    /// memory is reclaimed at process exit, which is sufficient for a run-and-exit tool.
-    wraps: std::collections::HashMap<usize, *mut c_void>,
+    /// object address -> wrapped native pointer (`napi_wrap`). Each entry holds its object
+    /// weakly and counts only while the handle upgrades: a weak handle never upgrades again
+    /// once its object has died, so a new object at a dead one's address never unwraps to the
+    /// old pointer. Finalizers are not run: memory is reclaimed at process exit, which is
+    /// sufficient for a run-and-exit tool.
+    wraps: std::collections::HashMap<usize, Wrap>,
+    /// Table size at which `napi_wrap` next prunes entries whose objects have died.
+    wraps_prune_at: usize,
     deferreds: Vec<Option<Deferred>>,
     async_works: Vec<Option<AsyncWork>>,
 }
 
-/// N-API references and deferreds' resolve/reject functions. A reference's value is a root
-/// whatever its count, as the handle it keeps did under reference counting.
+struct Wrap {
+    object: WeakValue,
+    native: *mut c_void,
+}
+
+impl NapiState {
+    fn wrap(&mut self, addr: usize, object: WeakValue, native: *mut c_void) {
+        if self.wraps.len() >= self.wraps_prune_at {
+            self.wraps.retain(|_, wrap| wrap.object.upgrade().is_some());
+            self.wraps_prune_at = (self.wraps.len() * 2).max(64);
+        }
+        self.wraps.insert(addr, Wrap { object, native });
+    }
+
+    /// The native pointer wrapped onto the live object at `addr`; a stale entry is dropped.
+    fn unwrap(&mut self, addr: usize) -> Option<*mut c_void> {
+        let wrap = self.wraps.get(&addr)?;
+        if wrap.object.upgrade().is_some() {
+            return Some(wrap.native);
+        }
+        self.wraps.remove(&addr);
+        None
+    }
+}
+
+/// N-API handles of the calls in progress, references and deferreds' resolve/reject functions.
+/// A reference's value is a root whatever its count, as the handle it keeps did under reference
+/// counting. Wraps hold their objects weakly.
 impl trust_js_host::HostTrace for NapiState {
     fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
+        for handle in &self.handles {
+            visitor.root(handle);
+        }
         for entry in self.refs.iter().flatten() {
             visitor.root(&entry.value);
         }
@@ -1229,10 +1278,13 @@ pub unsafe extern "C" fn napi_wrap(
 ) -> napi_status {
     let env = &mut *env;
     let obj = value_of(js_object);
-    let Some(addr) = env.interp().object_addr(&obj) else {
+    let (Some(addr), Some(weak)) = (
+        env.interp().object_addr(&obj),
+        env.interp().downgrade_object_value(&obj),
+    ) else {
         return NAPI_INVALID_ARG;
     };
-    env.napi_state().wraps.insert(addr, native_object);
+    env.napi_state().wrap(addr, weak, native_object);
     // Optionally hand back a reference to the wrapped object.
     if !result.is_null() {
         let mut r: napi_ref = std::ptr::null_mut();
@@ -1255,9 +1307,7 @@ pub unsafe extern "C" fn napi_unwrap(
     };
     *result = env
         .napi_state()
-        .wraps
-        .get(&addr)
-        .copied()
+        .unwrap(addr)
         .unwrap_or(std::ptr::null_mut());
     NAPI_OK
 }
@@ -1273,11 +1323,9 @@ pub unsafe extern "C" fn napi_remove_wrap(
     let Some(addr) = env.interp().object_addr(&obj) else {
         return NAPI_INVALID_ARG;
     };
-    let data = env
-        .napi_state()
-        .wraps
-        .remove(&addr)
-        .unwrap_or(std::ptr::null_mut());
+    let state = env.napi_state();
+    let data = state.unwrap(addr).unwrap_or(std::ptr::null_mut());
+    state.wraps.remove(&addr);
     if !result.is_null() {
         *result = data;
     }
@@ -1810,6 +1858,115 @@ mod tests {
         assert_eq!(unsafe { read_utf8(s.as_ptr(), 3) }, "hel");
         // A null pointer reads as empty.
         assert_eq!(unsafe { read_utf8(std::ptr::null(), NAPI_AUTO_LENGTH) }, "");
+    }
+
+    /// An object held only by an N-API handle: made in a frame of its own, so no stack word but
+    /// the handle arena's names it.
+    #[inline(never)]
+    fn marked_object(env: &mut Env, mark: f64) -> napi_value {
+        let mut object: napi_value = std::ptr::null_mut();
+        let mut value: napi_value = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(napi_create_object(env, &mut object), NAPI_OK);
+            assert_eq!(napi_create_double(env, mark, &mut value), NAPI_OK);
+            assert_eq!(
+                napi_set_named_property(env, object, c"mark".as_ptr(), value),
+                NAPI_OK
+            );
+        }
+        object
+    }
+
+    /// The values behind a call's napi_values stay alive while the call runs, whatever
+    /// collections its callbacks into JavaScript cause.
+    #[test]
+    fn handles_keep_their_values_across_a_collection() {
+        let mut engine = trust_js_host::Engine::new();
+        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        let objects: Vec<napi_value> = (0..64).map(|i| marked_object(&mut env, i as f64)).collect();
+        let ctx = unsafe { env.interp() };
+        ctx.collect_garbage_for_host();
+        for _ in 0..2000 {
+            ctx.new_object();
+        }
+        ctx.collect_garbage_for_host();
+        for (i, object) in objects.into_iter().enumerate() {
+            let mut mark: napi_value = std::ptr::null_mut();
+            let mut number = 0.0;
+            unsafe {
+                assert_eq!(
+                    napi_get_named_property(&mut env, object, c"mark".as_ptr(), &mut mark),
+                    NAPI_OK
+                );
+                assert_eq!(napi_get_value_double(&mut env, mark, &mut number), NAPI_OK);
+            }
+            assert_eq!(number, i as f64);
+        }
+    }
+
+    /// Wrap 100 objects held only by the handles of a call that then returns, in a frame of its
+    /// own; their addresses.
+    #[inline(never)]
+    fn wrap_objects_of_a_finished_call(engine: &mut trust_js_host::Engine) -> Vec<usize> {
+        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        (0..100)
+            .map(|i| {
+                let object = marked_object(&mut call, i as f64);
+                unsafe {
+                    assert_eq!(
+                        napi_wrap(
+                            &mut call,
+                            object,
+                            (i + 1) as *mut c_void,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        ),
+                        NAPI_OK
+                    );
+                    let mut native: *mut c_void = std::ptr::null_mut();
+                    assert_eq!(napi_unwrap(&mut call, object, &mut native), NAPI_OK);
+                    assert_eq!(native, (i + 1) as *mut c_void);
+                    call.interp().object_addr(&value_of(object)).unwrap()
+                }
+            })
+            .collect()
+    }
+
+    /// A wrap ends with its object: once the object has died it unwraps to nothing, and later
+    /// wraps prune its entry, so an address reused by a new object never yields the old pointer.
+    #[test]
+    fn wraps_end_with_their_objects() {
+        let mut engine = trust_js_host::Engine::new();
+        let addresses = wrap_objects_of_a_finished_call(&mut engine);
+        let mut outer = Env::new(engine.ctx() as *mut Ctx);
+        let ctx = unsafe { outer.interp() };
+        ctx.collect_garbage_for_host();
+        let state = unsafe { outer.napi_state() };
+        for address in &addresses {
+            assert_eq!(state.unwrap(*address), None, "a dead object's wrap is gone");
+        }
+        // Wrapping more objects prunes whatever stale entries remain.
+        for i in 0..200 {
+            let object = marked_object(&mut outer, i as f64);
+            unsafe {
+                napi_wrap(
+                    &mut outer,
+                    object,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        let state = unsafe { outer.napi_state() };
+        assert!(addresses.iter().all(|address| {
+            state
+                .wraps
+                .get(address)
+                .is_none_or(|wrap| wrap.object.upgrade().is_some())
+        }));
     }
 
     #[test]

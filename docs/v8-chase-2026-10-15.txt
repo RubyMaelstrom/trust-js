@@ -1180,3 +1180,21 @@ Step 1, baselines (gc-heap at f736f563; release runners, T262_WORKERS=6):
   61/0/1, node 40/0/0, runtime 182/0/1.
 - The temporal_cal graft gap does not reproduce: a PlainDate subclass
   with a non-ISO calendar keeps it in both builds.
+
+Step 2a, N-API (trust-js-node; both builds):
+- NapiState.wraps holds each wrapped object weakly, and an entry counts
+  only while its handle upgrades. napi_unwrap and napi_remove_wrap of a
+  new object at a dead wrapped object's address return null instead of
+  the dead object's pointer; napi_wrap prunes dead entries each time the
+  table doubles.
+- A second gap of the same kind, which the survey missed: each call's
+  napi_value arena lived in its Env, out of the collector's sight, so
+  under gc-heap an object held only by a handle (one the addon made and
+  has not returned yet) could be freed by a collection that a callback
+  into JavaScript caused. The arena moves to NapiState and is traced as
+  roots; an Env releases its own handles when its call ends.
+- Tests: handles_keep_their_values_across_a_collection (gc-heap; with
+  the arena untraced the handles' objects are freed: SIGSEGV in debug,
+  wrong values in release) and wraps_end_with_their_objects (both
+  builds; with liveness ignored, dead objects' wraps still unwrap).
+  trust-js-node 42/0/0 in both builds.
