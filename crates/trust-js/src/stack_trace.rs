@@ -1033,6 +1033,60 @@ fn function_frame(
     }
 }
 
+// P1 S2 (gc-heap): frame names are engine strings, so frames are traced wherever they are held.
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for Frame {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Frame {
+            kind: _,
+            name,
+            source: _, // Rust-heap source text
+            position: _,
+            start: _,
+            depth: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(name, sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for StackTrace {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let StackTrace { frames, lines: _ } = self;
+        crate::gc_trace::GcTrace::trace_gc(frames, sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for CodeFrame {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let CodeFrame {
+            kind: _,
+            name,
+            source: _,
+            start: _,
+            depth: _,
+            call_site: _,
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(name, sink);
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for ResumedFrame {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let ResumedFrame {
+            kind: _,
+            name,
+            source: _,
+            start: _,
+            function: _, // an identity, kept alive by its call while it runs
+        } = self;
+        crate::gc_trace::GcTrace::trace_gc(name, sink);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

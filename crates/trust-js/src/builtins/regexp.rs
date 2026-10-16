@@ -965,7 +965,8 @@ fn re_sym_replace_impl(
         } else {
             (pos_raw as usize).min(size)
         };
-        let mut captures: Vec<Value> = Vec::new();
+        // Rooted (gc-heap): each later capture's Get and ToString may run user code.
+        let mut captures = crate::rooting::RootedVec::new();
         for n in 1..=ncaptures {
             let cap = ab(i.get_member_key(result, &n.to_string()))?;
             captures.push(if matches!(cap, Value::Undefined) {

@@ -7645,7 +7645,8 @@ impl Interp {
                 .iter()
                 .take_while(|p| p.default.is_none() && !p.rest)
                 .count();
-            let name = func.name.clone().unwrap_or_default();
+            let name = Value::lstr(func.name.clone().unwrap_or_default());
+            let pins = crate::rooting::RootedVec::from_vec(vec![name.clone()]);
             let mut p = crate::value::Props::new();
             p.insert(
                 crate::value::fn_key(0), // "length"
@@ -7653,7 +7654,7 @@ impl Interp {
             );
             p.insert(
                 crate::value::fn_key(1), // "name"
-                Property::data(Value::lstr(name), false, false, true),
+                Property::data(name, false, false, true),
             );
             if has_prototype {
                 p.insert(
@@ -7679,6 +7680,7 @@ impl Interp {
                 function: p,
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
+                pins: std::cell::RefCell::new(pins),
             }
         });
         let proto_map = &maps.prototype;
@@ -7698,12 +7700,14 @@ impl Interp {
                     }
                     _ => {
                         let mut props = maps.function.clone();
+                        let name_value = Value::lstr(name.to_string());
                         assert!(
-                            props.set_value_at(1, Value::lstr(name.to_string())),
+                            props.set_value_at(1, name_value.clone()),
                             "function name slot"
                         );
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
+                            maps.pins.borrow_mut().push(name_value);
                         }
                         props
                     }

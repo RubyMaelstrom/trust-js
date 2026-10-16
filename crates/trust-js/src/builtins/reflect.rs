@@ -151,7 +151,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "Reflect.ownKeys called on non-object")),
         };
         let keys = object_own_property_keys(i, &o)?;
-        Ok(i.make_array(keys))
+        Ok(i.make_array(keys.into_vec()))
     });
     it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| match arg(a, 0) {
         Value::Obj(o) => {

@@ -189,6 +189,10 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         for interp in &self.interps {
             interp.trace_gc_roots(&mut words);
         }
+        // The tree shares one heap; its interned strings live as long as it does.
+        if let Some(root) = self.interps.first() {
+            crate::value::trace_interned_strings(&root.gc_heap, &mut words);
+        }
         crate::gc_trace::trace_thread_roots(&mut words);
         let mut reached = Vec::new();
         for host in &self.hosts {
@@ -509,26 +513,26 @@ impl Interp {
             arguments_shapes: _,
             descriptor_maps,
             iter_result_map,
-            computed_reads: _, // shapes and string pins
+            computed_reads,
             fragment_cache: _, // weak Realm keys and compiled plans
             enumeration_keys,
-            property_key_strings: _,
+            property_key_strings,
             frame_pool: _, // native JIT frames: the JIT is refused admission under gc-heap
             creation_pins: _, // weak pins
             global_env_pins: _, // weak pins
             call_site: _,
-            code_frames: _, // names and sources
+            code_frames,
             job_script_contexts: _,
             host_resolution_marker,
             jit_helpers: _,
             jit_layout: _,
             interp_layout: _,
             inline_ic_safe: _,
-            str_units: _,
-            re_texts: _,
-            re_text_ascii_hot: _,
+            str_units,
+            re_texts,
+            re_text_ascii_hot,
             regexp_dependency_cache: _,
-            regexp_last: _, // a weak constructor pin and strings
+            regexp_last,
             depth: _,
             direct_call_depth: _,
             proxy_forward_depth: _,
@@ -686,6 +690,28 @@ impl Interp {
         if let Some(symbol) = iterator_sym {
             sink.word(crate::value::symbol_identity(symbol) as u64);
         }
+        // String caches keyed by a string's address pin it: a pin keeps the address from being
+        // reused while an entry is keyed by it.
+        computed_reads.trace_pins(sink);
+        for (_, string) in property_key_strings.values() {
+            string.trace_gc(sink);
+        }
+        for (string, _, _) in str_units.values() {
+            string.trace_gc(sink);
+        }
+        for (string, text) in re_texts.values() {
+            string.trace_gc(sink);
+            text.trace_gc(sink);
+        }
+        if let Some((string, _, text)) = re_text_ascii_hot {
+            string.trace_gc(sink);
+            text.trace_gc(sink);
+        }
+        if let Some(last) = regexp_last {
+            last.input.trace_gc(sink);
+            last.text.trace_gc(sink);
+        }
+        code_frames.trace_gc(sink);
         // The Agent's registered (Symbol.for) and well-known Symbols live as long as it does.
         {
             let agent = symbol_agent.borrow();

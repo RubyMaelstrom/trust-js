@@ -687,6 +687,22 @@ impl ComputedReadCache {
         }
         storage.sets.len() * Self::SET_STRIDE + std::mem::size_of::<ComputedReadStorage>()
     }
+
+    /// The pinned key strings, roots while cached (gc-heap): a pin keeps its address from
+    /// being reused by another string while an entry is keyed by it.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) fn trace_pins(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        for set in storage.sets.iter() {
+            for way in &set.ways {
+                if let Some(key) = &way.pin {
+                    sink.word(key.cell_word());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -710,7 +726,10 @@ mod computed_read_cache_tests {
         let long = crate::lstr::LStr::from("k".repeat(1024));
         cache.insert(&long, state);
         assert!(cache.raw_sets.is_null());
-        assert_eq!(long.strong_count(), 1);
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert_eq!(long.strong_count(), 1);
+        }
         let spare = crate::lstr::LStr::from("s".repeat(255)).concat_grown("k");
         assert_eq!(spare.len(), 256);
         assert!(spare.retained_requested_bytes() > ComputedReadCache::MAX_KEY_ALLOCATION);
@@ -719,11 +738,17 @@ mod computed_read_cache_tests {
             cache.raw_sets.is_null(),
             "spare capacity counts against the retention cap"
         );
-        assert_eq!(spare.strong_count(), 1);
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert_eq!(spare.strong_count(), 1);
+        }
         let mut key = crate::lstr::LStr::from("method");
         cache.insert(&key, state);
         cache.insert(&key, IcState { slot: 9, ..state });
-        assert_eq!(key.strong_count(), 2, "refill must not duplicate its pin");
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert_eq!(key.strong_count(), 2, "refill must not duplicate its pin");
+        }
         assert!(
             !key.append_in_place("changed"),
             "cache identity must remain immutable"
@@ -740,10 +765,19 @@ mod computed_read_cache_tests {
         let sets = &cache.storage.as_ref().unwrap().sets;
         assert_eq!(sets.len(), ComputedReadCache::MAX_SETS);
         assert_eq!(sets.as_ptr(), cache.raw_sets);
-        assert!(keys.iter().filter(|key| key.strong_count() > 1).count() <= 4096);
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert!(keys.iter().filter(|key| key.strong_count() > 1).count() <= 4096);
+        }
         drop(cache);
-        assert_eq!(key.strong_count(), 1);
-        assert!(keys.iter().all(|key| key.strong_count() == 1));
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert_eq!(key.strong_count(), 1);
+        }
+        // Reference counts show the pins (gc-heap has none: pins are roots).
+        if cfg!(not(feature = "gc-heap")) {
+            assert!(keys.iter().all(|key| key.strong_count() == 1));
+        }
     }
 
     #[test]
@@ -1011,7 +1045,8 @@ pub(crate) fn invalidate_call_caches() {
 pub(crate) struct PrivateSite {
     env: std::cell::Cell<usize>,
     pin: std::cell::RefCell<crate::interpreter::WeakEnv>,
-    key: std::cell::RefCell<Option<crate::lstr::LStr>>,
+    /// Rooted (gc-heap): an unresolved name's key is a fresh string nothing else holds.
+    key: std::cell::RefCell<crate::rooting::Rooted<Option<crate::lstr::LStr>>>,
     slot: std::cell::Cell<u32>,
     /// The entry key last found for `key`. Instances that share a property layout share this
     /// allocation, so a pointer match answers the key comparison without reading its text.
@@ -1023,7 +1058,7 @@ impl PrivateSite {
         Self {
             env: std::cell::Cell::new(0),
             pin: std::cell::RefCell::new(crate::interpreter::WeakEnv::new()),
-            key: std::cell::RefCell::new(None),
+            key: std::cell::RefCell::new(crate::rooting::Rooted::new(None)),
             slot: std::cell::Cell::new(u32::MAX),
             entry_key: std::cell::RefCell::new(None),
         }
@@ -1052,7 +1087,7 @@ impl PrivateSite {
             self.slot.set(u32::MAX);
             *self.entry_key.borrow_mut() = None;
         }
-        *self.key.borrow_mut() = Some(key.clone());
+        **self.key.borrow_mut() = Some(key.clone());
         *self.pin.borrow_mut() = Env::downgrade(env);
         self.env.set(raw);
         key
@@ -26259,9 +26294,10 @@ impl crate::gc_trace::GcTrace for VmCoro {
             disposal,
             done: _,
             started: _,
-            frame: _,
+            frame,
         } = self;
         sink.object(realm);
+        frame.trace_gc(sink);
         cap_env.trace_gc(sink);
         env.trace_gc(sink);
         this_val.trace_gc(sink);

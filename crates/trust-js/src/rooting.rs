@@ -71,6 +71,19 @@ impl std::ops::DerefMut for RootedVec {
     }
 }
 
+/// A copy rooted on its own.
+impl Clone for RootedVec {
+    fn clone(&self) -> Self {
+        RootedVec::from_vec(self.to_vec())
+    }
+}
+
+impl std::fmt::Debug for RootedVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RootedVec({} values)", self.len())
+    }
+}
+
 impl<'a> IntoIterator for &'a RootedVec {
     type Item = &'a Value;
     type IntoIter = std::slice::Iter<'a, Value>;
@@ -79,6 +92,43 @@ impl<'a> IntoIterator for &'a RootedVec {
         self.iter()
     }
 }
+
+/// Iterating a `RootedVec` by value keeps the values not yet taken rooted, so a loop over a key
+/// list may run JavaScript between elements.
+impl IntoIterator for RootedVec {
+    type Item = Value;
+    type IntoIter = RootedIntoIter;
+    #[inline]
+    fn into_iter(self) -> RootedIntoIter {
+        RootedIntoIter {
+            values: self,
+            next: 0,
+        }
+    }
+}
+
+/// See [`RootedVec`]'s by-value `IntoIterator`.
+pub(crate) struct RootedIntoIter {
+    values: RootedVec,
+    next: usize,
+}
+
+impl Iterator for RootedIntoIter {
+    type Item = Value;
+    #[inline]
+    fn next(&mut self) -> Option<Value> {
+        let value = self.values.get(self.next)?.clone();
+        self.next += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.values.len() - self.next;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for RootedIntoIter {}
 
 impl FromIterator<Value> for RootedVec {
     fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {

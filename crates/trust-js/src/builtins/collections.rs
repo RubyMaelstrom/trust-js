@@ -62,10 +62,11 @@ pub(super) fn install_map_methods(it: &mut Interp) {
 }
 
 /// The receiver Set's values (deduped insertion order). Errors if `this` isn't a Set.
-fn set_values(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
+fn set_values(i: &mut Interp, this: &Value) -> Result<crate::rooting::RootedVec, Value> {
     // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
+    // Rooted (gc-heap): Set methods run the other set-like's methods between elements.
     let p = coll_ptr_kind(i, this, Some("Set"))?;
-    let mut values = Vec::with_capacity(coll_live_len(i, p));
+    let mut values = crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, p)));
     values.extend(i.map_data[&p].iter().map(|(key, _)| key.clone()));
     Ok(values)
 }
@@ -241,7 +242,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         // those getters make to the receiver are visible in the result.
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         // The result is rooted across the other set's `next` calls (I1).
-        let mut vals = crate::rooting::RootedVec::from_vec(set_values(i, &this)?);
+        let mut vals = set_values(i, &this)?;
         let mut result_index = crate::fasthash::FastMap::default();
         for (offset, value) in vals.iter().enumerate() {
             result_index
@@ -284,7 +285,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         coll_ptr_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
         // The snapshot and result are rooted across the other set's calls (I1).
-        let vals = crate::rooting::RootedVec::from_vec(set_values(i, &this)?);
+        let vals = set_values(i, &this)?;
         if (vals.len() as f64) <= other_size {
             // Iterate this Set, dropping elements the other's `has` reports.
             let mut out = crate::rooting::RootedVec::new();

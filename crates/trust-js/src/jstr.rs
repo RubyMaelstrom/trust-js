@@ -273,10 +273,12 @@ pub fn unit_str(unit: u16) -> String {
     from_units(&[unit])
 }
 
+#[cfg(not(feature = "gc-heap"))]
 thread_local! {
     /// Immutable one-code-unit ASCII strings are returned constantly by `charAt`, string
     /// indexing, and string iterators. Share their buffers instead of allocating the same 128
-    /// values repeatedly.
+    /// values repeatedly. With `gc-heap` each Agent heap interns its own
+    /// (`value::interned_string`): a thread's engines must not share cells.
     static ASCII_UNITS: [crate::lstr::LStr; 128] =
         std::array::from_fn(|unit| unit_str(unit as u16).into());
 }
@@ -284,6 +286,7 @@ thread_local! {
 /// Canonical array-index strings below this bound are interned (see [`index_lstr`]).
 pub(crate) const INDEX_STRINGS: u32 = 1024;
 
+#[cfg(not(feature = "gc-heap"))]
 thread_local! {
     /// ToString of the small array indices that integer-keyed property operations pass as
     /// ECMAScript String values (a Proxy trap's property key, for instance). Filled lazily;
@@ -299,6 +302,11 @@ pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
     if index >= INDEX_STRINGS {
         return crate::lstr::LStr::from(index.to_string().as_str());
     }
+    #[cfg(feature = "gc-heap")]
+    return crate::value::interned_string(128 + index as usize, || {
+        crate::lstr::LStr::from(index.to_string().as_str())
+    });
+    #[cfg(not(feature = "gc-heap"))]
     INDEX_UNITS.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.is_empty() {
@@ -312,11 +320,13 @@ pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
 
 /// The engine string for one UTF-16 code unit, interned for ASCII.
 pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
-    if unit < 128 {
-        ASCII_UNITS.with(|units| units[unit as usize].clone())
-    } else {
-        unit_str(unit).into()
+    if unit >= 128 {
+        return unit_str(unit).into();
     }
+    #[cfg(feature = "gc-heap")]
+    return crate::value::interned_string(unit as usize, || unit_str(unit).into());
+    #[cfg(not(feature = "gc-heap"))]
+    ASCII_UNITS.with(|units| units[unit as usize].clone())
 }
 
 /// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing

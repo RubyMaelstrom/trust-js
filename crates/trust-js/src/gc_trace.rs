@@ -53,6 +53,19 @@ impl GcTrace for Gc {
     }
 }
 
+impl GcTrace for crate::lstr::LStr {
+    #[inline]
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        sink.word(self.cell_word());
+    }
+}
+
+/// Rust-heap string slices are not GC cells.
+impl GcTrace for str {
+    #[inline]
+    fn trace_gc(&self, _: &mut dyn GcSink) {}
+}
+
 impl GcTrace for Env {
     #[inline]
     fn trace_gc(&self, sink: &mut dyn GcSink) {

@@ -568,6 +568,9 @@ pub struct FunctionMaps {
     /// anonymous function (`var f = () => {}`): a creation site's inferred name is fixed, so
     /// later closures clone it instead of running SetFunctionName per instance.
     pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
+    /// The engine strings the templates hold (their `name` values), rooted for as long as the
+    /// templates live (gc-heap): closures made later copy them.
+    pub(crate) pins: std::cell::RefCell<crate::rooting::RootedVec>,
 }
 
 /// The FunctionBody of a [`Function`]: the statements that ECMA-262 OrdinaryFunctionCreate

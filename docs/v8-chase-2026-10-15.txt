@@ -725,3 +725,51 @@ Results: gc-heap lib suite 1828/0/116, default 2149/0/3; 291 Symbol-,
 weak-collection-, property-key-, class- and ShadowRealm-related tests per
 test at stress interval 1: 268 pass, 23 ignored as in the suite; clippy
 clean on both feature sets; the workspace builds.
+
+Step 4d, strings as cells (gc-heap): an engine string (LStr) is a cell of
+the active Agent heap, a flat buffer or a view of one (one "string"
+descriptor; a view's edge is its owner). Handles are addresses: cloning
+copies, nothing is counted. Accumulation follows the revised Decision 4,
+frontier append (plan, recorded deviations): word 0 of a flat buffer is
+how far it has been written; an append to the string ending at that
+frontier, with spare capacity, writes past it and returns a view of the
+same buffer, anything else copies into a buffer with geometric
+capacity. JS-level check (debug build, global variable, s += "ab"):
+100k/200k/400k appends take 2.3/4.6/9.0 s, linear. The counted build is
+quadratic on that pattern (10.5/46.9/164 s; its unique-append fast path
+covers locals and properties, and the base commit behaves the same).
+- Roots and edges: values, packed words, String wrappers and iterators,
+  error stack frame names (Error objects, code frames, resumed frames),
+  the interpreter's string caches keyed by a string's address (their
+  pins become roots), the RegExp legacy match, prepared RegExp subjects,
+  private-name site keys (Rooted), function-name templates (pinned by
+  the template), and the heap's interned one-unit and index strings
+  (moved from thread-locals, which would share cells across Engines).
+- Allocation outside any Agent (before an Engine exists, or between
+  activations) goes to a per-thread default heap that never collects and
+  lives until the thread exits; a heap made per activation gap freed such
+  strings as soon as an Engine activated its own (found by a test that
+  built its subject string before the Engine).
+- I1 re-audit for primitive cells. Step 3c rooted value buffers that held
+  objects; lists that could hold only strings, Symbols or BigInts were
+  safe then and are not now. Own-key lists (ordinary, Proxy, enumerable
+  Proxy keys), Set value snapshots and Reflect argument lists are
+  RootedVecs, whose by-value iteration keeps the rest rooted; PropertyKey
+  lists carrying Symbols are Rooted; TypedArray sort and filter
+  buffers, RegExp replace captures, String.prototype.concat parts, the
+  host-indexed Object.keys path and the array-destructuring prefix are
+  rooted. Per-test GC stress found each of these (UAF, freed-cell reads,
+  wrong strings) or the audit did.
+- Tests: strings survive collections in every holder; accumulation keeps
+  aliases (an alias's own append copies); dead strings are reclaimed;
+  interned strings outlive their references (fails, returning another
+  string, without the interned roots). Removing string value tracing
+  fails the survival test (the heap verifier reports the missing edge).
+  Tests of the counted representation keep their behavioral assertions
+  and observe buffer identity instead of pointer identity; their
+  reference-count assertions run only in the counted build.
+Results: gc-heap lib suite 1832/0/116, default 2149/0/3 unchanged;
+per-test GC stress with the verifier: 1813 pass at interval 1, the 19
+slow ones at interval 100 (15) or 1000 (4: the live-object-limit handler
+test now needs more than 15 minutes at 100), 116 ignored as in the
+suite, none fail; clippy clean on both feature sets; the workspace builds.

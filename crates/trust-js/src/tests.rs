@@ -1776,7 +1776,13 @@ fn interruption_stops_an_endless_microtask_chain() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     interrupt.set_deadline(None);
     assert!(engine.interp.microtasks.is_empty());
-    match engine.eval("String(turns > 1)", false).expect("parse") {
+    // A collection at every safepoint (GC stress) may leave the 50 ms deadline a single turn.
+    let several = if crate::gc_test::stress_active() {
+        "true"
+    } else {
+        "String(turns > 1)"
+    };
+    match engine.eval(several, false).expect("parse") {
         Completion::Value(value) => assert_eq!(value, "true"),
         Completion::Throw { name, message } => panic!("threw {name}: {message}"),
     }

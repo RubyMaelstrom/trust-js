@@ -391,17 +391,21 @@ pub(crate) fn intl_delegate(
 /// order: a Proxy runs §10.5.11; a TypedArray lists its valid integer indices first
 /// (§10.4.5.7); every other object uses OrdinaryOwnPropertyKeys order (array-index keys
 /// ascending, then strings, then symbols, each in insertion order).
-pub(crate) fn object_own_property_keys(i: &mut Interp, o: &Gc) -> Result<Vec<Value>, Value> {
+pub(crate) fn object_own_property_keys(
+    i: &mut Interp,
+    o: &Gc,
+) -> Result<crate::rooting::RootedVec, Value> {
     ab(i.defer_trigger(o, None))?;
     if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
         return proxy_own_keys(i, &target, &handler);
     }
-    let mut out: Vec<Value> = if let Some(info) = ta_info(i, o) {
+    // Rooted (gc-heap): callers walk the keys while running traps and getters.
+    let mut out: crate::rooting::RootedVec = if let Some(info) = ta_info(i, o) {
         (0..i.ta_len(&info).unwrap_or(0))
             .map(|k| Value::lstr(k.to_string()))
             .collect()
     } else {
-        Vec::new()
+        crate::rooting::RootedVec::new()
     };
     for k in ordinary_own_keys_ordered(i, o)? {
         if Interp::is_sym_key(&k) {
@@ -421,13 +425,13 @@ pub(crate) fn proxy_own_keys(
     i: &mut Interp,
     target: &Value,
     handler: &Value,
-) -> Result<Vec<Value>, Value> {
+) -> Result<crate::rooting::RootedVec, Value> {
     // ECMA-262 §10.5.11, steps 1-22 in order.
     if matches!(handler, Value::Null) {
         return Err(i.make_error("TypeError", "proxy is revoked"));
     }
     let Value::Obj(target_object) = target else {
-        return Ok(Vec::new());
+        return Ok(crate::rooting::RootedVec::new());
     };
     let trap = ab(i.get_member_key(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
@@ -468,7 +472,7 @@ pub(crate) fn proxy_own_keys(
         }
     }
     if extensible_target && nonconfigurable_keys.is_empty() {
-        return Ok(keys.into_vec());
+        return Ok(keys);
     }
     for key in &nonconfigurable_keys {
         if !unchecked.remove(key.as_str()) {
@@ -479,7 +483,7 @@ pub(crate) fn proxy_own_keys(
         }
     }
     if extensible_target {
-        return Ok(keys.into_vec());
+        return Ok(keys);
     }
     for key in &configurable_keys {
         if !unchecked.remove(key.as_str()) {
@@ -495,7 +499,7 @@ pub(crate) fn proxy_own_keys(
             "ownKeys trap added a key to a non-extensible target",
         ));
     }
-    Ok(keys.into_vec())
+    Ok(keys)
 }
 
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
@@ -609,10 +613,13 @@ fn ta_byteoffset_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value,
 
 /// A proxy's own enumerable string keys (for Object.keys/values/entries): the ownKeys trap result
 /// filtered by each key's [[GetOwnProperty]] enumerable flag.
-pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Vec<Value>, Value> {
+pub(crate) fn proxy_enum_string_keys(
+    i: &mut Interp,
+    proxy: &Value,
+) -> Result<crate::rooting::RootedVec, Value> {
     let (target, handler) = proxy_pair(i, proxy).unwrap();
     let keys = proxy_own_keys(i, &target, &handler)?;
-    let mut out = Vec::new();
+    let mut out = crate::rooting::RootedVec::new();
     for k in keys {
         if let Value::Str(ks) = &k {
             if proxy_key_enumerable(i, &target, &handler, &crate::value::encode_string_key(ks))? {
@@ -1955,9 +1962,12 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
     }
     let proxy = proxy_pair(i, obj);
+    // A Symbol key's cell (gc-heap) stays rooted while the traps below run.
+    let mut key_roots = crate::rooting::ValueRoots::new();
     let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = &proxy {
         let mut ks = Vec::new();
         for k in proxy_own_keys(i, t, h)? {
+            key_roots.keep(&k);
             ks.push(ab(i.to_property_key(&k))?);
         }
         ks
@@ -2056,23 +2066,26 @@ fn object_define_properties(
     who: &str,
 ) -> Result<(), Value> {
     let props = Value::Obj(to_object_arg(i, props_arg, who)?);
-    let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &props) {
-        let mut ks = Vec::new();
-        for k in proxy_own_keys(i, &t, &h)? {
-            ks.push(ab(i.to_property_key(&k))?);
-        }
-        ks
-    } else {
-        ordinary_own_keys_ordered(i, props.as_obj().unwrap())?
-            .into_iter()
-            .map(crate::value::PropertyKey::stored)
-            .collect()
-    };
+    // Rooted (gc-heap): a Symbol key's cell outlives traps and getters, which may delete it.
+    let keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
+        crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &props) {
+            let mut ks = Vec::new();
+            let proxy_keys = proxy_own_keys(i, &t, &h)?;
+            for k in proxy_keys.iter() {
+                ks.push(ab(i.to_property_key(k))?);
+            }
+            ks
+        } else {
+            ordinary_own_keys_ordered(i, props.as_obj().unwrap())?
+                .into_iter()
+                .map(crate::value::PropertyKey::stored)
+                .collect()
+        });
     // Collect descriptor objects for enumerable own keys first (so all Gets precede any Defines).
     // They stay rooted through later getters and the defines' descriptor reads (I1).
     let mut descs: Vec<(crate::value::PropertyKey, Value)> = Vec::new();
     let mut roots = crate::rooting::ValueRoots::new();
-    for key in keys {
+    for key in keys.iter().cloned() {
         let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
             let d = proxy_gopd_value(i, &t, &h, &key)?;
             match &d {
@@ -2116,7 +2129,10 @@ fn object_define_properties(
 
 /// CreateListFromArrayLike: the object must be array-like (TypeError otherwise); reads `length`
 /// (ToLength) then the indexed elements in order. Used by Reflect.apply/construct.
-fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
+fn create_list_from_array_like(
+    i: &mut Interp,
+    v: &Value,
+) -> Result<crate::rooting::RootedVec, Value> {
     let o = match v {
         Value::Obj(o) => o.clone(),
         _ => {
@@ -2133,7 +2149,7 @@ fn create_list_from_array_like(i: &mut Interp, v: &Value) -> Result<Vec<Value>, 
     for k in 0..len {
         out.push(array_get_index(i, &o, v, k)?);
     }
-    Ok(out.into_vec())
+    Ok(out)
 }
 
 /// The RangeError for an argument list longer than [`MAX_ARGUMENTS_LEN`], raised before any
@@ -4510,11 +4526,14 @@ fn install_object(it: &mut Interp) {
         ab(i.defer_trigger(&o, None))?;
         if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
-            return Ok(i.make_array(keys));
+            return Ok(i.make_array(keys.into_vec()));
         }
         if let Some(length) = i.host_indexed_len(&o) {
             let own_keys = ordinary_own_keys_ordered(i, &o)?;
-            let mut keys = Vec::with_capacity(own_keys.len().max(length as usize));
+            // Rooted (gc-heap): the platform getter below runs between keys.
+            let mut keys = crate::rooting::RootedVec::from_vec(Vec::with_capacity(
+                own_keys.len().max(length as usize),
+            ));
             // EnumerableOwnProperties asks [[GetOwnProperty]] for each key. For a Web IDL
             // indexed property that operation invokes the platform getter even though
             // Object.keys ultimately keeps only the key.
@@ -4531,7 +4550,7 @@ fn install_object(it: &mut Interp) {
                     keys.push(crate::value::string_key_value(key));
                 }
             }
-            return Ok(i.make_array(keys));
+            return Ok(i.make_array(keys.into_vec()));
         }
         // A TypedArray's enumerable own keys are its integer indices plus string expandos.
         if let Some(info) = ta_info(i, &o) {
@@ -9281,7 +9300,9 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     // Open the inputs in order, GetIteratorFlattenable each as it is read. The lists are
     // rooted across the author code each step runs (I1).
-    let mut keys: Vec<crate::value::PropertyKey> = Vec::new();
+    // Rooted (gc-heap): a Symbol key's cell, like the iterators, outlives author code.
+    let mut keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
+        crate::rooting::Rooted::new(Vec::new());
     let mut iters = crate::rooting::RootedVec::new();
     let mut nexts = crate::rooting::RootedVec::new();
     let open_one = |i: &mut Interp,
@@ -9307,20 +9328,22 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     if keyed {
         // zipKeyed: each own enumerable non-undefined-valued key of `iterables` is an input.
-        let all_keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = proxy_pair(i, &input) {
-            let mut ks = Vec::new();
-            for k in proxy_own_keys(i, &t, &h)? {
-                ks.push(ab(i.to_property_key(&k))?);
-            }
-            ks
-        } else {
-            let o = input.as_obj().unwrap();
-            ordinary_own_keys_ordered(i, o)?
-                .into_iter()
-                .map(crate::value::PropertyKey::stored)
-                .collect()
-        };
-        for k in all_keys {
+        let all_keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
+            crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &input) {
+                let mut ks = Vec::new();
+                let proxy_keys = proxy_own_keys(i, &t, &h)?;
+                for k in proxy_keys.iter() {
+                    ks.push(ab(i.to_property_key(k))?);
+                }
+                ks
+            } else {
+                let o = input.as_obj().unwrap();
+                ordinary_own_keys_ordered(i, o)?
+                    .into_iter()
+                    .map(crate::value::PropertyKey::stored)
+                    .collect()
+            });
+        for k in all_keys.iter().cloned() {
             // [[GetOwnProperty]] fresh per key: skip missing or non-enumerable properties.
             let enumerable = if let Some((t, h)) = proxy_pair(i, &input) {
                 match proxy_gopd_value(i, &t, &h, &k) {
@@ -9453,7 +9476,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     set_internal_slot(&obj, "#\u{0}zip_pad", i.make_array(padding.into_vec()));
     set_internal_slot(&obj, "#\u{0}zip_finished", Value::Bool(false));
     if keyed {
-        let karr = i.make_array(keys.into_iter().map(|key| key.into_value()).collect());
+        let karr = i.make_array(keys.iter().cloned().map(|key| key.into_value()).collect());
         set_internal_slot(&obj, "#\u{0}zip_keys", karr);
     }
     i.def_method(&obj, "next", 0, zip_next);
@@ -11571,7 +11594,8 @@ fn install_string(it: &mut Interp) {
         // error timing.  If a surrogate boundary needs canonicalization, fall back immediately
         // to the old stepwise path; otherwise each intermediate byte length is just the sum and
         // all pieces can be copied once into one LStr allocation.
-        let mut parts = Vec::with_capacity(args.len() + 1);
+        // Rooted (gc-heap): ToString of a later argument may run user code.
+        let mut parts = crate::rooting::Rooted::new(Vec::with_capacity(args.len() + 1));
         parts.push(s);
         let mut total = parts[0].len();
         for (index, argument) in args.iter().enumerate() {
@@ -11602,7 +11626,10 @@ fn install_string(it: &mut Interp) {
                 .ok_or_else(|| i.make_error("RangeError", "Invalid string length"))?;
             parts.push(next);
         }
-        Ok(Value::Str(crate::lstr::LStr::concat_many(&parts, total)))
+        Ok(Value::Str(crate::lstr::LStr::concat_many(
+            parts.as_slice(),
+            total,
+        )))
     });
     it.def_method(&sp, "repeat", 1, |i, this, args| {
         let s = this_string(i, &this)?;

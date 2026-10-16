@@ -143,6 +143,7 @@ impl Value {
             Value::Obj(object) => Some(Gc::as_ptr(object) as u64),
             Value::BigInt(bigint) => Some(bigint.cell_word()),
             Value::Sym(symbol) => Some(symbol_identity(symbol) as u64),
+            Value::Str(string) => Some(string.cell_word()),
             _ => None,
         }
     }
@@ -461,6 +462,8 @@ impl Clone for PackedValue {
                 // A BigInt cell (gc-heap) needs no retain.
                 #[cfg(not(feature = "gc-heap"))]
                 PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
+                // A string cell (gc-heap) needs no retain.
+                #[cfg(not(feature = "gc-heap"))]
                 PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
                 // A Symbol cell (gc-heap) needs no retain.
                 #[cfg(not(feature = "gc-heap"))]
@@ -2405,6 +2408,13 @@ pub(crate) struct GcState {
     /// Symbol cells.
     #[cfg(feature = "gc-heap")]
     pub(crate) symbol_desc: crate::gc_core::DescId,
+    /// String cells (flat buffers and views).
+    #[cfg(feature = "gc-heap")]
+    pub(crate) string_desc: crate::gc_core::DescId,
+    /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
+    /// `jstr::index_lstr`), roots for the heap's lifetime.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -2416,6 +2426,7 @@ struct CellDescs {
     scope: crate::gc_core::DescId,
     bigint: crate::gc_core::DescId,
     symbol: crate::gc_core::DescId,
+    string: crate::gc_core::DescId,
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
@@ -2438,6 +2449,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     });
     let bigint = core.register_desc(crate::bigint::cell_layout());
     let symbol = core.register_desc(symbol_cell_layout());
+    let string = core.register_desc(crate::lstr::cell_layout());
     (
         core,
         CellDescs {
@@ -2445,8 +2457,44 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
             scope,
             bigint,
             symbol,
+            string,
         },
     )
+}
+
+/// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
+#[cfg(feature = "gc-heap")]
+pub(crate) fn alloc_string_cell(size: usize) -> *mut u8 {
+    with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(heap.string_desc, size))
+}
+
+/// The active heap's interned string at `slot`, made by `make` on first use (gc-heap). Engine
+/// strings are immutable values; interning per heap keeps one heap's cells out of another's.
+#[cfg(feature = "gc-heap")]
+pub(crate) fn interned_string(
+    slot: usize,
+    make: impl FnOnce() -> crate::lstr::LStr,
+) -> crate::lstr::LStr {
+    with_active_gc_heap(|heap| {
+        if let Some(Some(string)) = heap.interned_strings.borrow().get(slot) {
+            return string.clone();
+        }
+        let string = make();
+        let mut interned = heap.interned_strings.borrow_mut();
+        if interned.len() <= slot {
+            interned.resize(slot + 1, None);
+        }
+        interned[slot] = Some(string.clone());
+        string
+    })
+}
+
+/// Report a heap's interned strings, roots for its lifetime.
+#[cfg(feature = "gc-heap")]
+pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
+    for string in heap.interned_strings.borrow().iter().flatten() {
+        sink.word(string.cell_word());
+    }
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
@@ -2531,14 +2579,14 @@ impl crate::gc_trace::GcTrace for Object {
             Exotic::ArrayIterator(state) => sink.value(&state.target),
             Exotic::BigIntWrap(bigint) => sink.word(bigint.cell_word()),
             Exotic::SymWrap(symbol) => sink.word(symbol_identity(symbol) as u64),
+            Exotic::StrWrap(string) => sink.word(string.cell_word()),
+            Exotic::StringIterator(state) => state.string.trace_gc(sink),
+            Exotic::Error(stack) => stack.trace_gc(sink), // frame names
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
             | Exotic::NumWrap(_)
-            | Exotic::StrWrap(_)
-            | Exotic::Error(_) // frames hold names and sources, not values
-            | Exotic::Arguments
-            | Exotic::StringIterator(_) => {}
+            | Exotic::Arguments => {}
         }
         match call {
             Callable::User(user) => sink.env(&user.env),
@@ -2645,7 +2693,7 @@ impl PackedValue {
     /// edge.
     pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self.tag() {
-            PACK_BIGINT | PACK_SYM => sink.word(self.0.get() & PACK_PAYLOAD),
+            PACK_BIGINT | PACK_SYM | PACK_STR => sink.word(self.0.get() & PACK_PAYLOAD),
             _ => self.with_object_edge(|object| sink.object(object)),
         }
     }
@@ -3017,6 +3065,10 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         bigint_desc: descs.bigint,
         #[cfg(feature = "gc-heap")]
         symbol_desc: descs.symbol,
+        #[cfg(feature = "gc-heap")]
+        string_desc: descs.string,
+        #[cfg(feature = "gc-heap")]
+        interned_strings: RefCell::default(),
     })
 }
 
@@ -3114,17 +3166,34 @@ pub(crate) fn active_agent_slow_switches() -> u64 {
     ACTIVE_AGENT_SLOW_SWITCHES.with(Cell::get)
 }
 
+#[cfg(feature = "gc-heap")]
+thread_local! {
+    /// Where allocation goes outside any Agent (gc-heap): values made before an Engine exists,
+    /// or after its heap was deactivated. Never collected and released only when the thread
+    /// exits, so such values stay valid wherever they end up. A heap made per activation gap
+    /// instead freed them as soon as an Engine activated its own.
+    static DEFAULT_GC_HEAP: GcHeap = new_gc_heap();
+}
+
+/// The heap allocation uses while no Agent is active.
+fn unowned_gc_heap() -> GcHeap {
+    #[cfg(feature = "gc-heap")]
+    return DEFAULT_GC_HEAP.with(Rc::clone);
+    #[cfg(not(feature = "gc-heap"))]
+    new_gc_heap()
+}
+
 pub(crate) fn active_gc_heap() -> GcHeap {
     ACTIVE_GC_HEAP.with(|active| {
         let mut active = active.borrow_mut();
-        active.get_or_insert_with(new_gc_heap).clone()
+        active.get_or_insert_with(unowned_gc_heap).clone()
     })
 }
 
 fn with_active_gc_heap<R>(f: impl FnOnce(&GcState) -> R) -> R {
     ACTIVE_GC_HEAP.with(|active| {
         if active.borrow().is_none() {
-            *active.borrow_mut() = Some(new_gc_heap());
+            *active.borrow_mut() = Some(unowned_gc_heap());
         }
         let active = active.borrow();
         f(active

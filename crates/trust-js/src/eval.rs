@@ -248,7 +248,9 @@ impl Interp {
                         )
                     })
                 {
-                    let mut values = Vec::with_capacity(elems.len());
+                    // Rooted (gc-heap): binding one element may run code that empties the source.
+                    let mut values =
+                        crate::rooting::RootedVec::from_vec(Vec::with_capacity(elems.len()));
                     if let Some(Ok(())) =
                         self.inert_array_prefix(&value, elems.len(), |value| values.push(value))
                     {

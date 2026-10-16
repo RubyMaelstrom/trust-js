@@ -46,13 +46,13 @@ fn ascii_unit_observation_does_not_pin_unique_accumulators() {
     use crate::lstr::LStr;
     let mut engine = Engine::new();
     let mut s = LStr::from("a".repeat(128)).concat_owned(&LStr::from("b"));
-    let pointer = s.as_ptr();
+    let pointer = s.buffer_ptr();
     assert_eq!(engine.interp.str_len(&s), 129);
     assert_eq!(engine.interp.unit_at(&s, 128), Some(b'b' as u16));
     assert_eq!(engine.interp.unit_at(&s, 129), None);
     s = s.concat_owned(&LStr::from("c"));
     assert_eq!(
-        s.as_ptr(),
+        s.buffer_ptr(),
         pointer,
         "unit observation must not force a prefix copy"
     );

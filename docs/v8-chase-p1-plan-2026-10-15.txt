@@ -433,7 +433,7 @@ record deviations here *before* deviating.
 | S0.0 | done | 73c9d135 | sha256 match; vue observed=30016 invocations=12359; react checksum ok |
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
-| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, (this commit) | steps 1–4c: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and a buffer audit; BigInt payloads and Symbols as cells. Default suite 2149/0/3 unchanged; gc-heap lib suite 1828/0/116 (ignores carry their reason); per-test GC stress + verifier at step 3c: 1825 pass (19 slow ones at interval 100/1000), 0 fail |
+| S2 | in progress | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, (this commit) | steps 1–4d: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation). Default suite 2149/0/3 unchanged; gc-heap lib suite 1832/0/116 (ignores carry their reason); per-test GC stress + verifier: 1832 pass (19 slow ones at interval 100/1000), 0 fail |
 | S3 | not started | — | — |
 | S4 | not started | — | — |
 | S5 | not started | — | — |
@@ -477,12 +477,26 @@ Recorded deviations (S2, 2026-10-16; details in the program record):
   and nursery) and of contracts S2 removes (cross-Agent edges, the HostGc
   omission fallback, a callable lease rooting captures, handles that
   outlive their Agent). They retire with the old model at S6.
+- Decision 4's string accumulation mechanism is replaced at step 4d:
+  "frontier append" instead of the builder-cell typestate. A flat string
+  cell records how far its buffer has been written (its frontier).
+  Appending to a string that ends at its buffer's frontier, with spare
+  capacity, writes past the frontier, advances it and returns a view of
+  the same buffer; any other append copies into a new buffer with
+  geometric capacity. Bytes a string can read never change afterwards,
+  so in-place append needs no uniqueness proof and no slot typestate:
+  an alias keeps its own length, and its own later append copies.
+  Amortized += is preserved at the cost of one small view cell per
+  in-place append. The typestate is rejected because every read path of
+  every slot kind (locals, captures, properties and their hundreds of
+  readers) would have to freeze builders, and one missed path would make
+  an in-place append visible through an alias.
 - "GC stress + verifier green over the suite" runs each lib test in its
   own process at stress interval 1 (debug build: verifier and poisoning
   at every collection). Assertions about *when* collections or cleanup
   jobs happen are skipped under stress; tests whose cost is quadratic at
   interval 1 (deep recursion, long chains, allocation loops) run at
-  interval 100 instead (1000 for the three heaviest).
+  interval 100 instead (1000 for the heaviest four).
 
 ### Working agreements (all agents)
 

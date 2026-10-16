@@ -17,14 +17,24 @@
 //!
 //! Like `Rc`, `LStr` is neither `Send` nor `Sync` (non-atomic count; the engine is one thread
 //! per realm).
+//!
+//! With `gc-heap` (P1 S2) a string is a cell of the active Agent's heap: a handle is the cell's
+//! address, cloning copies it and nothing is counted. Word 0 of a flat buffer then records its
+//! *frontier*, how many bytes have been written into it. An append to a string that ends at its
+//! buffer's frontier, with spare capacity, writes past the frontier and returns a view of the
+//! same buffer; bytes a string can read never change afterwards, so aliases keep their own
+//! length and no uniqueness is needed (Decision 4 as revised at step 4d). Any other append
+//! copies into a new buffer with geometric capacity.
 
+#[cfg(not(feature = "gc-heap"))]
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ptr::NonNull;
 
 #[repr(C)]
 struct Header {
-    /// Strong count — MUST stay the first field (the JIT bumps it at payload offset 0).
+    /// Strong count — MUST stay the first field (the JIT bumps it at payload offset 0). With
+    /// `gc-heap`, a flat buffer's frontier (see the module docs); unused by a view.
     strong: Cell<usize>,
     len: Cell<u32>,
     cap: Cell<u32>,
@@ -72,9 +82,31 @@ const MIN_VIEW_BYTES: usize = 256;
 const VIEW_PIN_BYTES: usize = 1 << 20;
 const _: () = assert!(MIN_VIEW_BYTES > 10);
 
+#[cfg(not(feature = "gc-heap"))]
 fn layout(cap: u32) -> Layout {
     Layout::from_size_align(HDR + cap as usize, std::mem::align_of::<Header>())
         .expect("string too large")
+}
+
+/// The descriptor of string cells (gc-heap): a view's one edge is its flat owner.
+#[cfg(feature = "gc-heap")]
+pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
+    fn trace(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+        // SAFETY: string cells are initialized before any collection can trace them; a view
+        // is recognized by its reserved capacity.
+        unsafe {
+            let header = &*cell.cast::<Header>();
+            if header.cap.get() == VIEW_CAP {
+                visit((*cell.cast::<View>()).owner.p.as_ptr().cast::<u8>());
+            }
+        }
+    }
+    crate::gc_core::LayoutDesc {
+        name: "string",
+        trace,
+        weak: None,
+        finalize: None,
+    }
 }
 
 impl LStr {
@@ -90,13 +122,21 @@ impl LStr {
         assert!(cap < VIEW_CAP, "capacity claims representation bits");
         debug_assert!(!ascii || content.is_ascii());
         unsafe {
+            #[cfg(not(feature = "gc-heap"))]
             let p = alloc(layout(cap)) as *mut Header;
+            #[cfg(feature = "gc-heap")]
+            let p = crate::value::alloc_string_cell(HDR + cap as usize) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
             // The hint holds for `content`; constructors that append more bytes afterwards
             // re-AND it with the extra bytes' ASCII-ness (see concat2/concat_grown).
             let hint = if ascii { ASCII_HINT } else { 0 };
             p.as_ptr().write(Header {
-                strong: Cell::new(1),
+                // A count of one, or (gc-heap) the frontier: the content's end.
+                strong: Cell::new(if cfg!(feature = "gc-heap") {
+                    content.len()
+                } else {
+                    1
+                }),
                 len: Cell::new(content.len() as u32),
                 cap: Cell::new(cap | hint),
             });
@@ -104,6 +144,16 @@ impl LStr {
             std::ptr::copy_nonoverlapping(content.as_ptr(), data, content.len());
             LStr { p }
         }
+    }
+
+    /// Set a fresh, unpublished flat string's length after writing its bytes (and, with
+    /// `gc-heap`, its frontier to match).
+    #[inline]
+    fn set_fresh_len(&self, len: usize) {
+        let h = self.hdr();
+        h.len.set(len as u32);
+        #[cfg(feature = "gc-heap")]
+        h.strong.set(len);
     }
 
     /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]).
@@ -128,7 +178,7 @@ impl LStr {
             let data = (s.p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
             std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
-            s.hdr().len.set(total as u32);
+            s.set_fresh_len(total);
         }
         s.and_ascii(a.is_ascii() && b.is_ascii());
         s
@@ -148,7 +198,7 @@ impl LStr {
             std::ptr::copy_nonoverlapping(a.as_ptr(), data, a.len());
             std::ptr::copy_nonoverlapping(b.as_ptr(), data.add(a.len()), b.len());
             std::ptr::copy_nonoverlapping(c.as_ptr(), data.add(a.len() + b.len()), c.len());
-            s.hdr().len.set(total as u32);
+            s.set_fresh_len(total);
         }
         s.and_ascii(a.is_ascii() && b.is_ascii() && c.is_ascii());
         s
@@ -174,7 +224,7 @@ impl LStr {
                 data.add(a.len() + b.len() + c.len()),
                 d.len(),
             );
-            s.hdr().len.set(total as u32);
+            s.set_fresh_len(total);
         }
         s.and_ascii(a.is_ascii() && b.is_ascii() && c.is_ascii() && d.is_ascii());
         s
@@ -193,7 +243,7 @@ impl LStr {
             }
         }
         debug_assert_eq!(offset, total);
-        s.hdr().len.set(total as u32);
+        s.set_fresh_len(total);
         s.and_ascii(parts.iter().all(LStr::ascii_hint));
         s
     }
@@ -248,18 +298,40 @@ impl LStr {
         {
             return LStr::from(bytes);
         }
-        let view = Box::new(View {
+        LStr::new_view(owner.clone(), offset, bytes.len())
+    }
+
+    /// A view of `len` bytes of flat `owner` from `offset`.
+    fn new_view(owner: LStr, offset: usize, len: usize) -> LStr {
+        debug_assert!(owner.view().is_none(), "views own flat buffers");
+        let view = View {
             header: Header {
-                strong: Cell::new(1),
-                len: Cell::new(bytes.len() as u32),
+                strong: Cell::new(if cfg!(feature = "gc-heap") { 0 } else { 1 }),
+                len: Cell::new(len as u32),
                 cap: Cell::new(VIEW_CAP),
             },
-            owner: owner.clone(),
+            owner,
             offset,
-        });
+        };
+        #[cfg(not(feature = "gc-heap"))]
+        let p = Box::into_raw(Box::new(view)).cast::<Header>();
+        #[cfg(feature = "gc-heap")]
+        let p = {
+            let cell = crate::value::alloc_string_cell(std::mem::size_of::<View>()).cast::<View>();
+            // SAFETY: a fresh cell sized and aligned for a view.
+            unsafe { cell.write(view) };
+            cell.cast::<Header>()
+        };
         LStr {
-            p: unsafe { NonNull::new_unchecked(Box::into_raw(view).cast::<Header>()) },
+            p: unsafe { NonNull::new_unchecked(p) },
         }
+    }
+
+    /// The string's cell, as a GC edge (gc-heap).
+    #[cfg(feature = "gc-heap")]
+    #[inline]
+    pub(crate) fn cell_word(&self) -> u64 {
+        self.p.as_ptr() as u64
     }
 
     #[inline]
@@ -268,6 +340,13 @@ impl LStr {
             let bytes = std::slice::from_raw_parts(self.data(), self.hdr().len.get() as usize);
             std::str::from_utf8_unchecked(bytes)
         }
+    }
+
+    /// The flat buffer this string reads: a view's owner, else itself. An in-place append keeps
+    /// it (with `gc-heap` the result is a new view of the same buffer).
+    #[cfg(test)]
+    pub(crate) fn buffer_ptr(&self) -> *const u8 {
+        self.view_owner().unwrap_or(self).as_ptr()
     }
 
     /// Pointer identity (cache keys — same contract as `Rc::as_ptr`).
@@ -282,7 +361,11 @@ impl LStr {
     }
 
     #[inline]
+    #[track_caller]
     pub fn strong_count(&self) -> usize {
+        #[cfg(feature = "gc-heap")]
+        panic!("LStr::strong_count: gc-heap strings have no reference counts");
+        #[cfg(not(feature = "gc-heap"))]
         self.hdr().strong.get()
     }
 
@@ -316,6 +399,33 @@ impl LStr {
         self.append_with_hint(x, x.is_ascii())
     }
 
+    #[cfg(feature = "gc-heap")]
+    fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
+        // Frontier append: only the string ending where its buffer's writes end may extend it.
+        let (buffer, offset) = match self.view() {
+            Some(view) => (view.owner.clone(), view.offset),
+            None => (self.clone(), 0),
+        };
+        let len = self.len();
+        let h = buffer.hdr();
+        let frontier = h.strong.get();
+        if offset + len != frontier || frontier + x.len() > (h.cap.get() & !ASCII_HINT) as usize {
+            return false;
+        }
+        // SAFETY: past the frontier, within capacity: no string can read these bytes yet.
+        unsafe {
+            let data = (buffer.p.as_ptr() as *mut u8).add(HDR);
+            std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(frontier), x.len());
+        }
+        h.strong.set(frontier + x.len());
+        // The buffer's hint covers only the flat string's own bytes, so clearing it for a
+        // non-ASCII suffix is conservative.
+        buffer.and_ascii(ascii);
+        *self = LStr::new_view(buffer, offset, len + x.len());
+        true
+    }
+
+    #[cfg(not(feature = "gc-heap"))]
     fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
         let h = self.hdr();
         if h.strong.get() != 1 || h.cap.get() == VIEW_CAP {
@@ -349,7 +459,7 @@ impl LStr {
             let data = (s.p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(self.as_str().len()), x.len());
         }
-        s.hdr().len.set(need as u32);
+        s.set_fresh_len(need);
         s.and_ascii(ascii);
         s
     }
@@ -414,7 +524,7 @@ impl LStr {
                 std::ptr::copy(destination, destination.add(filled), copy_len);
                 filled += copy_len;
             }
-            repeated.hdr().len.set(total as u32);
+            repeated.set_fresh_len(total);
         }
         repeated.and_ascii(self.ascii_hint());
         repeated
@@ -453,7 +563,7 @@ impl LStr {
                 source.len(),
             );
         }
-        padded.hdr().len.set(total as u32);
+        padded.set_fresh_len(total);
         padded.and_ascii(true);
         padded
     }
@@ -476,7 +586,7 @@ impl LStr {
                 destination.add(index).write(byte);
             }
         }
-        mapped.hdr().len.set(source.len() as u32);
+        mapped.set_fresh_len(source.len());
         mapped
     }
 }
@@ -484,12 +594,25 @@ impl LStr {
 impl Clone for LStr {
     #[inline]
     fn clone(&self) -> LStr {
-        let h = self.hdr();
-        h.strong.set(h.strong.get() + 1);
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            let h = self.hdr();
+            h.strong.set(h.strong.get() + 1);
+        }
         LStr { p: self.p }
     }
 }
 
+/// Nothing to release under gc-heap: the collector frees unreachable cells. Kept as a type
+/// with drop glue so code written for counted strings (an explicit `drop` that releases a
+/// buffer early, scoped temporaries) reads the same in both builds.
+#[cfg(feature = "gc-heap")]
+impl Drop for LStr {
+    #[inline]
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(feature = "gc-heap"))]
 impl Drop for LStr {
     #[inline]
     fn drop(&mut self) {
@@ -609,11 +732,12 @@ mod tests {
     #[test]
     fn owned_concat_reuses_unique_capacity_and_preserves_aliases() {
         let mut s = LStr::from("a").concat_owned(&LStr::from("b"));
-        let p = s.as_ptr();
+        let p = s.buffer_ptr();
         s = s.concat_owned(&LStr::from("c"));
-        assert_eq!(s.as_ptr(), p);
+        assert_eq!(s.buffer_ptr(), p);
         assert_eq!(s.as_str(), "abc");
-        assert!(s.ascii_hint());
+        // A frontier append (gc-heap) returns a view, which carries no hint.
+        assert!(s.ascii_hint() || s.view_owner().is_some());
         let alias = s.clone();
         s = s.concat_owned(&LStr::from("d"));
         assert!(!LStr::ptr_eq(&s, &alias));
@@ -644,7 +768,9 @@ mod tests {
         assert_eq!(s.len(), 80_000);
         assert!(s.as_str().starts_with("abcdefgh"));
         assert!(s.as_str().ends_with("abcdefgh"));
-        let cap = (s.hdr().cap.get() & !ASCII_HINT) as usize;
+        // The buffer the accumulated string reads (a view's owner under gc-heap).
+        let buffer = s.view_owner().unwrap_or(&s);
+        let cap = (buffer.hdr().cap.get() & !ASCII_HINT) as usize;
         assert!(
             cap <= 4 * s.len(),
             "capacity {cap} not geometric vs len {}",
@@ -669,9 +795,9 @@ mod tests {
         let s = LStr::from("abc").concat_owned(&LStr::alloc_with_hint("d", 1, false));
         assert!(!s.ascii_hint(), "right hint must also be preserved");
         let s = LStr::from("a").concat_owned(&LStr::from("b"));
-        let p = s.as_ptr();
+        let p = s.buffer_ptr();
         let s = s.concat_owned(&LStr::from("é"));
-        assert_eq!(s.as_ptr(), p);
+        assert_eq!(s.buffer_ptr(), p);
         assert!(!s.ascii_hint());
         assert_eq!(s.as_str(), "abé");
     }
@@ -694,9 +820,9 @@ mod tests {
     #[test]
     fn populated_append_reuses_unique_capacity_and_keeps_aliases_immutable() {
         let mut value = LStr::alloc_with_hint("a", 16, true);
-        let pointer = value.as_ptr();
+        let pointer = value.buffer_ptr();
         value.append_or_replace(&LStr::from("b"));
-        assert_eq!(value.as_ptr(), pointer);
+        assert_eq!(value.buffer_ptr(), pointer);
         assert_eq!(value.as_str(), "ab");
         let snapshot = value.clone();
         value.append_or_replace(&LStr::from("c"));
@@ -728,14 +854,20 @@ mod tests {
         let appended = prefix.concat_owned(&LStr::from("!"));
         assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
         assert_eq!(alias.len(), 900);
-        let count = source.strong_count();
-        let packed = crate::value::PackedValue::pack(crate::value::Value::Str(nested));
-        let cloned = packed.clone();
-        drop(packed);
-        drop(cloned);
-        assert_eq!(source.strong_count(), count - 1);
-        drop(alias);
-        assert_eq!(source.strong_count(), 1);
+        // Reference counts release the owner as its views go; gc-heap has none to observe.
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            let count = source.strong_count();
+            let packed = crate::value::PackedValue::pack(crate::value::Value::Str(nested));
+            let cloned = packed.clone();
+            drop(packed);
+            drop(cloned);
+            assert_eq!(source.strong_count(), count - 1);
+            drop(alias);
+            if cfg!(not(feature = "gc-heap")) {
+                assert_eq!(source.strong_count(), 1);
+            }
+        }
         assert_eq!(std::mem::offset_of!(View, header), 0);
     }
 
@@ -747,19 +879,25 @@ mod tests {
             let slice = source.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
             assert_eq!(slice.as_str(), &source[start..end]);
-            assert_eq!(source.strong_count(), 1);
+            if cfg!(not(feature = "gc-heap")) {
+                assert_eq!(source.strong_count(), 1);
+            }
         }
         let shared = source.slice_bytes(0, 900);
         assert!(shared.view_owner().is_some());
         drop(shared);
-        assert_eq!(source.strong_count(), 1);
+        if cfg!(not(feature = "gc-heap")) {
+            assert_eq!(source.strong_count(), 1);
+        }
         // A large owner is pinned only by a slice covering at least half of it.
         let large = LStr::from("x".repeat(VIEW_PIN_BYTES + 4096));
         for (start, end) in [(0, 900), (1024, 300_000)] {
             let slice = large.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
             assert_eq!(slice.as_str(), &large[start..end]);
-            assert_eq!(large.strong_count(), 1);
+            if cfg!(not(feature = "gc-heap")) {
+                assert_eq!(large.strong_count(), 1);
+            }
         }
         assert!(large
             .slice_bytes(0, large.len() / 2 + 1024)

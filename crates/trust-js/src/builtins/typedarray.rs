@@ -980,8 +980,9 @@ fn ta_merge_sort(
         return Ok(());
     }
     let mid = n / 2;
-    let mut left = vals[..mid].to_vec();
-    let mut right = vals[mid..].to_vec();
+    // Rooted (gc-heap): while the comparator runs, a value may be held only by these halves.
+    let mut left = crate::rooting::RootedVec::from_vec(vals[..mid].to_vec());
+    let mut right = crate::rooting::RootedVec::from_vec(vals[mid..].to_vec());
     ta_merge_sort(i, &mut left, cmp, is_bigint)?;
     ta_merge_sort(i, &mut right, cmp, is_bigint)?;
     let (mut li, mut ri, mut k) = (0usize, 0usize, 0usize);
@@ -1142,7 +1143,8 @@ fn ta_native(
         })()),
         "filter" => Some((|| {
             let cb = require_cb(i)?;
-            let mut kept: Vec<Value> = Vec::new();
+            // Rooted (gc-heap): BigInt elements are cells, and the callback runs JavaScript.
+            let mut kept = crate::rooting::RootedVec::new();
             for k in 0..len {
                 let v = i.ta_read(&info, k);
                 let r = ab(cb.call(
@@ -1487,7 +1489,9 @@ fn ta_native(
                 }
                 return Ok(new_ta);
             }
-            let mut vals: Vec<Value> = (0..len).map(|k| i.ta_read(&info, k)).collect();
+            // Rooted (gc-heap): BigInt elements are cells, and the comparator runs JavaScript.
+            let mut vals: crate::rooting::RootedVec =
+                (0..len).map(|k| i.ta_read(&info, k)).collect();
             let cmp = cmp
                 .is_callable()
                 .then(|| crate::callback::Callback::new(cmp));
