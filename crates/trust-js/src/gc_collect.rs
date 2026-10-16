@@ -62,10 +62,7 @@ impl GcSink for WordSink<'_> {
 }
 
 fn value_word(value: &Value) -> Option<u64> {
-    match value {
-        Value::Obj(object) => Some(Gc::as_ptr(object) as u64),
-        _ => None,
-    }
+    value.cell_word()
 }
 
 /// One interpreter's host graph for this collection: what its `HostGc` slots report.

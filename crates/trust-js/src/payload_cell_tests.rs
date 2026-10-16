@@ -82,3 +82,34 @@ fn dead_bigints_are_reclaimed() {
         );
     }
 }
+
+/// A BigInt kept only by a WeakMap entry with a live key, or as a FinalizationRegistry cell's
+/// held value, survives collections (ephemeron values and side-table values are edges).
+#[test]
+fn bigints_held_by_weak_collections_survive() {
+    for tier in [Tier::Interp, Tier::Bytecode] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(
+            &mut engine,
+            r#"
+            var key = {}, weak = new WeakMap(), held = [];
+            var registry = new FinalizationRegistry(value => held.push(value));
+            (function () {
+                weak.set(key, 2n ** 100n + 7n);
+                registry.register({}, 3n ** 50n);
+            })();
+            true
+            "#,
+        );
+        engine.interp.gc_collect();
+        eval(&mut engine, "true");
+        engine.interp.gc_collect();
+        let result = eval(
+            &mut engine,
+            "[weak.get(key) === 2n ** 100n + 7n, held.length, held[0] === 3n ** 50n].join()",
+        );
+        assert_eq!(result, "true,1,true", "{tier:?}");
+    }
+}

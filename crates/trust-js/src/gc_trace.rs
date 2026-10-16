@@ -28,10 +28,8 @@ pub(crate) trait GcSink {
 
     #[inline]
     fn value(&mut self, value: &Value) {
-        match value {
-            Value::Obj(object) => self.object(object),
-            Value::BigInt(bigint) => self.word(bigint.cell_word()),
-            _ => {}
+        if let Some(word) = value.cell_word() {
+            self.word(word);
         }
     }
 }

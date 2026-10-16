@@ -134,6 +134,19 @@ pub enum Value {
     Obj(Gc) = 8,
 }
 
+#[cfg(feature = "gc-heap")]
+impl Value {
+    /// The cell this value holds, as a GC edge: an object or a payload cell (gc-heap).
+    #[inline]
+    pub(crate) fn cell_word(&self) -> Option<u64> {
+        match self {
+            Value::Obj(object) => Some(Gc::as_ptr(object) as u64),
+            Value::BigInt(bigint) => Some(bigint.cell_word()),
+            _ => None,
+        }
+    }
+}
+
 /// Emit a compact diagnostic for a computed property read whose base is nullish.
 ///
 /// This is intentionally opt-in: the normal error remains the spec-compatible generic

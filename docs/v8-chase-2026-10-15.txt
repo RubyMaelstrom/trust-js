@@ -695,3 +695,9 @@ BigInt tracing removed. Results: gc-heap lib suite 1827/0/114, default
 2149/0/3; the 234 BigInt-, typed-array-, literal- and parser-related
 tests pass per test at stress interval 1 (11 ignored as in the suite);
 clippy clean on both feature sets; the workspace builds.
+Follow-up: host roots, host and native-graph edges, Realm template values
+and WeakMap ephemeron values still converted only objects to edges, so
+a BigInt held only there was freed. Every value-to-edge conversion now
+goes through Value::cell_word; a new test covers WeakMap values and
+FinalizationRegistry held values (it fails without the fix). gc-heap
+lib suite 1828/0/114.

@@ -93,12 +93,20 @@ impl NativeGcGraph {
     }
 
     pub(crate) fn native_to_js(&mut self, from: NativeGcId, value: &Value) {
-        if let Some(value) = value.as_obj() {
+        // Every cell a value holds is an edge under gc-heap; reference counts keep primitive
+        // payloads alive otherwise, so only objects are graph targets.
+        #[cfg(feature = "gc-heap")]
+        let target = value.cell_word().map(|word| word as usize);
+        #[cfg(not(feature = "gc-heap"))]
+        let target = value
+            .as_obj()
+            .map(|object| crate::value::Gc::as_ptr(object) as usize);
+        if let Some(target) = target {
             let from = self.index(from);
             let next = self.heads[from];
             self.heads[from] = self.edges.len();
             self.edges.push(Edge {
-                target: Target::JavaScript(crate::value::Gc::as_ptr(value) as usize),
+                target: Target::JavaScript(target),
                 next,
             });
         }
