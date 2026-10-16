@@ -2393,7 +2393,9 @@ pub struct Chunk {
     /// One pre-shaped `Props` template per plain object-literal site (`Op::MakeObject`'s third
     /// operand indexes this; `u32::MAX` = duplicate keys, take the insert path). Built on first
     /// execution, cloned per instance — key hashing and shape transitions paid once per SITE.
-    obj_maps: Vec<std::cell::OnceCell<crate::value::Props>>,
+    /// Per object-literal site, the template built by its first execution; boxed, since most
+    /// sites of a large program never run.
+    obj_maps: Vec<std::cell::OnceCell<Box<crate::value::Props>>>,
     /// A bounded structural plan, never a receiver/descriptor/value snapshot.
     record_getter: std::cell::OnceCell<Option<Box<RecordGetterPlan>>>,
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
@@ -2654,7 +2656,7 @@ impl Chunk {
             .saturating_add(vec_bytes!(caches, std::cell::Cell<IcState>))
             .saturating_add(vec_bytes!(
                 obj_maps,
-                std::cell::OnceCell<crate::value::Props>
+                std::cell::OnceCell<Box<crate::value::Props>>
             ))
             .saturating_add(vec_bytes!(name_caches, std::cell::Cell<NameIc>))
             .saturating_add(vec_bytes!(name_num_bits, std::cell::Cell<u64>))
@@ -2786,6 +2788,7 @@ impl Chunk {
         }
         for map in &self.obj_maps {
             if let Some(map) = map.get() {
+                bytes = bytes.saturating_add(std::mem::size_of::<crate::value::Props>());
                 visitor.props(map);
             }
         }

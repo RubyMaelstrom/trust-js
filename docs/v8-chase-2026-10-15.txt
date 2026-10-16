@@ -1039,3 +1039,51 @@ short-lived plain object on Vue, React and the sustained workload and
 94.6% on Djot; three would miss Vue's 4-property temporaries (38.7% of
 its dying plain objects). Decision: 4 inline named slots, S0's
 hypothesis, now measured.
+
+Measurement note (S3): on this machine the big cores' delivered clock
+follows the shared CPU/GPU power budget (the owner's GPU services run
+alongside). CPU 5 averaged about 1.35 GHz under load while cpufreq
+reported 3.9 GHz, and wall times turned bimodal. Interleaving keeps
+wall-time comparisons unbiased but leaves a few percent of noise, so
+from S3 step 2 on comparisons use user-mode cycles and instructions
+(perf stat, unmultiplexed, CPU 5), which the clock does not move; wall
+time and peak RSS are still recorded.
+
+Step 2-3, inline named slots (gc-heap): a property map's values live in
+an InlineVec (inline_vec.rs) with 4 slots in the cell; a fifth spills
+them all to one heap buffer, kept if the map shrinks again. To keep the
+cell in the 192 B size class the `length`/`prototype` slot memos narrow
+to u16 under gc-heap (a slot past that range is not memoized):
+RefCell<Object> is exactly 192 B, held there by a const assertion, and
+Props 112 B. The default build keeps Vec-backed fields and the layouts
+its JIT probes.
+- Props templates stored by value grew with Props, mostly where they
+  stay empty: every parsed function's FunctionMaps cache and every
+  object-literal site's template cell. Both are boxed now; an AST
+  Function is 200 B in both builds (440 B before, 584 B with inline
+  slots).
+- Measured (release, fat LTO, CPU 5, user-mode cycles over 5
+  interleaved rounds; gc-heap at 51c8c26f against this step; the new
+  benchmarks/maps-sets.js exercises Map/Set data):
+                         interp     bytecode
+    sustained alloc.     -10.1%     -5.5%    (instructions -2.7/-3.1%)
+    property access      -1.1%      +1.3%
+    maps-sets            -1.8%      -1.2%
+    Vue                  -0.6%      +0.8%
+    React                -1.0%      +0.3%
+    Djot                 -1.3%      -1.1%
+  Instructions move by at most 0.3% elsewhere. Outputs are identical
+  to main everywhere. The default build's instruction counts equal
+  main's on every workload; its cycles vary by -2.7..+1.7%, as S2's
+  default build did against main (code layout).
+- Peak RSS moves with collection timing more than with layout: the
+  wall-time runs put it 4-6% lower on the sustained workload, and
+  Djot's peak about 2.8 MiB higher (with malloc huge pages off). Its
+  RSS trace matches S2's until the fourth collection, which comes
+  later: the third left a smaller live set (3,904 vs 9,615 objects; the
+  conservative scan saw different stack words), so the byte budget,
+  max(8 MiB, 2 x live), admitted more garbage first.
+- Two guards that skipped side-table probes for plain objects (the
+  module_ns lookup in generic [[Get]] and the receiver classification
+  of element feedback) measured as no change in instructions or cycles
+  and were dropped.

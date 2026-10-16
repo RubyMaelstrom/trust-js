@@ -83,7 +83,7 @@ fn templates_share_keys_but_not_values_or_descriptors() {
     );
     assert_eq!(
         a.retained_requested_storage_bytes(),
-        (2 * std::mem::size_of::<Property>(), true)
+        (crate::value::detached_field_bytes(2), true)
     );
     a.get_mut("x").unwrap().set_writable(false);
     assert!(b.get("x").unwrap().writable());
@@ -265,7 +265,7 @@ fn learned_insertion_chains_reserve_once_without_creating_predicted_fields() {
     ));
     assert_eq!(
         partial.borrow().props.retained_requested_storage_bytes(),
-        (3 * std::mem::size_of::<Property>(), true),
+        (crate::value::detached_field_bytes(3), true),
         "the whole small learned sequence is reserved by its first insertion"
     );
     assert_eq!(eval(&mut engine, "[Object.keys(partial),'chainSecond' in partial,Object.getOwnPropertyDescriptor(partial,'chainThird')].join('|')"), "chainFirst|false|");

@@ -7649,12 +7649,12 @@ impl Interp {
             } else {
                 None
             };
-            crate::ast::FunctionMaps {
+            Box::new(crate::ast::FunctionMaps {
                 function: p,
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
                 pins: std::cell::RefCell::new(pins),
-            }
+            })
         });
         let proto_map = &maps.prototype;
         // SetFunctionName: NamedEvaluation of an anonymous function expression, or a concise

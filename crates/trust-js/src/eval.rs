@@ -7425,7 +7425,7 @@ impl Interp {
     /// `base..base+count` must be initialized `PackedValue`s the caller relinquishes.
     pub(crate) unsafe fn make_plain_object_templated_from(
         &mut self,
-        tmpl: &std::cell::OnceCell<crate::value::Props>,
+        tmpl: &std::cell::OnceCell<Box<crate::value::Props>>,
         keys: &[std::rc::Rc<str>],
         base: *const PackedValue,
         count: usize,
@@ -7435,7 +7435,7 @@ impl Interp {
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
-            p
+            Box::new(p)
         });
         let props =
             map.instantiate_plain_packed((0..count).map(|slot| unsafe { base.add(slot).read() }));
@@ -7454,7 +7454,7 @@ impl Interp {
     /// Values arrive in key order, one slot per key.
     pub(crate) fn make_plain_object_templated(
         &mut self,
-        tmpl: &std::cell::OnceCell<crate::value::Props>,
+        tmpl: &std::cell::OnceCell<Box<crate::value::Props>>,
         keys: &[std::rc::Rc<str>],
         values: Vec<Value>,
     ) -> Value {
@@ -7463,7 +7463,7 @@ impl Interp {
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
-            p
+            Box::new(p)
         });
         let obj = crate::value::Object::new_with_parts(
             Some(self.object_proto.clone()),

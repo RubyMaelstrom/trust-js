@@ -130,6 +130,8 @@ mod host_collections;
 mod host_memory;
 #[cfg(test)]
 mod host_string_tests;
+#[cfg(feature = "gc-heap")]
+mod inline_vec;
 #[cfg(test)]
 mod internal_slot_tests;
 mod interpreter;

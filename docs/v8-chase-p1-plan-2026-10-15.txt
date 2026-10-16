@@ -434,7 +434,7 @@ record deviations here *before* deviating.
 | S0 | done (owner GO 2026-10-15) | 97b40245, 5e064214 | census/bucket/inventories; spike 3/3; string oracle; wasm32 run deferred (no toolchain) |
 | S1 | done (review fixes applied) | 6b0b469c, 75e1b77d | 33 debug / 31 release gc_core tests incl. adversarial scanner (d8-only reference), segment-chain, bounds-precision, weak/ephemeron and registry tests; mutation-checked; green under fat LTO and an opt-level matrix; clippy clean both feature sets; default build unchanged |
 | S2 | done (review fixes applied) | 88462dc1, 8cc370f1, 7435aa2b, 344ac1b2, 3dae06e7, def875f9, 12a07243, 597011c5, 14c9b990, b91d5154, dcf723f4, d6ef1e66, dcde3ef6, 51c8c26f | steps 1–7: Gc and Env seams; objects and environments as cells; collection at safepoints with exhaustive interpreter roots, side slots, Realm groups and ephemerons; I1 rooting from GC stress and buffer audits; BigInts, Symbols and strings as cells (frontier append for string accumulation); mandatory host enumeration (HostTrace, declared native closure captures); I8 sweep inventory; I9 by safepoint-only collection. Exit gate (this commit): default suite 2149/0/3 unchanged; gc-heap lib suite 1835/0/116 (ignores carry their reason); Test262 subsets 29028/0/1 on main, branch default and gc-heap at interp and bytecode, reports byte-identical; per-test GC stress + verifier 1835 pass (20 slow ones at interval 100/1000), 0 fail; perf tripwire recorded (benchmarks/p1-s2-tripwire-2026-10-16.json): outputs identical, default build at main's speed on the JS workloads, gc-heap -13%..+7% wall at bytecode and +4%..+21% at interp, peak RSS higher (byte-budget floor lowered from 64 to 8 MiB); wasm32 acceptance blocked (deviation). Review fixes (51c8c26f): class Symbol keys and decorator receivers traced; runtime callback and rejection batches rooted; sustained-allocation fixture reclaims its displaced objects; gc-heap lib suite 1836/0/116, runtime 182/0/1 in both builds |
-| S3 | in progress | (this commit) | step 1: layout census (TRUST_JS_GC_CENSUS); 4 inline named slots measured. Stage boundary: main has no commits past e3310993, nothing to sync |
+| S3 | in progress | e4ebb673, (this commit) | step 1: layout census (TRUST_JS_GC_CENSUS); 4 inline named slots measured. Steps 2-3: named properties in 4 inline slots (InlineVec), slot memos narrowed, RefCell<Object> exactly 192 B; templates boxed (AST Function 200 B in both builds); gc-heap cycles vs S2 -10.1/-5.5% on the sustained workload, within -1.8..+1.3% elsewhere; default build's instructions equal main's. Deviations: map_data and hot side tables move with S4's payloads; shapes page-resident not taken. Stage boundary: main has no commits past e3310993, nothing to sync |
 | S4 | not started | — | — |
 | S5 | not started | — | — |
 | S6 | not started | — | — |
@@ -507,6 +507,31 @@ Recorded deviations (S2, 2026-10-16; details in the program record):
   rustc/LLVM still has no WebAssembly backend and no wasm32 std. It
   moves to the S6 wasm32 acceptance gate, with a wasm32-capable
   toolchain as its prerequisite (owner).
+
+Recorded deviations (S3, 2026-10-16; details in the program record):
+
+- map_data does not move into a payload in S3; it moves with S4's
+  payload homes (proxy, typed-array and module-namespace state), one
+  payload mechanism for all. Measured: its address lookup is a few
+  percent of a Map-heavy microbenchmark (benchmarks/maps-sets.js) and
+  invisible on the gate fixtures. The reason for doing it in S3 (I8
+  forces touching the table) was met in S2 by the I8 eviction
+  inventory, and the move restructures every [[MapData]] access around
+  object borrows while the default build keeps the side table.
+- No other address-keyed table moves in S3. Measured on the gate
+  fixtures (gc-heap, bytecode tier): side-table probes cost at most
+  0.65% of cycles (a lookup attributed to module_ns on Vue) and
+  mapped_arguments about 0.1%; class_info, typed_arrays, proxies and
+  eval_realm_fns do not register by name. Skipping the module_ns
+  probes for plain objects changed neither instructions nor cycles, so
+  that lookup comes from elsewhere (merged code, likely proxies, which
+  Vue's reactivity hits); no guard is kept. S4 owns their payloads.
+- "Shapes page-resident" is not taken: key layouts stay
+  Rc<PropertyLayoutData>. Their reference traffic is at most 0.3% of
+  cycles on the gate fixtures, and GC-cell layouts would have to be
+  immutable (a collector cannot prove sole ownership the way
+  Rc::make_mut does), turning in-place key appends into copies unless
+  layouts carry an ownership mark. Revisit with S5's layout work.
 
 ### Working agreements (all agents)
 

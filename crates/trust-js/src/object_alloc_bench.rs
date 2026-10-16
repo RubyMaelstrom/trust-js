@@ -97,6 +97,12 @@ fn object_layout_sizes() {
         std::mem::size_of::<Property>(),
         std::mem::size_of::<std::cell::RefCell<Object>>()
     );
+    println!(
+        "FunctionMaps {} ast::Function {} OnceCell<Props> {}",
+        std::mem::size_of::<crate::ast::FunctionMaps>(),
+        std::mem::size_of::<crate::ast::Function>(),
+        std::mem::size_of::<std::cell::OnceCell<Props>>()
+    );
 }
 
 /// Collector throughput on a mixed heap: a retained old generation, then young objects, arrays,

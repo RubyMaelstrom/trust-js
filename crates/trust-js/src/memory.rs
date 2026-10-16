@@ -862,6 +862,7 @@ impl Visitor {
             self.chunk(chunk);
         }
         if let Some(maps) = function.fn_maps.get() {
+            bytes = bytes.saturating_add(size_of::<crate::ast::FunctionMaps>());
             self.props(&maps.function);
             if let Some(prototype_map) = &maps.prototype {
                 self.props(prototype_map);
@@ -2544,7 +2545,8 @@ mod tests {
         assert_eq!(visitor.rc_strs.len(), 3);
         assert_eq!(
             visitor.detached_property_storage,
-            3 * size_of::<crate::value::Property>()
+            crate::value::detached_field_bytes(1)
+                + crate::value::detached_field_bytes(2)
                 + size_of::<crate::value::PropertyLayoutData>()
                 + layout.capacity() * size_of::<Rc<str>>()
         );

@@ -796,8 +796,9 @@ pub struct Function {
     /// `Interp::make_function`): the function object's `Props` (length/name and a `prototype`
     /// placeholder) and, for prototype-bearing kinds, the fresh `.prototype`'s `Props` — cloned
     /// per closure instance instead of rebuilt insert by insert, so key hashing and shape
-    /// transitions are paid once per FUNCTION rather than once per closure.
-    pub fn_maps: std::cell::OnceCell<FunctionMaps>,
+    /// transitions are paid once per FUNCTION rather than once per closure. Boxed: the AST
+    /// keeps a slot for every parsed function, most of which are instantiated rarely or never.
+    pub fn_maps: std::cell::OnceCell<Box<FunctionMaps>>,
     /// Actual parameter/body key layouts observed before tier-up. Each cache is
     /// bounded to one layout; eval-dependent alternatives keep dynamic storage.
     pub(crate) env_layouts:

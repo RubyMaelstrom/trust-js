@@ -2837,6 +2837,11 @@ pub(crate) mod layout_census {
     }
 }
 
+// S3: the header and its inline named slots fill the 192 B size class exactly; growing either
+// moves every object into the 256 B class.
+#[cfg(feature = "gc-heap")]
+const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
+
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
 #[cfg(feature = "gc-heap")]
 pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
@@ -4584,18 +4589,49 @@ pub(crate) fn new_shared_indexed_property_layout(keys: Vec<Rc<str>>) -> Property
     Rc::new(PropertyLayoutData::with_shared_index(keys))
 }
 
+/// Named properties kept in the object cell under gc-heap (S3, Decision 3): the measured
+/// count that holds nearly every short-lived plain object in one allocation.
+#[cfg(feature = "gc-heap")]
+pub(crate) const INLINE_NAMED_SLOTS: usize = 4;
+
+/// Named-property values in key-layout order: in the cell up to [`INLINE_NAMED_SLOTS`] under
+/// gc-heap; a `Vec` otherwise, whose layout the JIT reads.
+#[cfg(feature = "gc-heap")]
+type Fields = crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS>;
+#[cfg(not(feature = "gc-heap"))]
+type Fields = Vec<Property>;
+
+/// Bytes a map with room for `capacity` named values owns outside its object: none while they
+/// fit the inline slots (gc-heap).
+#[cfg(test)]
+pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
+    #[cfg(feature = "gc-heap")]
+    if capacity <= INLINE_NAMED_SLOTS {
+        return 0;
+    }
+    capacity * std::mem::size_of::<Property>()
+}
+
 #[derive(Clone, Default)]
 struct NamedEntries {
-    fields: Vec<Property>,
+    fields: Fields,
     layout: Option<PropertyLayout>,
 }
 
 impl NamedEntries {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            fields: Vec::with_capacity(capacity),
+            fields: Fields::with_capacity(capacity),
             layout: None,
         }
+    }
+    /// The capacity of a separate heap buffer for the values: none while they sit in the cell.
+    fn heap_capacity(&self) -> usize {
+        #[cfg(feature = "gc-heap")]
+        if !self.fields.spilled() {
+            return 0;
+        }
+        self.fields.capacity()
     }
     fn len(&self) -> usize {
         self.fields.len()
@@ -4746,13 +4782,13 @@ pub struct Props {
     /// The `entries` slot of the `"prototype"` key, or `NO_SLOT` — same memo discipline as
     /// `len_slot`. Every `new` reads the constructor's `.prototype`; function objects are
     /// ordinary maps, so this skips the scan on the construct hot path.
-    proto_slot: std::cell::Cell<u32>,
+    proto_slot: std::cell::Cell<SlotMemo>,
     /// The `entries` slot of the `"length"` key, or `NO_SLOT`. Array `length` can't live in the
     /// inline caches (element entries occupy slots without transitioning the shape, so a shape
     /// match doesn't pin the slot) — this memo makes the every-time re-derive a direct slot read
     /// instead of a hashed key lookup. Maintained by `insert`; any slot-shifting removal resets
     /// it (`remove` re-memoizes on the next lookup via `length_slot`).
-    len_slot: std::cell::Cell<u32>,
+    len_slot: std::cell::Cell<SlotMemo>,
 }
 
 /// See [`Props::mirror`]. Bit values are chosen so the masks the JIT tests (`OK|NO_HOLES` and
@@ -4793,6 +4829,30 @@ pub(crate) fn f64_exact_i32(f: f64) -> bool {
 
 /// `elems` hole marker (also caps how many entries dense slots can address).
 const NO_SLOT: u32 = u32::MAX;
+
+/// A memoized `entries` slot (of `length` or `prototype`), or none. Narrow under gc-heap, where
+/// the object header must fit its size class (S3); a slot past its range is not memoized.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct SlotMemo(SlotMemoWord);
+#[cfg(feature = "gc-heap")]
+type SlotMemoWord = u16;
+#[cfg(not(feature = "gc-heap"))]
+type SlotMemoWord = u32;
+
+impl SlotMemo {
+    const NONE: Self = Self(SlotMemoWord::MAX);
+
+    #[inline]
+    fn of(slot: usize) -> Self {
+        SlotMemoWord::try_from(slot).map_or(Self::NONE, Self)
+    }
+
+    #[inline]
+    fn slot(self) -> Option<usize> {
+        (self.0 != SlotMemoWord::MAX).then_some(self.0 as usize)
+    }
+}
 
 /// Prototype ablation: retain the previous creation/growth policy in the same binary.
 /// The canonical descriptor and sparse-property implementations are shared in both modes.
@@ -5291,7 +5351,7 @@ impl Props {
 
     pub(crate) fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Props {
         Self::with_entries(NamedEntries {
-            fields: Vec::with_capacity(capacity),
+            fields: Fields::with_capacity(capacity),
             layout,
         })
     }
@@ -5383,7 +5443,7 @@ impl Props {
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
         let mut bytes = self
             .entries
-            .capacity()
+            .heap_capacity()
             .saturating_mul(std::mem::size_of::<Property>());
         let mut exact = true;
         for property in &self.entries.fields {
@@ -5445,8 +5505,8 @@ impl Props {
             proto_flag: std::cell::Cell::new(false),
             has_far: std::cell::Cell::new(false),
             elem_mode: std::cell::Cell::new(false),
-            proto_slot: std::cell::Cell::new(NO_SLOT),
-            len_slot: std::cell::Cell::new(NO_SLOT),
+            proto_slot: std::cell::Cell::new(SlotMemo::NONE),
+            len_slot: std::cell::Cell::new(SlotMemo::NONE),
         }
     }
 
@@ -5488,7 +5548,12 @@ impl Props {
         let shape = array_length_shape(&length_key);
         let mut props = Props {
             entries: NamedEntries {
-                fields: vec![Property::data(Value::Num(len as f64), true, false, false)],
+                fields: Fields::from_iter([Property::data(
+                    Value::Num(len as f64),
+                    true,
+                    false,
+                    false,
+                )]),
                 layout: Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone)),
             },
             shape,
@@ -5517,8 +5582,8 @@ impl Props {
             proto_flag: Cell::new(false),
             has_far: Cell::new(false),
             elem_mode: Cell::new(true),
-            proto_slot: Cell::new(NO_SLOT),
-            len_slot: Cell::new(0),
+            proto_slot: Cell::new(SlotMemo::NONE),
+            len_slot: Cell::new(SlotMemo::of(0)),
         };
         // Previously large numeric lists built a mirror while constructing decimal
         // property keys. Preserve native numeric-region access without those keys.
@@ -5782,25 +5847,23 @@ impl Props {
     /// The `"length"` property, resolved through the `len_slot` memo (one compare, no hashing).
     /// `None` when there is no own `length`.
     pub(crate) fn length_property(&self) -> Option<&Property> {
-        let s = self.len_slot.get();
-        if s != NO_SLOT {
-            debug_assert!(matches!(self.entries.get(s as usize), Some((k, _)) if &**k == "length"));
-            return self.entries.fields.get(s as usize);
+        if let Some(s) = self.len_slot.get().slot() {
+            debug_assert!(matches!(self.entries.get(s), Some((k, _)) if &**k == "length"));
+            return self.entries.fields.get(s);
         }
         let slot = self.find("length")?;
-        self.len_slot.set(slot as u32);
+        self.len_slot.set(SlotMemo::of(slot));
         Some(&self.entries.fields[slot])
     }
 
     /// Replace the value of an Array's own writable `length` data property, found through the
     /// `len_slot` memo. The caller has validated writability and the new length.
     pub(crate) fn set_array_length_value(&mut self, length: f64) {
-        let slot = self.len_slot.get();
-        let slot = if slot != NO_SLOT {
-            slot as usize
+        let slot = if let Some(slot) = self.len_slot.get().slot() {
+            slot
         } else {
             let slot = self.find("length").expect("array has own length");
-            self.len_slot.set(slot as u32);
+            self.len_slot.set(SlotMemo::of(slot));
             slot
         };
         debug_assert!(matches!(self.entries.get(slot), Some((k, _)) if &**k == "length"));
@@ -6444,7 +6507,7 @@ impl Props {
         }
         let slot = self.find("length").expect("Array length is not removed");
         self.entries.fields[slot].set_value(Value::Num((len - 1) as f64));
-        self.len_slot.set(slot as u32);
+        self.len_slot.set(SlotMemo::of(slot));
         Some(first)
     }
 
@@ -6551,20 +6614,14 @@ impl Props {
         // (every push/pop/length read; every `new`); their slots are memoized — answer without
         // hashing or scanning.
         if key == "length" {
-            let s = self.len_slot.get();
-            if s != NO_SLOT {
-                debug_assert!(
-                    matches!(self.entries.get(s as usize), Some((k, _)) if &**k == "length")
-                );
-                return Some(s as usize);
+            if let Some(s) = self.len_slot.get().slot() {
+                debug_assert!(matches!(self.entries.get(s), Some((k, _)) if &**k == "length"));
+                return Some(s);
             }
         } else if key == "prototype" {
-            let s = self.proto_slot.get();
-            if s != NO_SLOT {
-                debug_assert!(
-                    matches!(self.entries.get(s as usize), Some((k, _)) if &**k == "prototype")
-                );
-                return Some(s as usize);
+            if let Some(s) = self.proto_slot.get().slot() {
+                debug_assert!(matches!(self.entries.get(s), Some((k, _)) if &**k == "prototype"));
+                return Some(s);
             }
         }
         // Array shapes describe named keys only. The intrinsic length-only
@@ -6607,9 +6664,9 @@ impl Props {
                 }
                 if let Some(slot) = slot {
                     if key == "length" {
-                        self.len_slot.set(slot as u32);
+                        self.len_slot.set(SlotMemo::of(slot));
                     } else if key == "prototype" {
-                        self.proto_slot.set(slot as u32);
+                        self.proto_slot.set(SlotMemo::of(slot));
                     }
                 }
                 return slot;
@@ -6625,9 +6682,9 @@ impl Props {
         };
         if let Some(s) = found {
             if key == "length" {
-                self.len_slot.set(s as u32);
+                self.len_slot.set(SlotMemo::of(s));
             } else if key == "prototype" {
-                self.proto_slot.set(s as u32);
+                self.proto_slot.set(SlotMemo::of(s));
             }
         }
         found
@@ -6909,8 +6966,8 @@ impl Props {
         self.elems.mirror_clear();
         self.mirror_flags = MIRROR_OK | MIRROR_ALL_I32 | MIRROR_NO_HOLES;
         self.mirror_holes = 0;
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
+        self.len_slot.set(SlotMemo::NONE);
+        self.proto_slot.set(SlotMemo::NONE);
         self.has_far.set(false);
         self.shape = shape_fresh();
     }
@@ -7087,9 +7144,9 @@ impl Props {
                 }
             }
             if &*key == "length" {
-                self.len_slot.set(slot as u32);
+                self.len_slot.set(SlotMemo::of(slot));
             } else if &*key == "prototype" {
-                self.proto_slot.set(slot as u32);
+                self.proto_slot.set(SlotMemo::of(slot));
             }
             self.reserve_entry();
             self.entries.push((key, prop));
@@ -7117,8 +7174,8 @@ impl Props {
             packed.truncate(from);
         }
         self.entries.retain(|(k, _)| keep(k));
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
+        self.len_slot.set(SlotMemo::NONE);
+        self.proto_slot.set(SlotMemo::NONE);
         self.elems.set_index(None);
         if self.entries.len() > INDEX_THRESHOLD
             && (self.elem_mode.get()
@@ -7171,8 +7228,8 @@ impl Props {
         if !(self.elem_mode.get() && canonical_index(key).is_some()) {
             self.shape = shape_fresh();
         }
-        self.len_slot.set(NO_SLOT);
-        self.proto_slot.set(NO_SLOT);
+        self.len_slot.set(SlotMemo::NONE);
+        self.proto_slot.set(SlotMemo::NONE);
         if let Some(index) = self.elems.index_mut() {
             index.remove(key);
             // Every later entry moved down one slot. The index covers every entry, so
