@@ -2721,8 +2721,120 @@ impl PackedValue {
 /// Run `Object::drop` and release the object's Rust-heap payload when its cell dies.
 #[cfg(feature = "gc-heap")]
 fn finalize_object_cell(cell: *mut u8) {
+    if layout_census::enabled() {
+        // SAFETY: a dying cell is initialized and borrowed by no one.
+        if let Ok(object) = unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() } {
+            layout_census::record(layout_census::DEAD, object);
+        }
+    }
     // SAFETY: object cells are initialized by `Gc::new_in` before any collection or teardown.
     unsafe { std::ptr::drop_in_place(cell as *mut RefCell<Object>) };
+}
+
+/// The S3 layout census (`TRUST_JS_GC_CENSUS=1`, gc-heap; diagnostic only): how many named
+/// properties objects hold, sampled over the live heap after every collection and over objects
+/// as they die, by family. It sizes inline property slots (Decision 3).
+#[cfg(feature = "gc-heap")]
+pub(crate) mod layout_census {
+    use super::{Callable, Exotic, GcHeap, Object};
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(crate) const LIVE: usize = 0;
+    pub(crate) const DEAD: usize = 1;
+    const FAMILIES: [&str; 4] = ["function", "array", "exotic", "plain"];
+    /// Inclusive upper bounds of the named-property buckets; a last bucket takes the rest.
+    const BOUNDS: [usize; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 16, 32];
+    const BUCKETS: usize = BOUNDS.len() + 1;
+
+    struct Population {
+        named: [[AtomicU64; BUCKETS]; FAMILIES.len()],
+        named_total: [AtomicU64; FAMILIES.len()],
+        named_capacity: [AtomicU64; FAMILIES.len()],
+        sidecars: [AtomicU64; FAMILIES.len()],
+    }
+
+    static POPULATIONS: [Population; 2] = [const {
+        Population {
+            named: [const { [const { AtomicU64::new(0) }; BUCKETS] }; FAMILIES.len()],
+            named_total: [const { AtomicU64::new(0) }; FAMILIES.len()],
+            named_capacity: [const { AtomicU64::new(0) }; FAMILIES.len()],
+            sidecars: [const { AtomicU64::new(0) }; FAMILIES.len()],
+        }
+    }; 2];
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("TRUST_JS_GC_CENSUS").is_some())
+    }
+
+    pub(crate) fn record(population: usize, object: &Object) {
+        let family = if !matches!(object.call, Callable::None) {
+            0
+        } else if matches!(object.exotic, Exotic::Array) {
+            1
+        } else if !matches!(object.exotic, Exotic::None) || !object.ic_plain.get() {
+            2
+        } else {
+            3
+        };
+        let named = object.props.entries.len();
+        let bucket = BOUNDS.partition_point(|&bound| bound < named);
+        let counts = &POPULATIONS[population];
+        counts.named[family][bucket].fetch_add(1, Relaxed);
+        counts.named_total[family].fetch_add(named as u64, Relaxed);
+        counts.named_capacity[family]
+            .fetch_add(object.props.entries.fields.capacity() as u64, Relaxed);
+        if object.props.elems.0.is_some() {
+            counts.sidecars[family].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Record every live object of `heap`; call right after a collection's sweep.
+    pub(crate) fn sample_live(heap: &GcHeap) {
+        let cells = heap.core.borrow().live_cells(heap.object_desc);
+        for cell in cells {
+            // SAFETY: a live object cell is initialized; safepoints hold no mutable borrow.
+            if let Ok(object) =
+                unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
+            {
+                record(LIVE, object);
+            }
+        }
+        SAMPLES.fetch_add(1, Relaxed);
+    }
+
+    /// The census as a JSON object.
+    pub(crate) fn json() -> String {
+        let bounds = BOUNDS.map(|b| b.to_string()).join(",");
+        let population = |counts: &Population| {
+            FAMILIES
+                .iter()
+                .enumerate()
+                .map(|(family, name)| {
+                    let histogram = counts.named[family]
+                        .iter()
+                        .map(|count| count.load(Relaxed).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "\"{name}\":{{\"named_histogram\":[{histogram}],\"named_total\":{},\"named_capacity\":{},\"sidecars\":{}}}",
+                        counts.named_total[family].load(Relaxed),
+                        counts.named_capacity[family].load(Relaxed),
+                        counts.sidecars[family].load(Relaxed),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"live_samples\":{},\"named_bucket_upper_bounds\":[{bounds},null],\"live\":{{{}}},\"dead\":{{{}}}}}",
+            SAMPLES.load(Relaxed),
+            population(&POPULATIONS[LIVE]),
+            population(&POPULATIONS[DEAD]),
+        )
+    }
 }
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
@@ -2991,6 +3103,15 @@ pub(crate) fn gc_performance_metrics_finish(
     GC_LAST_SCOPES_AFTER.store(scopes_after, Relaxed);
 }
 
+/// The S3 layout census as a JSON field, when it was requested (gc-heap).
+fn layout_census_field() -> String {
+    #[cfg(feature = "gc-heap")]
+    if layout_census::enabled() {
+        return format!(",\"gc_layout_census\":{}", layout_census::json());
+    }
+    String::new()
+}
+
 /// JSON fields appended to the unstable process-level performance record. Object and scope counts
 /// are exact graph-node populations at collector boundaries; they intentionally are not described
 /// as bytes because strings, buffers, side tables, and shared allocations need separate accounting.
@@ -3011,10 +3132,11 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
     let nursery_fields = format!(
-        "\"gc_minor_collections\":{},\"gc_minor_objects_seen\":{},\"gc_minor_scopes_seen\":{}",
+        "\"gc_minor_collections\":{},\"gc_minor_objects_seen\":{},\"gc_minor_scopes_seen\":{}{}",
         GC_MINOR_COLLECTIONS.load(Relaxed),
         GC_MINOR_OBJECTS_SEEN.load(Relaxed),
         GC_MINOR_SCOPES_SEEN.load(Relaxed),
+        layout_census_field(),
     );
     format!(
         "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{},{nursery_fields}",

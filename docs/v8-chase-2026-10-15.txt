@@ -981,3 +981,61 @@ S2 review fixes (outside review of dcde3ef6, 2026-10-16)
   reviewer's reproductions (class field, suspended computed method,
   setImmediate after $262.gc()) pass at interp and bytecode; clippy and
   fmt clean for the engine and the runtime in both builds.
+
+S3 Layout A (started 2026-10-16; owner: go after the S2 review fixes)
+---------------------------------------------------------------------
+Stage boundary: main has no commits past the merge base e3310993, so
+there is nothing to sync.
+
+Plan, recorded before the work. Scope is the gc-heap object layout; the
+default build keeps its Vec-backed properties and the layouts its JIT
+probes (those probes compile out under gc-heap, where no JIT runs until
+S5).
+- Step 1, layout census: measure named-property counts to fix the
+  inline slot count (S0's hypothesis: 4).
+- Step 2, header diet: RefCell<Object> is 144 B in the 192 B size
+  class (48 B slack per object). Retire what gc-heap no longer needs
+  in the header (the old collector's scratch words; the old registry
+  slot once weak observers no longer key on it) and move array-only
+  and typed-array-only fields into the dense sidecar, so the header
+  plus 4 inline slots fits 192 B.
+- Step 3, inline named slots: up to 4 named properties live in the
+  cell; a fifth spills them all to one heap buffer. A plain object with
+  at most 4 properties is then one allocation (its key layout is
+  shared), and an array's `length` no longer costs an allocation of its
+  own: a short array is the cell plus its element storage, which
+  Decision 3 keeps separate.
+- Step 4, "shapes page-resident", read as: shared key layouts become
+  GC cells an object references directly, so creating or freeing an
+  object counts no references. Shape ids stay the identity inline
+  caches compare (never reused, so no cache can match a recycled
+  address). Taken only if it measures as a win; otherwise recorded as
+  a deviation.
+- Step 5, payload moves, measured one at a time: map_data first (I8
+  touches it anyway), then the hottest address-keyed tables found by
+  the S3 survey: typed_arrays (generic [[Get]]/[[Set]] consult it with
+  no guard), proxies, class_info (every user call), mapped_arguments
+  (every generic [[Get]]), eval_realm_fns (every VM native fast call).
+- Exit gate as planned: S2 gates green; the tripwire moves in the
+  predicted direction on the microbenchmarks; fixture RSS against the
+  S0 bound.
+
+Step 1, layout census (TRUST_JS_GC_CENSUS=1, gc-heap): after every
+collection each live object, and each object as its cell dies, is
+counted by family and named-property count (bytecode tier; release
+gc-heap shell at 51c8c26f plus this step). Share of plain objects with
+more than 3 / 4 / 8 named properties, in percent:
+                 live, summed over
+                 collections (n)          dying (n)
+  Vue            25.0/22.9/13.0 (1752)    38.7/0/0 (61393)
+  React          17.2/15.5/9.1 (927)      0/0/0 (19912)
+  Djot           14.1/10.2/1.5 (19087)    10.1/5.4/3.2 (65690)
+  prop. access   34.6/30.8/17.9 (2652)    -
+  sustained      0/0/0 (3.4M)             0/0/0 (440001)
+Functions hold 2.3-2.4 named properties (more than 4: 1.8-2.5% of the
+live ones) but reserve 3.3-4.4x that today; arrays hold one (length)
+and 87-100% of them carry a dense sidecar. Four slots hold every
+short-lived plain object on Vue, React and the sustained workload and
+94.6% on Djot; three would miss Vue's 4-property temporaries (38.7% of
+its dying plain objects). Decision: 4 inline named slots, S0's
+hypothesis, now measured.

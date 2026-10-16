@@ -108,7 +108,10 @@ comment/example in the same change.
   each test in its own process, since a use-after-free can take down the whole run).
   `TRUST_JS_GC_LOG=1` lines report live cells, live bytes and small-cell pages (64 KiB
   each) after each collection. `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of
-  the heap's byte budget, for collector tuning. `TRUST_JS_GC_WHY=1` records why each cell
+  the heap's byte budget, for collector tuning. `TRUST_JS_GC_CENSUS=1` adds a
+  `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
+  live objects after every collection and of objects as they die, by family (it walks the
+  heap at each collection; diagnostic only). `TRUST_JS_GC_WHY=1` records why each cell
   was marked; tests print the path with `gc_test::why`/`why_address` (a stack root names
   its frame's return address, for `addr2line`, and its depth below that frame's record).
   In test builds, `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.

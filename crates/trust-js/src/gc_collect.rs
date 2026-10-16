@@ -347,6 +347,9 @@ impl Interp {
             return;
         };
         let reclaimed = self.gc_heap_sweep(&heap, native);
+        if crate::value::layout_census::enabled() {
+            crate::value::layout_census::sample_live(&heap);
+        }
         crate::value::gc_finish_generation(&heap, true);
         let live = crate::value::heap_live_objects(&heap);
         let next = crate::gc_generational::next_threshold(live, self.live_object_limit);

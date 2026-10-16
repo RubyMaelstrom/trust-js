@@ -1033,6 +1033,24 @@ impl Heap {
         dead
     }
 
+    /// The allocated, non-zombie cells of `desc`: after a collection, the live ones.
+    pub(crate) fn live_cells(&self, desc: DescId) -> Vec<usize> {
+        let mut live = Vec::new();
+        for page in self.pages.iter().flatten().filter(|page| page.desc == desc) {
+            for i in 0..page.cells {
+                if bit(&page.allocated, i) && !bit(&page.zombies, i) {
+                    live.push(page.cell_ptr(i));
+                }
+            }
+        }
+        for (&start, large) in &self.larges {
+            if large.desc == desc && !large.zombie {
+                live.push(start);
+            }
+        }
+        live
+    }
+
     /// Whether `addr` (interior addresses included) lies in a cell of this heap that the
     /// current marking left unmarked: a weak reference to it must be cleared.
     pub(crate) fn is_dead_target(&self, addr: usize) -> bool {
