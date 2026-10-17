@@ -1,6 +1,5 @@
-//! The collector roots the native JIT's activations (P1 S5 step 7; gc-heap, ARM64), through the
-//! test-only admission (`Engine::admit_jit_for_test`), with collections on and, in debug builds,
-//! the heap verifier after every marking.
+//! The collector roots the native JIT's activations (P1 S5 step 7; gc-heap, ARM64), with
+//! collections on and, in debug builds, the heap verifier after every marking.
 //!
 //! Each program keeps values in one kind of JIT storage and forces a collection from inside the
 //! activation: the test native `collect()`, called from generated code, runs the explicit
@@ -151,13 +150,12 @@ pub(super) fn install(engine: &mut Engine, name: &str, length: usize, f: crate::
         .insert(name, Property::data(Value::Obj(native), true, true, true));
 }
 
-/// An engine at `Tier::Jit` (through the test admission) with tier threshold `threshold`, the
-/// test natives, and retention paths recorded for `collect()`'s markers.
+/// An engine at `Tier::Jit` with tier threshold `threshold`, the test natives, and retention
+/// paths recorded for `collect()`'s markers.
 pub(super) fn jit_engine(threshold: u32) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(threshold);
-    engine.admit_jit_for_test();
     assert_eq!(engine.interp.tier, Tier::Jit);
     engine
         .interp

@@ -314,9 +314,8 @@ pub(crate) enum JitOwnership {
     /// gc-heap: values carry no count; the collector traces what is reachable, so taking or
     /// releasing an owner needs no instruction. The ARM64 emitters' `Traced` arms emit none and
     /// keep only the tag routing that exists for other reasons (see `jit_ownership.rs`). The x64
-    /// backend refuses it: its `Traced` arms are unreachable until S6. `Tier::admitted` keeps
-    /// gc-heap engines on bytecode until S5 step 8; tests admit one engine through
-    /// `Engine::admit_jit_for_test`.
+    /// backend refuses it: its `Traced` arms are unreachable until S6, since `Tier::admitted`
+    /// keeps gc-heap engines on x86-64 on the bytecode VM.
     #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
     Traced,
 }
@@ -362,8 +361,8 @@ impl JitOwnership {
 }
 
 /// The `Traced` arm of the x64 ownership emitters. The x64 backend refuses gc-heap until S6
-/// (nothing admits it there: `Tier::admitted` clamps the tier, and the test-only admission is
-/// ARM64-only), so reaching this is a bug.
+/// (nothing admits it there: `Tier::admitted` keeps gc-heap engines on x86-64 on the bytecode
+/// VM), so reaching this is a bug.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[cold]
 #[track_caller]

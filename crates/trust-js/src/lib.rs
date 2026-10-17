@@ -903,30 +903,11 @@ impl Engine {
     /// Select the execution tier (see [`bytecode::Tier`]). `Interp` never touches any codegen
     /// path; `Bytecode` compiles eligible functions after
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls; `Jit` is the default and lowers
-    /// eligible bytecode to native code where the backend supports the host architecture.
+    /// eligible bytecode to native code where the backend supports the host architecture. The
+    /// engine runs [`bytecode::Tier::admitted`] for the request: a gc-heap build keeps x86-64 on
+    /// the bytecode VM.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
         self.interp.tier = tier.admitted();
-    }
-
-    /// Test-only (gc-heap test builds, ARM64): run this engine at [`bytecode::Tier::Jit`], which
-    /// [`bytecode::Tier::admitted`] otherwise keeps on the bytecode VM under gc-heap, so tests can
-    /// run generated code before S5 step 8 admits the JIT for every engine. Only this engine
-    /// bypasses the clamp, and only until a later [`Engine::set_tier`] applies it again. x64
-    /// stays refused (S6).
-    ///
-    /// The engine collects as usual: its JIT activations are roots (S5 step 7; see
-    /// `jit::JitFrame` and `gc_trace::JitFrameRoots`), and generated code's entry and loop polls
-    /// and the ends of its allocating helpers' calls collect when the heap's byte budget is
-    /// spent, its stress interval reached or a request deferred (step 7b; see
-    /// `value::LiveCount`).
-    #[cfg(all(
-        test,
-        feature = "gc-heap",
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ))]
-    pub(crate) fn admit_jit_for_test(&mut self) {
-        self.interp.tier = bytecode::Tier::Jit;
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).

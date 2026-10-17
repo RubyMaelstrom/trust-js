@@ -1,7 +1,6 @@
-//! Generated code under gc-heap's traced ownership (P1 S5 step 6), through the test-only
-//! admission (`Engine::admit_jit_for_test`): the engine runs at `Tier::Jit` and collects as
-//! usual, its JIT activations being roots since step 7 (whose rooting tests are
-//! `jit::rooting_tests`).
+//! Generated code under gc-heap's traced ownership (P1 S5 step 6): the engine runs at
+//! `Tier::Jit` (admitted under gc-heap on ARM64) and collects as usual, its JIT activations
+//! being roots (whose rooting tests are `jit::rooting_tests`).
 //!
 //! Each program runs at `Tier::Jit` and at `Tier::Bytecode` (tier threshold 0) in the same build
 //! and must produce the same, pinned, result; the functions it names must have run as native
@@ -14,16 +13,15 @@
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
 
-/// A fresh engine at `tier` (threshold 0); `Tier::Jit` goes through the test-only admission.
+/// A fresh engine at `tier` (threshold 0).
 fn engine(tier: Tier) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
-    if tier == Tier::Jit {
-        assert_eq!(engine.interp.tier, Tier::Bytecode, "gc-heap clamps the JIT");
-        engine.admit_jit_for_test();
-        assert_eq!(engine.interp.tier, Tier::Jit);
-    }
+    assert_eq!(
+        engine.interp.tier, tier,
+        "gc-heap admits every tier on ARM64"
+    );
     engine
 }
 
@@ -94,8 +92,8 @@ fn property_paths(run: impl FnOnce()) -> [u64; 3] {
     std::array::from_fn(|k| after[k] - before[k])
 }
 
-/// The admission no longer keeps its engine from collecting (step 7): a due safepoint
-/// collection runs inside JIT code, explicit requests run, and garbage dies.
+/// An engine running generated code collects: a due safepoint collection runs inside JIT
+/// code, explicit requests run, and garbage dies.
 #[test]
 fn admission_collects() {
     let mut jit = engine(Tier::Jit);

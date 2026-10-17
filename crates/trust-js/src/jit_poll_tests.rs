@@ -5,8 +5,8 @@
 //! canonical header, and in baseline code the calls of allocating helpers end in an explicit
 //! poll (`jit::emit_helper_end_poll`).
 //!
-//! The programs run through the test-only admission (`Engine::admit_jit_for_test`) with
-//! collections on and, in debug builds, the heap verifier after every marking. Each counts the
+//! The programs run at `Tier::Jit` with collections on and, in debug builds, the heap verifier
+//! after every marking. Each counts the
 //! collections generated code's polls ran, by caller (`jit::take_poll_census`), checks that its
 //! functions ran natively, and checks the due word against the heap's `collection_due` (as
 //! `Interp::gc_check` does at every safepoint in debug builds). "Stress 1" is the heap setting
@@ -27,12 +27,11 @@ const LOOP: usize = POLL_LOOP as usize;
 const ENTRY: usize = POLL_ENTRY as usize;
 const END: usize = POLL_HELPER_END as usize;
 
-/// An engine at `Tier::Jit` (through the test admission) with tier threshold 0.
+/// An engine at `Tier::Jit` with tier threshold 0.
 fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
-    engine.admit_jit_for_test();
     assert_eq!(engine.interp.tier, Tier::Jit);
     engine
 }

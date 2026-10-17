@@ -62,14 +62,16 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// The tier this build runs for a request: under the P1 gc-heap object model (S2) the JIT
-    /// refuses admission and compiled code stays on the bytecode VM (until S5 step 8; gc-heap
-    /// test builds can admit one engine, see `Engine::admit_jit_for_test`). [`Engine::set_tier`]
-    /// applies it; front ends compare it with the request to say when a tier is not available.
+    /// The tier this build runs for a request. Under the P1 gc-heap object model the x86-64
+    /// backend cannot emit traced ownership (`jit::JitOwnership::Traced`) until S6, so an x86-64
+    /// gc-heap build runs `Jit` as `Bytecode`. The ARM64 backend runs it in both builds, and on
+    /// a target without a native backend `Jit` runs on the bytecode VM in every build.
+    /// [`Engine::set_tier`] applies it; front ends compare it with the request to say when a
+    /// tier is not available.
     ///
     /// [`Engine::set_tier`]: crate::Engine::set_tier
     pub const fn admitted(self) -> Tier {
-        if cfg!(feature = "gc-heap") && matches!(self, Tier::Jit) {
+        if cfg!(all(feature = "gc-heap", target_arch = "x86_64")) && matches!(self, Tier::Jit) {
             Tier::Bytecode
         } else {
             self
