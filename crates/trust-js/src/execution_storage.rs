@@ -94,6 +94,10 @@ impl<S: StoredValue> SlotAccess for [S] {
     }
 }
 
+/// An operand stack. gc-heap: its whole capacity is initialized memory — new capacity is
+/// zero-filled where the buffer is created or grown, and nothing else changes it — so native
+/// code that borrows the buffer past its length (`jit::run`, `jit::run_borrowed_frame`) can
+/// have the collector scan words it has not written yet without reading uninitialized memory.
 pub(crate) struct ValueStack<S: StoredValue>(Vec<S>);
 
 impl<S: StoredValue> Default for ValueStack<S> {
@@ -104,15 +108,47 @@ impl<S: StoredValue> Default for ValueStack<S> {
 
 impl<S: StoredValue> ValueStack<S> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
+        #[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
+        let mut stack = Self(Vec::with_capacity(capacity));
+        #[cfg(feature = "gc-heap")]
+        stack.zero_spare_capacity();
+        stack
     }
     #[inline]
     pub(crate) fn push(&mut self, value: Value) {
-        self.0.push(S::from_value(value));
+        self.push_stored(S::from_value(value));
     }
     #[inline]
     pub(crate) fn push_stored(&mut self, value: S) {
+        #[cfg(feature = "gc-heap")]
+        {
+            let len = self.0.len();
+            if len == self.0.capacity() {
+                self.grow(1);
+            }
+            // SAFETY: the capacity exceeds the length; the slot past it becomes the top.
+            unsafe {
+                self.0.as_mut_ptr().add(len).write(value);
+                self.0.set_len(len + 1);
+            }
+        }
+        #[cfg(not(feature = "gc-heap"))]
         self.0.push(value);
+    }
+    /// gc-heap: grow by at least `additional` and zero-fill the new spare capacity.
+    #[cfg(feature = "gc-heap")]
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, additional: usize) {
+        self.0.reserve(additional);
+        self.zero_spare_capacity();
+    }
+    #[cfg(feature = "gc-heap")]
+    fn zero_spare_capacity(&mut self) {
+        let spare = self.0.spare_capacity_mut();
+        // SAFETY: the spare capacity is this Vec's memory past its length; zero bytes are a
+        // valid fill for it (a packed zero word is the Number +0).
+        unsafe { std::ptr::write_bytes(spare.as_mut_ptr(), 0, spare.len()) };
     }
     #[inline]
     pub(crate) fn pop_stored(&mut self) -> Option<S> {
@@ -160,12 +196,19 @@ impl<S: StoredValue> ValueStack<S> {
     }
     #[inline]
     pub(crate) fn reserve(&mut self, additional: usize) {
+        #[cfg(feature = "gc-heap")]
+        if self.0.capacity() - self.0.len() < additional {
+            self.grow(additional);
+        }
+        #[cfg(not(feature = "gc-heap"))]
         self.0.reserve(additional);
     }
     #[cfg(test)]
     #[inline]
     pub(crate) fn extend(&mut self, values: impl IntoIterator<Item = Value>) {
-        self.0.extend(values.into_iter().map(S::from_value));
+        for value in values {
+            self.push(value);
+        }
     }
     pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
         self.0.drain(at..).map(S::into_value).collect()

@@ -1339,27 +1339,91 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
     });
 }
 
-/// The JIT's activation-record freelist (see `Interp::frame_pool` and [`crate::jit::JitFrame`]).
-/// A newtype so teardown frees the records (their frame contents are already released whenever
-/// a record is pooled).
-pub(crate) struct FramePool(pub(crate) Vec<std::ptr::NonNull<crate::jit::JitFrame>>);
+/// An interpreter's JIT activation records (see `Interp::frame_pool` and
+/// [`crate::jit::JitFrame`]). `pool` is the freelist (dereferenced to): Rust entries pop and push
+/// it, and so does generated code, through the Vec's words at their probed offsets
+/// (`InterpLayout::frame_pool` is the address of `pool`). A pooled record's frame contents are
+/// already released. Teardown frees the pooled records.
+///
+/// gc-heap: `records` knows every record allocated for this interpreter and not yet freed:
+/// [`crate::jit::JitFrame::alloc`] inserts it, and freeing it (`JitFrame::release` past
+/// [`crate::jit::FRAME_POOL_LIMIT`], or teardown here) removes it. A record not in
+/// `pool[..len]` is active: a Rust entry (`run_moved_inner`) or a direct call popped it for an
+/// activation that has not finished yet (generated code pops with `len--` and pushes back in the
+/// finish stub; it never allocates or frees one). The collector traces every active record (see
+/// `GcTrace for FramePool`), so the registry costs nothing per call.
+#[derive(Default)]
+pub(crate) struct FramePool {
+    pub(crate) pool: Vec<std::ptr::NonNull<crate::jit::JitFrame>>,
+    #[cfg(feature = "gc-heap")]
+    records: crate::fasthash::FastSet<std::ptr::NonNull<crate::jit::JitFrame>>,
+}
 
 impl std::ops::Deref for FramePool {
     type Target = Vec<std::ptr::NonNull<crate::jit::JitFrame>>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.pool
     }
 }
 impl std::ops::DerefMut for FramePool {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.pool
     }
 }
 impl Drop for FramePool {
     fn drop(&mut self) {
-        for p in self.0.drain(..) {
+        for p in self.pool.drain(..) {
+            #[cfg(feature = "gc-heap")]
+            self.records.remove(&p);
             // SAFETY: pooled records come from `JitFrame::alloc` and are not executing.
             drop(unsafe { Box::from_raw(p.as_ptr()) });
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl FramePool {
+    /// Note a record [`crate::jit::JitFrame::alloc`] just created for this interpreter.
+    pub(crate) fn register(&mut self, record: std::ptr::NonNull<crate::jit::JitFrame>) {
+        self.records.insert(record);
+    }
+
+    /// Forget a record about to be freed.
+    pub(crate) fn unregister(&mut self, record: std::ptr::NonNull<crate::jit::JitFrame>) {
+        self.records.remove(&record);
+    }
+
+    /// How many records are registered, pooled or active (tests).
+    #[cfg(test)]
+    pub(crate) fn registered(&self) -> usize {
+        self.records.len()
+    }
+
+    /// The records of this interpreter that are not pooled: the running activations'.
+    pub(crate) fn active_records(&self) -> Vec<std::ptr::NonNull<crate::jit::JitFrame>> {
+        // Outside JavaScript every record is pooled; the pool holds at most FRAME_POOL_LIMIT.
+        if self.records.len() == self.pool.len() {
+            return Vec::new();
+        }
+        let pooled: crate::fasthash::FastSet<_> = self.pool.iter().copied().collect();
+        self.records
+            .iter()
+            .copied()
+            .filter(|record| !pooled.contains(record))
+            .collect()
+    }
+}
+
+/// Every active record: its context's values precisely and its words conservatively (see
+/// `GcTrace for JitFrame`). Pooled records own nothing and are not traced, so the stale words a
+/// finished activation leaves in its record retain nothing.
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for FramePool {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        for record in self.active_records() {
+            // SAFETY: a registered record is allocated until it is freed, which happens only
+            // to pooled records (or past the pool limit, after its activation finished).
+            unsafe { record.as_ref() }.trace_gc(sink);
         }
     }
 }
@@ -2993,7 +3057,8 @@ pub(crate) struct InterpLayout {
     pub fnf_ptr_word: usize,
     pub fnf_len_word: usize,
     pub fnf_cap_word: usize,
-    /// `frame_pool` (Vec<NonNull<PackedValue>>) base + its word offsets.
+    /// The `frame_pool` freelist (`FramePool::pool`, a Vec<NonNull<JitFrame>>) base + its word
+    /// offsets.
     pub frame_pool: usize,
     pub fp_ptr_word: usize,
     pub fp_len_word: usize,
@@ -3052,15 +3117,15 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
     }
     let fnf = probe_vec_words(&i.fn_frames, 3, i.fn_frames.capacity());
     i.fn_frames = saved_frames;
-    let saved_pool = std::mem::replace(&mut i.frame_pool.0, Vec::with_capacity(7));
+    let saved_pool = std::mem::replace(&mut i.frame_pool.pool, Vec::with_capacity(7));
     for _ in 0..3 {
         i.frame_pool
-            .0
+            .pool
             .push(std::ptr::NonNull::new(0x2000 as *mut crate::jit::JitFrame).unwrap());
     }
-    let fp = probe_vec_words(&i.frame_pool.0, 3, i.frame_pool.0.capacity());
-    i.frame_pool.0.clear();
-    i.frame_pool.0 = saved_pool;
+    let fp = probe_vec_words(&i.frame_pool.pool, 3, i.frame_pool.pool.capacity());
+    i.frame_pool.pool.clear();
+    i.frame_pool.pool = saved_pool;
     let (Some(fnf), Some(fp)) = (fnf, fp) else {
         return InterpLayout::default(); // valid: false
     };
@@ -3079,7 +3144,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         fnf_ptr_word: fnf.0,
         fnf_len_word: fnf.1,
         fnf_cap_word: fnf.2,
-        frame_pool: off(&i.frame_pool as *const _ as usize),
+        frame_pool: off(&i.frame_pool.pool as *const _ as usize),
         fp_ptr_word: fp.0,
         fp_len_word: fp.1,
         fp_cap_word: fp.2,
@@ -3196,9 +3261,10 @@ pub struct Interp {
     /// Immutable property-name encodings used by ordinary record enumeration.
     /// The Rc pin prevents address reuse; no object, descriptor or value is cached.
     pub(crate) property_key_strings: crate::cache::ByteLru<usize, (Rc<str>, crate::lstr::LStr)>,
-    /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
-    /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
-    /// bookkeeping. Buffers hold no live values while pooled.
+    /// Freelist of the JIT's activation records ([`crate::jit::JitFrame`]: a context and
+    /// [`crate::jit::FRAME_BUF`] slot and operand words each) — a pop and pointer math per call
+    /// instead of `Vec` bookkeeping. Records hold no live values while pooled. Under gc-heap it
+    /// also registers every record, so the collector finds the active ones (see [`FramePool`]).
     pub(crate) frame_pool: FramePool,
     /// Prototype pins for property-*creation* inline caches (see
     /// [`crate::bytecode::IC_CREATE`]), keyed by prototype identity. Creation states rotate
@@ -5431,7 +5497,7 @@ impl Interp {
             fragment_cache: Default::default(),
             enumeration_keys: crate::cache::ByteLru::new(1 << 20, 256),
             property_key_strings: crate::cache::ByteLru::new(256 << 10, 512),
-            frame_pool: FramePool(Vec::new()),
+            frame_pool: FramePool::default(),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
             call_site: crate::stack_trace::NO_POSITION,

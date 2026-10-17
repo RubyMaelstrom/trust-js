@@ -546,15 +546,6 @@ pub enum ExecutionOutcome {
 /// child realms. Opaque object handles belong to this engine; retaining one does not keep the
 /// realm executable after the engine has been destroyed.
 pub struct Engine {
-    /// The no-GC region [`Engine::admit_jit_for_test`] holds. Declared before `interp`, so it
-    /// closes before the engine's heap is released.
-    #[cfg(all(
-        test,
-        feature = "gc-heap",
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    ))]
-    jit_test_admission: Option<gc_core::NoGcScope>,
     // Thread-backed generator bodies hold a pointer to the interpreter while suspended. Boxing
     // makes that address stable even when ordinary Rust code moves the public `Engine` value.
     interp: Box<Interp>,
@@ -580,13 +571,6 @@ impl Engine {
         let mut interp = Interp::new();
         interp.runtime_interrupt = interrupt;
         Engine {
-            #[cfg(all(
-                test,
-                feature = "gc-heap",
-                target_arch = "aarch64",
-                any(target_os = "macos", target_os = "linux", target_os = "windows")
-            ))]
-            jit_test_admission: None,
             interp: Box::new(interp),
         }
     }
@@ -930,13 +914,10 @@ impl Engine {
     /// bypasses the clamp, and only until a later [`Engine::set_tier`] applies it again. x64
     /// stays refused (S6).
     ///
-    /// JIT frames are not roots of the collector yet (S5 step 7 registers them): their slots,
-    /// operand words and contexts live in pooled records it cannot see. So this also keeps the
-    /// engine from collecting at all, for the rest of its life: `gc_suppressed` skips every
-    /// safepoint collection (the allocation threshold, the heap's byte budget and stress
-    /// interval, task boundaries, buffer pressure, failed allocations), and a no-GC region on
-    /// its heap defers every other request, explicit collections included
-    /// (`gc_core::Heap::nogc`). A program run under it must finish without needing a collection.
+    /// The engine collects as usual: its JIT activations are roots (S5 step 7; see
+    /// `jit::JitFrame` and `gc_trace::JitFrameRoots`). Generated code's own polls do not see the
+    /// heap's byte budget, stress interval or pending requests yet (step 7b): collections come
+    /// from the safepoints its helpers and the runtime reach.
     #[cfg(all(
         test,
         feature = "gc-heap",
@@ -945,10 +926,6 @@ impl Engine {
     ))]
     pub(crate) fn admit_jit_for_test(&mut self) {
         self.interp.tier = bytecode::Tier::Jit;
-        if self.jit_test_admission.is_none() {
-            self.interp.suspend_gc();
-            self.jit_test_admission = Some(self.interp.gc_heap.core.borrow().nogc());
-        }
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).

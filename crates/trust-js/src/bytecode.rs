@@ -26360,14 +26360,85 @@ impl crate::gc_trace::GcTrace for VmCoro {
         {
             resources.trace_gc(sink);
             pending_resource.trace_gc(sink);
-            match output {
-                DisposeCompletion::Throw(value)
-                | DisposeCompletion::SourceReturn(value)
-                | DisposeCompletion::ResumeReturn(value) => value.trace_gc(sink),
-                DisposeCompletion::Normal
-                | DisposeCompletion::BareReturn
-                | DisposeCompletion::Jump { .. } => {}
+            output.trace_gc(sink);
+        }
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for DisposeCompletion {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        match self {
+            DisposeCompletion::Throw(value)
+            | DisposeCompletion::SourceReturn(value)
+            | DisposeCompletion::ResumeReturn(value) => value.trace_gc(sink),
+            DisposeCompletion::Normal
+            | DisposeCompletion::BareReturn
+            | DisposeCompletion::Jump {
+                target: _,
+                handler_depth: _,
+            } => {}
+        }
+    }
+}
+
+/// A native continuation's exit step, held in its context between the exit and the driver.
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for VmStep {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        match self {
+            VmStep::FragmentExit(_, value)
+            | VmStep::Done(value)
+            | VmStep::Return(value)
+            | VmStep::ResumeReturn(value)
+            | VmStep::Await(value)
+            | VmStep::Yield(value)
+            | VmStep::YieldStar(value) => value.trace_gc(sink),
+            VmStep::BareReturn
+            | VmStep::AbruptJump {
+                target: _,
+                handler_depth: _,
+            } => {}
+            VmStep::AsyncClose {
+                iterator,
+                from_sync: _,
+                swallow_error: _,
+            } => iterator.trace_gc(sink),
+            VmStep::Dispose { frame, completion } => {
+                frame.trace_gc(sink);
+                completion.trace_gc(sink);
             }
         }
+    }
+}
+
+/// A native activation's bridge state, reached from its context (see `GcTrace for JitCtx`).
+/// The operand words `jit_vm_operation` lends to one VM operation sit in `stack` meanwhile.
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for NativeActivation {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            chunk: _,
+            env,
+            cap_env,
+            stack,
+            references,
+            disposal_frames,
+            class_states,
+        } = self;
+        env.trace_gc(sink);
+        cap_env.trace_gc(sink);
+        stack.trace_gc(sink);
+        references.trace_gc(sink);
+        disposal_frames.trace_gc(sink);
+        class_states.trace_gc(sink);
+    }
+}
+
+#[cfg(all(test, feature = "gc-heap"))]
+impl NativeActivation {
+    /// The running environment's cell (tests).
+    pub(crate) fn env_address(&self) -> usize {
+        Env::as_ptr(&self.env) as usize
     }
 }

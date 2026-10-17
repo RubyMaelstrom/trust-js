@@ -180,6 +180,15 @@ mod loop_latch_tests;
 mod traced_tests;
 
 #[cfg(all(
+    test,
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_rooting_tests.rs"]
+mod rooting_tests;
+
+#[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -1869,6 +1878,61 @@ impl JitCtx {
     pub(crate) unsafe fn clone_slot(&self, slot: usize) -> Value {
         debug_assert!(slot < self.n_slots);
         unsafe { (*self.slots.add(slot)).unpack() }
+    }
+}
+
+/// gc-heap: the values a running context holds in its own fields, traced precisely. Whoever
+/// makes the context a root scans its slot and operand words: an active [`JitFrame`] record its
+/// whole word buffer, a Rust entry the ranges it registers (`gc_trace::JitFrameRoots`). The raw
+/// identities it caches are kept alive by their owners, as classified below.
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for JitCtx {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let JitCtx {
+            helpers: _,
+            stack_base: _, // the operand words: scanned by the registration
+            final_sp: _,
+            slots: _, // the slot words: scanned by the registration
+            inline_ic_safe: _,
+            // The running environment, owned by the entry's frame (`run`'s environment, a
+            // moved entry's activation or callee closure), by the callee closure a direct call
+            // keeps on the caller's operand stack and in its FnFrame, by `activation`, or by
+            // the VM frame a borrowed entry runs (registered by `drive_vm`).
+            env_raw: _,
+            this_raw: _,    // points at `this_val`
+            global_body: _, // the realm's global object and scope
+            genv: _,
+            interp: _,
+            chunk: _, // code, not cells
+            this_val,
+            n_slots: _,
+            handlers: _, // pcs and depths
+            handler_floor: _,
+            code_base: _,
+            pc_offsets: _,
+            error,
+            ret,
+            env_parent_raw: _, // reached through `env_raw`
+            opstat_enabled: _,
+            callstat_enabled: _,
+            propstat_enabled: _,
+            inline_recompile_at: _,
+            live_objects: _,
+            activation,
+            // `drive_vm`'s borrow of its own frame state, which it registers (VM_FRAMES) for
+            // its whole call: the references, environments and stack this points at.
+            resume_activation: _,
+            resume_pc: _,
+            resume_step,
+            references_raw: _,  // into `activation` or the borrowed continuation
+            accessor_holder: _, // consumed before any JavaScript runs
+            accessor_slot: _,
+        } = self;
+        this_val.trace_gc(sink);
+        ret.trace_gc(sink);
+        error.trace_gc(sink);
+        activation.trace_gc(sink);
+        resume_step.trace_gc(sink);
     }
 }
 
@@ -18228,6 +18292,18 @@ pub(crate) unsafe fn run_borrowed_frame(
     };
     ctx.this_raw = &ctx.this_val;
     stack.set_len(0);
+    // gc-heap: the lent operand words leave the VM frame's traced length for the native run,
+    // so they are this context's roots until it ends: the buffer's whole capacity, which covers
+    // the entry depth and `max_stack` and is initialized (see `ValueStack`). The VM frame's
+    // slots, environments and references stay registered by `drive_vm`.
+    #[cfg(feature = "gc-heap")]
+    let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
+        ctx: std::ptr::addr_of!(ctx),
+        words: [
+            (std::ptr::null(), 0),
+            (stack_base.cast_const().cast(), stack.capacity()),
+        ],
+    });
     let entry: extern "C" fn(*mut JitCtx) -> u64 = std::mem::transmute(code.mem);
     let saved_strict = i.strict;
     let outcome = loop {
@@ -18275,6 +18351,8 @@ pub(crate) unsafe fn run_borrowed_frame(
         // A synchronous DisposeNormal can finish without suspension. Continue from its
         // settled bytecode successor using the same borrowed activation and no allocation.
     };
+    #[cfg(feature = "gc-heap")]
+    drop(roots);
     i.strict = saved_strict;
     (*state.stack).set_len(ctx.final_sp.offset_from(stack_base) as usize);
     *handlers = std::mem::take(&mut ctx.handlers);
@@ -18368,7 +18446,20 @@ pub fn run(
     };
     ctx.this_raw = &ctx.this_val as *const Value;
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
+    // gc-heap: the pooled buffers are this context's roots for the native run (the stack scan
+    // sees the context itself): every slot, initialized above, and the operand words up to
+    // `max_stack`, initialized because a ValueStack's whole capacity is (see `ValueStack`).
+    #[cfg(feature = "gc-heap")]
+    let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
+        ctx: std::ptr::addr_of!(ctx),
+        words: [
+            (slots.as_ptr().cast(), slots.len()),
+            (stack_base.cast_const().cast(), code.max_stack),
+        ],
+    });
     let ok = entry(&mut ctx);
+    #[cfg(feature = "gc-heap")]
+    drop(roots);
     drop(env); // the env handle must outlive the run (ctx.env_ref aliases it)
                // Drop any operands left on the raw stack (a throw can leave temporaries).
     unsafe {
@@ -18415,6 +18506,15 @@ pub(crate) const FRAME_POOL_LIMIT: usize = 256;
 /// Pooled records hold: `this_val` and `ret` Undefined; `error`, `activation` and `resume_step`
 /// None; an empty `handlers` Vec (capacity retained); null resume/reference pointers; and a zero
 /// handler floor. Generated code relies on these to skip the corresponding stores on entry.
+///
+/// gc-heap rooting: the interpreter's `FramePool` registers every record, and the collector
+/// traces each one that is not pooled — from the pop that starts an activation (by a Rust entry
+/// or a direct call's machine code) to the push or free that ends it. It traces the context's
+/// values precisely (`GcTrace for JitCtx`) and all [`FRAME_BUF`] words conservatively, as packed
+/// words: the slots and the operand stack, including the caller's operands under a direct call
+/// (the callee closure among them) and the stale words a finished callee or a popped operand
+/// leaves, which can only retain. No stack pointer is needed. `alloc` zero-fills the words, so
+/// every scanned word has been written.
 #[repr(C)]
 pub(crate) struct JitFrame {
     pub(crate) ctx: JitCtx,
@@ -18424,13 +18524,28 @@ pub(crate) struct JitFrame {
 /// Byte offset of a record's slot storage from the record (and its context) base.
 pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
 
+/// gc-heap: an active record (see [`JitFrame`] and `GcTrace for FramePool`).
+#[cfg(feature = "gc-heap")]
+impl crate::gc_trace::GcTrace for JitFrame {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let JitFrame { ctx, words } = self;
+        ctx.trace_gc(sink);
+        // SAFETY: `alloc` zero-filled every word; later writes store complete packed words.
+        unsafe { crate::gc_trace::scan_words(words.as_ptr().cast::<u64>(), FRAME_BUF, sink) };
+    }
+}
+
 impl JitFrame {
-    /// A new record owned by `i`'s pool, with its interpreter-constant fields initialized.
+    /// A new record owned by `i`'s pool, with its interpreter-constant fields initialized
+    /// (gc-heap: registered with the pool, its words zero-filled).
     pub(crate) fn alloc(i: &mut Interp) -> std::ptr::NonNull<JitFrame> {
         let mut record = Box::<JitFrame>::new_uninit();
         let base = record.as_mut_ptr();
-        unsafe {
+        let record = unsafe {
             let words = std::ptr::addr_of_mut!((*base).words).cast::<PackedValue>();
+            // The collector scans an active record's words whole (see `JitFrame`).
+            #[cfg(feature = "gc-heap")]
+            words.write_bytes(0, FRAME_BUF);
             std::ptr::addr_of_mut!((*base).ctx).write(JitCtx {
                 helpers: i.jit_helpers.as_ptr(),
                 stack_base: words,
@@ -18467,7 +18582,10 @@ impl JitFrame {
             });
             (*base).ctx.this_raw = std::ptr::addr_of!((*base).ctx.this_val);
             std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
-        }
+        };
+        #[cfg(feature = "gc-heap")]
+        i.frame_pool.register(record);
+        record
     }
 
     /// Restore the pooled invariants of a record whose activation has finished (its slots and
@@ -18492,6 +18610,8 @@ impl JitFrame {
         if i.frame_pool.len() < FRAME_POOL_LIMIT {
             i.frame_pool.push(frame);
         } else {
+            #[cfg(feature = "gc-heap")]
+            i.frame_pool.unregister(frame);
             drop(unsafe { Box::from_raw(frame.as_ptr()) });
         }
     }
@@ -18819,7 +18939,19 @@ unsafe fn run_moved_oversized(
     };
     ctx.this_raw = &ctx.this_val as *const Value;
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
+    // gc-heap: as in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
+    // above, are named here; the operand words are initialized up to `max_stack`.
+    #[cfg(feature = "gc-heap")]
+    let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
+        ctx: std::ptr::addr_of!(ctx),
+        words: [
+            (slots_ptr.cast_const().cast(), n_slots),
+            (stack_base.cast_const().cast(), code.max_stack),
+        ],
+    });
     let ok = entry(&mut ctx);
+    #[cfg(feature = "gc-heap")]
+    drop(roots);
     unsafe {
         let mut p = ctx.stack_base;
         while p < ctx.final_sp {

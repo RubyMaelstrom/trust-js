@@ -224,8 +224,26 @@ pub(crate) struct VmFrameRoots {
     pub(crate) class_states: *const [Option<crate::eval::PreparedClassEvaluation>],
 }
 
+/// One running JIT activation whose context lives in a Rust entry's frame (`jit::run`,
+/// `jit::run_moved_oversized` and `jit::run_borrowed_frame`; the other activations run on pooled
+/// records, see `jit::JitFrame`). The stack scan sees the context's own words, but not the
+/// Rust-heap buffers its machine code keeps slots and operands in, nor what its fields own.
+/// The entry registers both for the whole native run ([`enter_jit_frame`]); traced as the
+/// context's values precisely (`GcTrace for JitCtx`) and each word range conservatively
+/// ([`scan_words`]).
+pub(crate) struct JitFrameRoots {
+    pub(crate) ctx: *const crate::jit::JitCtx,
+    /// Word ranges `(start, words)`: the entry's slots (none for a borrowed VM frame, whose
+    /// slots `drive_vm` registers) and its operand buffer. Every word in them has been written
+    /// before the run starts (each entry says how); stale words above the live operand top can
+    /// only retain.
+    pub(crate) words: [(*const u64, usize); 2],
+}
+
 thread_local! {
     static VM_FRAMES: std::cell::RefCell<Vec<VmFrameRoots>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static JIT_FRAMES: std::cell::RefCell<Vec<JitFrameRoots>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Coroutines removed from their owner's table while they run.
     static RUNNING_COROUTINES: std::cell::RefCell<Vec<*const crate::coroutine::Coroutine>> =
@@ -264,7 +282,57 @@ pub(crate) fn enter_coroutine(coroutine: *const crate::coroutine::Coroutine) -> 
     CoroutineGuard
 }
 
-/// Trace this thread's registered VM frames, rooted value buffers and running coroutines.
+/// Unregisters a [`JitFrameRoots`] (also on unwind).
+#[must_use]
+pub(crate) struct JitFrameGuard;
+
+impl Drop for JitFrameGuard {
+    fn drop(&mut self) {
+        JIT_FRAMES.with(|frames| frames.borrow_mut().pop());
+    }
+}
+
+/// Register a Rust entry's running JIT activation. The context and the word ranges must stay
+/// in place, and the ranges written, until the guard drops.
+pub(crate) fn enter_jit_frame(roots: JitFrameRoots) -> JitFrameGuard {
+    JIT_FRAMES.with(|frames| frames.borrow_mut().push(roots));
+    JitFrameGuard
+}
+
+/// The contexts of the Rust entries' JIT activations registered on this thread (tests).
+#[cfg(test)]
+pub(crate) fn jit_frame_contexts() -> Vec<*const crate::jit::JitCtx> {
+    JIT_FRAMES.with(|frames| frames.borrow().iter().map(|frame| frame.ctx).collect())
+}
+
+/// The word-range lengths of each Rust entry's JIT activation registered on this thread
+/// (tests).
+#[cfg(test)]
+pub(crate) fn jit_frames_registered() -> Vec<[usize; 2]> {
+    JIT_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .iter()
+            .map(|frame| [frame.words[0].1, frame.words[1].1])
+            .collect()
+    })
+}
+
+/// Report each of the `len` words at `start` as a candidate cell word: a conservative root
+/// range. The heap resolves the words that address an allocated cell (masking a packed word's
+/// tag) and ignores the rest, so a stale or numeric word can only retain.
+///
+/// # Safety
+/// `start..start + len` is readable, and every word in it has been written.
+pub(crate) unsafe fn scan_words(start: *const u64, len: usize, sink: &mut dyn GcSink) {
+    for k in 0..len {
+        // SAFETY: the caller's contract.
+        sink.word(unsafe { start.add(k).read() });
+    }
+}
+
+/// Trace this thread's registered VM frames, Rust entries' JIT activations, rooted value
+/// buffers and running coroutines.
 pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
     VM_FRAMES.with(|frames| {
         for frame in frames.borrow().iter() {
@@ -278,6 +346,18 @@ pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
                 (*frame.this_val).trace_gc(sink);
                 (*frame.disposal_frames).trace_gc(sink);
                 (*frame.class_states).trace_gc(sink);
+            }
+        }
+    });
+    JIT_FRAMES.with(|frames| {
+        for frame in frames.borrow().iter() {
+            // SAFETY: registered only while the entry's native run holds the context and its
+            // written word ranges in place.
+            unsafe {
+                (*frame.ctx).trace_gc(sink);
+                for &(start, len) in &frame.words {
+                    scan_words(start, len, sink);
+                }
             }
         }
     });
@@ -417,6 +497,18 @@ impl GcTrace for crate::interpreter::Disposable {
         } = self;
         value.trace_gc(sink);
         method.trace_gc(sink);
+    }
+}
+
+impl GcTrace for crate::interpreter::Abrupt {
+    fn trace_gc(&self, sink: &mut dyn GcSink) {
+        match self {
+            crate::interpreter::Abrupt::Throw(value)
+            | crate::interpreter::Abrupt::Return(value)
+            | crate::interpreter::Abrupt::Break(_, value)
+            | crate::interpreter::Abrupt::Continue(_, value) => value.trace_gc(sink),
+            crate::interpreter::Abrupt::Interrupt(_) => {}
+        }
     }
 }
 

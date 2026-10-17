@@ -1,7 +1,7 @@
 //! Generated code under gc-heap's traced ownership (P1 S5 step 6), through the test-only
-//! admission (`Engine::admit_jit_for_test`): the engine runs at `Tier::Jit` and never collects,
-//! because JIT frames are not roots of the collector before step 7. Every program is small
-//! enough to finish without a collection.
+//! admission (`Engine::admit_jit_for_test`): the engine runs at `Tier::Jit` and collects as
+//! usual, its JIT activations being roots since step 7 (whose rooting tests are
+//! `jit::rooting_tests`).
 //!
 //! Each program runs at `Tier::Jit` and at `Tier::Bytecode` (tier threshold 0) in the same build
 //! and must produce the same, pinned, result; the functions it names must have run as native
@@ -27,7 +27,7 @@ fn engine(tier: Tier) -> Engine {
     engine
 }
 
-fn eval(engine: &mut Engine, source: &str) -> String {
+pub(super) fn eval(engine: &mut Engine, source: &str) -> String {
     match engine.eval(source, false).expect("fixture parses") {
         Completion::Value(value) => value,
         Completion::Throw { name, message } => panic!("{name}: {message}"),
@@ -35,7 +35,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 /// Run `f` on the bytecode chunk of the global function `name`.
-fn with_chunk<R>(
+pub(super) fn with_chunk<R>(
     engine: &mut Engine,
     name: &str,
     f: impl FnOnce(&crate::bytecode::Chunk) -> R,
@@ -56,7 +56,7 @@ fn with_chunk<R>(
 }
 
 /// Every named global function ran as native code.
-fn assert_native(engine: &mut Engine, names: &[&str]) {
+pub(super) fn assert_native(engine: &mut Engine, names: &[&str]) {
     for name in names {
         assert!(
             with_chunk(engine, name, |chunk| chunk.jit.get().flatten().is_some()),
@@ -67,7 +67,7 @@ fn assert_native(engine: &mut Engine, names: &[&str]) {
 
 /// Let callers' direct sequences admit `name` (its one-shot inline recompile is settled; see
 /// `CallIc::direct`).
-fn settle(engine: &mut Engine, name: &str) {
+pub(super) fn settle(engine: &mut Engine, name: &str) {
     with_chunk(engine, name, |chunk| {
         chunk.inline_attempted.set(true);
         chunk.inline_retry_at.set(0);
@@ -94,16 +94,18 @@ fn property_paths(run: impl FnOnce()) -> [u64; 3] {
     std::array::from_fn(|k| after[k] - before[k])
 }
 
-/// The admission keeps its engine from collecting at all: neither a due safepoint collection
-/// nor an explicit request runs (the heap defers the latter), so garbage stays allocated.
+/// The admission no longer keeps its engine from collecting (step 7): a due safepoint
+/// collection runs inside JIT code, explicit requests run, and garbage dies.
 #[test]
-fn admission_refuses_every_collection() {
+fn admission_collects() {
     let mut jit = engine(Tier::Jit);
-    eval(&mut jit, "var victim = {v: 1}; 0;");
-    let env = jit.interp.global_env.clone();
-    let victim = jit.interp.get_var("victim", &env).ok().expect("victim");
-    let weak = crate::value::Gc::downgrade(victim.as_obj().expect("an object"));
-    drop(victim);
+    // The victim's handle lives only in this helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        eval(&mut jit, "var victim = {v: 1}; 0;");
+        let env = jit.interp.global_env.clone();
+        let victim = jit.interp.get_var("victim", &env).ok().expect("victim");
+        crate::value::Gc::downgrade(victim.as_obj().expect("an object"))
+    });
     let stats = |engine: &Engine| engine.interp.gc_heap.core.borrow().stats();
     let before = stats(&jit);
     // Every safepoint now finds a collection due by the live-object threshold.
@@ -111,21 +113,23 @@ fn admission_refuses_every_collection() {
     assert_eq!(
         eval(
             &mut jit,
-            "victim = null; var junk = []; for (var i = 0; i < 1000; i++) junk.push({i: i}); \
-             junk = null; 1;",
+            "function fill(n) { var junk = []; for (var i = 0; i < n; i++) junk.push({i: i}); \
+             return junk.length; } victim = null; fill(1000);",
         ),
-        "1"
+        "1000"
     );
-    jit.interp.gc_task_boundary();
-    jit.interp.collect_garbage_for_host();
-    jit.interp.gc_collect();
-    let after = stats(&jit);
-    assert_eq!(after.collections, before.collections, "nothing collected");
+    assert_native(&mut jit, &["fill"]);
+    let during = stats(&jit);
     assert!(
-        after.deferred_collections > before.deferred_collections,
-        "the explicit requests were deferred"
+        during.collections > before.collections,
+        "a due safepoint collection ran"
     );
-    assert!(weak.upgrade().is_some(), "garbage stays allocated");
+    jit.interp.gc_collect();
+    assert!(
+        stats(&jit).collections > during.collections,
+        "an explicit request ran"
+    );
+    assert!(!crate::gc_test::alive(&weak), "garbage was collected");
 }
 
 /// Operand-stack and slot words of objects and strings: LoadLocal and Dup clone, StoreLocal

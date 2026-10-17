@@ -570,7 +570,7 @@ impl Interp {
             fragment_cache: _, // weak Realm keys and compiled plans
             enumeration_keys,
             property_key_strings,
-            frame_pool: _, // native JIT frames: the JIT is refused admission under gc-heap
+            frame_pool, // the active JIT records (Rust entries' contexts: thread roots)
             creation_pins: _, // weak pins
             global_env_pins: _, // weak pins
             call_site: _,
@@ -724,10 +724,13 @@ impl Interp {
         error_protos.trace_gc(sink);
         eval_fn.trace_gc(sink);
         extra_protos.trace_gc(sink);
+        // Pooled buffers are empty; one in use is registered by its activation (`drive_vm`, or
+        // a JIT entry's `gc_trace::JitFrameRoots`).
         for (slots, stack) in vm_pool {
             slots.trace_gc(sink);
             stack.trace_gc(sink);
         }
+        frame_pool.trace_gc(sink);
         native_arg_pool.trace_gc(sink);
         for map in descriptor_maps.iter().chain([iter_result_map]) {
             if let Some(props) = map.get() {
