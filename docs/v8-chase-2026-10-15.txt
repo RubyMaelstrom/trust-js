@@ -1828,3 +1828,48 @@ main):
   define a setter there, construct again. Without the fence the setter
   is skipped ("0:true") in the bytecode VM and in the native template.
 - Lib suites: embed 2154/0/3, embed,gc-heap 1851/0/114.
+
+Step 3, ownership emitters (default build, no code change; 95d3d589):
+- Every reference-count sequence the JIT emits goes through a named
+  emitter that reads one description, JitOwnership (from
+  JitLayout::ownership(); for now only Refcount { strong_off }).
+  ARM64 (jit_ownership.rs): the execution-word owner guard; clone,
+  shared drop and word release; increments, the non-final guard and
+  its load and check halves, commit and non-final decrements,
+  release-shared and release-unless-last; drop-helper calls; the
+  direct-call frame teardown (surplus arguments, callee, `this`,
+  slots). The PropertyLayout Rc keeps three emitters of its own. x64:
+  an increment and two guarded decrements. Routed, by the step's
+  census: 21 clones, 7 shared drops, 6 word releases and one inline
+  copy, the drop-helper calls, 44 inline decrements, 4 increments, 41
+  guards, the frame teardown, 7 x64 sites, 3 PropertyLayout sites,
+  and one site the survey missed (the computed-method key release).
+  The 20 sequences that hardcoded offset 0 read the description. Tag
+  guards, alias compares and gates stay at their sites.
+- Code dumps (default build, ASLR off) against the step-1 baselines:
+  vue (55 chunks) and react (9) identical; djot (160) identical when
+  each MOVZ/MOVK run is compared as one masked address. Compared word
+  by word, three or four djot chunks differ: the binary's new size
+  moves its heap, a string constant's address needs one 16-bit lane
+  more or fewer, and later in-chunk branches shift by a word
+  (disassembled; nothing else differs). With the base binary's
+  program break aligned to the new one's, the word-by-word comparison
+  matches as well, also with per-chunk and inline stubs and on 20
+  other benchmark workloads. A temporary unit test found the x64
+  emitters byte-identical to the sequences they replace.
+- Lib suites: embed 2154/0/3; embed,gc-heap 1851/0/114 in four runs
+  (the step-2 test failed in a fifth, fixed below); clippy clean in
+  both builds.
+
+Step 2 follow-up, a flaky test (gc-heap): the address-reuse test
+failed in some full multi-threaded runs (every --nocapture run),
+never alone. Each tier made a fresh heap, which in a full run
+allocated at the previous tier's addresses: the second tier's
+prototype sat where the first tier's reused object had been, and
+that object's handle, left in the test function's frame, retained it
+(the retention trace named the test's own frame, 496 bytes below its
+record). Alone, the two heaps landed apart. Each tier now runs in a
+helper between stack scrubs (`scrubbed`, the embedder-entry
+wrapper), so no handle outlives its tier. Full gc-heap runs after the
+fix: 4 of 4 pass (1851/0/114), 3 of them --nocapture, which failed 3
+of 3 before; the default build passes it.

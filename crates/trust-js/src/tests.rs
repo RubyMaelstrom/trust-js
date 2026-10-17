@@ -3765,54 +3765,62 @@ fn discarded_function_templates_release_their_name_strings() {
 #[test]
 fn creation_caches_do_not_trust_a_reused_prototype_address() {
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
-        let mut engine = Engine::new();
-        engine.set_tier(tier);
-        engine.set_tier_threshold(0);
+        // A tier's fresh heap can allocate at the previous tier's addresses, its prototype where
+        // the previous new object was. Between stack scrubs, no handle the previous tier left in
+        // a frame survives to retain it (gc-heap).
+        crate::scrubbed(|| creation_cache_after_address_reuse(tier));
+    }
+}
+
+#[inline(never)]
+fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
+    let mut engine = Engine::new();
+    engine.set_tier(tier);
+    engine.set_tier_threshold(0);
+    eval_to_string(
+        &mut engine,
+        "var C = class { constructor() { this.x = 1; } };
+         function NT() {}
+         var args = [];
+         var hits = 0;
+         var desc = { set(v) { hits++; }, configurable: true };
+         NT.prototype = {};
+         for (var i = 0; i < 20; i++) Reflect.construct(C, args, NT);
+         0",
+    );
+    let cached = crate::gc_test::in_frame(|| {
+        let global = crate::value::Value::Obj(engine.interp.global.clone());
+        let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
+        let proto = engine
+            .interp
+            .member_get(&nt, "prototype")
+            .ok()
+            .expect("NT.prototype");
+        crate::gc_test::HiddenAddress::of(&proto)
+    });
+    eval_to_string(&mut engine, "NT.prototype = null; 0");
+    // The first collection finds the prototype dead and prunes its pin; the second frees
+    // its address (gc-heap keeps a pinned dead cell reserved until then).
+    engine.interp.gc_collect();
+    engine.interp.gc_collect();
+    let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
+        .expect("a new object takes the dead prototype's address");
+    let global = crate::value::Value::Obj(engine.interp.global.clone());
+    assert!(engine
+        .interp
+        .member_set(&global, "P2", crate::value::Value::Obj(reused))
+        .is_ok());
+    assert_eq!(
         eval_to_string(
             &mut engine,
-            "var C = class { constructor() { this.x = 1; } };
-             function NT() {}
-             var args = [];
-             var hits = 0;
-             var desc = { set(v) { hits++; }, configurable: true };
-             NT.prototype = {};
-             for (var i = 0; i < 20; i++) Reflect.construct(C, args, NT);
-             0",
-        );
-        let cached = crate::gc_test::in_frame(|| {
-            let global = crate::value::Value::Obj(engine.interp.global.clone());
-            let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
-            let proto = engine
-                .interp
-                .member_get(&nt, "prototype")
-                .ok()
-                .expect("NT.prototype");
-            crate::gc_test::HiddenAddress::of(&proto)
-        });
-        eval_to_string(&mut engine, "NT.prototype = null; 0");
-        // The first collection finds the prototype dead and prunes its pin; the second frees
-        // its address (gc-heap keeps a pinned dead cell reserved until then).
-        engine.interp.gc_collect();
-        engine.interp.gc_collect();
-        let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
-            .expect("a new object takes the dead prototype's address");
-        let global = crate::value::Value::Obj(engine.interp.global.clone());
-        assert!(engine
-            .interp
-            .member_set(&global, "P2", crate::value::Value::Obj(reused))
-            .is_ok());
-        assert_eq!(
-            eval_to_string(
-                &mut engine,
-                "Object.defineProperty(P2, 'x', desc);
-                 NT.prototype = P2;
-                 var o = Reflect.construct(C, args, NT);
-                 hits + ':' + Object.hasOwn(o, 'x')",
-            ),
-            "1:false",
-            "{tier:?}: the setter on the new prototype runs"
-        );
-    }
+            "Object.defineProperty(P2, 'x', desc);
+             NT.prototype = P2;
+             var o = Reflect.construct(C, args, NT);
+             hits + ':' + Object.hasOwn(o, 'x')",
+        ),
+        "1:false",
+        "{tier:?}: the setter on the new prototype runs"
+    );
 }
 
 /// A new plain object at `address`, allocating until the allocator hands that address out.
