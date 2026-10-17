@@ -4024,10 +4024,54 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
 mod jit_heap_tests {
     use super::*;
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
-    )]
+    /// gc-heap: an allocation counts in the active Agent's heap, and a collection counts its
+    /// own heap's deaths in that heap's counter, whichever Agent is active (a tracing heap
+    /// frees at collections).
+    #[cfg(feature = "gc-heap")]
+    #[test]
+    fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
+        // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
+        // share a native thread. A captured JIT counter must keep tracking its owning heap.
+        use crate::gc_test::{alive, in_frame};
+        let mut first = crate::Engine::new();
+        let mut second = crate::Engine::new();
+        let first_counter = live_objects_ptr(&first.interp.gc_heap);
+        let second_counter = live_objects_ptr(&second.interp.gc_heap);
+        assert_ne!(first_counter, second_counter);
+        // SAFETY: both heap owners remain alive throughout these counter reads.
+        let counts = || unsafe { (*first_counter, *second_counter) };
+        {
+            let _first_active = first.interp.enter_agent();
+            first.interp.gc_collect();
+        }
+        {
+            let _second_active = second.interp.enter_agent();
+            second.interp.gc_collect();
+        }
+        let (first_base, second_base) = counts();
+
+        let _first_active = first.interp.enter_agent();
+        let first_object = in_frame(|| Gc::downgrade(&Object::new(None)));
+        {
+            let _second_active = second.interp.enter_agent();
+            let second_object = in_frame(|| Gc::downgrade(&Object::new(None)));
+            assert_eq!(counts(), (first_base + 1, second_base + 1));
+            first.interp.gc_collect();
+            assert!(!alive(&first_object));
+            assert_eq!(counts(), (first_base, second_base + 1));
+            second.interp.gc_collect();
+            assert!(!alive(&second_object));
+            assert_eq!(counts(), (first_base, second_base));
+        }
+
+        let first_object = in_frame(|| Gc::downgrade(&Object::new(None)));
+        assert_eq!(counts(), (first_base + 1, second_base));
+        first.interp.gc_collect();
+        assert!(!alive(&first_object));
+        assert_eq!(counts(), (first_base, second_base));
+    }
+
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
         // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may

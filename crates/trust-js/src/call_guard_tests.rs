@@ -61,8 +61,8 @@ fn check(source: &str, expected: &str) {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -133,8 +133,8 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -230,8 +230,8 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -264,20 +264,22 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
             for (var n=0; n<12; n++) checkedDrive(victim, 0);
         "#,
         );
-        let victim = object(&mut engine, "victim");
-        let token = object(&mut engine, "token");
-        let victim_weak = Gc::downgrade(&victim);
-        let token_weak = Gc::downgrade(&token);
-        let driver = chunk(&mut engine, "checkedDrive");
-        let entry = driver
-            .cached_call_for(Gc::as_ptr(&victim) as usize)
-            .expect("capturing callee is cached");
-        assert_ne!(
-            entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
-            0,
-            "activation-homed callee forces the checked helper rather than direct machine call"
-        );
-        drop((victim, token));
+        // The handles, and the cached entry's raw callee and environment addresses, live only
+        // in this helper frame (gc-heap scans the stack).
+        let (victim_weak, token_weak) = crate::gc_test::in_frame(|| {
+            let victim = object(&mut engine, "victim");
+            let token = object(&mut engine, "token");
+            let driver = chunk(&mut engine, "checkedDrive");
+            let entry = driver
+                .cached_call_for(Gc::as_ptr(&victim) as usize)
+                .expect("capturing callee is cached");
+            assert_ne!(
+                entry.direct & crate::bytecode::CALL_IC_NEEDS_ENV,
+                0,
+                "activation-homed callee forces the checked helper rather than direct machine call"
+            );
+            (Gc::downgrade(&victim), Gc::downgrade(&token))
+        });
         eval(&mut engine, "token = null");
         let result = eval(
             &mut engine,
@@ -300,8 +302,8 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -368,8 +370,8 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

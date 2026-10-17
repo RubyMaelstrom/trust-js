@@ -1100,15 +1100,19 @@ impl crate::gc_trace::GcTrace for ResumedFrame {
 mod tests {
     use super::*;
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
-    )]
     #[test]
     fn shared_inline_sites_keep_positions_live_until_the_last_chunk() {
-        let engine = crate::Engine::new();
+        #[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
+        let mut engine = crate::Engine::new();
+        #[cfg(not(feature = "gc-heap"))]
         let callee = engine.interp.new_object();
+        #[cfg(not(feature = "gc-heap"))]
         let pin = crate::value::Gc::downgrade(&callee);
+        // gc-heap: the callee lives until the collection below finds it unreachable; no handle
+        // in this frame may retain it (the stack is scanned).
+        #[cfg(feature = "gc-heap")]
+        let pin =
+            crate::gc_test::in_frame(|| crate::value::Gc::downgrade(&engine.interp.new_object()));
         let (mut sites, positions) = InlineSites::register(vec![
             InlineSite {
                 callee: pin.clone(),
@@ -1135,9 +1139,12 @@ mod tests {
         let inner = inline_site(positions[1]).expect("the clone owns both registered identities");
         assert_eq!(inner.outer, positions[0]);
         assert_eq!(inline_site(inner.outer).unwrap().outer, 37);
+        #[cfg(not(feature = "gc-heap"))]
         drop(callee);
+        #[cfg(feature = "gc-heap")]
+        engine.interp.gc_collect();
         assert!(
-            pin.upgrade().is_none(),
+            !crate::gc_test::alive(&pin),
             "inline metadata must retain no JavaScript owner"
         );
         assert!(

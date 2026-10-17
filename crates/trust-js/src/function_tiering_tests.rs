@@ -239,8 +239,8 @@ fn install_native(engine: &mut Engine, name: &str, callback: crate::value::Nativ
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn recursive_borrowed_parameter_scopes_keep_both_live_activations() {
@@ -361,8 +361,8 @@ fn check_fragment(source: &str, expected: &str) {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn sloppy_fragments_publish_parameter_objects_before_parked_handlers() {
@@ -374,8 +374,8 @@ fn sloppy_fragments_publish_parameter_objects_before_parked_handlers() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn sloppy_fragments_keep_shadowed_and_captured_lexical_homes_distinct() {
@@ -385,8 +385,8 @@ fn sloppy_fragments_keep_shadowed_and_captured_lexical_homes_distinct() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn sloppy_fragment_aliases_follow_nested_labels_and_finally_completions() {
@@ -397,8 +397,8 @@ fn sloppy_fragment_aliases_follow_nested_labels_and_finally_completions() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn constructor_migration_keeps_reflect_new_target_and_return_rules() {
@@ -409,8 +409,8 @@ fn constructor_migration_keeps_reflect_new_target_and_return_rules() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn derived_constructor_loops_preserve_their_established_completion_path() {
@@ -565,8 +565,8 @@ fn migrated_private_homes_release_overwritten_objects_before_returning() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
@@ -609,8 +609,8 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
@@ -723,8 +723,8 @@ thread_local! {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn generic_native_promotion_uses_the_callees_running_realm() {

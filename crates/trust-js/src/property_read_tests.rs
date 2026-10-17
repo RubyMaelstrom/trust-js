@@ -997,8 +997,8 @@ fn propstat_classify_buckets_match_template_guards_without_running_getters() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn propstat_diagnostic_tallies_helper_reasons_at_exit() {
@@ -1063,8 +1063,8 @@ fn validated_accessor_reads_observe_live_mutations_in_every_tier() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn validated_accessor_landing_is_exercised_by_jit_reads() {

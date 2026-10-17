@@ -851,10 +851,6 @@ fn legacy_function_reflection_diagnostics_preserve_lazy_materialization() {
     );
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
-)]
 #[test]
 fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
     for mode in [1, 2] {
@@ -883,23 +879,29 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
             ),
             "ok"
         );
-        let global = crate::value::Value::Obj(engine.interp.global.clone());
-        let value = engine
-            .interp
-            .eval_in_realm(&global, "victim")
-            .unwrap_or_else(|_| panic!("live victim"));
-        let crate::value::Value::Obj(function) = value else {
-            panic!("function object")
-        };
-        let weak = crate::value::Gc::downgrade(&function);
-        drop(function);
+        // The function's handle lives only in this helper frame (gc-heap scans the stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let global = crate::value::Value::Obj(engine.interp.global.clone());
+            let value = engine
+                .interp
+                .eval_in_realm(&global, "victim")
+                .unwrap_or_else(|_| panic!("live victim"));
+            let crate::value::Value::Obj(function) = value else {
+                panic!("function object")
+            };
+            crate::value::Gc::downgrade(&function)
+        });
         let source = format!("try {{ dispatch(victim,{mode}) }} catch(error) {{ error===sentinel ? 'sentinel' : 'wrong error' }}");
         assert_eq!(
             run_in(&mut engine, &source),
             if mode == 1 { "17" } else { "sentinel" }
         );
         // The body removed both the global owner and the default prototype's constructor
-        // backlink. Only the caller operand remained; cleanup must drop that owner exactly once.
+        // backlink. Only the caller operand remained; cleanup must drop that owner exactly once
+        // (gc-heap: leave no word that retains it, so the next collection finds it dead).
+        if cfg!(feature = "gc-heap") {
+            engine.interp.gc_collect();
+        }
         assert_eq!(
             weak.strong_count(),
             0,
@@ -986,8 +988,8 @@ fn megamorphic_direct_call_can_grow_the_secondary_cache_in_a_nested_call() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn megamorphic_cache_does_not_keep_discarded_functions_alive() {
@@ -14621,8 +14623,8 @@ fn for_head_no_in_function_boundaries_execute() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn loop_free_functions_earn_native_code_through_vm_runs() {
@@ -29591,8 +29593,8 @@ fn jit_function_call_intrinsic_preserves_target_and_receiver_guards() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn interp_layout_probes() {

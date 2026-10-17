@@ -315,8 +315,8 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: needs the JIT, refused admission under gc-heap until S5"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
