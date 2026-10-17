@@ -1249,7 +1249,7 @@ fn materialize(
                 // Clone cannot call author code, allocate, or invalidate another
                 // virtual register; the canonical local continues to own the source.
                 let cloned = a.new_label();
-                emit_exec_clone(a, layout, 9, 10, 11, cloned);
+                exec_clone(a, layout.ownership(), 9, 10, 11, cloned);
                 a.bind(cloned);
                 emit_exec_word_store(a, 9, 20, offset);
             }
@@ -2535,7 +2535,7 @@ pub(super) fn emit(
                 }
                 for slot in [pattern.value, pattern.mapped] {
                     let offset = slot as i32 * 8;
-                    emit_exec_release_word(a, layout, 22, offset);
+                    exec_release_word(a, layout.ownership(), 22, offset);
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     emit_exec_word_store(a, 9, 22, offset);
                     if let Some(home) = plan.tagged_reg(slot) {
@@ -2550,7 +2550,7 @@ pub(super) fn emit(
                     key_src,
                     candidate.post_fail,
                 );
-                emit_exec_clone(a, layout, 12, 13, 16, candidate.post_fail);
+                exec_clone(a, layout.ownership(), 12, 13, 16, candidate.post_fail);
                 // The first Tdz made this destination Empty, so the cloned result can be
                 // transferred directly into its canonical owner slot.
                 emit_exec_word_store(a, 12, 22, pattern.value as i32 * 8);
@@ -3183,7 +3183,7 @@ pub(super) fn emit(
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(10, 9);
                     a.b_cond(C_EQ, bailout);
-                    emit_exec_clone(a, layout, 10, 11, 12, bailout);
+                    exec_clone(a, layout.ownership(), 10, 11, 12, bailout);
                     let dest = (depth as i32 - physical as i32) * 8;
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);
@@ -3748,7 +3748,7 @@ fn emit_pop_cond(a: &mut asm::Asm, layout: &crate::value::JitLayout, unwind: usi
     let done = a.new_label();
     emit_peek_cond_inline(a, layout, false, unwind);
     emit_exec_word_load(a, 9, 20, -8);
-    emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+    exec_drop_shared(a, layout.ownership(), 9, 10, 11, slow);
     a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(slow);
@@ -3802,7 +3802,7 @@ fn emit_effect(
             a.ldr_imm(10, 9, 0);
             a.ldr_imm(11, 9, 8);
             emit_exec_encode_wide(a, 10, 11, 12, 13, 14, 0, slow);
-            emit_exec_clone(a, layout, 12, 13, 14, slow);
+            exec_clone(a, layout.ownership(), 12, 13, 14, slow);
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
             a.b(done);
@@ -3828,9 +3828,7 @@ fn emit_effect(
             a.mov_imm64(10, crate::value::PACK_STR);
             a.logic_x(1, 10, 10, 11);
             emit_exec_word_store(a, 10, 20, 0);
-            a.ldur(13, 11, 0);
-            a.add_imm(13, 13, 1);
-            a.stur(13, 11, 0);
+            rc_inc(a, layout.ownership(), 11, 13, 1);
             a.add_imm(20, 20, 8);
         }
         Op::GetProp(name, cache)
@@ -4013,7 +4011,7 @@ fn emit_effect(
             emit_update_local(a, slot, kind, pc_u32, unwind);
         }
         Op::Pop if fast & 64 != 0 && layout.valid && layout.rc_strong_off < 256 => {
-            emit_exec_release_word(a, layout, 20, -8);
+            exec_release_word(a, layout.ownership(), 20, -8);
             a.sub_imm(20, 20, 8);
         }
         Op::Pop | Op::Dup if fast & 64 != 0 => {
@@ -4021,10 +4019,10 @@ fn emit_effect(
             let done = a.new_label();
             emit_exec_word_load(a, 9, 20, -8);
             if matches!(op, Op::Pop) {
-                emit_exec_drop_shared(a, layout, 9, 10, 11, slow);
+                exec_drop_shared(a, layout.ownership(), 9, 10, 11, slow);
                 a.sub_imm(20, 20, 8);
             } else {
-                emit_exec_clone(a, layout, 9, 10, 11, slow);
+                exec_clone(a, layout.ownership(), 9, 10, 11, slow);
                 emit_exec_word_store(a, 9, 20, 0);
                 a.add_imm(20, 20, 8);
             }

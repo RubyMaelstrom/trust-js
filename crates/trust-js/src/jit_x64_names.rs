@@ -498,7 +498,7 @@ fn load_value(a: &mut Asm, l: &JitLayout, for_call: bool, slow: usize) {
     let copied = a.label();
     a.nr_test(DX);
     a.jcc(EQ, copied);
-    a.nr_mem(true, &[0xff], 0, DX, l.rc_strong_off as i32);
+    a.rc_inc_rdx(l.ownership());
     a.bind(copied);
     if for_call {
         a.nr_imm(DX, PACK_UNDEFINED);
@@ -575,11 +575,8 @@ fn store_value(a: &mut Asm, l: &JitLayout, slow: usize) {
     let commit = a.label();
     a.nr_test(DX);
     a.jcc(EQ, commit);
-    a.nr_load(AX, DX, l.rc_strong_off);
-    a.nr_op_imm(7, AX, 1);
-    a.jcc(BE, slow);
-    // No further guard/helper after this mutation. R8/R9/R10 hold the transferred new owner.
-    a.nr_mem(true, &[0xff], 1, DX, l.rc_strong_off as i32);
+    // No further guard/helper after this decrement. R8/R9/R10 hold the transferred new owner.
+    a.rc_dec_nonfinal_rdx_imm32(l.ownership(), slow);
     a.bind(commit);
     let packed = a.label();
     let done = a.label();

@@ -26,6 +26,7 @@ pub(super) fn emit(
     direct_finish: usize,
 ) -> bool {
     let rc_ok = layout.valid && layout.rc_strong_off < 256;
+    let own = layout.ownership();
     let op = &chunk.jit_ops()[pc];
     match op {
         Op::TypeofIs(test, negate) if fast & 2 != 0 && rc_ok && layout.rc_strong_off == 0 => {
@@ -52,7 +53,7 @@ pub(super) fn emit(
             a.cset_w(11, if *negate { C_NE } else { C_EQ });
             // Every declining owner guard precedes the decrement. Last owners and
             // BigInt retain the real destructor through the checked operation.
-            emit_exec_drop_shared(a, layout, 12, 13, 14, slow);
+            exec_drop_shared(a, own, 12, 13, 14, slow);
             a.mov_imm64(9, crate::value::PACK_BOOL);
             a.logic_x(1, 9, 9, 11);
             emit_exec_word_store(a, 9, 20, -8);
@@ -151,7 +152,7 @@ pub(super) fn emit(
             let slow = a.new_label();
             let done = a.new_label();
             emit_exec_word_load(a, 9, 20, -8);
-            emit_exec_clone(a, layout, 9, 10, 11, slow);
+            exec_clone(a, own, 9, 10, 11, slow);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
             a.b(done);
@@ -168,7 +169,7 @@ pub(super) fn emit(
             a.ldr_imm(10, 9, 0);
             a.ldr_imm(11, 9, 8);
             emit_exec_encode_wide(a, 10, 11, 12, 13, 14, 0, slow);
-            emit_exec_clone(a, layout, 12, 13, 14, slow);
+            exec_clone(a, own, 12, 13, 14, slow);
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
             a.b(done);
@@ -597,7 +598,7 @@ pub(super) fn emit(
             a.mov_imm64(10, crate::value::PACK_EMPTY);
             a.cmp_reg_x(9, 10); // Empty = TDZ throw → slow
             a.b_cond(C_EQ, slow);
-            emit_exec_clone(a, layout, 9, 10, 11, slow);
+            exec_clone(a, own, 9, 10, 11, slow);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
             a.b(done);
@@ -620,7 +621,7 @@ pub(super) fn emit(
             emit_update_local(a, *slot, *kind, pc as u32, unwind);
         }
         Op::Pop if fast & 64 != 0 && rc_ok => {
-            emit_exec_release_word(a, layout, 20, -8);
+            exec_release_word(a, own, 20, -8);
             a.sub_imm(20, 20, 8);
         }
         Op::DestructureGuard if fast & 1024 != 0 => {
@@ -652,7 +653,7 @@ pub(super) fn emit(
         Op::Void if fast & (64 | 128) == (64 | 128) && rc_ok => {
             // GetValue/effects already ran. Release the consumed owner exactly as Pop (a last
             // owner's destructor runs through the drop helper), then return undefined.
-            emit_exec_release_word(a, layout, 20, -8);
+            exec_release_word(a, own, 20, -8);
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
             emit_exec_word_store(a, 9, 20, -8);
         }
@@ -680,9 +681,7 @@ pub(super) fn emit(
             a.mov_imm64(10, crate::value::PACK_STR);
             a.logic_x(1, 10, 10, 11);
             emit_exec_word_store(a, 10, 20, 0);
-            a.ldur(13, 11, 0); // strong (payload+0)
-            a.add_imm(13, 13, 1);
-            a.stur(13, 11, 0);
+            rc_inc(a, own, 11, 13, 1);
             a.add_imm(20, 20, 8);
         }
         Op::DestructureGuard => {
@@ -703,14 +702,14 @@ pub(super) fn emit(
         // is commonly the slot's last owner; release it in place (no generic dispatch).
         Op::Tdz(slot) if fast & 16 != 0 && rc_ok && (*slot as u32) * 8 + 8 < 4096 => {
             let off = *slot as i32 * 8;
-            emit_exec_release_word(a, layout, 22, off);
+            exec_release_word(a, own, 22, off);
             a.mov_imm64(9, crate::value::PACK_EMPTY);
             emit_exec_word_store(a, 9, 22, off);
         }
         Op::ResetSlots(start, count) if rc_ok && (*start as u32 + *count as u32) * 8 < 4096 => {
             for k in *start..*start + *count {
                 let off = k as i32 * 8;
-                emit_exec_release_word(a, layout, 22, off);
+                exec_release_word(a, own, 22, off);
                 a.mov_imm64(9, crate::value::PACK_UNDEFINED);
                 emit_exec_word_store(a, 9, 22, off);
             }

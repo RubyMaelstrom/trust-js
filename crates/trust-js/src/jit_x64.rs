@@ -5,9 +5,9 @@
 //! can then be ported without duplicating runtime semantics or compromising deoptimization.
 
 use super::{
-    JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC, H_GET_ELEM,
-    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
-    H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    JitCode, JitOwnership, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC,
+    H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER,
+    H_RETURN, H_SET_PROP, H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -199,17 +199,38 @@ impl Asm {
         self.jcc(0x83, slow);
         self.bind(number);
     }
-    fn inc_strong_rdx(&mut self, disp: i32) {
+    // Ownership emitters (the x64 counterparts of `jit_ownership.rs`): every reference-count
+    // sequence of this backend. RDX holds the untagged String/Symbol/Object payload, which the
+    // caller's tag guard (`reference_or_immediate`, or the name templates' `owner_pointer`)
+    // proved reference-counted.
+
+    /// Acquire one owner of the payload in RDX (`inc qword [rdx+strong]`). Flags clobbered.
+    fn rc_inc_rdx(&mut self, own: JitOwnership) {
+        let JitOwnership::Refcount { strong_off } = own;
         self.bytes(&[0x48, 0xff, 0x82]);
-        self.bytes(&disp.to_le_bytes());
+        self.bytes(&strong_off.to_le_bytes());
     }
-    fn guard_dec_strong_rdx(&mut self, disp: i32, slow: usize) {
+    /// Release one owner of the payload in RDX. A last owner branches to `slow` before any
+    /// change (the checked path runs the real destructor). Clobbers RAX and flags.
+    fn rc_dec_nonfinal_rdx(&mut self, own: JitOwnership, slow: usize) {
+        let JitOwnership::Refcount { strong_off } = own;
         self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
-        self.bytes(&disp.to_le_bytes());
+        self.bytes(&strong_off.to_le_bytes());
         self.bytes(&[0x48, 0x83, 0xf8, 0x01]);
         self.jcc(0x86, slow); // last reference needs the real destructor
         self.bytes(&[0x48, 0xff, 0x8a]);
-        self.bytes(&disp.to_le_bytes());
+        self.bytes(&strong_off.to_le_bytes());
+    }
+    /// [`Self::rc_dec_nonfinal_rdx`] in the name templates' encoding (an imm32 compare).
+    fn rc_dec_nonfinal_rdx_imm32(&mut self, own: JitOwnership, slow: usize) {
+        let JitOwnership::Refcount { strong_off } = own;
+        self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
+        self.bytes(&strong_off.to_le_bytes());
+        self.bytes(&[0x48, 0x81, 0xf8]); // cmp rax,imm32 1
+        self.bytes(&1i32.to_le_bytes());
+        self.jcc(0x86, slow); // last reference needs the real destructor
+        self.bytes(&[0x48, 0xff, 0x8a]);
+        self.bytes(&strong_off.to_le_bytes());
     }
     fn numeric_compare(&mut self, setcc: u8, reject_unordered: bool) {
         // Packed Numbers are raw f64 bits; ucomisd supplies ordered scalar flags.
@@ -528,7 +549,7 @@ fn emit_prop_own(
     a.reference_or_immediate(true, immediate, slow);
     a.bytes(&[0x4c, 0x89, 0xd0]);
     a.payload_rax_to_rdx();
-    a.inc_strong_rdx(layout.rc_strong_off as i32);
+    a.rc_inc_rdx(layout.ownership());
     a.jmp(copied);
     a.bind(immediate);
     a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word; no ownership traffic
@@ -776,7 +797,7 @@ pub(super) fn compile_entry(
     let ret_ok = a.label();
     let ret_throw = a.label();
     let rc_ok = layout.valid && layout.rc_strong_off <= i32::MAX as usize;
-    let rc_strong = layout.rc_strong_off as i32;
+    let own = layout.ownership();
     let interrupt_offset = (ilayout.valid
         && ilayout.interrupt_poll_tick <= i32::MAX as usize
         && ilayout.gc_next <= i32::MAX as usize)
@@ -915,7 +936,7 @@ pub(super) fn compile_entry(
                 a.reference_or_immediate(rc_ok, copy, slow);
                 a.load_word_r15(off);
                 a.payload_rax_to_rdx();
-                a.inc_strong_rdx(rc_strong);
+                a.rc_inc_rdx(own);
                 a.jmp(done);
                 a.bind(copy);
                 a.load_word_r15(off);
@@ -937,7 +958,7 @@ pub(super) fn compile_entry(
                 a.reference_or_immediate(rc_ok, commit, slow);
                 a.load_word_r15(off);
                 a.payload_rax_to_rdx();
-                a.guard_dec_strong_rdx(rc_strong, slow);
+                a.rc_dec_nonfinal_rdx(own, slow);
                 a.bind(commit);
                 a.load_word_r13(-SLOT_BYTES); // transfer one owner, no retain
                 a.store_word_r15(off);
@@ -955,7 +976,7 @@ pub(super) fn compile_entry(
                 a.reference_or_immediate(rc_ok, commit, slow);
                 a.load_word_r13(-SLOT_BYTES);
                 a.payload_rax_to_rdx();
-                a.guard_dec_strong_rdx(rc_strong, slow);
+                a.rc_dec_nonfinal_rdx(own, slow);
                 a.bind(commit);
                 a.add_sp(-8);
                 a.jmp(exit);
@@ -971,7 +992,7 @@ pub(super) fn compile_entry(
                 a.reference_or_immediate(rc_ok, copy, slow);
                 a.load_word_r13(-SLOT_BYTES);
                 a.payload_rax_to_rdx();
-                a.inc_strong_rdx(rc_strong);
+                a.rc_inc_rdx(own);
                 a.bind(copy);
                 a.load_word_r13(-SLOT_BYTES);
                 a.store_word_r13(0);

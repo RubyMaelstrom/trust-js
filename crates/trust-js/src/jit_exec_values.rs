@@ -227,116 +227,6 @@ pub(super) fn emit_exec_encode_wide(
     a.bind(done);
 }
 
-/// Branch to heap for known shared-Rc execution kinds, reject BigInt's distinct owner
-/// representation, otherwise leave scalar owners alone. Both scratch registers and NZCV
-/// are clobbered, raw is untouched. Execution storage never contains lazy prototypes.
-fn classify_owner(
-    a: &mut asm::Asm,
-    raw: u32,
-    ptr: u32,
-    count: u32,
-    heap: usize,
-    scalar: usize,
-    slow: usize,
-) {
-    assert!(raw != ptr && raw != count && ptr != count);
-    a.lsr_imm(ptr, raw, 48);
-    a.movz(count, (PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(ptr, count);
-    a.b_cond(C_EQ, heap);
-    a.b_cond(C_HI, slow); // unknown/property-only tag, never guess an owner type.
-    a.movz(count, (PACK_BIGINT >> 48) as u32, 0);
-    a.cmp_reg_x(ptr, count);
-    a.b_cond(C_LO, scalar);
-    a.b_cond(C_EQ, slow);
-    // The only high lanes strictly above BigInt and at most Symbol are String/Symbol.
-    // Lower lanes are scalars (including positive Numbers); lanes above Symbol but
-    // below Object are negative Numbers. Preserve the object-first fast path and
-    // reject the same unknown tags as before without inspecting/dereferencing payloads.
-    const _: () = assert!(PACK_STR == PACK_BIGINT + (1 << 48));
-    const _: () = assert!(PACK_SYM == PACK_STR + (1 << 48));
-    const _: () = assert!(PACK_SYM < PACK_OBJ);
-    a.movz(count, (PACK_SYM >> 48) as u32, 0);
-    a.cmp_reg_x(ptr, count);
-    a.b_cond(C_LS, heap);
-    a.b(scalar);
-}
-
-/// Acquire one owner of raw. Guards precede all changes; slow must clone via the checked
-/// operation. Preserve raw, clobber exactly ptr/count/NZCV. The word itself is not stored.
-pub(super) fn emit_exec_clone(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    raw: u32,
-    ptr: u32,
-    count: u32,
-    slow: usize,
-) {
-    let heap = a.new_label();
-    let done = a.new_label();
-    classify_owner(a, raw, ptr, count, heap, done, slow);
-    a.bind(heap);
-    emit_exec_payload(a, raw, ptr);
-    a.ldur(count, ptr, layout.rc_strong_off as i32);
-    a.add_imm(count, count, 1);
-    a.stur(count, ptr, layout.rc_strong_off as i32);
-    a.bind(done);
-}
-
-/// Release one non-final owner. BigInt and last references branch before any decrement;
-/// the checked path must run the real destructor. Raw and its physical word are unchanged
-/// so the caller can retire/replace the slot only after success. ptr/count/NZCV clobbered.
-pub(super) fn emit_exec_drop_shared(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    raw: u32,
-    ptr: u32,
-    count: u32,
-    slow: usize,
-) {
-    let heap = a.new_label();
-    let done = a.new_label();
-    classify_owner(a, raw, ptr, count, heap, done, slow);
-    a.bind(heap);
-    emit_exec_payload(a, raw, ptr);
-    a.ldur(count, ptr, layout.rc_strong_off as i32);
-    a.cmp_imm_x(count, 1);
-    a.b_cond(C_LS, slow);
-    a.sub_imm(count, count, 1);
-    a.stur(count, ptr, layout.rc_strong_off as i32);
-    a.bind(done);
-}
-
-/// Release the packed owner stored at `[base + off]` (a local slot or an operand-stack word).
-/// Shared owners are decremented inline; a last owner, a BigInt or any other word whose release
-/// needs its destructor goes to `H_DROP_PACKED_AT`, which runs only Rust destruction (no author
-/// code, allocation of JS values, or unwinding). The word is left moved-from: the caller must
-/// overwrite or pop it. Scratch x9..x11; the helper path clobbers x0..x17 (the frame registers
-/// x19..x22 are preserved).
-pub(super) fn emit_exec_release_word(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    base: u32,
-    off: i32,
-) {
-    let release = a.new_label();
-    let done = a.new_label();
-    emit_exec_word_load(a, 9, base, off);
-    emit_exec_drop_shared(a, layout, 9, 10, 11, release);
-    a.b(done);
-    a.bind(release);
-    a.mov(0, 19);
-    a.movz(1, 0, 0);
-    if off >= 0 {
-        a.add_imm(2, base, off as u32);
-    } else {
-        a.sub_imm(2, base, off.unsigned_abs());
-    }
-    a.ldr_imm(16, 21, (super::H_DROP_PACKED_AT * 8) as u32);
-    a.blr(16);
-    a.bind(done);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,7 +436,7 @@ mod tests {
         let scalar = a.new_label();
         let heap = a.new_label();
         let slow = a.new_label();
-        classify_owner(&mut a, 0, 3, 4, heap, scalar, slow);
+        exec_owner_guard(&mut a, 0, 3, 4, heap, scalar, slow);
         assert_eq!(a.buf.len(), 13, "classifier code-size regression");
         let mut destinations = [(0, 0); 3];
         for (kind, label) in [scalar, heap, slow].into_iter().enumerate() {
@@ -672,9 +562,9 @@ mod tests {
         let mut a = asm::Asm::new();
         let slow = a.new_label();
         if clone {
-            emit_exec_clone(&mut a, layout, 0, 2, 3, slow);
+            exec_clone(&mut a, layout.ownership(), 0, 2, 3, slow);
         } else {
-            emit_exec_drop_shared(&mut a, layout, 0, 2, 3, slow);
+            exec_drop_shared(&mut a, layout.ownership(), 0, 2, 3, slow);
         }
         a.str_imm(0, 1, 0);
         a.movz(0, 1, 0);
