@@ -1338,3 +1338,56 @@ Step 3 part 2, one binding in the cell (gc-heap):
   react -9.4%, vue -1.4%. Part 1's RSS rises are gone. sa gives back
   some of part 1's RSS gain: its 400k empty function environments
   each grow by 32 B.
+
+Step 3 recorded comparison (fat LTO; base 230d0005, step 3 bb394ad0;
+perf stat cycles:u/instructions:u, CPU 5, 7 interleaved rounds,
+medians; outputs identical everywhere):
+- gc-heap cycles at interp: pa +0.0%, sa -3.2%, ms -1.4%, djot -0.8%,
+  react -4.9%, vue -3.4%. At bytecode: pa -1.5%, sa -1.3%, ms -3.0%,
+  djot +0.4%, react +0.6%, vue +0.3% (the rises sit inside the
+  run-to-run ranges). Instructions fall everywhere (-0.1..-4.4%).
+- gc-heap peak RSS at interp: pa -16.2%, sa -7.8%, ms -5.2%, djot
+  -10.3%, react -35.8%, vue -15.7%. At bytecode: pa -26.2%, sa -6.1%,
+  ms -3.4%, djot -14.6%, react -9.9%, vue -1.1%.
+- Default build: cycles -1.4..+0.2%, instructions within 0.2%. RSS is
+  within its run-to-run spread, which is bimodal on the small fixtures
+  (pa bytecode 12.0-14.1 MiB in both). Its code changed only in the
+  shared scope constructor and how fixed bindings are collected.
+
+Step 4 plan, function payloads (recorded before the work; gc-heap):
+- 4a: a deferred `prototype` (LazyFunctionPrototype) names its function
+  through a weak handle, used only to set `constructor` when the
+  prototype materializes. Each constructor's creation then allocates a
+  weak cell and registers it, and a dead constructor's cell stays
+  reserved (a zombie) until the collection after its death. A lazy word
+  lives only in its function's properties (cloning one materializes it),
+  so under gc-heap the function is named by an untraced handle instead.
+  The default build keeps the weak handle: a strong one would be a
+  reference cycle there.
+- 4b: each closure's Callable::User holds an Rc<UserCallable>: a malloc
+  of 64 B at creation, and a reference-count round trip on every call
+  (the call path clones its Callable). Under gc-heap the UserCallable
+  becomes a payload cell (32 B class) that traces its environment, the
+  function object traces the cell, and handles are Copy. The JIT's
+  UserCallable probe reports no layout under gc-heap (refused until
+  S5).
+- Each part measured like step 3 (no-LTO gc-heap iteration builds; a
+  fat-LTO recorded comparison at the end of the step).
+
+Step 4 deviation, recorded before the work: a page pool (4c).
+- Measured first (fat LTO, against step 3): 4a's cycles are within
+  +-1.2% everywhere, with fewer instructions at vue/djot interp. 4a+4b
+  cycles: djot bytecode -2.2%, ms interp -1.5%, vue interp -1.4%,
+  react interp -1.0%, pa bytecode +1.3%, sa within 0.3%. (At no-LTO,
+  4b cost sa 1-3%: the cell allocation path does more work than
+  malloc's thread cache for 400k short-lived closures.)
+- But peak RSS rose where pages empty out: vue bytecode +4-5 MiB with
+  4a, djot bytecode +4 MiB with 4a+4b (distributions disjoint). The
+  heap itself shrank: with 4a, vue bytecode keeps 47 pages after a
+  collection instead of 125, because zombie constructor cells no
+  longer pin pages. gc_core frees every empty page to the allocator at
+  once and takes fresh zeroed 64 KiB-aligned blocks for new ones, so
+  the pages 4a empties churn through glibc each cycle and fragment it.
+- 4c: gc_core keeps empty pages in a bounded pool (up to the larger of
+  64 pages and the live page count) and reuses them, re-zeroed, before
+  allocating; teardown frees the pool. Measured with 4a and 4b.

@@ -13,6 +13,15 @@ enum State {
 }
 
 pub(super) struct LazyFunctionPrototype {
+    /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
+    /// A lazy word lives only in that function's properties (cloning one materializes it), so
+    /// the function is alive whenever the prototype materializes. gc-heap names it with an
+    /// untraced handle: a weak one would allocate a weak cell per constructor and keep a dead
+    /// constructor's cell reserved for a collection. The default build holds it weakly, since a
+    /// strong `Rc` would be a cycle.
+    #[cfg(feature = "gc-heap")]
+    owner: Gc,
+    #[cfg(not(feature = "gc-heap"))]
     owner: crate::value::WeakGc,
     state: RefCell<State>,
     // Reuse the creation Agent's exact key layout/shape, not whichever Agent first reads it.
@@ -36,6 +45,9 @@ impl LazyFunctionPrototype {
             "lazy prototype template with a non-writable or accessor field"
         );
         Self {
+            #[cfg(feature = "gc-heap")]
+            owner: *owner,
+            #[cfg(not(feature = "gc-heap"))]
             owner: Gc::downgrade(owner),
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
@@ -56,6 +68,9 @@ impl LazyFunctionPrototype {
         if self.constructor {
             // A descriptor clone materializes before it can outlive the function. All other
             // value reads retain their receiver, including reads while its RefCell is borrowed.
+            #[cfg(feature = "gc-heap")]
+            let owner = self.owner;
+            #[cfg(not(feature = "gc-heap"))]
             let owner = self
                 .owner
                 .upgrade()
@@ -245,6 +260,28 @@ mod tests {
              Object.hasOwn(()=>0,'prototype'),Object.hasOwn(async()=>0,'prototype')].join('|');
         "#,
             "true|true|true|true|false|false|true|true|false|false",
+        );
+    }
+
+    /// P1 S4 (gc-heap): a dead constructor's cell is freed by the collection that finds it
+    /// dead. Its deferred prototype holds no weak handle that would keep the cell reserved (a
+    /// zombie) until the next collection.
+    #[cfg(feature = "gc-heap")]
+    #[test]
+    fn dead_constructors_leave_no_reserved_cells() {
+        let mut engine = Engine::new();
+        engine.interp.gc_collect();
+        let cells = |engine: &Engine| engine.interp.gc_heap.core.borrow().stats().live_cells;
+        let before = cells(&engine);
+        eval(
+            &mut engine,
+            "(() => { for (let i = 0; i < 1000; i++) (function () {}); })(); 0",
+        );
+        engine.interp.gc_collect();
+        let after = cells(&engine);
+        assert!(
+            after < before + 100,
+            "dead constructors' cells stay reserved: {before} -> {after}"
         );
     }
 
