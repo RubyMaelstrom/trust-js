@@ -1873,3 +1873,59 @@ helper between stack scrubs (`scrubbed`, the embedder-entry
 wrapper), so no handle outlives its tier. Full gc-heap runs after the
 fix: 4 of 4 pass (1851/0/114), 3 of them --nocapture, which failed 3
 of 3 before; the default build passes it.
+
+Step 4, JitLayout v2 (6c665386):
+- jit_layout() no longer panics under gc-heap; each probe measures the
+  build's own representation on live values. Facts of the build's types
+  live in a JitRepr, probed once per process, which JitLayout reaches
+  through the word rc_strong_off occupied. Deviation from the plan's
+  "fields on JitLayout": every Interp caches a JitLayout inline and
+  generated code reads Interp fields at probed offsets, so 120 bytes of
+  new fields moved all of them and changed every default-build dump.
+- Ownership: Refcount { strong_off } in the default build (found in a
+  live object's RcBox header as an extra owner comes and goes, checked
+  against the count), Traced under gc-heap (no count probe). The
+  rc_strong_off gates are ownership predicates (fits_unscaled,
+  count_first, x64 fits_disp32): unchanged in the default build, true
+  for Traced. Every ownership emitter's Traced arm is unreachable until
+  step 6.
+- PropertyLayout's count probed on a live Rc in both builds. Handle
+  offsets measured from the stored word (under gc-heap the cell
+  address; gc_data_off 0). Named fields: Vec { ptr, len, cap } by
+  default; under gc-heap an InlineVec (u32 length and capacity, the 4
+  elements in place exactly while the capacity word is 0, else a heap
+  pointer), probed in place and spilled. SlotMemo width and "no slot"
+  (4 / u32::MAX; 2 / 0xFFFF). The call probe verified on a live closure
+  of a parsed function in both builds (valid under gc-heap now). The
+  Collection tag (directly after None's, so one range test can admit
+  both). Binding storage per build (gc-heap: the first binding in the
+  environment cell); the parent field checked on a live child scope.
+- No path compiles JIT code under gc-heap: Interp::tier is clamped
+  where it is initialized and in Engine::set_tier, every compile entry
+  requires Tier::Jit, and tests that compile directly are compiled out
+  or ignored there.
+- value::jit_layout_tests (7, both builds) read every exported offset
+  through raw memory on live structures and compare with the safe
+  accessors.
+
+Step 5, storage emitters (88f3914b):
+- jit_storage.rs: named-field length, capacity, data and length store;
+  binding-map entries; slot memo load and "no slot" branch. About 40
+  ARM64 sites use them, gated by matching *_fits predicates. Default
+  layouts get exactly the old instructions; gc-heap's get u32 length
+  and capacity words, in-place elements while the capacity word is 0
+  (the inline capacity while in place), and LDRH memos compared with
+  0xFFFF through a scratch register. x64 keeps its Vec reads inline and
+  declines the InlineVec layouts (checked helpers until S6's x64 pass;
+  a deviation).
+- jit::storage::tests (4, both builds) assemble sequences from the
+  emitters and run them against synthetic sequences and live objects
+  (1-9 fields, in place and spilled), memos and scopes: the first
+  generated code run under gc-heap. Inverting the in-place rule or
+  widening a gc-heap load makes them fail.
+- Gates (steps 4 and 5, rechecked at 88f3914b): code dumps identical
+  to the step-1 baselines with each MOVZ/MOVK run compared as one
+  masked address (vue 55, react 9, djot 160; word by word one djot
+  chunk differs by the heap-address lane of step 3); outputs identical;
+  lib embed 2165/0/3, embed,gc-heap 1863/0/113; clippy clean in both
+  builds.
