@@ -159,10 +159,10 @@ mod cell {
     pub struct Env(NonNull<RefCell<Scope>>);
 
     impl Env {
-        /// Allocate `scope` in its agent heap (`scope.gc_heap`).
+        /// Allocate `scope` in the active Agent's heap.
         #[inline]
         pub(crate) fn new(scope: Scope) -> Env {
-            let cell = crate::value::alloc_scope_cell(&scope.gc_heap);
+            let cell = crate::value::alloc_scope_cell();
             // SAFETY: a fresh cell sized and aligned for `RefCell<Scope>`. Allocation never
             // collects, so the cell is initialized before any collection can trace it.
             unsafe {

@@ -2327,6 +2327,7 @@ impl<T> SlotRegistry<T> {
         self.free.push(slot);
     }
 
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))] // the scope registry's
     fn live_len(&self) -> usize {
         self.entries.len() - self.free.len()
     }
@@ -2403,6 +2404,8 @@ pub(crate) struct GcState {
     registry: RefCell<SlotRegistry<Object>>,
     weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
     /// Environment records, registered like objects and removed synchronously by `Scope::drop`.
+    /// gc-heap environments are cells, which the heap enumerates itself.
+    #[cfg(not(feature = "gc-heap"))]
     scopes: RefCell<SlotRegistry<crate::interpreter::Scope>>,
     minor_collections: Cell<u8>,
     major_live: Cell<i64>,
@@ -2547,23 +2550,25 @@ fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     scope.trace_gc(&mut crate::gc_trace::VisitSink(visit));
 }
 
-/// Run `Scope::drop` and release the record's Rust-heap payload when its cell dies.
+/// Release the record's Rust-heap payload when its cell dies.
 #[cfg(feature = "gc-heap")]
 fn finalize_scope_cell(cell: *mut u8) {
     // SAFETY: environment cells are initialized by `Env::new` before any collection.
     unsafe { std::ptr::drop_in_place(cell as *mut RefCell<crate::interpreter::Scope>) };
 }
 
-/// A fresh cell for one environment record in `heap` (see `Env::new`).
+/// A fresh cell for one environment record in the active heap (see `Env::new`).
 #[cfg(feature = "gc-heap")]
-pub(crate) fn alloc_scope_cell(heap: &GcHeap) -> *mut RefCell<crate::interpreter::Scope> {
-    heap.core
-        .borrow_mut()
-        .alloc(
-            heap.scope_desc,
-            std::mem::size_of::<RefCell<crate::interpreter::Scope>>(),
-        )
-        .cast()
+pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
+    with_active_gc_heap(|heap| {
+        heap.core
+            .borrow_mut()
+            .alloc(
+                heap.scope_desc,
+                std::mem::size_of::<RefCell<crate::interpreter::Scope>>(),
+            )
+            .cast()
+    })
 }
 
 #[cfg(feature = "gc-heap")]
@@ -2962,9 +2967,12 @@ pub(crate) fn scan_gc_heap_retained_memory(
     heap: &GcHeap,
     visitor: &mut crate::memory::Visitor,
 ) -> (usize, bool) {
-    let mut bytes = std::mem::size_of::<GcState>()
-        .saturating_add(heap.registry.borrow().requested_bytes())
-        .saturating_add(heap.scopes.borrow().requested_bytes());
+    let mut bytes =
+        std::mem::size_of::<GcState>().saturating_add(heap.registry.borrow().requested_bytes());
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        bytes = bytes.saturating_add(heap.scopes.borrow().requested_bytes());
+    }
     {
         let observed = heap.weak_observers.borrow();
         bytes = bytes.saturating_add(
@@ -3195,6 +3203,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
         registry: RefCell::new(SlotRegistry::new()),
         weak_observers: RefCell::new(Default::default()),
+        #[cfg(not(feature = "gc-heap"))]
         scopes: RefCell::new(SlotRegistry::new()),
         minor_collections: Cell::new(0),
         major_live: Cell::new(0),
@@ -3505,14 +3514,10 @@ pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
         .into_iter()
         .map(Env::from_rc)
         .collect();
-    // SAFETY: registry entries are live environment cells (removed by `Scope::drop`).
+    // gc-heap keeps no nursery list of environments; the refcount nursery collector this
+    // serves never runs there.
     #[cfg(feature = "gc-heap")]
-    let scopes = heap
-        .scopes
-        .borrow()
-        .young_entry_ptrs()
-        .map(|entry| unsafe { Env::from_raw(entry) })
-        .collect();
+    let scopes = gc_scope_snapshot(heap);
     (objects, scopes)
 }
 
@@ -3526,6 +3531,7 @@ pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
         crate::bytecode::call_cache_diagnostics::report();
     }
     heap.registry.borrow_mut().clear_young();
+    #[cfg(not(feature = "gc-heap"))]
     heap.scopes.borrow_mut().clear_young();
     if major {
         heap.minor_collections.set(0);
@@ -3595,6 +3601,7 @@ pub(crate) fn destroy_gc_heap(heap: &GcHeap) {
 }
 
 /// Register a newly created environment record in its heap's scope registry.
+#[cfg(not(feature = "gc-heap"))]
 pub(crate) fn gc_register_scope(scope: &Env) {
     let record = scope.borrow();
     let slot = record.gc_heap.scopes.borrow_mut().reserve();
@@ -3609,13 +3616,17 @@ pub(crate) fn gc_register_scope(scope: &Env) {
 }
 
 /// Remove a dying environment record from its heap's registry (see `Scope::drop`).
+#[cfg(not(feature = "gc-heap"))]
 pub(crate) fn gc_unregister_scope(heap: &GcHeap, slot: u32) {
     heap.scopes.borrow_mut().remove(slot as usize);
 }
 
-/// The live environment-record count.
+/// The live environment-record count (gc-heap: environment cells not yet swept).
 pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
-    heap.scopes.borrow().live_len()
+    #[cfg(not(feature = "gc-heap"))]
+    return heap.scopes.borrow().live_len();
+    #[cfg(feature = "gc-heap")]
+    heap.core.borrow().live_count(heap.scope_desc)
 }
 
 /// Environment records unregister synchronously on destruction, so there are no dead entries to
@@ -3635,13 +3646,15 @@ pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
         .collect()
 }
 
+/// The environment cells of `heap` not yet swept.
 #[cfg(feature = "gc-heap")]
 pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
-    // SAFETY: registry entries are live environment cells (removed by `Scope::drop`).
-    heap.scopes
-        .borrow()
-        .entry_ptrs()
-        .map(|entry| unsafe { Env::from_raw(entry) })
+    let cells = heap.core.borrow().live_cells(heap.scope_desc);
+    // SAFETY: an allocated cell of the environment descriptor holds an initialized record
+    // (`Env::new` writes it before anything can run).
+    cells
+        .into_iter()
+        .map(|cell| unsafe { Env::from_raw(cell as *const RefCell<crate::interpreter::Scope>) })
         .collect()
 }
 

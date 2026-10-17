@@ -1034,6 +1034,27 @@ impl Heap {
     }
 
     /// The allocated, non-zombie cells of `desc`: after a collection, the live ones.
+    /// How many cells [`Heap::live_cells`] would list.
+    pub(crate) fn live_count(&self, desc: DescId) -> usize {
+        let paged: usize = self
+            .pages
+            .iter()
+            .flatten()
+            .filter(|page| page.desc == desc)
+            .map(|page| {
+                (0..page.cells)
+                    .filter(|&i| bit(&page.allocated, i) && !bit(&page.zombies, i))
+                    .count()
+            })
+            .sum();
+        paged
+            + self
+                .larges
+                .values()
+                .filter(|large| large.desc == desc && !large.zombie)
+                .count()
+    }
+
     pub(crate) fn live_cells(&self, desc: DescId) -> Vec<usize> {
         let mut live = Vec::new();
         for page in self.pages.iter().flatten().filter(|page| page.desc == desc) {

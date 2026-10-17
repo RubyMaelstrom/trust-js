@@ -173,8 +173,6 @@ impl GcSink for VisitSink<'_> {
 impl GcTrace for crate::interpreter::Scope {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
         let crate::interpreter::Scope {
-            gc_slot: _,
-            gc_heap: _,
             vars,
             parent,
             with_obj,

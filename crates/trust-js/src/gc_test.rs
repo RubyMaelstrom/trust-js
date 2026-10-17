@@ -39,8 +39,9 @@ impl WeakCell for crate::interpreter::WeakEnv {
             .map(|env| crate::interpreter::Env::as_ptr(&env) as usize)
     }
 
+    /// The active heap: an environment cell records no heap of its own.
     fn heap(&self) -> Option<crate::value::GcHeap> {
-        self.upgrade().map(|env| env.borrow().gc_heap.clone())
+        self.upgrade().map(|_| crate::value::active_gc_heap())
     }
 }
 

@@ -1256,3 +1256,40 @@ Step 2b/2c, ShadowRealm (both builds unless noted):
   (no-LTO release runners): 64/64 executed at interp and bytecode in
   both builds, and under gc-heap at stress 1. Under gc-heap, host
   36/0/0 and runtime lib 110/0/1.
+
+Step 3 plan, environment cells (recorded before the work; gc-heap,
+since the default build's cycle collector needs the scope registry):
+- Part 1: Scope loses its registry slot and heap handle. The cell
+  shrinks from 104 B to 96 B (size class 128 -> 96), and creating a
+  scope skips the heap-handle clone and the registry's two borrows.
+  Environments allocate in the active heap; the scope snapshot and
+  counts walk the heap's live environment cells.
+- Part 2: a census of bindings per environment (live and dead) on the
+  fixtures at interp and bytecode, then an inline binding capacity
+  chosen from it against the classes (96/128/192), measured.
+- Each part is measured as S3's steps were: perf stat cycles:u and
+  instructions:u on CPU 5, peak RSS and collections, on
+  property-access, sustained-allocation, maps-sets and
+  benchmarks/fixtures/{djot,react,vue}.js at interp and bytecode.
+  Iteration builds are no-LTO; the recorded comparison is fat LTO.
+
+Step 3 part 1, the scope registry (gc-heap):
+- A Scope has no registry slot or heap handle under gc-heap, so its
+  cell is 96 B (asserted): size class 96 instead of 128. Environments
+  allocate in the active heap; gc_scope_snapshot and the scope counts
+  walk the heap's environment cells (Heap::live_count added). gc_check's
+  scope-churn trigger is default-build only.
+- Lib suites unchanged: default 2071/0/3, gc-heap 1769/0/109.
+- Measured on no-LTO iteration builds: gc-heap, base 230d0005, perf
+  stat on CPU 5, 7 interleaved rounds, medians; outputs identical.
+  Cycles at interp: pa +1.4%, sa -4.0%, ms -1.6%, djot -2.0%, react
+  -3.0%, vue -1.5%. At bytecode: pa -2.8%, sa -3.7%, ms -3.1%, djot
+  -0.1%, react +0.5%, vue +0.3%. Peak RSS: sa -10.4% (interp) and
+  -18.5% (bytecode), react interp -12.0%, but pa interp +12.5%, djot
+  bytecode +6.9% and vue interp +3.6%.
+- The RSS rises: the byte budget counts cells, not the binding vectors
+  beside them. property-access at interp allocates almost nothing but
+  environments. With 96-byte cells it collects 18 times instead of 24,
+  so about a third more dead environments are alive at the peak, each
+  with a 192-byte binding vector (Vec capacity 4 on first push). Part 2
+  moves the common binding into the cell.

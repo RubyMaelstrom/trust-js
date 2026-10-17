@@ -2289,8 +2289,11 @@ mod binding_layout_tests {
 
 pub struct Scope {
     /// Slot in [`Scope::gc_heap`]'s environment registry (`u32::MAX` while unregistered).
+    /// gc-heap environments are cells, which their heap enumerates: no registry.
+    #[cfg(not(feature = "gc-heap"))]
     pub(crate) gc_slot: std::cell::Cell<u32>,
     /// The heap whose registry lists this record; `Scope::drop` unregisters it there.
+    #[cfg(not(feature = "gc-heap"))]
     pub(crate) gc_heap: crate::value::GcHeap,
     pub vars: VarMap,
     pub parent: Option<Env>,
@@ -2317,6 +2320,12 @@ pub struct Scope {
     pub lexical_names: ScopeNames,
 }
 
+/// P1 S4: an environment cell fits the heap's 96-byte size class (without the default build's
+/// registry fields).
+#[cfg(feature = "gc-heap")]
+const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 96);
+
+#[cfg(not(feature = "gc-heap"))]
 impl Drop for Scope {
     fn drop(&mut self) {
         let slot = self.gc_slot.get();
@@ -2439,25 +2448,37 @@ impl Binding {
     }
 }
 
-fn register_scope(e: &Env) {
-    crate::value::gc_register_scope(e);
+/// A new environment record (registered with its heap in the default build).
+#[inline]
+fn new_env(
+    vars: VarMap,
+    parent: Option<Env>,
+    with_obj: Option<Value>,
+    under_with: bool,
+    var_boundary: bool,
+    catch_param: bool,
+) -> Env {
+    let e = Env::new(Scope {
+        #[cfg(not(feature = "gc-heap"))]
+        gc_slot: std::cell::Cell::new(u32::MAX),
+        #[cfg(not(feature = "gc-heap"))]
+        gc_heap: crate::value::active_gc_heap(),
+        vars,
+        parent,
+        with_obj,
+        under_with,
+        var_boundary,
+        catch_param,
+        lexical_names: ScopeNames::default(),
+    });
+    #[cfg(not(feature = "gc-heap"))]
+    crate::value::gc_register_scope(&e);
+    e
 }
 
 pub fn new_scope(parent: Option<Env>) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Env::new(Scope {
-        gc_slot: std::cell::Cell::new(u32::MAX),
-        gc_heap: crate::value::active_gc_heap(),
-        vars: Default::default(),
-        parent,
-        with_obj: None,
-        under_with,
-        var_boundary: false,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-    });
-    register_scope(&e);
-    e
+    new_env(Default::default(), parent, None, under_with, false, false)
 }
 
 /// A *variable* environment: the hoisting target for `var`/function declarations (function body,
@@ -2472,55 +2493,33 @@ pub(crate) fn new_var_scope_with_capacity(parent: Option<Env>, capacity: usize) 
 
 pub(crate) fn new_var_scope_with_bindings(parent: Option<Env>, vars: VarMap) -> Env {
     let under_with = parent.as_ref().is_some_and(|p| p.borrow().under_with);
-    let e = Env::new(Scope {
-        gc_slot: std::cell::Cell::new(u32::MAX),
-        gc_heap: crate::value::active_gc_heap(),
-        vars,
-        parent,
-        with_obj: None,
-        under_with,
-        var_boundary: true,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-    });
-    register_scope(&e);
-    e
+    new_env(vars, parent, None, under_with, true, false)
 }
 
 /// A `catch (e)` parameter environment: like a block scope, but flagged so a sloppy direct `eval`'s
 /// var-hoisting walk skips it (see [`Scope::catch_param`]).
 pub fn new_catch_scope(parent: Env) -> Env {
     let under_with = parent.borrow().under_with;
-    let e = Env::new(Scope {
-        gc_slot: std::cell::Cell::new(u32::MAX),
-        gc_heap: crate::value::active_gc_heap(),
-        vars: Default::default(),
-        parent: Some(parent),
-        with_obj: None,
+    new_env(
+        Default::default(),
+        Some(parent),
+        None,
         under_with,
-        var_boundary: false,
-        catch_param: true,
-        lexical_names: ScopeNames::default(),
-    });
-    register_scope(&e);
-    e
+        false,
+        true,
+    )
 }
 
 /// A `with (obj)` environment: identifier lookups consult `obj` before the enclosing scope.
 pub fn new_with_scope(parent: Env, obj: Value) -> Env {
-    let e = Env::new(Scope {
-        gc_slot: std::cell::Cell::new(u32::MAX),
-        gc_heap: crate::value::active_gc_heap(),
-        vars: Default::default(),
-        parent: Some(parent),
-        with_obj: Some(obj),
-        under_with: true,
-        var_boundary: false,
-        catch_param: false,
-        lexical_names: ScopeNames::default(),
-    });
-    register_scope(&e);
-    e
+    new_env(
+        Default::default(),
+        Some(parent),
+        Some(obj),
+        true,
+        false,
+        false,
+    )
 }
 
 /// Walk up from `env` to the nearest variable environment (function body, global, or `eval` scope) —
@@ -3520,7 +3519,9 @@ pub struct Interp {
     /// The pending task collection must revisit the complete graph: the host released old
     /// objects (a discarded document) that a nursery collection would not reach.
     pub(crate) gc_task_major: bool,
-    /// Prune the scope registry once its entry count passes this floating threshold.
+    /// Prune the scope registry once its entry count passes this floating threshold (default
+    /// build: gc-heap keeps no scope registry).
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
     /// build a wrapper object instead of returning a primitive).
@@ -11145,7 +11146,9 @@ impl Interp {
         }
         self.gc_weak_metadata_safepoint(false);
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
-        // allocating few objects, and each dead weak registry entry pins its allocation.
+        // allocating few objects, and each dead weak registry entry pins its allocation. (gc-heap:
+        // environments are cells, so the heap's byte budget bounds their churn.)
+        #[cfg(not(feature = "gc-heap"))]
         if crate::value::gc_scope_registry_len(&self.gc_heap) > self.scope_gc_next {
             let live = crate::value::gc_scope_registry_prune(&self.gc_heap);
             self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
