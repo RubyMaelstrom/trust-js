@@ -3759,6 +3759,79 @@ fn discarded_function_templates_release_their_name_strings() {
     );
 }
 
+/// P1 S5 (both builds): a property-creation cache (`IC_CREATE`) names its receiver's prototype by
+/// address. Once that prototype dies and its pin is pruned, a new object can take the address,
+/// and the cache must not stand for the new object's chain: here a setter of the created name.
+#[test]
+fn creation_caches_do_not_trust_a_reused_prototype_address() {
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval_to_string(
+            &mut engine,
+            "var C = class { constructor() { this.x = 1; } };
+             function NT() {}
+             var args = [];
+             var hits = 0;
+             var desc = { set(v) { hits++; }, configurable: true };
+             NT.prototype = {};
+             for (var i = 0; i < 20; i++) Reflect.construct(C, args, NT);
+             0",
+        );
+        let cached = crate::gc_test::in_frame(|| {
+            let global = crate::value::Value::Obj(engine.interp.global.clone());
+            let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
+            let proto = engine
+                .interp
+                .member_get(&nt, "prototype")
+                .ok()
+                .expect("NT.prototype");
+            crate::gc_test::HiddenAddress::of(&proto)
+        });
+        eval_to_string(&mut engine, "NT.prototype = null; 0");
+        // The first collection finds the prototype dead and prunes its pin; the second frees
+        // its address (gc-heap keeps a pinned dead cell reserved until then).
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
+            .expect("a new object takes the dead prototype's address");
+        let global = crate::value::Value::Obj(engine.interp.global.clone());
+        assert!(engine
+            .interp
+            .member_set(&global, "P2", crate::value::Value::Obj(reused))
+            .is_ok());
+        assert_eq!(
+            eval_to_string(
+                &mut engine,
+                "Object.defineProperty(P2, 'x', desc);
+                 NT.prototype = P2;
+                 var o = Reflect.construct(C, args, NT);
+                 hits + ':' + Object.hasOwn(o, 'x')",
+            ),
+            "1:false",
+            "{tier:?}: the setter on the new prototype runs"
+        );
+    }
+}
+
+/// A new plain object at `address`, allocating until the allocator hands that address out.
+#[inline(never)]
+fn object_at(
+    engine: &mut Engine,
+    address: crate::gc_test::HiddenAddress,
+) -> Option<crate::value::Gc> {
+    let mut held = Vec::new();
+    for _ in 0..200_000 {
+        let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
+        if crate::value::Gc::as_ptr(&object) as usize == address.get() {
+            return Some(object);
+        }
+        held.push(object);
+    }
+    None
+}
+
 /// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
 /// kept only by its own wrapped function, stored inside it, is collected.
 #[cfg(feature = "gc-heap")]

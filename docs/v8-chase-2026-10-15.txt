@@ -1808,3 +1808,23 @@ Step 1, honest gates and baselines:
   since they carry addresses): vue 55 chunks (202,161 words), react 9
   (28,748), djot 160 (1,331,341), identical run to run. Steps that must
   leave the default build's emitted code alone are compared with them.
+
+Step 2, the creation-pin candidate (both builds; pre-existing, also on
+main):
+- Confirmed. A property-creation cache (IC_CREATE) proves "no setter,
+  read-only or own copy of this name on the chain" for the receiver's
+  prototype, named by address and an epoch. When that prototype died,
+  gc_prune_dead_pins dropped its pin and the address became free, but
+  the cache stayed valid: a new object at the address, given a setter
+  for the name (a new key on an unmarked object does not bump the
+  epoch), was skipped by `this.x = v`, which created an own property
+  instead. Pruning a dead creation pin now bumps the epoch first,
+  fencing every creation cache, as dead global-environment pins fence
+  the call caches. The other pinned caches (construct, overflow,
+  callback, proxy-trap, capacity hints) drop each entry with its pin.
+- Test creation_caches_do_not_trust_a_reused_prototype_address (both
+  builds, bytecode and jit): fill the cache through Reflect.construct,
+  let the prototype die, allocate until an object takes its address,
+  define a setter there, construct again. Without the fence the setter
+  is skipped ("0:true") in the bytecode VM and in the native template.
+- Lib suites: embed 2154/0/3, embed,gc-heap 1851/0/114.

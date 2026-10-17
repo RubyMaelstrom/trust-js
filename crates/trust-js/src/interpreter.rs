@@ -12002,7 +12002,14 @@ impl Interp {
     /// pin itself does not retain allocator headers (gc-heap: reserved dead cells) forever; a
     /// live cache identity remains ABA-safe because its pin still owns that allocation.
     pub(crate) fn gc_prune_dead_pins(&mut self) {
+        let creation_pins = self.creation_pins.len();
         self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
+        if self.creation_pins.len() != creation_pins {
+            // A property-creation cache names its prototype by address and outlives the pin:
+            // once the pin goes, a new object can take that address. Fence every creation
+            // cache before the address can be reused.
+            crate::value::bump_proto_epoch();
+        }
         self.construct_ics
             .retain(|_, entry| entry.pin.strong_count() != 0);
         self.call_overflow.prune_dead();
