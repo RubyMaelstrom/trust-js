@@ -2304,3 +2304,43 @@ Step 8b, JIT-path count tests (e02fa8f0, 4c805bb7):
     nothing in the engine depends on time). Step 8c isolates it.
   - The stress child (27 tests, from 19) alone: 29.4 s.
   - Clippy clean in both builds; rustfmt clean.
+
+Step 8c, per-test GC stress with the JIT on (8db05b95, 9d8c20de):
+- An exploratory run at 08122116 (8a's code, beside 8b's agent, so its
+  timeouts are inflated): each gc-heap lib test in its own process,
+  debug (the heap verifier and freed-cell poisoning at every
+  collection). The JIT is the default tier, so a test runs generated
+  code where its functions tier up (8 calls, a hot loop, a self-hosted
+  built-in's first call) or where it forces compiles. At interval 1:
+  2146 pass, 82 ignored, 1 fails, 6 time out; no crash, no verifier
+  report. The 6 and S4's 19 slow tests pass at interval 100, except
+  jit::int_typed_tests::integer_comparisons_and_branches_match_in_
+  every_tier, which passes at 1000 with S4's 4 (alone, it and tests::
+  long_expression_chains_run took 859 s and 839 s, close to the
+  runner's 900 s limit). No engine bug found.
+- The failure: tests::compiled_allocation_guard_accepts_maximum_signed_
+  threshold asserted at least 1000 interrupt ticks for Tier::Jit.
+  Generated code's interrupt poll counts a tick only on its fast path;
+  under stress every poll after an allocation finds a collection due
+  and takes the slow path (jit_interrupt), which checks the host
+  interrupt on every call and counts nothing. Interrupt latency is not
+  at stake. The tick check now holds for the VM tier, which counts
+  first, and for the JIT without stress, where it shows that the guard
+  treats gc_next = i64::MAX as never due (8db05b95).
+- Step 8b's default-suite failure: tests::creation_caches_do_not_trust_
+  a_reused_prototype_address (step 2) now reruns itself alone in a
+  child process (--exact, --test-threads=1) and requires the child's
+  pass, so no other test thread shares its allocator (9d8c20de). With
+  the prototype-epoch bump (step 2's fence) removed, it still fails in
+  both builds ("0:true", through the child).
+- Gates (at 9d8c20de, quiet machine):
+  - Per-test GC stress + verifier + poisoning (debug, embed,gc-heap,
+    each lib test in its own process, 900 s each, 1800 s at 1000): 2194
+    pass, 62 ignored, 0 fail, no crash, no timeout, no verifier report.
+    2165 at interval 1 (2978 s at 12 processes), 24 at 100 (S4's 19 and
+    the exploratory run's other 5 timeouts), 5 at 1000 (S4's 4 and
+    integer_comparisons_and_branches_match_in_every_tier). S4's gate
+    (fd1da511) passed 1848 with 114 ignored (1825, 19, 4); the 346 more
+    are S5's new tests and those 8a and 8b returned.
+  - Lib suites: embed 2165/0/3 twice; embed,gc-heap 2194/0/62 twice.
+  - Clippy clean in both builds; rustfmt clean.
