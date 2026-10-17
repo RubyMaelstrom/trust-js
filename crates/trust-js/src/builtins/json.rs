@@ -57,11 +57,18 @@ pub(super) fn install_json(it: &mut Interp) {
         // that many spaces (clamped 0..10), a String its first 10 code units, else no indentation.
         let mut space = arg(args, 2);
         if let Value::Obj(o) = &space {
-            let exotic = o.borrow().exotic.clone();
-            match exotic {
-                Exotic::NumWrap(_) => space = Value::Num(ab(i.to_number(&space))?),
-                Exotic::StrWrap(_) => space = Value::Str(ab(i.to_string(&space))?),
-                _ => {}
+            // Classify first: the conversions may run JavaScript, which needs `o` unborrowed.
+            let (number, string) = {
+                let exotic = &o.borrow().exotic;
+                (
+                    matches!(exotic, Exotic::NumWrap(_)),
+                    matches!(exotic, Exotic::StrWrap(_)),
+                )
+            };
+            if number {
+                space = Value::Num(ab(i.to_number(&space))?);
+            } else if string {
+                space = Value::Str(ab(i.to_string(&space))?);
             }
         }
         let gap = match space {

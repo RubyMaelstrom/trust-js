@@ -2001,11 +2001,15 @@ pub struct StringIteratorState {
 
 /// Exotic internal data for built-in object kinds: arrays, primitive wrappers (the
 /// [[BooleanData]]/[[NumberData]]/[[StringData]]/[[SymbolData]]/[[BigIntData]] of wrapper
-/// objects), errors, arguments objects, and array/string iterators.
-#[derive(Clone)]
+/// objects), errors, arguments objects, array/string iterators, and (gc-heap) Maps and Sets.
 #[allow(dead_code)]
 pub enum Exotic {
     None,
+    /// P1 S4 (gc-heap): a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
+    /// `Interp::collection`). The default build keeps it in `Interp::map_data`. Declared next to
+    /// `None` so that [`Exotic::is_ordinary`] tests one tag range.
+    #[cfg(feature = "gc-heap")]
+    Collection(Box<crate::ordered_collection::OrderedCollection>),
     Array,
     BoolWrap(bool),
     NumWrap(f64),
@@ -2026,6 +2030,26 @@ pub enum Exotic {
 }
 
 impl Exotic {
+    /// No exotic internal methods: `None`, or (gc-heap) a Map's or Set's [[MapData]]/[[SetData]],
+    /// which an otherwise ordinary object carries in its cell. Property caches and fast paths
+    /// that admit plain objects ask this, so Maps and Sets keep them.
+    #[inline]
+    pub(crate) fn is_ordinary(&self) -> bool {
+        #[cfg(feature = "gc-heap")]
+        return matches!(self, Exotic::None | Exotic::Collection(_));
+        #[cfg(not(feature = "gc-heap"))]
+        matches!(self, Exotic::None)
+    }
+
+    /// A Map's or Set's in-cell data (gc-heap; never in the default build).
+    #[inline]
+    pub(crate) fn is_collection(&self) -> bool {
+        #[cfg(feature = "gc-heap")]
+        return matches!(self, Exotic::Collection(_));
+        #[cfg(not(feature = "gc-heap"))]
+        false
+    }
+
     pub(crate) fn str_wrap(value: crate::lstr::LStr) -> Exotic {
         Exotic::StrWrap(Box::new(value))
     }
@@ -2664,6 +2688,7 @@ impl crate::gc_trace::GcTrace for Object {
             Exotic::StrWrap(string) => sink.word(string.cell_word()),
             Exotic::StringIterator(state) => state.string.trace_gc(sink),
             Exotic::Error(stack) => stack.trace_gc(sink), // frame names
+            Exotic::Collection(data) => data.trace_gc(sink),
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)

@@ -34,40 +34,45 @@ pub(super) fn install_map_methods(it: &mut Interp) {
     let mp = it.extra_protos.get("Map").cloned().unwrap();
     // getOrInsert(key, value): return the existing value, or insert and return `value`.
     it.def_method(&mp, "getOrInsert", 2, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
+        let map = coll_obj_kind(i, &this, Some("Map"))?;
         let key = canonicalize_map_key(arg(a, 0));
-        if let Some(value) = collection_get(i, ptr, &key) {
+        if let Some(value) = collection_get(i, map, &key) {
             return Ok(value);
         }
         let value = arg(a, 1);
-        collection_set(i, ptr, key, value.clone());
+        collection_set(i, map, key, value.clone());
         Ok(value)
     });
     it.def_method(&mp, "getOrInsertComputed", 2, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
+        let map = coll_obj_kind(i, &this, Some("Map"))?;
         // CoerceKey: -0 is canonicalized to +0 (so the callback and stored key see +0).
         let key = canonicalize_map_key(arg(a, 0));
         let cb = arg(a, 1);
         if !cb.is_callable() {
             return Err(i.make_error("TypeError", "callback is not callable"));
         }
-        if let Some(value) = collection_get(i, ptr, &key) {
+        if let Some(value) = collection_get(i, map, &key) {
             return Ok(value);
         }
         let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
         // The callback may have inserted the key; the computed value overwrites that mutation.
-        collection_set(i, ptr, key, value.clone());
+        collection_set(i, map, key, value.clone());
         Ok(value)
     });
 }
 
 /// The receiver Set's values (deduped insertion order). Errors if `this` isn't a Set.
 fn set_values(i: &mut Interp, this: &Value) -> Result<crate::rooting::RootedVec, Value> {
-    // Requires a real Set [[SetData]] slot — a Map (which shares the map_data table) is rejected.
+    // Requires a real Set [[SetData]] slot — a Map (stored the same way) is rejected.
     // Rooted (gc-heap): Set methods run the other set-like's methods between elements.
-    let p = coll_ptr_kind(i, this, Some("Set"))?;
-    let mut values = crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, p)));
-    values.extend(i.map_data[&p].iter().map(|(key, _)| key.clone()));
+    let set = coll_obj_kind(i, this, Some("Set"))?;
+    let mut values = crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, set)));
+    values.extend(
+        i.collection(set)
+            .expect("brand-checked Set")
+            .iter()
+            .map(|(key, _)| key.clone()),
+    );
     Ok(values)
 }
 
@@ -152,15 +157,13 @@ fn new_set(i: &mut Interp, values: Vec<Value>) -> Value {
     // The Set algebra algorithms use OrdinaryObjectCreate(%Set.prototype%), not species or the
     // currently active new.target (which may belong to an unrelated enclosing constructor).
     let obj = Object::new(i.extra_protos.get("Set").cloned());
-    let ptr = Gc::as_ptr(&obj) as usize;
-    i.gc_pin(&obj);
-    i.map_data.insert(
-        ptr,
+    i.set_collection(
+        &obj,
         OrderedCollection::with_capacity(CollectionKind::Set, values.len()),
     );
     for value in values {
         let value = canonicalize_map_key(value);
-        collection_set(i, ptr, value.clone(), value);
+        collection_set(i, &obj, value.clone(), value);
     }
     Value::Obj(obj)
 }
@@ -227,8 +230,8 @@ fn set_like_next(i: &mut Interp, iter: &Value, next: &Value) -> Result<Option<Va
 
 /// SetDataHas against the LIVE backing data (skipping tombstones) — set-like callbacks may have
 /// mutated the receiver since any snapshot was taken.
-fn set_data_has(i: &Interp, ptr: usize, v: &Value) -> bool {
-    collection_has(i, ptr, v)
+fn set_data_has(i: &Interp, set: &Gc, v: &Value) -> bool {
+    collection_has(i, set, v)
 }
 
 pub(super) fn install_set_methods(it: &mut Interp) {
@@ -236,7 +239,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
     it.def_method(&sp, "union", 1, |i, this, a| {
         // GetSetRecord (which may run `has`/`size`/`keys` getters that mutate this Set) happens
         // BEFORE the result is snapshotted from O.[[SetData]], per spec.
-        coll_ptr_kind(i, &this, Some("Set"))?;
+        coll_obj_kind(i, &this, Some("Set"))?;
         let (_has, keys, _size) = set_record(i, &arg(a, 0))?;
         // GetKeysIterator (keys() call + `next` get) precedes the [[SetData]] copy, so mutations
         // those getters make to the receiver are visible in the result.
@@ -256,16 +259,16 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         Ok(new_set(i, vals.into_vec()))
     });
     it.def_method(&sp, "intersection", 1, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+        let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
         // The result is rooted across the other set's `has`/`next` calls (I1).
         let mut out = crate::rooting::RootedVec::new();
         let mut result_index = crate::fasthash::FastMap::default();
-        if (coll_live_len(i, ptr) as f64) <= other_size {
+        if (coll_live_len(i, set) as f64) <= other_size {
             // Walk this Set LIVE, probing the other's `has` — the callback may delete
             // and re-append entries, and the walk observes that (appended entries are visited).
-            let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
-            while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
+            let cursor = collection_cursor(i, set);
+            while let Some((k, _)) = collection_next(i, set, &cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     result_index_insert(&mut out, &mut result_index, k);
                 }
@@ -274,7 +277,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // Iterate the other's keys, probing this Set's LIVE data (no `has` calls on the other).
             let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
             while let Some(k) = set_like_next(i, &iter, &next)? {
-                if set_data_has(i, ptr, &k) {
+                if set_data_has(i, set, &k) {
                     result_index_insert(&mut out, &mut result_index, k);
                 }
             }
@@ -282,7 +285,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         Ok(new_set(i, out.into_vec()))
     });
     it.def_method(&sp, "difference", 1, |i, this, a| {
-        coll_ptr_kind(i, &this, Some("Set"))?;
+        coll_obj_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
         // The snapshot and result are rooted across the other set's calls (I1).
         let vals = set_values(i, &this)?;
@@ -313,7 +316,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         }
     });
     it.def_method(&sp, "symmetricDifference", 1, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+        let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (_has, keys, _size) = set_record(i, &arg(a, 0))?;
         // GetKeysIterator precedes the [[SetData]] copy. For each key of `other`: present in the
         // LIVE receiver → remove it from the result (in both); absent → append if not already in
@@ -336,7 +339,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         }
         while let Some(k) = set_like_next(i, &iter, &next)? {
             let result_offset = option_result_index_find(&result, &result_index, &k);
-            if set_data_has(i, ptr, &k) {
+            if set_data_has(i, set, &k) {
                 if let Some(offset) = result_offset {
                     result[offset] = None;
                     option_result_index_remove(&mut result_index, &k, offset);
@@ -350,15 +353,15 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         Ok(new_set(i, out))
     });
     it.def_method(&sp, "isSubsetOf", 1, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+        let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (has, _keys, other_size) = set_record(i, &arg(a, 0))?;
         // A larger set cannot be a subset; otherwise every element must be in the other. The
         // receiver's data is walked LIVE by index (the `has` callback may delete entries).
-        if (coll_live_len(i, ptr) as f64) > other_size {
+        if (coll_live_len(i, set) as f64) > other_size {
             return Ok(Value::Bool(false));
         }
-        let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
-        while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
+        let cursor = collection_cursor(i, set);
+        while let Some((k, _)) = collection_next(i, set, &cursor) {
             if !set_like_has(i, &has, &arg(a, 0), &k)? {
                 return Ok(Value::Bool(false));
             }
@@ -366,17 +369,17 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         Ok(Value::Bool(true))
     });
     it.def_method(&sp, "isSupersetOf", 1, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+        let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (_has, keys, other_size) = set_record(i, &arg(a, 0))?;
         // A smaller set cannot be a superset; otherwise every other key must be in this. The
         // other's keys are iterated lazily against the LIVE receiver data (the iterator may add
         // entries), closing the iterator if a missing key exits early.
-        if (coll_live_len(i, ptr) as f64) < other_size {
+        if (coll_live_len(i, set) as f64) < other_size {
             return Ok(Value::Bool(false));
         }
         let (iter, next) = set_like_open(i, &keys, &arg(a, 0))?;
         while let Some(k) = set_like_next(i, &iter, &next)? {
-            if !set_data_has(i, ptr, &k) {
+            if !set_data_has(i, set, &k) {
                 ab(i.iterator_close_normal(&iter))?;
                 return Ok(Value::Bool(false));
             }
@@ -384,12 +387,12 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         Ok(Value::Bool(true))
     });
     it.def_method(&sp, "isDisjointFrom", 1, |i, this, a| {
-        let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+        let set = coll_obj_kind(i, &this, Some("Set"))?;
         let (has, keys, other_size) = set_record(i, &arg(a, 0))?;
-        if (coll_live_len(i, ptr) as f64) <= other_size {
+        if (coll_live_len(i, set) as f64) <= other_size {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
-            let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
-            while let Some((k, _)) = i.map_data[&ptr].next(&cursor) {
+            let cursor = collection_cursor(i, set);
+            while let Some((k, _)) = collection_next(i, set, &cursor) {
                 if set_like_has(i, &has, &arg(a, 0), &k)? {
                     return Ok(Value::Bool(false));
                 }
@@ -400,7 +403,7 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             while let Some(k) = set_like_next(i, &iter, &next)? {
                 // SetDataHas is deliberately live: the arbitrary other's iterator can mutate the
                 // receiver between steps (ECMA-262 §24.2.4.10).
-                if set_data_has(i, ptr, &k) {
+                if set_data_has(i, set, &k) {
                     ab(i.iterator_close_normal(&iter))?;
                     return Ok(Value::Bool(false));
                 }
@@ -435,18 +438,18 @@ fn collection_ctor(
     }
     let obj = new_from_ctor(i, name)?;
     let ptr = Gc::as_ptr(&obj) as usize;
-    i.gc_pin(&obj);
     let kind = if is_set {
         CollectionKind::Set
     } else {
         CollectionKind::Map
     };
     if name.starts_with("Weak") {
+        i.gc_pin(&obj);
         i.weak_collection_data.insert(ptr, Vec::new());
         i.weak_collection_index
             .insert(ptr, crate::weak_metadata::WeakCollectionIndex::new(kind));
     } else {
-        i.map_data.insert(ptr, OrderedCollection::new(kind));
+        i.set_collection(&obj, OrderedCollection::new(kind));
     }
     let mv = Value::Obj(obj);
     if let Some(src) = args.first() {
@@ -485,45 +488,68 @@ fn collection_ctor(
 }
 
 /// Count entries, not hash buckets: distinct SameValueZero keys may have the same hash.
-fn coll_live_len(i: &Interp, ptr: usize) -> usize {
-    i.map_data.get(&ptr).map_or(0, OrderedCollection::len)
+fn coll_live_len(i: &Interp, object: &Gc) -> usize {
+    i.collection(object).map_or(0, |data| data.len())
 }
 
-fn collection_get(i: &Interp, ptr: usize, key: &Value) -> Option<Value> {
-    i.map_data.get(&ptr)?.get(key).cloned()
+fn collection_get(i: &Interp, object: &Gc, key: &Value) -> Option<Value> {
+    i.collection(object)?.get(key).cloned()
 }
 
-fn collection_has(i: &Interp, ptr: usize, key: &Value) -> bool {
-    i.map_data.get(&ptr).is_some_and(|data| data.has(key))
+fn collection_has(i: &Interp, object: &Gc, key: &Value) -> bool {
+    i.collection(object).is_some_and(|data| data.has(key))
 }
 
-fn collection_set(i: &mut Interp, ptr: usize, key: Value, value: Value) {
-    i.map_data
-        .get_mut(&ptr)
-        .expect("collection internal slot")
-        .insert(key, value);
+// A `RefMut` (gc-heap) needs a mutable binding to be written through; a `&mut` does not.
+#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
+fn collection_set(i: &mut Interp, object: &Gc, key: Value, value: Value) {
+    let mut data = i.collection_mut(object).expect("collection internal slot");
+    data.insert(key, value);
 }
 
-fn collection_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
-    i.map_data
-        .get_mut(&ptr)
-        .is_some_and(|data| data.delete(key))
+#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
+fn collection_delete(i: &mut Interp, object: &Gc, key: &Value) -> bool {
+    match i.collection_mut(object) {
+        Some(mut data) => data.delete(key),
+        None => false,
+    }
 }
 
-fn collection_clear(i: &mut Interp, ptr: usize) {
-    if let Some(data) = i.map_data.get_mut(&ptr) {
+#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
+fn collection_clear(i: &mut Interp, object: &Gc) {
+    if let Some(mut data) = i.collection_mut(object) {
         data.clear();
     }
 }
 
+/// A live cursor over `object`'s (brand-checked) collection.
+pub(super) fn collection_cursor(
+    i: &mut Interp,
+    object: &Gc,
+) -> crate::ordered_collection::CollectionCursor {
+    i.collection_mut(object)
+        .expect("brand-checked collection")
+        .cursor()
+}
+
+/// The entry at `cursor` in `object`'s collection, which is borrowed for this step only:
+/// callers run JavaScript between steps, and it may mutate the collection.
+pub(super) fn collection_next(
+    i: &Interp,
+    object: &Gc,
+    cursor: &crate::ordered_collection::CollectionCursor,
+) -> Option<(Value, Value)> {
+    i.collection(object)?.next(cursor)
+}
+
 fn map_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-    Ok(Value::Num(coll_live_len(i, ptr) as f64))
+    let map = coll_obj_kind(i, &this, Some("Map"))?;
+    Ok(Value::Num(coll_live_len(i, map) as f64))
 }
 
 fn set_size(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-    Ok(Value::Num(coll_live_len(i, ptr) as f64))
+    let set = coll_obj_kind(i, &this, Some("Set"))?;
+    Ok(Value::Num(coll_live_len(i, set) as f64))
 }
 
 /// CoerceKey for Map/Set: `-0` is canonicalized to `+0` so a stored key (and any key handed to a
@@ -536,14 +562,14 @@ fn canonicalize_map_key(k: Value) -> Value {
 }
 
 pub(crate) fn map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, map, Some("Map"))?;
+    let map = coll_obj_kind(i, map, Some("Map"))?;
     let key = canonicalize_map_key(key.clone());
-    Ok(collection_get(i, ptr, &key).unwrap_or(Value::Undefined))
+    Ok(collection_get(i, map, &key).unwrap_or(Value::Undefined))
 }
 
 pub(crate) fn map_set(i: &mut Interp, map: &Value, key: Value, value: Value) -> Result<(), Value> {
-    let ptr = coll_ptr_kind(i, map, Some("Map"))?;
-    collection_set(i, ptr, canonicalize_map_key(key), value);
+    let map = coll_obj_kind(i, map, Some("Map"))?;
+    collection_set(i, map, canonicalize_map_key(key), value);
     Ok(())
 }
 
@@ -578,14 +604,14 @@ pub(super) fn install_map_like(
     // (Set.prototype.clear rejects a Map and vice-versa), so select a kind-specific fn pointer.
     let clear_fn: NativeFn = if is_set {
         |i, this, _| {
-            let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
-            collection_clear(i, ptr);
+            let set = coll_obj_kind(i, &this, Some("Set"))?;
+            collection_clear(i, set);
             Ok(Value::Undefined)
         }
     } else {
         |i, this, _| {
-            let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
-            collection_clear(i, ptr);
+            let map = coll_obj_kind(i, &this, Some("Map"))?;
+            collection_clear(i, map);
             Ok(Value::Undefined)
         }
     };
@@ -699,13 +725,10 @@ pub(super) fn install_map_like(
             })?;
             drop(group_index);
             let m = Object::new(i.extra_protos.get("Map").cloned());
-            let ptr = Gc::as_ptr(&m) as usize;
-            i.gc_pin(&m);
-            i.map_data
-                .insert(ptr, OrderedCollection::new(CollectionKind::Map));
+            i.set_collection(&m, OrderedCollection::new(CollectionKind::Map));
             for group in groups {
                 let values = i.make_array(group.values);
-                collection_set(i, ptr, group.key, values);
+                collection_set(i, &m, group.key, values);
             }
             Ok(Value::Obj(m))
         });
@@ -890,17 +913,18 @@ fn weak_remove(
 // `is_operand_only_native`). None of them can run author code: keys compare with
 // SameValueZero or by identity, and failures are TypeErrors created natively.
 
-/// One [[MapData]]/[[SetData]] lookup with the exact-kind brand check (`coll_ptr_kind`'s
+/// One [[MapData]]/[[SetData]] lookup with the exact-kind brand check (`coll_obj_kind`'s
 /// semantics and error), for the per-key methods below.
 fn collection_of_kind<'a>(
     i: &'a Interp,
-    this: &Value,
+    this: &'a Value,
     kind: crate::ordered_collection::CollectionKind,
-) -> Result<&'a crate::ordered_collection::OrderedCollection, Value> {
-    this.as_obj()
-        .and_then(|object| i.map_data.get(&(Gc::as_ptr(object) as usize)))
-        .filter(|data| data.kind() == kind)
-        .ok_or_else(|| i.make_error("TypeError", "method called on an incompatible receiver"))
+) -> Result<crate::ordered_collection::CollectionRef<'a>, Value> {
+    let data = this
+        .as_obj()
+        .and_then(|object| i.collection(object))
+        .filter(|data| data.kind() == kind);
+    data.ok_or_else(|| i.make_error("TypeError", "method called on an incompatible receiver"))
 }
 
 /// The key argument after CoerceKey's `-0` → `+0`, borrowed when unchanged.
@@ -922,17 +946,21 @@ pub(crate) fn nf_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
         .unwrap_or(Value::Undefined))
 }
 
+#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
 pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     // `map_set` with one [[MapData]] lookup (`insert` canonicalizes -0).
-    let data = this
-        .as_obj()
-        .and_then(|object| i.map_data.get_mut(&(Gc::as_ptr(object) as usize)))
-        .filter(|data| data.kind() == crate::ordered_collection::CollectionKind::Map);
-    match data {
-        Some(data) => data.insert(arg(a, 0), arg(a, 1)),
-        None => {
-            return Err(i.make_error("TypeError", "method called on an incompatible receiver"));
-        }
+    let inserted = match this.as_obj() {
+        Some(object) => match i.collection_mut(object) {
+            Some(mut data) if data.kind() == crate::ordered_collection::CollectionKind::Map => {
+                data.insert(arg(a, 0), arg(a, 1));
+                true
+            }
+            _ => false,
+        },
+        None => false,
+    };
+    if !inserted {
+        return Err(i.make_error("TypeError", "method called on an incompatible receiver"));
     }
     Ok(this)
 }
@@ -943,15 +971,15 @@ pub(crate) fn nf_map_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
 }
 
 pub(crate) fn nf_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, Some("Map"))?;
+    let map = coll_obj_kind(i, &this, Some("Map"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    Ok(Value::Bool(collection_delete(i, ptr, &key)))
+    Ok(Value::Bool(collection_delete(i, map, &key)))
 }
 
 pub(crate) fn nf_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+    let set = coll_obj_kind(i, &this, Some("Set"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    collection_set(i, ptr, key.clone(), key);
+    collection_set(i, set, key.clone(), key);
     Ok(this)
 }
 
@@ -961,9 +989,9 @@ pub(crate) fn nf_set_has(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
 }
 
 pub(crate) fn nf_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, Some("Set"))?;
+    let set = coll_obj_kind(i, &this, Some("Set"))?;
     let key = canonicalize_map_key(arg(a, 0));
-    Ok(Value::Bool(collection_delete(i, ptr, &key)))
+    Ok(Value::Bool(collection_delete(i, set, &key)))
 }
 
 pub(crate) fn nf_weak_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {

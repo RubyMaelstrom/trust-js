@@ -887,7 +887,9 @@ pub(crate) fn object_get_own_property(
 ) -> Result<Option<Property>, Value> {
     {
         let body = o.borrow();
-        if body.ic_plain.get() && matches!(body.exotic, Exotic::None | Exotic::Array) {
+        if body.ic_plain.get()
+            && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
+        {
             return Ok(body.props.get(key).cloned());
         }
     }
@@ -3343,22 +3345,21 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
 
 /// Brand-check a Map/Set receiver: it must be an object carrying a collection data slot (every
 /// Map/Set/WeakMap/WeakSet gets one at construction), else TypeError.
-fn coll_ptr(i: &Interp, this: &Value) -> Result<usize, Value> {
-    coll_ptr_kind(i, this, None)
+fn coll_obj<'a>(i: &Interp, this: &'a Value) -> Result<&'a Gc, Value> {
+    coll_obj_kind(i, this, None)
 }
 
-/// Resolve a Map/Set backing pointer with a brand check. `want = Some("Map"|"Set")` requires that
-/// exact kind; `None` accepts either strong collection but still rejects WeakMap/WeakSet and plain
-/// objects (which lack a strong `[[MapData]]`/`[[SetData]]` slot).
-fn coll_ptr_kind(i: &Interp, this: &Value, want: Option<&str>) -> Result<usize, Value> {
+/// A Map/Set receiver after a brand check. `want = Some("Map"|"Set")` requires that exact kind;
+/// `None` accepts either strong collection but still rejects WeakMap/WeakSet and plain objects
+/// (which lack a strong `[[MapData]]`/`[[SetData]]` slot).
+fn coll_obj_kind<'a>(i: &Interp, this: &'a Value, want: Option<&str>) -> Result<&'a Gc, Value> {
     let err = || i.make_error("TypeError", "method called on an incompatible receiver");
     let o = this.as_obj().ok_or_else(err)?;
-    let ptr = Gc::as_ptr(o) as usize;
-    let data = i.map_data.get(&ptr).ok_or_else(err)?;
-    if want.is_some_and(|want| data.kind().name() != want) {
+    let kind = i.collection(o).map(|data| data.kind()).ok_or_else(err)?;
+    if want.is_some_and(|want| kind.name() != want) {
         return Err(err());
     }
-    Ok(ptr)
+    Ok(o)
 }
 
 /// Build a live Map/Set iterator. `kind`: 0 = values, 1 = keys, 2 = [key,value].
@@ -3369,7 +3370,7 @@ fn collection_iter_kind(
     kind: u8,
     want: &str,
 ) -> Result<Value, Value> {
-    coll_ptr_kind(i, this, Some(want))?;
+    coll_obj_kind(i, this, Some(want))?;
     collection_iter(i, this, kind)
 }
 
@@ -3380,7 +3381,7 @@ fn collection_for_each(
     a: &[Value],
     want: Option<&str>,
 ) -> Result<Value, Value> {
-    let ptr = coll_ptr_kind(i, &this, want)?;
+    let object = coll_obj_kind(i, &this, want)?;
     let cb = arg(a, 0);
     if !cb.is_callable() {
         return Err(i.make_error("TypeError", "forEach callback is not callable"));
@@ -3389,18 +3390,20 @@ fn collection_for_each(
     let cb_this = arg(a, 1);
     // Cursors survive clear/compaction, including recursively nested forEach calls. Never hold a
     // collection borrow across JavaScript: callbacks may mutate this collection arbitrarily.
-    let cursor = i.map_data.get_mut(&ptr).unwrap().cursor();
-    while let Some((k, v)) = i.map_data[&ptr].next(&cursor) {
+    let cursor = collections::collection_cursor(i, object);
+    while let Some((k, v)) = collections::collection_next(i, object, &cursor) {
         ab(cb.call(i, cb_this.clone(), [v, k, this.clone()]))?;
     }
     Ok(Value::Undefined)
 }
 
 fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Value> {
-    let ptr = coll_ptr(i, this)?;
-    let data = i.map_data.get_mut(&ptr).unwrap();
-    let brand = data.kind();
-    let cursor = data.cursor();
+    let target = coll_obj(i, this)?;
+    let brand = i
+        .collection(target)
+        .expect("brand-checked collection")
+        .kind();
+    let cursor = collections::collection_cursor(i, target);
     let key = if brand == crate::ordered_collection::CollectionKind::Set {
         "%SetIteratorPrototype%"
     } else {
@@ -3416,7 +3419,7 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
     i.collection_iterators.insert(
         Gc::as_ptr(&obj) as usize,
         crate::ordered_collection::CollectionIterator {
-            target: Some(this.as_obj().unwrap().clone()),
+            target: Some(target.clone()),
             cursor: Some(cursor),
             kind,
             brand,
@@ -3439,10 +3442,7 @@ fn map_set_iter_step(
         .ok_or_else(|| i.make_error("TypeError", "incompatible collection iterator"))?;
     let kind = state.kind;
     let entry = match (&state.target, &state.cursor) {
-        (Some(target), Some(cursor)) => i
-            .map_data
-            .get(&(Gc::as_ptr(target) as usize))
-            .and_then(|data| data.next(cursor)),
+        (Some(target), Some(cursor)) => collections::collection_next(i, target, cursor),
         _ => None,
     };
     if let Some((key, value)) = entry {
@@ -6392,7 +6392,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // HasProperty/Get. Only an ordinary result can define properties without
         // invoking author code that changes the source between those reads.
         let unobservable_defines = result.as_obj().is_some_and(|object| {
-            matches!(object.borrow().exotic, Exotic::None | Exotic::Array)
+            (object.borrow().exotic.is_ordinary()
+                || matches!(object.borrow().exotic, Exotic::Array))
                 && i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
         });
         let mut n = 0u64;

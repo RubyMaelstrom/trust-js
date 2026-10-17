@@ -18804,9 +18804,14 @@ fn weakmap_uses_ephemeron_liveness() {
 #[test]
 fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
+    // gc-heap keeps a Map's or Set's data in its cell, not in `map_data`.
+    #[cfg(not(feature = "gc-heap"))]
+    let map_data_len = |engine: &Engine| engine.interp.map_data.len();
+    #[cfg(feature = "gc-heap")]
+    let map_data_len = |_: &Engine| 0;
     let before = [
         engine.interp.gc_pins.len(),
-        engine.interp.map_data.len(),
+        map_data_len(&engine),
         engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
@@ -18839,7 +18844,7 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        engine.interp.map_data.len(),
+        map_data_len(&engine),
         engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),

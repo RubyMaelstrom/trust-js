@@ -423,7 +423,7 @@ impl Interp {
         use crate::interpreter::{
             execution_stack_exhausted, with_execution_stack, GC_CALL_POLL_MASK,
         };
-        use crate::value::{Callable, Exotic};
+        use crate::value::Callable;
         if self.tier != crate::bytecode::Tier::Jit || self.pending_tail.is_some() {
             return None;
         }
@@ -465,7 +465,7 @@ impl Interp {
         }
         let values = {
             let receiver = receiver.borrow();
-            if !receiver.ic_plain.get() || !matches!(receiver.exotic, Exotic::None) {
+            if !receiver.ic_plain.get() || !receiver.exotic.is_ordinary() {
                 return None;
             }
             chunk.record_getter_values(&receiver.props)?

@@ -615,7 +615,6 @@ impl Interp {
             pending_dynamic_imports,
             next_dynamic_import_id: _,
             module_ns: _,            // side slots
-            map_data: _,             // side slots
             collection_iterators: _, // side slots
             weak_collection_data: _, // ephemerons
             weak_collection_index: _,

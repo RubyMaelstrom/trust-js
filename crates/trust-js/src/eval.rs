@@ -2255,7 +2255,7 @@ impl Interp {
             }
             // The receiver transitively owns every prototype. This walk runs no author code.
             let object = unsafe { (*current).borrow() };
-            if !object.ic_plain.get() || !matches!(object.exotic, Exotic::None) {
+            if !object.ic_plain.get() || !object.exotic.is_ordinary() {
                 return None;
             }
             let (layout, prefix, enumerable) = object.props.enumeration_layout()?;
@@ -3090,10 +3090,10 @@ impl Interp {
             let next = {
                 let object = current.borrow();
                 if !object.ic_plain.get()
-                    || !matches!(
+                    || !(matches!(
                         object.exotic,
                         crate::value::Exotic::None | crate::value::Exotic::Array
-                    )
+                    ) || object.exotic.is_collection())
                 {
                     return None;
                 }
@@ -3120,10 +3120,10 @@ impl Interp {
             let next = {
                 let object = current.borrow();
                 if !object.ic_plain.get()
-                    || !matches!(
+                    || !(matches!(
                         object.exotic,
                         crate::value::Exotic::None | crate::value::Exotic::Array
-                    )
+                    ) || object.exotic.is_collection())
                 {
                     return None;
                 }
@@ -3154,10 +3154,10 @@ impl Interp {
         };
         let mut object = object.borrow_mut();
         if !object.ic_plain.get()
-            || !matches!(
+            || !(matches!(
                 object.exotic,
                 crate::value::Exotic::None | crate::value::Exotic::Array
-            )
+            ) || object.exotic.is_collection())
         {
             return Err(value);
         }
@@ -7024,23 +7024,23 @@ impl Interp {
                             db.call = src_call;
                             db.is_constructor = is_ctor;
                         }
+                        // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
+                        // onto `this`, so a subclass instance carries the built-in's state.
+                        let (sp, dp) = (Gc::as_ptr(src) as usize, Gc::as_ptr(dst) as usize);
+                        self.gc_pin(dst);
+                        let mut moved_collection = self.move_collection(src, dst);
                         // A subclass instance inherits the built-in's exotic behavior (e.g. an Array
-                        // subclass is itself an Array exotic).
-                        let src_exotic = src.borrow().exotic.clone();
+                        // subclass is itself an Array exotic). The native object is discarded, so
+                        // its exotic state moves rather than copies.
+                        let src_exotic = std::mem::replace(
+                            &mut src.borrow_mut().exotic,
+                            crate::value::Exotic::None,
+                        );
                         if !matches!(src_exotic, crate::value::Exotic::None) {
                             if matches!(src_exotic, crate::value::Exotic::Array) {
                                 dst.borrow().props.mark_array();
                             }
                             dst.borrow_mut().exotic = src_exotic;
-                        }
-                        // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
-                        // onto `this`, so a subclass instance carries the built-in's state.
-                        let (sp, dp) = (Gc::as_ptr(src) as usize, Gc::as_ptr(dst) as usize);
-                        self.gc_pin(dst);
-                        let mut moved_collection = false;
-                        if let Some(v) = self.map_data.remove(&sp) {
-                            self.map_data.insert(dp, v);
-                            moved_collection = true;
                         }
                         // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
                         // index are one internal slot implementation and must move together to the

@@ -201,7 +201,7 @@ impl Interp {
         {
             let body = object.borrow();
             let shape = body.props.shape();
-            if matches!(body.exotic, Exotic::None) && crate::value::is_cacheable_shape(shape) {
+            if body.exotic.is_ordinary() && crate::value::is_cacheable_shape(shape) {
                 let slot = if shape == reference.shape {
                     Some(reference.slot)
                 } else {

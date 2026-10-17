@@ -1412,3 +1412,64 @@ Step 4 results (gc-heap; parts committed separately):
   -11.9/-13.1%, sa -4.1/-2.3%, vue -2.4/-1.8%, react flat, pa +0.8%
   at interp. Without 4c, 4a and 4b had raised bytecode RSS by 4-6 MiB
   (vue, djot).
+
+Step 5 plan, exotic payloads (recorded before the work; gc-heap):
+- Survey (read-only): Map/Set methods probe map_data by address once
+  or twice per call (two for add/delete/size/clear, three for
+  getOrInsert), and iteration once per step plus the iterator table.
+  Proxies are probed on calls, constructs and [[Get]]/[[Set]] misses
+  once any proxy exists. Map and Set objects are Exotic::None today
+  and take the receiver inline caches.
+- map_data first: under gc-heap a Map/Set's OrderedCollection moves
+  into its cell as Exotic::Collection(Box<_>) (Exotic stays 16 B; the
+  cell stays 184 B). Methods reach it through the object they hold,
+  borrowed for one step and never across JavaScript, instead of by
+  address. The inline-cache checks that admit plain exotics also admit
+  Collection. Collections stop pinning themselves (the pin only kept
+  the table owner's address). Exotic loses its Clone derive (the
+  super() graft moves the payload). The default build keeps map_data.
+- Then proxies, typed-array state and module namespaces as measured
+  results warrant; any not taken is recorded with its measurement.
+
+Step 4 recorded comparison (fat LTO; step 3 bb394ad0, step 4 a73169a0;
+CPU 5, 7 interleaved rounds, medians; outputs identical everywhere):
+- gc-heap cycles at interp: pa -0.3%, sa +0.0%, ms -0.3%, djot -0.4%,
+  react -0.8%, vue -1.0%. At bytecode: pa +0.4%, sa +0.0%, ms +1.2%,
+  djot -0.6%, react -0.6%, vue +1.8% (its ranges overlap). Instructions
+  within +-0.7%.
+- gc-heap peak RSS at interp: pa -1.6%, sa -4.1%, ms -10.7%, djot
+  -17.7%, react +0.9%, vue -4.5%. At bytecode: pa -0.6%, sa -2.2%, ms
+  -16.5%, djot -4.7%, react -4.0%, vue -2.4%.
+- Default build: cycles within +-0.7%, instructions unchanged, RSS
+  within its spread.
+
+Step 5a, a Map's or Set's data in its cell (gc-heap):
+- Exotic::Collection(Box<OrderedCollection>) holds [[MapData]]/[[SetData]].
+  It is declared next to None, and Exotic stays 16 B (the cell stays
+  184 B). Interp::collection/collection_mut borrow the data with its
+  object (map_data in the default build), and set_collection and
+  move_collection install and move it. Map/Set methods brand-check the
+  object they already hold (coll_obj_kind). Iteration and forEach
+  borrow the data for one step, never across JavaScript. Maps and Sets
+  no longer pin themselves; map_data, its sweep and its side-slot entry
+  are default-build only.
+- Inline-cache and fast-path checks that admitted plain objects use
+  Exotic::is_ordinary (None or Collection), so Maps and Sets keep their
+  caches; element-receiver feedback classifies them as ordinary. Exotic
+  lost its Clone derive: the super() graft moves the native object's
+  exotic state, and JSON.stringify classifies its space argument
+  instead of copying it.
+- Lib suites: default 2071/0/3, gc-heap 1772/0/107 (two refcount-
+  collector tests that touch map_data are now compiled out under
+  gc-heap instead of ignored). Test262 (no-LTO runners) built-ins/Map,
+  Set, Map/SetIteratorPrototype, WeakMap, WeakSet, JSON/stringify,
+  Array/prototype/concat and language/statements/class/subclass: 1079/
+  1079 in both builds at interp and bytecode, and under gc-heap at GC
+  stress 1 at bytecode. At interp under stress, two concat typed-array
+  tests time out, as they do with step 2's runner (230d0005).
+- Measured (no-LTO gc-heap against step 4, CPU 5, 7 rounds, outputs
+  identical): ms -6.0% cycles at bytecode and -5.3% at interp
+  (instructions -2.8/-1.9%, peak RSS -6.1/-5.0%). Others within
+  +-1.6%. pa interp is +1.4% instructions, which a symbol profile puts
+  in Props::get and get_member_recv_impl inlining, not in the new
+  checks; it is left to the fat-LTO comparison.

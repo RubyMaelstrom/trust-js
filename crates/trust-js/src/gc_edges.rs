@@ -440,7 +440,29 @@ mod tests {
             },
         );
         engine.interp.module_ns.insert(key(1), Default::default());
-        engine.interp.map_data.insert(key(2), Vec::new().into());
+        // Family 2: [[MapData]]'s table; gc-heap keeps a Map's data in its cell, and its table in
+        // the list is the iterator table.
+        let insert_family_2 = |engine: &mut Engine| {
+            #[cfg(not(feature = "gc-heap"))]
+            engine.interp.map_data.insert(key(2), Vec::new().into());
+            #[cfg(feature = "gc-heap")]
+            engine.interp.collection_iterators.insert(
+                key(2),
+                crate::ordered_collection::CollectionIterator {
+                    target: None,
+                    cursor: None,
+                    kind: 0,
+                    brand: crate::ordered_collection::CollectionKind::Map,
+                },
+            );
+        };
+        let remove_family_2 = |engine: &mut Engine| {
+            #[cfg(not(feature = "gc-heap"))]
+            engine.interp.map_data.remove(&key(2));
+            #[cfg(feature = "gc-heap")]
+            engine.interp.collection_iterators.remove(&key(2));
+        };
+        insert_family_2(&mut engine);
         engine.interp.ta_buffer.insert(key(3), Value::Undefined);
         engine
             .interp
@@ -490,7 +512,7 @@ mod tests {
         }
         // Inventory is rebuilt from actual entries each collection, not inferred
         // from gc_pins and not invalidated by a stale persistent owner flag.
-        engine.interp.map_data.remove(&key(2));
+        remove_family_2(&mut engine);
         assert!(!engine
             .interp
             .gc_slot_owner_mask(&index)
@@ -513,7 +535,7 @@ mod tests {
             engine.interp.gc_pin(&owner);
             assert!(engine.interp.gc_can_skip_unpinned_slots(count));
         }
-        engine.interp.map_data.insert(key(2), Vec::new().into());
+        insert_family_2(&mut engine);
         let owner = engine.interp.gc_pins.remove(&key(2)).unwrap();
         assert!(!engine.interp.gc_can_skip_unpinned_slots(count));
         engine.interp.gc_pin(&owner);
@@ -525,10 +547,9 @@ mod tests {
         assert!(!engine.interp.gc_can_skip_unpinned_slots(count));
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-    )]
+    // The refcount cycle collector's test (disabled under gc-heap, whose Maps keep their data
+    // in their cells, not in `map_data`).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn gc_internal_slot_kinds_share_unpinned_owners_without_deduplicating_handles() {
         for budget in [0, EDGE_CACHE_BYTES] {
@@ -588,10 +609,9 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-    )]
+    // The refcount cycle collector's test (disabled under gc-heap, whose Maps keep their data
+    // in their cells, not in `map_data`).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn gc_internal_slot_owner_outside_snapshot_stays_conservative() {
         for budget in [0, EDGE_CACHE_BYTES] {

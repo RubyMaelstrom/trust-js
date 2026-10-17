@@ -276,6 +276,7 @@ fn ordered_collection_iterator_cycle_is_collectable() {
     engine.eval("collection = iterator = null", false).unwrap();
     engine.interp.gc_collect();
     assert!(!crate::gc_test::alive(&weak));
+    #[cfg(not(feature = "gc-heap"))]
     assert!(engine.interp.map_data.is_empty());
     assert!(engine.interp.collection_iterators.is_empty());
 }

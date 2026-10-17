@@ -1044,6 +1044,15 @@ impl Visitor {
                     self.value(&Value::Str(string.clone()));
                 }
             }
+            #[cfg(feature = "gc-heap")]
+            Exotic::Collection(entries) => {
+                internal_bytes += std::mem::size_of_val(&**entries)
+                    .saturating_add(entries.storage_bytes_lower_bound());
+                for (key, value) in entries.iter() {
+                    self.value(key);
+                    self.value(value);
+                }
+            }
             Exotic::None
             | Exotic::Array
             | Exotic::BoolWrap(_)
@@ -2118,12 +2127,14 @@ fn scan_realm(
         );
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     totals
         .interpreter_side_tables
         .add(interp.map_data.len().saturating_mul(size_of::<(
             usize,
             crate::ordered_collection::OrderedCollection,
         )>()));
+    #[cfg(not(feature = "gc-heap"))]
     for entries in interp.map_data.values() {
         totals
             .interpreter_side_tables
@@ -2176,7 +2187,11 @@ fn scan_realm(
                 .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
         );
     }
-    if !interp.map_data.is_empty()
+    #[cfg(not(feature = "gc-heap"))]
+    let map_data = !interp.map_data.is_empty();
+    #[cfg(feature = "gc-heap")]
+    let map_data = false;
+    if map_data
         || !interp.collection_iterators.is_empty()
         || !interp.weak_collection_data.is_empty()
         || !interp.weak_collection_index.is_empty()
@@ -3202,6 +3217,7 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let after = measure(&engine.interp, &objects, &scopes);
 
+        #[cfg(not(feature = "gc-heap"))]
         assert!(!engine.interp.map_data.is_empty());
         assert!(!engine.interp.collection_iterators.is_empty());
         assert!(!engine.interp.weak_collection_data.is_empty());

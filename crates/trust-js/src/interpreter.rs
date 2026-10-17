@@ -3354,6 +3354,8 @@ pub struct Interp {
         crate::fasthash::FastMap<String, crate::modules::NsBinding>,
     >,
     /// Ordered, indexed [[MapData]] / [[SetData]], including internal kind and live cursor tracking.
+    /// gc-heap keeps each in its Map's or Set's cell (`Exotic::Collection`).
+    #[cfg(not(feature = "gc-heap"))]
     pub(crate) map_data:
         crate::fasthash::FastMap<usize, crate::ordered_collection::OrderedCollection>,
     /// Unforgeable Map/Set iterator slots. Live targets are strong edges from the iterator owner;
@@ -3735,6 +3737,7 @@ interp_memory_inventory! {
     pending_dynamic_imports => "measured",
     next_dynamic_import_id => "non_owning",
     module_ns => "measured",
+    #[cfg(not(feature = "gc-heap"))]
     map_data => "measured",
     collection_iterators => "measured",
     weak_collection_data => "measured",
@@ -3847,8 +3850,8 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    // gc-heap adds `heap_release`.
-    assert_eq!(names.len(), 169 + usize::from(cfg!(feature = "gc-heap")));
+    // gc-heap adds `heap_release` and keeps no `map_data`.
+    assert_eq!(names.len(), 169);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -4062,12 +4065,33 @@ pub struct PromiseState {
 /// object, as walked by `Interp::visit_object_edges`. Expands `$callback!(table, ...)`. Keep
 /// this list and that walker identical; debug builds assert that a collector never skips an
 /// owner of one of these tables.
+#[cfg(not(feature = "gc-heap"))]
 macro_rules! gc_side_slot_tables {
     ($callback:ident) => {
         $callback!(
             class_info,
             module_ns,
             map_data,
+            collection_iterators,
+            ta_buffer,
+            proxies,
+            host_indexed,
+            promises,
+            promise_forward,
+            async_gen_queue,
+            finalization_registries,
+            mapped_arguments,
+        )
+    };
+}
+
+/// gc-heap keeps a Map's or Set's [[MapData]]/[[SetData]] in its cell, not in `map_data`.
+#[cfg(feature = "gc-heap")]
+macro_rules! gc_side_slot_tables {
+    ($callback:ident) => {
+        $callback!(
+            class_info,
+            module_ns,
             collection_iterators,
             ta_buffer,
             proxies,
@@ -5181,7 +5205,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
     while let Some(object) = cur {
         let next = {
             let b = object.borrow();
-            if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+            if !b.ic_plain.get() || !b.exotic.is_ordinary() {
                 return None;
             }
             if let Some(property) = b.props.get(key) {
@@ -5204,7 +5228,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
 fn ta_accessor_holder_is_pristine(holder: &Gc) -> bool {
     let holder = holder.borrow();
     holder.ic_plain.get()
-        && matches!(holder.exotic, Exotic::None)
+        && holder.exotic.is_ordinary()
         && [
             TaAccessor::Length,
             TaAccessor::ByteLength,
@@ -5396,6 +5420,7 @@ impl Interp {
             re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
+            #[cfg(not(feature = "gc-heap"))]
             map_data: Default::default(),
             collection_iterators: Default::default(),
             weak_collection_data: Default::default(),
@@ -6031,6 +6056,8 @@ impl Interp {
                     crate::value::Exotic::Array => ElementReceiverKind::Array,
                     crate::value::Exotic::StrWrap(_) => ElementReceiverKind::String,
                     crate::value::Exotic::None => ElementReceiverKind::Ordinary,
+                    #[cfg(feature = "gc-heap")]
+                    crate::value::Exotic::Collection(_) => ElementReceiverKind::Ordinary,
                     _ => ElementReceiverKind::Exotic,
                 }
             }
@@ -6662,7 +6689,7 @@ impl Interp {
         }
         {
             let borrowed = object.borrow();
-            let ordinary = matches!(borrowed.exotic, Exotic::None)
+            let ordinary = borrowed.exotic.is_ordinary()
                 && matches!(borrowed.call, Callable::None)
                 && borrowed.extensible
                 && self.ordinary_get_ptr(ptr);
@@ -8052,7 +8079,7 @@ impl Interp {
             && self.ordinary_get_ptr(Gc::as_ptr(op) as usize)
             && matches!(ap.borrow().proto.as_ref(), Some(p) if Gc::ptr_eq(p, op))
             && op.borrow().proto.is_none()
-            && matches!(op.borrow().exotic, Exotic::None)
+            && op.borrow().exotic.is_ordinary()
             && no_index_keys(ap)
             && no_index_keys(op)
             && {
@@ -8075,7 +8102,7 @@ impl Interp {
         if !self.non_typed_ordinary_get_ptr(Gc::as_ptr(o) as usize) {
             return false;
         }
-        if !matches!(o.borrow().exotic, Exotic::Array | Exotic::None) {
+        if !(matches!(o.borrow().exotic, Exotic::Array) || o.borrow().exotic.is_ordinary()) {
             return false;
         }
         true
@@ -8091,7 +8118,7 @@ impl Interp {
     pub(crate) fn plain_own_element_present(object: &Gc, index: u32) -> bool {
         let body = object.borrow();
         body.ic_plain.get()
-            && matches!(body.exotic, Exotic::Array | Exotic::None)
+            && (matches!(body.exotic, Exotic::Array) || body.exotic.is_ordinary())
             && body.props.get_index(index).is_some()
     }
 
@@ -8120,7 +8147,7 @@ impl Interp {
                 return None;
             }
             b = o.borrow();
-        } else if !matches!(b.exotic, Exotic::Array | Exotic::None) {
+        } else if !(matches!(b.exotic, Exotic::Array) || b.exotic.is_ordinary()) {
             return None;
         }
         // One-load mirror hit (see `Props::mirror`); a miss only means "answer classically".
@@ -8177,7 +8204,7 @@ impl Interp {
         }
         let n = n as u32;
         let mut b = o.borrow_mut();
-        if !matches!(b.exotic, Exotic::Array | Exotic::None) {
+        if !(matches!(b.exotic, Exotic::Array) || b.exotic.is_ordinary()) {
             return Err(v);
         }
         // Mirror-coherent overwrite (does NOT invalidate the mirror like a raw get_index_mut).
@@ -8436,14 +8463,15 @@ impl Interp {
         // over an ordinary object. NumWrap/BoolWrap (Number/Boolean prototypes and their
         // wrappers) are stricter still: no name is exotic-provided at all, and they are never
         // `elem_mode` either (`mark_array` fires only on becoming `Exotic::Array`).
-        matches!(
+        (matches!(
             b.exotic,
             Exotic::None
                 | Exotic::Array
                 | Exotic::StrWrap(_)
                 | Exotic::NumWrap(_)
                 | Exotic::BoolWrap(_)
-        ) && b.ic_plain.get()
+        ) || b.exotic.is_collection())
+            && b.ic_plain.get()
     }
 
     /// The `GetProp`/`GetMethod` inline-cache fast path; `None` means "take the slow path".
@@ -8556,10 +8584,11 @@ impl Interp {
                 // Absence-of-entry proves OrdinaryGet absence only where no name is
                 // exotic-provided: `None` plus NumWrap/BoolWrap (never StrWrap's
                 // `length`/indices, never Array elements), mirrored in the fill.
-                if !(matches!(
+                if !((matches!(
                     b.exotic,
                     Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
-                ) && b.ic_plain.get()
+                ) || b.exotic.is_collection())
+                    && b.ic_plain.get()
                     && b.props.shape() == shape)
                 {
                     return None;
@@ -8598,7 +8627,7 @@ impl Interp {
             // (element entries occupy slots without transitioning the shape, so two
             // same-shape arrays can hold `length` at different slots).
             let non_digit = !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
-            let recv_shape_ok = matches!(rb.exotic, Exotic::None)
+            let recv_shape_ok = rb.exotic.is_ordinary()
                 || (matches!(rb.exotic, Exotic::Array) && (depth >= 1 || keychk) && non_digit)
                 // Wrapper named entries are shape-pinned (not elem_mode); StrWrap index/length
                 // reads are exotic-provided and never fill states at this site's name, and the
@@ -8641,13 +8670,14 @@ impl Interp {
                         .take(depth.saturating_sub(1) as usize)
                     {
                         let mb = (*hp).borrow();
-                        if !(matches!(
+                        if !((matches!(
                             mb.exotic,
                             Exotic::None
                                 | Exotic::StrWrap(_)
                                 | Exotic::NumWrap(_)
                                 | Exotic::BoolWrap(_)
-                        ) && mb.ic_plain.get()
+                        ) || mb.exotic.is_collection())
+                            && mb.ic_plain.get()
                             && mb.props.shape() == mid_shape)
                         {
                             return None;
@@ -8655,13 +8685,14 @@ impl Interp {
                         hp = Gc::as_ptr(mb.proto.as_ref()?);
                     }
                     let hb = (*hp).borrow();
-                    let holder_exotic_ok = matches!(
+                    let holder_exotic_ok = (matches!(
                         hb.exotic,
                         Exotic::None
                             | Exotic::StrWrap(_)
                             | Exotic::NumWrap(_)
                             | Exotic::BoolWrap(_)
-                    ) || (keychk && matches!(hb.exotic, Exotic::Array));
+                    ) || hb.exotic.is_collection())
+                        || (keychk && matches!(hb.exotic, Exotic::Array));
                     if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
                     {
                         let property = if keychk {
@@ -8726,10 +8757,10 @@ impl Interp {
                 }
                 absent_shapes[depth as usize] = b.props.shape();
                 absent_ok = absent_ok
-                    && matches!(
+                    && (matches!(
                         b.exotic,
                         Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
-                    );
+                    ) || b.exotic.is_collection());
                 if let Some(slot) = b.props.slot_of(name) {
                     let p = b.props.property_at(slot).unwrap();
                     let v = self.snapshot_cached_get(
@@ -8745,13 +8776,13 @@ impl Interp {
                     // (`IC_ARR_KEYCHK`): hits re-verify the entry's key, and the JIT templates
                     // (exact depth compares, no bounds check) route it to the helper. Digit
                     // names stay uncached (element reads have their own paths).
-                    let keychk = !matches!(
+                    let keychk = !(matches!(
                         b.exotic,
                         Exotic::None
                             | Exotic::StrWrap(_)
                             | Exotic::NumWrap(_)
                             | Exotic::BoolWrap(_)
-                    );
+                    ) || b.exotic.is_collection());
                     if keychk && name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
                         return Some(v);
                     }
@@ -8795,13 +8826,13 @@ impl Interp {
                     return Some(v);
                 }
                 if (1..=4).contains(&depth)
-                    && matches!(
+                    && (matches!(
                         b.exotic,
                         Exotic::None
                             | Exotic::StrWrap(_)
                             | Exotic::NumWrap(_)
                             | Exotic::BoolWrap(_)
-                    )
+                    ) || b.exotic.is_collection())
                 {
                     mids[depth as usize - 1] = Some(b.props.shape());
                 }
@@ -8979,7 +9010,7 @@ impl Interp {
             return Err(lval); // the generic path raises the RangeError
         }
         let mut b = o.borrow_mut();
-        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
+        if !b.ic_plain.get() || !b.exotic.is_ordinary() {
             return Err(lval);
         }
         let Some(p) = b.props.get(name) else {
@@ -9013,7 +9044,7 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> bool {
         let mut b = o.borrow_mut();
-        if !matches!(b.exotic, Exotic::None) {
+        if !b.exotic.is_ordinary() {
             return false;
         }
         if !b.ic_plain.get() {
@@ -9154,7 +9185,7 @@ impl Interp {
                     return false;
                 }
                 let hb = h.borrow();
-                if !(matches!(hb.exotic, Exotic::None) && hb.ic_plain.get()) {
+                if !(hb.exotic.is_ordinary() && hb.ic_plain.get()) {
                     return false;
                 }
                 if let Some(slot) = hb.props.slot_of(name) {
@@ -10848,7 +10879,7 @@ impl Interp {
         let concrete = {
             let concrete = proto.borrow();
             concrete.ic_plain.get()
-                && matches!(concrete.exotic, Exotic::None)
+                && concrete.exotic.is_ordinary()
                 && concrete
                     .proto
                     .as_ref()
@@ -11373,20 +11404,7 @@ impl Interp {
                 mask
             }};
         }
-        owners!(
-            class_info,
-            module_ns,
-            map_data,
-            collection_iterators,
-            ta_buffer,
-            proxies,
-            host_indexed,
-            promises,
-            promise_forward,
-            async_gen_queue,
-            finalization_registries,
-            mapped_arguments,
-        )
+        gc_side_slot_tables!(owners)
     }
 
     /// A collection-local proof that an unpinned object cannot own any of the
@@ -11412,20 +11430,7 @@ impl Interp {
         }
         // Keep this complete alongside BOTH edge walkers and the test-only
         // slot inventory above. Any unrecognized owner keeps the full trace.
-        pinned!(
-            class_info,
-            module_ns,
-            map_data,
-            collection_iterators,
-            ta_buffer,
-            proxies,
-            host_indexed,
-            promises,
-            promise_forward,
-            async_gen_queue,
-            finalization_registries,
-            mapped_arguments,
-        )
+        gc_side_slot_tables!(pinned)
     }
 
     /// Report every strong graph edge `o` owns to `sink`: its prototype, property values and
@@ -11458,8 +11463,17 @@ impl Interp {
             }
             // [[IteratedArrayLike]] is a graph edge owned by the iterator, even
             // though it is deliberately absent from the ordinary property map.
-            if let Exotic::ArrayIterator(state) = &b.exotic {
-                sink.value(&state.target);
+            match &b.exotic {
+                Exotic::ArrayIterator(state) => sink.value(&state.target),
+                // gc-heap: a Map's or Set's entries, in its cell.
+                #[cfg(feature = "gc-heap")]
+                Exotic::Collection(entries) => {
+                    for (key, value) in entries.iter() {
+                        sink.value(key);
+                        sink.value(value);
+                    }
+                }
+                _ => {}
             }
             match &b.call {
                 // A user function's closure environment.
@@ -11526,6 +11540,7 @@ impl Interp {
                 }
             }
         }
+        #[cfg(not(feature = "gc-heap"))]
         if let Some(entries) = self.map_data.get(&ptr) {
             for (key, value) in entries.iter() {
                 sink.value(key);
@@ -11731,6 +11746,7 @@ impl Interp {
             eval_realm_fns,
             module_ns,
             realms,
+            #[cfg(not(feature = "gc-heap"))]
             map_data,
             collection_iterators,
             typed_arrays,
@@ -11912,6 +11928,7 @@ impl Interp {
         crate::gc_sweep::set(eval_realm_fns, dead);
         crate::gc_sweep::map(module_ns, dead);
         crate::gc_sweep::map(realms, dead);
+        #[cfg(not(feature = "gc-heap"))]
         crate::gc_sweep::map(map_data, dead);
         crate::gc_sweep::map(collection_iterators, dead);
         crate::gc_sweep::map(typed_arrays, dead);
@@ -13003,7 +13020,7 @@ impl Interp {
         };
         let body = target.borrow();
         body.ic_plain.get()
-            && matches!(body.exotic, Exotic::None | Exotic::Array)
+            && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
             && body.props.get(key).is_none_or(Property::configurable)
     }
 
