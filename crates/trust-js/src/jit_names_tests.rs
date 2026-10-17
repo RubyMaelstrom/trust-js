@@ -214,6 +214,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     for generation in [0, 1, u32::MAX - 1, u32::MAX] {
         holder.borrow_mut().vars.set_generation_for_test(generation);
         let reference = PreparedReference::scope(Rc::from("outer"), holder.clone(), true);
+        #[cfg(not(feature = "gc-heap"))]
         let count = Env::strong_count(&holder);
         assert_eq!(
             unsafe { probe(&reference) },
@@ -223,6 +224,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
                 reference.binding as usize
             }
         );
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Env::strong_count(&holder), count);
         assert_eq!(reference.generation, generation);
     }
@@ -234,12 +236,26 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     let mut reference = PreparedReference::object(Rc::from("outer"), object.clone(), false);
     reference.slot = object.borrow().props.slot_of("outer").unwrap();
     reference.shape = object.borrow().props.shape();
+    #[cfg(not(feature = "gc-heap"))]
     let count = crate::value::Gc::strong_count(&object);
     assert_ne!(unsafe { probe(&reference) }, 0);
     for shape in [0, u32::MAX] {
         reference.shape = shape;
         assert_eq!(unsafe { probe(&reference) }, 0);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), count);
         assert_eq!(reference.shape, shape);
+    }
+    // gc-heap owners carry no count: the probes leave both bases intact, which a collection
+    // (and, in debug builds, its heap verifier) confirms.
+    #[cfg(feature = "gc-heap")]
+    {
+        let mut engine = engine;
+        engine.interp.gc_collect();
+        assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
+        assert!(matches!(
+            object.borrow().props.get("outer").map(|p| p.value()),
+            Some(Value::Num(n)) if n == 13.0
+        ));
     }
 }

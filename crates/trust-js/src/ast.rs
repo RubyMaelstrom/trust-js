@@ -1445,7 +1445,7 @@ impl Function {
     /// ECMA-262 e28783d5, Execution Contexts / PrepareForOrdinaryCall: changing a
     /// later entry must not replace an existing invocation's evaluation state.
     #[inline]
-    #[cfg(all(test, not(feature = "gc-heap")))]
+    #[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
     pub(crate) fn execution_code(&self) -> Option<&Option<Rc<crate::bytecode::Chunk>>> {
         self.code2.get().or_else(|| self.code.get())
     }

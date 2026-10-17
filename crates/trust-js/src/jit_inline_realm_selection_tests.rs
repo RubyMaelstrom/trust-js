@@ -185,6 +185,93 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
     i.gc_collect();
 }
 
+/// gc-heap: the inline metadata names the planning environment only by address and by weak pin.
+/// The environment dies at the first collection after its last strong handle, its address
+/// stays reserved while a compiled guard pins it, and dropping the last such chunk lets the
+/// next collection free it.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots() {
+    use crate::gc_test::HiddenAddress;
+    use crate::interpreter::Env;
+    /// Whether the cell at `address` is still allocated (live, or dead and weakly pinned).
+    #[inline(never)]
+    fn reserved(i: &crate::interpreter::Interp, address: HiddenAddress) -> bool {
+        i.gc_heap
+            .core
+            .borrow()
+            .is_allocated_word(address.get() as u64)
+    }
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let i = &mut *engine.interp;
+    eval_string(
+        i,
+        "function leaf(n){return n+3;}function subject(n){return leaf(n)*2;}",
+    );
+    let user = subject(i);
+    let primary = bytecode::compile(&user.func).unwrap();
+    primary.inline_attempted.set(true);
+    primary.inline_retry_at.set(0);
+    assert!(user.func.code.set(Some(primary.clone())).is_ok());
+    for _ in 0..8 {
+        assert_eq!(eval_string(i, "subject(5)"), "16");
+    }
+    // The planning environment's handle and address stay in this helper frame (gc-heap scans
+    // the stack).
+    let (chunk, weak, address) = crate::gc_test::in_frame(|| {
+        let planning = crate::interpreter::new_scope(None);
+        let address = Env::as_ptr(&planning) as usize;
+        let plan = bytecode::plan_inlines(&primary, &user.func, user.realm, &planning);
+        assert!(!plan.is_empty());
+        let chunk = bytecode::compile_with_inlines(&user.func, &plan, &primary).unwrap();
+        assert!(chunk.inline_realm_compatible(address));
+        let target = chunk
+            .jit_ops()
+            .iter()
+            .find_map(|op| match *op {
+                bytecode::Op::InlineGuard(target, _) => Some(chunk.jit_inline_target(target)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(target.genv_pin.as_ptr() as usize, address);
+        (
+            chunk,
+            Env::downgrade(&planning),
+            HiddenAddress::from_fn(|| address),
+        )
+    });
+    i.gc_collect();
+    assert!(
+        !crate::gc_test::alive(&weak),
+        "metadata must not keep bindings/Realm values alive"
+    );
+    // Only the chunk's pin names the dead environment now.
+    drop(weak);
+    i.gc_collect();
+    assert!(
+        reserved(i, address),
+        "a retained inline pin keeps the dead environment's address reserved"
+    );
+    let reused = crate::gc_test::in_frame(|| {
+        (0..64)
+            .map(|_| crate::interpreter::new_scope(None))
+            .any(|env| Env::as_ptr(&env) as usize == address.get())
+    });
+    assert!(
+        !reused,
+        "a retained inline pin prevents another environment reusing the guard's address"
+    );
+    drop(chunk);
+    i.gc_collect();
+    assert!(
+        !reserved(i, address),
+        "last inline owner releases its allocation lease"
+    );
+}
+
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots() {
     let mut engine = Engine::new();

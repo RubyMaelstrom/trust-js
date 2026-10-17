@@ -57,51 +57,58 @@ mod profiler;
 #[path = "jit_cache.rs"]
 pub(crate) mod cache;
 
+// The JIT's tests need native code, and several compile directly through the backend: a gc-heap
+// build compiles them out on x86-64, whose backend refuses traced ownership until S6 (see
+// `Tier::admitted`).
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
-    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", not(feature = "gc-heap"))
+    ),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "jit_cache_tests.rs"]
 mod cache_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_coverage_tests.rs"]
 mod coverage_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_assignment_tests.rs"]
 mod assignment_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_update_elem_tests.rs"]
 mod update_elem_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_call_reference_tests.rs"]
 mod call_reference_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_call_closure_tests.rs"]
 mod call_closure_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_osr_entry_tests.rs"]
 mod osr_entry_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_continuation_tests.rs"]
 mod continuation_tests;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_inline_context_tests.rs"]
 mod inline_context_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
-    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", not(feature = "gc-heap"))
+    ),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "bytecode_inline_prepared_tests.rs"]
@@ -109,8 +116,10 @@ mod inline_prepared_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
-    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", not(feature = "gc-heap"))
+    ),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "jit_inline_realm_selection_tests.rs"]
@@ -118,8 +127,10 @@ mod inline_realm_selection_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
-    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", not(feature = "gc-heap"))
+    ),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "call_global_env_pin_tests.rs"]
@@ -127,7 +138,6 @@ mod call_global_env_pin_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -136,7 +146,6 @@ mod math_intrinsic_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -145,7 +154,6 @@ mod int_typed_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -154,7 +162,6 @@ mod constant_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -163,7 +170,6 @@ mod name_dispatch_tests;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -204,7 +210,7 @@ mod poll_tests;
 #[path = "jit_regions.rs"]
 mod regions;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -222,7 +228,7 @@ pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     }
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 pub(crate) fn test_tdz_array_pair_hits() -> [u64; 2] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -240,7 +246,7 @@ pub(crate) fn test_tdz_array_pair_hits() -> [u64; 2] {
     }
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -1438,7 +1444,7 @@ impl Drop for ExecutableCodeReservation<'_> {
     }
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 mod executable_code_budget_tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
@@ -2172,7 +2178,6 @@ pub(crate) fn helper_name(index: usize) -> &'static str {
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -2332,7 +2337,7 @@ mod shared_stub_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 mod helper_identity_tests {
     use super::*;
 
@@ -2346,7 +2351,7 @@ mod helper_identity_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 mod native_op_tests {
     use super::*;
 
@@ -3569,7 +3574,7 @@ mod asm {
         None
     }
 
-    #[cfg(all(test, not(feature = "gc-heap")))]
+    #[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
     mod tests {
         #[test]
         fn optional_region_reference_inventory_ignores_unused_bailouts() {
@@ -5072,28 +5077,27 @@ fn emit_residency_mark(a: &mut asm::Asm, residency: u64, enter: bool) {
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod x64;
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_exec_memory_tests.rs"]
 mod exec_memory_tests;
 
-#[cfg(all(test, not(feature = "gc-heap"), target_arch = "aarch64"))]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[path = "jit_call_epoch_tests.rs"]
 mod call_epoch_tests;
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "native_array_local_tests.rs"]
 mod native_array_local_tests;
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_numeric_array_tests.rs"]
 mod numeric_array_tests;
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_property_store_tests.rs"]
 mod property_store_tests;
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
 #[path = "jit_return_tests.rs"]
 mod return_tests;
 
@@ -8151,7 +8155,6 @@ const DIRECT_SAVE_SURPLUS: u32 = 12;
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -8223,6 +8226,7 @@ mod direct_call_tests {
             ));
             for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
                 holder.borrow_mut().props.set_value(&key, value.clone());
+                #[cfg(not(feature = "gc-heap"))]
                 let owners = key.strong_count();
                 let mut operands = [
                     PackedValue::pack(receiver.clone()),
@@ -8241,11 +8245,21 @@ mod direct_call_tests {
                     _ => panic!("wrong computed value"),
                 }
                 drop(operands);
+                #[cfg(not(feature = "gc-heap"))]
                 assert_eq!(
                     key.strong_count(),
                     owners,
                     "key operand leaked or was dropped twice"
                 );
+                // gc-heap owners carry no count: the probe leaves the key's, the holder's and
+                // the receiver's cells intact, which a collection (and, in debug builds, its
+                // heap verifier) confirms.
+                #[cfg(feature = "gc-heap")]
+                {
+                    engine.interp.gc_collect();
+                    assert_eq!(key.as_str(), format!("method{depth}"));
+                    assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
+                }
             }
             holder
                 .borrow_mut()
@@ -13881,7 +13895,6 @@ fn build_chain(
 
 #[cfg(all(
     test,
-    not(feature = "gc-heap"),
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]

@@ -351,7 +351,7 @@ out.join('|');
     );
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "gc-heap")))]
 fn owners(engine: &mut Engine, name: &str) -> usize {
     use crate::value::Value;
     let env = engine.interp.global_env.clone();
@@ -381,18 +381,12 @@ fn settle(engine: &mut Engine, name: &str) {
     chunk.inline_retry_at.set(0);
 }
 
-/// The shared finish stub scans every callee slot: a slot count of any residue, with an owner
-/// at any position (first or second word of a pair, the odd tail, beside negative Numbers
-/// that take the slow pair path), releases that owner exactly once.
+/// Callees with every slot count from 1 to 13 holding the owner `a` at the first, middle and
+/// last slot, each with a driver that calls it `n` times: the program (after `prelude`, which
+/// binds `token` and `text`) and the (callee, driver) names.
 #[cfg(target_arch = "aarch64")]
-#[test]
-fn direct_calls_release_slot_owners_exactly_once() {
-    let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
-    engine.set_tier_threshold(0);
-    let mut source = String::from(
-        "var token={}, text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
-    );
+fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
+    let mut source = String::from(prelude);
     let mut names = Vec::new();
     for n in 1..=13usize {
         for position in [0, n / 2, n - 1] {
@@ -417,6 +411,69 @@ fn direct_calls_release_slot_owners_exactly_once() {
             names.push((name, driver));
         }
     }
+    (source, names)
+}
+
+/// gc-heap: owners carry no count and the finish stub releases nothing. Every slot shape runs
+/// through the direct sequence, also with a collection due at every poll (stress 1), and keeps
+/// its results; once the program drops `token`, no finished callee's record retains it.
+#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
+#[test]
+fn direct_calls_release_slot_owners_exactly_once() {
+    use super::rooting_tests::{assert_tracked_collectable, jit_engine, run};
+    let mut engine = jit_engine(0);
+    let (source, names) = slot_owner_program(
+        "var token=track({}), text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
+    );
+    run(&mut engine, &source);
+    for (_, driver) in &names {
+        run(&mut engine, &format!("{driver}(2);"));
+    }
+    for (name, driver) in &names {
+        settle(&mut engine, name);
+        settle(&mut engine, driver);
+    }
+    let mut direct = false;
+    for _ in 0..200 {
+        super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+        for (_, driver) in &names {
+            assert_eq!(run(&mut engine, &format!("{driver}(40);")), "0");
+        }
+        if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) >= names.len() * 40 {
+            direct = true;
+            break;
+        }
+    }
+    assert!(
+        direct,
+        "the callees must run through the direct-call sequence"
+    );
+    super::take_poll_census();
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(1);
+    for (_, driver) in &names {
+        assert_eq!(run(&mut engine, &format!("{driver}(3);")), "0");
+    }
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+    assert!(
+        super::take_poll_census().collections.iter().sum::<u64>() > 0,
+        "generated code's polls collected"
+    );
+    assert_eq!(run(&mut engine, "token=null;text=null;0"), "0");
+    assert_tracked_collectable(&mut engine);
+}
+
+/// The shared finish stub scans every callee slot: a slot count of any residue, with an owner
+/// at any position (first or second word of a pair, the odd tail, beside negative Numbers
+/// that take the slow pair path), releases that owner exactly once.
+#[cfg(all(target_arch = "aarch64", not(feature = "gc-heap")))]
+#[test]
+fn direct_calls_release_slot_owners_exactly_once() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let (source, names) = slot_owner_program(
+        "var token={}, text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
+    );
     evaluate(&mut engine, &source);
     for (_, driver) in &names {
         evaluate(&mut engine, &format!("{driver}(2);"));

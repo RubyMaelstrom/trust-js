@@ -62,22 +62,35 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     // The program's function AST, unlike its per-Realm callable, survives the settings change.
     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     let program = engine.interp.shared_snapshot_program(bytes).unwrap();
-    assert!(engine.interp.run_classic_program(&program, None).is_ok());
+    // The completion value (the caller function) stays in a helper frame: gc-heap scans the
+    // stack.
+    assert!(crate::gc_test::in_frame(|| engine
+        .interp
+        .run_classic_program(&program, None)
+        .is_ok()));
     for _ in 0..8 {
         assert_eq!(
             eval(&mut engine, "subject(nativeRealmProbe) === globalThis"),
             "true"
         );
     }
-    let subject = engine
-        .interp
-        .member_get(&main, "subject")
-        .ok()
-        .expect("shared caller callable");
-    let function = match &subject.as_obj().unwrap().borrow().call {
-        Callable::User(user) => user.func.clone(),
-        _ => panic!("shared caller function"),
-    };
+    // Handles and addresses of the old settings environment's objects stay in helper frames:
+    // gc-heap scans the stack.
+    let (subject, function) = crate::gc_test::in_frame(|| {
+        let subject = engine
+            .interp
+            .member_get(&main, "subject")
+            .ok()
+            .expect("shared caller callable");
+        let function = match &subject.as_obj().unwrap().borrow().call {
+            Callable::User(user) => user.func.clone(),
+            _ => panic!("shared caller function"),
+        };
+        (
+            crate::value::Gc::downgrade(subject.as_obj().unwrap()),
+            function,
+        )
+    });
     let chunk = function
         .code
         .get()
@@ -100,17 +113,19 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             CALL_IC_WAYS,
         )
     };
-    let original = cells
-        .iter()
-        .map(Cell::get)
-        .find(|entry| entry.callee == native_id)
-        .expect("warmed live native entry");
-    assert_ne!(original.native, 0);
-    assert_eq!(
-        original.global_env,
-        crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
-    );
-    let retired_env = crate::interpreter::Env::downgrade(&engine.interp.global_env);
+    let retired_env = crate::gc_test::in_frame(|| {
+        let original = cells
+            .iter()
+            .map(Cell::get)
+            .find(|entry| entry.callee == native_id)
+            .expect("warmed live native entry");
+        assert_ne!(original.native, 0);
+        assert_eq!(
+            original.global_env,
+            crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize
+        );
+        crate::interpreter::Env::downgrade(&engine.interp.global_env)
+    });
     assert!(engine
         .interp
         .global_env_pins
@@ -122,20 +137,23 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     let unchanged = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
     assert_eq!(CALL_IC_EPOCH.load(Relaxed), unchanged);
-    assert_eq!(
+    let epoch = crate::gc_test::in_frame(|| {
         cells
             .iter()
             .map(Cell::get)
             .find(|entry| entry.callee == native_id)
             .unwrap()
-            .epoch,
-        unchanged
-    );
+            .epoch
+    });
+    assert_eq!(epoch, unchanged);
 
     eval(&mut engine, "delete globalThis.subject;");
     drop(subject);
     assert!(engine.interp.release_host_job_context(41));
     engine.interp.switch_host_job_context(42);
+    // A reference count frees the old settings environment with its last owner; gc-heap
+    // frees it at the collection below.
+    #[cfg(not(feature = "gc-heap"))]
     assert_eq!(
         retired_env.strong_count(),
         0,
@@ -143,6 +161,11 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     );
     let before = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
+    #[cfg(feature = "gc-heap")]
+    assert!(
+        !crate::gc_test::alive(&retired_env),
+        "callee/code do not retain the old settings environment"
+    );
     assert_eq!(
         CALL_IC_EPOCH.load(Relaxed),
         before + 1,

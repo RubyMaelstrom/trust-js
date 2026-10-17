@@ -174,6 +174,14 @@ fn assignment_store_retains_new_host_owners_and_releases_final_old_owners() {
                     crate::value::NativeCaptures::None,
                 )))
             });
+        // A reference count runs the destructor when the store releases its last owner;
+        // gc-heap runs it when the next collection finds the witness dead.
+        let eval = |engine: &mut Engine, source: &str| {
+            eval(engine, source);
+            if cfg!(feature = "gc-heap") {
+                engine.interp.gc_collect();
+            }
+        };
         eval(&mut engine, "function put(o,v){return o.field=v;}var o={field:0};for(var warm=0;warm<160;warm++)put(o,warm);");
         eval(
             &mut engine,

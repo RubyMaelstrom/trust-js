@@ -4,27 +4,35 @@
 //! live ordinary own dense data element; every uncertain case replays the
 //! original LoadLocal/LoadLocal/op sequence.
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+#[cfg(not(feature = "gc-heap"))]
+use std::cell::RefCell;
+use std::{cell::Cell, rc::Rc};
 
-use crate::{bytecode::Tier, value::Value, Completion, Engine};
+#[cfg(not(feature = "gc-heap"))]
+use crate::value::Value;
+use crate::{bytecode::Tier, Completion, Engine};
 
+// Default build only: the foreign array's write runs when the JIT releases the last owner
+// (the reference-count mechanism these tests pin), and under gc-heap an Agent's values never
+// reach another Agent's heap (I6).
+#[cfg(not(feature = "gc-heap"))]
 struct ForeignArrayWriteOnDrop {
     engine: Rc<RefCell<Engine>>,
     receiver: Value,
     drops: Rc<Cell<usize>>,
 }
 
+#[cfg(not(feature = "gc-heap"))]
 struct ForeignArrayDropState {
     engine: Rc<RefCell<Engine>>,
     drops: Rc<Cell<usize>>,
 }
 
 // The foreign Engine is a separate Agent: none of this Agent's values.
+#[cfg(not(feature = "gc-heap"))]
 crate::value_free!(ForeignArrayDropState);
 
+#[cfg(not(feature = "gc-heap"))]
 impl Drop for ForeignArrayWriteOnDrop {
     fn drop(&mut self) {
         let mut engine = self.engine.borrow_mut();
@@ -39,6 +47,7 @@ impl Drop for ForeignArrayWriteOnDrop {
     }
 }
 
+#[cfg(not(feature = "gc-heap"))]
 fn install_foreign_array_dropper(
     engine: &mut Engine,
     foreign: Rc<RefCell<Engine>>,
@@ -56,6 +65,7 @@ fn install_foreign_array_dropper(
     );
 }
 
+#[cfg(not(feature = "gc-heap"))]
 fn make_foreign_array_dropper(
     interp: &mut crate::interpreter::Interp,
     _: Value,
@@ -215,7 +225,25 @@ fn tdz_tagged_write_releases_last_owner_before_collection() {
         let mut engine = engine(tier);
         assert_eq!(eval(&mut engine, source), "undefined", "{tier:?}");
         let before = super::test_tdz_effect_paths();
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(eval(&mut engine, "releaseAtNextTdz();"), "true", "{tier:?}");
+        // gc-heap: the collection inside the loop can still find the witness through a stale
+        // word in the live native frames above it (the stack is scanned conservatively, at
+        // every tier); once the activation has finished, a collection finds it dead and runs
+        // its destructor.
+        #[cfg(feature = "gc-heap")]
+        {
+            eval(&mut engine, "releaseAtNextTdz();");
+            engine.interp.gc_collect();
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "tdzWeak.deref() === undefined && nativeTdzDropCount() === 1"
+                ),
+                "true",
+                "{tier:?}"
+            );
+        }
         if tier == Tier::Jit {
             let after = super::test_tdz_effect_paths();
             assert!(
@@ -384,6 +412,8 @@ fn pair_proxy_and_coercible_key_fallback_preserve_has_get_conversion_order() {
     );
 }
 
+// Pins the count guard of the TDZ pair (see the foreign dropper above).
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn pair_final_owner_release_falls_back_before_foreign_engine_mutation() {
     let mut engine = engine(Tier::Jit);
@@ -433,6 +463,8 @@ fn pair_final_owner_release_falls_back_before_foreign_engine_mutation() {
     );
 }
 
+// Pins the count guard of the TDZ pair (see the foreign dropper above).
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn pair_same_object_two_owners_falls_back_and_three_owners_admit() {
     for keep_third_owner in [false, true] {

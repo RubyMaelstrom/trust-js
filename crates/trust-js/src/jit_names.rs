@@ -16,7 +16,7 @@ thread_local! {
     };
 }
 
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(test)]
 #[path = "jit_names_tests.rs"]
 mod tests;
 

@@ -139,6 +139,7 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     }
 }
 
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     let mut engine = Engine::new();
@@ -171,6 +172,51 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     }
 }
 
+/// gc-heap: the returned object survives the collection `enter` runs after the callee's
+/// teardown, and once the test drops the result a collection finds it dead: neither the
+/// occupied result slot nor the native frame keeps a hidden owner.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
+    let mut engine = Engine::new();
+    for source in [
+        "function pass(value){return value;}",
+        "function pass(value){return;}",
+        "function pass(value){}",
+    ] {
+        let (chunk, code) = compile_return(&mut engine, source);
+        for occupied in [false, true] {
+            // The object's handles live only in this helper frame (gc-heap scans the stack).
+            let weak = crate::gc_test::in_frame(|| {
+                let object = crate::value::Object::new(None);
+                let weak = crate::value::Gc::downgrade(&object);
+                let previous = if occupied {
+                    Value::Obj(object.clone())
+                } else {
+                    Value::Undefined
+                };
+                let (result, helpers) =
+                    enter(&mut engine, &chunk, &code, Value::Obj(object), previous);
+                assert_eq!(helpers, usize::from(occupied), "{source}");
+                if source.contains("return value") {
+                    assert!(
+                        matches!(&result, Value::Obj(o) if crate::value::Gc::as_ptr(o) == weak.as_ptr())
+                    );
+                } else {
+                    assert!(matches!(result, Value::Undefined));
+                }
+                weak
+            });
+            engine.interp.gc_collect();
+            assert!(
+                !crate::gc_test::alive(&weak),
+                "{source} occupied={occupied}"
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let mut engine = Engine::new();
@@ -203,6 +249,44 @@ fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     assert_eq!(
         weak.strong_count(),
         0,
+        "a dropped result must not leave a hidden native owner"
+    );
+}
+
+/// gc-heap: a cyclic object whose only owner is the return word survives the collection `enter`
+/// runs after the callee's teardown, intact; once the test drops it, a collection finds it dead.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
+    let mut engine = Engine::new();
+    let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
+    // The object's handles live only in this helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
+        let weak = crate::value::Gc::downgrade(&object);
+        object.borrow_mut().props.insert(
+            "self",
+            crate::value::Property::plain(Value::Obj(object.clone())),
+        );
+        let (result, helpers) = enter(
+            &mut engine,
+            &chunk,
+            &code,
+            Value::Obj(object),
+            Value::Undefined,
+        );
+        assert_eq!(helpers, 0);
+        let returned = result.as_obj().unwrap();
+        assert_eq!(crate::value::Gc::as_ptr(returned), weak.as_ptr());
+        let self_value = returned.borrow().props.get("self").unwrap().value();
+        assert!(
+            matches!(&self_value, Value::Obj(value) if crate::value::Gc::ptr_eq(value, returned))
+        );
+        weak
+    });
+    engine.interp.gc_collect();
+    assert!(
+        !crate::gc_test::alive(&weak),
         "a dropped result must not leave a hidden native owner"
     );
 }
