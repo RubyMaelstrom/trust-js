@@ -465,6 +465,10 @@ pub(crate) struct Heap {
     /// Slots are reused after release, so page indices stay stable.
     pages: Vec<Option<PageMeta>>,
     free_page_slots: Vec<u32>,
+    /// P1 S4: the memory of released pages, kept for reuse. Freeing each empty page to the
+    /// allocator and taking a fresh 64 KiB-aligned block for the next fragments the allocator's
+    /// arena; peak memory grew where pages empty out every cycle. Capped by `spare_page_cap`.
+    spare_pages: Vec<usize>,
     /// Page number (address >> PAGE_SHIFT; page addresses would leave
     /// FxHash's low bits zero) to index in `pages`.
     page_map: FastMap<usize, u32>,
@@ -512,6 +516,7 @@ impl Heap {
             classes: Vec::new(),
             pages: Vec::new(),
             free_page_slots: Vec::new(),
+            spare_pages: Vec::new(),
             page_map: FastMap::default(),
             larges: BTreeMap::new(),
             large_span: (usize::MAX, 0),
@@ -798,9 +803,21 @@ impl Heap {
 
     fn new_page(&mut self, desc: DescId, class: usize) -> u32 {
         let cell_size = SIZE_CLASSES[class];
-        // SAFETY: non-zero size; null is checked below.
-        let base = unsafe { alloc_zeroed(page_layout()) };
-        assert!(!base.is_null(), "GC page allocation failed");
+        let base = match self.spare_pages.pop() {
+            Some(base) => {
+                let base = base as *mut u8;
+                // SAFETY: a spare page is a `page_layout()` block no cell occupies; zeroed like a
+                // fresh one.
+                unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
+                base
+            }
+            None => {
+                // SAFETY: non-zero size; null is checked below.
+                let base = unsafe { alloc_zeroed(page_layout()) };
+                assert!(!base.is_null(), "GC page allocation failed");
+                base
+            }
+        };
         let cells = PAGE_SIZE / cell_size;
         // Thread the free list: cell i -> i+1 (stored as i+2), last -> 0.
         for i in 0..cells {
@@ -1580,8 +1597,19 @@ impl Heap {
             class.current = None;
         }
         self.free_page_slots.push(index as u32);
-        // SAFETY: allocated in new_page with this layout; no cell remains.
-        unsafe { dealloc(page.base as *mut u8, page_layout()) };
+        if self.spare_pages.len() < self.spare_page_cap() {
+            self.spare_pages.push(page.base);
+        } else {
+            // SAFETY: allocated in new_page with this layout; no cell remains.
+            unsafe { dealloc(page.base as *mut u8, page_layout()) };
+        }
+    }
+
+    /// How many released pages to keep: the larger of 64 and the pages in use, so a heap that
+    /// empties and refills pages each cycle reuses them, and one that shrank for good returns
+    /// what it no longer needs.
+    fn spare_page_cap(&self) -> usize {
+        self.page_map.len().max(64)
     }
 
     #[cfg(test)]
@@ -1619,6 +1647,10 @@ impl Heap {
             }
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
+        }
+        for base in std::mem::take(&mut self.spare_pages) {
+            // SAFETY: a spare page is a `page_layout()` block from new_page.
+            unsafe { dealloc(base as *mut u8, page_layout()) };
         }
         self.free_page_slots.clear();
         self.page_map.clear();
@@ -2315,6 +2347,25 @@ mod tests {
         assert_eq!(fx.live(), 3);
         assert_eq!((fx.val(a), fx.val(b), fx.val(c)), (1, 2, 3));
         assert_eq!(fx.heap.stats().cells_swept, 1);
+    }
+
+    /// P1 S4: a collection's emptied pages are kept and reused before any new page is allocated.
+    #[test]
+    fn emptied_pages_are_reused() {
+        let mut fx = Fixture::new();
+        let per_page = PAGE_SIZE / 16;
+        let first: std::collections::HashSet<usize> = (0..per_page * 4)
+            .map(|i| fx.alloc_node(0, i as u64) as usize >> PAGE_SHIFT)
+            .collect();
+        assert_eq!(first.len(), 4);
+        fx.collect();
+        assert_eq!((fx.live(), fx.heap.stats().pages_live), (0, 0));
+        assert_eq!(fx.heap.spare_pages.len(), 4);
+        let second: std::collections::HashSet<usize> = (0..per_page * 4)
+            .map(|i| fx.alloc_node(0, i as u64) as usize >> PAGE_SHIFT)
+            .collect();
+        assert_eq!(second, first, "the spare pages are reused");
+        assert!(fx.heap.spare_pages.is_empty());
     }
 
     #[test]
