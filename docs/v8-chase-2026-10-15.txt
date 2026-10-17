@@ -1688,3 +1688,100 @@ S4 review fixes, measured (2026-10-17)
   allocations and the pool now keeps them for the next cycle.
 - Lib suite gc-heap 1850/0/114 (the default build has no gc_core);
   clippy clean.
+
+S5 JIT re-pointing (started 2026-10-17)
+---------------------------------------
+Stage boundary: main has no commits past the merge base e3310993.
+
+Plan, recorded before the work. Two read-only surveys (emitted code and
+layouts; collector interaction, caches and tests) found:
+- Generated code does reference-count work at about 140 sites in nine
+  families (exec clone/drop/release, drop-helper calls, 47 inline
+  commit decrements, increments, 46 "count > 1" guards, frame teardown,
+  x64), all assuming a strong count at payload+0. Under gc-heap word 0
+  of an object cell is its RefCell flag, of a string cell its append
+  frontier: any of them corrupts a cell. jit_layout() panics under
+  gc-heap (it probes Gc::strong_count).
+- Layout probes that pass but would be wrong under gc-heap: named
+  fields are an InlineVec<Property, 4> (u32 len, u32 cap, inline
+  elements or a heap pointer), probed as a Vec; SlotMemo is u16, read
+  as u32; Exotic::Collection is not None to the JIT's guards; the
+  function probe expects an RcBox for Rc<Function>; environments are
+  header-less cells whose first binding is inline.
+- Correction to the S0 record (I7): JIT registers never hold sole
+  references, and the native stack is scanned, but the canonical slots
+  and operand stacks of JIT frames are not stack-resident. They live in
+  vm_pool vectors, boxed JitFrame records (frame_pool, untraced) and,
+  for OSR and continuations, a VM stack whose length is set to 0 for
+  the native run. None is registered with the collector, and the
+  JIT-only Rust helpers (about 7k lines) never ran under GC stress.
+- Polls emitted into JIT code test the object count only, not gc-heap's
+  byte budget, stress interval or pending request; direct JIT-to-JIT
+  calls skip gc_check_amortized.
+- Gates that pass vacuously: --tier=jit and set_tier(Jit) silently run
+  bytecode under gc-heap, and difftest files a crashing child as
+  inconclusive.
+- Possible address reuse (VM and JIT, unconfirmed): pruning a dead
+  creation pin does not fence the IC_CREATE states holding the
+  prototype's raw address.
+- Coverage under gc-heap: 31 lib tests ignored as "needs the JIT", 257
+  tests in 38 JIT modules compiled out, and about 20 reference-count
+  ignores that are JIT-ABI tests needing rooting counterparts.
+
+Steps (aarch64; x64 stays compiled but refused under gc-heap until S6's
+zombie pass; the default build keeps its code, checked by identical
+code dumps where a step touches emission):
+- Step 1, honest gates and baselines: difftest builds with gc-heap and
+  reports crashes apart from timeouts and memory kills (a crash is a
+  failure); --tier=jit says when it is clamped; fixture and gate runs
+  prove native compiles (TRUST_JS_TIER_LOG or the perf metrics' compile
+  counts). Baselines in the default build: difftest seed 7 count 150,
+  the fixtures at jit (outputs and compile counts), and code dumps for
+  the steps that must leave its emitted code unchanged.
+- Step 2, the creation-pin candidate: an address-reuse test for
+  IC_CREATE (and the other pinned caches' prune paths) in both builds;
+  fence what it finds.
+- Step 3, ownership emitters (default build, no code change): every
+  reference-count sequence goes through named emitters (exec clone/
+  drop/release, rc increment, non-final guard, frame teardown, the
+  PropertyLayout Rc kept apart), on ARM64 and x64. Gate: JIT tests
+  pass; code dumps byte-identical on the fixtures.
+- Step 4, JitLayout v2: an ownership mode (reference count at an offset,
+  or traced); no count probe under gc-heap; the InlineVec header and
+  SlotMemo width exported; the function probe, Collection tag, scope
+  and binding storage probed per build. Layout tests in both builds.
+- Step 5, one named-fields accessor emitter (Vec, or InlineVec: inline
+  while cap is 0) and the gc-heap scope small-storage probe. Default
+  code dumps unchanged.
+- Step 6, gc-heap emission: the ownership emitters emit nothing under
+  gc-heap (tag guards and the layout Rc stay), Collection passes the
+  ordinary-object guards. A test-only switch admits the JIT under
+  gc-heap.
+- Step 7, rooting: active JIT frames are registered (Rust entries and
+  machine-code direct calls); helpers that can collect see the
+  published stack pointer; slots, operands up to it, and the context's
+  this/return/error/activation are traced; borrowed frames keep their
+  stack length; frame_pool is traced or empty. Tests force a collection
+  inside each collecting helper family under the verifier.
+- Step 7b, polls: JIT polls and direct-call entry see the heap's
+  "collection due" (budget, stress, pending). Test: call-only and
+  loop-only JIT code collects at stress 1.
+- Step 8, admission: Jit is admitted under gc-heap on aarch64; the 38
+  modules and 31 ignores return, the JIT-ABI reference-count tests are
+  rewritten as rooting tests; per-test GC stress with the verifier and
+  the JIT on; fixes as found.
+- Step 9, the tagged word in execution: under gc-heap the execution
+  word is Copy with no ownership (lazy prototypes kept out of
+  execution), `this` travels packed, constant strings are immediates;
+  Binding.value stays wide (measured; any part not taken is recorded).
+- Exit gate: lib suite at the default tier in both builds; difftest
+  --seed 7 --count 150 agrees in both builds with crashes counted;
+  fixtures correct at --tier=jit with native compiles shown; per-test
+  GC stress + verifier with the JIT on; tripwire (fixtures at jit, both
+  builds) recorded. Outside review checkpoint.
+
+Decided before the work: "allocation slow path may collect" (the plan)
+would reopen S2's safepoint-only collection (I9) and its I1 audit.
+Instead the JIT's allocating helpers end in an explicit poll once their
+result sits in a canonical slot, so I7 is exercised at those points
+under stress without collecting inside allocation (a deviation).
