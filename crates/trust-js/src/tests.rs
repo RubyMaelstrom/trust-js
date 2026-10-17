@@ -3766,6 +3766,28 @@ fn discarded_function_templates_release_their_name_strings() {
 /// and the cache must not stand for the new object's chain: here a setter of the created name.
 #[test]
 fn creation_caches_do_not_trust_a_reused_prototype_address() {
+    // The test needs the dead prototype's address back. The default build's objects come from
+    // the process allocator, which the suite's other test threads share and can take it from;
+    // a process that runs this test alone gets it back.
+    const CHILD: &str = "TRUST_JS_TEST_ADDRESS_REUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::creation_caches_do_not_trust_a_reused_prototype_address",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated address-reuse test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         // A tier's fresh heap can allocate at the previous tier's addresses, its prototype where
         // the previous new object was. Between stack scrubs, no handle the previous tier left in
