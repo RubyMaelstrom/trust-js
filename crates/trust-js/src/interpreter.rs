@@ -1399,6 +1399,14 @@ impl FramePool {
         self.records.len()
     }
 
+    /// The registry's own storage (memory reports; it keeps the capacity a deep recursion
+    /// reached).
+    pub(crate) fn registry_bytes(&self) -> usize {
+        self.records
+            .capacity()
+            .saturating_mul(size_of::<std::ptr::NonNull<crate::jit::JitFrame>>())
+    }
+
     /// The records of this interpreter that are not pooled: the running activations'.
     pub(crate) fn active_records(&self) -> Vec<std::ptr::NonNull<crate::jit::JitFrame>> {
         // Outside JavaScript every record is pooled; the pool holds at most FRAME_POOL_LIMIT.

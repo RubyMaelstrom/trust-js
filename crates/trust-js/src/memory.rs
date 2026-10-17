@@ -1357,6 +1357,8 @@ fn scan_realm(
                     .saturating_mul(size_of::<crate::interpreter::WeakEnv>()),
             ),
     );
+    #[cfg(feature = "gc-heap")]
+    totals.engine_caches.add(interp.frame_pool.registry_bytes());
     for (slots, stack) in &interp.vm_pool {
         totals.engine_caches.add(
             slots
