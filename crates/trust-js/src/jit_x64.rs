@@ -202,7 +202,8 @@ impl Asm {
     // Ownership emitters (the x64 counterparts of `jit_ownership.rs`): every reference-count
     // sequence of this backend. RDX holds the untagged String/Symbol/Object payload, which the
     // caller's tag guard (`reference_or_immediate`, or the name templates' `owner_pointer`)
-    // proved reference-counted. Their `Traced` arms (gc-heap) are unreachable until S5 step 6.
+    // proved reference-counted. Their `Traced` arms (gc-heap) are unreachable: x64 refuses
+    // gc-heap until S6.
 
     /// Acquire one owner of the payload in RDX (`inc qword [rdx+strong]`). Flags clobbered.
     fn rc_inc_rdx(&mut self, own: JitOwnership) {

@@ -63,7 +63,8 @@ pub enum Tier {
 
 impl Tier {
     /// The tier this build runs for a request: under the P1 gc-heap object model (S2) the JIT
-    /// refuses admission and compiled code stays on the bytecode VM. [`Engine::set_tier`]
+    /// refuses admission and compiled code stays on the bytecode VM (until S5 step 8; gc-heap
+    /// test builds can admit one engine, see `Engine::admit_jit_for_test`). [`Engine::set_tier`]
     /// applies it; front ends compare it with the request to say when a tier is not available.
     ///
     /// [`Engine::set_tier`]: crate::Engine::set_tier
@@ -24249,6 +24250,8 @@ unsafe fn jit_callstat(
                 break 'r "gate: sloppy this-user, non-object receiver";
             }
         }
+        // The direct sequence's shared-callee guard; traced ownership (gc-heap) has none.
+        #[cfg(not(feature = "gc-heap"))]
         if let Value::Obj(o) = &(*sp.sub(argc + 1)).unpack() {
             if crate::value::Gc::strong_count(o) <= 2 {
                 break 'r "gate: callee refcount <= 1";

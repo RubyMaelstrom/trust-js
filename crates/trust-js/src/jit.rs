@@ -171,6 +171,15 @@ mod name_dispatch_tests;
 mod loop_latch_tests;
 
 #[cfg(all(
+    test,
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_traced_tests.rs"]
+mod traced_tests;
+
+#[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -285,14 +294,24 @@ pub(crate) enum JitOwnership {
     #[cfg_attr(feature = "gc-heap", allow(dead_code))]
     Refcount { strong_off: i32 },
     /// gc-heap: values carry no count; the collector traces what is reachable, so taking or
-    /// releasing an owner needs no instruction. What generated code emits for it is S5 step 6's
-    /// to define: until then every ownership emitter's `Traced` arm is unreachable, and no JIT
-    /// code is compiled under gc-heap (`Tier::admitted` keeps the tier on bytecode).
+    /// releasing an owner needs no instruction. The ARM64 emitters' `Traced` arms emit none and
+    /// keep only the tag routing that exists for other reasons (see `jit_ownership.rs`). The x64
+    /// backend refuses it: its `Traced` arms are unreachable until S6. `Tier::admitted` keeps
+    /// gc-heap engines on bytecode until S5 step 8; tests admit one engine through
+    /// `Engine::admit_jit_for_test`.
     #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
     Traced,
 }
 
 impl JitOwnership {
+    /// Whether owners hold counts (`Refcount`). Sites emit their count-only logic beside the
+    /// ownership emitters (an alias compare that keeps a shared count above zero, a marker or
+    /// register that carries a count to a later decrement, the direct call's surplus-argument
+    /// counter) only then; traced ownership needs none of it.
+    pub(crate) fn counted(self) -> bool {
+        matches!(self, JitOwnership::Refcount { .. })
+    }
+
     /// Whether the ARM64 ownership emitters can address the count with the unscaled 9-bit
     /// LDUR/STUR offset: a count within the payload's first 256 bytes. Traced ownership has no
     /// count instruction.
@@ -324,13 +343,14 @@ impl JitOwnership {
     }
 }
 
-/// The `Traced` arm of every ownership emitter (ARM64 and x64). Traced (gc-heap) values carry
-/// no count, and what generated code does for them instead is S5 step 6's to define; until
-/// then no JIT code is compiled under gc-heap, so reaching this is a bug.
+/// The `Traced` arm of the x64 ownership emitters. The x64 backend refuses gc-heap until S6
+/// (nothing admits it there: `Tier::admitted` clamps the tier, and the test-only admission is
+/// ARM64-only), so reaching this is a bug.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[cold]
 #[track_caller]
 fn ownership_traced(emitter: &str) -> ! {
-    unreachable!("{emitter}: traced (gc-heap) ownership has no emission before S5 step 6")
+    unreachable!("{emitter}: x64 has no traced (gc-heap) emission before S6")
 }
 
 impl crate::value::JitLayout {
@@ -5154,12 +5174,104 @@ fn guard_prop_writable(a: &mut asm::Asm, reg: u32, base: u32, flags: u32, slow: 
     a.cbz(reg, false, slow);
 }
 
-/// Branch to `miss` unless the exotic discriminant byte already loaded in `reg` is
-/// `Exotic::None` or an admitted primitive-wrapper tag. Wrapper tags are admitted only at
-/// sites whose compile-time name passed the wrapper name gates (not `length`/`description`,
-/// not digit-leading): StrWrap answers those names outside its entries, Num/Bool wrappers
-/// answer none. Shape, `ic_plain`, slot bounds and the live accessor bit are still checked
-/// by the caller around this guard, so a mutation after the fill re-routes to the helper.
+/// Whether generated code admits a Map's or Set's `Exotic::Collection` (gc-heap) wherever it
+/// admits an ordinary object: [`crate::value::Exotic::is_ordinary`] accepts it, and the
+/// interpreter's caches treat its named fields and elements as ordinary. Its tag must directly
+/// follow None's (`JitRepr::exotic_ordinary_contiguous`) for one range test to admit both;
+/// otherwise, and in the default build (which has no such variant), a Collection takes the
+/// checked path.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn exotic_collection_admitted(layout: &crate::value::JitLayout) -> bool {
+    layout.repr.exotic_collection_tag.is_some() && layout.repr.exotic_ordinary_contiguous
+}
+
+/// Branch to `ok` when the exotic discriminant byte loaded in `reg` is one
+/// [`crate::value::Exotic::is_ordinary`] accepts; otherwise fall through. Default build:
+/// `cmp reg, #none; b.eq ok`. With Collection admitted ([`exotic_collection_admitted`]), one
+/// unsigned range test from None's tag: `sub scratch, reg, #none; cmp scratch, #1; b.ls ok`,
+/// which preserves `reg` unless `scratch` is `reg`. Clobbers NZCV and `scratch`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn branch_exotic_ordinary(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    reg: u32,
+    scratch: u32,
+    ok: usize,
+) {
+    let none_tag = layout.exotic_none_tag as u32;
+    if exotic_collection_admitted(layout) {
+        a.sub_imm(scratch, reg, none_tag);
+        a.cmp_imm_w(scratch, 1);
+        a.b_cond(C_LS, ok);
+    } else {
+        a.cmp_imm_w(reg, none_tag);
+        a.b_cond(C_EQ, ok);
+    }
+}
+
+/// Branch to `miss` unless the exotic discriminant byte loaded in `reg` is one
+/// [`crate::value::Exotic::is_ordinary`] accepts (see [`branch_exotic_ordinary`]):
+/// `cmp reg, #none; b.ne miss`, or with Collection admitted
+/// `sub scratch, reg, #none; cmp scratch, #1; b.hi miss`. `scratch` may be `reg` when the tag
+/// is dead afterwards. Clobbers NZCV and `scratch`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn guard_exotic_ordinary(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    reg: u32,
+    scratch: u32,
+    miss: usize,
+) {
+    let none_tag = layout.exotic_none_tag as u32;
+    if exotic_collection_admitted(layout) {
+        a.sub_imm(scratch, reg, none_tag);
+        a.cmp_imm_w(scratch, 1);
+        a.b_cond(C_HI, miss);
+    } else {
+        a.cmp_imm_w(reg, none_tag);
+        a.b_cond(C_NE, miss);
+    }
+}
+
+/// [`guard_exotic_ordinary`] that also admits `Exotic::Array` (the element templates and the
+/// key-checked Array holder): the ordinary test, then `cmp reg, #array; b.ne miss`, so
+/// `scratch` must differ from `reg`. Clobbers NZCV and `scratch`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn guard_exotic_ordinary_or_array(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    reg: u32,
+    scratch: u32,
+    miss: usize,
+) {
+    debug_assert_ne!(reg, scratch, "the Array compare reads the tag");
+    let ok = a.new_label();
+    branch_exotic_ordinary(a, layout, reg, scratch, ok);
+    a.cmp_imm_w(reg, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, miss);
+    a.bind(ok);
+}
+
+/// Branch to `miss` unless the exotic discriminant byte already loaded in `reg` is ordinary
+/// (`Exotic::None`, or under gc-heap a Collection: see [`branch_exotic_ordinary`]) or an
+/// admitted primitive-wrapper tag. Wrapper tags are admitted only at sites whose compile-time
+/// name passed the wrapper name gates (not `length`/`description`, not digit-leading): StrWrap
+/// answers those names outside its entries, Num/Bool wrappers answer none. Shape, `ic_plain`,
+/// slot bounds and the live accessor bit are still checked by the caller around this guard, so
+/// a mutation after the fill re-routes to the helper. Clobbers NZCV and `scratch`, which must
+/// differ from `reg` when a wrapper is admitted.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -5168,18 +5280,18 @@ fn guard_exotic_none_or_wrap(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     reg: u32,
+    scratch: u32,
     str_wrap: bool,
     num_bool_wrap: bool,
     miss: usize,
 ) {
     if !str_wrap && !num_bool_wrap {
-        a.cmp_imm_w(reg, layout.exotic_none_tag as u32);
-        a.b_cond(C_NE, miss);
+        guard_exotic_ordinary(a, layout, reg, scratch, miss);
         return;
     }
+    debug_assert_ne!(reg, scratch, "the wrapper compares read the tag");
     let ok = a.new_label();
-    a.cmp_imm_w(reg, layout.exotic_none_tag as u32);
-    a.b_cond(C_EQ, ok);
+    branch_exotic_ordinary(a, layout, reg, scratch, ok);
     if str_wrap {
         a.cmp_imm_w(reg, layout.exotic_strwrap_tag as u32);
         a.b_cond(C_EQ, ok);
@@ -5288,7 +5400,6 @@ fn emit_prop_way_probe(
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let plain = layout.obj_ic_plain as u32;
-    let none_tag = layout.exotic_none_tag as u32;
     let d1 = a.new_label();
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
@@ -5302,8 +5413,7 @@ fn emit_prop_way_probe(
     a.ldrb_imm(14, 11, ex);
     if arr_ok || wrap_ok {
         let ex_ok = a.new_label();
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_EQ, ex_ok);
+        branch_exotic_ordinary(a, layout, 14, 15, ex_ok);
         if arr_ok {
             let not_arr = a.new_label();
             a.cmp_imm_w(14, layout.exotic_array_tag as u32);
@@ -5323,8 +5433,7 @@ fn emit_prop_way_probe(
         a.b(miss);
         a.bind(ex_ok);
     } else {
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_NE, miss);
+        guard_exotic_ordinary(a, layout, 14, 14, miss);
     }
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
@@ -5366,7 +5475,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5378,7 +5487,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5394,7 +5503,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5407,7 +5516,7 @@ fn emit_prop_way_probe(
     a.cbz(17, true, miss);
     a.add_imm(11, 17, rcv);
     a.ldrb_imm(14, 11, ex);
-    guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+    guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
     a.cbz(14, false, miss);
     a.ldr_w_imm(14, 11, sh);
@@ -5429,7 +5538,7 @@ fn emit_prop_way_probe(
         a.b_cond(C_NE, kc_route);
         if arr_ok || wrap_ok {
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, false, true, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
         }
         let chain_end = a.new_label();
         for (lvl, shape_off) in [
@@ -5445,7 +5554,7 @@ fn emit_prop_way_probe(
             a.cbz(17, true, miss); // chain ended before the recorded level count
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, false, true, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5470,18 +5579,13 @@ fn emit_prop_way_probe(
         a.b_cond(C_EQ, load_kc);
         a.cmp_imm_w(9, 0x41);
         a.b_cond(C_NE, miss);
-        // one proto hop; the holder may be Exotic::None or an Array (its entry key gets
+        // one proto hop; the holder may be ordinary or an Array (its entry key gets
         // re-checked, which is what makes an array holder's slot trustworthy at all)
         a.ldr_imm(17, 11, pr);
         a.cbz(17, true, miss);
         a.add_imm(11, 17, rcv);
         a.ldrb_imm(14, 11, ex);
-        let ex_ok = a.new_label();
-        a.cmp_imm_w(14, none_tag);
-        a.b_cond(C_EQ, ex_ok);
-        a.cmp_imm_w(14, layout.exotic_array_tag as u32);
-        a.b_cond(C_NE, miss);
-        a.bind(ex_ok);
+        guard_exotic_ordinary_or_array(a, layout, 14, 15, miss);
         a.ldrb_imm(14, 11, plain);
         a.cbz(14, false, miss);
         a.ldr_w_imm(14, 11, sh);
@@ -5613,7 +5717,6 @@ fn emit_prop_load_inline(
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
 
     let plain = layout.obj_ic_plain as u32;
     // Key-checked entries (`IC_ARR_KEYCHK`: the holder is an Array — `arr.length`, or a method
@@ -5786,8 +5889,7 @@ fn emit_prop_load_inline(
         a.ldrb_imm(14, 11, ex);
         if arr_ok || wrap_ok {
             let recv_exotic_ok = a.new_label();
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_EQ, recv_exotic_ok);
+            branch_exotic_ordinary(a, layout, 14, 15, recv_exotic_ok);
             if arr_ok && st.depth >= 1 {
                 a.cmp_imm_w(14, layout.exotic_array_tag as u32);
                 a.b_cond(C_EQ, recv_exotic_ok);
@@ -5803,8 +5905,7 @@ fn emit_prop_load_inline(
             a.b(miss);
             a.bind(recv_exotic_ok);
         } else {
-            a.cmp_imm_w(14, none_tag);
-            a.b_cond(C_NE, miss);
+            guard_exotic_ordinary(a, layout, 14, 14, miss);
         }
         a.ldrb_imm(14, 11, plain);
         a.cbz(14, false, miss);
@@ -5817,7 +5918,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5835,7 +5936,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -5853,7 +5954,7 @@ fn emit_prop_load_inline(
             a.cbz(17, true, miss);
             a.add_imm(11, 17, rcv);
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, wrap_ok, wrap_ok, miss);
+            guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.cbz(14, false, miss);
             a.ldr_w_imm(14, 11, sh);
@@ -6088,8 +6189,6 @@ fn emit_method_elem_dense(
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
     let plain = layout.obj_ic_plain as u32;
     let commit = a.new_label();
     emit_exec_word_load(a, 10, 20, -16);
@@ -6100,15 +6199,11 @@ fn emit_method_elem_dense(
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
-    // Object base; exotic must be None or Array, and plain (no side-table behavior).
+    // Object base; exotic must be ordinary (None, or a gc-heap Map/Set) or Array, and plain
+    // (no side-table behavior).
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let ex_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, ex_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(ex_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
     a.ldr_imm(12, 11, el);
@@ -6257,8 +6352,7 @@ fn emit_computed_method_inline(
     a.b_cond(C_HI, slow); // array key-checked holders, absence and deep/exotic paths remain checked
     let ordinary = a.new_label();
     a.ldrb_imm(14, 11, exotic);
-    a.cmp_imm_w(14, layout.exotic_none_tag as u32);
-    a.b_cond(C_EQ, ordinary);
+    branch_exotic_ordinary(a, layout, 14, 16, ordinary);
     a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
     a.b_cond(C_EQ, ordinary);
     a.cmp_imm_w(14, layout.exotic_array_tag as u32);
@@ -6276,8 +6370,7 @@ fn emit_computed_method_inline(
         a.add_imm(11, 17, object_data);
         let hop_ordinary = a.new_label();
         a.ldrb_imm(14, 11, exotic);
-        a.cmp_imm_w(14, layout.exotic_none_tag as u32);
-        a.b_cond(C_EQ, hop_ordinary);
+        branch_exotic_ordinary(a, layout, 14, 16, hop_ordinary);
         a.cmp_imm_w(14, layout.exotic_strwrap_tag as u32);
         a.b_cond(C_NE, slow);
         a.bind(hop_ordinary);
@@ -6321,9 +6414,12 @@ fn emit_computed_method_inline(
     exec_clone(a, own, 12, 13, 16, slow);
     // A hit owns a cache pin of this exact LStr, so the operand cannot be its final owner.
     // Clone the result first (it may alias the key); preserve the original receiver for Call.
-    emit_exec_word_load(a, 14, 20, -8);
-    emit_exec_payload(a, 14, 14);
-    rc_dec_nonfinal_scaled(a, own, 14, 16);
+    // Traced ownership releases the key by overwriting it.
+    if own.counted() {
+        emit_exec_word_load(a, 14, 20, -8);
+        emit_exec_payload(a, 14, 14);
+        rc_dec_nonfinal_scaled(a, own, 14, 16);
+    }
     emit_exec_word_store(a, 12, 20, -8);
     a.b(done);
     a.bind(slow);
@@ -6671,9 +6767,10 @@ fn emit_call_inline_marked(
 /// `[this, callee, args...]`. Every guard precedes the single commit: all arguments must be
 /// Numbers (so ToNumber/ToInt32 run no author code), `this` must be Undefined (a plain
 /// identifier call, `U(a, b)`) or a shared Object (`Math.f(x)`), and the callee must be shared;
-/// any other shape takes `hit_slow`, which re-runs the exact builtin through the helper. The
-/// result Number replaces `this`. Clobbers x9, x11, x13, x14, x16, x17, d0, d1; preserves x10,
-/// x12 and x15 for the ordinary call on a decline.
+/// any other shape takes `hit_slow`, which re-runs the exact builtin through the helper (traced
+/// ownership has no sharing to prove, so only the tag guards remain). The result Number
+/// replaces `this`. Clobbers x9, x11, x13, x14, x16, x17, d0, d1; preserves x10, x12 and x15
+/// for the ordinary call on a decline.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -6707,6 +6804,8 @@ fn emit_math_intrinsic(
         emit_exec_number_guard(a, 13, 1, 16, hit_slow);
     }
     // `this`: Undefined needs no release; an Object must be shared. x11 = its pointer or 0.
+    // Traced ownership releases nothing: x11 is not set, and an Object `this` falls through.
+    let counted = own.counted();
     let this_undefined = a.new_label();
     let this_ready = a.new_label();
     emit_exec_word_load(a, 17, 20, this_off);
@@ -6714,16 +6813,20 @@ fn emit_math_intrinsic(
     a.cmp_reg_x(17, 16);
     a.b_cond(C_EQ, this_undefined);
     emit_exec_tag_guard(a, 17, crate::value::PACK_OBJ, 16, hit_slow);
-    emit_exec_payload(a, 17, 11);
-    // The receiver may be the builtin itself (f.same = f; f.same(x)). The two
-    // independent saved counts below cannot release aliased operand owners,
-    // and their combined release can require the real last-owner destructor.
-    a.cmp_reg_x(11, 10);
-    a.b_cond(C_EQ, hit_slow);
-    rc_guard_nonfinal(a, own, 11, 14, 1, hit_slow);
-    a.b(this_ready);
+    if counted {
+        emit_exec_payload(a, 17, 11);
+        // The receiver may be the builtin itself (f.same = f; f.same(x)). The two
+        // independent saved counts below cannot release aliased operand owners,
+        // and their combined release can require the real last-owner destructor.
+        a.cmp_reg_x(11, 10);
+        a.b_cond(C_EQ, hit_slow);
+        rc_guard_nonfinal(a, own, 11, 14, 1, hit_slow);
+        a.b(this_ready);
+    }
     a.bind(this_undefined);
-    a.movz(11, 0, 0);
+    if counted {
+        a.movz(11, 0, 0);
+    }
     a.bind(this_ready);
     // The callee is the stored Rc of the proven builtin: release one non-final owner.
     rc_guard_nonfinal(a, own, 10, 13, 1, hit_slow);
@@ -6784,11 +6887,13 @@ fn emit_math_intrinsic(
     }
     // Commit: release `this` (when an Object) and the callee, then replace `this` with the result.
     a.bind(commit);
-    let skip_this = a.new_label();
-    a.cbz(11, true, skip_this);
-    rc_commit_dec(a, own, 11, 14, 1);
-    a.bind(skip_this);
-    rc_commit_dec(a, own, 10, 13, 1);
+    if counted {
+        let skip_this = a.new_label();
+        a.cbz(11, true, skip_this);
+        rc_commit_dec(a, own, 11, 14, 1);
+        a.bind(skip_this);
+        rc_commit_dec(a, own, 10, 13, 1);
+    }
     emit_exec_number_store(a, 0, 20, this_off, 9);
     a.sub_imm(20, 20, (argc + 1) * 8);
     a.b(done);
@@ -6970,31 +7075,39 @@ fn emit_call_intrinsics1(
     // decrement, like the distinct function handle.
     a.bind(is_nan);
     {
+        // Traced ownership releases nothing: x11 is not set.
+        let counted = own.counted();
         let receiver_ready = a.new_label();
         emit_exec_word_load(a, 9, 20, -8);
         emit_exec_number_guard(a, 9, 0, 16, hit_slow);
         rc_guard_nonfinal(a, own, 10, 13, 1, hit_slow);
         emit_exec_word_load(a, 9, 20, -24);
-        a.movz(11, 0, 0); // no receiver release
+        if counted {
+            a.movz(11, 0, 0); // no receiver release
+        }
         a.mov_imm64(16, crate::value::PACK_UNDEFINED);
         a.cmp_reg_x(9, 16);
         a.b_cond(C_EQ, receiver_ready);
         emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-        emit_exec_payload(a, 9, 11);
-        // The receiver and callee may be their only two live owners. Their
-        // ordered release then needs the checked last-owner destructor.
-        a.cmp_reg_x(11, 10);
-        a.b_cond(C_EQ, hit_slow);
-        rc_guard_nonfinal(a, own, 11, 14, 1, hit_slow);
+        if counted {
+            emit_exec_payload(a, 9, 11);
+            // The receiver and callee may be their only two live owners. Their
+            // ordered release then needs the checked last-owner destructor.
+            a.cmp_reg_x(11, 10);
+            a.b_cond(C_EQ, hit_slow);
+            rc_guard_nonfinal(a, own, 11, 14, 1, hit_slow);
+        }
         a.bind(receiver_ready);
         // ---- commit: decrements, Boolean over the receiver slot ----
         a.fcmp(0, 0);
         a.cset_w(9, C_VS);
         rc_commit_dec(a, own, 10, 13, 1);
-        let released = a.new_label();
-        a.cbz(11, true, released);
-        rc_dec_nonfinal(a, own, 11, 14);
-        a.bind(released);
+        if counted {
+            let released = a.new_label();
+            a.cbz(11, true, released);
+            rc_dec_nonfinal(a, own, 11, 14);
+            a.bind(released);
+        }
         a.mov_imm64(16, crate::value::PACK_BOOL);
         a.logic_x(1, 9, 9, 16);
         emit_exec_word_store(a, 9, 20, -24);
@@ -7028,11 +7141,13 @@ fn emit_call_intrinsics1(
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-    emit_exec_word_load(a, 11, 20, -24);
-    emit_exec_payload(a, 11, 11);
-    // Two aliased operand owners need ordered drops, including any last owner.
-    a.cmp_reg_x(11, 10);
-    a.b_cond(C_EQ, hit_slow);
+    if own.counted() {
+        emit_exec_word_load(a, 11, 20, -24);
+        emit_exec_payload(a, 11, 11);
+        // Two aliased operand owners need ordered drops, including any last owner.
+        a.cmp_reg_x(11, 10);
+        a.b_cond(C_EQ, hit_slow);
+    }
     rc_guard_nonfinal(a, own, 11, 14, 1, hit_slow);
     rc_guard_nonfinal(a, own, 10, 13, 1, hit_slow);
     a.ldur_d(0, 20, -8);
@@ -7725,7 +7840,9 @@ fn emit_direct_call(
     // Move packed argument owners byte-for-byte; there is no conversion or possible miss.
     // ECMA-262 OrdinaryCallBindThis/FunctionDeclarationInstantiation bind the first n_params
     // values; an over-applied call's surplus words stay owned by the caller's operand stack and
-    // are released after the call (w7 = their count, kept in the save area across it).
+    // are released after the call (w7 = their count, kept in the save area across it). Traced
+    // ownership releases them by popping them: no count is kept.
+    let counted = own.counted();
     a.sub_imm(8, 20, (argc * 8) as u32);
     let surplus = a.new_label();
     let moved = a.new_label();
@@ -7737,7 +7854,9 @@ fn emit_direct_call(
         a.str_imm(4, 15, (k * 8) as u32);
     }
     a.movz(6, argc as u32, 0); // first slot left to initialize
-    a.movz(7, 0, 0); // no surplus
+    if counted {
+        a.movz(7, 0, 0); // no surplus
+    }
     a.b(moved);
     a.bind(surplus);
     // w6 = n_params < argc: move exactly those arguments.
@@ -7754,8 +7873,10 @@ fn emit_direct_call(
         a.add_imm(3, 3, 1);
         a.b(move_loop);
         a.bind(move_done);
-        a.movz(7, argc as u32, 0);
-        a.sub_reg(7, 7, 6);
+        if counted {
+            a.movz(7, argc as u32, 0);
+            a.sub_reg(7, 7, 6);
+        }
     }
     a.bind(moved);
     // Initialize every remaining local (from slot w6) to a complete packed Undefined word.
@@ -7823,14 +7944,17 @@ fn emit_direct_call(
         a.str_imm(0, 9, cx_this);
         a.str_imm(1, 9, cx_this + 8);
     }
-    // Save area: [record, constructing (byte) | surplus count (u32 @ 12), new_target (16B)].
-    // constructing and new_target live on the interpreter and are cleared for the callee.
+    // Save area: [record, constructing (byte) | surplus count (u32 @ 12, counted ownership
+    // only), new_target (16B)]. constructing and new_target live on the interpreter and are
+    // cleared for the callee.
     a.sub_imm(31, 31, 32);
     a.stur(9, 31, 0);
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(4, construct_base, construct_offset);
     a.stur(4, 31, 8);
-    a.str_w_imm(7, 31, DIRECT_SAVE_SURPLUS); // over-applied argument count
+    if counted {
+        a.str_w_imm(7, 31, DIRECT_SAVE_SURPLUS); // over-applied argument count
+    }
     a.strb_imm(31, construct_base, construct_offset);
     a.ldr_imm(4, 14, il.new_target as u32);
     a.ldr_imm(5, 14, (il.new_target + 8) as u32);
@@ -7867,7 +7991,9 @@ fn emit_direct_call(
     a.ldur(5, 31, 24);
     a.str_imm(4, 14, il.new_target as u32);
     a.str_imm(5, 14, (il.new_target + 8) as u32);
-    a.ldr_w_imm(7, 31, DIRECT_SAVE_SURPLUS);
+    if counted {
+        a.ldr_w_imm(7, 31, DIRECT_SAVE_SURPLUS);
+    }
     a.add_imm(31, 31, 32);
 
     // ---- release over-applied arguments, pop the callee (and skip the consumed this slot);
@@ -7903,7 +8029,7 @@ extern "C" fn record_direct_packed_return() {
 }
 
 /// Byte offset, within the direct sequence's save area, of the over-applied argument count
-/// (the u32 above the `constructing` byte).
+/// (the u32 above the `constructing` byte). Only counted ownership keeps it.
 const DIRECT_SAVE_SURPLUS: u32 = 12;
 
 #[cfg(all(
@@ -8666,7 +8792,6 @@ fn emit_update_prop_inline(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -8685,8 +8810,7 @@ fn emit_update_prop_inline(
     // 3. ordinary receiver, shape match
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(9, 11, ex);
-    a.cmp_imm_w(9, none_tag);
-    a.b_cond(C_NE, slow);
+    guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
     a.cbz(9, false, slow);
     a.ldr_w_imm(9, 11, sh);
@@ -8797,8 +8921,6 @@ fn emit_update_elem_inline(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
@@ -8821,12 +8943,7 @@ fn emit_update_elem_inline(
     // 4. ordinary or Array exotic, not in any side table (proxy, typed array, host object)
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let ex_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, ex_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(ex_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
     // 5. dense element storage; x15 → the element's Property
@@ -9184,20 +9301,23 @@ fn emit_instanceof_inline(
 
     // Popping the RHS must not run a destructor. A refcounted LHS (string/symbol/object) also
     // needs a spare owner. For an object LHS, alias-aware validation mirrors the equality
-    // template: the same Rc needs three live strong refs before subtracting two.
+    // template: the same Rc needs three live strong refs before subtracting two. Traced
+    // ownership needs only x10, the object LHS's payload, for the walk below.
     rc_guard_nonfinal(a, own, 11, 15, 1, slow);
     a.cmp_imm_w(7, 6);
     a.b_cond(C_LO, refs_ok);
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
     rc_guard_nonfinal(a, own, 10, 14, 1, slow);
-    a.cmp_imm_w(7, 8);
-    a.b_cond(C_NE, refs_ok);
-    a.cmp_reg_x(10, 11);
-    a.b_cond(C_EQ, ptr_same);
-    a.b(refs_ok);
-    a.bind(ptr_same);
-    rc_guard_nonfinal(a, own, 10, 14, 2, slow);
+    if own.counted() {
+        a.cmp_imm_w(7, 8);
+        a.b_cond(C_NE, refs_ok);
+        a.cmp_reg_x(10, 11);
+        a.b_cond(C_EQ, ptr_same);
+        a.b(refs_ok);
+        a.bind(ptr_same);
+        rc_guard_nonfinal(a, own, 10, 14, 2, slow);
+    }
     a.bind(refs_ok);
 
     // RHS: ordinary/plain constructor, canonical Function.prototype, and cached shape.
@@ -9262,12 +9382,14 @@ fn emit_instanceof_inline(
 
     // Commit: all guards have passed. Drop both object handles without reaching zero, replace
     // the two inputs with one Bool, and leave the stack in the normal binary-op shape.
-    let lhs_dropped = a.new_label();
-    a.cmp_imm_w(7, 6);
-    a.b_cond(C_LO, lhs_dropped);
-    rc_dec_nonfinal(a, own, 10, 14);
-    a.bind(lhs_dropped);
-    rc_dec_nonfinal(a, own, 11, 14);
+    if own.counted() {
+        let lhs_dropped = a.new_label();
+        a.cmp_imm_w(7, 6);
+        a.b_cond(C_LO, lhs_dropped);
+        rc_dec_nonfinal(a, own, 10, 14);
+        a.bind(lhs_dropped);
+        rc_dec_nonfinal(a, own, 11, 14);
+    }
     a.mov_imm64(10, crate::value::PACK_BOOL);
     a.logic_x(1, 9, 9, 10);
     emit_exec_word_store(a, 9, 20, -16);
@@ -9460,7 +9582,6 @@ fn emit_set_prop_inline(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -9498,12 +9619,12 @@ fn emit_set_prop_inline(
             emit_exec_payload(a, 9, 10);
         }
     }
-    // 2. object base; exotic None, and not a side-table exotic (proxy/typed-array/namespace).
-    //    Receiver-wide facts — validated once, shared by both ways.
+    // 2. object base; exotic ordinary (None, or a gc-heap Map/Set), and not a side-table exotic
+    //    (proxy/typed-array/namespace). Receiver-wide facts — validated once, shared by both
+    //    ways.
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(9, 11, ex);
-    a.cmp_imm_w(9, none_tag);
-    a.b_cond(C_NE, slow);
+    guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
     a.cbz(9, false, slow);
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
@@ -9546,7 +9667,9 @@ fn emit_set_prop_inline(
         // dec); BigInt or a last reference → helper. An old value that IS the receiver
         // (`o.x === o`) also bails: its dec and the receiver dec below hit the same counter,
         // and the two independent strong > 1 guards would let the pair scribble it to 0
-        // without running the destructor.
+        // without running the destructor. Traced ownership drops the old value by
+        // overwriting it: only the BigInt and lazy-prototype exclusions remain, and the
+        // commit reads no marker.
         if layout.entry_accessor == layout.entry_value + 8 {
             a.ldur(12, 15, ev);
             a.lsr_imm(9, 12, 48);
@@ -9556,39 +9679,43 @@ fn emit_set_prop_inline(
             a.movz(14, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
             a.cmp_reg_x(9, 14);
             a.b_cond(C_EQ, miss); // lazy storage has an owning Rc destructor
-            let old_ref = a.new_label();
-            let old_plain = a.new_label();
-            for tag in [
-                crate::value::PACK_STR,
-                crate::value::PACK_SYM,
-                crate::value::PACK_OBJ,
-            ] {
-                a.movz(14, (tag >> 48) as u32, 0);
-                a.cmp_reg_x(9, 14);
-                a.b_cond(C_EQ, old_ref);
+            if own.counted() {
+                let old_ref = a.new_label();
+                let old_plain = a.new_label();
+                for tag in [
+                    crate::value::PACK_STR,
+                    crate::value::PACK_SYM,
+                    crate::value::PACK_OBJ,
+                ] {
+                    a.movz(14, (tag >> 48) as u32, 0);
+                    a.cmp_reg_x(9, 14);
+                    a.b_cond(C_EQ, old_ref);
+                }
+                a.movz(9, 0, 0); // commit marker: no old refcount decrement
+                a.b(old_plain);
+                a.bind(old_ref);
+                a.lsl_imm(12, 12, 16);
+                a.lsr_imm(12, 12, 16);
+                a.cmp_reg_x(12, 10);
+                a.b_cond(C_EQ, miss);
+                rc_guard_nonfinal(a, own, 12, 14, 1, miss);
+                a.movz(9, 6, 0); // any refcounted old value
+                a.bind(old_plain);
             }
-            a.movz(9, 0, 0); // commit marker: no old refcount decrement
-            a.b(old_plain);
-            a.bind(old_ref);
-            a.lsl_imm(12, 12, 16);
-            a.lsr_imm(12, 12, 16);
-            a.cmp_reg_x(12, 10);
-            a.b_cond(C_EQ, miss);
-            rc_guard_nonfinal(a, own, 12, 14, 1, miss);
-            a.movz(9, 6, 0); // any refcounted old value
-            a.bind(old_plain);
         } else {
             a.ldurb(9, 15, ev);
             a.cmp_imm_w(9, 5);
             a.b_cond(C_EQ, miss);
-            let old_plain = a.new_label();
-            a.cmp_imm_w(9, 6);
-            a.b_cond(C_LO, old_plain);
-            a.ldur(12, 15, ev + 8);
-            a.cmp_reg_x(12, 10);
-            a.b_cond(C_EQ, miss);
-            rc_guard_nonfinal(a, own, 12, 14, 1, miss);
-            a.bind(old_plain);
+            if own.counted() {
+                let old_plain = a.new_label();
+                a.cmp_imm_w(9, 6);
+                a.b_cond(C_LO, old_plain);
+                a.ldur(12, 15, ev + 8);
+                a.cmp_reg_x(12, 10);
+                a.b_cond(C_EQ, miss);
+                rc_guard_nonfinal(a, own, 12, 14, 1, miss);
+                a.bind(old_plain);
+            }
         }
     };
     // One pass over the ways (x8 = way cursor, w6 = ways left; neither probe clobbers them,
@@ -9632,11 +9759,13 @@ fn emit_set_prop_inline(
     }
     a.stur(16, 15, ev);
     // drop the old value (refcounted: strong was > 1, so this never frees)
-    let no_old_dec = a.new_label();
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_LO, no_old_dec);
-    rc_dec_nonfinal(a, own, 12, 14);
-    a.bind(no_old_dec);
+    if own.counted() {
+        let no_old_dec = a.new_label();
+        a.cmp_imm_w(9, 6);
+        a.b_cond(C_LO, no_old_dec);
+        rc_dec_nonfinal(a, own, 12, 14);
+        a.bind(no_old_dec);
+    }
     if matches!(recv, PropRecv::Stack) {
         // drop the receiver (strong was > 1)
         rc_dec_nonfinal(a, own, 10, 9);
@@ -9927,35 +10056,38 @@ fn emit_eq_inline(
     if strict {
         // Different tags (both-number already peeled off): strictly unequal. Guard BOTH drops
         // before either dec so the slow fallback re-runs the op against untouched state.
+        // Traced ownership drops nothing: only the BigInt exclusions remain.
         a.bind(l_diff);
         a.cmp_imm_w(9, 5);
         a.b_cond(C_EQ, slow);
         a.cmp_imm_w(10, 5);
         a.b_cond(C_EQ, slow);
-        let ga = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, ga);
-        emit_exec_word_load(a, 12, 20, -16);
-        emit_exec_payload(a, 12, 12);
-        rc_guard_nonfinal(a, own, 12, 14, 1, slow);
-        a.bind(ga);
-        let gb = a.new_label();
-        a.cmp_imm_w(10, 6);
-        a.b_cond(C_LO, gb);
-        emit_exec_word_load(a, 13, 20, -8);
-        emit_exec_payload(a, 13, 13);
-        rc_guard_nonfinal(a, own, 13, 15, 1, slow);
-        a.bind(gb);
-        let da = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, da);
-        rc_commit_dec(a, own, 12, 14, 1);
-        a.bind(da);
-        let db = a.new_label();
-        a.cmp_imm_w(10, 6);
-        a.b_cond(C_LO, db);
-        rc_commit_dec(a, own, 13, 15, 1);
-        a.bind(db);
+        if own.counted() {
+            let ga = a.new_label();
+            a.cmp_imm_w(9, 6);
+            a.b_cond(C_LO, ga);
+            emit_exec_word_load(a, 12, 20, -16);
+            emit_exec_payload(a, 12, 12);
+            rc_guard_nonfinal(a, own, 12, 14, 1, slow);
+            a.bind(ga);
+            let gb = a.new_label();
+            a.cmp_imm_w(10, 6);
+            a.b_cond(C_LO, gb);
+            emit_exec_word_load(a, 13, 20, -8);
+            emit_exec_payload(a, 13, 13);
+            rc_guard_nonfinal(a, own, 13, 15, 1, slow);
+            a.bind(gb);
+            let da = a.new_label();
+            a.cmp_imm_w(9, 6);
+            a.b_cond(C_LO, da);
+            rc_commit_dec(a, own, 12, 14, 1);
+            a.bind(da);
+            let db = a.new_label();
+            a.cmp_imm_w(10, 6);
+            a.b_cond(C_LO, db);
+            rc_commit_dec(a, own, 13, 15, 1);
+            a.bind(db);
+        }
         a.b(l_false);
     }
     a.bind(l_num);
@@ -10295,19 +10427,23 @@ fn emit_store_name_value(
     // Both stores own the same compact word; no repacking or allocation is necessary.
     emit_exec_word_load(a, 10, 20, -8);
     // Release the old packed owner. Scalars need nothing; common refcounted values decrement
-    // inline, while BigInt or a last owner uses the exact packed destructor.
+    // inline, while BigInt or a last owner uses the exact packed destructor. Traced
+    // ownership releases a String/Symbol/Object by overwriting it; BigInt and a lazy
+    // prototype still take the destructor.
     a.ldur(16, 14, 0);
     a.lsr_imm(9, 16, 48);
     let old_ref = a.new_label();
     let old_drop = a.new_label();
-    for tag in [crate::value::PACK_STR, crate::value::PACK_SYM] {
-        a.movz(13, (tag >> 48) as u32, 0);
+    if own.counted() {
+        for tag in [crate::value::PACK_STR, crate::value::PACK_SYM] {
+            a.movz(13, (tag >> 48) as u32, 0);
+            a.cmp_reg_w(9, 13);
+            a.b_cond(C_EQ, old_ref);
+        }
+        a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
         a.cmp_reg_w(9, 13);
         a.b_cond(C_EQ, old_ref);
     }
-    a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_EQ, old_ref);
     a.movz(13, (crate::value::PACK_BIGINT >> 48) as u32, 0);
     a.cmp_reg_w(9, 13);
     a.b_cond(C_EQ, old_drop);
@@ -10315,11 +10451,13 @@ fn emit_store_name_value(
     a.cmp_reg_w(9, 13);
     a.b_cond(C_EQ, old_drop);
     a.b(packed_commit);
-    a.bind(old_ref);
-    a.lsl_imm(11, 16, 16);
-    a.lsr_imm(11, 11, 16);
-    rc_release_unless_last(a, own, 11, 12, old_drop);
-    a.b(packed_commit);
+    if own.counted() {
+        a.bind(old_ref);
+        a.lsl_imm(11, 16, 16);
+        a.lsr_imm(11, 11, 16);
+        rc_release_unless_last(a, own, 11, 12, old_drop);
+        a.b(packed_commit);
+    }
     a.bind(old_drop);
     // A last owner, a BigInt, or a lazy prototype (an owning Rc that is not a value owner):
     // this helper call is not only ownership work.
@@ -10365,12 +10503,15 @@ fn emit_store_name_value(
     a.ldurb(9, 14, 0);
     a.cmp_imm_w(9, 5);
     a.b_cond(C_EQ, slow);
+    // A traced old value is released by overwriting it: no count, no last owner.
     let old_scalar = a.new_label();
     let old_last_ref = a.new_label();
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_LO, old_scalar);
-    a.ldur(11, 14, 8);
-    rc_release_unless_last(a, own, 11, 12, old_last_ref);
+    if own.counted() {
+        a.cmp_imm_w(9, 6);
+        a.b_cond(C_LO, old_scalar);
+        a.ldur(11, 14, 8);
+        rc_release_unless_last(a, own, 11, 12, old_last_ref);
+    }
     a.bind(old_scalar);
     emit_exec_word_load(a, 8, 20, -8);
     emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
@@ -10382,14 +10523,16 @@ fn emit_store_name_value(
     // Releasing the last owner can recursively destroy an object graph, but Value destruction
     // cannot execute JavaScript. Preserve the already-validated binding pointer across the ABI
     // call, then commit the still-owned operand-stack value.
-    a.bind(old_last_ref);
-    drop_helper_call(a, H_DROP_AT, Some((14, 15)), |a| a.mov(2, 14));
-    emit_exec_word_load(a, 8, 20, -8);
-    emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
-    a.stur(9, 14, 0);
-    a.stur(10, 14, 8);
-    a.sub_imm(20, 20, 8);
-    a.b(done);
+    if own.counted() {
+        a.bind(old_last_ref);
+        drop_helper_call(a, H_DROP_AT, Some((14, 15)), |a| a.mov(2, 14));
+        emit_exec_word_load(a, 8, 20, -8);
+        emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
+        a.stur(9, 14, 0);
+        a.stur(10, 14, 8);
+        a.sub_imm(20, 20, 8);
+        a.b(done);
+    }
 }
 
 /// Inline free-name read (`LoadName`) against the per-site [`crate::bytecode::NameIc`]. Ordinary
@@ -11671,8 +11814,6 @@ fn emit_get_elem_inline_marked(
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -11694,15 +11835,11 @@ fn emit_get_elem_inline_marked(
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
     rc_guard_nonfinal(a, own, 10, 11, 1, slow);
-    // 4. object base; exotic must be None or Array, and plain (no side-table behavior)
+    // 4. object base; exotic must be ordinary (None, or a gc-heap Map/Set) or Array, and plain
+    //    (no side-table behavior)
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let ex_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, ex_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(ex_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
     // 5. mirror read: coherent + hole-free ⇒ bounds + one indexed load of a known Num — no
@@ -11967,8 +12104,6 @@ fn emit_set_elem_inline_marked(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -11987,15 +12122,10 @@ fn emit_set_elem_inline_marked(
     emit_exec_word_load(a, 10, 20, -24);
     emit_exec_payload(a, 10, 10);
     rc_guard_nonfinal(a, own, 10, 11, 1, slow);
-    // 4. object base; exotic None or Array, and plain
+    // 4. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let ex_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, ex_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(ex_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
     // 5. dense bounds
@@ -12021,32 +12151,37 @@ fn emit_set_elem_inline_marked(
     // 9. old value: trivially droppable (tag ≤ 4), or refcounted with strong > 1 (inline dec);
     //    BigInt or a last reference → helper. An old value that IS the receiver (`a[0] === a`)
     //    also bails: its dec plus the receiver dec below would take the shared counter to 0
-    //    without running the destructor. w9 = old drop marker, x12 = old payload.
+    //    without running the destructor. w9 = old drop marker, x12 = old payload (counted
+    //    ownership; traced ownership keeps only the BigInt exclusion and reads no marker).
     if layout.entry_accessor == layout.entry_value + 8 {
         emit_packed_number_drop_guard(a, layout, 15, slow);
     } else {
         a.ldurb(9, 15, ev);
         a.cmp_imm_w(9, 5);
         a.b_cond(C_EQ, slow);
-        let old_plain = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, old_plain);
-        a.ldur(12, 15, ev + 8);
-        a.cmp_reg_x(12, 10);
-        a.b_cond(C_EQ, slow);
-        rc_guard_nonfinal(a, own, 12, 13, 1, slow);
-        a.bind(old_plain);
+        if own.counted() {
+            let old_plain = a.new_label();
+            a.cmp_imm_w(9, 6);
+            a.b_cond(C_LO, old_plain);
+            a.ldur(12, 15, ev + 8);
+            a.cmp_reg_x(12, 10);
+            a.b_cond(C_EQ, slow);
+            rc_guard_nonfinal(a, own, 12, 13, 1, slow);
+            a.bind(old_plain);
+        }
     }
     // --- commit ---
     // Move v into the entry; a refcounted payload transfers ownership without a clone.
     emit_packed_stack_encode(a, -8, slow);
     a.stur(16, 15, ev);
     // drop the old value (refcounted: strong was > 1, so this never frees)
-    let no_old_dec = a.new_label();
-    a.cmp_imm_w(9, 6);
-    a.b_cond(C_LO, no_old_dec);
-    rc_dec_nonfinal(a, own, 12, 13);
-    a.bind(no_old_dec);
+    if own.counted() {
+        let no_old_dec = a.new_label();
+        a.cmp_imm_w(9, 6);
+        a.b_cond(C_LO, no_old_dec);
+        rc_dec_nonfinal(a, own, 12, 13);
+        a.bind(no_old_dec);
+    }
     // Keep the element mirror coherent (x9/x12/x13/d0/d1 are dead here; v words in 14/17,
     // bases in 10/11/15 stay live).
     emit_mirror_store(
@@ -12259,15 +12394,11 @@ fn emit_in_keyed(
         emit_exec_word_load(a, 10, 22, receiver_slot.unwrap() as i32);
         emit_exec_payload(a, 10, 10);
     }
-    // 3. object base; exotic None or Array, and plain (no side-table internal methods).
+    // 3. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain (no
+    //    side-table internal methods).
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let exotic_ok = a.new_label();
-    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
-    a.b_cond(C_EQ, exotic_ok);
-    a.cmp_imm_w(12, layout.exotic_array_tag as u32);
-    a.b_cond(C_NE, slow);
-    a.bind(exotic_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, slow);
     // 4. element storage sidecar (none: no elements to find here).
@@ -12589,7 +12720,8 @@ enum KeySrc {
 
 /// Guard that a packed property's old value is a Number, whose overwrite needs no destructor.
 /// Keeping this numeric-only makes the emitted template small; other packed values use the
-/// checked helper. On success w9 is the zero old-drop marker and x12 is scratch.
+/// checked helper. On success w9 is the zero old-drop marker (counted ownership; traced
+/// ownership leaves the old tag in w9, as its commits read no marker) and x12 is scratch.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12614,7 +12746,9 @@ fn emit_packed_number_drop_guard(
     a.cmp_reg_x(9, 14);
     a.b_cond(C_LS, slow);
     a.bind(number);
-    a.movz(9, 0, 0);
+    if layout.ownership().counted() {
+        a.movz(9, 0, 0);
+    }
 }
 
 /// Encode a wide Number at `off` into x16. Other kinds stay on the checked path, keeping the
@@ -12700,8 +12834,6 @@ fn emit_elem_local_keyed(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
     let get = kind == ElemLocalKind::Get;
     debug_assert!(get || key == KeySrc::Stack);
     // Stack-keyed layout: Get → [key @ -16]; Set* → [key @ -32, v @ -16].
@@ -12741,15 +12873,10 @@ fn emit_elem_local_keyed(
     // 3. receiver rc ptr straight from the slot (no strong-count games — nothing drops)
     emit_exec_word_load(a, 10, 22, slot_off as i32);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic None or Array, and plain
+    // 4. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let ex_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, ex_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(ex_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
     a.cbz(12, false, typed);
 
@@ -12848,28 +12975,33 @@ fn emit_elem_local_keyed(
         }
     } else {
         guard_prop_writable(a, 9, 15, ew, slow);
-        // 9. old value: trivially droppable, or refcounted with strong > 1.
+        // 9. old value: trivially droppable, or refcounted with strong > 1 (traced ownership
+        //    drops it by overwriting it; only the BigInt exclusion remains).
         if layout.entry_accessor == layout.entry_value + 8 {
             emit_packed_number_drop_guard(a, layout, 15, slow);
         } else {
             a.ldurb(9, 15, ev);
             a.cmp_imm_w(9, 5);
             a.b_cond(C_EQ, slow);
-            let old_plain = a.new_label();
-            a.cmp_imm_w(9, 6);
-            a.b_cond(C_LO, old_plain);
-            a.ldur(12, 15, ev + 8);
-            rc_guard_nonfinal(a, own, 12, 13, 1, slow);
-            a.bind(old_plain);
+            if own.counted() {
+                let old_plain = a.new_label();
+                a.cmp_imm_w(9, 6);
+                a.b_cond(C_LO, old_plain);
+                a.ldur(12, 15, ev + 8);
+                rc_guard_nonfinal(a, own, 12, 13, 1, slow);
+                a.bind(old_plain);
+            }
         }
         // --- commit: move v into the entry, drop the old value ---
         emit_packed_stack_encode(a, -8, slow);
         a.stur(16, 15, ev);
-        let no_old_dec = a.new_label();
-        a.cmp_imm_w(9, 6);
-        a.b_cond(C_LO, no_old_dec);
-        rc_dec_nonfinal(a, own, 12, 13);
-        a.bind(no_old_dec);
+        if own.counted() {
+            let no_old_dec = a.new_label();
+            a.cmp_imm_w(9, 6);
+            a.b_cond(C_LO, no_old_dec);
+            rc_dec_nonfinal(a, own, 12, 13);
+            a.bind(no_old_dec);
+        }
         // Element mirror (x9/x12/x13/d1 dead here; the key f64 survives in d0).
         emit_mirror_store(a, layout, 11, MirrorKey::F64InDreg(0), MirrorVal::Stack(-8));
         if kind == ElemLocalKind::SetKeep {
@@ -12954,8 +13086,6 @@ fn emit_local_own_dense_data_guard(
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
 
     // In source order the key local is loaded before the receiver local. Merely probing
     // either canonical slot is non-observable; any TDZ value misses to the original PC,
@@ -12984,12 +13114,7 @@ fn emit_local_own_dense_data_guard(
     emit_exec_payload(a, 10, 10);
     a.add_imm(11, 10, rcv);
     a.ldrb_imm(12, 11, ex);
-    let exotic_ok = a.new_label();
-    a.cmp_imm_w(12, none_tag);
-    a.b_cond(C_EQ, exotic_ok);
-    a.cmp_imm_w(12, arr_tag);
-    a.b_cond(C_NE, slow);
-    a.bind(exotic_ok);
+    guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     // `ic_plain` excludes proxies and all objects whose property lookup can invoke an
     // exotic internal method. Array's indexed exotic behavior is already represented by
     // its live dense sidecar, while this flag rules out any other side-table behavior.
@@ -13113,7 +13238,8 @@ fn emit_local_assumed_dense_data_value(
 /// Prove that clearing these two locals cannot destroy an Object. Object destruction can
 /// drop host closures, whose Rust destructors may use a foreign `Ctx` to mutate another live
 /// heap object. Refuse the fused path if either release could be final; if both slots own the
-/// same object, one additional owner beyond those two is required.
+/// same object, one additional owner beyond those two is required. Traced ownership destroys
+/// nothing at a clear: only the rejection of property-only tags remains, for both locals.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13130,6 +13256,16 @@ pub(super) fn emit_tdz_objects_nonfinal(
     let own = layout.ownership();
     let object_tag = (crate::value::PACK_OBJ >> 48) as u32;
 
+    if !own.counted() {
+        for off in [first_off, second_off] {
+            emit_exec_word_load(a, 9, 22, off as i32);
+            a.lsr_imm(13, 9, 48);
+            a.movz(14, object_tag, 0);
+            a.cmp_reg_x(13, 14);
+            a.b_cond(C_HI, slow); // reject property-only tags such as PACK_LAZY_PROTO.
+        }
+        return;
+    }
     emit_exec_word_load(a, 9, 22, first_off as i32);
     a.lsr_imm(13, 9, 48);
     a.movz(14, object_tag, 0);
@@ -13937,8 +14073,6 @@ fn emit_chain_marked(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
     let plain = layout.obj_ic_plain as u32;
 
     let done = a.new_label();
@@ -14020,8 +14154,7 @@ fn emit_chain_marked(
                 }
                 a.add_imm(11, 10, rcv);
                 a.ldrb_imm(14, 11, ex);
-                a.cmp_imm_w(14, none_tag);
-                a.b_cond(C_NE, guard!());
+                guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
                 a.cbz(14, false, guard!());
                 a.ldr_w_imm(14, 11, sh);
@@ -14033,8 +14166,7 @@ fn emit_chain_marked(
                     a.cbz(17, true, guard!());
                     a.add_imm(11, 17, rcv);
                     a.ldrb_imm(14, 11, ex);
-                    a.cmp_imm_w(14, none_tag);
-                    a.b_cond(C_NE, guard!());
+                    guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
                     a.cbz(14, false, guard!());
                     a.ldr_w_imm(14, 11, sh);
@@ -14052,8 +14184,7 @@ fn emit_chain_marked(
                     a.cbz(17, true, guard!());
                     a.add_imm(11, 17, rcv);
                     a.ldrb_imm(14, 11, ex);
-                    a.cmp_imm_w(14, none_tag);
-                    a.b_cond(C_NE, guard!());
+                    guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
                     a.cbz(14, false, guard!());
                     a.ldr_w_imm(14, 11, sh);
@@ -14111,8 +14242,7 @@ fn emit_chain_marked(
                 }
                 a.add_imm(11, 10, rcv);
                 a.ldrb_imm(14, 11, ex);
-                a.cmp_imm_w(14, none_tag);
-                a.b_cond(C_NE, guard!());
+                guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
                 a.cbz(14, false, guard!());
                 a.ldr_w_imm(14, 11, sh);
@@ -14237,12 +14367,7 @@ fn emit_chain_marked(
                         emit_exec_payload(a, 10, 10);
                         a.add_imm(11, 10, rcv);
                         a.ldrb_imm(12, 11, ex);
-                        let ex_ok = a.new_label();
-                        a.cmp_imm_w(12, none_tag);
-                        a.b_cond(C_EQ, ex_ok);
-                        a.cmp_imm_w(12, arr_tag);
-                        a.b_cond(C_NE, guard!());
-                        a.bind(ex_ok);
+                        guard_exotic_ordinary_or_array(a, layout, 12, 13, guard!());
                         a.ldrb_imm(12, 11, plain); // no side-table behavior
                         a.cbz(12, false, typed);
                         if rfree.len() >= 3 {
@@ -14513,25 +14638,30 @@ fn emit_chain_marked(
                 }
                 if is_set {
                     guard_prop_writable(a, 9, 15, ew, guard!());
-                    // old value: droppable inline, or bail (w14/x12 stay live to the dec)
+                    // old value: droppable inline, or bail (w14/x12 stay live to the dec;
+                    // traced ownership drops it by overwriting it)
                     a.ldrb_imm(14, 15, ev as u32);
                     a.cmp_imm_w(14, 5);
                     a.b_cond(C_EQ, guard!());
-                    let old_plain = a.new_label();
-                    a.cmp_imm_w(14, 6);
-                    a.b_cond(C_LO, old_plain);
-                    a.ldur(12, 15, ev + 8);
-                    rc_guard_nonfinal(a, own, 12, 13, 1, guard!());
-                    a.bind(old_plain);
+                    if own.counted() {
+                        let old_plain = a.new_label();
+                        a.cmp_imm_w(14, 6);
+                        a.b_cond(C_LO, old_plain);
+                        a.ldur(12, 15, ev + 8);
+                        rc_guard_nonfinal(a, own, 12, 13, 1, guard!());
+                        a.bind(old_plain);
+                    }
                     // commit: entry = Num(dv); drop the old value
                     a.movz(9, 4, 0);
                     a.stur(9, 15, ev);
                     a.stur_d(dv, 15, ev + 8);
-                    let no_dec = a.new_label();
-                    a.cmp_imm_w(14, 6);
-                    a.b_cond(C_LO, no_dec);
-                    rc_dec_nonfinal(a, own, 12, 13);
-                    a.bind(no_dec);
+                    if own.counted() {
+                        let no_dec = a.new_label();
+                        a.cmp_imm_w(14, 6);
+                        a.b_cond(C_LO, no_dec);
+                        rc_dec_nonfinal(a, own, 12, 13);
+                        a.bind(no_dec);
+                    }
                     // Element mirror: dv is a proven Num; int-ness is unknown in this tier.
                     emit_mirror_store(
                         a,
@@ -16158,8 +16288,7 @@ fn emit_region_own_entry(
     let shape = (layout.obj_props + layout.props_shape) as u32;
     a.add_imm(body_reg, rc_reg, rcv);
     a.ldrb_imm(9, body_reg, ex);
-    a.cmp_imm_w(9, layout.exotic_none_tag as u32);
-    a.b_cond(C_NE, fail);
+    guard_exotic_ordinary(a, layout, 9, 9, fail);
     a.ldrb_imm(9, body_reg, plain);
     a.cbz(9, false, fail);
     a.ldr_w_imm(9, body_reg, shape);
@@ -16204,13 +16333,16 @@ fn emit_linked_scan_materialize(
     }
 
     // Preamble guards proved these decrements cannot hit the last reference, including when the
-    // old next/peek aliases.  x3=old next payload, w4/x5=old peek tag/payload.
+    // old next/peek aliases.  x3=old next payload, w4/x5=old peek tag/payload. Traced
+    // ownership released both by overwriting them.
     rc_dec_nonfinal(a, own, 3, 9);
-    let scalar_peek = a.new_label();
-    a.cmp_imm_w(4, 6);
-    a.b_cond(C_LO, scalar_peek);
-    rc_dec_nonfinal(a, own, 5, 9);
-    a.bind(scalar_peek);
+    if own.counted() {
+        let scalar_peek = a.new_label();
+        a.cmp_imm_w(4, 6);
+        a.b_cond(C_LO, scalar_peek);
+        rc_dec_nonfinal(a, own, 5, 9);
+        a.bind(scalar_peek);
+    }
 }
 
 /// Linked-list SSA region.  The initial `next` frame owner roots the complete property chain, so
@@ -16234,27 +16366,32 @@ fn emit_linked_scan_region(
 
     // Pin the old slot owners for one-time replacement.  Reject BigInt and any reference whose
     // decrement might invoke a destructor; the baseline path remains untouched on rejection.
+    // Traced ownership has no destructor to avoid: only the tag and BigInt guards remain.
     a.ldr_imm(9, 22, plan.next_off);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, plain_h);
     emit_exec_payload(a, 9, 3);
     rc_guard_nonfinal(a, own, 3, 9, 1, plain_h);
     a.ldr_imm(9, 22, plan.peek_off);
     emit_exec_kind(a, 9, 4, 10, plain_h);
-    emit_exec_payload(a, 9, 5);
+    if own.counted() {
+        emit_exec_payload(a, 9, 5);
+    }
     a.cmp_imm_w(4, 5);
     a.b_cond(C_EQ, plain_h); // BigInt has a different ownership representation
-    let peek_safe = a.new_label();
-    a.cmp_imm_w(4, 6);
-    a.b_cond(C_LO, peek_safe);
-    rc_load_count(a, own, 5, 9);
-    a.cmp_reg_x(5, 3);
-    let distinct = a.new_label();
-    a.b_cond(C_NE, distinct);
-    rc_check_nonfinal(a, own, 9, 2, plain_h); // two old frame owners of the same allocation
-    a.b(peek_safe);
-    a.bind(distinct);
-    rc_check_nonfinal(a, own, 9, 1, plain_h);
-    a.bind(peek_safe);
+    if own.counted() {
+        let peek_safe = a.new_label();
+        a.cmp_imm_w(4, 6);
+        a.b_cond(C_LO, peek_safe);
+        rc_load_count(a, own, 5, 9);
+        a.cmp_reg_x(5, 3);
+        let distinct = a.new_label();
+        a.b_cond(C_NE, distinct);
+        rc_check_nonfinal(a, own, 9, 2, plain_h); // two old frame owners of the same allocation
+        a.b(peek_safe);
+        a.bind(distinct);
+        rc_check_nonfinal(a, own, 9, 1, plain_h);
+        a.bind(peek_safe);
+    }
 
     a.mov(0, 3); // borrowed current node
     a.movz(8, 0, 0); // no successful assignment yet
@@ -16345,8 +16482,6 @@ fn emit_loop_chain(
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
     let es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
-    let arr_tag = layout.exotic_array_tag as u32;
     let plain = layout.obj_ic_plain as u32;
     let mf = (layout.obj_props + layout.props_mirror_flags) as u32;
     let mirror = el;
@@ -16494,12 +16629,7 @@ fn emit_loop_chain(
         emit_exec_payload(a, 10, 10);
         a.add_imm(r, 10, rcv);
         a.ldrb_imm(12, r, ex);
-        let ex_ok = a.new_label();
-        a.cmp_imm_w(12, none_tag);
-        a.b_cond(C_EQ, ex_ok);
-        a.cmp_imm_w(12, arr_tag);
-        a.b_cond(C_NE, pre_fail);
-        a.bind(ex_ok);
+        guard_exotic_ordinary_or_array(a, layout, 12, 13, pre_fail);
         a.ldrb_imm(12, r, plain);
         a.cbz(12, false, pre_fail);
         if rp.mirror {
@@ -17119,20 +17249,24 @@ fn emit_loop_chain(
                             a.ldrb_imm(14, 15, ev as u32);
                             a.cmp_imm_w(14, 5);
                             a.b_cond(C_EQ, guard!());
-                            let old_plain = a.new_label();
-                            a.cmp_imm_w(14, 6);
-                            a.b_cond(C_LO, old_plain);
-                            a.ldur(12, 15, ev + 8);
-                            rc_guard_nonfinal(a, own, 12, 13, 1, guard!());
-                            a.bind(old_plain);
+                            if own.counted() {
+                                let old_plain = a.new_label();
+                                a.cmp_imm_w(14, 6);
+                                a.b_cond(C_LO, old_plain);
+                                a.ldur(12, 15, ev + 8);
+                                rc_guard_nonfinal(a, own, 12, 13, 1, guard!());
+                                a.bind(old_plain);
+                            }
                             a.movz(9, 4, 0);
                             a.stur(9, 15, ev);
                             a.stur_d(2, 15, ev + 8);
-                            let no_dec = a.new_label();
-                            a.cmp_imm_w(14, 6);
-                            a.b_cond(C_LO, no_dec);
-                            rc_dec_nonfinal(a, own, 12, 13);
-                            a.bind(no_dec);
+                            if own.counted() {
+                                let no_dec = a.new_label();
+                                a.cmp_imm_w(14, 6);
+                                a.b_cond(C_LO, no_dec);
+                                rc_dec_nonfinal(a, own, 12, 13);
+                                a.bind(no_dec);
+                            }
                             // Element mirror: the value was staged in d2; key registers are
                             // still intact (operand frees are deferred to op end).
                             let mkey = match key {

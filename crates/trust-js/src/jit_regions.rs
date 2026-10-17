@@ -35,6 +35,13 @@ thread_local! {
     static PROPERTY_PATHS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
 }
 
+/// Property paths recorded so far on this thread (see `PROPERTY_PATHS`; gc-heap tests only, the
+/// default build's tests read the counter directly).
+#[cfg(all(test, feature = "gc-heap"))]
+pub(super) fn property_paths() -> [u64; 7] {
+    PROPERTY_PATHS.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 extern "C" fn record_property_path(event: usize) {
     PROPERTY_PATHS.with(|counts| {
@@ -1454,8 +1461,7 @@ fn emit_borrowed_own_read(
         }
     } else {
         a.ldrb_imm(14, 11, layout.obj_exotic as u32);
-        a.cmp_imm_w(14, layout.exotic_none_tag as u32);
-        a.b_cond(C_NE, fail);
+        guard_exotic_ordinary(a, layout, 14, 14, fail);
         a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
         a.cbz(14, false, fail);
         a.ldr_w_imm(14, 11, (layout.obj_props + layout.props_shape) as u32);
@@ -1553,8 +1559,7 @@ fn emit_borrowed_method(
             a.add_imm(11, 17, layout.obj_from_rc as u32);
         }
         a.ldrb_imm(14, 11, layout.obj_exotic as u32);
-        a.cmp_imm_w(14, layout.exotic_none_tag as u32);
-        a.b_cond(C_NE, fail);
+        guard_exotic_ordinary(a, layout, 14, 14, fail);
         a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
         a.cbz(14, false, fail);
         a.ldr_w_imm(14, 11, (layout.obj_props + layout.props_shape) as u32);

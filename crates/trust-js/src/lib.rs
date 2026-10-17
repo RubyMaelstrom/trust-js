@@ -546,6 +546,15 @@ pub enum ExecutionOutcome {
 /// child realms. Opaque object handles belong to this engine; retaining one does not keep the
 /// realm executable after the engine has been destroyed.
 pub struct Engine {
+    /// The no-GC region [`Engine::admit_jit_for_test`] holds. Declared before `interp`, so it
+    /// closes before the engine's heap is released.
+    #[cfg(all(
+        test,
+        feature = "gc-heap",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    jit_test_admission: Option<gc_core::NoGcScope>,
     // Thread-backed generator bodies hold a pointer to the interpreter while suspended. Boxing
     // makes that address stable even when ordinary Rust code moves the public `Engine` value.
     interp: Box<Interp>,
@@ -571,6 +580,13 @@ impl Engine {
         let mut interp = Interp::new();
         interp.runtime_interrupt = interrupt;
         Engine {
+            #[cfg(all(
+                test,
+                feature = "gc-heap",
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            jit_test_admission: None,
             interp: Box::new(interp),
         }
     }
@@ -906,6 +922,33 @@ impl Engine {
     /// eligible bytecode to native code where the backend supports the host architecture.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
         self.interp.tier = tier.admitted();
+    }
+
+    /// Test-only (gc-heap test builds, ARM64): run this engine at [`bytecode::Tier::Jit`], which
+    /// [`bytecode::Tier::admitted`] otherwise keeps on the bytecode VM under gc-heap, so tests can
+    /// run generated code before S5 step 8 admits the JIT for every engine. Only this engine
+    /// bypasses the clamp, and only until a later [`Engine::set_tier`] applies it again. x64
+    /// stays refused (S6).
+    ///
+    /// JIT frames are not roots of the collector yet (S5 step 7 registers them): their slots,
+    /// operand words and contexts live in pooled records it cannot see. So this also keeps the
+    /// engine from collecting at all, for the rest of its life: `gc_suppressed` skips every
+    /// safepoint collection (the allocation threshold, the heap's byte budget and stress
+    /// interval, task boundaries, buffer pressure, failed allocations), and a no-GC region on
+    /// its heap defers every other request, explicit collections included
+    /// (`gc_core::Heap::nogc`). A program run under it must finish without needing a collection.
+    #[cfg(all(
+        test,
+        feature = "gc-heap",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn admit_jit_for_test(&mut self) {
+        self.interp.tier = bytecode::Tier::Jit;
+        if self.jit_test_admission.is_none() {
+            self.interp.suspend_gc();
+            self.jit_test_admission = Some(self.interp.gc_heap.core.borrow().nogc());
+        }
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).

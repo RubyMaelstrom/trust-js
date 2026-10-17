@@ -19,9 +19,16 @@
 //! The few-instruction emitters are `#[inline]`, like the sequences templates used to write in
 //! place; the `exec_*` and `frame_*` emitters stay out of line, like the functions they were.
 //!
-//! Every emitter that takes a [`JitOwnership`] has a `Traced` arm (the gc-heap build, whose
-//! values carry no count). It is unreachable until S5 step 6 defines gc-heap emission: no JIT
-//! code is compiled under gc-heap before then.
+//! Every emitter that takes a [`JitOwnership`] has a `Traced` arm: the gc-heap build, whose
+//! values carry no count. The collector traces the cells reachable from the words generated
+//! code stores, so acquiring or releasing an owner emits no instruction there. What a `Traced`
+//! arm keeps is the tag routing that exists for other reasons: [`exec_owner_guard`] still sends
+//! BigInt (whose checked path is kept), property-only and unknown tags to the checked path,
+//! since a lazy prototype owns an `Rc` in both builds, and a word release still runs
+//! `H_DROP_PACKED_AT` on those. Count guards never branch, so a site's slow path is reached
+//! only through its other guards. Count-only logic that sites keep beside these emitters (alias
+//! compares, old-value markers, the direct call's surplus counter) is emitted only while owners
+//! are counted ([`JitOwnership::counted`]).
 
 use super::*;
 use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
@@ -69,6 +76,8 @@ pub(super) fn exec_owner_guard(
 
 /// Acquire one owner of raw. Guards precede all changes; slow must clone via the checked
 /// operation. Preserve raw, clobber exactly ptr/count/NZCV. The word itself is not stored.
+/// Traced: the owner guard alone (BigInt, property-only and unknown tags to `slow`); a heap kind
+/// or scalar falls through with nothing acquired. Same clobbers.
 pub(super) fn exec_clone(
     a: &mut asm::Asm,
     own: JitOwnership,
@@ -77,21 +86,22 @@ pub(super) fn exec_clone(
     count: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("exec_clone")
-    };
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
     a.bind(heap);
-    emit_exec_payload(a, raw, ptr);
-    rc_inc(a, own, ptr, count, 1);
+    if own.counted() {
+        emit_exec_payload(a, raw, ptr);
+        rc_inc(a, own, ptr, count, 1);
+    }
     a.bind(done);
 }
 
 /// Release one non-final owner. BigInt and last references branch before any decrement;
 /// the checked path must run the real destructor. Raw and its physical word are unchanged
 /// so the caller can retire/replace the slot only after success. ptr/count/NZCV clobbered.
+/// Traced: the owner guard alone (BigInt, property-only and unknown tags to `slow`); a heap kind
+/// or scalar falls through with nothing released. Same clobbers.
 pub(super) fn exec_drop_shared(
     a: &mut asm::Asm,
     own: JitOwnership,
@@ -100,15 +110,14 @@ pub(super) fn exec_drop_shared(
     count: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("exec_drop_shared")
-    };
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
     a.bind(heap);
-    emit_exec_payload(a, raw, ptr);
-    rc_release_shared(a, own, ptr, count, slow);
+    if own.counted() {
+        emit_exec_payload(a, raw, ptr);
+        rc_release_shared(a, own, ptr, count, slow);
+    }
     a.bind(done);
 }
 
@@ -117,20 +126,15 @@ pub(super) fn exec_drop_shared(
 /// needs its destructor goes to `H_DROP_PACKED_AT`, which runs only Rust destruction (no author
 /// code, allocation of JS values, or unwinding). The word is left moved-from: the caller must
 /// overwrite or pop it. Scratch x9..x11; the helper path clobbers x0..x17 (the frame registers
-/// x19..x22 are preserved).
+/// x19..x22 are preserved). Traced: heap kinds and scalars need nothing; BigInt, property-only
+/// and unknown tags still take `H_DROP_PACKED_AT` (see [`exec_drop_shared`]).
 pub(super) fn exec_release_word(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("exec_release_word")
-    };
     emit_exec_word_load(a, 9, base, off);
     exec_release_loaded(a, own, base, off);
 }
 
 /// [`exec_release_word`] after its load: x9 already holds the word at `[base + off]`.
 pub(super) fn exec_release_loaded(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("exec_release_loaded")
-    };
     let release = a.new_label();
     let done = a.new_label();
     exec_drop_shared(a, own, 9, 10, 11, release);
@@ -150,32 +154,40 @@ pub(super) fn exec_release_loaded(a: &mut asm::Asm, own: JitOwnership, base: u32
 // Strong counts of String/Symbol/Object payloads (`ptr` is the untagged payload: the stored
 // Rc pointer). None of these emitters classifies a word: the site has already proven that
 // `ptr` names a reference-counted owner. `count` is the scratch register for the count.
+//
+// Traced (gc-heap): there is no count. Every emitter below emits nothing: `ptr` and `count`
+// are neither read nor written, NZCV is preserved, and a guard never branches.
 // ---------------------------------------------------------------------------------------------
 
 /// Acquire `n` owners of the payload at `ptr`. Clobbers count; flags are preserved.
 #[inline]
 pub(super) fn rc_inc(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32, n: u32) {
-    let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("rc_inc")
-    };
-    a.ldur(count, ptr, strong_off);
-    a.add_imm(count, count, n);
-    a.stur(count, ptr, strong_off);
+    match own {
+        JitOwnership::Refcount { strong_off } => {
+            a.ldur(count, ptr, strong_off);
+            a.add_imm(count, count, n);
+            a.stur(count, ptr, strong_off);
+        }
+        // Storing the word where the collector traces it is the acquisition.
+        JitOwnership::Traced => {}
+    }
 }
 
 /// Load the payload's count into `count` for a later [`rc_check_nonfinal`] (the site does
-/// unrelated work, such as an alias test, between the two). Nothing else changes.
+/// unrelated work, such as an alias test, between the two). Nothing else changes. Traced:
+/// nothing is loaded, so a site must not read `count` for anything but these emitters.
 #[inline]
 pub(super) fn rc_load_count(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
-    let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("rc_load_count")
-    };
-    a.ldur(count, ptr, strong_off);
+    match own {
+        JitOwnership::Refcount { strong_off } => a.ldur(count, ptr, strong_off),
+        JitOwnership::Traced => {}
+    }
 }
 
 /// Branch to `slow` unless the count loaded into `count` exceeds `spare`, the number of owners
 /// the site will release (more than one when operands alias): the releases then never free,
-/// so they need no destructor. Clobbers NZCV only.
+/// so they need no destructor. Clobbers NZCV only. Traced: no release frees, so this never
+/// branches and emits nothing.
 #[inline]
 pub(super) fn rc_check_nonfinal(
     a: &mut asm::Asm,
@@ -184,17 +196,19 @@ pub(super) fn rc_check_nonfinal(
     spare: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("rc_check_nonfinal")
-    };
-    a.cmp_imm_x(count, spare);
-    a.b_cond(C_LS, slow);
+    match own {
+        JitOwnership::Refcount { .. } => {
+            a.cmp_imm_x(count, spare);
+            a.b_cond(C_LS, slow);
+        }
+        JitOwnership::Traced => {}
+    }
 }
 
 /// The non-final guard: load the payload's count and branch to `slow` unless it exceeds
 /// `spare` (see [`rc_check_nonfinal`]). Every guard precedes the site's first mutation. On
 /// fall-through `count` holds the loaded count for [`rc_commit_dec`] or a further check.
-/// Clobbers count and NZCV.
+/// Clobbers count and NZCV. Traced: emits nothing (never branches, `count` not loaded).
 #[inline]
 pub(super) fn rc_guard_nonfinal(
     a: &mut asm::Asm,
@@ -204,52 +218,52 @@ pub(super) fn rc_guard_nonfinal(
     spare: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("rc_guard_nonfinal")
-    };
     rc_load_count(a, own, ptr, count);
     rc_check_nonfinal(a, own, count, spare, slow);
 }
 
 /// Release `n` owners by storing the count a guard left in `count`, minus `n`. Nothing may
 /// have changed that count since it was loaded (no helper call, no other release of the
-/// same payload in between). Clobbers count; flags are preserved.
+/// same payload in between). Clobbers count; flags are preserved. Traced: emits nothing.
 #[inline]
 pub(super) fn rc_commit_dec(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32, n: u32) {
-    let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("rc_commit_dec")
-    };
-    a.sub_imm(count, count, n);
-    a.stur(count, ptr, strong_off);
+    match own {
+        JitOwnership::Refcount { strong_off } => {
+            a.sub_imm(count, count, n);
+            a.stur(count, ptr, strong_off);
+        }
+        // Dropping the word is the release: the collector reclaims what nothing traces.
+        JitOwnership::Traced => {}
+    }
 }
 
 /// Release one owner whose count an earlier guard proved non-final. The count is re-read, so
 /// releases of the same payload in between (an aliased operand) are accounted for as long as
-/// the guard reserved them. Clobbers count; flags are preserved.
+/// the guard reserved them. Clobbers count; flags are preserved. Traced: emits nothing.
 #[inline]
 pub(super) fn rc_dec_nonfinal(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("rc_dec_nonfinal")
-    };
     rc_load_count(a, own, ptr, count);
     rc_commit_dec(a, own, ptr, count, 1);
 }
 
 /// [`rc_dec_nonfinal`] in the scaled LDR/STR encoding (the strong-count offset must be a
 /// non-negative multiple of eight). Used where another owner, such as a cache pin, keeps the
-/// payload alive without a guard. Clobbers count; flags are preserved.
+/// payload alive without a guard. Clobbers count; flags are preserved. Traced: emits nothing.
 #[inline]
 pub(super) fn rc_dec_nonfinal_scaled(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
-    let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("rc_dec_nonfinal_scaled")
-    };
-    a.ldr_imm(count, ptr, strong_off as u32);
-    a.sub_imm(count, count, 1);
-    a.str_imm(count, ptr, strong_off as u32);
+    match own {
+        JitOwnership::Refcount { strong_off } => {
+            a.ldr_imm(count, ptr, strong_off as u32);
+            a.sub_imm(count, count, 1);
+            a.str_imm(count, ptr, strong_off as u32);
+        }
+        JitOwnership::Traced => {}
+    }
 }
 
 /// Guard and release one owner: a last owner branches to `slow` before any change (the
-/// checked path runs the real destructor). Clobbers count and NZCV.
+/// checked path runs the real destructor). Clobbers count and NZCV. Traced: emits nothing
+/// (never branches).
 #[inline]
 pub(super) fn rc_release_shared(
     a: &mut asm::Asm,
@@ -258,16 +272,13 @@ pub(super) fn rc_release_shared(
     count: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("rc_release_shared")
-    };
     rc_guard_nonfinal(a, own, ptr, count, 1, slow);
     rc_commit_dec(a, own, ptr, count, 1);
 }
 
 /// Release one owner unless it is the last one (count exactly 1), which branches to `last`
 /// unchanged so the site can run the real destructor through a drop helper. Clobbers count
-/// and NZCV.
+/// and NZCV. Traced: emits nothing (never branches to `last`).
 #[inline]
 pub(super) fn rc_release_unless_last(
     a: &mut asm::Asm,
@@ -276,14 +287,16 @@ pub(super) fn rc_release_unless_last(
     count: u32,
     last: usize,
 ) {
-    let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("rc_release_unless_last")
-    };
-    a.ldur(count, ptr, strong_off);
-    a.cmp_imm_x(count, 1);
-    a.b_cond(C_EQ, last);
-    a.sub_imm(count, count, 1);
-    a.stur(count, ptr, strong_off);
+    match own {
+        JitOwnership::Refcount { strong_off } => {
+            a.ldur(count, ptr, strong_off);
+            a.cmp_imm_x(count, 1);
+            a.b_cond(C_EQ, last);
+            a.sub_imm(count, count, 1);
+            a.stur(count, ptr, strong_off);
+        }
+        JitOwnership::Traced => {}
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -318,6 +331,12 @@ pub(super) fn drop_helper_call(
 
 // ---------------------------------------------------------------------------------------------
 // Direct-call frame teardown
+//
+// Traced (gc-heap): every teardown emitter emits nothing. The surplus arguments, the callee
+// operand, the record's `this` and its slots hold execution words and a wide Value, never a
+// lazy prototype, and releasing them is dropping them: the caller pops the operand words, and
+// the record keeps its slot words until its next entry overwrites them. The sites' own
+// stores that restore pooled invariants (Undefined over `this` and `ret`) stay.
 // ---------------------------------------------------------------------------------------------
 
 /// Release the w7 over-applied argument words — the last w7 of the call's argument words, just
@@ -325,10 +344,11 @@ pub(super) fn drop_helper_call(
 /// (including two surplus words naming one object) or a BigInt runs its destructor through
 /// `H_DROP_PACKED_AT` (Rust destruction only). Releasing them after the call rather than at
 /// entry is unobservable. w8 (the completion flag) survives; x3..x7 and x16 are clobbered.
+/// Traced: emits nothing and reads no w7 (the direct call keeps no surplus count then).
 pub(super) fn frame_surplus_release(a: &mut asm::Asm, own: JitOwnership) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("frame_surplus_release")
-    };
+    if !own.counted() {
+        return;
+    }
     let done = a.new_label();
     let next_word = a.new_label();
     let helper = a.new_label();
@@ -351,9 +371,10 @@ pub(super) fn frame_surplus_release(a: &mut asm::Asm, own: JitOwnership) {
 /// Release the caller's callee operand (an Object, proven by the call IC) after restoring its
 /// activation. w8 carries the completion flag from the finish stub and must survive any
 /// last-owner destruction. Clobbers x3, x5 and x6, and x0..x17 on the last-owner path.
+/// Traced: emits nothing.
 pub(super) fn frame_callee_release(a: &mut asm::Asm, own: JitOwnership, argc: usize) {
     let JitOwnership::Refcount { strong_off } = own else {
-        ownership_traced("frame_callee_release")
+        return;
     };
     a.sub_imm(3, 20, ((argc + 1) * 8) as u32);
     a.ldr_imm(5, 3, 0);
@@ -402,10 +423,11 @@ fn frame_drop_at(a: &mut asm::Asm, value_reg: u32, helper: usize) {
 /// reference take `H_DROP_AT` (full drop, may cascade), after which x10 is reloaded. The
 /// binding is not reset here: `jit_drop_at` destroys the Value in place without overwriting
 /// it, so the caller must store Undefined over it on every path. Clobbers x0..x17 and NZCV.
+/// Traced: emits nothing (x10 and the binding unchanged); the caller's reset still applies.
 pub(super) fn frame_this_release(a: &mut asm::Asm, own: JitOwnership, cx_this: u32) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("frame_this_release")
-    };
+    if !own.counted() {
+        return;
+    }
     let this_done = a.new_label();
     let this_drop = a.new_label();
     a.ldrb_imm(9, 10, cx_this);
@@ -428,16 +450,17 @@ pub(super) fn frame_this_release(a: &mut asm::Asm, own: JitOwnership, cx_this: u
 /// would zero the count without ever running the destructor and leak the whole subgraph
 /// (Splay's splay_ dummy node caught exactly that). Bare dec when shared; `H_DROP_PACKED_AT`
 /// for a last reference, a BigInt or a property-only tag. Exit: x10 = the record; clobbers
-/// x0..x17 and NZCV.
+/// x0..x17 and NZCV. Traced: emits nothing (x10 unchanged); the record's slots keep their
+/// words, which own nothing once the record is back in the pool.
 pub(super) fn frame_slots_release(
     a: &mut asm::Asm,
     own: JitOwnership,
     cx_slots: u32,
     cx_n_slots: u32,
 ) {
-    let JitOwnership::Refcount { .. } = own else {
-        ownership_traced("frame_slots_release")
-    };
+    if !own.counted() {
+        return;
+    }
     a.ldr_imm(9, 10, cx_slots);
     a.ldr_imm(5, 10, cx_n_slots);
     a.movz(14, LOW_HEAP_TAG, 0);

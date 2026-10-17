@@ -224,8 +224,7 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cbz(9, true, slow);
     a.add_imm(9, 9, layout.obj_from_rc as u32);
     a.ldrb_imm(10, 9, layout.obj_exotic as u32);
-    a.cmp_imm_w(10, layout.exotic_none_tag as u32);
-    a.b_cond(C_NE, slow);
+    guard_exotic_ordinary(a, layout, 10, 10, slow);
     a.ldrb_imm(10, 9, layout.obj_ic_plain as u32);
     a.cbz(10, false, slow);
     a.ldr_w_imm(10, 8, offset_of!(R, shape) as u32);
