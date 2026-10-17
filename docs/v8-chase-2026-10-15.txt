@@ -1929,3 +1929,70 @@ Step 5, storage emitters (88f3914b):
   chunk differs by the heap-address lane of step 3); outputs identical;
   lib embed 2165/0/3, embed,gc-heap 1863/0/113; clippy clean in both
   builds.
+
+Step 6, gc-heap emission (5489ceb6):
+- The ARM64 ownership emitters' Traced arms emit no count instruction.
+  Clone, shared drop and word release keep the execution-word owner
+  guard: BigInt (its checked path kept), property-only and unknown tags
+  still take the checked path, since a lazy prototype owns an Rc in
+  both builds, and a word release still reaches H_DROP_PACKED_AT for
+  them; heap kinds and scalars fall through. Increments, the non-final
+  guard and its halves, commits, decrements, release-shared and
+  release-unless-last emit nothing, so no count guard branches. The
+  direct-call teardown emits nothing; the finish stub still stores
+  Undefined over `this` and moves `ret`. drop_helper_call and the
+  PropertyLayout Rc emitters are unchanged. x64 stays refused (its
+  Traced arms unreachable until S6).
+- Call-site audit: logic beside the emitters that only serves counts
+  is emitted only while JitOwnership::counted(): the direct call's
+  surplus-argument count (w7) and its save-area word; alias compares
+  that keep a count above zero (Math, isNaN and sqrt intrinsics,
+  instanceof, set-property and wide set-element old values, the
+  linked-scan region; TDZ object pairs keep only their property-only
+  rejection); old-value markers and release registers read by later
+  decrements; loads made only for a decrement. Store-name overwrites an
+  old String, Symbol or Object (BigInt and lazy prototypes still take
+  the drop helper). jit_callstat's Rust mirror of the shared-callee
+  gate (Gc::strong_count panics under gc-heap) is default-build only.
+- Maps and Sets: where a guard means "an ordinary object"
+  (Exotic::is_ordinary), gc-heap admits Collection with one unsigned
+  range test from None's tag (Array keeps its own compare): property
+  loads (receivers, hops, holders, absence levels), stores, creations
+  and updates, computed methods, dense element methods, element get,
+  set, update and `in`, numeric and loop chains, region own entries and
+  borrowed reads, property references. Left alone: the name templates'
+  global-object checks (a global object is never a Map or Set; the VM
+  checks Exotic::None there), instanceof's constructor operand, the
+  regions' typed-array element, Array-only sites. The default build
+  emits its old compares; the range test's scratch register is dead at
+  every gc-heap site (checked in review).
+- Test-only admission: Engine::admit_jit_for_test (gc-heap test builds,
+  ARM64) runs one engine at Tier::Jit past the clamp and, because JIT
+  frames are not rooted yet, stops it collecting for the rest of its
+  life (gc_suppressed for safepoints, a no-GC region deferring explicit
+  requests).
+- jit::traced_tests (10, gc-heap): programs for every emitter family
+  and for Map and Set access run at jit (through the hook) and at
+  bytecode with the same pinned results and native code asserted.
+  Warm property loads are all native hits; direct calls return through
+  the direct sequence on every iteration, recursing to depth 300 (past
+  the 256-record pool); Map and Set access is 300 native hits and no
+  fallback (50 and 250 with Collection admission removed). The hook
+  collects nothing even when a collection is due or requested (2
+  collections without its no-GC region). Assembled Traced count and
+  teardown emitters are empty, and Traced clone and drop send exactly
+  BigInt and the tags above Object to the checked path, over all 65,536
+  tags. An uncommitted smoke run sent 427 programs from the existing
+  JIT test files through the hook: no disagreement with bytecode.
+- For step 7: under gc-heap a finished callee's record returns to the
+  pool with its slot words unchanged (stale, owning nothing), and
+  surplus arguments and the callee are popped by moving the stack
+  pointer, so stale words sit above the operand top. The direct call no
+  longer needs a second owner of the callee: during the call the
+  caller's operand word below the arguments can be the closure's only
+  root, so the caller's operand words must stay traced.
+- Gates (rechecked at 5489ceb6): code dumps identical to the step-1
+  baselines with each MOVZ/MOVK run compared as one masked address (vue
+  55, react 9, djot 160; word by word the djot address lane of step 3);
+  outputs identical; lib embed 2165/0/3, embed,gc-heap 1873/0/113;
+  clippy clean in both builds.
