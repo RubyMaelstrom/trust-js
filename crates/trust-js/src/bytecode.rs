@@ -18786,6 +18786,10 @@ impl VmCoro {
         i: &mut Interp,
         signal: crate::coroutine::Resume,
     ) -> crate::coroutine::Suspend {
+        debug_assert!(
+            !crate::gc_sweep::evicting(),
+            "a coroutine resumed in the collector's eviction step"
+        );
         // This local owner remains an external GC root while the driver has
         // temporarily removed the continuation from its owner's internal slot.
         let realm = self.realm.clone();

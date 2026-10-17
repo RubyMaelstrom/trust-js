@@ -10,7 +10,10 @@
 //!
 //! A ShadowRealm's interpreter shares its parent's heap: one heap per Agent, so no edge ever
 //! crosses heaps (I6). Only the root interpreter collects, over its whole ShadowRealm tree; a
-//! collection requested inside a ShadowRealm runs at the root's next safepoint.
+//! collection requested inside a ShadowRealm runs at the root's next safepoint. A realm's
+//! roots belong to its ShadowRealm object, traced once that object is marked, so a realm kept
+//! only by cycles through itself is collected; while code in a realm runs, its roots and its
+//! ShadowRealm object are roots.
 
 use super::*;
 use crate::fasthash::{FastMap, FastSet};
@@ -133,6 +136,8 @@ struct Marking<'a> {
     interps: Vec<&'a Interp>,
     /// Parallel to `interps`.
     hosts: Vec<RefCell<HostGraph>>,
+    /// ShadowRealm object -> the index of its realm's interpreter.
+    shadow_owners: FastMap<usize, usize>,
     /// Realm-group members (objects and global environments) → (interpreter, Realm key). A
     /// Realm is not a root: marking any member activates the whole group, as in the old
     /// collector, so a retired Realm is reclaimed with everything it alone keeps alive.
@@ -147,9 +152,13 @@ impl<'a> Marking<'a> {
     #[inline(never)]
     fn new(root: &'a Interp) -> Self {
         let mut interps = vec![root];
+        let mut shadow_owners = FastMap::default();
         let mut next = 0;
         while let Some(&interp) = interps.get(next) {
-            interps.extend(interp.shadow_realms.values().map(|child| &**child));
+            for (&owner, child) in &interp.shadow_realms {
+                shadow_owners.insert(owner, interps.len());
+                interps.push(&**child);
+            }
             next += 1;
         }
         let mut hosts = Vec::with_capacity(interps.len());
@@ -177,6 +186,7 @@ impl<'a> Marking<'a> {
         Marking {
             interps,
             hosts,
+            shadow_owners,
             realm_members,
             templates,
             activated_realms: RefCell::default(),
@@ -198,28 +208,39 @@ impl<'a> Marking<'a> {
     }
 }
 
+impl Marking<'_> {
+    /// The roots of interpreter `index` and of its host.
+    fn trace_interp_roots(&self, index: usize, words: &mut WordSink<'_>) {
+        self.interps[index].trace_gc_roots(words);
+        let mut host = self.hosts[index].borrow_mut();
+        for &root in &host.roots {
+            words.word(root);
+        }
+        let mut reached = Vec::new();
+        host.native.trace_roots(&mut reached);
+        for target in reached {
+            words.word(target as u64);
+        }
+    }
+}
+
 impl crate::gc_core::MarkClient for Marking<'_> {
     fn roots(&self, sink: &mut dyn FnMut(u64)) {
         let mut words = WordSink(sink);
-        for interp in &self.interps {
-            interp.trace_gc_roots(&mut words);
+        self.trace_interp_roots(0, &mut words);
+        // A realm with code running: its roots, and its ShadowRealm object, which the sweep
+        // must not take from under it. Other realms' roots are their objects' side slots.
+        for (&owner, &index) in &self.shadow_owners {
+            if self.interps[index].shadow_entered() {
+                words.word(owner as u64);
+                self.trace_interp_roots(index, &mut words);
+            }
         }
         // The tree shares one heap; its interned strings live as long as it does.
         if let Some(root) = self.interps.first() {
             crate::value::trace_interned_strings(&root.gc_heap, &mut words);
         }
         crate::gc_trace::trace_thread_roots(&mut words);
-        let mut reached = Vec::new();
-        for host in &self.hosts {
-            let mut host = host.borrow_mut();
-            for &root in &host.roots {
-                words.word(root);
-            }
-            host.native.trace_roots(&mut reached);
-            for target in reached.drain(..) {
-                words.word(target as u64);
-            }
-        }
     }
 
     fn side_slot_owners(&self, owners: &mut dyn FnMut(usize)) {
@@ -234,6 +255,9 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         };
         for interp in &self.interps {
             interp.for_each_side_slot_owner(&mut note);
+        }
+        for &owner in self.shadow_owners.keys() {
+            note(owner);
         }
         for &member in self.realm_members.keys() {
             note(member);
@@ -250,6 +274,12 @@ impl crate::gc_core::MarkClient for Marking<'_> {
 
     fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
         let mut words = WordSink(sink);
+        if let Some(&index) = self.shadow_owners.get(&owner) {
+            // An entered realm's roots were traced as roots.
+            if !self.interps[index].shadow_entered() {
+                self.trace_interp_roots(index, &mut words);
+            }
+        }
         for interp in &self.interps {
             interp.trace_owner_slots(owner, &mut words);
         }
@@ -606,7 +636,8 @@ impl Interp {
             global_var_names: _,
             gc_pins: _,       // bookkeeping for side-table owners, not holders
             ta_buffer: _,     // side slots
-            shadow_realms: _, // members of the collection's tree
+            shadow_realms: _, // members of the collection's tree, traced as side slots
+            shadow_home: _,   // a weak owner; its entry count is read by `Marking`
             data_views: _,
             regexps: _,
             regexp_programs: _,

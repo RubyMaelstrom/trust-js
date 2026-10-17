@@ -3616,6 +3616,131 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         .any(|object| crate::value::Gc::ptr_eq(object, &child_object)));
 }
 
+/// The completion value of `source`, or a panic naming what it threw.
+fn eval_to_string(engine: &mut Engine, source: &str) -> String {
+    match engine.eval(source, false).expect("parses") {
+        Completion::Value(value) => value,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    }
+}
+
+/// P1 S4: a wrapped function keeps its ShadowRealm alive. The ShadowRealm object can die
+/// first; the wrapped function still calls into the realm it came from.
+#[test]
+fn shadow_realm_wrapped_function_outlives_its_shadow_realm_object() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "var twice = (() => new ShadowRealm().evaluate('(x) => x * 2'))();
+             $262.gc(); $262.gc();
+             twice(21)",
+        ),
+        "42"
+    );
+}
+
+/// P1 S4: a ShadowRealm whose object is otherwise unreachable stays alive while its code runs,
+/// across a collection caused by a host callback it calls.
+#[test]
+fn shadow_realm_survives_a_collection_while_it_runs() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "(() => new ShadowRealm().evaluate(
+               '(collect) => { const kept = [1, 2, 3]; collect(); return kept.map(x => x * 2).join() }'
+             ))()(() => { $262.gc(); $262.gc(); })",
+        ),
+        "2,4,6"
+    );
+}
+
+/// P1 S4: a ShadowRealm stays in the collection's tree while a wrapped function's `name` and
+/// `length` are read from it, whatever its getters do. Here the getter queues jobs, reachable
+/// only from the realm's own job queue, then collects.
+#[test]
+fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "var realm = new ShadowRealm();
+             var make = realm.evaluate(`(collect) => {
+               globalThis.seen = 0;
+               const queue = (n) => {
+                 const token = { mark: n };
+                 Promise.resolve().then(() => { globalThis.seen += token.mark; });
+               };
+               const read = () => globalThis.seen;
+               Object.defineProperty(read, 'name', { get() {
+                 for (let i = 1; i <= 20; i++) queue(i);
+                 collect();
+                 return 'read';
+               } });
+               return read;
+             }`);
+             var read = make(() => {
+               $262.gc(); $262.gc();
+               for (let i = 0; i < 1000; i++) ({ filler: [i] });
+             });
+             realm.evaluate('0');
+             read() + ':' + read.name",
+        ),
+        "210:read"
+    );
+}
+
+/// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
+/// kept only by its own wrapped function, stored inside it, is collected.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn shadow_realm_kept_only_through_itself_is_collected() {
+    let mut engine = Engine::new();
+    eval_to_string(
+        &mut engine,
+        "(() => {
+           const realm = new ShadowRealm();
+           realm.evaluate('(f) => { globalThis.kept = f; }')(realm.evaluate('() => 1'));
+         })(); 0",
+    );
+    assert_eq!(engine.interp.shadow_realms.len(), 1);
+    engine.interp.gc_collect();
+    assert!(
+        engine.interp.shadow_realms.is_empty(),
+        "a realm kept only through itself was retained"
+    );
+}
+
+/// P1 S4 (I5): a collected ShadowRealm ends without resuming its suspended coroutines, here a
+/// module body parked at a top-level await (`VmCoro::resume` asserts that no coroutine resumes
+/// in the collector's eviction step).
+#[test]
+fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
+    let mut engine = Engine::new();
+    engine.set_module_loader(|specifier: &str, _referrer: &str| {
+        (specifier == "parked").then(|| {
+            (
+                "parked".to_string(),
+                "export const ready = 1; await new Promise(() => {});".to_string(),
+            )
+        })
+    });
+    eval_to_string(
+        &mut engine,
+        "(() => { new ShadowRealm().importValue('parked', 'ready'); })(); 0",
+    );
+    let parked: usize = engine
+        .interp
+        .shadow_realms
+        .values()
+        .map(|realm| realm.generators.len())
+        .sum();
+    assert!(parked > 0, "the realm holds a parked module body");
+    engine.interp.gc_collect();
+    assert!(engine.interp.shadow_realms.is_empty());
+}
+
 #[test]
 fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
     let mut engine = Engine::new();

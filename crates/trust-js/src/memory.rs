@@ -674,8 +674,7 @@ impl Visitor {
                 // See Bound above: this Box cannot be shared between object holders.
                 self.callable_metadata = self
                     .callable_metadata
-                    .saturating_add(size_of_val(value.as_ref()))
-                    .saturating_add(size_of::<Value>());
+                    .saturating_add(size_of_val(value.as_ref()));
                 self.value(&value.target);
             }
             Callable::AccessorGet(name)

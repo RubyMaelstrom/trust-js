@@ -1198,3 +1198,61 @@ Step 2a, N-API (trust-js-node; both builds):
   wrong values in release) and wraps_end_with_their_objects (both
   builds; with liveness ignored, dead objects' wraps still unwrap).
   trust-js-node 42/0/0 in both builds.
+
+Step 2b/2c plan (ShadowRealm; recorded before the work). Reproduced
+first, in both builds unless noted:
+- A wrapped function whose ShadowRealm object has died throws "the
+  ShadowRealm is no longer available": the realm dies under it.
+- A realm whose object dies while its code runs is dropped mid-call. A
+  host callback that collects during a wrapped call is a use-after-free
+  (default build: abort; gc-heap: hidden only while a stale stack word
+  happens to keep the object).
+- gc-heap: make_wrapped_shadow takes the realm out of the tree while
+  the target's name/length getters run, so a collection there does not
+  trace it.
+Fix:
+- Wrapped functions hold their ShadowRealm object as a traced edge, and
+  the realm key derives from it. Cross wrappers, which run only inside
+  their realm, name it through the interpreter they run in; that
+  interpreter knows its owner (weakly) and its parent.
+- gc-heap: a realm's roots count only while its ShadowRealm object is
+  marked or while code in it runs (an entry count, which also roots the
+  object). A realm kept only by its own wrapped function, stored inside
+  it, is then still collected. The default build's per-heap cycle
+  collector cannot collect that cross-heap cycle; recorded, not fixed.
+- A collected realm, with its nested realms, drops its suspended
+  coroutines without resuming them; a debug assertion keeps VM code out
+  of the eviction step.
+- make_wrapped_shadow uses the realm in place, as calls do.
+
+Step 2b/2c, ShadowRealm (both builds unless noted):
+- WrappedShadow holds its ShadowRealm object as a traced edge, and its
+  realm key derives from it; WrappedCross holds only its target. An
+  entry (evaluate, importValue, a wrapped call, CopyNameAndLength)
+  records the parent and counts itself in the realm's ShadowHome, which
+  also holds the owner weakly for cross wrappers. CopyNameAndLength now
+  uses the realm in place instead of taking it out of the tree.
+- gc-heap: a realm's roots (and its host's) are its ShadowRealm
+  object's side slot. While the realm is entered they are roots, with
+  the object, and the entry also holds the object on its frame.
+- A collected realm and its nested realms drop their coroutines
+  unresumed. VmCoro::resume debug-asserts that it is not in the
+  eviction step, which gc_sweep::Evicting marks. Only an Agent's root
+  interpreter flushes the function profile on drop, so a collected
+  realm no longer clears its Agent's aggregate.
+- Tests, each shown failing without its fix:
+  shadow_realm_wrapped_function_outlives_its_shadow_realm_object (both
+  builds before the fix; gc-heap with the edge untraced);
+  shadow_realm_survives_a_collection_while_it_runs (default build
+  before the fix: abort in Rc); shadow_realm_kept_only_through_itself_
+  is_collected (gc-heap, with every realm's roots unconditional);
+  collected_shadow_realm_ends_without_resuming_its_coroutines (both
+  builds, with the coroutines left to Interp::drop: the assertion
+  fires); shadow_realm_stays_traced_while_its_function_is_wrapped
+  (gc-heap, with the realm out of the tree during the getters: freed
+  jobs give a wrong sum).
+- Results: trust-js lib default 2071/0/3, gc-heap 1769/0/109; the new
+  tests also pass at GC stress 1 and 100. Test262 built-ins/ShadowRealm
+  (no-LTO release runners): 64/64 executed at interp and bytecode in
+  both builds, and under gc-heap at stress 1. Under gc-heap, host
+  36/0/0 and runtime lib 110/0/1.

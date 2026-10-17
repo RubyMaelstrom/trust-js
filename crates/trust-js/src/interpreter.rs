@@ -3398,6 +3398,8 @@ pub struct Interp {
     /// Each `ShadowRealm` instance owns an isolated realm (a full sub-interpreter), keyed by the
     /// ShadowRealm object's pointer. Only primitive completion values cross the boundary.
     pub(crate) shadow_realms: crate::fasthash::FastMap<usize, Box<Interp>>,
+    /// A ShadowRealm's interpreter: its place in its parent's tree (None for an Agent's root).
+    pub(crate) shadow_home: Option<ShadowHome>,
     /// DataView state `(buffer ptr, byteOffset, byteLength)`, keyed by the DataView's pointer.
     /// DataView state: (buffer ptr, byteOffset, byteLength, is-length-tracking).
     pub(crate) data_views: crate::fasthash::FastMap<usize, (usize, usize, usize, bool)>,
@@ -3728,6 +3730,7 @@ interp_memory_inventory! {
     gc_pins => "measured",
     ta_buffer => "measured",
     shadow_realms => "measured",
+    shadow_home => "non_owning",
     data_views => "measured",
     regexps => "measured",
     regexp_programs => "measured",
@@ -3818,7 +3821,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
         );
     }
     // gc-heap adds `heap_release`.
-    assert_eq!(names.len(), 168 + usize::from(cfg!(feature = "gc-heap")));
+    assert_eq!(names.len(), 169 + usize::from(cfg!(feature = "gc-heap")));
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -3828,13 +3831,65 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
     let _tripwire: fn(&Interp) = interp_memory_inventory_exhaustive_pattern;
 }
 
+/// What a ShadowRealm's interpreter knows of the realm that owns it.
+pub(crate) struct ShadowHome {
+    /// The ShadowRealm object, in the parent realm. Weak: the object keeps the realm, not the
+    /// reverse; it is alive whenever code in this realm runs.
+    pub(crate) owner: crate::value::WeakGc,
+    /// The parent interpreter, recorded at each entry (see [`Interp::enter_shadow`]).
+    pub(crate) parent: *mut Interp,
+    /// Entries in progress: code in this realm is running. gc-heap collections treat the
+    /// realm's roots and its ShadowRealm object as roots meanwhile.
+    pub(crate) entries: u32,
+}
+
+/// An entry into a ShadowRealm's interpreter, which is used in place: its `Box` is pinned, and
+/// re-entrant calls (host code called from the realm calling back into it) are sequenced by
+/// the JS call stack. Holds the realm's agent active until it drops.
+pub(crate) struct ShadowEntry {
+    sub: *mut Interp,
+    /// Keeps the owner alive meanwhile (the default build's cycle collector sees a holder).
+    _owner: Gc,
+    _agent: crate::value::AgentActivationGuard,
+}
+
+impl ShadowEntry {
+    pub(crate) fn interp(&mut self) -> &mut Interp {
+        // SAFETY: an entered realm stays in its parent's table: its ShadowRealm object, held
+        // here, does not die meanwhile.
+        unsafe { &mut *self.sub }
+    }
+}
+
+impl Drop for ShadowEntry {
+    fn drop(&mut self) {
+        if let Some(home) = self.interp().shadow_home.as_mut() {
+            home.entries -= 1;
+        }
+    }
+}
+
+/// End a collected ShadowRealm's interpreter and its nested realms' (I5), in the collector's
+/// eviction step while the cells they name are intact. Their suspended coroutines are as
+/// unreachable as they are, so they end as memory instead of being resumed to terminate, as
+/// when an Agent ends with live state (`Interp::drop`).
+fn drop_collected_realm(mut realm: Box<Interp>) {
+    for (_, nested) in std::mem::take(&mut realm.shadow_realms) {
+        drop_collected_realm(nested);
+    }
+    drop(std::mem::take(&mut realm.generators));
+}
+
 impl Drop for Interp {
     fn drop(&mut self) {
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush
         // the opt-in function profile when the owning Agent is destroyed so browser-workload
         // diagnostics retain their measurements; `dump` clears the TLS aggregate, preventing a
-        // later Agent on the same worker from reporting these calls twice.
-        function_profile_dump();
+        // later Agent on the same worker from reporting these calls twice. A ShadowRealm's
+        // interpreter is not an Agent: its calls stay in its Agent's profile.
+        if self.shadow_home.is_none() {
+            function_profile_dump();
+        }
         // A suspended coroutine owns non-Send `Rc` values on its worker stack and retains a raw
         // pointer back to this interpreter. Wake and unwind every such body while `self` is still
         // valid, waiting for acknowledgement before normal field destruction begins.
@@ -5150,15 +5205,49 @@ impl Interp {
         Self::new_in_heap(symbol_agent, crate::value::new_gc_heap(), true)
     }
 
-    /// A ShadowRealm's implementation interpreter: same Agent (Symbols), isolated globals and
-    /// intrinsics. Under gc-heap it allocates in its parent's heap — one heap per Agent, so no
-    /// edge between the two realms' objects ever crosses heaps (I6) — and the root of the
-    /// ShadowRealm tree collects for all of it.
-    pub(crate) fn new_shadow(parent: &Interp) -> Interp {
+    /// A ShadowRealm's implementation interpreter, owned by the ShadowRealm object `owner`:
+    /// same Agent (Symbols), isolated globals and intrinsics. Under gc-heap it allocates in its
+    /// parent's heap — one heap per Agent, so no edge between the two realms' objects ever
+    /// crosses heaps (I6) — and the root of the ShadowRealm tree collects for all of it.
+    pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> Interp {
         #[cfg(feature = "gc-heap")]
-        return Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
+        let mut realm =
+            Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
         #[cfg(not(feature = "gc-heap"))]
-        Self::new_with_symbol_agent(parent.symbol_agent.clone())
+        let mut realm = Self::new_with_symbol_agent(parent.symbol_agent.clone());
+        realm.shadow_home = Some(ShadowHome {
+            owner: Gc::downgrade(owner),
+            parent: std::ptr::null_mut(),
+            entries: 0,
+        });
+        realm
+    }
+
+    /// Enter the realm of the ShadowRealm object `realm` (None if this interpreter does not own
+    /// it). While the entry lives, code may run in the realm.
+    pub(crate) fn enter_shadow(&mut self, realm: &Gc) -> Option<ShadowEntry> {
+        let parent = self as *mut Interp;
+        let sub = self.shadow_realms.get_mut(&(Gc::as_ptr(realm) as usize))?;
+        let home = sub
+            .shadow_home
+            .as_mut()
+            .expect("a ShadowRealm's interpreter knows its owner");
+        home.parent = parent;
+        home.entries += 1;
+        let agent = sub.enter_agent();
+        Some(ShadowEntry {
+            sub: &mut **sub,
+            _owner: realm.clone(),
+            _agent: agent,
+        })
+    }
+
+    /// Whether code in this (ShadowRealm) interpreter is running.
+    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+    pub(crate) fn shadow_entered(&self) -> bool {
+        self.shadow_home
+            .as_ref()
+            .is_some_and(|home| home.entries > 0)
     }
 
     fn new_in_heap(
@@ -5302,6 +5391,7 @@ impl Interp {
             gc_pins: Default::default(),
             ta_buffer: Default::default(),
             shadow_realms: Default::default(),
+            shadow_home: None,
             data_views: Default::default(),
             regexps: Default::default(),
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
@@ -11356,8 +11446,12 @@ impl Interp {
                 // as an internal slot. Keep that target graph edge visible to the
                 // cycle collector; otherwise a live wrapper can retain a callable
                 // whose object is swept and later reports "value is not a
-                // function" when invoked. (ECMA-262 [[Call]] wrapper target.)
-                Callable::WrappedShadow(shadow) => sink.value(&shadow.target),
+                // function" when invoked. (ECMA-262 [[Call]] wrapper target.) A
+                // ShadowRealm wrapper also keeps its ShadowRealm object, and so the realm.
+                Callable::WrappedShadow(shadow) => {
+                    sink.object(&shadow.realm);
+                    sink.value(&shadow.target);
+                }
                 Callable::WrappedCross(cross) => sink.value(&cross.target),
                 _ => {}
             }
@@ -11601,6 +11695,7 @@ impl Interp {
     /// not inherit them. Every other field keeps its keys alive, pins them weakly, is swept by
     /// an earlier step, or is not keyed by object addresses. Shared by both collectors.
     fn gc_evict_dead_owners(&mut self, dead: &crate::fasthash::FastSet<usize>) {
+        let _evicting = crate::gc_sweep::Evicting::enter();
         let Interp {
             // Keyed by an object's address: evicted below.
             class_info,
@@ -11654,6 +11749,7 @@ impl Interp {
             global_env_pins: _,
             htmldda: _,
             symbol_agent: _,
+            shadow_home: _, // a weak owner
             // Proofs naming addresses through weak pins (reserved, as above).
             ta_accessor_protector: _,
             array_iteration_protector: _,
@@ -11801,7 +11897,18 @@ impl Interp {
         crate::gc_sweep::map(array_buffer_versions, dead);
         crate::gc_sweep::map(array_buffer_dirty_ranges, dead);
         crate::gc_sweep::map(ta_buffer, dead);
-        crate::gc_sweep::map(shadow_realms, dead);
+        if !shadow_realms.is_empty() {
+            let collected: Vec<usize> = shadow_realms
+                .keys()
+                .filter(|owner| dead.contains(owner))
+                .copied()
+                .collect();
+            for owner in collected {
+                if let Some(realm) = shadow_realms.remove(&owner) {
+                    drop_collected_realm(realm);
+                }
+            }
+        }
         crate::gc_sweep::set(immutable_buffers, dead);
         crate::gc_sweep::set(host_keyed_buffers, dead);
         crate::gc_sweep::map(generators, dead);
@@ -13248,17 +13355,29 @@ impl Interp {
                 result
             }
             Callable::WrappedShadow(shadow) => {
-                self.call_wrapped_shadow(shadow.realm, (*shadow.target).clone(), args)
+                self.call_wrapped_shadow(&shadow.realm, (*shadow.target).clone(), args)
             }
             Callable::WrappedCross(cross) => {
-                let realm = cross.realm;
-                let parent = cross.parent;
                 let target = cross.target;
+                // A cross wrapper runs only in its own realm, entered from its parent.
+                let (realm, parent) = {
+                    let home = self
+                        .shadow_home
+                        .as_ref()
+                        .filter(|home| home.entries > 0)
+                        .expect("a cross-realm wrapper runs in its entered ShadowRealm");
+                    let realm = home
+                        .owner
+                        .upgrade()
+                        .expect("an entered ShadowRealm's object is alive");
+                    (realm, home.parent)
+                };
                 if std::env::var("TRUST_JS_DBG").is_ok() {
                     eprintln!(
-                        "DBG cross enter realm={realm} parent={parent:x} self={:p} tkind={}",
+                        "DBG cross enter realm={:p} parent={parent:p} self={:p} tkind={}",
+                        Gc::as_ptr(&realm),
                         self as *const Interp,
-                        match &*target {
+                        match &target {
                             Value::Obj(o) => match &o.borrow().call {
                                 Callable::User(_) => "user",
                                 Callable::WrappedShadow(_) => "wshadow",
@@ -13270,10 +13389,9 @@ impl Interp {
                         }
                     );
                 }
-                // SAFETY: the host Interp (engine root or a boxed sub-realm) is pinned in memory
-                // while any of its sub-realm's objects — including this wrapper — exist, and it
-                // is suspended (not mutably borrowed) whenever sub-realm code runs.
-                let host: &mut Interp = unsafe { &mut *(parent as *mut Interp) };
+                // SAFETY: the parent entered this realm (`enter_shadow` recorded its address)
+                // and is suspended in that call, not mutably borrowed, while code here runs.
+                let host: &mut Interp = unsafe { &mut *parent };
                 for a in args {
                     if matches!(a, Value::Obj(_)) && !a.is_callable() {
                         return Err(self.throw(
@@ -13288,13 +13406,15 @@ impl Interp {
                     let mut out_args = crate::rooting::RootedVec::new();
                     for a in args {
                         if a.is_callable() {
-                            out_args
-                                .push(host.make_wrapped_shadow(realm, a.clone()).map_err(|_| ())?);
+                            out_args.push(
+                                host.make_wrapped_shadow(&realm, a.clone())
+                                    .map_err(|_| ())?,
+                            );
                         } else {
                             out_args.push(a.clone());
                         }
                     }
-                    Ok(host.call(*target, Value::Undefined, &out_args))
+                    Ok(host.call(target, Value::Undefined, &out_args))
                 })();
                 let host_result = match host_result {
                     Ok(result) => result,
@@ -13307,7 +13427,7 @@ impl Interp {
                 };
                 match host_result {
                     Ok(v) if !matches!(v, Value::Obj(_)) => Ok(v),
-                    Ok(v) if v.is_callable() => Ok(self.make_wrapped_cross(realm, parent, v)),
+                    Ok(v) if v.is_callable() => Ok(self.make_wrapped_cross(v)),
                     Ok(_) => {
                         Err(self.throw("TypeError", "a wrapped function returned a non-primitive"))
                     }
@@ -13403,22 +13523,19 @@ impl Interp {
         }
     }
 
-    /// Make a ShadowRealm wrapped function: a caller-realm callable around `target` in `realm`.
-    /// CopyNameAndLength copies the target's `length` (a non-negative integer) and `name` (a string,
-    /// else "") — a throwing `length`/`name` getter propagates.
     /// The namespace object of a loaded module (for ShadowRealm.importValue).
     pub(crate) fn module_namespace(&self, key: &str) -> Option<Value> {
         let key = crate::modules::module_map_key(self.host_job_context, key);
         self.module_recs.get(&key).map(|m| m.ns.clone())
     }
 
-    /// Marshal an evaluate/importValue result out of the shadow realm `realm`.
-    pub(crate) fn make_shadow_result(&mut self, realm: usize, v: Value) -> Result<Value, Abrupt> {
+    /// Marshal an evaluate/importValue result out of the realm of the ShadowRealm object `realm`.
+    pub(crate) fn make_shadow_result(&mut self, realm: &Gc, v: Value) -> Result<Value, Abrupt> {
         self.marshal_from_shadow(realm, v)
     }
 
     /// Marshal one value crossing OUT of a shadow realm into this (host) realm.
-    fn marshal_from_shadow(&mut self, realm: usize, v: Value) -> Result<Value, Abrupt> {
+    fn marshal_from_shadow(&mut self, realm: &Gc, v: Value) -> Result<Value, Abrupt> {
         if !matches!(v, Value::Obj(_)) {
             return Ok(v);
         }
@@ -13431,13 +13548,17 @@ impl Interp {
         ))
     }
 
+    /// Make a ShadowRealm wrapped function: a caller-realm callable around `target` in the realm
+    /// of the ShadowRealm object `realm`. CopyNameAndLength copies the target's `length` (a
+    /// non-negative integer) and `name` (a string, else "") — a throwing `length`/`name` getter
+    /// propagates.
     pub(crate) fn make_wrapped_shadow(
         &mut self,
-        realm: usize,
+        realm: &Gc,
         target: Value,
     ) -> Result<Value, Abrupt> {
         let f = Object::new(Some(self.function_proto.clone()));
-        f.borrow_mut().call = Callable::wrapped_shadow(realm, target.clone());
+        f.borrow_mut().call = Callable::wrapped_shadow(realm.clone(), target.clone());
         // CopyNameAndLength: the Gets run in the realm that owns `target` (its proxy state
         // lives there); an abrupt Get is a TypeError of the calling realm.
         let bad = |i: &mut Interp| {
@@ -13446,23 +13567,17 @@ impl Interp {
                 "wrapped function name/length are not accessible",
             )
         };
-        let (length_r, name_r) = match self.shadow_realms.remove(&realm) {
-            Some(mut sub) => {
-                let (l, n) = {
-                    let _agent = sub.enter_agent();
-                    // HasOwnProperty first (its [[GetOwnProperty]] trap is observable and may
-                    // throw), and both Gets allocate in the target realm when user code runs.
-                    let l = match crate::builtins::has_own_property_trapped(
-                        &mut sub, &target, "length",
-                    ) {
-                        Ok(true) => sub.get_member_key(&target, "length"),
-                        Ok(false) => Ok(Value::Num(0.0)),
-                        Err(e) => Err(Abrupt::Throw(e)),
-                    };
-                    let n = sub.get_member_key(&target, "name");
-                    (l, n)
+        let (length_r, name_r) = match self.enter_shadow(realm) {
+            Some(mut entry) => {
+                let sub = entry.interp();
+                // HasOwnProperty first (its [[GetOwnProperty]] trap is observable and may
+                // throw), and both Gets allocate in the target realm when user code runs.
+                let l = match crate::builtins::has_own_property_trapped(sub, &target, "length") {
+                    Ok(true) => sub.get_member_key(&target, "length"),
+                    Ok(false) => Ok(Value::Num(0.0)),
+                    Err(e) => Err(Abrupt::Throw(e)),
                 };
-                self.shadow_realms.insert(realm, sub);
+                let n = sub.get_member_key(&target, "name");
                 (l, n)
             }
             None => (
@@ -13499,19 +13614,10 @@ impl Interp {
     /// there, and marshal the primitive (or further-wrapped callable) result back.
     fn call_wrapped_shadow(
         &mut self,
-        realm: usize,
+        realm: &Gc,
         target: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        // The sub-interpreter is used in place (Box targets are pinned), so re-entrant calls —
-        // host code invoked from inside the realm calling back into it — work.
-        let subptr = match self.shadow_realms.get_mut(&realm) {
-            Some(b) => &mut **b as *mut Interp,
-            None => return Err(self.throw("TypeError", "the ShadowRealm is no longer available")),
-        };
-        // SAFETY: pinned Box target; any aliasing re-entry is sequenced by the JS call stack.
-        let sub: &mut Interp = unsafe { &mut *subptr };
-        let parent_ptr = self as *mut Interp as usize;
         for a in args {
             if matches!(a, Value::Obj(_)) && !a.is_callable() {
                 return Err(self.throw(
@@ -13523,12 +13629,15 @@ impl Interp {
         // Primitive arguments cross directly; callables wrap as sub-realm functions that
         // re-enter this realm; other objects throw.
         let result = {
-            let _agent = sub.enter_agent();
+            let Some(mut entry) = self.enter_shadow(realm) else {
+                return Err(self.throw("TypeError", "the ShadowRealm is no longer available"));
+            };
+            let sub = entry.interp();
             // Rooted while later wrappers are made (I1).
             let mut inner_args = crate::rooting::RootedVec::new();
             for a in args {
                 if a.is_callable() {
-                    inner_args.push(sub.make_wrapped_cross(realm, parent_ptr, a.clone()));
+                    inner_args.push(sub.make_wrapped_cross(a.clone()));
                 } else {
                     inner_args.push(a.clone());
                 }
@@ -13582,14 +13691,9 @@ impl Interp {
     }
 
     /// Create the sub-realm-side wrapper for a host callable.
-    pub(crate) fn make_wrapped_cross(
-        &mut self,
-        realm: usize,
-        parent: usize,
-        target: Value,
-    ) -> Value {
+    pub(crate) fn make_wrapped_cross(&mut self, target: Value) -> Value {
         let f = Object::new(Some(self.function_proto.clone()));
-        f.borrow_mut().call = Callable::wrapped_cross(realm, parent, target);
+        f.borrow_mut().call = Callable::wrapped_cross(target);
         f.borrow_mut().props.insert(
             "length",
             Property::data(Value::Num(0.0), false, false, true),

@@ -3,8 +3,35 @@
 //! is made here. Choose key removal or a table scan according to the smaller working set.
 
 use crate::fasthash::FastSet;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
+
+thread_local! {
+    static EVICTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks a collector's eviction step on this thread while it lives (see
+/// `Interp::gc_evict_dead_owners`).
+pub(crate) struct Evicting(bool);
+
+impl Evicting {
+    pub(crate) fn enter() -> Self {
+        Self(EVICTING.replace(true))
+    }
+}
+
+impl Drop for Evicting {
+    fn drop(&mut self) {
+        EVICTING.set(self.0);
+    }
+}
+
+/// Whether this thread is in a collector's eviction step, which runs no VM code: what it drops
+/// ends as memory (I5).
+pub(crate) fn evicting() -> bool {
+    EVICTING.get()
+}
 
 pub(crate) fn map<T, S: BuildHasher>(table: &mut HashMap<usize, T, S>, dead: &FastSet<usize>) {
     if table.is_empty() || dead.is_empty() {

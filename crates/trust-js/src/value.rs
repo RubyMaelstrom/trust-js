@@ -1839,13 +1839,13 @@ pub enum Callable {
     User(Rc<UserCallable>) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
     Bound(Box<BoundCallable>) = 4,
-    /// A ShadowRealm wrapped function: `target` is a callable inside the sub-realm identified by
-    /// `realm` (its pointer). Calls marshal primitive args in and the primitive result out.
+    /// A ShadowRealm wrapped function: `target` is a callable inside the realm of the ShadowRealm
+    /// object `realm`, which the wrapper keeps alive. Calls marshal primitive args in and the
+    /// primitive result out.
     WrappedShadow(Rc<WrappedShadowCallable>) = 5,
     /// The inverse: a function living *inside* a ShadowRealm whose `target` is a callable of the
-    /// host realm. `realm` is this sub-realm's key in the host's map and `parent` is the host
-    /// interpreter's stable address (hosts are either the engine root or boxed sub-realms, both
-    /// pinned in memory while any of their sub-realm objects exist).
+    /// host realm. It runs only in its own realm's interpreter, which knows its host (see
+    /// `Interp::shadow_home`).
     WrappedCross(Box<WrappedCrossCallable>) = 6,
     /// An auto-accessor's synthesized getter: reads the private backing field (brand-checked) off
     /// the receiver.
@@ -1921,15 +1921,14 @@ impl Clone for UserCallable {
 
 #[derive(Clone)]
 pub struct WrappedShadowCallable {
-    pub(crate) realm: usize,
+    /// The ShadowRealm object whose realm `target` lives in (a traced edge).
+    pub(crate) realm: Gc,
     pub(crate) target: Box<Value>,
 }
 
 #[derive(Clone)]
 pub struct WrappedCrossCallable {
-    pub(crate) realm: usize,
-    pub(crate) parent: usize,
-    pub(crate) target: Box<Value>,
+    pub(crate) target: Value,
 }
 
 impl Callable {
@@ -1942,7 +1941,7 @@ impl Callable {
         }))
     }
 
-    pub(crate) fn wrapped_shadow(realm: usize, target: Value) -> Callable {
+    pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
         Callable::WrappedShadow(Rc::new(WrappedShadowCallable {
             realm,
             target: Box::new(target),
@@ -1953,12 +1952,8 @@ impl Callable {
         Callable::Bound(Box::new(BoundCallable { target, this, args }))
     }
 
-    pub(crate) fn wrapped_cross(realm: usize, parent: usize, target: Value) -> Callable {
-        Callable::WrappedCross(Box::new(WrappedCrossCallable {
-            realm,
-            parent,
-            target: Box::new(target),
-        }))
+    pub(crate) fn wrapped_cross(target: Value) -> Callable {
+        Callable::WrappedCross(Box::new(WrappedCrossCallable { target }))
     }
 }
 
@@ -2620,7 +2615,10 @@ impl crate::gc_trace::GcTrace for Object {
                     sink.value(argument);
                 }
             }
-            Callable::WrappedShadow(shadow) => sink.value(&shadow.target),
+            Callable::WrappedShadow(shadow) => {
+                sink.object(&shadow.realm);
+                sink.value(&shadow.target);
+            }
             Callable::WrappedCross(cross) => sink.value(&cross.target),
             Callable::NativeData(native) => native.trace_gc(sink),
             Callable::None

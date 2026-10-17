@@ -20,7 +20,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         // The realm lives in a pointer-keyed internal-slot table. Pin the owner against allocator
         // address reuse; the cycle collector evicts the Box before releasing the pin.
         i.gc_pin(&obj);
-        let realm = Interp::new_shadow(i);
+        let realm = Interp::new_shadow(i, &obj);
         i.shadow_realms.insert(p, Box::new(realm));
         // Constructing the isolated implementation heap activates it while its intrinsics are
         // allocated. The constructor itself continues in the caller's surrounding Agent.
@@ -41,15 +41,20 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         .insert("ShadowRealm", Property::builtin(Value::Obj(ctor)));
 }
 
+/// `this` as a ShadowRealm object this interpreter owns the realm of.
+fn this_shadow_realm(i: &Interp, this: &Value) -> Option<Gc> {
+    this.as_obj()
+        .filter(|object| i.shadow_realms.contains_key(&(Gc::as_ptr(object) as usize)))
+        .cloned()
+}
+
 fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = map_ptr(&this)
-        .filter(|p| i.shadow_realms.contains_key(p))
-        .ok_or_else(|| {
-            i.make_error(
-                "TypeError",
-                "ShadowRealm.prototype.evaluate called on a non-ShadowRealm",
-            )
-        })?;
+    let realm = this_shadow_realm(i, &this).ok_or_else(|| {
+        i.make_error(
+            "TypeError",
+            "ShadowRealm.prototype.evaluate called on a non-ShadowRealm",
+        )
+    })?;
     let src = match arg(a, 0) {
         Value::Str(s) => s.to_string(),
         _ => {
@@ -69,11 +74,9 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
         Ok(parsed) => parsed,
         Err(e) => return Err(i.make_error("SyntaxError", e.message)),
     };
-    let subptr = &mut **i.shadow_realms.get_mut(&ptr).unwrap() as *mut Interp;
-    // SAFETY: pinned Box target; re-entrant evaluation is sequenced by the JS call stack.
-    let sub: &mut Interp = unsafe { &mut *subptr };
     let result = {
-        let _agent = sub.enter_agent();
+        let mut entry = i.enter_shadow(&realm).expect("checked above");
+        let sub = entry.interp();
         // PerformShadowRealmEval: like eval code — `var`s instantiate in the realm's global,
         // lexicals live in a fresh declarative environment per evaluation.
         sub.strict = matches!(
@@ -95,7 +98,7 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
     };
     match result {
         // Primitives cross the realm boundary directly; callables wrap; other objects throw.
-        Ok(v) => ab(i.make_shadow_result(ptr, v)),
+        Ok(v) => ab(i.make_shadow_result(&realm, v)),
         // An error thrown inside the shadow realm is re-thrown as a TypeError of the calling realm.
         Err(_) => Err(i.make_error(
             "TypeError",
@@ -108,14 +111,12 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
 /// marshal its `exportName` export out (primitive or wrapped callable).
 fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     // Brand check, specifier ToString, and exportName validation all throw synchronously.
-    let ptr = map_ptr(&this)
-        .filter(|p| i.shadow_realms.contains_key(p))
-        .ok_or_else(|| {
-            i.make_error(
-                "TypeError",
-                "ShadowRealm.prototype.importValue called on a non-ShadowRealm",
-            )
-        })?;
+    let realm = this_shadow_realm(i, &this).ok_or_else(|| {
+        i.make_error(
+            "TypeError",
+            "ShadowRealm.prototype.importValue called on a non-ShadowRealm",
+        )
+    })?;
     let spec = ab(i.to_string(&arg(a, 0)))?.to_string();
     let name = match arg(a, 1) {
         Value::Str(s) => s.to_string(),
@@ -130,13 +131,11 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
         let base = i.import_base.clone();
         let (key, src) = loader(&spec, &base, None)
             .ok_or_else(|| i.make_error("TypeError", format!("module not found: {spec}")))?;
-        let subptr = &mut **i.shadow_realms.get_mut(&ptr).unwrap() as *mut Interp;
-        // SAFETY: pinned Box target (see shadow_evaluate).
-        let sub: &mut Interp = unsafe { &mut *subptr };
-        sub.module_loader = Some(loader);
-        sub.import_base = base;
         let (loaded, ns, value) = {
-            let _agent = sub.enter_agent();
+            let mut entry = i.enter_shadow(&realm).expect("checked above");
+            let sub = entry.interp();
+            sub.module_loader = Some(loader);
+            sub.import_base = base;
             let r = sub.load_module(&key, &src);
             sub.drain_microtasks();
             let ns = sub.module_namespace(&key);
@@ -157,7 +156,7 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
                 "TypeError",
                 format!("importValue: no export named '{name}'"),
             )),
-            Ok(v) => ab(i.make_shadow_result(ptr, v)),
+            Ok(v) => ab(i.make_shadow_result(&realm, v)),
             Err(_) => Err(i.make_error("TypeError", "importValue: export access failed")),
         }
     })(i);
