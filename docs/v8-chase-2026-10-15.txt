@@ -1603,3 +1603,38 @@ only). crystal aarch64, rustc 1.99.0; release = fat LTO unless noted.
   is placement in the other direction: its function differs only in
   address bits.
 - wasm32 acceptance: still blocked (see the S2 deviation).
+
+S4 review fixes (outside review of e31e419b, 2026-10-17)
+-------------------------------------------------------
+- [P2] The page pool kept up to half of a heap that emptied at once.
+  release_page checked the cap (the larger of 64 and the pages in use)
+  as each page went, so the cap shrank with the pages still to go:
+  300 emptied pages left 150 pooled, and nothing trimmed them later.
+  The sweep now pools every page it releases and trims the pool to the
+  cap when it is done. Test spare_pages_stay_capped_after_the_heap_
+  shrinks: a 300-page burst that dies, then one that keeps 100 pages
+  and shrinks to none (64, 100 and 64 pooled; with the release-time
+  check, 150 after the first).
+- [P2] Function-name templates rooted their strings for the heap's
+  lifetime (a7e7da88's GcState.template_strings), so discarded code
+  left its names behind. Each FunctionMaps now owns its roots
+  (value::TemplateRoots, shared by clones), and the heap lists them
+  weakly (GcState.template_roots): it traces the live ones and drops
+  dead entries as it goes. The collection that finds discarded code
+  dead still traces its templates, which die in its sweep, so their
+  strings go at the next collection. Roots are registered only in the
+  heap that built the template, so heap isolation is unchanged. Test
+  discarded_function_templates_release_their_name_strings: 16
+  discarded functions with 64 KiB names; with the roots leaked for the
+  heap's lifetime, live bytes after two collections go from 230,128
+  to 1,278,998.
+- [P2] Sustained-allocation evidence. The validation plan asks at every
+  stage from S2 for post-GC live bytes, allocated against live pages,
+  the pause distribution and total GC %; S2 recorded them, S3 and S4
+  did not. GcStats gains pages_spare (released pages kept for reuse),
+  and TRUST_JS_GC_LOG lines report it. The measurements follow in the
+  next entry (a batch render took the machine when these fixes were
+  ready).
+- Lib suites: --features embed 2153/0/3, embed,gc-heap 1850/0/114 (the
+  two new tests). Clippy clean for both feature sets; gc-heap with
+  heap-bridge checks. The new tests pass at GC stress 1.

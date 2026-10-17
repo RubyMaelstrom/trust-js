@@ -106,9 +106,10 @@ comment/example in the same change.
 - With the `gc-heap` feature (P1): `TRUST_JS_GC_STRESS=N` collects at the first safepoint
   after every N cell allocations and polls at every call (N=1 finds unrooted values; run
   each test in its own process, since a use-after-free can take down the whole run).
-  `TRUST_JS_GC_LOG=1` lines report live cells, live bytes and small-cell pages (64 KiB
-  each) after each collection. `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of
-  the heap's byte budget, for collector tuning. `TRUST_JS_GC_CENSUS=1` adds a
+  `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
+  each) and released pages kept for reuse (`spare`) after each collection.
+  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget, for
+  collector tuning. `TRUST_JS_GC_CENSUS=1` adds a
   `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
   heap at each collection; diagnostic only). `TRUST_JS_GC_WHY=1` records why each cell

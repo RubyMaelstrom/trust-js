@@ -3731,6 +3731,34 @@ fn function_name_templates_serve_only_their_heap() {
     }
 }
 
+/// P1 S4 review (gc-heap): an AST-level template's name strings stay roots only while the
+/// parsed code holding the template lives. Discarded code leaves nothing rooted in the heap.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn discarded_function_templates_release_their_name_strings() {
+    const NAME_BYTES: usize = 64 * 1024;
+    let mut engine = Engine::new();
+    // The collection that finds discarded code dead still traces its templates (they die in
+    // its sweep, with the closures holding the code), so their strings go in the next one.
+    let live_bytes = |engine: &mut Engine| {
+        engine.interp.gc_collect();
+        engine.interp.gc_collect();
+        engine.interp.gc_heap.core.borrow().stats().live_bytes
+    };
+    eval_to_string(&mut engine, "(function warm() {}); 0");
+    let before = live_bytes(&mut engine);
+    for i in 0..16 {
+        let name = format!("f{i}{}", "a".repeat(NAME_BYTES));
+        eval_to_string(&mut engine, &format!("(function {name}() {{}}); 0"));
+    }
+    let after = live_bytes(&mut engine);
+    // Retained templates would keep all 16 names (1 MiB); allow a few to stray stack words.
+    assert!(
+        after < before + 4 * NAME_BYTES,
+        "discarded templates kept their names: live bytes {before} -> {after}"
+    );
+}
+
 /// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
 /// kept only by its own wrapped function, stored inside it, is collected.
 #[cfg(feature = "gc-heap")]

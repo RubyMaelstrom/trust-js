@@ -7763,7 +7763,8 @@ impl Interp {
                 .take_while(|p| p.default.is_none() && !p.rest)
                 .count();
             let name = Value::lstr(func.name.clone().unwrap_or_default());
-            crate::value::pin_template_value(&name);
+            let roots = crate::value::TemplateRoots::new();
+            roots.pin(&name);
             let mut p = crate::value::Props::new();
             p.insert(
                 crate::value::fn_key(0), // "length"
@@ -7798,6 +7799,7 @@ impl Interp {
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
                 heap: crate::value::active_heap_id(),
+                roots,
             })
         });
         let proto_map = &maps.prototype;
@@ -7842,7 +7844,7 @@ impl Interp {
                         );
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
-                            crate::value::pin_template_value(&name_value);
+                            maps.roots.pin(&name_value);
                         }
                         props
                     }

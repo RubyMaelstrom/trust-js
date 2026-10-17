@@ -393,10 +393,11 @@ impl Interp {
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             let stats = heap.core.borrow().stats();
             eprintln!(
-                "[gc-heap] cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} collections={} deferred={}",
+                "[gc-heap] cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}",
                 stats.live_cells,
                 stats.live_bytes,
                 stats.pages_live,
+                stats.pages_spare,
                 stats.collections,
                 stats.deferred_collections
             );

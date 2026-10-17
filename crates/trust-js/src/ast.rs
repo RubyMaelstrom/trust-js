@@ -569,11 +569,12 @@ pub struct FunctionMaps {
     /// later closures clone it instead of running SetFunctionName per instance.
     pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
     /// The Agent heap whose strings the templates hold (their `name` values; see
-    /// `value::active_heap_id`), which keeps them for its lifetime (`value::pin_template_value`).
-    /// gc-heap strings are cells of one heap, and parsed code can outlive an engine or serve
-    /// several: another heap's closures take their own name strings.
+    /// `value::active_heap_id`). gc-heap strings are cells of one heap, and parsed code can
+    /// outlive an engine or serve several: another heap's closures take their own name strings.
     #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
     pub(crate) heap: u64,
+    /// Those strings, roots of `heap` while this template lives.
+    pub(crate) roots: crate::value::TemplateRoots,
 }
 
 /// The FunctionBody of a [`Function`]: the statements that ECMA-262 OrdinaryFunctionCreate

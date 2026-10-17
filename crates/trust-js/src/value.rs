@@ -2488,10 +2488,11 @@ pub(crate) struct GcState {
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     #[cfg(feature = "gc-heap")]
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
-    /// P1 S4: the strings that AST-level templates built in this heap hold (`ast::FunctionMaps`
-    /// names), roots for the heap's lifetime. A template serves only the heap that built it.
+    /// P1 S4: the roots of the AST-level templates built in this heap (see [`TemplateRoots`]),
+    /// held weakly: a template's strings are roots while the template lives. Dead entries are
+    /// dropped as they are traced.
     #[cfg(feature = "gc-heap")]
-    pub(crate) template_strings: RefCell<Vec<crate::lstr::LStr>>,
+    pub(crate) template_roots: RefCell<Vec<std::rc::Weak<TemplateStrings>>>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -2595,9 +2596,17 @@ pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_tr
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
     }
-    for string in heap.template_strings.borrow().iter() {
-        sink.word(string.cell_word());
-    }
+    heap.template_roots
+        .borrow_mut()
+        .retain(|roots| match roots.upgrade() {
+            Some(strings) => {
+                for string in strings.borrow().iter() {
+                    sink.word(string.cell_word());
+                }
+                true
+            }
+            None => false,
+        });
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
@@ -3385,7 +3394,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         #[cfg(feature = "gc-heap")]
         interned_strings: RefCell::default(),
         #[cfg(feature = "gc-heap")]
-        template_strings: RefCell::default(),
+        template_roots: RefCell::default(),
     })
 }
 
@@ -3398,15 +3407,66 @@ pub(crate) fn active_heap_id() -> u64 {
     with_active_gc_heap(|heap| heap.heap_id)
 }
 
-/// Keep `value`, a string an AST-level template holds, for the active heap's lifetime (gc-heap,
-/// where strings are cells of one heap; the default build's are reference-counted).
-pub(crate) fn pin_template_value(value: &Value) {
+/// The strings one AST-level template holds (gc-heap).
+#[cfg(feature = "gc-heap")]
+pub(crate) type TemplateStrings = RefCell<Vec<crate::lstr::LStr>>;
+
+/// The roots of one AST-level template (`ast::FunctionMaps`): under gc-heap, the strings it
+/// holds, cells of the heap that built it. They are roots while the template lives, and the
+/// heap lists them weakly (`GcState::template_roots`), so the strings of discarded code are
+/// collected. Clones share the roots. The default build's strings are reference-counted, and
+/// this is empty.
+#[derive(Clone)]
+pub(crate) struct TemplateRoots {
     #[cfg(feature = "gc-heap")]
-    if let Value::Str(string) = value {
-        with_active_gc_heap(|heap| heap.template_strings.borrow_mut().push(string.clone()));
+    strings: Rc<TemplateStrings>,
+}
+
+impl TemplateRoots {
+    /// Roots for a template the active heap builds.
+    pub(crate) fn new() -> Self {
+        #[cfg(feature = "gc-heap")]
+        {
+            let strings = Rc::new(TemplateStrings::default());
+            with_active_gc_heap(|heap| {
+                heap.template_roots
+                    .borrow_mut()
+                    .push(Rc::downgrade(&strings))
+            });
+            TemplateRoots { strings }
+        }
+        #[cfg(not(feature = "gc-heap"))]
+        TemplateRoots {}
     }
-    #[cfg(not(feature = "gc-heap"))]
-    let _ = value;
+
+    /// Keep `value`, a string the template holds, for the template's lifetime.
+    pub(crate) fn pin(&self, value: &Value) {
+        #[cfg(feature = "gc-heap")]
+        if let Value::Str(string) = value {
+            self.strings.borrow_mut().push(string.clone());
+        }
+        #[cfg(not(feature = "gc-heap"))]
+        let _ = value;
+    }
+
+    /// Bytes allocated beside the template (memory accounting).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        #[cfg(feature = "gc-heap")]
+        return std::mem::size_of::<TemplateStrings>()
+            + 2 * std::mem::size_of::<usize>()
+            + self.strings.borrow().capacity() * std::mem::size_of::<crate::lstr::LStr>();
+        #[cfg(not(feature = "gc-heap"))]
+        0
+    }
+}
+
+impl std::fmt::Debug for TemplateRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut roots = f.debug_struct("TemplateRoots");
+        #[cfg(feature = "gc-heap")]
+        roots.field("strings", &self.strings.borrow().len());
+        roots.finish()
+    }
 }
 
 #[inline]

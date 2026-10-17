@@ -446,6 +446,9 @@ pub(crate) struct GcStats {
     pub(crate) cells_marked: u64,
     pub(crate) cells_swept: u64,
     pub(crate) pages_live: usize,
+    /// Released pages kept for reuse (see `Heap::spare_pages`): memory the heap holds beyond
+    /// its live pages.
+    pub(crate) pages_spare: usize,
     pub(crate) live_cells: usize,
     pub(crate) live_bytes: usize,
     /// Collections that were due but postponed, counted once per pending
@@ -467,7 +470,8 @@ pub(crate) struct Heap {
     free_page_slots: Vec<u32>,
     /// P1 S4: the memory of released pages, kept for reuse. Freeing each empty page to the
     /// allocator and taking a fresh 64 KiB-aligned block for the next fragments the allocator's
-    /// arena; peak memory grew where pages empty out every cycle. Capped by `spare_page_cap`.
+    /// arena; peak memory grew where pages empty out every cycle. Trimmed to `spare_page_cap`
+    /// after each sweep.
     spare_pages: Vec<usize>,
     /// Page number (address >> PAGE_SHIFT; page addresses would leave
     /// FxHash's low bits zero) to index in `pages`.
@@ -679,6 +683,7 @@ impl Heap {
         let mut s = self.stats;
         let pages = self.pages.iter().flatten();
         s.pages_live = pages.clone().count();
+        s.pages_spare = self.spare_pages.len();
         s.live_cells = pages.clone().map(|p| p.live).sum::<usize>() + self.larges.len();
         s.live_bytes = pages.map(|p| p.live * p.cell_size).sum::<usize>()
             + self.larges.values().map(|l| l.size).sum::<usize>();
@@ -1541,6 +1546,7 @@ impl Heap {
                 live_bytes += live * cell_size;
             }
         }
+        self.trim_spare_pages();
         for class in self.classes.iter_mut().flatten() {
             class.avail.clear();
         }
@@ -1597,12 +1603,8 @@ impl Heap {
             class.current = None;
         }
         self.free_page_slots.push(index as u32);
-        if self.spare_pages.len() < self.spare_page_cap() {
-            self.spare_pages.push(page.base);
-        } else {
-            // SAFETY: allocated in new_page with this layout; no cell remains.
-            unsafe { dealloc(page.base as *mut u8, page_layout()) };
-        }
+        // Kept for now; the sweep trims the pool once it knows how many pages stay in use.
+        self.spare_pages.push(page.base);
     }
 
     /// How many released pages to keep: the larger of 64 and the pages in use, so a heap that
@@ -1610,6 +1612,21 @@ impl Heap {
     /// what it no longer needs.
     fn spare_page_cap(&self) -> usize {
         self.page_map.len().max(64)
+    }
+
+    /// Free the spare pages beyond the cap. The sweep calls this after releasing its empty
+    /// pages: a cap checked at each release would shrink with the pages still to go, and keep
+    /// about half of a large heap that emptied at once.
+    fn trim_spare_pages(&mut self) {
+        let cap = self.spare_page_cap();
+        while self.spare_pages.len() > cap {
+            let base = self
+                .spare_pages
+                .pop()
+                .expect("more spare pages than the cap");
+            // SAFETY: a spare page is a `page_layout()` block from new_page; no cell remains.
+            unsafe { dealloc(base as *mut u8, page_layout()) };
+        }
     }
 
     #[cfg(test)]
@@ -2366,6 +2383,47 @@ mod tests {
             .collect();
         assert_eq!(second, first, "the spare pages are reused");
         assert!(fx.heap.spare_pages.is_empty());
+    }
+
+    /// P1 S4 review: after a large heap empties or shrinks, the pool keeps at most the larger of
+    /// 64 pages and the pages still in use, however many pages one sweep released.
+    #[test]
+    fn spare_pages_stay_capped_after_the_heap_shrinks() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let per_page = PAGE_SIZE / 16;
+        // A burst of 300 pages, all garbage.
+        for i in 0..per_page * 300 {
+            fx.alloc_node(0, i as u64);
+        }
+        assert_eq!(fx.heap.stats().pages_live, 300);
+        fx.collect();
+        let stats = fx.heap.stats();
+        assert_eq!((stats.pages_live, stats.pages_spare), (0, 64));
+        fx.collect();
+        assert_eq!(
+            fx.heap.stats().pages_spare,
+            64,
+            "a later collection keeps the cap"
+        );
+        // Another burst of 300 pages, keeping the first cell of each of 100 pages (chained
+        // from one root), then shrinking to nothing.
+        let mut kept = 0u64;
+        for i in 0..per_page * 300 {
+            if i % per_page == 0 && i < per_page * 100 {
+                kept = tagged(fx.alloc_node(kept, i as u64));
+                fx.roots[0] = kept;
+            } else {
+                fx.alloc_node(0, i as u64);
+            }
+        }
+        fx.collect();
+        let stats = fx.heap.stats();
+        assert_eq!((stats.pages_live, stats.pages_spare), (100, 100));
+        fx.roots[0] = 0;
+        fx.collect();
+        let stats = fx.heap.stats();
+        assert_eq!((stats.pages_live, stats.pages_spare), (0, 64));
     }
 
     #[test]

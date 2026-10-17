@@ -862,6 +862,7 @@ impl Visitor {
         }
         if let Some(maps) = function.fn_maps.get() {
             bytes = bytes.saturating_add(size_of::<crate::ast::FunctionMaps>());
+            bytes = bytes.saturating_add(maps.roots.heap_bytes());
             self.props(&maps.function);
             if let Some(prototype_map) = &maps.prototype {
                 self.props(prototype_map);
