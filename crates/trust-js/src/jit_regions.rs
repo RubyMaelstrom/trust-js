@@ -157,7 +157,7 @@ pub(super) extern "C" fn record_local_array_legacy_get() {
 }
 
 /// Register regions entered so far on this thread (tests only).
-#[cfg(all(test, not(feature = "gc-heap")))]
+#[cfg(test)]
 pub(super) fn executed_regions() -> u64 {
     EXECUTED_REGIONS.with(std::cell::Cell::get)
 }
@@ -2340,6 +2340,10 @@ pub(super) fn emit(
     let parameter_aliases =
         entry_kind == NativeEntryKind::BorrowedFrame && chunk.jit_borrowed_parameter_aliases();
     let emission_start = a.checkpoint();
+    // gc-heap: checked effects end in no poll (their virtual operands and private homes are
+    // not materialized); the backedge guard bails to the canonical header to collect.
+    #[cfg(feature = "gc-heap")]
+    let end_polls = a.set_end_polls(false);
 
     let plain = a.new_label();
     let mut saved_work = 0usize;
@@ -3545,7 +3549,7 @@ pub(super) fn emit(
                         FrameEffect::Full => plan.flush_locals(a),
                     }
                     if accumulation {
-                        emit_string_accumulation(a, pc as u32, false);
+                        emit_string_accumulation(a, pc as u32, false, unwind);
                     }
                     #[cfg(test)]
                     if let Op::Tdz(slot) = ops[pc] {
@@ -3713,6 +3717,8 @@ pub(super) fn emit(
     a.bind(private_unwind);
     plan.flush_locals(a);
     a.b(unwind);
+    #[cfg(feature = "gc-heap")]
+    a.set_end_polls(end_polls);
     Emission {
         plain,
         targets,

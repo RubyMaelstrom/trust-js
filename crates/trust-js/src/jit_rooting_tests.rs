@@ -45,7 +45,7 @@ struct Census {
 }
 
 /// `track(value)`: the test follows an object through a weak handle; returns `value`.
-fn track(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+pub(super) fn track(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if let Value::Obj(object) = &value {
         let weak = Gc::downgrade(object);
@@ -72,6 +72,18 @@ fn collect(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
             .collect(),
     };
     CENSUS.with(|all| all.borrow_mut().push(census));
+    let pending = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    let marks: String = pending
+        .iter()
+        .map(|weak| weak_marker(&i.gc_heap, weak))
+        .collect();
+    Ok(Value::str(marks))
+}
+
+/// `marks()`: for each object tracked since the last `collect()` or `marks()`, what marked it
+/// first in the most recent collection, whoever ran it (a poll of generated code, say), without
+/// collecting: the markers of `collect()`.
+pub(super) fn marks(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
     let pending = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
     let marks: String = pending
         .iter()
@@ -129,7 +141,7 @@ fn invoke(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
         .map_err(crate::interpreter::abrupt_value)
 }
 
-fn install(engine: &mut Engine, name: &str, length: usize, f: crate::value::NativeFn) {
+pub(super) fn install(engine: &mut Engine, name: &str, length: usize, f: crate::value::NativeFn) {
     let native = engine.interp.make_native(name, length, f);
     engine
         .interp
@@ -141,7 +153,7 @@ fn install(engine: &mut Engine, name: &str, length: usize, f: crate::value::Nati
 
 /// An engine at `Tier::Jit` (through the test admission) with tier threshold `threshold`, the
 /// test natives, and retention paths recorded for `collect()`'s markers.
-fn jit_engine(threshold: u32) -> Engine {
+pub(super) fn jit_engine(threshold: u32) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(threshold);
@@ -154,6 +166,7 @@ fn jit_engine(threshold: u32) -> Engine {
         .borrow_mut()
         .set_retention_tracing(true);
     install(&mut engine, "collect", 0, collect);
+    install(&mut engine, "marks", 0, marks);
     install(&mut engine, "track", 1, track);
     install(&mut engine, "invoke", 1, invoke);
     PENDING.with(|pending| pending.borrow_mut().clear());
@@ -163,7 +176,7 @@ fn jit_engine(threshold: u32) -> Engine {
 }
 
 /// Evaluate `source` in a frame of its own: no handle it leaves behind is in the test's frame.
-fn run(engine: &mut Engine, source: &str) -> String {
+pub(super) fn run(engine: &mut Engine, source: &str) -> String {
     crate::gc_test::in_frame(|| eval(engine, source))
 }
 
@@ -175,7 +188,7 @@ fn last_census() -> Census {
 /// Run `source` until a round returns through the direct call sequence at least `direct` times:
 /// a concurrent test can exhaust the process-wide call-cache epoch, which sends calls through
 /// the checked helper until their sites refill. Returns the last round's result.
-fn direct_round(engine: &mut Engine, source: &str, direct: usize) -> String {
+pub(super) fn direct_round(engine: &mut Engine, source: &str, direct: usize) -> String {
     let mut result = String::new();
     for _ in 0..100 {
         super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
@@ -189,7 +202,7 @@ fn direct_round(engine: &mut Engine, source: &str, direct: usize) -> String {
 
 /// Once its activations have finished, nothing a program tracked survives a collection: pooled
 /// records, pooled buffers and finished entries hold nothing.
-fn assert_tracked_collectable(engine: &mut Engine) {
+pub(super) fn assert_tracked_collectable(engine: &mut Engine) {
     assert_eq!(
         crate::gc_trace::jit_frames_registered().len(),
         0,

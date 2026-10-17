@@ -189,6 +189,15 @@ mod traced_tests;
 mod rooting_tests;
 
 #[cfg(all(
+    test,
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_poll_tests.rs"]
+mod poll_tests;
+
+#[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -1849,7 +1858,8 @@ pub struct JitCtx {
     pub inline_recompile_at: u32,
     /// Address of the executing thread's live-object counter. Compiled chunks may cross thread
     /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
-    /// when an activation starts rather than embedded while machine code is compiled.
+    /// when an activation starts rather than embedded while machine code is compiled. Under
+    /// gc-heap the heap's due word follows the count (`value::LiveCount`): polls load both.
     pub live_objects: *const i64,
     pub(crate) activation: Option<Box<crate::bytecode::NativeActivation>>,
     /// Native slices borrow VmCoro's authoritative heap state only while running. Ordinary
@@ -2618,6 +2628,11 @@ mod asm {
         /// Immutable scalar original-PC/slot/exit-label plans; no JavaScript owners.
         /// Checked numeric replay uses the same before-read transaction as ordinary entry.
         string_accumulations: Vec<(u32, u16, usize)>,
+        /// gc-heap: the code being emitted is a chunk body's baseline code, where a call to an
+        /// allocating helper ends in the explicit poll (see `super::emit_helper_end_poll`).
+        /// Clear in region code, shared stubs and loose test assemblies.
+        #[cfg(feature = "gc-heap")]
+        end_polls: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -2640,7 +2655,19 @@ mod asm {
                 marks: Vec::new(),
                 mark_stack: Vec::new(),
                 string_accumulations: Vec::new(),
+                #[cfg(feature = "gc-heap")]
+                end_polls: false,
             }
+        }
+        /// gc-heap: set whether helper calls emitted from here on end in the explicit poll (see
+        /// the `end_polls` field); returns the previous setting.
+        #[cfg(feature = "gc-heap")]
+        pub fn set_end_polls(&mut self, on: bool) -> bool {
+            std::mem::replace(&mut self.end_polls, on)
+        }
+        #[cfg(feature = "gc-heap")]
+        pub fn end_polls(&self) -> bool {
+            self.end_polls
         }
         /// Start a profiler attribution region (a no-op unless `TRUST_JS_JIT_MAP` is set).
         pub fn mark_push(&mut self, name: &'static str) {
@@ -2880,6 +2907,20 @@ mod asm {
             );
             let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
             self.emit(0xA900_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
+        }
+        /// ldp xt1, xt2, [xn, #imm] (signed offset, any base register; xn may be xt1 or xt2)
+        #[cfg(feature = "gc-heap")]
+        pub fn ldp_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
+            debug_assert!(
+                imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
+                "AArch64 LDP signed offset out of imm7 range: {imm_bytes}"
+            );
+            debug_assert_ne!(
+                rt1, rt2,
+                "an LDP loading one register twice is unpredictable"
+            );
+            let imm7 = ((imm_bytes / 8) & 0x7f) as u32;
+            self.emit(0xA940_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
         }
         /// ldp xt1, xt2, [xn], #imm (post-index, any base register)
         pub fn ldp_post_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
@@ -4017,9 +4058,10 @@ fn compile_entry(
     // interruption are observed here on the shared amortized cadence. Code that never takes a
     // back-edge (loop-free recursion makes billions of calls) must still be interruptible, since
     // a user agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
-    // established and the operand stack empty, so the helper sees every owned root.
+    // established and the operand stack empty, so the helper sees every owned root. A direct
+    // call `blr`s to the code start: this is its safepoint too.
     if !borrowed_entry {
-        emit_interrupt_poll(&mut a, ilayout, l_unwind);
+        emit_interrupt_poll(&mut a, ilayout, POLL_ENTRY, l_unwind);
     }
     if borrowed_entry {
         // The Rust entry validates the bytecode PC and its settled stack before dispatch.
@@ -4117,11 +4159,15 @@ fn compile_entry(
     let mut region_copy_bytes = 0usize;
     let mut stronger_header_cache = vec![None; ops.len()];
     let in_loop = loop_body_mask(ops);
+    // gc-heap: the body's baseline templates end each call to an allocating helper in the
+    // explicit poll; region emission clears this for its own code.
+    #[cfg(feature = "gc-heap")]
+    a.set_end_polls(true);
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
         a.set_hot(in_loop[pc]);
         if interrupt_targets[pc] {
-            emit_interrupt_poll(&mut a, ilayout, l_unwind);
+            emit_interrupt_poll(&mut a, ilayout, POLL_LOOP, l_unwind);
         }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
@@ -4134,7 +4180,7 @@ fn compile_entry(
             a.b(l_ret_ok);
             continue;
         }
-        emit_string_accumulation(&mut a, pc as u32, false);
+        emit_string_accumulation(&mut a, pc as u32, false, l_unwind);
         // Loop-spanning chain: a fully-chainable, branch-free loop headed here runs with its
         // locals register-resident across the back edge. The plain templates for the region are
         // still emitted below (starting at `plain_h`) as the bail target; the head's canonical
@@ -4754,6 +4800,8 @@ fn compile_entry(
         }
     }
     a.set_hot(false);
+    #[cfg(feature = "gc-heap")]
+    a.set_end_polls(false);
     // Fall off the end: return undefined (compile() always terminates with ReturnUndef, but be
     // safe about it).
     if borrowed_entry {
@@ -6818,6 +6866,11 @@ fn emit_call_inline_marked(
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.bind(done);
+    // gc-heap: every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
+    // call) lands here with its result pushed. A native or intrinsic can allocate after the
+    // call's last safepoint.
+    #[cfg(feature = "gc-heap")]
+    emit_helper_end_poll(a, l_unwind);
 }
 /// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
 /// an immediate in the site's own code, or w8 in the chunk's shared intrinsic stub.
@@ -7694,16 +7747,17 @@ pub(crate) enum DirectCallSite {
     AfterReturn,
 }
 
-/// The direct (shared-ctx) JIT→JIT call sequence, emitted after a guarded cache hit when the
-/// fill-time gates allow it (see [`crate::bytecode::CallIc::direct`]). Everything the layered
-/// path does survives — recursion depth, the amortized gc tick (a due tick falls to the
-/// generic path BEFORE any mutation), the `FnFrame`, constructing/new.target clearing, the
-/// callee's own handler watermark — but the callee runs on the CALLER's `JitCtx` with its
-/// frame fields swapped, entered by a bare `blr`: no helper dispatch, no probe re-read, no
-/// fresh JitCtx, no `run_moved`. Teardown (drops, pool return, frame pop, tail drain) is one
-/// `H_DIRECT_FINISH` call; the sequence then restores every swapped field and either pushes
-/// the return value or routes to the caller's unwind. Falls back to `hit_slow` (the
-/// H_CALL_HIT path) on any gate failure, with NO state mutated.
+/// The direct JIT→JIT call sequence, emitted after a guarded cache hit when the fill-time gates
+/// allow it (see [`crate::bytecode::CallIc::direct`]). Everything the layered path does
+/// survives — recursion depth, the `FnFrame`, constructing/new.target clearing, the callee's
+/// own handler watermark — and its safepoint is the callee's entry poll (see
+/// [`emit_interrupt_poll`]), which runs once the call has committed: the sequence checks no
+/// allocation pressure or gc tick of its own. The callee runs on an activation record popped
+/// from the frame pool, entered by a bare `blr`: no helper dispatch, no probe re-read, no
+/// `run_moved`. Teardown (drops, pool return, frame pop, tail drain) is the chunk's finish
+/// stub; the sequence then restores the interpreter's construct state and either pushes the
+/// return value or routes to the caller's unwind. Falls back to `hit_slow` (the H_CALL_HIT
+/// path) on any gate failure, with NO state mutated.
 ///
 /// Returns false (nothing emitted) when an emission-time precondition fails — the caller then
 /// emits only the probe + H_CALL_HIT form.
@@ -17780,7 +17834,7 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     if idx == H_EXEC {
         // A chain's replay ladder enters with canonical owners before this original read.
         // General CFG emitters also flush all homes at candidate reads before calling here.
-        emit_string_accumulation(a, pc, true);
+        emit_string_accumulation(a, pc, true, l_unwind);
     }
     if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS {
         // A slow path runs rarely and costs far more than a call and return: the sequence
@@ -17789,6 +17843,10 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
         let stub = a.shared_stub(SharedStub::Helper { idx: idx as u8 }.key());
         a.bl_label(stub);
         a.cbnz(1, false, l_unwind);
+        #[cfg(feature = "gc-heap")]
+        if helper_ends_in_poll(idx) {
+            emit_helper_end_poll(a, l_unwind);
+        }
         return;
     }
     a.mov(0, 19);
@@ -17798,15 +17856,98 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     a.blr(16);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
+    #[cfg(feature = "gc-heap")]
+    if helper_ends_in_poll(idx) {
+        emit_helper_end_poll(a, l_unwind);
+    }
+}
+
+/// gc-heap: whether a call to helper `idx` through [`emit_op_helper`] ends in the explicit poll
+/// (see [`emit_helper_end_poll`]). The census of helper families:
+/// - Polled after their call: the ones that can allocate cells without reaching a safepoint
+///   (`gc_check`, `gc_check_amortized` or a call into JavaScript) before they return, or that
+///   reach one only before allocating: `exec` (generic operations), `make_object`,
+///   `make_array`, `make_regexp`, `make_closure`, `object_literal`, `abstract_operation`,
+///   `iteration`, `add_strings`, `get_prop`, `set_prop`, `get_method_elem`/`get_elem`,
+///   `set_elem`, `instanceof` and `reference_op` (natives, host accessors, lazy prototypes,
+///   key and string conversions). Calls (`call`, `call_hit`, `intrinsic`, direct calls) poll
+///   once at their site's end, `new` after its own sequence and `string_accumulation` on its
+///   committed exit, outside this table.
+/// - Not polled: `cond`, `return`, `push_handler`, `pop_handler`, `drop_at`,
+///   `drop_packed_at`, `strict_eq` and `loop_backedge` allocate no cell; `unwind` and
+///   `complete` route a completion already made (their ABIs return a code address);
+///   `direct_finish` runs inside a direct call, whose site polls at its end (a tail call goes
+///   through `gc_check_amortized` first); `slice_op` ends the native slice, and the code that
+///   resumes or receives it polls; `interrupt` is the poll.
+#[cfg(all(
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn helper_ends_in_poll(idx: usize) -> bool {
+    matches!(
+        idx,
+        H_EXEC
+            | H_MAKE_OBJECT
+            | H_MAKE_ARRAY
+            | H_MAKE_REGEXP
+            | H_MAKE_CLOSURE
+            | H_OBJECT_LITERAL
+            | H_ABSTRACT
+            | H_ITERATION
+            | H_ADD_STRINGS
+            | H_GET_PROP
+            | H_SET_PROP
+            | H_GET_ELEM
+            | H_SET_ELEM
+            | H_INSTANCEOF
+            | H_REFERENCE_OP
+    )
+}
+
+/// gc-heap: the explicit poll that ends a call to an allocating helper in a chunk body's
+/// baseline code (the recorded S5 deviation: allocation never collects, I9, and these polls
+/// take the place of "the allocation slow path may collect"). It runs once the helper has
+/// returned: the helper's results then sit in canonical places (operand words below the
+/// returned sp, slots, context fields) and nothing it produced lives elsewhere, since baseline
+/// code keeps no value in a register across a helper call. Region code, whose checked effects
+/// run with virtual operands and private homes, and shared stubs, which region sites share,
+/// emit none (see `Asm::set_end_polls`): a region collects at its canonical header.
+///
+/// Three instructions while the heap's due word is clear (the context's count pointer, the
+/// word, a CBZ). A set word calls `H_INTERRUPT` (`POLL_HELPER_END`), whose `gc_check` collects
+/// and so clears it; a throw from there (the live-object limit's RangeError, a host interrupt)
+/// unwinds from here. The object count is left to the entry and loop polls.
+#[cfg(all(
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_helper_end_poll(a: &mut asm::Asm, l_unwind: usize) {
+    #[cfg(test)]
+    if TEST_NO_END_POLLS.with(std::cell::Cell::get) {
+        return;
+    }
+    if !a.end_polls() {
+        return;
+    }
+    let done = a.new_label();
+    a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
+    a.ldr_imm(9, 9, crate::value::LIVE_DUE_OFF);
+    a.cbz(9, true, done);
+    emit_op_helper(a, H_INTERRUPT, POLL_HELPER_END, l_unwind);
+    a.bind(done);
 }
 
 /// Try only primitive RHS strings. Miss preserves the canonical state and continues the
-/// original operation; success commits the entire region then takes its original continuation.
+/// original operation; success commits the entire region then takes its original continuation
+/// (gc-heap baseline code: after the helper-end poll; a throw from that poll goes to
+/// `l_unwind`).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool) {
+fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool, l_unwind: usize) {
     #[cfg(test)]
     if !replay && crate::bytecode::string_accumulation::TEST_REPLAY_ONLY.with(std::cell::Cell::get)
     {
@@ -17824,13 +17965,114 @@ fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool) {
     a.cmp_reg_x(10, 11);
     a.b_cond(C_NE, ordinary);
     emit_helper(a, H_STRING_ACCUMULATION, pc);
+    #[cfg(feature = "gc-heap")]
+    if a.end_polls() {
+        a.cbnz(1, false, ordinary); // an unchanged miss
+        emit_helper_end_poll(a, l_unwind);
+        a.b(exit);
+        a.bind(ordinary);
+        return;
+    }
+    #[cfg(not(feature = "gc-heap"))]
+    let _ = l_unwind;
     a.cbz(1, false, exit);
     a.bind(ordinary);
+}
+
+/// `H_INTERRUPT`'s immediate: which poll calls it. A loop header's poll (where a region's poll
+/// bail lands too) passes `POLL_LOOP`; under gc-heap a function entry's passes `POLL_ENTRY` and
+/// the end of an allocating helper's call `POLL_HELPER_END`, so tests can count the collections
+/// each kind runs. The default build passes 0 from every poll.
+pub(crate) const POLL_LOOP: u32 = 0;
+pub(crate) const POLL_ENTRY: u32 = if cfg!(feature = "gc-heap") { 1 } else { 0 };
+#[cfg(feature = "gc-heap")]
+pub(crate) const POLL_HELPER_END: u32 = 2;
+
+/// Test-only (gc-heap): what generated code's `H_INTERRUPT` calls on this thread did, indexed by
+/// the caller's `POLL_*` kind: the calls, the collections they ran, and the most bytes the heap
+/// had allocated past its trigger when a call collected.
+#[cfg(all(test, feature = "gc-heap"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PollCensus {
+    pub(crate) calls: [u64; 3],
+    pub(crate) collections: [u64; 3],
+    pub(crate) max_overshoot: usize,
+}
+
+#[cfg(all(test, feature = "gc-heap"))]
+thread_local! {
+    static POLL_CENSUS: std::cell::Cell<PollCensus> = const {
+        std::cell::Cell::new(PollCensus {
+            calls: [0; 3],
+            collections: [0; 3],
+            max_overshoot: 0,
+        })
+    };
+    /// Test-only switch: chunks compiled while it is set end no helper call in a poll (see
+    /// `emit_helper_end_poll`), so a test can watch the entry and loop polls alone.
+    pub(crate) static TEST_NO_END_POLLS: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// The poll census so far on this thread, which then starts over (tests).
+#[cfg(all(test, feature = "gc-heap"))]
+pub(crate) fn take_poll_census() -> PollCensus {
+    POLL_CENSUS.with(|census| census.replace(PollCensus::default()))
+}
+
+/// `jit_interrupt`'s record of one call (tests): its caller, whether it collected, and the
+/// heap's allocated bytes past the trigger before it ran.
+#[cfg(all(test, feature = "gc-heap"))]
+pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize) {
+    POLL_CENSUS.with(|census| {
+        let mut current = census.get();
+        let kind = kind as usize;
+        current.calls[kind] += 1;
+        if collected {
+            current.collections[kind] += 1;
+            current.max_overshoot = current.max_overshoot.max(overshoot);
+        }
+        census.set(current);
+    });
+}
+
+/// Load the live-object count into x9 from its address in x9 (`JitCtx::live_objects`). Under
+/// gc-heap the cell heap's due word follows the count (`value::LiveCount`): one LDP loads both
+/// (the word into x10) and a set word takes `slow`, so the poll sees the heap's byte budget,
+/// stress interval and deferred requests, none of which moves the count. That is one
+/// instruction more than the default build's LDR (a CBNZ) and needs x10, which both polls
+/// reload with `gc_next` next.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_live_count(a: &mut asm::Asm, slow: usize) {
+    #[cfg(feature = "gc-heap")]
+    {
+        const _: () = assert!(crate::value::LIVE_DUE_OFF == 8);
+        a.ldp_base(9, 10, 9, 0);
+        a.cbnz(10, true, slow);
+    }
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        let _ = slow;
+        a.ldr_imm(9, 9, 0);
+    }
 }
 
 /// Generated-loop safepoint. Allocation pressure must not wait for the interrupt divider:
 /// call-free loops can allocate cycles, and deferring optional task collection does not
 /// defer the live-object ceiling. The cold helper sees canonical owned frame roots.
+///
+/// The fast path loads `ctx.interp` and the count, compares the count with `gc_next`, then
+/// bumps the shared interrupt divider (11 instructions); the slow path is `H_INTERRUPT`
+/// (`jit_interrupt`: the host interrupt, then `Interp::gc_check`), taken when the count passes
+/// `gc_next`, every 16384 ticks and, under gc-heap, while the heap's due word is set (see
+/// [`emit_live_count`]: 12 instructions). There `gc_check` collects, which clears the word,
+/// unless collections are suppressed or deferred (a no-GC region, an outstanding borrow, an
+/// interpreter that does not own its heap): then the word stays set and every poll calls the
+/// helper until one can collect. `kind` is `POLL_LOOP` or `POLL_ENTRY`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17838,6 +18080,7 @@ fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool) {
 fn emit_interrupt_poll(
     a: &mut asm::Asm,
     ilayout: &crate::interpreter::InterpLayout,
+    kind: u32,
     l_unwind: usize,
 ) {
     let offset = ilayout.interrupt_poll_tick;
@@ -17847,14 +18090,14 @@ fn emit_interrupt_poll(
         || !ilayout.gc_next.is_multiple_of(8)
         || ilayout.gc_next / 8 >= 4096
     {
-        emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
+        emit_op_helper(a, H_INTERRUPT, kind, l_unwind);
         return;
     }
     let done = a.new_label();
     let slow = a.new_label();
     a.ldr_imm(14, 19, 72); // ctx.interp
     a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
-    a.ldr_imm(9, 9, 0);
+    emit_live_count(a, slow);
     a.ldr_imm(10, 14, ilayout.gc_next as u32);
     a.cmp_reg_x(9, 10);
     a.b_cond(C_GT, slow);
@@ -17865,7 +18108,7 @@ fn emit_interrupt_poll(
     a.logic_imm_w(0, 10, 9, mask);
     a.cbnz(10, false, done);
     a.bind(slow);
-    emit_op_helper(a, H_INTERRUPT, 0, l_unwind);
+    emit_op_helper(a, H_INTERRUPT, kind, l_unwind);
     a.bind(done);
 }
 
@@ -17909,6 +18152,14 @@ fn emit_region_poll_finish(
 /// Private optimized backedges must participate in the same cancellation cadence as
 /// canonical headers. On a due tick materialize and revisit that header without storing
 /// the tick: it performs the poll exactly once with all owned roots visible to helpers.
+///
+/// A general region (`check_allocation`) also bails while the live-object count passes
+/// `gc_next` and, under gc-heap, while the heap's due word is set (+1 instruction, see
+/// [`emit_live_count`]); its checked effects never poll themselves. The bail lands on the
+/// canonical header, whose poll collects. While collections are suppressed or deferred the
+/// word stays set and every backedge bails, but each bail follows a whole iteration run in the
+/// region, and the header re-enters the region after its poll: the loop makes progress at
+/// the cost of a materialization, a helper call and a reload per iteration.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17934,7 +18185,7 @@ fn emit_region_poll_guard(
             return;
         }
         a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, live_objects) as u32);
-        a.ldr_imm(9, 9, 0);
+        emit_live_count(a, bail);
         a.ldr_imm(10, 14, ilayout.gc_next as u32);
         a.cmp_reg_x(9, 10);
         a.b_cond(C_GT, bail);

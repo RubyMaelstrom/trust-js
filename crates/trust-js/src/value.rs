@@ -2766,7 +2766,7 @@ pub(crate) struct GcState {
     major_live: Cell<i64>,
     shapes: RefCell<ShapeTable>,
     array_length_shape: Cell<u32>,
-    live: Cell<i64>,
+    live: LiveCount,
     allocated: Cell<u64>,
     #[cfg(feature = "heap-bridge")]
     pub(crate) central: RefCell<crate::heap::CentralHeap>,
@@ -2802,6 +2802,78 @@ pub(crate) struct GcState {
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
+
+/// The live-object count, which generated code compares with `Interp::gc_next` at its polls.
+#[cfg(not(feature = "gc-heap"))]
+type LiveCount = Cell<i64>;
+
+/// gc-heap: the live-object count and, beside it, the cell heap's due word: 1 exactly while
+/// `gc_core::Heap::collection_due` holds (the byte budget is spent, the stress interval reached
+/// or a request deferred), which the heap keeps current as their only writer (attached by
+/// [`new_gc_heap`]). None of these moves the count. `JitCtx::live_objects` holds the count's
+/// address, so a JIT poll loads both words with one LDP: the count for its `gc_next` compare,
+/// the due word for its slow path (see `jit::emit_live_count`).
+#[cfg(feature = "gc-heap")]
+#[repr(C)]
+pub(crate) struct LiveCount {
+    count: Cell<i64>,
+    due: Cell<u64>,
+}
+
+#[cfg(feature = "gc-heap")]
+impl LiveCount {
+    fn new(count: i64) -> Self {
+        Self {
+            count: Cell::new(count),
+            due: Cell::new(0),
+        }
+    }
+
+    fn get(&self) -> i64 {
+        self.count.get()
+    }
+
+    fn set(&self, count: i64) {
+        self.count.set(count);
+    }
+
+    fn as_ptr(&self) -> *mut i64 {
+        self.count.as_ptr()
+    }
+}
+
+/// Byte offset of the due word from the live-object count (see [`LiveCount`]).
+#[cfg(feature = "gc-heap")]
+pub(crate) const LIVE_DUE_OFF: u32 = 8;
+
+#[cfg(feature = "gc-heap")]
+const _: () = assert!(
+    std::mem::offset_of!(LiveCount, count) == 0
+        && std::mem::offset_of!(LiveCount, due) == LIVE_DUE_OFF as usize
+);
+
+/// Whether the cell heap has a collection due, as generated code reads it (gc-heap tests; see
+/// [`LiveCount`]).
+#[cfg(all(test, feature = "gc-heap"))]
+pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
+    heap.live.due.get() != 0
+}
+
+/// Debug builds: the due word agrees with the core's `collection_due` (gc-heap; checked at
+/// `Interp::gc_check`).
+#[cfg(feature = "gc-heap")]
+pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
+    if cfg!(debug_assertions) {
+        if let Ok(core) = heap.core.try_borrow() {
+            assert!(
+                core.due_word_agrees(),
+                "the due word ({}) disagrees with collection_due ({})",
+                heap.live.due.get(),
+                core.collection_due()
+            );
+        }
+    }
+}
 
 /// The descriptors of a [`GcState`]'s cell kinds.
 #[cfg(feature = "gc-heap")]
@@ -3667,7 +3739,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     #[cfg(feature = "gc-heap")]
     let (core, descs) = new_cell_heap();
-    Rc::new(GcState {
+    let heap = Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
@@ -3679,7 +3751,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         major_live: Cell::new(0),
         shapes: RefCell::new(ShapeTable::new()),
         array_length_shape: Cell::new(SHAPE_EMPTY),
-        live: Cell::new(0),
+        live: LiveCount::new(0),
         allocated: Cell::new(0),
         #[cfg(feature = "heap-bridge")]
         central: RefCell::new(crate::heap::CentralHeap::new()),
@@ -3701,7 +3773,15 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         interned_strings: RefCell::default(),
         #[cfg(feature = "gc-heap")]
         template_roots: RefCell::default(),
-    })
+    });
+    // SAFETY: the word lives in this heap's `GcState`, which the `Rc` keeps at one address for
+    // as long as the core, one of its fields, lives; nothing but the core writes it.
+    #[cfg(feature = "gc-heap")]
+    unsafe {
+        let word = std::ptr::NonNull::from(&heap.live.due);
+        heap.core.borrow_mut().attach_due_word(word);
+    }
+    heap
 }
 
 pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
@@ -3930,7 +4010,8 @@ pub(crate) fn active_shape_transition_count() -> u64 {
 /// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
 /// Both native backends capture this pointer in the shared JIT entry paths. Those
 /// wrappers are also type-checked on fallback targets; obtaining this stable Cell
-/// address does not depend on native code generation or a platform ABI.
+/// address does not depend on native code generation or a platform ABI. Under gc-heap the
+/// cell heap's due word follows the count ([`LiveCount`]).
 pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
 }

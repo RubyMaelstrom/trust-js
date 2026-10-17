@@ -24257,20 +24257,21 @@ unsafe fn jit_callstat(
                 break 'r "gate: callee refcount <= 1";
             }
         }
+        // No allocation-pressure or gc-tick gate: the callee's entry poll is the direct call's
+        // safepoint.
         if i.depth >= i.direct_call_depth {
             break 'r "gate: depth";
-        }
-        if crate::value::heap_live_objects(&i.gc_heap) > i.gc_next {
-            break 'r "gate: allocation pressure";
-        }
-        if i.gc_tick.wrapping_add(1) & crate::interpreter::GC_DIRECT_MAINT_MASK == 0 {
-            break 'r "gate: maintenance tick due";
         }
         if i.fn_frames.len() == i.fn_frames.capacity() {
             break 'r "gate: fn_frames at capacity";
         }
         if i.frame_pool.is_empty() {
             break 'r "gate: frame pool empty";
+        }
+        let callee = &*ic.chunk_raw;
+        let retry_at = callee.inline_retry_at.get();
+        if retry_at != 0 && callee.jit_runs.get().wrapping_add(1) >= retry_at {
+            break 'r "gate: inline retry due";
         }
         break 'r "all gates pass (direct not emitted at site?)";
     };
@@ -26080,8 +26081,10 @@ unsafe fn jit_complete_target(
 }
 
 /// Full loop safepoint reached by the generated tier's interrupt divider or allocation
-/// pressure guard. KeptAlive roots remain intact until the host's job boundary; optional
-/// task collection deferral must not suppress allocation-limit/cycle-collection safepoints.
+/// pressure guard (under gc-heap also the heap's due word, at entry and loop polls and at the
+/// end of allocating helpers' calls; `_imm` names the caller, see `jit::POLL_LOOP`). KeptAlive
+/// roots remain intact until the host's job boundary; optional task collection deferral must
+/// not suppress allocation-limit/cycle-collection safepoints.
 pub(crate) unsafe extern "C" fn jit_interrupt(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
@@ -26089,7 +26092,18 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
-    match i.interrupt_poll_force().and_then(|()| i.gc_check()) {
+    #[cfg(all(test, feature = "gc-heap"))]
+    let (collections, overshoot) = {
+        let core = i.gc_heap.core.borrow();
+        (core.collections(), core.budget_overshoot())
+    };
+    let result = i.interrupt_poll_force().and_then(|()| i.gc_check());
+    #[cfg(all(test, feature = "gc-heap"))]
+    {
+        let collected = i.gc_heap.core.borrow().collections() != collections;
+        crate::jit::record_poll(_imm, collected, overshoot);
+    }
+    match result {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(abrupt) => {
             ctx.error = Some(abrupt);

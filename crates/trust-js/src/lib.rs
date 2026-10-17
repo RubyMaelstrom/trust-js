@@ -915,9 +915,10 @@ impl Engine {
     /// stays refused (S6).
     ///
     /// The engine collects as usual: its JIT activations are roots (S5 step 7; see
-    /// `jit::JitFrame` and `gc_trace::JitFrameRoots`). Generated code's own polls do not see the
-    /// heap's byte budget, stress interval or pending requests yet (step 7b): collections come
-    /// from the safepoints its helpers and the runtime reach.
+    /// `jit::JitFrame` and `gc_trace::JitFrameRoots`), and generated code's entry and loop polls
+    /// and the ends of its allocating helpers' calls collect when the heap's byte budget is
+    /// spent, its stress interval reached or a request deferred (step 7b; see
+    /// `value::LiveCount`).
     #[cfg(all(
         test,
         feature = "gc-heap",

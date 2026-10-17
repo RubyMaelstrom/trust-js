@@ -3633,9 +3633,8 @@ pub struct Interp {
     /// ArrayBuffer data allocated since the last collection, and the amount that triggers the
     /// next one (see [`Interp::note_buffer_allocation`]).
     pub(crate) buffer_gc: BufferPressure,
-    /// Call counter for [`Interp::gc_check_amortized`]. Layered calls poll every 256 calls; direct
-    /// JIT calls compare live objects with `gc_next` exactly and use this only for sparse scope-
-    /// registry maintenance.
+    /// Call counter for [`Interp::gc_check_amortized`]: layered calls poll every 256 calls. Direct
+    /// JIT calls leave it alone; the callee's entry poll is their safepoint.
     pub(crate) gc_tick: u32,
     /// Allocation counter at the preceding host task boundary.
     pub(crate) gc_task_allocated: u64,
@@ -4545,12 +4544,8 @@ pub(crate) fn default_live_object_limit() -> i64 {
 
 /// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
 pub const GC_TRIGGER: i64 = 100_000;
-/// Layered calls check allocation counters once per 256 calls. Direct JIT calls compare object
-/// pressure exactly; this mask also arms a forced full check when that comparison is due.
+/// Layered calls check allocation counters once per 256 calls (see `gc_check_amortized`).
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
-/// Direct calls compare object pressure exactly. This sparser cadence only maintains the scope
-/// weak registry, bounding dead-header slack without forcing frequent Rust transitions.
-pub(crate) const GC_DIRECT_MAINT_MASK: u32 = 4095;
 /// Scope-registry entry count that arms a registry prune.
 const SCOPE_GC_TRIGGER: usize = 65_536;
 
@@ -11312,8 +11307,8 @@ impl Interp {
         }
     }
 
-    /// [`gc_check`] amortized for layered calls. Direct JIT calls perform the cheap live-object
-    /// comparison in machine code and enter this path only when collection is actually due.
+    /// [`gc_check`] amortized for layered calls. A direct JIT call does not come here: its
+    /// callee's entry poll is the call's safepoint (see `jit::emit_interrupt_poll`).
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
@@ -11329,6 +11324,9 @@ impl Interp {
     }
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
+        // gc-heap: the due word JIT polls read is the core's `collection_due` (debug builds).
+        #[cfg(feature = "gc-heap")]
+        crate::value::debug_assert_due_word(&self.gc_heap);
         if self.gc_suppressed != 0 {
             return Ok(());
         }

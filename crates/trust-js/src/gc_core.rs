@@ -32,6 +32,7 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
@@ -496,6 +497,14 @@ pub(crate) struct Heap {
     /// [`Heap::collection_due`] at its own safepoints, where it can supply
     /// roots the heap cannot see (the interpreter's state).
     collect_on_alloc: bool,
+    /// The embedder's copy of [`Heap::collection_due`], as a word that code polls without
+    /// calling into the heap (see [`Heap::attach_due_word`]).
+    due_word: Option<NonNull<Cell<u64>>>,
+    /// Allocated bytes past which [`Heap::alloc`] recomputes the due word: the byte trigger;
+    /// under a stress interval the current total (the allocation count decides, so every
+    /// allocation recomputes); `usize::MAX` once due (no allocation can make it false; marking,
+    /// sweeping and the settings recompute it).
+    due_check_bytes: usize,
     stats: GcStats,
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
@@ -536,6 +545,8 @@ impl Heap {
             stress_every: 0,
             allocs_since_gc: 0,
             collect_on_alloc: true,
+            due_word: None,
+            due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             retention_tracing: false,
             last_parents: FastMap::default(),
@@ -655,6 +666,7 @@ impl Heap {
 
     pub(crate) fn set_stress_every(&mut self, allocs: usize) {
         self.stress_every = allocs;
+        self.refresh_due();
     }
 
     /// See the `collect_on_alloc` field.
@@ -670,6 +682,60 @@ impl Heap {
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
     }
 
+    /// Keep `word` equal to [`Heap::collection_due`] (1 or 0) from now on, for code that polls
+    /// for a collection without calling into the heap (the native JIT's polls; see
+    /// `value::LiveCount`). The heap is the word's only writer. An allocation that spends the
+    /// byte budget or reaches the stress interval sets it ([`Heap::alloc`]), and so does a
+    /// deferred request; marking (which takes the pending request), the end of every sweep (a
+    /// new budget and interval, and any request that arrived meanwhile) and the settings
+    /// recompute it. Nothing else changes what `collection_due` reads.
+    ///
+    /// # Safety
+    /// `word` must stay valid at its address, and written by no one else, for as long as the
+    /// heap lives.
+    pub(crate) unsafe fn attach_due_word(&mut self, word: NonNull<Cell<u64>>) {
+        self.due_word = Some(word);
+        self.refresh_due();
+    }
+
+    /// Collections run so far (without the page walk of [`Heap::stats`]).
+    #[cfg(test)]
+    pub(crate) fn collections(&self) -> u64 {
+        self.stats.collections
+    }
+
+    /// Bytes allocated past the trigger: how far allocation has run beyond the budget.
+    #[cfg(test)]
+    pub(crate) fn budget_overshoot(&self) -> usize {
+        self.allocated_bytes.saturating_sub(self.trigger_bytes)
+    }
+
+    /// Whether the attached due word (if any) agrees with [`Heap::collection_due`]: the
+    /// invariant [`Heap::attach_due_word`] promises, for debug assertions.
+    pub(crate) fn due_word_agrees(&self) -> bool {
+        // SAFETY: `attach_due_word`'s contract.
+        self.due_word
+            .is_none_or(|word| (unsafe { word.as_ref() }.get() != 0) == self.collection_due())
+    }
+
+    /// Recompute the due word and the allocation check after an input of
+    /// [`Heap::collection_due`] changed.
+    #[cold]
+    fn refresh_due(&mut self) {
+        let due = self.collection_due();
+        self.due_check_bytes = if due {
+            usize::MAX
+        } else if self.stress_every > 0 {
+            self.allocated_bytes
+        } else {
+            self.trigger_bytes
+        };
+        if let Some(word) = self.due_word {
+            // SAFETY: `attach_due_word`'s contract.
+            unsafe { word.as_ref() }.set(u64::from(due));
+        }
+    }
+
     /// The next collection is due once allocated bytes exceed
     /// max(`min_bytes`, live × (1 + `growth_percent`/100)), so marking work
     /// per allocated byte stays bounded as the live heap grows.
@@ -677,6 +743,7 @@ impl Heap {
         self.min_trigger_bytes = min_bytes;
         self.growth_percent = growth_percent;
         self.trigger_bytes = min_bytes;
+        self.refresh_due();
     }
 
     pub(crate) fn stats(&self) -> GcStats {
@@ -767,6 +834,11 @@ impl Heap {
         self.stats.allocations += 1;
         self.allocated_bytes = self.allocated_bytes.saturating_add(cost);
         self.allocs_since_gc += 1;
+        // The due word's one compare: an allocation past the budget (any allocation under a
+        // stress interval) recomputes it, out of line.
+        if self.allocated_bytes > self.due_check_bytes {
+            self.refresh_due();
+        }
         ptr
     }
 
@@ -1121,6 +1193,7 @@ impl Heap {
             if native_stack {
                 self.stats.deferred_native_stack += 1;
             }
+            self.refresh_due();
         }
         false
     }
@@ -1131,6 +1204,7 @@ impl Heap {
             "re-entrant GC collection"
         );
         self.control.pending_collect.set(false);
+        self.refresh_due();
         self.stats.collections += 1;
         let mut m = Marker {
             parents: self.retention_tracing.then(FastMap::default),
@@ -1178,6 +1252,8 @@ impl Heap {
         self.trim_spare_pages();
         self.allocs_since_gc = 0;
         self.control.collecting.set(false);
+        // A new budget and interval; a request deferred meanwhile keeps the word set.
+        self.refresh_due();
     }
 
     fn mark_root_ranges(&mut self, m: &mut Marker) {
@@ -1678,6 +1754,7 @@ impl Heap {
         }
         self.large_span = (usize::MAX, 0);
         self.allocated_bytes = 0;
+        self.refresh_due();
     }
 }
 
@@ -1686,6 +1763,8 @@ impl Drop for Heap {
         if !std::thread::panicking() {
             self.debug_assert_quiescent();
         }
+        // The due word belongs to the heap's owner, which may be dropping it too.
+        self.due_word = None;
         self.release_all();
     }
 }
@@ -2878,6 +2957,79 @@ mod tests {
         let _p = fx.heap.alloc(fx.leaf, 16);
         assert!(fx.heap.stats().collections > before, "deferred GC must run");
         black_box(&top);
+    }
+
+    /// The attached due word follows `collection_due` through each of its inputs: the byte
+    /// budget (set by the allocation that spends it, not before), the stress interval, a
+    /// deferred request (also one deferred while a collection runs) and the collections that
+    /// reset them.
+    #[test]
+    fn due_word_tracks_collection_due() {
+        // Declared before the fixture: the word outlives the heap.
+        let word = Box::new(Cell::new(7u64));
+        let mut fx = Fixture::new();
+        // As in an engine heap: allocation never collects.
+        fx.heap.set_collect_on_alloc(false);
+        // SAFETY: `word` outlives the heap and nothing else writes it.
+        unsafe { fx.heap.attach_due_word(NonNull::from(&*word)) };
+        let due = |fx: &Fixture| {
+            assert!(fx.heap.due_word_agrees());
+            word.get() == 1
+        };
+        assert!(!due(&fx), "attaching writes the current state");
+
+        fx.heap.set_heap_growth(4096, 100);
+        let mut allocated = 0;
+        while !fx.heap.collection_due() {
+            assert!(!due(&fx));
+            black_box(fx.alloc_node(0, 0));
+            allocated += 16;
+        }
+        assert!(
+            due(&fx),
+            "the allocation that spends the budget sets the word"
+        );
+        assert!(allocated > 4096 && allocated <= 4096 + 16, "{allocated}");
+        fx.collect();
+        assert!(!due(&fx), "a collection resets the budget");
+
+        fx.heap.set_stress_every(3);
+        for _ in 0..2 {
+            black_box(fx.alloc_node(0, 0));
+            assert!(!due(&fx));
+        }
+        black_box(fx.alloc_node(0, 0));
+        assert!(
+            due(&fx),
+            "the stress interval's last allocation sets the word"
+        );
+        fx.collect();
+        assert!(!due(&fx));
+        fx.heap.set_stress_every(1);
+        black_box(fx.alloc_node(0, 0));
+        assert!(due(&fx));
+        fx.heap.set_stress_every(0);
+        assert!(!due(&fx), "a setting recomputes the word");
+
+        {
+            let _scope = fx.heap.nogc();
+            assert!(!fx.heap.collect_at_safepoint());
+            assert!(due(&fx), "a deferred request sets the word");
+        }
+        assert!(due(&fx), "until a collection takes the request");
+        fx.collect();
+        assert!(!due(&fx));
+
+        // A request deferred while a collection runs survives its sweep.
+        assert!(fx.heap.start_marking(false, &NoClient));
+        {
+            let _scope = fx.heap.nogc();
+            assert!(!fx.heap.start_marking(false, &NoClient));
+        }
+        fx.heap.finish_collection(&|_| false);
+        assert!(due(&fx) && fx.heap.collection_pending());
+        fx.collect();
+        assert!(!due(&fx));
     }
 
     #[test]
