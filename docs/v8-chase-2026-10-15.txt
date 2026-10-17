@@ -2081,3 +2081,86 @@ Step 7, rooting (64fcd6b9, 9ad0012b):
   outputs identical; lib embed 2165/0/3, embed,gc-heap 1883/0/113; the
   rooting and step-6 tests alone at TRUST_JS_GC_STRESS=1, 20 passed in
   10 s; clippy clean in both builds; rustfmt clean.
+
+Step 7b, polls (f61f10fb):
+- The due word: under gc-heap the core keeps a word equal to
+  collection_due() (gc_core::Heap::attach_due_word; the heap is its only
+  writer). Heap::alloc adds one compare against a precomputed threshold
+  (the byte trigger; under a stress interval the current total;
+  usize::MAX once due) and recomputes out of line, so the allocation
+  that spends the budget or reaches the interval sets it. A deferred
+  request sets it; marking, the end of each sweep and the settings
+  recompute it. It sits beside GcState's live-object count
+  (value::LiveCount, repr(C), gc-heap only) and is attached when the
+  heap is created. gc_check asserts in debug builds that it agrees with
+  collection_due().
+- Polls (ARM64, gc-heap): JitCtx::live_objects already holds the count's
+  address, so entry and loop polls load count and word with one LDP and
+  take the H_INTERRUPT slow path while the word is set (12 fast-path
+  instructions; 11 in the default build, unchanged). A general region's
+  backedge guard (11 to 12) bails to its canonical header the same way.
+  A direct call's safepoint is its callee's entry poll: the comments
+  that said the direct call checks a gc tick are corrected, and the
+  callstat mirror gains the inline-retry gate it lacked and loses two
+  gates the sequence never had.
+- While collections are suppressed or deferred, and in a ShadowRealm's
+  interpreter (its root collects), the word stays set and every poll
+  calls the helper. A region then bails on each backedge after a whole
+  iteration and re-enters at the header, so the loop progresses.
+- The recorded deviation, as emitted code: in a chunk body's baseline
+  code each call to an allocating helper ends in an explicit poll once
+  the helper has returned with its results in canonical places (3
+  instructions while the word is clear, else H_INTERRUPT). It is emitted
+  after the call, not run in the Rust helpers, because region checked
+  effects call the same helpers and must not poll; region code and
+  shared stubs emit none. Polled: exec, make_object, make_array,
+  make_regexp, make_closure, object_literal, abstract_operation,
+  iteration, add_strings, get_prop, set_prop, get_elem, set_elem,
+  instanceof and reference_op; every call site once at its end; new
+  after its sequence; string accumulation on its committed exit. Not
+  polled: helpers that allocate no cell (cond, return, the handler
+  pushes and pops, the drops, strict_eq, loop_backedge), that route a
+  completion already made (unwind, complete), that run inside a direct
+  call whose site polls (direct_finish), that leave native code
+  (slice_op), and the poll itself.
+- jit::poll_tests (6, gc-heap) count collections by poll kind. At
+  stress 1, loop-only code collects every iteration: at helper ends (two
+  per iteration), at the loop header with end polls off, and at its
+  header as a region. At stress 1, loop-free recursion through direct
+  calls collects at callee entry polls. Without stress, a string loop
+  collects 82 times in 12,000 iterations on an 11,520-byte budget, with
+  allocation at most 80 bytes past the trigger; the tick divider alone
+  would have run none. A request deferred inside a native is honoured
+  at the next poll of each kind. Operand temporaries survive end-poll
+  collections, marked first by a root. A region loop completes while
+  collections are suppressed or deferred.
+  gc_core::due_word_tracks_collection_due follows the word through each
+  input.
+- The stress child (step 6's and 7's tests at TRUST_JS_GC_STRESS=1) now
+  runs 3,966 collections in about 30 s (1,296 in 10 s before).
+- For step 8:
+  - While the word stays set, a deferred attempt costs two 256 KiB
+    stack scrubs per poll; no engine path is known to defer while
+    JavaScript runs.
+  - Allocation in an acyclic region waits for the first poll after it.
+  - End polls add 3 instructions per allocating-helper call site and per
+    call site; the tripwire measures them.
+  - Deep recursion under stress would gain from scanning records only
+    up to a published stack pointer.
+- Gates (rechecked at f61f10fb):
+  - Code dumps identical to the step-1 baselines (vue 55, react 9, djot
+    160); outputs identical.
+  - Lib suites: embed 2165/0/3, embed,gc-heap 1890/0/113.
+  - The step-6, 7 and 7b tests alone at TRUST_JS_GC_STRESS=1: 26 passed
+    in 29 s.
+  - Clippy clean in both builds; rustfmt clean.
+
+Step 8 runs as three sequential sub-steps:
+- 8a: admits the JIT under gc-heap on aarch64 and retires the test
+  hook. It returns the 38 modules and 31 ignores, giving each count-only
+  test a gc-heap form or keeping it default-only with its reason, and
+  fixes what admission breaks, checked on the fixtures and difftest.
+- 8b: rewrites the JIT-ABI reference-count tests outside those modules
+  as rooting tests.
+- 8c: runs per-test GC stress over the suite with the verifier and the
+  JIT on, with fixes.
