@@ -67,6 +67,12 @@ fn main() {
         .collect();
     let mut engine = Engine::new();
     if let Some(t) = tier {
+        if t.admitted() != t {
+            eprintln!(
+                "trust-js: {t:?} is not available in this build; running {:?}",
+                t.admitted()
+            );
+        }
         engine.set_tier(t);
     }
     if let Some(n) = threshold {

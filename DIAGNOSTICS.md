@@ -66,11 +66,11 @@ comment/example in the same change.
 - `TRUST_JS_TIER_LOG=1` helps diagnose compilation bailouts.
 - `TRUST_JS_JIT_DUMP=<names>` prints the bytecode of chunks whose first four slot names contain
   the text, and `TRUST_JS_JIT_CODEDUMP=<names>[@<offset>]` the finished ARM64 words of the same
-  chunks (hex, one per line; assemble them with `clang --target=aarch64-linux-gnu -c` and
-  `objdump -d`). `@<offset>` also requires the function's source start offset, the `@N` that
-  `TRUST_JS_JIT_MAP=1` prints in its `[jit-map-range]` lines, which singles out one function among
-  many that share names. Any value of `TRUST_JS_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base
-  and length) per compiled chunk.
+  chunks (`*` dumps every chunk; hex, one per line; assemble them with `clang
+  --target=aarch64-linux-gnu -c` and `objdump -d`). `@<offset>` also requires the function's
+  source start offset, the `@N` that `TRUST_JS_JIT_MAP=1` prints in its `[jit-map-range]` lines,
+  which singles out one function among many that share names. Any value of
+  `TRUST_JS_JIT_CODEDUMP` adds a `[jit-map]` line (runtime base and length) per compiled chunk.
 - `TRUST_JS_JIT_NO_NAME_ELEM=1` compiles `LoadName K; <pure key>; GetElem/SetElemDrop` register
   regions with the ordinary LoadName and element templates instead of reading a typed array
   straight from its binding (see `NameElementPlan` in `jit_regions.rs`).

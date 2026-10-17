@@ -1785,3 +1785,26 @@ would reopen S2's safepoint-only collection (I9) and its I1 audit.
 Instead the JIT's allocating helpers end in an explicit poll once their
 result sits in a canonical slot, so I7 is exercised at those points
 under stress without collecting inside allocation (a deviation).
+
+Step 1, honest gates and baselines:
+- difftest: a --check child that dies without being killed for its
+  budget is rerun one tier at a time (--observe, same caps). When the
+  interp oracle completes and bytecode or jit crashes, the seed fails
+  as a crash (saved to the corpus, and replayed as a regression); when
+  the oracle crashes too, or the allocation cap aborts the tier, it
+  stays inconclusive. The crate gains a gc-heap feature and says when
+  its jit tier runs as bytecode. Tier::admitted is public, and the
+  engine binary says when --tier=jit is not available.
+  TRUST_JS_JIT_CODEDUMP=* dumps every chunk.
+- Baselines (no-LTO release builds of this commit unless noted):
+  difftest --seed 7 --count 150 (interp oracle against bytecode and
+  jit): 138 agree, 12 skipped, in both builds (gc-heap's jit tier runs
+  as bytecode). Fixtures at --tier=jit in the default build (fat LTO,
+  af79a759): vue 55, react 9 and djot 160 native compiles, all
+  successful; outputs identical to this commit's default jit and
+  gc-heap bytecode runs. gc-heap compiles none.
+- Code dumps (default build, ASLR off, every chunk; MOVZ/MOVN/MOVK
+  immediates, ADRP pages and branches that leave the chunk masked,
+  since they carry addresses): vue 55 chunks (202,161 words), react 9
+  (28,748), djot 160 (1,331,341), identical run to run. Steps that must
+  leave the default build's emitted code alone are compared with them.

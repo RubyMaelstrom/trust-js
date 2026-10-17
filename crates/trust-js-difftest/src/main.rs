@@ -153,8 +153,8 @@ fn run_tier(src: &str, tier: Tier) -> Outcome {
 fn diverges(src: &str) -> bool {
     let oracle = run_tier(src, Tier::Interp);
     // The tree-walker is the reference: both compiled tiers must match it (Jit exercises the
-    // machine-code templates + register chains on aarch64-macos and degrades to the bytecode VM
-    // elsewhere — still a valid, if redundant, comparison).
+    // machine-code templates + register chains on aarch64 and degrades to the bytecode VM
+    // elsewhere, or where the build does not admit it — still a valid, if redundant, comparison).
     oracle != run_tier(src, Tier::Bytecode) || oracle != run_tier(src, Tier::Jit)
 }
 
@@ -495,6 +495,9 @@ enum Verdict {
     Diverge,
     /// Killed for exceeding the memory/time budget — inconclusive, not a divergence.
     Inconclusive,
+    /// The oracle tier completes on its own but this tier's child crashed (a signal, panic or
+    /// abort): a failure, like a divergence.
+    Crash(Tier),
 }
 
 /// Run `src` in a capped child (`--check`), polling its RSS and enforcing a wall-clock deadline.
@@ -514,9 +517,10 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
             return match status.code() {
                 Some(3) => Verdict::Diverge,
                 Some(0) => Verdict::Agree,
-                // Nonzero-but-not-3 (a crash/abort in BOTH tiers, e.g. a stack overflow on a
-                // deeply-recursive program) is inconclusive, not a divergence.
-                _ => Verdict::Inconclusive,
+                // Nonzero-but-not-3: a crash or abort somewhere in the run. It is inconclusive
+                // when the oracle crashes too (a stack overflow on a deeply recursive program,
+                // the allocation cap); a tier that crashes where the oracle completes fails.
+                _ => classify_crash(exe, tmp),
             };
         }
         // Poll RSS via `ps` (dependency-free); kill if over budget or past the deadline.
@@ -536,6 +540,49 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
             let _ = child.kill();
             let _ = child.wait();
             return Verdict::Inconclusive;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
+/// A `--check` child died: rerun the program (still in `tmp`) one tier at a time (`--observe`,
+/// under the same caps). The first tier that crashes while the oracle completes is the verdict.
+fn classify_crash(exe: &std::path::Path, tmp: &std::path::Path) -> Verdict {
+    if !observe_completes(exe, tmp, "interp") {
+        return Verdict::Inconclusive;
+    }
+    for (name, tier) in [("bytecode", Tier::Bytecode), ("jit", Tier::Jit)] {
+        if !observe_completes(exe, tmp, name) {
+            return Verdict::Crash(tier);
+        }
+    }
+    Verdict::Inconclusive
+}
+
+/// Whether a capped `--observe` child running `tmp` in `tier` exits normally. Running out of
+/// budget (the wall clock, or the allocation cap's abort) counts as completing: it is not a crash.
+fn observe_completes(exe: &std::path::Path, tmp: &std::path::Path, tier: &str) -> bool {
+    let err_path = tmp.with_extension("err");
+    let mut child = std::process::Command::new(exe)
+        .arg("--observe")
+        .arg(tmp)
+        .arg(tier)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let err = std::fs::read_to_string(&err_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&err_path);
+            return status.success() || err.contains("memory allocation of");
+        }
+        if start.elapsed().as_millis() as u64 > TIMEOUT_MS {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&err_path);
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
@@ -586,6 +633,12 @@ fn fuzz_parent(args: Vec<String>) {
     }
     let exe = std::env::current_exe().unwrap();
     let tmp = std::env::temp_dir().join(format!("difftest-{}.js", std::process::id()));
+    if Tier::Jit.admitted() != Tier::Jit {
+        println!(
+            "note: the jit tier is not available in this build and runs as {:?}",
+            Tier::Jit.admitted()
+        );
+    }
 
     // Replay the regression corpus first — old divergences must stay fixed forever.
     if corpus.is_dir() {
@@ -598,9 +651,19 @@ fn fuzz_parent(args: Vec<String>) {
         entries.sort();
         for p in &entries {
             let src = std::fs::read_to_string(p).unwrap();
-            if run_capped(&exe, &src, &tmp) == Verdict::Diverge {
-                eprintln!("REGRESSION: corpus case {} diverges again", p.display());
-                std::process::exit(1);
+            match run_capped(&exe, &src, &tmp) {
+                Verdict::Diverge => {
+                    eprintln!("REGRESSION: corpus case {} diverges again", p.display());
+                    std::process::exit(1);
+                }
+                Verdict::Crash(tier) => {
+                    eprintln!(
+                        "REGRESSION: corpus case {} crashes in {tier:?}",
+                        p.display()
+                    );
+                    std::process::exit(1);
+                }
+                Verdict::Agree | Verdict::Inconclusive => {}
             }
         }
         if !entries.is_empty() {
@@ -614,6 +677,17 @@ fn fuzz_parent(args: Vec<String>) {
         match run_capped(&exe, &generate(s), &tmp) {
             Verdict::Agree => agreed += 1,
             Verdict::Inconclusive => skipped += 1,
+            Verdict::Crash(tier) => {
+                std::fs::create_dir_all(&corpus).unwrap();
+                let path = corpus.join(format!("seed-{s}-crash.js"));
+                std::fs::write(&path, generate(s)).unwrap();
+                eprintln!(
+                    "CRASH at seed {s} in {tier:?} (the interp oracle completes); saved {}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(&tmp);
+                std::process::exit(1);
+            }
             Verdict::Diverge => {
                 eprintln!("DIVERGENCE at seed {s} — minimizing…");
                 let min = minimize_capped(&exe, &generate(s), &tmp);

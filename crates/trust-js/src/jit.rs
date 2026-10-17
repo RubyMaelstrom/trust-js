@@ -4689,9 +4689,9 @@ fn compile_entry(
     // branches, including every word inserted while relaxing long conditional branches.
     let (words, pc_offsets) = a.finish_with_offsets(&pc_labels[..ops.len()]);
     // Debug: `TRUST_JS_JIT_CODEDUMP=<substr>` prints the finished code words (hex, one per line)
-    // of chunks whose leading slot names contain the substring — round-trip them through
-    // `clang -c` + `objdump -d` for a disassembly of exactly what runs. `names@N` selects the
-    // function that starts at source offset N. Any value also prints
+    // of chunks whose leading slot names contain the substring (`*`: every chunk) — round-trip
+    // them through `clang -c` + `objdump -d` for a disassembly of exactly what runs. `names@N`
+    // selects the function that starts at source offset N. Any value also prints
     // a `[jit-map]` line per compiled chunk (runtime base + length), which joins a `sample`
     // profile's raw addresses to chunk-relative offsets.
     let codedump_pat = env_value!("TRUST_JS_JIT_CODEDUMP");
@@ -4709,8 +4709,7 @@ fn compile_entry(
             Some((names, origin)) => (names, origin.parse::<u32>().ok()),
             None => (pat, None),
         };
-        if !names_pat.is_empty()
-            && name.contains(names_pat)
+        if (names_pat == "*" || !names_pat.is_empty() && name.contains(names_pat))
             && origin.is_none_or(|origin| chunk.jit_debug_origin().0 == origin)
         {
             eprintln!("[jit-codedump] fn({name}) {} words", words.len());

@@ -63,8 +63,11 @@ pub enum Tier {
 
 impl Tier {
     /// The tier this build runs for a request: under the P1 gc-heap object model (S2) the JIT
-    /// refuses admission and compiled code stays on the bytecode VM.
-    pub(crate) const fn admitted(self) -> Tier {
+    /// refuses admission and compiled code stays on the bytecode VM. [`Engine::set_tier`]
+    /// applies it; front ends compare it with the request to say when a tier is not available.
+    ///
+    /// [`Engine::set_tier`]: crate::Engine::set_tier
+    pub const fn admitted(self) -> Tier {
         if cfg!(feature = "gc-heap") && matches!(self, Tier::Jit) {
             Tier::Bytecode
         } else {
