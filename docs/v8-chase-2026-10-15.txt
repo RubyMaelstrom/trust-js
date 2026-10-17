@@ -2241,3 +2241,66 @@ it); 3 get count-free forms; 2 stay default-only. The other 27 test the
 runtime, the VM and the collector; they keep their ignores, recorded
 open with the census's proposed forms (most drop a count line or check
 collectability instead).
+
+Step 8b, JIT-path count tests (e02fa8f0, 4c805bb7):
+- The 20 reference-count ignores whose subject is a JIT path, by the
+  census's numbering (tests only; no emitted code changed):
+  - Rooting counterparts: 8 tests stand in for 9 under gc-heap
+    (jit::rooting_tests (10) to (15); callback::tests::long_callback_
+    calls_root_operands_and_cache_weakly; bytecode::osr_tests::osr_entry_
+    operand_prefix_is_a_root). Each runs the path in generated code (the
+    return helper through a context registered with gc_trace::enter_jit_
+    frame), forces a collection inside it, checks that the values under
+    test are marked first by a root (R), reads them back, and checks that
+    nothing it tracked survives once the activation ends. The paths: a
+    self-cycle held only by a slot; the computed-read helper's operand
+    stack and GetMethodElem's receiver; the named-read helper's committed
+    result and its throw path; ctx.ret through jit_return; the committed
+    native call from a warmed call cache entry (also through a throwing
+    callback and a drained tail call); a callback with six arguments into
+    a compiled callee, whose shared cache pins it weakly; an OSR entry's
+    operand prefix. The 8 originals become default-only with a comment
+    naming their counterpart; the OSR original counts nothing and runs in
+    both builds.
+  - Lifted unchanged (stale S2 reasons): 7, with the x86-64 gc-heap
+    ignore where they reach the backend.
+  - Count-free forms: 3 (raw frame words, raw literal factories, the
+    packed native ABI; a lazy prototype's word, the one packed word that
+    still owns under gc-heap, checks jit_drop_packed_at).
+  - Default-only: 2 (the counted arm of the execution-word emitters,
+    whose Traced arm jit::traced_tests covers; count churn of moved
+    native arguments, whose rooting (15) covers).
+- Mutation checks (temporary, not committed), each failing its
+  counterparts: without the records' word scan (10) to (13), (15) and
+  the callback's argument lose R; without this_val's trace, the
+  callback's receiver; without ret's trace, (14); without the borrowed
+  frame's operand range, the OSR prefix; without the native call's
+  root_slice, (15)'s Rust-side leg.
+- Findings:
+  - In generated code a native call's argument is also held by its
+    moved word in the caller's operand stack, which records keep and
+    scan whole, so only a call from Rust shows the boundary's own
+    rooting; (15) checks both.
+  - With a root removed, a test can read freed or reused cells before it
+    asserts; the counterparts assert markers first.
+  - Census corrections: on ARM64 gc-heap the callback cache fills; the
+    throw path's receiver is a precise root only while the getter uses
+    `this` (the counterpart's getters do).
+  - gc_scan_spike::spike_scan_cost_is_linear_and_small's 1 s wall-clock
+    bound failed once on a loaded machine (1.05 s).
+- The other 27 reference-count ignores (runtime, VM and collector
+  subjects) remain ignored, open.
+- Gates (rechecked at 4c805bb7):
+  - Lib suites: embed,gc-heap 2194/0/62 twice (from 2176/0/82: 7
+    lifted, 3 count-free and 8 new tests pass; 10 originals leave the
+    gc-heap build). embed 2165/0/3 in three of four runs. The first, run
+    beside 12 per-test stress processes, failed tests::creation_caches_
+    do_not_trust_a_reused_prototype_address (step 2's test) in the
+    default build: no object took the dead prototype's address within
+    200,000 allocations. It passed 20 runs alone, 48 runs as 12 parallel
+    processes and the three full runs after. The default build's objects
+    come from the process allocator, which the suite's other test threads
+    share, so another test can take the freed address first (inferred;
+    nothing in the engine depends on time). Step 8c isolates it.
+  - The stress child (27 tests, from 19) alone: 29.4 s.
+  - Clippy clean in both builds; rustfmt clean.
