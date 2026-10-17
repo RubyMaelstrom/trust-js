@@ -254,11 +254,10 @@ fn prepared_reference_native_kind_flags_use_compact_binding_size_and_live_import
     assert!(binding.imported);
     binding.set_import_reference(None);
     assert!(!binding.imported);
-    // gc-heap keeps a map's first binding in place, which the native JIT (refused there) does
-    // not read.
-    assert_eq!(
+    // Both builds' entries validate: a Vec, or under gc-heap an InlineVec keeping a map's first
+    // binding in place.
+    assert!(
         VarMap::jit_small_storage_layout().is_some(),
-        !cfg!(feature = "gc-heap"),
         "current Rust small map layout validates"
     );
 }

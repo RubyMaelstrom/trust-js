@@ -12,10 +12,16 @@
 //! that some sites also need for words that are not reference-counted (a lazy prototype).
 //!
 //! Not value ownership: a `PropertyLayout` key buffer is an `Rc<PropertyLayoutData>` in every
-//! build. Its count changes only through the `layout_rc_*` emitters at the end of this file.
+//! build. Its count changes only through the `layout_rc_*` emitters at the end of this file,
+//! which read their own probed offset (`JitRepr::layout_rc_strong_off`) and are emitted in
+//! both builds.
 //!
 //! The few-instruction emitters are `#[inline]`, like the sequences templates used to write in
 //! place; the `exec_*` and `frame_*` emitters stay out of line, like the functions they were.
+//!
+//! Every emitter that takes a [`JitOwnership`] has a `Traced` arm (the gc-heap build, whose
+//! values carry no count). It is unreachable until S5 step 6 defines gc-heap emission: no JIT
+//! code is compiled under gc-heap before then.
 
 use super::*;
 use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
@@ -71,6 +77,9 @@ pub(super) fn exec_clone(
     count: u32,
     slow: usize,
 ) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("exec_clone")
+    };
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
@@ -91,6 +100,9 @@ pub(super) fn exec_drop_shared(
     count: u32,
     slow: usize,
 ) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("exec_drop_shared")
+    };
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
@@ -107,12 +119,18 @@ pub(super) fn exec_drop_shared(
 /// overwrite or pop it. Scratch x9..x11; the helper path clobbers x0..x17 (the frame registers
 /// x19..x22 are preserved).
 pub(super) fn exec_release_word(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("exec_release_word")
+    };
     emit_exec_word_load(a, 9, base, off);
     exec_release_loaded(a, own, base, off);
 }
 
 /// [`exec_release_word`] after its load: x9 already holds the word at `[base + off]`.
 pub(super) fn exec_release_loaded(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("exec_release_loaded")
+    };
     let release = a.new_label();
     let done = a.new_label();
     exec_drop_shared(a, own, 9, 10, 11, release);
@@ -137,7 +155,9 @@ pub(super) fn exec_release_loaded(a: &mut asm::Asm, own: JitOwnership, base: u32
 /// Acquire `n` owners of the payload at `ptr`. Clobbers count; flags are preserved.
 #[inline]
 pub(super) fn rc_inc(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32, n: u32) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("rc_inc")
+    };
     a.ldur(count, ptr, strong_off);
     a.add_imm(count, count, n);
     a.stur(count, ptr, strong_off);
@@ -147,7 +167,9 @@ pub(super) fn rc_inc(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32, 
 /// unrelated work, such as an alias test, between the two). Nothing else changes.
 #[inline]
 pub(super) fn rc_load_count(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("rc_load_count")
+    };
     a.ldur(count, ptr, strong_off);
 }
 
@@ -162,7 +184,9 @@ pub(super) fn rc_check_nonfinal(
     spare: u32,
     slow: usize,
 ) {
-    let JitOwnership::Refcount { .. } = own;
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("rc_check_nonfinal")
+    };
     a.cmp_imm_x(count, spare);
     a.b_cond(C_LS, slow);
 }
@@ -180,6 +204,9 @@ pub(super) fn rc_guard_nonfinal(
     spare: u32,
     slow: usize,
 ) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("rc_guard_nonfinal")
+    };
     rc_load_count(a, own, ptr, count);
     rc_check_nonfinal(a, own, count, spare, slow);
 }
@@ -189,7 +216,9 @@ pub(super) fn rc_guard_nonfinal(
 /// same payload in between). Clobbers count; flags are preserved.
 #[inline]
 pub(super) fn rc_commit_dec(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32, n: u32) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("rc_commit_dec")
+    };
     a.sub_imm(count, count, n);
     a.stur(count, ptr, strong_off);
 }
@@ -199,6 +228,9 @@ pub(super) fn rc_commit_dec(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count
 /// the guard reserved them. Clobbers count; flags are preserved.
 #[inline]
 pub(super) fn rc_dec_nonfinal(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("rc_dec_nonfinal")
+    };
     rc_load_count(a, own, ptr, count);
     rc_commit_dec(a, own, ptr, count, 1);
 }
@@ -208,7 +240,9 @@ pub(super) fn rc_dec_nonfinal(a: &mut asm::Asm, own: JitOwnership, ptr: u32, cou
 /// payload alive without a guard. Clobbers count; flags are preserved.
 #[inline]
 pub(super) fn rc_dec_nonfinal_scaled(a: &mut asm::Asm, own: JitOwnership, ptr: u32, count: u32) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("rc_dec_nonfinal_scaled")
+    };
     a.ldr_imm(count, ptr, strong_off as u32);
     a.sub_imm(count, count, 1);
     a.str_imm(count, ptr, strong_off as u32);
@@ -224,6 +258,9 @@ pub(super) fn rc_release_shared(
     count: u32,
     slow: usize,
 ) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("rc_release_shared")
+    };
     rc_guard_nonfinal(a, own, ptr, count, 1, slow);
     rc_commit_dec(a, own, ptr, count, 1);
 }
@@ -239,7 +276,9 @@ pub(super) fn rc_release_unless_last(
     count: u32,
     last: usize,
 ) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("rc_release_unless_last")
+    };
     a.ldur(count, ptr, strong_off);
     a.cmp_imm_x(count, 1);
     a.b_cond(C_EQ, last);
@@ -287,6 +326,9 @@ pub(super) fn drop_helper_call(
 /// `H_DROP_PACKED_AT` (Rust destruction only). Releasing them after the call rather than at
 /// entry is unobservable. w8 (the completion flag) survives; x3..x7 and x16 are clobbered.
 pub(super) fn frame_surplus_release(a: &mut asm::Asm, own: JitOwnership) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("frame_surplus_release")
+    };
     let done = a.new_label();
     let next_word = a.new_label();
     let helper = a.new_label();
@@ -310,7 +352,9 @@ pub(super) fn frame_surplus_release(a: &mut asm::Asm, own: JitOwnership) {
 /// activation. w8 carries the completion flag from the finish stub and must survive any
 /// last-owner destruction. Clobbers x3, x5 and x6, and x0..x17 on the last-owner path.
 pub(super) fn frame_callee_release(a: &mut asm::Asm, own: JitOwnership, argc: usize) {
-    let JitOwnership::Refcount { strong_off } = own;
+    let JitOwnership::Refcount { strong_off } = own else {
+        ownership_traced("frame_callee_release")
+    };
     a.sub_imm(3, 20, ((argc + 1) * 8) as u32);
     a.ldr_imm(5, 3, 0);
     emit_exec_payload(a, 5, 5);
@@ -359,6 +403,9 @@ fn frame_drop_at(a: &mut asm::Asm, value_reg: u32, helper: usize) {
 /// binding is not reset here: `jit_drop_at` destroys the Value in place without overwriting
 /// it, so the caller must store Undefined over it on every path. Clobbers x0..x17 and NZCV.
 pub(super) fn frame_this_release(a: &mut asm::Asm, own: JitOwnership, cx_this: u32) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("frame_this_release")
+    };
     let this_done = a.new_label();
     let this_drop = a.new_label();
     a.ldrb_imm(9, 10, cx_this);
@@ -388,6 +435,9 @@ pub(super) fn frame_slots_release(
     cx_slots: u32,
     cx_n_slots: u32,
 ) {
+    let JitOwnership::Refcount { .. } = own else {
+        ownership_traced("frame_slots_release")
+    };
     a.ldr_imm(9, 10, cx_slots);
     a.ldr_imm(5, 10, cx_n_slots);
     a.movz(14, LOW_HEAP_TAG, 0);
@@ -464,12 +514,19 @@ pub(super) fn frame_slots_release(
 // PropertyLayout key buffers (an `Rc<PropertyLayoutData>` in every build, never a value owner)
 // ---------------------------------------------------------------------------------------------
 
-/// The strong-count offset of a stored `PropertyLayout` Rc pointer. `jit_layout` verifies the
-/// layout's live count at this offset (the RcBox header an object's `rc_strong_off` also
-/// measures) before it reports the layout valid.
+/// The strong-count offset of a stored `PropertyLayout` Rc pointer
+/// (`JitRepr::layout_rc_strong_off`): `jit_repr` locates it on a live `Rc<PropertyLayoutData>`
+/// in both builds and verifies its count before a layout is reported valid. Sites gate on
+/// [`layout_rc_fits`].
 #[inline]
 fn layout_rc_strong_off(layout: &crate::value::JitLayout) -> i32 {
-    layout.rc_strong_off as i32
+    layout.repr.layout_rc_strong_off as i32
+}
+
+/// Whether the `layout_rc_*` emitters can address the PropertyLayout count with the unscaled
+/// 9-bit LDUR/STUR offset.
+pub(super) fn layout_rc_fits(layout: &crate::value::JitLayout) -> bool {
+    layout.repr.layout_rc_strong_off < 256
 }
 
 /// Branch to `miss` unless the PropertyLayout at `ptr` has another owner, so replacing it

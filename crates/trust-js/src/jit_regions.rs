@@ -3821,7 +3821,7 @@ fn emit_effect(
             a.add_imm(20, 20, 8);
         }
         Op::Const(k)
-            if fast & 128 != 0 && layout.rc_strong_off == 0 && chunk.jit_const_is_str(k) =>
+            if fast & 128 != 0 && layout.ownership().count_first() && chunk.jit_const_is_str(k) =>
         {
             a.mov_imm64(9, chunk.jit_const_ptr(k) as u64);
             a.ldr_imm(11, 9, 8);
@@ -4010,7 +4010,7 @@ fn emit_effect(
         Op::UpdateLocal(slot, kind) if fast & 32 != 0 && slot as u32 * 8 + 8 < 4096 => {
             emit_update_local(a, slot, kind, pc_u32, unwind);
         }
-        Op::Pop if fast & 64 != 0 && layout.valid && layout.rc_strong_off < 256 => {
+        Op::Pop if fast & 64 != 0 && layout.valid && layout.ownership().fits_unscaled() => {
             exec_release_word(a, layout.ownership(), 20, -8);
             a.sub_imm(20, 20, 8);
         }

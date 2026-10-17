@@ -25,11 +25,13 @@ pub(super) fn emit(
     unwind: usize,
     direct_finish: usize,
 ) -> bool {
-    let rc_ok = layout.valid && layout.rc_strong_off < 256;
+    let rc_ok = layout.valid && layout.ownership().fits_unscaled();
     let own = layout.ownership();
     let op = &chunk.jit_ops()[pc];
     match op {
-        Op::TypeofIs(test, negate) if fast & 2 != 0 && rc_ok && layout.rc_strong_off == 0 => {
+        Op::TypeofIs(test, negate)
+            if fast & 2 != 0 && rc_ok && layout.ownership().count_first() =>
+        {
             use crate::value::TypeofTest;
             let slow = a.new_label();
             let done = a.new_label();
@@ -673,7 +675,7 @@ pub(super) fn emit(
         Op::Const(k)
             if fast & 128 != 0
                 && rc_ok
-                && layout.rc_strong_off == 0
+                && layout.ownership().count_first()
                 && chunk.jit_const_is_str(*k) =>
         {
             a.mov_imm64(9, chunk.jit_const_ptr(*k) as u64);

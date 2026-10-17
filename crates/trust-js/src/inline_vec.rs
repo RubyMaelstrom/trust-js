@@ -236,6 +236,49 @@ impl<T, const N: usize> InlineVec<T, N> {
         // SAFETY: the first `len` elements are initialized and now outside the length.
         unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.as_mut_ptr(), len)) };
     }
+
+    /// Where generated code finds this vector's parts ([`crate::value::JitVecLayout::Inline`]):
+    /// the field offsets of the type, checked against live vectors in both states — elements in
+    /// place and spilled to a heap buffer — by reading every word through them and comparing it
+    /// with the safe accessors. `element` makes the probe's elements. `None` if any disagrees.
+    pub(crate) fn probe_jit_layout(
+        mut element: impl FnMut() -> T,
+    ) -> Option<crate::value::JitVecLayout> {
+        use std::mem::offset_of;
+        let data = offset_of!(Self, data);
+        let (len, cap) = (offset_of!(Self, len), offset_of!(Self, cap));
+        let inline = data + offset_of!(Data<T, N>, inline);
+        let heap = data + offset_of!(Data<T, N>, heap);
+        let at = |vec: &Self, off: usize| (vec as *const Self).cast::<u8>().wrapping_add(off);
+        // SAFETY (both reads): `off` is a measured offset of a field of that type within `vec`.
+        let word = |vec: &Self, off: usize| unsafe { at(vec, off).cast::<u32>().read() } as usize;
+        let pointer = |vec: &Self, off: usize| unsafe { at(vec, off).cast::<usize>().read() };
+        let mut in_place = Self::new();
+        in_place.push(element());
+        // Length N + 1 below capacity N + 2, so every word read is distinct.
+        let mut spilled = Self::with_capacity(N + 2);
+        for _ in 0..=N {
+            spilled.push(element());
+        }
+        let in_place_ok = !in_place.spilled()
+            && word(&in_place, len) == in_place.len()
+            && word(&in_place, cap) == 0
+            && std::ptr::eq(at(&in_place, inline), in_place.as_ptr().cast::<u8>());
+        let spilled_ok = spilled.spilled()
+            && word(&spilled, len) == spilled.len()
+            && word(&spilled, cap) == spilled.capacity()
+            && spilled.len() != spilled.capacity()
+            && pointer(&spilled, heap) == spilled.as_ptr() as usize;
+        (in_place_ok && spilled_ok && heap.is_multiple_of(8)).then_some(
+            crate::value::JitVecLayout::Inline {
+                len,
+                cap,
+                inline,
+                heap,
+                inline_capacity: N,
+            },
+        )
+    }
 }
 
 impl<T, const N: usize> Drop for InlineVec<T, N> {

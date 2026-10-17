@@ -516,10 +516,6 @@ mod packed_value_tests {
 
     /// The JIT backends read wide Values as (tag word, payload word) and a Bool as bit 0 of the
     /// payload word. Pin that representation.
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
     #[test]
     fn wide_value_layout_is_tag_word_then_payload_word() {
         assert_eq!(std::mem::size_of::<Value>(), 16);
@@ -543,7 +539,8 @@ mod packed_value_tests {
             },
             1.5
         );
-        // The Obj payload is the stored Rc pointer; the Object sits `obj_from_rc` bytes in.
+        // The Obj payload is the stored handle word (the Rc pointer, or under gc-heap the cell
+        // address); the Object sits `obj_from_rc` bytes in.
         let object = Object::new(None);
         let layout = jit_layout(&object);
         let value = Value::Obj(object.clone());
@@ -1185,40 +1182,49 @@ pub(crate) fn new_symbol_agent() -> SymbolAgent {
     }))
 }
 
-/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph.
-/// Every field is *measured at runtime* against the real types (never hardcoded); the std layouts
-/// that aren't guaranteed — where a `Vec`'s data pointer sits, the `RcBox` header size, the
-/// `Option<Gc>` niche — are located by probing and reported in `valid`. If `valid` is false the
+/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph,
+/// and how the build keeps values alive. Every field is *measured at runtime* against the real
+/// types of the build (never hardcoded); the layouts that aren't guaranteed — where a `Vec`'s or
+/// an `InlineVec`'s words sit, a handle's header size, the `Option<Gc>` niche — are located by
+/// probing and checked against live values, and reported in `valid`. If `valid` is false the
 /// JIT emits no inline caches and everything routes through the checked helper, so a future
 /// libstd layout change degrades performance, never correctness.
 ///
-/// All offsets are relative to the *stored* `Rc` pointer — the value in a `Value::Obj` payload and
-/// in an `Option<Gc>` (proto) field, which points at the `RcBox` header (`{strong, weak, value}`),
-/// NOT at `Rc::as_ptr` (which is the inner `value`, `rcbox_data` bytes further on). The inline
-/// templates only ever have the stored pointer, so measuring from it is what makes them correct.
+/// Object offsets are relative to the *stored* handle word — the value in a `Value::Obj` payload,
+/// a packed object word's payload and an `Option<Gc>` (proto) field. In the default build that
+/// word is the `Rc` pointer, which points at the `RcBox` header (`{strong, weak, value}`), NOT at
+/// [`Gc::as_ptr`] (the inner `RefCell<Object>`, `gc_data_off` bytes further on). Under gc-heap it
+/// is the cell address, where the `RefCell<Object>` starts (`gc_data_off` is 0). The inline
+/// templates only ever have the stored word, so measuring from it is what makes them correct.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct JitLayout {
-    /// Stored `Rc` pointer → the `Object` (through the `RcBox` header and the `RefCell` wrapper).
+    /// Stored handle word → the `Object` (through the RcBox header, if any, and the `RefCell`
+    /// wrapper, whose borrow flag is the first word of a gc-heap object cell).
     pub obj_from_rc: usize,
-    /// Stored `Rc` pointer → `Rc::as_ptr` (the RcBox header size): what the call probes add to
-    /// a Value payload before comparing against a fill-time `Rc::as_ptr` identity.
+    /// Stored handle word → [`Gc::as_ptr`] (the RcBox header size; 0 under gc-heap): what the
+    /// call probes add to a payload before comparing it with a fill-time `Gc::as_ptr` identity.
     pub gc_data_off: usize,
-    /// Stored `Rc` pointer → the strong count (the `RcBox`'s first field).
-    pub rc_strong_off: usize,
+    /// The build's representation facts beyond these offsets ([`JitRepr`]): how values are
+    /// owned, how named fields and binding-map entries hold their elements, a slot memo's width
+    /// and the gc-heap Collection tag, probed once per process.
+    pub(crate) repr: &'static JitRepr,
     pub obj_proto: usize,
     pub obj_props: usize,
     pub obj_exotic: usize,
     pub obj_is_constructor: usize,
     pub obj_extensible: usize,
     pub props_shape: usize,
-    /// Validated named-entry memo for the own `length` key, or NO_SLOT.
+    /// The named-entry slot memo of the own `length` key (`Props::len_slot`, a `SlotMemo`):
+    /// a slot number of `JitRepr::slot_memo_width` bytes, or `JitRepr::slot_memo_none`.
     pub props_len_slot: usize,
     pub props_proto_flag: usize,
     /// `Props::elem_mode` and `Props::has_far` (`Cell<bool>` bytes): an Array's map whose
     /// canonical-index keys all live in element storage.
     pub props_elem_mode: usize,
     pub props_has_far: usize,
-    /// The contiguous instance-field `Vec<Property>` within `Props`.
+    /// The contiguous instance-field storage within `Props` (a `Vec<Property>`, or under
+    /// gc-heap an `InlineVec` holding the first fields in the cell). Generated code reaches its
+    /// elements, length and capacity only as `JitRepr::props_fields` describes.
     pub props_entries: usize,
     /// Nullable stored Rc pointer to the shared key Vec; live keys are its fields-length prefix.
     pub props_layout: usize,
@@ -1283,15 +1289,22 @@ pub struct JitLayout {
     pub obj_ic_plain: usize,
     /// Fail-closed probe for ordinary numeric typed-array backing storage.
     pub native_typed_array: Option<crate::native_typed_array::Layout>,
-    /// `Rc::as_ptr(env)` → the scope's `VarMap` generation counter (through the `RefCell`).
+    /// Scope offsets are relative to [`Env::as_ptr`] (the `RefCell<Scope>`), what generated code
+    /// keeps for an environment. `Env::as_ptr(env)` → the scope's `VarMap` generation counter
+    /// (through the `RefCell`).
     pub scope_gen: usize,
     /// The live fixed-binding-layout identity, zero after structural mutation.
     pub scope_layout: usize,
-    /// Parent `Option<Env>` within `Rc::as_ptr(env)`, with its checked nullable-Rc ABI.
+    /// Parent `Option<Env>` within `Env::as_ptr(env)`: a stored environment handle word, or
+    /// null (the handle's niche; checked live).
     pub scope_parent: usize,
+    /// Stored environment handle word → `Env::as_ptr` (the RcBox header size; 0 under gc-heap,
+    /// where the word is the cell address).
     pub scope_data_off: usize,
     pub scope_parent_valid: bool,
-    /// Guarded repr(Rust) small binding-map arm and its Vec, relative to Rc::as_ptr(env).
+    /// Guarded repr(Rust) small binding-map arm (its tag byte: Small 0, Large 1, Indexed 2) and
+    /// its ordered entries, which the Indexed arm shares, relative to `Env::as_ptr(env)`. The
+    /// entries hold their elements as `JitRepr::scope_small` describes.
     pub scope_small_tag: usize,
     pub scope_small_vec: usize,
     pub scope_binding_stride: usize,
@@ -1320,21 +1333,268 @@ pub struct JitLayout {
     pub key_probe_ok: bool,
     /// `call` within `Object`: [`Callable`]'s discriminant byte at +0, its payload word at +8.
     pub obj_call: usize,
-    /// Stored `Rc<UserCallable>` pointer → its `func`, `env` and `realm` fields.
+    /// `Callable::User`'s payload word (a [`UserFn`]: the `Rc<UserCallable>` pointer, or under
+    /// gc-heap the closure cell's address) → the [`UserCallable`]'s `func`, `env` (a stored
+    /// environment handle word) and `realm` fields.
     pub user_func: usize,
     pub user_env: usize,
     pub user_realm: usize,
-    /// Stored `Rc<Function>` pointer → `Rc::as_ptr` (the AST identity a `CallIc` records).
+    /// Stored `Rc<Function>` pointer → `Rc::as_ptr` (the AST identity a `CallIc` records; the
+    /// AST is reference-counted in every build).
     pub func_data_off: usize,
-    /// `Rc::as_ptr(env)` → `Scope::under_with` (through the `RefCell`).
+    /// `Env::as_ptr(env)` → `Scope::under_with` (through the `RefCell`).
     pub scope_under_with: usize,
-    /// The six fields above matched the live representation, so the JIT's code-keyed call probe
-    /// may read a callee's [`UserCallable`] directly.
+    /// The six fields above matched a live closure's representation, so the JIT's code-keyed
+    /// call probe may read a callee's [`UserCallable`] directly.
     pub call_probe_valid: bool,
     pub valid: bool,
 }
 
-/// Measure [`JitLayout`] against the live types, probing the non-guaranteed std layouts.
+/// How generated code finds a growable sequence's elements, length and capacity, at offsets
+/// from the sequence field: `Props`' named values and a binding map's entries are a `Vec` in the
+/// default build and an `InlineVec` (`crate::inline_vec`) under gc-heap. Measured and checked
+/// against live sequences by [`jit_repr`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JitVecLayout {
+    /// A `Vec`: the 8-byte data pointer, length and capacity words. The elements are always
+    /// behind the data pointer.
+    Vec { ptr: usize, len: usize, cap: usize },
+    /// An `InlineVec<T, N>`: 4-byte (`u32`) length and capacity words. Exactly while the
+    /// capacity word is 0 the elements are in place, from `inline`, with room for
+    /// `inline_capacity` (N) of them; otherwise the 8-byte word at `heap` points at a heap buffer
+    /// holding the capacity word's count (the pointer takes the place of the in-place elements,
+    /// so the two may overlap).
+    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+    Inline {
+        len: usize,
+        cap: usize,
+        inline: usize,
+        heap: usize,
+        inline_capacity: usize,
+    },
+}
+
+/// Locate a `Vec`'s data pointer, length and capacity words by value, each the only word that
+/// holds it. The caller makes the three distinct (a length below the capacity).
+pub(crate) fn probe_vec_layout<T>(vec: &Vec<T>) -> Option<JitVecLayout> {
+    if vec.len() >= vec.capacity() || !std::mem::size_of::<Vec<T>>().is_multiple_of(8) {
+        return None;
+    }
+    let words = unsafe {
+        std::slice::from_raw_parts(
+            vec as *const Vec<T> as *const usize,
+            std::mem::size_of::<Vec<T>>() / 8,
+        )
+    };
+    let only = |value: usize| {
+        let mut at = words.iter().enumerate().filter(|(_, w)| **w == value);
+        match (at.next(), at.next()) {
+            (Some((index, _)), None) => Some(index * 8),
+            _ => None,
+        }
+    };
+    Some(JitVecLayout::Vec {
+        ptr: only(vec.as_ptr() as usize)?,
+        len: only(vec.len())?,
+        cap: only(vec.capacity())?,
+    })
+}
+
+/// The build's representation facts that generated code depends on beyond [`JitLayout`]'s
+/// offsets. They are facts of the build's types, so [`jit_repr`] probes them on live values once
+/// per process, and every `JitLayout` refers to them. Kept out of line, they leave the size of a
+/// `JitLayout` unchanged: each `Interp` caches one inline, and generated code reads the
+/// interpreter's fields at probed offsets.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct JitRepr {
+    /// How generated code keeps a String/Symbol/Object payload alive: default build, one strong
+    /// count per owner at an offset of the stored word (located and verified on a live object);
+    /// gc-heap, traced (no count). Read through [`JitLayout::ownership`].
+    pub(crate) ownership: crate::jit::JitOwnership,
+    /// Stored PropertyLayout Rc pointer → its strong count. Key layouts are
+    /// `Rc<PropertyLayoutData>` in every build: located and verified on a live layout,
+    /// independently of how values are owned.
+    pub(crate) layout_rc_strong_off: usize,
+    /// How the instance-field storage at `JitLayout::props_entries` holds its `Property` values.
+    pub(crate) props_fields: JitVecLayout,
+    /// Where a small (or indexed) binding map keeps its ordered entries, and how: a `Vec`, or
+    /// under gc-heap an `InlineVec` keeping the first binding in the environment cell. The
+    /// source of `JitLayout`'s `scope_small_*` fields; `None` when the probe disagreed.
+    pub(crate) scope_small: Option<crate::interpreter::JitBindingStorage>,
+    /// The width of a `SlotMemo` in bytes (4 in the default build, 2 under gc-heap) and its
+    /// "no slot" value (the width's all-ones), both measured on live memos. A width other than
+    /// 2 or 4 bytes reports 0.
+    pub(crate) slot_memo_width: usize,
+    pub(crate) slot_memo_none: u32,
+    /// `Exotic::Collection`'s discriminant byte under gc-heap (a Map's or Set's data in the
+    /// cell of an otherwise ordinary object); `None` in the default build, which has no such
+    /// variant.
+    pub(crate) exotic_collection_tag: Option<u8>,
+    /// Whether the tags [`Exotic::is_ordinary`] accepts form one range from
+    /// `JitLayout::exotic_none_tag`: `exotic_none_tag ..= exotic_collection_tag` (or None's tag
+    /// alone), so one unsigned range test can admit them. Probed: Collection's tag must directly
+    /// follow None's.
+    pub(crate) exotic_ordinary_contiguous: bool,
+    /// The ownership, PropertyLayout count, named-field and Collection-tag probes held: a
+    /// `JitLayout` is valid only if they did.
+    pub(crate) valid: bool,
+}
+
+/// The build's [`JitRepr`], probed on live values on first use.
+pub(crate) fn jit_repr() -> &'static JitRepr {
+    static REPR: std::sync::OnceLock<JitRepr> = std::sync::OnceLock::new();
+    REPR.get_or_init(probe_jit_repr)
+}
+
+fn probe_jit_repr() -> JitRepr {
+    use std::mem::offset_of;
+    // Default build: one strong count per owner, located in the RcBox header of a live object as
+    // an extra owner comes and goes. gc-heap: the collector traces; there is no count.
+    #[cfg(not(feature = "gc-heap"))]
+    let (ownership, ownership_ok) = {
+        let object = Object::new(None);
+        let stored = unsafe { *(&object as *const Gc as *const usize) };
+        match probe_strong_count(
+            stored,
+            Gc::as_ptr(&object) as usize,
+            || Gc::strong_count(&object),
+            || object.clone(),
+        )
+        .and_then(|strong_off| i32::try_from(strong_off).ok())
+        {
+            Some(strong_off) => (crate::jit::JitOwnership::Refcount { strong_off }, true),
+            None => (crate::jit::JitOwnership::Refcount { strong_off: 0 }, false),
+        }
+    };
+    #[cfg(feature = "gc-heap")]
+    let (ownership, ownership_ok) = (crate::jit::JitOwnership::Traced, true);
+
+    // Key layouts are `Rc<PropertyLayoutData>` in every build (never a value owner): locate their
+    // strong count on a live one, as for an object's in the default build.
+    let key_layout = Rc::new(PropertyLayoutData::new(vec![Rc::<str>::from("key")]));
+    let layout_rc_strong_off = probe_strong_count(
+        unsafe { *(&key_layout as *const PropertyLayout as *const usize) },
+        Rc::as_ptr(&key_layout) as usize,
+        || Rc::strong_count(&key_layout),
+        || key_layout.clone(),
+    );
+
+    // Named fields: a Vec<Property> in the default build, its words located by value (capacity 3,
+    // length 1); under gc-heap an InlineVec keeping the first INLINE_NAMED_SLOTS in the cell,
+    // probed in place and spilled.
+    #[cfg(not(feature = "gc-heap"))]
+    let props_fields = {
+        let mut fields: Fields = Vec::with_capacity(3);
+        fields.push(Property::plain(Value::Num(0.0)));
+        probe_vec_layout(&fields)
+    };
+    #[cfg(feature = "gc-heap")]
+    let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
+
+    // gc-heap: a Map's or Set's data is `Exotic::Collection`, declared right after `None` so
+    // that `Exotic::is_ordinary` is one tag range. Its tag must be payload-independent and
+    // distinct from every admitted tag, or no tag guard is sound: fail closed.
+    let tag = |exotic: &Exotic| unsafe { *(exotic as *const Exotic as *const u8) };
+    let none_tag = tag(&Exotic::None);
+    #[cfg(feature = "gc-heap")]
+    let (exotic_collection_tag, collection_ok) = {
+        use crate::ordered_collection::{CollectionKind, OrderedCollection};
+        let map = Exotic::Collection(Box::new(OrderedCollection::new(CollectionKind::Map)));
+        let set = Exotic::Collection(Box::new(OrderedCollection::new(CollectionKind::Set)));
+        let collection = tag(&map);
+        let others = [
+            none_tag,
+            tag(&Exotic::Array),
+            tag(&Exotic::str_wrap("".into())),
+            tag(&Exotic::NumWrap(0.0)),
+            tag(&Exotic::BoolWrap(false)),
+        ];
+        (
+            Some(collection),
+            tag(&set) == collection && !others.contains(&collection),
+        )
+    };
+    #[cfg(not(feature = "gc-heap"))]
+    let (exotic_collection_tag, collection_ok) = (None::<u8>, true);
+    let exotic_ordinary_contiguous = collection_ok
+        && exotic_collection_tag.is_none_or(|tag| none_tag.checked_add(1) == Some(tag));
+
+    // A SlotMemo's width and "no slot" value, read back from live memos (a `Props` memo cell is
+    // a transparent `Cell<SlotMemo>`).
+    let slot_memo_width = std::mem::size_of::<SlotMemo>();
+    let memo_props = Props::new();
+    let memo_word = |memo: SlotMemo| {
+        memo_props.len_slot.set(memo);
+        let at =
+            (&memo_props as *const Props as *const u8).wrapping_add(offset_of!(Props, len_slot));
+        match slot_memo_width {
+            2 => Some(u32::from(unsafe { at.cast::<u16>().read() })),
+            4 => Some(unsafe { at.cast::<u32>().read() }),
+            _ => None,
+        }
+    };
+    let slot_memo_none = memo_word(SlotMemo::NONE).unwrap_or(0);
+    let slot_memo_ok = memo_word(SlotMemo::of(5)) == Some(5)
+        && SlotMemo::of(5).slot() == Some(5)
+        && SlotMemo::NONE.slot().is_none()
+        && u64::from(slot_memo_none) + 1 == 1u64 << (8 * slot_memo_width);
+
+    JitRepr {
+        ownership,
+        layout_rc_strong_off: layout_rc_strong_off.unwrap_or(0),
+        props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
+            ptr: 0,
+            len: 0,
+            cap: 0,
+        }),
+        scope_small: crate::interpreter::VarMap::jit_small_storage_layout(),
+        slot_memo_width: if slot_memo_ok { slot_memo_width } else { 0 },
+        slot_memo_none,
+        exotic_collection_tag,
+        exotic_ordinary_contiguous,
+        valid: ownership_ok
+            && layout_rc_strong_off.is_some()
+            && props_fields.is_some()
+            && collection_ok,
+    }
+}
+
+/// Locate the strong count of a reference-counted allocation from its stored pointer `stored`,
+/// whose data starts at `data`: the one header word that reads `count()` and follows it while an
+/// extra owner made by `owner` comes and goes. `None` unless exactly one word does.
+fn probe_strong_count<T>(
+    stored: usize,
+    data: usize,
+    count: impl Fn() -> usize,
+    owner: impl FnOnce() -> T,
+) -> Option<usize> {
+    let header = data.checked_sub(stored)?;
+    if !header.is_multiple_of(8) || header > 64 {
+        return None;
+    }
+    // SAFETY: the header words lie between the stored pointer and the live allocation's data.
+    let words = || -> Vec<usize> {
+        (0..header)
+            .step_by(8)
+            .map(|off| unsafe { *((stored + off) as *const usize) })
+            .collect()
+    };
+    let (before, held) = (words(), count());
+    let extra = owner();
+    let (during, counted) = (words(), count());
+    drop(extra);
+    let after = words();
+    let mut moved = (0..before.len()).filter(|&i| {
+        before[i] == held && during[i] == counted && after[i] == held && counted == held + 1
+    });
+    match (moved.next(), moved.next()) {
+        (Some(word), None) => Some(word * 8),
+        _ => None,
+    }
+}
+
+/// Measure [`JitLayout`] against the live types of the build, probing the non-guaranteed
+/// layouts and checking them on live values.
 pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     use std::mem::offset_of;
     // Rc<str> fat-pointer probe (word order and RcBox data offset are not std-guaranteed): a
@@ -1352,41 +1612,35 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             (0, 0, 0, false)
         }
     };
-    let as_ptr = Gc::as_ptr(sample) as usize; // → the RefCell<Object> (RcBox value field)
-    let stored_word = unsafe { *(sample as *const Gc as *const usize) };
-    let gc_data_off = as_ptr.wrapping_sub(stored_word);
+    // The stored handle word — a `Value::Obj` payload, a packed object word's payload, an
+    // `Option<Gc>` (proto) field — is the RcBox pointer in the default build (`gc_data_off`
+    // bytes before `Gc::as_ptr`, with the strong count in that header) and the cell address
+    // under gc-heap (`Gc::as_ptr` itself: the cell starts with the RefCell<Object>). Every
+    // object offset is measured from it, through either header and the RefCell wrapper.
+    let stored = unsafe { *(sample as *const Gc as *const usize) };
+    let as_ptr = Gc::as_ptr(sample) as usize; // the RefCell<Object>
     let obj_addr = &*sample.borrow() as *const Object as usize;
-    let refcell_value = obj_addr - as_ptr;
-
-    // The *stored* Rc pointer — what a Value::Obj payload / Option<Gc> holds — is the RcBox base
-    // (strong count at its start), `rcbox_data` bytes before `Rc::as_ptr`. Read it out of an
-    // Option<Gc> (whose Some variant is exactly the raw pointer, None = null via the niche).
+    let gc_data_off = as_ptr.wrapping_sub(stored);
+    let obj_from_rc = obj_addr.wrapping_sub(stored);
+    // An Option<Gc> (a proto field) holds exactly the stored word, and None is null (the
+    // handle's non-null niche).
     let some_proto: Option<Gc> = Some(sample.clone());
-    let stored = unsafe { *(&some_proto as *const Option<Gc> as *const usize) };
     let none_proto: Option<Gc> = None;
-    let none_word = unsafe { *(&none_proto as *const Option<Gc> as *const usize) };
-    let niche_ok = none_word == 0 && as_ptr >= stored;
-    let rcbox_data = as_ptr - stored; // RcBox header (strong+weak) before the value
-    let obj_from_rc = rcbox_data + refcell_value; // stored ptr → Object
-    let rc_strong_off = 0usize; // strong count is the RcBox's first field
-                                // Verify: the strong count sits at `stored + rc_strong_off` and reads the live count.
-    let strong_ok =
-        unsafe { *((stored + rc_strong_off) as *const usize) } == Gc::strong_count(sample);
+    let niche_ok = std::mem::size_of::<Option<Gc>>() == std::mem::size_of::<usize>()
+        && unsafe { *(&some_proto as *const Option<Gc> as *const usize) } == stored
+        && unsafe { *(&none_proto as *const Option<Gc> as *const usize) } == 0
+        && stored <= as_ptr
+        && as_ptr <= obj_addr;
+    let repr = jit_repr();
 
     // Vec data-pointer and length words (RawVec layout is not guaranteed — locate them by value).
     // Capacity 3 / length 1 makes the three words distinguishable.
     let mut v: Vec<Property> = Vec::with_capacity(3);
     v.push(Property::plain(Value::Num(0.0)));
-    let vptr = v.as_ptr() as usize;
-    let vwords = unsafe {
-        std::slice::from_raw_parts(
-            &v as *const Vec<_> as *const usize,
-            std::mem::size_of::<Vec<Property>>() / 8,
-        )
+    let (vec_ptr_off, vec_len_off, vec_cap_off) = match probe_vec_layout(&v) {
+        Some(JitVecLayout::Vec { ptr, len, cap }) => (Some(ptr), Some(len), Some(cap)),
+        _ => (None, None, None),
     };
-    let vec_ptr_off = vwords.iter().position(|&w| w == vptr).map(|i| i * 8);
-    let vec_len_off = vwords.iter().position(|&w| w == 1).map(|i| i * 8);
-    let vec_cap_off = vwords.iter().position(|&w| w == 3).map(|i| i * 8);
     let mut keys = Vec::with_capacity(3);
     keys.push(Rc::<str>::from("key"));
     let key_layout = Some(Rc::new(PropertyLayoutData::new(keys)));
@@ -1406,11 +1660,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     // its first-field key Vec. Measure this path instead of relying on the Rust struct layout.
     let layout_data_off = (&key_layout.as_ref().unwrap().keys as *const Vec<Rc<str>> as usize)
         .wrapping_sub(layout_word);
+    // (The layout's strong count is `JitRepr::layout_rc_strong_off`.)
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = layout_data_off < 256
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
-        && unsafe { *((layout_word + rc_strong_off) as *const usize) }
-            == Rc::strong_count(key_layout.as_ref().unwrap())
         && unsafe { *(&empty_layout as *const Option<PropertyLayout> as *const usize) } == 0;
     let object = sample.borrow();
     let heap_word = unsafe { *(&object.gc_heap as *const GcHeap as *const usize) };
@@ -1519,8 +1772,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         *(&Exotic::str_wrap("x".into()) as *const Exotic as *const u8)
     });
 
-    // Scope offsets for the inline LoadName template: Rc::as_ptr → RefCell<Scope> value →
-    // Scope.vars → VarMap generation. The RefCell value offset is probed on a live scope.
+    // Scope offsets for the inline LoadName template, relative to `Env::as_ptr` (the
+    // RefCell<Scope>) → Scope.vars → VarMap generation. The RefCell value offset is probed on a
+    // live scope; a stored environment handle word is the RcBox pointer (default build) or the
+    // cell address (gc-heap), `scope_data_off` bytes before `Env::as_ptr`.
     let probe_env = crate::interpreter::new_scope(None);
     let scope_addr = {
         let b = probe_env.borrow();
@@ -1531,11 +1786,17 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let scope_data_off = (Env::as_ptr(&probe_env) as usize).wrapping_sub(scope_stored);
     let parent_some = Some(probe_env.clone());
     let parent_none: Option<Env> = None;
+    let scope_parent = scope_refcell + offset_of!(crate::interpreter::Scope, parent);
+    // A live child's parent field holds the parent's stored word, at the measured offset.
+    let probe_child = crate::interpreter::new_scope(Some(probe_env.clone()));
+    let child_parent =
+        unsafe { *((Env::as_ptr(&probe_child) as usize + scope_parent) as *const usize) };
     let scope_parent_valid = std::mem::size_of::<Option<Env>>() == std::mem::size_of::<usize>()
         && scope_data_off < 256
         && unsafe { *(&parent_some as *const Option<Env> as *const usize) } == scope_stored
-        && unsafe { *(&parent_none as *const Option<Env> as *const usize) } == 0;
-    let scope_parent = scope_refcell + offset_of!(crate::interpreter::Scope, parent);
+        && unsafe { *(&parent_none as *const Option<Env> as *const usize) } == 0
+        && child_parent == scope_stored
+        && child_parent.wrapping_add(scope_data_off) == Env::as_ptr(&probe_env) as usize;
     let scope_gen = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::generation_offset();
@@ -1543,12 +1804,23 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::layout_id_offset();
     let vars_offset = scope_refcell + offset_of!(crate::interpreter::Scope, vars);
-    let small = crate::interpreter::VarMap::jit_small_storage_layout();
-    let (small_tag, small_vec, scope_binding_stride, scope_binding_offset) =
-        small.unwrap_or((0, 0, 0, 0));
-    let scope_small_tag = vars_offset + small_tag;
-    let scope_small_vec = vars_offset + small_vec;
-    let scope_small_valid = small.is_some();
+    // The ordered entries of a small (or indexed) binding map, probed per build.
+    let scope_small_valid = repr.scope_small.is_some();
+    let small = repr
+        .scope_small
+        .unwrap_or(crate::interpreter::JitBindingStorage {
+            tag: 0,
+            entries: 0,
+            storage: JitVecLayout::Vec {
+                ptr: 0,
+                len: 0,
+                cap: 0,
+            },
+            stride: 0,
+            binding: 0,
+        });
+    let scope_small_tag = vars_offset + small.tag;
+    let scope_small_vec = vars_offset + small.entries;
     let scope_with = scope_refcell + offset_of!(crate::interpreter::Scope, with_obj);
     let without_object: Option<Value> = None;
     let with_object = Some(Value::Num(1.0));
@@ -1562,8 +1834,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let binding_import = offset_of!(crate::interpreter::Binding, imported);
 
     // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
-    // and `UserCallable` is repr(C). Verify both against live values, and that every `Rc` the
-    // probe follows has the same header size as the object `Rc` measured above.
+    // and `UserCallable` is repr(C). Verify both on live values: a native callable, and a
+    // closure of a parsed function, whose payload word (its `UserFn`: the Rc<UserCallable>
+    // pointer, or under gc-heap the closure cell's address) must lead through the measured
+    // offsets to the closure's func, env and realm, and whose func word plus `func_data_off`
+    // must be the AST identity a CallIc records.
     fn call_layout_probe(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
         Ok(Value::Undefined)
     }
@@ -1576,18 +1851,43 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && native_words[1] == native as usize
         && std::mem::align_of::<UserCallable>() == 8
         && std::mem::align_of::<Function>() <= 8;
-    let func_probe = Rc::new([0usize; 3]);
-    let func_probe_word = unsafe { *(&func_probe as *const Rc<[usize; 3]> as *const usize) };
-    let func_data_off = (Rc::as_ptr(&func_probe) as usize).wrapping_sub(func_probe_word);
+    let parsed = crate::parser::parse_script("function probe(){}", false).ok();
+    let probe_func = match parsed.as_deref() {
+        Some([crate::ast::Stmt::FuncDecl(func)]) => Some(func.clone()),
+        _ => None,
+    };
+    let (user_func, user_env, user_realm, func_data_off, closure_ok) = match probe_func {
+        Some(func) => {
+            let realm = obj_addr; // any identity the probe can recognize
+            let closure = Callable::user(func.clone(), probe_env.clone(), realm);
+            let words: [usize; 2] =
+                unsafe { std::mem::transmute_copy::<Callable, [usize; 2]>(&closure) };
+            let Callable::User(user) = &closure else {
+                unreachable!("Callable::user makes a user callable")
+            };
+            let payload = words[1];
+            let user_data_off = (user_fn_ptr(user) as usize).wrapping_sub(payload);
+            let func_word = unsafe { std::mem::transmute_copy::<Rc<Function>, usize>(&func) };
+            let func_data_off = (Rc::as_ptr(&func) as usize).wrapping_sub(func_word);
+            let user_func = user_data_off + offset_of!(UserCallable, func);
+            let user_env = user_data_off + offset_of!(UserCallable, env);
+            let user_realm = user_data_off + offset_of!(UserCallable, realm);
+            let read = |off: usize| unsafe { *((payload + off) as *const usize) };
+            let ok = words[0] & 0xff == CALLABLE_USER_TAG as usize
+                && user_data_off < 256
+                && func_data_off < 256
+                && read(user_func) == func_word
+                && read(user_func).wrapping_add(func_data_off) == Rc::as_ptr(&user.func) as usize
+                && read(user_env).wrapping_add(scope_data_off) == Env::as_ptr(&user.env) as usize
+                && read(user_realm) == realm;
+            (user_func, user_env, user_realm, func_data_off, ok)
+        }
+        None => (0, 0, 0, 0, false),
+    };
     let scope_under_with = scope_refcell + offset_of!(crate::interpreter::Scope, under_with);
-    // gc-heap stores a closure cell, not an `Rc`, behind `Callable::User`: the native JIT
-    // (refused there until S5) gets no code-keyed call probe.
-    let call_probe_valid = !cfg!(feature = "gc-heap")
-        && callable_ok
-        && func_data_off == rcbox_data
-        && rcbox_data < 256;
+    let call_probe_valid = callable_ok && closure_ok;
 
-    let valid = strong_ok
+    let valid = repr.valid
         && niche_ok
         && vec_ptr_off.is_some()
         && vec_len_off.is_some()
@@ -1601,7 +1901,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     JitLayout {
         obj_from_rc,
         gc_data_off,
-        rc_strong_off,
+        repr,
         obj_proto: offset_of!(Object, proto),
         obj_ic_plain: offset_of!(Object, ic_plain),
         native_typed_array: crate::native_typed_array::probe_layout(offset_of!(
@@ -1661,8 +1961,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_parent_valid,
         scope_small_tag,
         scope_small_vec,
-        scope_binding_stride,
-        scope_binding_offset,
+        scope_binding_stride: small.stride,
+        scope_binding_offset: small.binding,
         scope_small_valid,
         scope_with,
         scope_with_none,
@@ -1672,15 +1972,19 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         binding_init,
         binding_import,
         obj_call: offset_of!(Object, call),
-        user_func: rcbox_data + offset_of!(UserCallable, func),
-        user_env: rcbox_data + offset_of!(UserCallable, env),
-        user_realm: rcbox_data + offset_of!(UserCallable, realm),
+        user_func,
+        user_env,
+        user_realm,
         func_data_off,
         scope_under_with,
         call_probe_valid,
         valid,
     }
 }
+
+#[cfg(all(test, target_pointer_width = "64"))]
+#[path = "jit_layout_tests.rs"]
+mod jit_layout_tests;
 
 impl Value {
     /// The JS string whose code points are the characters of the Rust text `s`.
@@ -1847,8 +2151,9 @@ pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
 ///
 /// `repr(u8)` with fixed discriminants gives the enum a defined layout: the discriminant byte
 /// at offset 0 and the single pointer-sized payload at offset 8. The JIT's code-keyed call
-/// probe reads [`Callable::User`]'s tag and its `Rc<UserCallable>` pointer straight from a
-/// callee object (see `JitLayout::obj_call_tag`; default build).
+/// probe reads [`Callable::User`]'s tag and its [`UserFn`] word (the `Rc<UserCallable>`
+/// pointer, or under gc-heap the closure cell's address) straight from a callee object (see
+/// `JitLayout::obj_call` and `JitLayout::user_func`).
 #[derive(Clone)]
 #[repr(u8)]
 pub enum Callable {
@@ -1912,7 +2217,7 @@ pub(crate) enum NativeCallableBody {
 }
 
 /// `repr(C)`: the JIT's code-keyed call probe reads `func`, `env` and `realm` at fixed offsets
-/// from the `Rc<UserCallable>` data (see `JitLayout::user_func`).
+/// from the `UserCallable` data, which the [`UserFn`] word leads to (see `JitLayout::user_func`).
 #[repr(C)]
 pub struct UserCallable {
     pub(crate) func: Rc<Function>,

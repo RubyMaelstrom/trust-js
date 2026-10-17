@@ -5,9 +5,9 @@
 //! can then be ported without duplicating runtime semantics or compromising deoptimization.
 
 use super::{
-    JitCode, JitOwnership, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC,
-    H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER,
-    H_RETURN, H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    ownership_traced, JitCode, JitOwnership, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE,
+    H_COND, H_EXEC, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER,
+    H_PUSH_HANDLER, H_RETURN, H_SET_PROP, H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -202,18 +202,22 @@ impl Asm {
     // Ownership emitters (the x64 counterparts of `jit_ownership.rs`): every reference-count
     // sequence of this backend. RDX holds the untagged String/Symbol/Object payload, which the
     // caller's tag guard (`reference_or_immediate`, or the name templates' `owner_pointer`)
-    // proved reference-counted.
+    // proved reference-counted. Their `Traced` arms (gc-heap) are unreachable until S5 step 6.
 
     /// Acquire one owner of the payload in RDX (`inc qword [rdx+strong]`). Flags clobbered.
     fn rc_inc_rdx(&mut self, own: JitOwnership) {
-        let JitOwnership::Refcount { strong_off } = own;
+        let JitOwnership::Refcount { strong_off } = own else {
+            ownership_traced("rc_inc_rdx")
+        };
         self.bytes(&[0x48, 0xff, 0x82]);
         self.bytes(&strong_off.to_le_bytes());
     }
     /// Release one owner of the payload in RDX. A last owner branches to `slow` before any
     /// change (the checked path runs the real destructor). Clobbers RAX and flags.
     fn rc_dec_nonfinal_rdx(&mut self, own: JitOwnership, slow: usize) {
-        let JitOwnership::Refcount { strong_off } = own;
+        let JitOwnership::Refcount { strong_off } = own else {
+            ownership_traced("rc_dec_nonfinal_rdx")
+        };
         self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
         self.bytes(&strong_off.to_le_bytes());
         self.bytes(&[0x48, 0x83, 0xf8, 0x01]);
@@ -223,7 +227,9 @@ impl Asm {
     }
     /// [`Self::rc_dec_nonfinal_rdx`] in the name templates' encoding (an imm32 compare).
     fn rc_dec_nonfinal_rdx_imm32(&mut self, own: JitOwnership, slow: usize) {
-        let JitOwnership::Refcount { strong_off } = own;
+        let JitOwnership::Refcount { strong_off } = own else {
+            ownership_traced("rc_dec_nonfinal_rdx_imm32")
+        };
         self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
         self.bytes(&strong_off.to_le_bytes());
         self.bytes(&[0x48, 0x81, 0xf8]); // cmp rax,imm32 1
@@ -461,9 +467,9 @@ fn emit_prop_own(
         layout.entry_size,
         layout.entry_value,
         layout.entry_accessor,
-        layout.rc_strong_off,
     ];
     if !layout.valid
+        || !layout.ownership().fits_disp32()
         || layout.entry_accessor != layout.entry_value + 8
         || cache == 0
         || offsets.iter().any(|offset| *offset > i32::MAX as usize)
@@ -796,7 +802,7 @@ pub(super) fn compile_entry(
     let unwind = a.label();
     let ret_ok = a.label();
     let ret_throw = a.label();
-    let rc_ok = layout.valid && layout.rc_strong_off <= i32::MAX as usize;
+    let rc_ok = layout.valid && layout.ownership().fits_disp32();
     let own = layout.ownership();
     let interrupt_offset = (ilayout.valid
         && ilayout.interrupt_poll_tick <= i32::MAX as usize

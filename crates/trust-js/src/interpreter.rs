@@ -1520,9 +1520,9 @@ fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
     capacity.saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>())
 }
 
-/// The vector is first so its native layout can share the Small storage path (default build;
-/// the JIT reads no gc-heap binding storage). The probe below verifies that fact against the
-/// actual Rust enum layout.
+/// The entries are first so their native layout can share the Small storage path (in both
+/// builds). `VarMap::jit_small_storage_layout` verifies that fact against the actual Rust enum
+/// layout.
 #[repr(C)]
 struct IndexedBindings {
     entries: BindingEntries,
@@ -1939,21 +1939,13 @@ impl VarMap {
         std::mem::offset_of!(VarMap, layout_id)
     }
 
-    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout. A native
-    /// fresh-activation hit additionally requires the same nonzero ordered layout identity.
-    /// Unknown compiler layouts simply retain the checked map path.
-    pub(crate) fn jit_small_storage_layout() -> Option<(usize, usize, usize, usize)> {
-        // gc-heap keeps the first entry in place, not behind a Vec; the native JIT is refused
-        // there (until S5) and keeps the checked map path.
-        #[cfg(feature = "gc-heap")]
-        return None;
-        #[cfg(not(feature = "gc-heap"))]
-        Self::jit_vec_storage_layout()
-    }
-
-    #[cfg(not(feature = "gc-heap"))]
-    fn jit_vec_storage_layout() -> Option<(usize, usize, usize, usize)> {
-        let mut small = Self::with_capacity(1);
+    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout, in both
+    /// builds: the entries are a `Vec`, or under gc-heap an `InlineVec` whose first binding
+    /// stays in the environment cell. A native fresh-activation hit additionally requires the
+    /// same nonzero ordered layout identity. Unknown compiler layouts simply retain the checked
+    /// map path.
+    pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
+        let mut small = Self::with_capacity(3);
         small.insert("probe", Binding::data(Value::Num(7.0), true, true));
         let large = Self::with_capacity(SMALL_VAR_MAP_CAPACITY + 1);
         let tag = std::mem::offset_of!(VarMap, map);
@@ -1965,9 +1957,10 @@ impl VarMap {
         let VarStorage::Small(entries) = &small.map else {
             return None;
         };
-        let vector =
-            entries as *const Vec<(Rc<str>, Binding)> as usize - &small as *const VarMap as usize;
-        let binding = &entries[0].1 as *const Binding as usize - entries.as_ptr() as usize;
+        let vector = entries as *const BindingEntries as usize - &small as *const VarMap as usize;
+        let elements: &[(Rc<str>, Binding)] = entries;
+        let binding = &elements[0].1 as *const Binding as usize - elements.as_ptr() as usize;
+        let storage = Self::jit_entries_layout(entries)?;
         let mut indexed = Self::default();
         indexed.insert("probe", Binding::data(Value::Num(7.0), true, true));
         indexed.share_layout(&std::cell::OnceCell::new());
@@ -1975,18 +1968,52 @@ impl VarMap {
         let VarStorage::Indexed(indexed_bindings) = &indexed.map else {
             return None;
         };
-        let indexed_vector = &indexed_bindings.entries as *const Vec<(Rc<str>, Binding)> as usize
+        let indexed_vector = &indexed_bindings.entries as *const BindingEntries as usize
             - &indexed as *const VarMap as usize;
         if indexed_tag != 2 || indexed_vector != vector {
             return None;
         }
-        Some((
+        Some(JitBindingStorage {
             tag,
-            vector,
-            std::mem::size_of::<(Rc<str>, Binding)>(),
+            entries: vector,
+            storage,
+            stride: std::mem::size_of::<(Rc<str>, Binding)>(),
             binding,
-        ))
+        })
     }
+
+    /// The default build's entries are a `Vec`: its words, located on the probe's live one
+    /// (length 1, capacity 3).
+    #[cfg(not(feature = "gc-heap"))]
+    fn jit_entries_layout(entries: &BindingEntries) -> Option<crate::value::JitVecLayout> {
+        crate::value::probe_vec_layout(entries)
+    }
+
+    /// gc-heap's entries are an `InlineVec`, probed in place and spilled.
+    #[cfg(feature = "gc-heap")]
+    fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
+        BindingEntries::probe_jit_layout(|| {
+            (
+                Rc::from("probe"),
+                Binding::data(Value::Num(7.0), true, true),
+            )
+        })
+    }
+}
+
+/// Where generated code finds a binding map's ordered entries, relative to its [`VarMap`]
+/// (see [`VarMap::jit_small_storage_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JitBindingStorage {
+    /// The storage enum's tag byte: Small 0, Large 1, Indexed 2.
+    pub(crate) tag: usize,
+    /// The Small arm's entries, which the Indexed arm keeps at the same offset.
+    pub(crate) entries: usize,
+    /// How the entries hold their `(Rc<str>, Binding)` elements.
+    pub(crate) storage: crate::value::JitVecLayout,
+    /// The element stride, and the `Binding` within an element.
+    pub(crate) stride: usize,
+    pub(crate) binding: usize,
 }
 
 #[cfg(test)]

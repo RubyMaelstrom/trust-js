@@ -131,6 +131,7 @@ impl Asm {
 
 fn valid(l: &JitLayout) -> bool {
     l.valid
+        && l.ownership().fits_disp32()
         && l.scope_parent_valid
         && l.scope_with_valid
         && l.key_probe_ok
@@ -157,7 +158,6 @@ fn valid(l: &JitLayout) -> bool {
             l.entry_value,
             l.entry_accessor,
             l.entry_writable,
-            l.rc_strong_off,
             l.scope_data_off,
             l.obj_from_rc,
             l.str_ptr_word,

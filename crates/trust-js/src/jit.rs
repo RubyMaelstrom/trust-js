@@ -262,23 +262,69 @@ mod ownership;
 ))]
 use ownership::*;
 
-/// How generated code keeps a heap value (String, Symbol, Object) alive, read from the probed
-/// [`crate::value::JitLayout`]. Every reference-count sequence the native JIT emits goes through
+/// How generated code keeps a heap value (String, Symbol, Object) alive, probed for the build by
+/// [`crate::value::jit_layout`]. Every reference-count sequence the native JIT emits goes through
 /// the ownership emitters (`jit_ownership.rs` on ARM64, the `rc_*` emitters of the x64 backend),
 /// which take this description; templates never address a count themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JitOwnership {
-    /// Each owner holds one strong count: the word at `payload + strong_off`, where the payload
-    /// is the stored Rc pointer (`JitLayout::rc_strong_off`, verified by `jit_layout`).
+    /// Default build: each owner holds one strong count, the word at `payload + strong_off`,
+    /// where the payload is the stored Rc pointer (located and verified live by `jit_layout`).
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
     Refcount { strong_off: i32 },
+    /// gc-heap: values carry no count; the collector traces what is reachable, so taking or
+    /// releasing an owner needs no instruction. What generated code emits for it is S5 step 6's
+    /// to define: until then every ownership emitter's `Traced` arm is unreachable, and no JIT
+    /// code is compiled under gc-heap (`Tier::admitted` keeps the tier on bytecode).
+    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+    Traced,
+}
+
+impl JitOwnership {
+    /// Whether the ARM64 ownership emitters can address the count with the unscaled 9-bit
+    /// LDUR/STUR offset: a count within the payload's first 256 bytes. Traced ownership has no
+    /// count instruction.
+    pub(crate) fn fits_unscaled(self) -> bool {
+        match self {
+            JitOwnership::Refcount { strong_off } => (0..256).contains(&strong_off),
+            JitOwnership::Traced => true,
+        }
+    }
+
+    /// Whether the count is the payload's first word, the contract the string-constant,
+    /// `typeof`, inline-intrinsic and direct-finish templates were written against. Traced
+    /// ownership has no count instruction.
+    pub(crate) fn count_first(self) -> bool {
+        match self {
+            JitOwnership::Refcount { strong_off } => strong_off == 0,
+            JitOwnership::Traced => true,
+        }
+    }
+
+    /// Whether the x64 ownership emitters can address the count with a 32-bit displacement:
+    /// every `Refcount` offset (`jit_layout` reports a layout whose count offset exceeds `i32`
+    /// invalid). Traced ownership has no count instruction.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn fits_disp32(self) -> bool {
+        match self {
+            JitOwnership::Refcount { .. } | JitOwnership::Traced => true,
+        }
+    }
+}
+
+/// The `Traced` arm of every ownership emitter (ARM64 and x64). Traced (gc-heap) values carry
+/// no count, and what generated code does for them instead is S5 step 6's to define; until
+/// then no JIT code is compiled under gc-heap, so reaching this is a bug.
+#[cold]
+#[track_caller]
+fn ownership_traced(emitter: &str) -> ! {
+    unreachable!("{emitter}: traced (gc-heap) ownership has no emission before S5 step 6")
 }
 
 impl crate::value::JitLayout {
     /// The ownership description the ownership emitters read.
     pub(crate) fn ownership(&self) -> JitOwnership {
-        JitOwnership::Refcount {
-            strong_off: self.rc_strong_off as i32,
-        }
+        self.repr.ownership
     }
 }
 
@@ -3819,7 +3865,7 @@ fn compile_entry(
     let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     // Whether the probed layout supports inline refcount bumps/decs (clone/drop of Str/Sym/Obj
     // without a helper call). All strong-count templates gate on this.
-    let rc_ok = layout.valid && layout.rc_strong_off < 256;
+    let rc_ok = layout.valid && layout.ownership().fits_unscaled();
     let mut a = asm::Asm::new();
     a.set_stubs_ok(true);
     let residency = Box::<cache::CodeResidency>::default();
@@ -4718,7 +4764,7 @@ fn compile_entry(
             &mut a,
             ilayout,
             layout.ownership(),
-            rc_ok && layout.rc_strong_off == 0,
+            rc_ok && layout.ownership().count_first(),
         );
     }
 
@@ -5059,7 +5105,7 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && enl / 8 < 4096
         && layout.entry_accessor < 4096
         && layout.entry_value + 16 < 256
-        && layout.rc_strong_off < 256
+        && layout.ownership().fits_unscaled()
         && layout.entry_size < 0x1_0000
         && (layout.obj_props + layout.props_layout).is_multiple_of(8)
         && (layout.obj_props + layout.props_layout) / 8 < 4096
@@ -6347,7 +6393,7 @@ fn emit_call_inline_marked(
     let (Op::Call(argc, c) | Op::CallWithThis(argc, c)) = op else {
         unreachable!("call emitter requires a call opcode");
     };
-    let rc_ok = layout.valid && layout.rc_strong_off < 256;
+    let rc_ok = layout.valid && layout.ownership().fits_unscaled();
     let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     let inline_probe = fast & 524288 != 0;
     let slow = a.new_label();
@@ -6427,7 +6473,7 @@ fn emit_call_inline_marked(
             // After the live IC proof, bypass every native-id comparison at once.
             // Keep the hit entry and way registers for the ordinary call below.
             if with_this
-                && ((*argc == 1 && rc_ok && layout.rc_strong_off == 0)
+                && ((*argc == 1 && rc_ok && layout.ownership().count_first())
                     || (*argc == 0 && array_intrinsics_on)
                     || ((1..=8).contains(argc) && function_call_intrinsic_on)
                     || *argc == 2)
@@ -6441,7 +6487,7 @@ fn emit_call_inline_marked(
             // make millions of these per parse. Any miss (intrinsic id, receiver
             // tag/hint, index shape, bounds, last-reference operands) takes the
             // H_CALL_HIT form, whose Rust side handles native entries generally.
-            if with_this && *argc == 1 && rc_ok && layout.rc_strong_off == 0 {
+            if with_this && *argc == 1 && rc_ok && layout.ownership().count_first() {
                 let discard = matches!(ops.get(pc + 1), Some(Op::Pop));
                 let no_intr = a.new_label();
                 if use_shared_stub(a) {
@@ -6648,7 +6694,7 @@ fn emit_math_intrinsic(
         INTRINSIC_MATH_FROUND, INTRINSIC_MATH_IMUL, INTRINSIC_MATH_MAX, INTRINSIC_MATH_MIN,
         INTRINSIC_MATH_TRUNC,
     };
-    if !(layout.valid && layout.rc_strong_off < 256) {
+    if !(layout.valid && layout.ownership().fits_unscaled()) {
         a.b(no_intr);
         return;
     }
@@ -8573,7 +8619,8 @@ fn get_method_inlinable(layout: &crate::value::JitLayout) -> bool {
 }
 
 /// Same gate as [`get_prop_inlinable`] plus the `writable` byte (the store re-checks it — an
-/// in-place defineProperty can flip attributes without changing the shape).
+/// in-place defineProperty can flip attributes without changing the shape) and the creation
+/// commit's PropertyLayout count.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -8581,6 +8628,7 @@ fn get_method_inlinable(layout: &crate::value::JitLayout) -> bool {
 fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
     let cap = layout.obj_props + layout.props_entries + layout.vec_cap_off;
     get_prop_inlinable(layout)
+        && layout_rc_fits(layout)
         && layout.entry_writable < 256
         && layout.entry_accessor < 256
         && layout.obj_extensible < 4096
@@ -8872,7 +8920,7 @@ fn emit_update_elem_inline(
 ))]
 fn eq_inlinable(layout: &crate::value::JitLayout) -> bool {
     layout.valid
-        && layout.rc_strong_off < 256
+        && layout.ownership().fits_unscaled()
         && layout.obj_from_rc < 4096
         && layout.obj_ic_plain < 4096
         && crate::lstr::LEN_OFF.is_multiple_of(4)
@@ -9090,7 +9138,7 @@ fn instanceof_inlinable(
         && enl / 8 < 4096
         && layout.entry_accessor < 4096
         && layout.entry_value < 256
-        && layout.rc_strong_off < 256
+        && layout.ownership().fits_unscaled()
         && layout.entry_size < 0x1_0000
         && il.function_proto.is_multiple_of(8)
         && il.function_proto / 8 < 4096
@@ -10099,7 +10147,7 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
     // The global-mode path additionally bakes the property-IC offsets (shape/entries/accessor),
     // so it shares that gate.
     get_prop_inlinable(layout)
-        && layout.rc_strong_off < 256
+        && layout.ownership().fits_unscaled()
         && layout.scope_gen.is_multiple_of(4)
         && layout.scope_gen / 4 < 4096
         && layout.scope_layout.is_multiple_of(4)
@@ -11263,12 +11311,12 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
     a.bind(finish);
     if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
         let layout = context.layout;
-        let rc_ok = layout.valid && layout.rc_strong_off < 256;
+        let rc_ok = layout.valid && layout.ownership().fits_unscaled();
         emit_direct_finish_stub(
             &mut a,
             context.ilayout?,
             layout.ownership(),
-            rc_ok && layout.rc_strong_off == 0,
+            rc_ok && layout.ownership().count_first(),
         );
     }
     let (words, offsets) = a.finish_with_offsets(&[entry]);
