@@ -6452,7 +6452,12 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
         if !crate::gc_test::stress_active() {
             assert_eq!(engine.interp.gc_next, i64::MAX, "{tier:?}");
         }
-        assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
+        // Generated code counts a tick only on its poll's fast path. Under GC stress each poll
+        // after an allocation finds a collection due and takes the slow path (`jit_interrupt`),
+        // which checks the interrupt on every call without counting.
+        if tier == crate::bytecode::Tier::Bytecode || !crate::gc_test::stress_active() {
+            assert!(engine.interp.interrupt_poll_tick >= 1000, "{tier:?}");
+        }
     }
 }
 
