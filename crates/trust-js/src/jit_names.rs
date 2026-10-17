@@ -95,17 +95,17 @@ fn emit_deep_name_target_ptr(
     a.ldr_imm(14, 12, offset_of!(NativeNameDescriptor, binding) as u32);
     a.b(binding_ready);
     a.bind(holder_slot);
-    if layout.scope_small_valid {
+    if scope_entries_fit(layout) {
         a.ldrb_imm(13, 9, layout.scope_small_tag as u32);
         a.cmp_imm_w(13, 1);
         a.b_cond(C_EQ, slow);
         a.cmp_imm_w(13, 2);
         a.b_cond(C_HI, slow);
         a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
-        a.ldr_imm(14, 9, (layout.scope_small_vec + layout.vec_len_off) as u32);
+        scope_entries_len(a, layout, 14, 9);
         a.cmp_reg_x(13, 14);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(14, 9, (layout.scope_small_vec + layout.vec_ptr_off) as u32);
+        scope_entries_data(a, layout, 14, 9);
         a.mov_imm64(15, layout.scope_binding_stride as u64);
         a.madd(14, 13, 15, 14);
         a.add_imm(14, 14, layout.scope_binding_offset as u32);
@@ -137,18 +137,10 @@ fn emit_deep_name_target_ptr(
     a.cmp_reg_w(13, 15);
     a.b_cond(C_NE, slow);
     a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
-    a.ldr_imm(
-        15,
-        14,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 15, 14);
     a.cmp_reg_x(13, 15);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(
-        15,
-        14,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 15, 14);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     a.mov(14, 15);
@@ -164,10 +156,7 @@ fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
         && layout.scope_with < 4096
         && (!layout.scope_small_valid
             || (layout.scope_small_tag < 4096
-                && (layout.scope_small_vec + layout.vec_ptr_off).is_multiple_of(8)
-                && (layout.scope_small_vec + layout.vec_ptr_off) / 8 < 4096
-                && (layout.scope_small_vec + layout.vec_len_off).is_multiple_of(8)
-                && (layout.scope_small_vec + layout.vec_len_off) / 8 < 4096
+                && scope_entries_fit(layout)
                 && layout.scope_binding_offset < 4096))
 }
 
@@ -247,18 +236,10 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cmp_reg_w(10, 11);
     a.b_cond(C_NE, slow);
     a.ldr_imm(10, 8, offset_of!(R, slot) as u32);
-    a.ldr_imm(
-        11,
-        9,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 11, 9);
     a.cmp_reg_x(10, 11);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(
-        14,
-        9,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 14, 9);
     a.mov_imm64(11, layout.entry_size as u64);
     a.madd(14, 10, 11, 14);
     a.bind(done);

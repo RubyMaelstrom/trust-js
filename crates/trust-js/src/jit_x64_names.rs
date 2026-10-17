@@ -8,7 +8,7 @@ use crate::bytecode::lexical_cache::{
 };
 use crate::bytecode::UpdKind;
 use crate::eval::{PreparedReference, PreparedReferenceSlot};
-use crate::value::{JitLayout, PACK_NULL, PACK_STR, PACK_SYM};
+use crate::value::{JitLayout, JitVecLayout, PACK_NULL, PACK_STR, PACK_SYM};
 use std::mem::{offset_of, size_of};
 
 const AX: u8 = 0;
@@ -129,7 +129,24 @@ impl Asm {
     }
 }
 
+/// The small binding map's entry count and data-pointer words, as displacements from the
+/// scope, when its entries are a `Vec` (the default build; see `vec_fields`).
+fn vec_scope_entries(l: &JitLayout) -> Option<(usize, usize)> {
+    match (
+        l.scope_small_valid,
+        l.repr.scope_small.map(|small| small.storage),
+    ) {
+        (true, Some(JitVecLayout::Vec { ptr, len, .. })) => {
+            Some((l.scope_small_vec + len, l.scope_small_vec + ptr))
+        }
+        _ => None,
+    }
+}
+
 fn valid(l: &JitLayout) -> bool {
+    let Some((fields_len, fields_ptr)) = vec_fields(l) else {
+        return false;
+    };
     l.valid
         && l.ownership().fits_disp32()
         && l.scope_parent_valid
@@ -149,8 +166,8 @@ fn valid(l: &JitLayout) -> bool {
             l.binding_init,
             l.binding_import,
             l.binding_mutable,
-            l.obj_props + l.props_entries + l.vec_len_off,
-            l.obj_props + l.props_entries + l.vec_ptr_off,
+            fields_len,
+            fields_ptr,
             l.obj_props + l.props_shape,
             l.obj_ic_plain,
             l.obj_exotic,
@@ -173,8 +190,10 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
 }
 
-/// R9=body, AX=shape, DX=slot. Output CX=Property, R11=1. No value flags yet.
+/// R9=body, AX=shape, DX=slot. Output CX=Property, R11=1. No value flags yet. `valid` admitted
+/// the layout: the named fields are a `Vec`.
 fn global_target(a: &mut Asm, l: &JitLayout, slow: usize) {
+    let (fields_len, fields_ptr) = vec_fields(l).expect("valid() admits Vec fields only");
     a.nr_zero_guard(R9, slow);
     a.nr_zero_guard(AX, slow);
     a.nr_max_guard(AX, CX, slow);
@@ -186,10 +205,10 @@ fn global_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
     a.nr_load8(CX, R9, l.obj_ic_plain);
     a.nr_zero_guard(CX, slow);
-    a.nr_load(CX, R9, l.obj_props + l.props_entries + l.vec_len_off);
+    a.nr_load(CX, R9, fields_len);
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    a.nr_load(CX, R9, l.obj_props + l.props_entries + l.vec_ptr_off);
+    a.nr_load(CX, R9, fields_ptr);
     a.nr_mul_imm(DX, l.entry_size);
     a.nr_reg(0x01, CX, DX);
     a.nr_imm(R11, 1);
@@ -251,17 +270,17 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_load(CX, R8, offset_of!(NativeNameDescriptor, binding));
     a.jmp(binding);
     a.bind(fresh);
-    if l.scope_small_valid {
+    if let Some((entries_len, entries_ptr)) = vec_scope_entries(l) {
         a.nr_load8(AX, R9, l.scope_small_tag);
         a.nr_imm(DX, 2);
         a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
         a.nr_cmp(AX, DX);
         a.jcc(NE, slow);
         a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
-        a.nr_load(CX, R9, l.scope_small_vec + l.vec_len_off);
+        a.nr_load(CX, R9, entries_len);
         a.nr_cmp(DX, CX);
         a.jcc(AE, slow);
-        a.nr_load(CX, R9, l.scope_small_vec + l.vec_ptr_off);
+        a.nr_load(CX, R9, entries_ptr);
         a.nr_mul_imm(DX, l.scope_binding_stride);
         a.nr_reg(0x01, CX, DX);
         a.nr_lea(CX, CX, l.scope_binding_offset as i32);

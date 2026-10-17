@@ -1464,18 +1464,10 @@ fn emit_borrowed_own_read(
         a.b_cond(C_NE, fail);
     }
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     // No live descriptor-kind check: the receiver shape was just proved equal
@@ -1580,18 +1572,10 @@ fn emit_borrowed_method(
         a.b_cond(C_NE, fail);
     }
     a.mov_imm64(13, state.slot as u64);
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     // No live descriptor-kind check: holder shape was just proved equal to

@@ -1353,7 +1353,8 @@ pub struct JitLayout {
 /// How generated code finds a growable sequence's elements, length and capacity, at offsets
 /// from the sequence field: `Props`' named values and a binding map's entries are a `Vec` in the
 /// default build and an `InlineVec` (`crate::inline_vec`) under gc-heap. Measured and checked
-/// against live sequences by [`jit_repr`].
+/// against live sequences by [`jit_repr`]; the ARM64 storage emitters (`jit_storage.rs`) read
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JitVecLayout {
     /// A `Vec`: the 8-byte data pointer, length and capacity words. The elements are always
@@ -6484,6 +6485,17 @@ impl Props {
         }
         Some((layout, self.entries.len() as u8, enumerable))
     }
+    /// The named-field count and capacity, as the JIT's storage emitters read them.
+    #[cfg(test)]
+    pub(crate) fn named_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn named_capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
     /// Final named-property count of a small ordinary instance. The construct JIT records this
     /// after a successful call so forwarding constructors whose own bytecode has no direct
     /// `this.x` stores can reserve the right capacity on later allocations.

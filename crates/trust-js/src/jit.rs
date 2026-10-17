@@ -262,6 +262,18 @@ mod ownership;
 ))]
 use ownership::*;
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_storage.rs"]
+mod storage;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+use storage::*;
+
 /// How generated code keeps a heap value (String, Symbol, Object) alive, probed for the build by
 /// [`crate::value::jit_layout`]. Every reference-count sequence the native JIT emits goes through
 /// the ownership emitters (`jit_ownership.rs` on ARM64, the `rc_*` emitters of the x64 backend),
@@ -5087,8 +5099,6 @@ fn compile_profiled_with(
 ))]
 fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
     let sh = layout.obj_props + layout.props_shape;
-    let en = layout.obj_props + layout.props_entries + layout.vec_ptr_off;
-    let enl = layout.obj_props + layout.props_entries + layout.vec_len_off;
     layout.valid
         // Packed property values are eight bytes. Until these templates decode them, keep only
         // property/name/element operations on their checked paths; unrelated JIT templates stay
@@ -5099,10 +5109,8 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.obj_ic_plain < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
-        && en.is_multiple_of(8)
-        && en / 8 < 4096
-        && enl.is_multiple_of(8)
-        && enl / 8 < 4096
+        && fields_data_fits(layout)
+        && fields_len_fits(layout)
         && layout.entry_accessor < 4096
         && layout.entry_value + 16 < 256
         && layout.ownership().fits_unscaled()
@@ -5602,8 +5610,6 @@ fn emit_prop_load_inline(
     let ex = layout.obj_exotic as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
-    let en_len = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
@@ -5920,10 +5926,10 @@ fn emit_prop_load_inline(
     let val_body = a.new_label();
     let accessor_hit = a.new_label();
     let emit_entry = |a: &mut asm::Asm| {
-        a.ldr_imm(16, 11, en_len);
+        fields_len(a, layout, 16, 11);
         a.cmp_reg_x(13, 16);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 11, en);
+        fields_data(a, layout, 15, 11);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
     };
@@ -5974,10 +5980,10 @@ fn emit_prop_load_inline(
     // into the shared value path.
     a.bind(load_kc);
     if kc {
-        a.ldr_imm(16, 11, en_len);
+        fields_len(a, layout, 16, 11);
         a.cmp_reg_x(13, 16);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(15, 11, en);
+        fields_data(a, layout, 15, 11);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
         // Named fields have no inline key: follow the holder's shared layout at the same slot.
@@ -6079,7 +6085,6 @@ fn emit_method_elem_dense(
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
@@ -6133,7 +6138,7 @@ fn emit_method_elem_dense(
     a.ldr_w_imm(13, 12, 0);
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, ea, slow);
@@ -6304,18 +6309,10 @@ fn emit_computed_method_inline(
     a.b_cond(C_NE, slow);
     a.bind(load);
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(
-        15,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, layout.entry_accessor as u32, slow);
@@ -8626,7 +8623,6 @@ fn get_method_inlinable(layout: &crate::value::JitLayout) -> bool {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
-    let cap = layout.obj_props + layout.props_entries + layout.vec_cap_off;
     get_prop_inlinable(layout)
         && layout_rc_fits(layout)
         && layout.entry_writable < 256
@@ -8637,8 +8633,7 @@ fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.obj_props + layout.props_proto_flag < 4096
         && layout.props_elems.is_multiple_of(8)
         && layout.props_elems / 8 < 4096
-        && cap.is_multiple_of(8)
-        && cap / 8 < 4096
+        && fields_capacity_fits(layout)
         && layout.gc_data_off < 4096
         && layout.str_ptr_word < 256
         && layout.str_len_word < 256
@@ -8667,7 +8662,6 @@ fn emit_update_prop_inline(
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -8699,14 +8693,10 @@ fn emit_update_prop_inline(
     a.cmp_reg_w(9, 14);
     a.b_cond(C_NE, slow);
     // 4. bounds-check the cached slot, then entry: data property, writable, holding a Num
-    a.ldr_imm(
-        16,
-        11,
-        (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-    );
+    fields_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, ea, slow);
@@ -8803,7 +8793,6 @@ fn emit_update_elem_inline(
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -8865,7 +8854,7 @@ fn emit_update_elem_inline(
     a.ldr_w_imm(13, 12, 0);
     a.cmn_imm_w(13, 1); // NO_SLOT: a hole consults the prototype chain
     a.b_cond(C_EQ, slow);
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 14, 15, ea, slow);
@@ -9119,8 +9108,6 @@ fn instanceof_inlinable(
     il: &crate::interpreter::InterpLayout,
 ) -> bool {
     let sh = layout.obj_props + layout.props_shape;
-    let en = layout.obj_props + layout.props_entries + layout.vec_ptr_off;
-    let enl = layout.obj_props + layout.props_entries + layout.vec_len_off;
     layout.valid
         && il.valid
         && layout.entry_accessor == layout.entry_value + 8
@@ -9132,10 +9119,8 @@ fn instanceof_inlinable(
         && layout.obj_is_constructor < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
-        && en.is_multiple_of(8)
-        && en / 8 < 4096
-        && enl.is_multiple_of(8)
-        && enl / 8 < 4096
+        && fields_data_fits(layout)
+        && fields_len_fits(layout)
         && layout.entry_accessor < 4096
         && layout.entry_value < 256
         && layout.ownership().fits_unscaled()
@@ -9172,8 +9157,6 @@ fn emit_instanceof_inline(
     let have = a.new_label();
     let own = layout.ownership();
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
-    let enl = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
 
     // The RHS must be an object. A primitive LHS is immediately false once the
     // ordinary-constructor guards below pass; accepting it here avoids a helper call for the
@@ -9243,10 +9226,10 @@ fn emit_instanceof_inline(
     // Resolve the cached own `.prototype` slot defensively, require a data property holding an
     // object, and untag its stored Rc pointer from the packed heap value.
     a.ldr_w_imm(13, 13, IC_OFF_SLOT);
-    a.ldr_imm(14, 12, enl);
+    fields_len(a, layout, 14, 12);
     a.cmp_reg_x(13, 14);
     a.b_cond(C_HS, slow);
-    a.ldr_imm(15, 12, en);
+    fields_data(a, layout, 15, 12);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 9, 15, layout.entry_accessor as u32, slow);
@@ -9330,12 +9313,10 @@ fn emit_prop_create_probe(
     // Named-only small map: no DenseStorage sidecar/index, <=8 entries, and spare capacity.
     a.ldr_imm(9, 11, (layout.obj_props + layout.props_elems) as u32);
     a.cbnz(9, true, miss);
-    let len_off = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
-    let cap_off = (layout.obj_props + layout.props_entries + layout.vec_cap_off) as u32;
-    a.ldr_imm(13, 11, len_off);
+    fields_len(a, layout, 13, 11);
     a.cmp_imm_x(13, 8);
     a.b_cond(C_HS, miss);
-    a.ldr_imm(14, 11, cap_off);
+    fields_capacity(a, layout, 14, 11);
     a.cmp_reg_x(13, 14);
     a.b_cond(C_HS, miss);
     let transition_layout = a.new_label();
@@ -9475,7 +9456,6 @@ fn emit_set_prop_inline(
     let rcv = layout.obj_from_rc as u32;
     let ex = layout.obj_exotic as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -9554,14 +9534,10 @@ fn emit_set_prop_inline(
         a.ldr_w_imm(9, 11, sh);
         a.cmp_reg_w(9, 14);
         a.b_cond(C_NE, miss);
-        a.ldr_imm(
-            16,
-            11,
-            (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32,
-        );
+        fields_len(a, layout, 16, 11);
         a.cmp_reg_x(13, 16);
         a.b_cond(C_HS, miss);
-        a.ldr_imm(15, 11, en);
+        fields_data(a, layout, 15, 11);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
         guard_prop_data(a, 9, 15, ea, miss);
@@ -9680,7 +9656,6 @@ fn emit_set_prop_inline(
     // Creation commit (out of the update hit's fall-through line).
     if create_ok {
         use crate::bytecode::IC_OFF_HOLDER_SHAPE;
-        let len_off = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
         a.bind(create_commit);
         if keep {
             // All creation proofs are complete. Preserve x7 (layout), x12
@@ -9701,7 +9676,7 @@ fn emit_set_prop_inline(
         a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
         a.bind(layout_installed);
         // From here no branch can fail: compute the vacant entry and pack the incoming value.
-        a.ldr_imm(15, 11, en);
+        fields_data(a, layout, 15, 11);
         a.mov_imm64(16, es);
         a.madd(15, 13, 16, 15);
         emit_exec_word_load(a, 16, 20, -8);
@@ -9721,7 +9696,7 @@ fn emit_set_prop_inline(
         a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
         a.str_w_imm(14, 11, sh);
         a.add_imm(13, 13, 1);
-        a.str_imm(13, 11, len_off);
+        fields_set_len(a, layout, 13, 11);
         if matches!(recv, PropRecv::Stack) {
             rc_dec_nonfinal(a, own, 10, 9);
             if keep {
@@ -11404,7 +11379,6 @@ fn emit_name_ic_value_ptr_in(
     let bi = layout.binding_init as u32;
     let g_ex = layout.obj_exotic as u32;
     let g_sh = (layout.obj_props + layout.props_shape) as u32;
-    let g_en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let g_ea = layout.entry_accessor as u32;
     let g_ev = layout.entry_value as u32;
     let g_es = layout.entry_size as u64;
@@ -11463,7 +11437,7 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_reg_w(15, 17);
     a.b_cond(C_NE, slow);
     a.mov_w(16, 16); // zero-extend the slot half
-    a.ldr_imm(15, 14, g_en);
+    fields_data(a, layout, 15, 14);
     a.mov_imm64(17, g_es);
     a.madd(15, 16, 17, 15);
     guard_prop_data(a, 14, 15, g_ea, slow);
@@ -11484,21 +11458,21 @@ fn emit_name_ic_value_ptr_in(
     // Same published ordered layout, different activation allocation. Derive
     // this invocation's Binding address; no previous invocation is retained.
     a.bind(fixed_scope);
-    if layout.scope_small_valid {
+    if scope_entries_fit(layout) {
         a.cbz(13, false, slow); // layout ID zero never proves a slot
         a.ldr_w_imm(11, 9, layout.scope_layout as u32);
         a.cmp_reg_w(11, 13);
         a.b_cond(C_NE, slow);
         a.ldrb_imm(11, 9, layout.scope_small_tag as u32);
-        a.cmp_imm_w(11, 1); // reject Large; Small(0) and Indexed(2) share the probed vector
+        a.cmp_imm_w(11, 1); // reject Large; Small(0) and Indexed(2) share the probed entries
         a.b_cond(C_EQ, slow);
         a.cmp_imm_w(11, 2);
         a.b_cond(C_HI, slow);
         a.ldr_imm(14, 12, NAME_IC_OFF_BINDING);
-        a.ldr_imm(11, 9, (layout.scope_small_vec + layout.vec_len_off) as u32);
+        scope_entries_len(a, layout, 11, 9);
         a.cmp_reg_x(14, 11);
         a.b_cond(C_HS, slow);
-        a.ldr_imm(11, 9, (layout.scope_small_vec + layout.vec_ptr_off) as u32);
+        scope_entries_data(a, layout, 11, 9);
         a.mov_imm64(15, layout.scope_binding_stride as u64);
         a.madd(14, 14, 15, 11);
         a.add_imm(14, 14, layout.scope_binding_offset as u32);
@@ -11694,7 +11668,6 @@ fn emit_get_elem_inline_marked(
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
@@ -11793,7 +11766,7 @@ fn emit_get_elem_inline_marked(
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
     // 7. entry base = entries data ptr + slot*entry_size
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     // 8. not an accessor
@@ -11990,7 +11963,6 @@ fn emit_set_elem_inline_marked(
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -12040,7 +12012,7 @@ fn emit_set_elem_inline_marked(
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
     // 7. entry base
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     // 8. data property, writable
@@ -12387,10 +12359,9 @@ fn define_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
         ]
         .into_iter()
         .all(|off| off < 4096)
-        && (props + layout.props_len_slot).is_multiple_of(4)
-        && (props + layout.props_len_slot) / 4 < 4096
+        && slot_memo_fits(layout, props + layout.props_len_slot)
+        && fields_data_fits(layout)
         && [
-            props + layout.props_entries + layout.vec_ptr_off,
             mirror + layout.vec_ptr_off,
             mirror + layout.vec_len_off,
             mirror + layout.vec_cap_off,
@@ -12474,14 +12445,9 @@ fn emit_define_elem_inline(
     a.ldrb_imm(12, 11, props + layout.props_has_far as u32);
     a.cbnz(12, false, slow);
     // ... and has a memoized, writable data `length` holding a Number (x14 = entry, d1 = L).
-    a.ldr_w_imm(12, 11, props + layout.props_len_slot as u32);
-    a.cmn_imm_w(12, 1);
-    a.b_cond(C_EQ, slow);
-    a.ldr_imm(
-        14,
-        11,
-        props + (layout.props_entries + layout.vec_ptr_off) as u32,
-    );
+    slot_memo_load(a, layout, 12, 11, layout.obj_props + layout.props_len_slot);
+    slot_memo_branch_none(a, layout, 12, 15, slow);
+    fields_data(a, layout, 14, 11);
     a.mov_imm64(15, layout.entry_size as u64);
     a.madd(14, 12, 15, 14);
     guard_prop_data(a, 15, 14, layout.entry_accessor as u32, slow);
@@ -12730,7 +12696,6 @@ fn emit_elem_local_keyed(
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let ew = layout.entry_writable as u32;
@@ -12851,7 +12816,7 @@ fn emit_elem_local_keyed(
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
     // 7. entry base
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     // 8. data property (+ writable for the set forms)
@@ -12986,7 +12951,6 @@ fn emit_local_own_dense_data_guard(
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
     let es = layout.entry_size as u64;
@@ -13058,7 +13022,7 @@ fn emit_local_own_dense_data_guard(
     a.ldr_w_imm(13, 12, 0);
     a.cmn_imm_w(13, 1);
     a.b_cond(C_EQ, slow);
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     guard_prop_data(a, 14, 15, ea, slow);
@@ -13102,7 +13066,6 @@ fn emit_local_assumed_dense_data_value(
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let es = layout.entry_size as u64;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
 
     match key {
         KeySrc::Slot(offset) => {
@@ -13134,7 +13097,7 @@ fn emit_local_assumed_dense_data_value(
     a.ldr_imm(12, 12, evp);
     a.add_shifted(12, 12, 9, 2);
     a.ldr_w_imm(13, 12, 0);
-    a.ldr_imm(15, 11, en);
+    fields_data(a, layout, 15, 11);
     a.mov_imm64(16, es);
     a.madd(15, 13, 16, 15);
     if layout.entry_accessor == layout.entry_value + 8 {
@@ -13965,8 +13928,6 @@ fn emit_chain_marked(
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
-    let enl = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
     let ev = layout.entry_value as i32;
     let num_ev = if layout.entry_accessor == layout.entry_value + 8 {
         ev
@@ -14100,11 +14061,11 @@ fn emit_chain_marked(
                     a.cmp_reg_w(14, 16);
                     a.b_cond(C_NE, guard!());
                 }
-                a.ldr_imm(16, 11, enl);
+                fields_len(a, layout, 16, 11);
                 a.mov_imm64(13, st.slot as u64);
                 a.cmp_reg_x(13, 16);
                 a.b_cond(C_HS, guard!());
-                a.ldr_imm(15, 11, en);
+                fields_data(a, layout, 15, 11);
                 a.mov_imm64(16, es);
                 a.madd(15, 13, 16, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
@@ -14158,11 +14119,11 @@ fn emit_chain_marked(
                 a.mov_imm64(16, st.recv_shape as u64);
                 a.cmp_reg_w(14, 16);
                 a.b_cond(C_NE, guard!());
-                a.ldr_imm(16, 11, enl);
+                fields_len(a, layout, 16, 11);
                 a.mov_imm64(13, st.slot as u64);
                 a.cmp_reg_x(13, 16);
                 a.b_cond(C_HS, guard!());
-                a.ldr_imm(15, 11, en);
+                fields_data(a, layout, 15, 11);
                 a.mov_imm64(16, es);
                 a.madd(15, 13, 16, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
@@ -14357,7 +14318,7 @@ fn emit_chain_marked(
                         a.ldr_w_imm(13, 12, 0);
                         a.cmn_imm_w(13, 1);
                         a.b_cond(C_EQ, guard!()); // hole: property creation → plain path
-                        a.ldr_imm(15, 11, en);
+                        fields_data(a, layout, 15, 11);
                         a.movz(14, es as u32, 0);
                         a.madd(15, 13, 14, 15);
                         if layout.entry_accessor == layout.entry_value + 8 {
@@ -14478,7 +14439,7 @@ fn emit_chain_marked(
                     a.ldr_w_imm(13, 12, 0);
                     a.cmn_imm_w(13, 1);
                     a.b_cond(C_EQ, classic);
-                    a.ldr_imm(15, 11, en);
+                    fields_data(a, layout, 15, 11);
                     a.movz(14, es as u32, 0);
                     a.madd(15, 13, 14, 15);
                     if layout.entry_accessor == layout.entry_value + 8 {
@@ -14524,7 +14485,7 @@ fn emit_chain_marked(
                 a.ldr_w_imm(13, 12, 0);
                 a.cmn_imm_w(13, 1);
                 a.b_cond(C_EQ, guard!());
-                a.ldr_imm(15, 11, en);
+                fields_data(a, layout, 15, 11);
                 a.movz(9, es as u32, 0); // entry stride (< 65536; the key index in x9 is dead)
                 a.madd(15, 13, 9, 15);
                 guard_prop_data(a, 9, 15, ea, guard!());
@@ -16195,8 +16156,6 @@ fn emit_region_own_entry(
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let shape = (layout.obj_props + layout.props_shape) as u32;
-    let entries = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
-    let entries_len = (layout.obj_props + layout.props_entries + layout.vec_len_off) as u32;
     a.add_imm(body_reg, rc_reg, rcv);
     a.ldrb_imm(9, body_reg, ex);
     a.cmp_imm_w(9, layout.exotic_none_tag as u32);
@@ -16207,11 +16166,11 @@ fn emit_region_own_entry(
     a.mov_imm64(16, state.recv_shape as u64);
     a.cmp_reg_w(9, 16);
     a.b_cond(C_NE, fail);
-    a.ldr_imm(16, body_reg, entries_len);
+    fields_len(a, layout, 16, body_reg);
     a.mov_imm64(13, state.slot as u64);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    a.ldr_imm(entry_reg, body_reg, entries);
+    fields_data(a, layout, entry_reg, body_reg);
     a.mov_imm64(16, layout.entry_size as u64);
     a.madd(entry_reg, 13, 16, entry_reg);
     guard_prop_data(a, 9, entry_reg, layout.entry_accessor as u32, fail);
@@ -16377,7 +16336,6 @@ fn emit_loop_chain(
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let en = (layout.obj_props + layout.props_entries + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
     let num_ev = if layout.entry_accessor == layout.entry_value + 8 {
         ev
@@ -16612,7 +16570,7 @@ fn emit_loop_chain(
             a.ldr_imm(x, 12, evp);
         }
         if let Some(x) = rp.enreg {
-            a.ldr_imm(x, r, en);
+            fields_data(a, layout, x, r);
         }
     }
 
@@ -16810,7 +16768,7 @@ fn emit_loop_chain(
                         a.ldr_w_imm(13, 12, 0);
                         a.cmn_imm_w(13, 1);
                         a.b_cond(C_EQ, guard!());
-                        a.ldr_imm(15, $r, en);
+                        fields_data(a, layout, 15, $r);
                         a.movz(9, es as u32, 0);
                         a.madd(15, 13, 9, 15);
                         guard_prop_data(a, 9, 15, ea, guard!());
@@ -17109,7 +17067,7 @@ fn emit_loop_chain(
                             let enr = match rp.enreg {
                                 Some(x) => x,
                                 None => {
-                                    a.ldr_imm(15, r, en);
+                                    fields_data(a, layout, 15, r);
                                     15
                                 }
                             };

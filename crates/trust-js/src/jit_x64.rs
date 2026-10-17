@@ -446,6 +446,17 @@ thread_local! {
     };
 }
 
+/// The named-field count and data-pointer words of an Object, as displacements from it, when its
+/// fields are a `Vec` (the default build). This backend reads only that layout inline: gc-heap's
+/// `InlineVec` (see `JitVecLayout`) keeps the checked helpers until the x64 pass of S6.
+fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
+    let fields = layout.obj_props + layout.props_entries;
+    match layout.repr.props_fields {
+        crate::value::JitVecLayout::Vec { ptr, len, .. } => Some((fields + len, fields + ptr)),
+        crate::value::JitVecLayout::Inline { .. } => None,
+    }
+}
+
 /// Probe the live property IC, including fills made after this machine body was compiled.
 /// Receiver, cache, bounds, descriptor and owner checks precede the single clone/push commit.
 /// The canonical local/this owner keeps the receiver alive throughout the borrowed lookup.
@@ -457,13 +468,16 @@ fn emit_prop_own(
     slow: usize,
 ) -> bool {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
+    let Some((fields_len, fields_ptr)) = vec_fields(layout) else {
+        return false;
+    };
     let offsets = [
         layout.obj_from_rc,
         layout.obj_exotic,
         layout.obj_ic_plain,
         layout.obj_props + layout.props_shape,
-        layout.obj_props + layout.props_entries + layout.vec_len_off,
-        layout.obj_props + layout.props_entries + layout.vec_ptr_off,
+        fields_len,
+        fields_ptr,
         layout.entry_size,
         layout.entry_value,
         layout.entry_accessor,
@@ -533,10 +547,10 @@ fn emit_prop_own(
     a.jmp(slow);
     a.bind(found);
     a.bytes(&[0x49, 0x3b, 0x93]); // cmp rdx,live entry count
-    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_len_off) as i32).to_le_bytes());
+    a.bytes(&(fields_len as i32).to_le_bytes());
     a.jcc(0x83, slow);
     a.bytes(&[0x49, 0x8b, 0x83]); // rax=live entries buffer
-    a.bytes(&((layout.obj_props + layout.props_entries + layout.vec_ptr_off) as i32).to_le_bytes());
+    a.bytes(&(fields_ptr as i32).to_le_bytes());
     a.bytes(&[0x48, 0x69, 0xd2]); // imul rdx,rdx,entry_size
     a.bytes(&(layout.entry_size as i32).to_le_bytes());
     a.bytes(&[0x48, 0x01, 0xd0]); // rax=Property address
@@ -631,8 +645,7 @@ fn emit_prop_num(
     let Ok(proto) = i32::try_from(layout.obj_proto) else {
         return false;
     };
-    let Ok(entries) = i32::try_from(layout.obj_props + layout.props_entries + layout.vec_ptr_off)
-    else {
+    let Some(Ok(entries)) = vec_fields(layout).map(|(_, ptr)| i32::try_from(ptr)) else {
         return false;
     };
     let Some(entry_base) = layout.entry_size.checked_mul(st.slot as usize) else {
