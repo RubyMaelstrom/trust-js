@@ -1516,6 +1516,90 @@ Exit gate finding, fixed before the gate (pre-existing since S2):
   as the engine's entry points do: a scoped guard switched back
   afterwards and broke nested_calls_keep_the_surrounding_agent_
   activation_on_the_fast_path), so a program allocates in its own heap
-  whatever heap was active when it was called. Test function_name_templates_serve_only_their_heap: two
-  engines, the first dropped before the second runs; with the heap
-  check removed, the second's closure names are not cells of its heap.
+  whatever heap was active when it was called. Test
+  function_name_templates_serve_only_their_heap: two engines, the first
+  dropped before the second runs; with the heap check removed, the
+  second's closure names are not cells of its heap.
+
+S4 exit gate (2026-10-17)
+-------------------------
+Builds: main = e3310993; branch = fd1da511 plus this commit (records
+only). crystal aarch64, rustc 1.99.0; release = fat LTO unless noted.
+- Lib suite: --features embed 2153/0/3 (S3: 2149/0/3; four ShadowRealm
+  tests), embed,gc-heap 1848/0/114 (S3: 1839/0/116; nine new tests, and
+  two refcount-collector tests compiled out under gc-heap instead of
+  ignored).
+- Test262, full (no-LTO release runners from a7e7da88, gc-heap and
+  default, TRUST_JS_TIER=interp and =bytecode; annexB, built-ins,
+  harness, intl402, language, staging; 53,872 files): 53,575 of 53,575
+  executed pass in each run, and all four reports are byte-identical to
+  main's from step 1, as they were at 0eb6ff6d. Parity. fd1da511 only
+  changes run_program's activation, which the runner reaches through
+  Engine::eval with its agent already active.
+- Downstream suites (fd1da511, both builds alike): host 36/0/0, timers
+  5/0/0, fs (no tests), web 61/0/1, node 42/0/0 (step 2a's two tests),
+  runtime 182/0/1 (45 test binaries).
+- GC stress + verifier + poisoning (debug fd1da511, embed,gc-heap,
+  every test in its own process, 900 s each): 1848 pass, 114 ignored,
+  0 fail; 1825 at interval 1, 19 at 100 and 4 at 1000. The gate's first
+  run (0eb6ff6d) failed one test: the finding above.
+- Address-keyed tables: gc_evict_dead_owners destructures Interp
+  exhaustively and classifies every field. Tables keyed by an object's
+  address are evicted there or swept with the weak state; the others
+  are keyed by values they keep alive, through weak pins (a dead
+  address stays reserved until the pin is pruned), or not by address.
+  Under gc-heap map_data and the scope registry are gone: Map/Set data
+  and environments live in their cells. Tables outside Interp are S2's
+  I8 inventory; S4 adds none that outlives a collection (Marking's
+  shadow_owners lives for one). Downstream, NapiState.wraps is keyed by
+  address but holds each object weakly (step 2a): a dead object's entry
+  misses on lookup and is pruned as the table grows. The survey found
+  no other.
+- I5 teardown: the plan's survey audited every Drop with effects beyond
+  freeing memory, in the engine and downstream. Downstream resources
+  (executors, task and thread pools, workers, sockets and servers,
+  native libraries, TLS/net/dgram, child processes) live in OpState
+  slots or Runtime fields; JavaScript holds integer ids, and they close
+  explicitly or at Agent teardown, before the heap is released. In the
+  engine one teardown depended on collection timing, a collected
+  ShadowRealm's Interp dropping inside the sweep (fixed in step 2b/2c).
+  The downstream suites now run under gc-heap and pass with the default
+  build's counts. Found and left open, none of them caused by the
+  collector: napi_wrap never runs finalizers (by design, noted there:
+  memory is reclaimed at process exit); AddonRegistry says addons stay
+  loaded for the process lifetime but lives in OpState, so they are
+  dlclosed at Agent teardown; SqliteState has no Drop, so databases
+  still open at Agent teardown are never closed; and native memory
+  released by FinalizationRegistry callbacks (TextDecoder, compression
+  codecs, wasm store handles) is not counted in the byte budget (S6's
+  budget policy).
+- Tripwire, JS workloads (base 230d0005, S3 with step 2's fixes, against
+  fd1da511; perf stat cycles:u/instructions:u on CPU 5, 7 interleaved
+  rounds, medians; clock 1.35-1.41 GHz in every run; outputs identical
+  everywhere). gc-heap cycles at interp: pa -0.0%, sa -3.1%, ms -6.1%,
+  djot -1.6%, react -5.1%, vue -4.6%. At bytecode: pa -2.4%, sa -0.7%,
+  ms -8.3%, djot -1.9%, react +2.4%, vue -1.6%; react rechecked over 15
+  rounds is -0.4%. Instructions fall everywhere (-0.1..-4.3%) except
+  vue bytecode (+0.2%). gc-heap peak RSS at interp: pa -16.6%, sa
+  -11.7%, ms -21.8%, djot -26.3%, react -21.1%, vue -17.1%. At bytecode:
+  pa -17.3%, sa -8.1%, ms -20.5%, djot -18.0%, react -8.0%, vue -5.3%.
+  Default build: cycles -2.3..+0.8% and instructions -0.3..+0.0%, except
+  react bytecode at +3.6% cycles (+3.1% over the 15-round recheck, with
+  0.2% fewer instructions and overlapping ranges); RSS within its spread
+  (pa interp takes the same bimodal values, 11.7 or 12.7-13.7 MiB, in
+  both).
+- Tripwire, object_alloc_bench (release lib test binaries; ns/op,
+  medians of 5 interleaved runs, base -> fd1da511): gc-heap templated
+  {x,y} + drop 108.5 -> 111.6 (+2.9%), Object::new + drop 102.4 ->
+  102.9, Props::new 6.3 -> 5.9, the rest within 1.5%. Default build:
+  templated 103.1 -> 99.2 (-3.8%), the rest within 0.5%. Bisected
+  (gc-heap, 5 runs each, spreads under 0.4 ns): 106.8 at step 3's end
+  (bb394ad0), 107.6 at step 4's (a73169a0), 111.6 after step 5 and the
+  gate fixes. Not added work: Object::new_with_parts has the same 249
+  instructions in both binaries, its operands differing only by GcState
+  fields 32 bytes further on (template_strings, a7e7da88) and by address
+  bits; the whole bench executes the same instructions (medians of 3
+  runs: 10.43G, +0.02%) in 1.6% more cycles. The default build's -3.8%
+  is placement in the other direction: its function differs only in
+  address bits.
+- wasm32 acceptance: still blocked (see the S2 deviation).
