@@ -3868,8 +3868,8 @@ mod tests {
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+        all(feature = "gc-heap", target_arch = "x86_64"),
+        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
     )]
     #[test]
     fn borrowed_osr_cache_metadata_is_counted_once_and_released_with_chunk() {

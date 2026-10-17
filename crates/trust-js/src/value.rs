@@ -774,13 +774,13 @@ mod packed_value_tests {
         assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// Raw frame-word reads, writes, `replace_raw` and `drop_in_place` move the one owner without
+    /// retain or loss and leave the other words intact; gc-heap handles hold no count, so there
+    /// the words and identities alone.
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
+        #[cfg(not(feature = "gc-heap"))]
         let before = Gc::strong_count(&obj);
         let mut frame: [std::mem::MaybeUninit<PackedValue>; 5] =
             std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
@@ -793,15 +793,20 @@ mod packed_value_tests {
             base.add(3).write(PackedValue::pack(Value::Null));
             base.add(4).write(PackedValue::pack(Value::Num(-0.0)));
         }
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Gc::strong_count(&obj), before + 1);
         unsafe {
             let moved = base.add(1).read();
             base.add(1).write(PackedValue::pack(Value::Undefined));
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(Gc::strong_count(&obj), before + 1);
             assert_eq!((*base).bits(), 1.5f64.to_bits());
             assert!(matches!(moved.unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             PackedValue::replace_raw(base.add(3).cast(), moved.into_value());
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(Gc::strong_count(&obj), before + 1);
+            #[cfg(feature = "gc-heap")]
+            assert!(matches!((*base.add(3)).unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
             assert!(matches!((*base.add(2)).unpack(), Value::Bool(true)));
             assert!(
@@ -811,6 +816,7 @@ mod packed_value_tests {
                 std::ptr::drop_in_place(base.add(k));
             }
         }
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Gc::strong_count(&obj), before);
     }
 

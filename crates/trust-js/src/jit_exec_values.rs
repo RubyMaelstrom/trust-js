@@ -600,6 +600,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn reference_count(value: &Value) -> usize {
         match value {
             Value::Obj(object) => crate::value::Gc::strong_count(object),
@@ -609,10 +610,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    // The counted arm only; jit::traced_tests checks the Traced arm.
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn native_owner_clone_drop_all_kinds_and_last_owner_fallback() {
         let mut interp = crate::interpreter::Interp::new();

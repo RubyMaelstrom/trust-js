@@ -707,14 +707,14 @@ mod tests {
         assert_eq!(second_weak.strong_count(), 0);
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// The raw literal factories (inline, heap-packed and large arrays; templated objects) move
+    /// their operand words into elements and fields: lengths, identities and -0 hold, and in the
+    /// default build no count changes (gc-heap handles hold none).
     #[test]
     fn compact_storage_raw_literals_move_packed_owners_without_refcount_churn() {
         let mut interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
+        #[cfg(not(feature = "gc-heap"))]
         let baseline = crate::value::Gc::strong_count(&object);
         // Exercise inline-packed, heap-packed and large dense array factories.
         for count in [0, 1, 10, 11, 32, 33, 70] {
@@ -723,6 +723,7 @@ mod tests {
                 .collect();
             let array = unsafe { interp.make_array_from_raw(operands.as_mut_ptr(), count) };
             unsafe { operands.set_len(0) };
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline + count);
             let Value::Obj(array) = array else {
                 panic!("array factory returned a primitive")
@@ -738,6 +739,7 @@ mod tests {
                 );
             }
             drop(array);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
         let template = std::cell::OnceCell::new();
@@ -750,6 +752,7 @@ mod tests {
             let result = unsafe {
                 interp.make_plain_object_templated_from(&template, &keys, operands.as_mut_ptr(), 2)
             };
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
             let Value::Obj(result) = result else {
                 panic!("object factory returned a primitive")
@@ -758,7 +761,14 @@ mod tests {
                 matches!(result.borrow().props.get("negativeZero").unwrap().value(),
                 Value::Num(number) if number.to_bits() == (-0.0f64).to_bits())
             );
+            #[cfg(feature = "gc-heap")]
+            assert!(
+                matches!(result.borrow().props.get("held").unwrap().value(),
+                Value::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object)),
+                "the field holds the moved operand's object"
+            );
             drop(result);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
     }

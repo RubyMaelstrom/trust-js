@@ -457,10 +457,6 @@ fn warmed_descriptors_accessors_and_proxies_remain_instance_local() {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
 #[test]
 fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
     let mut engine = Engine::new();

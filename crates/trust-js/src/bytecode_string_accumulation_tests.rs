@@ -627,8 +627,8 @@ fn every_original_vm_interior_stop_exposes_ordinary_state_before_commit() {
 }
 
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
@@ -699,8 +699,8 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix() {
@@ -751,8 +751,8 @@ fn borrowed_native_every_original_interior_resumes_without_replaying_the_prefix(
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
+    all(feature = "gc-heap", target_arch = "x86_64"),
+    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
 )]
 #[test]
 fn borrowed_native_preentry_interrupt_leaves_binding_then_commits_before_yield() {

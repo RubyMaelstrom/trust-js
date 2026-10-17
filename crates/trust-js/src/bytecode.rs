@@ -26264,10 +26264,7 @@ mod return_slot_tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
@@ -26302,6 +26299,74 @@ mod return_slot_tests {
             wide_ptr
         );
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    /// gc-heap: the same prefix offsets and sizes. Values hold no count, and the one packed
+    /// word that still owns is a lazy prototype's (an `Rc` in both builds): `jit_drop_packed_at`
+    /// releases its one owner, which drops the lazy prototype and with it its owner of the key
+    /// layout. Both drop helpers return the word they were given.
+    #[cfg(feature = "gc-heap")]
+    #[test]
+    fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PackedValue>(), 8);
+        assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
+        if size_of::<usize>() == 8 {
+            assert_eq!(offset_of!(JitCtx, helpers), 0);
+            assert_eq!(offset_of!(JitCtx, stack_base), 8);
+            assert_eq!(offset_of!(JitCtx, final_sp), 16);
+            assert_eq!(offset_of!(JitCtx, slots), 24);
+            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
+            assert_eq!(offset_of!(JitCtx, env_raw), 40);
+            assert_eq!(offset_of!(JitCtx, this_raw), 48);
+            assert_eq!(offset_of!(JitCtx, global_body), 56);
+            assert_eq!(offset_of!(JitCtx, genv), 64);
+            assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
+        }
+        let keys = crate::value::new_property_layout(vec![Rc::from("constructor")]);
+        let owner = crate::value::Object::new(None);
+        let mut property = crate::value::Property::plain(Value::Undefined);
+        property.defer_function_prototype(
+            &owner,
+            crate::value::Object::new(None),
+            &crate::value::Props::with_layout(0, Some(keys.clone())),
+        );
+        assert_eq!(
+            Rc::strong_count(&keys),
+            2,
+            "the lazy prototype owns the key layout"
+        );
+        // Move the property's word out, at the offset generated stores address it by.
+        let entry_value = crate::value::jit_layout(&owner).entry_value;
+        let mut packed = unsafe {
+            let word = (&raw mut property)
+                .cast::<u8>()
+                .add(entry_value)
+                .cast::<PackedValue>();
+            let packed = ManuallyDrop::new(word.read());
+            word.write(PackedValue::pack(Value::Undefined));
+            packed
+        };
+        assert_eq!(
+            packed.bits() & !0xffff_ffff_ffff,
+            crate::value::PACK_LAZY_PROTO
+        );
+        let packed_ptr = &raw mut *packed;
+        assert_eq!(
+            unsafe { jit_drop_packed_at(std::ptr::null_mut(), 0, packed_ptr) },
+            packed_ptr
+        );
+        assert_eq!(
+            Rc::strong_count(&keys),
+            1,
+            "releasing the word dropped the lazy prototype"
+        );
+        let mut wide = ManuallyDrop::new(Value::Obj(owner));
+        let wide_ptr = &raw mut *wide;
+        assert_eq!(
+            unsafe { jit_drop_at(std::ptr::null_mut(), 0, wide_ptr) },
+            wide_ptr
+        );
     }
 }
 
