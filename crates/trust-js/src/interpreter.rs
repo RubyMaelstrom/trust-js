@@ -17227,8 +17227,9 @@ impl Interp {
         body: &[Stmt],
         source: Option<Rc<crate::stack_trace::ScriptSource>>,
     ) -> Result<Value, Abrupt> {
-        // The program allocates in this Agent's heap, whichever was active when it was called.
-        let _agent = self.enter_agent();
+        // The program allocates in this Agent's heap, whichever was active when it was called;
+        // this Agent stays the surrounding one afterwards, as the engine's entry points leave it.
+        self.activate_gc_heap();
         // ScriptEvaluation: the Script Record is the ScriptOrModule of its code; its host-
         // defined base is the host's current script base (HTML: the classic script's base URL).
         if let Some(source) = &source {

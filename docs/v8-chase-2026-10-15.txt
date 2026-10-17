@@ -1512,8 +1512,10 @@ Exit gate finding, fixed before the gate (pre-existing since S2):
   reused), and its strings are rooted in that heap for the heap's
   lifetime (GcState.template_strings, traced with the interned
   strings). Another heap's closures take their own name strings.
-  run_program also enters its interpreter's agent, so a program
-  allocates in its own heap whatever heap was active when it was
-  called. Test function_name_templates_serve_only_their_heap: two
+  run_program also activates its interpreter's agent (persistently,
+  as the engine's entry points do: a scoped guard switched back
+  afterwards and broke nested_calls_keep_the_surrounding_agent_
+  activation_on_the_fast_path), so a program allocates in its own heap
+  whatever heap was active when it was called. Test function_name_templates_serve_only_their_heap: two
   engines, the first dropped before the second runs; with the heap
   check removed, the second's closure names are not cells of its heap.
