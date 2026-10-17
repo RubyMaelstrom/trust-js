@@ -1473,3 +1473,21 @@ Step 5a, a Map's or Set's data in its cell (gc-heap):
   +-1.6%. pa interp is +1.4% instructions, which a symbol profile puts
   in Props::get and get_member_recv_impl inlining, not in the new
   checks; it is left to the fat-LTO comparison.
+
+Step 5b/5c, the remaining exotic tables (gc-heap and default):
+- Probes counted per table (a scratch build whose proxy, typed-array
+  and module-namespace tables count lookups, by call site). Proxies:
+  vue 3.4M probes at bytecode and 8.5M at interp against 19 proxies;
+  the other fixtures make essentially none outside unguarded sites. At
+  ~5 ns a probe that is at most ~1% of vue's runtime, for a 53-site
+  change. Moving proxy state into the cell is not taken in S4: S5's
+  specializing tier needs Proxy's state in the object anyway, so it
+  moves then, measured there. Typed arrays and module namespaces: no
+  fixture creates either, but their tables were probed on [[Get]]/
+  [[Set]] slow paths for every object (pa interp 5.7M typed-array
+  probes on an empty table, 1M namespace and 1M proxy probes). Not
+  moved; their hot probes are now guarded.
+- 5c: typed_array_at and is_namespace answer an empty table without a
+  probe, and [[Set]]'s prototype walk uses proxy_at (already guarded).
+  Measured against 5a (no-LTO gc-heap, 7 rounds): pa interp -0.8%
+  cycles (-0.2% instructions); everything else within +-0.5%.

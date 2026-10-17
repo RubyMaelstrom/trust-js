@@ -9350,6 +9350,16 @@ impl Interp {
         self.proxies.get(&ptr).cloned()
     }
 
+    /// The TypedArray state of `ptr`, skipping the table probe when no TypedArray exists: the
+    /// [[Get]]/[[Set]] slow paths ask for every object.
+    #[inline(always)]
+    pub(crate) fn typed_array_at(&self, ptr: usize) -> Option<TaInfo> {
+        if self.typed_arrays.is_empty() {
+            return None;
+        }
+        self.typed_arrays.get(&ptr).copied()
+    }
+
     #[inline(always)]
     pub(crate) fn defer_trigger(&mut self, o: &Gc, key: Option<&str>) -> Result<(), Abrupt> {
         if self.deferred_ns.is_empty() {
@@ -9553,7 +9563,7 @@ impl Interp {
                 }
                 // TypedArray integer-index reads come from the backing buffer, not the property map.
                 // length/byteLength/byteOffset are computed (and 0 once the buffer is detached).
-                if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+                if let Some(info) = self.typed_array_at(ptr) {
                     match self.ta_index_kind(&info, key) {
                         TaIndex::Element(idx) => {
                             if let Some(trace) = trace.as_deref_mut() {
@@ -10312,7 +10322,7 @@ impl Interp {
         }
         // TypedArray integer-index writes go straight to the backing buffer; a canonical-numeric key
         // that isn't a valid index is inert (the value coercion still runs, then is discarded).
-        if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+        if let Some(info) = self.typed_array_at(ptr) {
             match self.ta_index_kind(&info, key) {
                 TaIndex::Element(_) | TaIndex::Exotic => {
                     if let Some(trace) = trace.as_deref_mut() {
@@ -10348,7 +10358,7 @@ impl Interp {
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
             let optr = Gc::as_ptr(&o) as usize;
-            if let Some((target, handler)) = self.proxies.get(&optr).cloned() {
+            if let Some((target, handler)) = self.proxy_at(optr) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
                         crate::feedback::PropertyOutcome::Exotic,

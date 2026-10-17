@@ -1748,9 +1748,10 @@ impl Interp {
 
     // --- Namespace exotic-object behaviour ----------------------------------------------------
 
-    /// Whether `ptr` (an object pointer) is a module namespace exotic object.
+    /// Whether `ptr` (an object pointer) is a module namespace exotic object. Asked on [[Get]]
+    /// slow paths for every object, so an empty table answers without a probe.
     pub(crate) fn is_namespace(&self, ptr: usize) -> bool {
-        self.module_ns.contains_key(&ptr)
+        !self.module_ns.is_empty() && self.module_ns.contains_key(&ptr)
     }
 
     /// A module namespace's `[[GetOwnProperty]]` for a string key: `Some(property)` with the export's
