@@ -1638,3 +1638,53 @@ S4 review fixes (outside review of e31e419b, 2026-10-17)
 - Lib suites: --features embed 2153/0/3, embed,gc-heap 1850/0/114 (the
   two new tests). Clippy clean for both feature sets; gc-heap with
   heap-bridge checks. The new tests pass at GC stress 1.
+
+S4 review fixes, measured (2026-10-17)
+--------------------------------------
+- The pool's cap as first enforced (af79a759: the larger of 64 and the
+  pages in use) brought back allocator churn where the live heap is
+  small. Vue at interp keeps 0.4 MiB live in about 39 pages while each
+  cycle's 8 MiB budget refills about 100: 64 waited in the pool and 36
+  a cycle went back to glibc and came back fresh (peak RSS 56.9 MiB;
+  58.2 with fd1da511's release-time check). The cap is now the pages
+  the next cycle's allocation budget can fill (trigger minus live
+  bytes, at least 64), applied once the sweep has set that budget. All
+  of Vue's released pages wait for the next cycle (peak RSS 42.6 MiB),
+  and a heap that shrank keeps no more than its smaller budget. Test
+  spare_pages_follow_the_next_cycles_budget replaces spare_pages_stay_
+  capped_after_the_heap_shrinks: with the engine's 8 MiB floor, a
+  300-page burst of garbage leaves 128 pooled (150 with the release-time
+  check); 300 live pages raise the budget so a 200-page burst on top
+  stays pooled; when they die the pool returns to 128.
+- Contention: another session's batch renders (Blender, 4-12 threads)
+  ran during a first measurement of these fixes. measure.py now records
+  the CPU time other processes used during each run (/proc/stat); the
+  runs below saw 0.24-1.14 other cores (desktop background, no render),
+  and all are kept.
+- Sustained-allocation workload (benchmarks/sustained-allocation.js,
+  TRUST_JS_PERF_METRICS=1 and TRUST_JS_GC_LOG=1; fat LTO, CPU 5, 5 runs
+  each; main = e3310993, S3 = S4's base 230d0005, S4 = this commit;
+  medians, pauses over all runs):
+                     collections  pause total  max     GC share  peak RSS
+    interp   main    16           700 ms       82 ms   25.2%     180 MiB
+             S3      20           686 ms       47 ms   29.1%     206 MiB
+             S4      20           655 ms       45 ms   28.8%     185 MiB
+    bytecode main    16           486 ms       63 ms   28.4%     147 MiB
+             S3      20           566 ms       39 ms   39.1%     198 MiB
+             S4      20           543 ms       36 ms   37.5%     184 MiB
+  Pause distribution (S4, 100 pauses per tier): interp 6 under 5 ms, 9
+  at 5-10, 20 at 10-25, 65 at 25-50; bytecode the same (S3: interp
+  5/7/20/68, bytecode 5/10/20/65; main mostly 25-100 ms). Post-GC live
+  bytes 36.8 MiB in every build and tier, in at most 621-625 small-cell
+  pages (94-95% of their bytes live, as at S2); after a collection up
+  to 570-575 released pages (36 MiB) wait for the next cycle's 36.8 MiB
+  budget. The GC share stays far from S6's 5% target.
+- Tripwire recheck (gc-heap, fd1da511 against this commit; fat LTO,
+  perf stat on CPU 5, 7 rounds): instructions equal everywhere
+  (+-0.1%), cycles -1.4..+2.3%, outputs identical. Peak RSS: vue interp
+  -27.2% (58.0 -> 42.2 MiB), react interp -16.0%, ms -9.6% (bytecode)
+  and -15.6% (interp), pa bytecode -0.6%; elsewhere +0.9..+6.4% (+1.5
+  to 3.7 MiB), where glibc used to recycle freed pages for other
+  allocations and the pool now keeps them for the next cycle.
+- Lib suite gc-heap 1850/0/114 (the default build has no gc_core);
+  clippy clean.
