@@ -2344,3 +2344,78 @@ Step 8c, per-test GC stress with the JIT on (8db05b95, 9d8c20de):
     are S5's new tests and those 8a and 8b returned.
   - Lib suites: embed 2165/0/3 twice; embed,gc-heap 2194/0/62 twice.
   - Clippy clean in both builds; rustfmt clean.
+
+Step 9 plan, from a read-only survey at 08122116 (with sub-surveys of
+the emitter sites, `this`, string constants and bindings, spot-checked
+against the source):
+- Under gc-heap a packed word owns nothing but a lazy prototype's
+  Rc<LazyFunctionPrototype>: BigInt, String, Symbol and Object payloads
+  are cell addresses. A lazy word is only ever the value of a function's
+  "prototype" property (one creation site). Rust materializes it at
+  every property-to-execution boundary; generated code keeps it out at
+  3 emitter sites and 2 region read guards; execution storage never
+  holds one.
+- Generated code still routes ownership for nothing under gc-heap: the
+  13-instruction owner guard at 30 sites whose word is never lazy, and
+  14 BigInt-only and 4 never-lazy inline tag tests. Two traps: in
+  emit_store_local the BigInt test before the slot release and the
+  clone after it go together; the region materialize clone has no slow
+  path and relies on the read guards before it.
+- `this` is packed up to each JIT entry and widened there (JitCtx.
+  this_val is a Value, reached through this_raw); a direct call decodes
+  it (33 instructions). JitCtx is repr(C) and later fields are reached
+  by offset_of!, so a packed this_val must be gc-heap only.
+- String constants: the template loads the cell from the chunk's
+  constant slot and tags it. An immediate is safe under gc-heap (the
+  chunk's RootedVec roots the cell, cells don't move, chunks don't cross
+  Agents) but must stay out of the process-wide stubs; the default
+  build keeps its increment (in-place append needs a count of 1).
+- A packed Binding.value would leave the environment cell in its
+  128-byte class; the gains are in the binding load and store
+  sequences.
+
+Deviations from the plan's step 9, recorded before the work:
+- "The execution word is Copy": not literally. PackedValue keeps its
+  Cell<u64>, since shared slots are written through &self (mapped-
+  argument aliases, SlotAccess, slots the VM lends to generated code)
+  and a Copy type cannot contain a Cell. Under gc-heap it gets no Drop
+  and a Clone that copies the bits (debug-asserting a non-lazy word),
+  pinned by a !needs_drop assertion, so copies and drops are free.
+  Literal Copy needs one Cell<Word> slot type, simpler once the counted
+  build is gone: an S6 item. Value stays non-Copy under gc-heap; its
+  drop glue is already empty (also S6).
+- "Lazy prototypes kept out of execution" already holds. Step 9 also
+  makes the lazy prototype a gc-heap payload cell (as S4 did for
+  UserCallable), so that no word owns an Rc once Drop goes and property
+  overwrites release nothing. If the cell measures badly, Property owns
+  the Rc instead (recorded if taken).
+- "`this` travels packed" covers JIT contexts, entries and direct
+  calls; the VM's `this` (run, drive_vm, VmCoro) stays wide.
+
+Step 9 runs as six sequential sub-steps, one agent each, both builds
+green after each:
+- 9a, gc-heap emission: under Traced the exec clone, drop and release
+  emitters emit nothing, and the BigInt-only and never-lazy tag tests
+  go. Where the key can be "prototype" (named reads of it, the computed
+  method read, LoadRef through a with object, the region own reads), a
+  named property-word guard sends a lazy word to the slow path: a
+  materialization boundary, not ownership. Generated code only.
+- 9b, lazy prototypes as gc-heap payload cells; the old-value release
+  paths of property stores become default-only.
+- 9c, PackedValue without Drop and with a bit-copy Clone under gc-heap;
+  an explicit materializing read where properties reach execution.
+- 9d, `this` packed in JitCtx under gc-heap (a JitRepr fact for the
+  emitters; the finish stub resets a full Undefined word).
+- 9e, string constants as immediates under gc-heap.
+- 9f, Binding.value measured and decided; the step's tripwire.
+Order: 9b before 9c (Drop goes only once no word owns an Rc); 9d and 9e
+after 9a, so their templates assume guard-free words.
+Gates for each sub-step: default code dumps identical to the step-1
+baselines; lib suites in both builds; clippy and rustfmt; the stress
+child with the sub-step's tests at stress 1; fixtures at --tier=jit and
+difftest --seed 7 --count 150 in both builds. Measured per sub-step:
+gc-heap code-dump words against the step-8 code (no-LTO, ASLR off: vue
+56 chunks, 229,659 words; react 10, 33,677; djot 160, 1,257,266; equal
+run to run). At the end: fixtures at --tier=jit in both builds (fat
+LTO; cycles, instructions, peak RSS) against step 8's code, and the
+per-test GC stress run with the JIT on over the whole suite.
