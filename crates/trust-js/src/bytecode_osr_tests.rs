@@ -78,6 +78,108 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
 }
 
+/// gc-heap (the rooting harness `jit::rooting_tests`): the operand prefix a hot Script loop
+/// lends its native code at OSR entry is a root for that native run. A fresh object the VM
+/// tracks below a loop entered at depth 1 waits in the borrowed frame's operand words, which the
+/// entry registers; when the native code calls `collect()` after the loop, they mark it. The
+/// run returns it intact, and once the run ends nothing keeps it.
+#[cfg(all(
+    feature = "gc-heap",
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[test]
+fn osr_entry_operand_prefix_is_a_root() {
+    use crate::jit::rooting_tests::{assert_tracked_collectable, jit_engine, last_census};
+    let mut engine = jit_engine(0);
+    let body = crate::parser::parse_script(
+        "track({tag: 'O'}); for (let k = 0; k < 2000; k++) {} osrMarks = collect();",
+        false,
+    )
+    .ok()
+    .expect("prefix fixture parses");
+    let mut chunk = compile_script(&body, false).expect("prefix fixture compiles");
+    let raw = Rc::get_mut(&mut chunk).unwrap();
+    // The compiled call, literal and reference sites (with their caches) are reused in another
+    // order, so that `track`'s result stays on the stack below the loop instead of becoming the
+    // completion value.
+    assert_eq!(
+        raw.ops[..4],
+        [
+            Op::LoadNameForCall(0, 0),
+            Op::Const(0),
+            Op::MakeObject(1, 1, 0),
+            Op::CallWithThis(1, 0)
+        ]
+    );
+    assert_eq!(
+        raw.ops[16..19],
+        [
+            Op::ResolveNameRef(2, 0),
+            Op::LoadNameForCall(3, 1),
+            Op::CallWithThis(0, 1)
+        ]
+    );
+    assert!(matches!(raw.consts[1], Value::Num(n) if n == 0.0));
+    assert!(matches!(raw.consts[2], Value::Num(n) if n == 2000.0));
+    raw.ops = vec![
+        // track({tag: 'O'}): the prefix.
+        Op::LoadNameForCall(0, 0),
+        Op::Const(0),
+        Op::MakeObject(1, 1, 0),
+        Op::CallWithThis(1, 0),
+        // for (k = 0; k < 2000; k++) {}, its header at depth 1.
+        Op::Const(1),
+        Op::StoreLocal(1),
+        Op::LoadLocal(1),
+        Op::Const(2),
+        Op::Lt,
+        Op::JumpIfFalse(12),
+        Op::UpdateLocal(1, UpdKind::IncDiscard),
+        Op::Jump(6),
+        // osrMarks = collect(), in the same native run.
+        Op::ResolveNameRef(2, 0),
+        Op::LoadNameForCall(3, 1),
+        Op::CallWithThis(0, 1),
+        Op::StoreRef(0),
+        Op::Return,
+    ];
+    raw.jit_needs_activation_state = raw.ops.iter().any(jit_bridge_op);
+    raw.has_tail_calls = false;
+    let env = engine.interp.global_env.clone();
+    crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
+    // The result's handle lives only in this helper frame (gc-heap scans the stack).
+    let tag = crate::gc_test::in_frame(|| {
+        let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
+            .ok()
+            .expect("the prefix loop completes");
+        let marks = engine.interp.get_var("osrMarks", &env).ok().expect("marks");
+        assert!(
+            matches!(&marks, Value::Str(marks) if marks.as_str() == "R"),
+            "the prefix was marked by a root"
+        );
+        let tag = result
+            .as_obj()
+            .expect("the prefix")
+            .borrow()
+            .props
+            .get("tag")
+            .map(crate::value::Property::value);
+        tag
+    });
+    assert!(matches!(tag, Some(Value::Str(tag)) if tag.as_str() == "O"));
+    assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
+    let census = last_census();
+    assert!(
+        census
+            .entries
+            .iter()
+            .any(|&[slots, stack]| slots == 0 && stack > 0),
+        "collect() ran in the loop's borrowed frame: {census:?}"
+    );
+    assert_tracked_collectable(&mut engine);
+}
+
 #[test]
 fn osr_compile_unavailable_keeps_exact_baseline_state_without_replay() {
     let mut engine = crate::Engine::new();

@@ -120,10 +120,8 @@ fn invoke(
     (values, ctx.error.take())
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+// Reference counting (gc-heap: jit::rooting_tests::computed_read_operands_are_roots).
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
     let mut engine = Engine::new();

@@ -7,16 +7,21 @@
 //! for each object tracked since its last call, what marked it first: `R` a root, `S` something
 //! else (the native stack, a cell), `D` nothing (it died). Roots are marked before the native
 //! stack is scanned, so a stale stack copy of a value cannot stand in for the JIT root under
-//! test; nothing but a JIT activation (and in (9) the call's FnFrame) holds a tracked object as
-//! a root in these programs. The programs then read their values back. `collect()` also records the JIT roots registered at
+//! test; nothing but a JIT activation (and in (9) the call's FnFrame, in (15) the native call's
+//! own rooting of its arguments) holds a tracked object as a root in these programs. The
+//! programs then read their values back. `collect()` also records the JIT roots registered at
 //! the time (active records, Rust entries' word ranges) and the same marker for the environment
 //! of every materialized native activation, and each test checks that its program ran natively
 //! the way it is meant to. Once a program's activations have finished, a collection from the
 //! test (its stack scrubbed, see `gc_test`) must find every object it tracked dead.
+//!
+//! From (10) on, and in two tests kept beside the paths they cover (a callback's long argument
+//! list, an OSR entry's operand prefix), these programs check under gc-heap the JIT paths whose
+//! default-build tests count references.
 
 use crate::bytecode::Tier;
 use crate::interpreter::Interp;
-use crate::value::{Gc, Property, Value, WeakGc};
+use crate::value::{Gc, PackedValue, Property, Value, WeakGc};
 use crate::Engine;
 use std::cell::RefCell;
 
@@ -33,18 +38,18 @@ thread_local! {
 
 /// The JIT roots registered while a `collect()` ran.
 #[derive(Clone, Debug, Default)]
-struct Census {
+pub(crate) struct Census {
     /// Active records of the collecting interpreter.
-    records: usize,
+    pub(crate) records: usize,
     /// Each Rust entry's registered activation: its slot and operand word counts.
-    entries: Vec<[usize; 2]>,
+    pub(crate) entries: Vec<[usize; 2]>,
     /// A marker for the environment of each materialized native activation of a running JIT
     /// context.
     activations: String,
 }
 
 /// `track(value)`: the test follows an object through a weak handle; returns `value`.
-pub(super) fn track(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn track(_: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if let Value::Obj(object) = &value {
         let weak = Gc::downgrade(object);
@@ -140,7 +145,7 @@ fn invoke(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
         .map_err(crate::interpreter::abrupt_value)
 }
 
-pub(super) fn install(engine: &mut Engine, name: &str, length: usize, f: crate::value::NativeFn) {
+pub(crate) fn install(engine: &mut Engine, name: &str, length: usize, f: crate::value::NativeFn) {
     let native = engine.interp.make_native(name, length, f);
     engine
         .interp
@@ -152,7 +157,7 @@ pub(super) fn install(engine: &mut Engine, name: &str, length: usize, f: crate::
 
 /// An engine at `Tier::Jit` with tier threshold `threshold`, the test natives, and retention
 /// paths recorded for `collect()`'s markers.
-pub(super) fn jit_engine(threshold: u32) -> Engine {
+pub(crate) fn jit_engine(threshold: u32) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(threshold);
@@ -174,12 +179,12 @@ pub(super) fn jit_engine(threshold: u32) -> Engine {
 }
 
 /// Evaluate `source` in a frame of its own: no handle it leaves behind is in the test's frame.
-pub(super) fn run(engine: &mut Engine, source: &str) -> String {
+pub(crate) fn run(engine: &mut Engine, source: &str) -> String {
     crate::gc_test::in_frame(|| eval(engine, source))
 }
 
 /// What the last `collect()` found registered.
-fn last_census() -> Census {
+pub(crate) fn last_census() -> Census {
     CENSUS.with(|census| census.borrow().last().cloned().expect("collect() ran"))
 }
 
@@ -200,7 +205,7 @@ pub(super) fn direct_round(engine: &mut Engine, source: &str, direct: usize) -> 
 
 /// Once its activations have finished, nothing a program tracked survives a collection: pooled
 /// records, pooled buffers and finished entries hold nothing.
-pub(super) fn assert_tracked_collectable(engine: &mut Engine) {
+pub(crate) fn assert_tracked_collectable(engine: &mut Engine) {
     assert_eq!(
         crate::gc_trace::jit_frames_registered().len(),
         0,
@@ -523,10 +528,400 @@ fn a_fresh_callee_closure_survives_its_direct_call() {
     assert_tracked_collectable(&mut engine);
 }
 
-/// These programs and step 6's (`jit::traced_tests`) again at `TRUST_JS_GC_STRESS=1`, which
-/// collects at every safepoint that follows an allocation (the calls, polls and natives JIT
-/// code reaches throughout, besides `collect()`), in a process of their own: the setting is
-/// read once per process.
+/// (10) A self-cycle whose only outside owner is an execution word: `held`, which refers to
+/// itself, lives in a direct callee's slot while it collects. The record marks it, the cycle
+/// reads back, and once the activation ends the cycle keeps nothing alive.
+#[test]
+fn self_cycles_in_slots_are_roots() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        function cyclic(n) {
+            var held = track({tag: 'Y' + n});
+            held.self = held;
+            var marks = collect();
+            return marks + ':' + (held.self === held) + ':' + held.self.tag;
+        }
+        function callCyclic(n) { return cyclic(n); }
+        callCyclic(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "R:true:Y0");
+    assert_native(&mut engine, &["cyclic", "callCyclic"]);
+    settle(&mut engine, "cyclic");
+    assert_eq!(direct_round(&mut engine, "callCyclic(1);", 1), "R:true:Y1");
+    assert!(last_census().records >= 2, "caller and callee records");
+    assert_tracked_collectable(&mut engine);
+}
+
+/// (11) The computed-read helper's canonical operand stack (`jit_get_element`). While a proxy's
+/// `get` trap collects inside the helper, the operand below the read's object and key (`pair`'s
+/// first argument) is marked by the activation, for the stack (`GetElem`) and the local
+/// (`GetElemLocal`) form. A method read (`GetMethodElem`) puts its receiver back below the
+/// method; the call then finds it there as `this` while the method, `collect` itself, runs.
+#[test]
+fn computed_read_operands_are_roots() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        var trap = new Proxy({}, {get(target, key, receiver) { return collect(); }});
+        var methods = {get(target, key, receiver) { return collect; }};
+        function pair(a, b) { return b + ':' + a.tag; }
+        function stackRead(n, k) { return pair(track({tag: 'G' + n}), trap[k]); }
+        function localRead(n, k, p) { return pair(track({tag: 'L' + n}), p[k]); }
+        function methodRead(n, k) { return track(new Proxy({}, methods))[k]() + ':M' + n; }
+        function reads(n) {
+            return [stackRead(n, 'x'), localRead(n, 'x', trap), methodRead(n, 'm')].join();
+        }
+        reads(0);
+    "#;
+    crate::bytecode::TEST_JIT_GET_ELEM_HELPERS.with(|count| count.set([0; 3]));
+    assert_eq!(run(&mut engine, source), "R:G0,R:L0,R:M0");
+    assert_native(&mut engine, &["stackRead", "localRead", "methodRead"]);
+    for n in 1..3 {
+        assert_eq!(
+            run(&mut engine, &format!("reads({n});")),
+            format!("R:G{n},R:L{n},R:M{n}")
+        );
+    }
+    let helpers = crate::bytecode::TEST_JIT_GET_ELEM_HELPERS.with(std::cell::Cell::get);
+    assert!(
+        helpers.iter().all(|&count| count > 0),
+        "every form ran the helper: {helpers:?}"
+    );
+    assert!(last_census().records >= 1);
+    assert_tracked_collectable(&mut engine);
+}
+
+/// (12) The named-read helper's commit (`jit_get_prop`). A getter, which only the helper runs,
+/// returns a fresh object, and the helper commits it to the operand stack in place of the
+/// receiver. That result and the operand below it (`triple`'s first argument) wait there while
+/// `collect()` runs and are marked by the activation, for the local (`GetPropLocal`) and the
+/// stack (`GetProp`) form.
+#[test]
+fn named_read_results_are_roots() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        var getters = {get v() { return track({tag: 'V'}); }};
+        function triple(a, b, c) { return c + ':' + a.tag + ':' + b.tag; }
+        function localRead(n, s) { return triple(track({tag: 'L' + n}), s.v, collect()); }
+        function stackRead(n) { return triple(track({tag: 'G' + n}), getters.v, collect()); }
+        function reads(n) { return localRead(n, getters) + ',' + stackRead(n); }
+        reads(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "RR:L0:V,RR:G0:V");
+    assert_native(&mut engine, &["localRead", "stackRead"]);
+    for n in 1..3 {
+        assert_eq!(
+            run(&mut engine, &format!("reads({n});")),
+            format!("RR:L{n}:V,RR:G{n}:V")
+        );
+    }
+    assert!(last_census().records >= 1);
+    assert_tracked_collectable(&mut engine);
+}
+
+/// (13) The named-read helper's exceptional path: an inherited getter that collects and throws.
+/// While it runs, the operand below the read (`pair`'s first argument) is marked by the
+/// activation, and so is the receiver: the getter's `this` once `GetProp` or `GetPropLocal` has
+/// consumed it, and also still on the stack under `GetMethod`, which keeps it for the unwind. The
+/// catch receives the markers and the receiver's id, and after the unwind and the activation
+/// nothing the program tracked survives.
+#[test]
+fn named_read_throws_root_their_operands() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        var throwing = {
+            get v() { throw collect() + ':' + this.id; },
+            get m() { throw collect() + ':' + this.id; },
+        };
+        function receiver(id) { var o = Object.create(throwing); o.id = id; return track(o); }
+        function pair(a, b) { return a.tag + b; }
+        function stackThrows(n) {
+            try { return pair(track({tag: 'G' + n}), receiver('g' + n).v); }
+            catch (marks) { return marks; }
+        }
+        function localThrows(n, o) {
+            try { return pair(track({tag: 'L' + n}), o.v); }
+            catch (marks) { return marks; }
+        }
+        function methodThrows(n) {
+            try { return pair(track({tag: 'M' + n}), receiver('m' + n).m()); }
+            catch (marks) { return marks; }
+        }
+        function reads(n) {
+            return [stackThrows(n), localThrows(n, receiver('l' + n)), methodThrows(n)].join();
+        }
+        reads(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "RR:g0,RR:l0,RR:m0");
+    assert_native(&mut engine, &["stackThrows", "localThrows", "methodThrows"]);
+    for n in 1..3 {
+        assert_eq!(
+            run(&mut engine, &format!("reads({n});")),
+            format!("RR:g{n},RR:l{n},RR:m{n}")
+        );
+    }
+    assert!(last_census().records >= 1);
+    assert_tracked_collectable(&mut engine);
+}
+
+/// A context for `jit_return`, which reads and writes only `ret` and the operand it is given;
+/// every other field is a valid Rust value that reaches nothing.
+fn return_context() -> super::JitCtx {
+    super::JitCtx {
+        helpers: std::ptr::null(),
+        stack_base: std::ptr::null_mut(),
+        final_sp: std::ptr::null_mut(),
+        slots: std::ptr::null_mut(),
+        inline_ic_safe: std::ptr::null(),
+        env_raw: std::ptr::null(),
+        this_raw: std::ptr::null(),
+        global_body: std::ptr::null(),
+        genv: 0,
+        interp: std::ptr::null_mut(),
+        chunk: std::ptr::null(),
+        this_val: Value::Undefined,
+        n_slots: 0,
+        handlers: Vec::new(),
+        handler_floor: 0,
+        code_base: std::ptr::null(),
+        pc_offsets: std::ptr::null(),
+        error: None,
+        ret: PackedValue::pack(Value::Undefined),
+        env_parent_raw: std::ptr::null(),
+        opstat_enabled: false,
+        callstat_enabled: false,
+        propstat_enabled: false,
+        inline_recompile_at: 0,
+        live_objects: std::ptr::null(),
+        activation: None,
+        resume_activation: std::ptr::null_mut(),
+        resume_pc: 0,
+        resume_step: None,
+        references_raw: std::ptr::null_mut(),
+        accessor_holder: 0,
+        accessor_slot: 0,
+    }
+}
+
+/// Store a fresh tracked object `{tag}` in `word` from a frame of its own, so that no handle to
+/// it is left in the caller's frame; returns its weak handle.
+#[inline(never)]
+fn track_into(i: &mut Interp, word: &mut PackedValue, tag: &str) -> WeakGc {
+    let object = i.new_object();
+    object
+        .borrow_mut()
+        .props
+        .insert("tag", Property::plain(Value::str(tag)));
+    *word = PackedValue::pack(Value::Obj(object));
+    let _ = track(i, Value::Undefined, &[Value::Obj(object)]);
+    Gc::downgrade(&object)
+}
+
+/// Store a second word for the object `source` holds in `word`, from a frame of its own.
+#[inline(never)]
+fn alias_into(source: &PackedValue, word: &mut PackedValue) {
+    *word = source.clone();
+}
+
+/// The `tag` of the object `word` holds, read in a frame of its own.
+#[inline(never)]
+fn tag_of(word: &PackedValue) -> Option<String> {
+    let tag =
+        word.with_object(|object| object.borrow().props.get("tag").map(Property::value))??;
+    match tag {
+        Value::Str(tag) => Some(tag.as_str().to_owned()),
+        _ => None,
+    }
+}
+
+/// An explicit collection from this frame. The dead frames below it are zeroed first, so the
+/// collector's own frames, built over them, inherit no stale copy of a value the caller has
+/// let go (which the stack scan would take for an owner).
+#[inline(always)]
+fn collect_here(i: &mut Interp) {
+    crate::gc_core::scrub_stack(64 * 1024);
+    i.gc_collect();
+}
+
+/// One round of [`context_return_slot_is_a_root`]: `ret` empty or holding an object, and the
+/// returned operand a fresh object or an alias of the one `ret` holds.
+#[inline(never)]
+fn return_round(i: &mut Interp, occupied: bool, alias: bool) {
+    use crate::bytecode::jit_return;
+    let mut ctx = return_context();
+    // The operand word lives on the Rust heap, unregistered: once `jit_return` has moved it into
+    // `ret`, only `ret` can keep the result alive.
+    let mut operand = Box::new(std::mem::ManuallyDrop::new(PackedValue::pack(
+        Value::Undefined,
+    )));
+    let old = occupied.then(|| track_into(i, &mut ctx.ret, "old"));
+    let returned = match &old {
+        Some(old) if alias => {
+            alias_into(&ctx.ret, &mut operand);
+            old.clone()
+        }
+        _ => track_into(i, &mut operand, "returned"),
+    };
+    let _frame = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
+        ctx: &ctx,
+        words: [(std::ptr::null(), 0), (std::ptr::null(), 0)],
+    });
+    let base: *mut PackedValue = &mut **operand;
+    // SAFETY: `base` holds one written word; the operand pointer is one past it.
+    assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
+    collect_here(i);
+    let round = format!("occupied {occupied}, alias {alias}");
+    assert_eq!(
+        weak_marker(&i.gc_heap, &returned),
+        'R',
+        "{round}: `ret` keeps the result"
+    );
+    assert_eq!(
+        tag_of(&ctx.ret).as_deref(),
+        Some(if alias { "old" } else { "returned" }),
+        "{round}"
+    );
+    if let Some(old) = old.filter(|_| !alias) {
+        assert_eq!(
+            weak_marker(&i.gc_heap, &old),
+            'D',
+            "{round}: the displaced result is collectable"
+        );
+    }
+    // A bare return empties `ret` without reading its operand pointer.
+    let unused = std::ptr::NonNull::<PackedValue>::dangling().as_ptr();
+    // SAFETY: a bare return reads no operand.
+    assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
+    assert!(ctx.ret.is_undefined());
+    collect_here(i);
+    assert_eq!(
+        weak_marker(&i.gc_heap, &returned),
+        'D',
+        "{round}: a bare return lets the old result go"
+    );
+    // SAFETY: as above.
+    assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
+}
+
+/// (14) A context's return slot (`jit_return`, the checked return helper), through a synthetic
+/// context registered as a Rust entry's activation (`gc_trace::enter_jit_frame`): no program
+/// collects while `ret` is occupied, since the finish stub moves the result out first (see (3)).
+/// `jit_return` moves the operand into `ret`, whether `ret` was empty, held another object (the
+/// displaced result) or the same one (an alias). A collection then finds the result marked by
+/// `ret`, a root, and the displaced result dead, while the context is still registered; after a
+/// bare return, which empties `ret`, the result is collectable too.
+#[test]
+fn context_return_slot_is_a_root() {
+    let mut engine = jit_engine(0);
+    for (occupied, alias) in [(false, false), (true, false), (true, true)] {
+        return_round(&mut engine.interp, occupied, alias);
+    }
+    assert_tracked_collectable(&mut engine);
+}
+
+/// The committed native-call boundary called from Rust (as `call_jit_cached`'s native entry
+/// calls it), with `collect` as the native: the receiver word stays in this frame, and the
+/// argument word is moved out of an unregistered Rust-heap buffer, so in the native the
+/// boundary's own rooting of the moved arguments (`rooting::root_slice`) is the argument's only
+/// root. Returns the markers of the receiver and the argument.
+#[inline(never)]
+fn committed_from_rust(i: &mut Interp) -> String {
+    let mut this_slot = std::mem::ManuallyDrop::new(PackedValue::pack(Value::Undefined));
+    track_into(i, &mut this_slot, "receiver");
+    let mut args = vec![PackedValue::pack(Value::Undefined)];
+    track_into(i, &mut args[0], "argument");
+    // A stack copy of the argument word until the boundary has moved it: a collection at the
+    // boundary's entry (GC stress) must not find the argument unrooted. It marks as `S`.
+    let held = std::mem::ManuallyDrop::new(args[0].clone());
+    // SAFETY: the receiver word and one argument word are written; the boundary consumes the
+    // argument, and `args` is emptied before it drops.
+    let result = unsafe { i.call_native_committed(collect, &*this_slot, args.as_mut_ptr(), 1) };
+    unsafe { args.set_len(0) };
+    std::hint::black_box(&held);
+    match result {
+        Ok(Value::Str(marks)) => marks.as_str().to_owned(),
+        _ => panic!("collect() returns its markers"),
+    }
+}
+
+/// (15) The committed native-call boundary (`Interp::call_native_committed`), reached from a
+/// warmed site's native call cache entry. The receiver word stays in the caller's operand stack
+/// and the arguments move into the call, which roots them. A collection in the native
+/// (`collect` itself), in a callback the native calls and which throws through it, and in a tail
+/// call the boundary drains after the native returns, finds the receiver and the argument marked
+/// by roots. In generated code the argument's moved word also stays in the caller's scanned
+/// operand stack, so the boundary's own rooting shows only from Rust, with the operands outside
+/// any root (`committed_from_rust`): there the receiver is marked by the stack and the argument
+/// by the boundary.
+#[test]
+fn committed_native_call_operands_are_roots() {
+    /// `callThrough(callback, ...args)`: `callback(...args)`, whose throw propagates.
+    fn call_through(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+        let callback = args.first().cloned().unwrap_or(Value::Undefined);
+        i.call(callback, Value::Undefined, args.get(1..).unwrap_or(&[]))
+            .map_err(crate::interpreter::abrupt_value)
+    }
+    /// `tailCall(callee)`: leaves a pending tail call of `callee()`, which the boundary drains.
+    fn tail_call(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+        let callee = args.first().cloned().unwrap_or(Value::Undefined);
+        i.pending_tail = Some(Box::new((callee, Value::Undefined, Vec::new())));
+        Ok(Value::Undefined)
+    }
+    let mut engine = jit_engine(0);
+    install(&mut engine, "callThrough", 1, call_through);
+    install(&mut engine, "tailCall", 1, tail_call);
+    let source = r#"
+        function viaSite(n) {
+            return track({tag: 'H' + n, nat: collect}).nat(track({tag: 'A' + n}));
+        }
+        function fail(key) { throw collect() + ':' + key.tag; }
+        function viaThrow(n) {
+            try { return track({tag: 'T' + n, nat: callThrough}).nat(fail, track({tag: 'K' + n})); }
+            catch (marks) { return marks; }
+        }
+        function viaTail(n) {
+            return track({tag: 'U' + n, nat: tailCall}).nat(collect, track({tag: 'W' + n}));
+        }
+        function calls(n) { return [viaSite(n), viaThrow(n), viaTail(n)].join(); }
+        calls(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "RR,RR:K0,RR");
+    assert_native(&mut engine, &["viaSite", "fail", "viaThrow", "viaTail"]);
+    for n in 1..3 {
+        assert_eq!(
+            run(&mut engine, &format!("calls({n});")),
+            format!("RR,RR:K{n},RR")
+        );
+    }
+    assert!(last_census().records >= 1);
+    for (function, native) in [
+        ("viaSite", "collect"),
+        ("viaThrow", "callThrough"),
+        ("viaTail", "tailCall"),
+    ] {
+        let target = crate::gc_test::in_frame(|| {
+            let env = engine.interp.global_env.clone();
+            let value = engine.interp.get_var(native, &env).ok().expect("a native");
+            Gc::as_ptr(value.as_obj().expect("a function object")) as usize
+        });
+        assert!(
+            with_chunk(&mut engine, function, |chunk| chunk
+                .cached_call_for(target)
+                .is_some_and(|entry| entry.native != 0)),
+            "{function}'s call of {native} takes the native entry"
+        );
+    }
+    assert_eq!(
+        crate::gc_test::in_frame(|| committed_from_rust(&mut engine.interp)),
+        "SR"
+    );
+    assert_tracked_collectable(&mut engine);
+}
+
+/// These programs, the rooting tests that use this harness beside the tests they stand in for
+/// under gc-heap (a callback's long argument list, an OSR entry's operand prefix) and step 6's
+/// (`jit::traced_tests`) again at `TRUST_JS_GC_STRESS=1`, which collects at every safepoint
+/// that follows an allocation (the calls, polls and natives JIT code reaches throughout,
+/// besides `collect()`), in a process of their own: the setting is read once per process.
 #[test]
 fn rooting_holds_under_gc_stress() {
     const CHILD: &str = "TRUST_JS_TEST_ROOTING_STRESS_CHILD";
@@ -536,6 +931,8 @@ fn rooting_holds_under_gc_stress() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "jit::rooting_tests::",
+            "callback::tests::long_callback_calls_root_operands_and_cache_weakly",
+            "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
             "jit::traced_tests::",
             "--skip",
             "rooting_holds_under_gc_stress",

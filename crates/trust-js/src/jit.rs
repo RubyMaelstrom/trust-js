@@ -192,7 +192,7 @@ mod traced_tests;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_rooting_tests.rs"]
-mod rooting_tests;
+pub(crate) mod rooting_tests;
 
 #[cfg(all(
     test,

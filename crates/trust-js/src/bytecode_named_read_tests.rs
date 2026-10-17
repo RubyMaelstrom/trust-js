@@ -75,6 +75,7 @@ struct Invocation {
     stack: Box<[MaybeUninit<PackedValue>; 4]>,
     initialized: [bool; 4],
     live: usize,
+    #[cfg(not(feature = "gc-heap"))]
     prefix_len: usize,
     error: Option<Abrupt>,
 }
@@ -88,6 +89,7 @@ impl Invocation {
         unsafe { self.stack[index].assume_init_read().into_value() }
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn packed(&self, index: usize) -> &PackedValue {
         assert!(index < self.live && self.initialized[index]);
         // SAFETY: the helper's returned SP covers precisely its still-owned packed cells.
@@ -98,12 +100,14 @@ impl Invocation {
         (0..self.live).map(|index| self.value(index)).collect()
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn take_prefix(&mut self) -> Vec<Value> {
         (0..self.prefix_len)
             .map(|index| self.value(index))
             .collect()
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn drop_slot(&mut self, index: usize) {
         assert!(index < self.live && self.initialized[index]);
         self.initialized[index] = false;
@@ -216,6 +220,7 @@ fn invoke(
         stack,
         initialized: std::array::from_fn(|index| index < live),
         live,
+        #[cfg(not(feature = "gc-heap"))]
         prefix_len,
         error,
     }
@@ -309,10 +314,8 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
     values.clear();
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+// Reference counting (gc-heap: jit::rooting_tests::named_read_results_are_roots).
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
     let mut engine = Engine::new();
@@ -374,6 +377,7 @@ fn collect_named_read(
     Ok(Value::Undefined)
 }
 
+#[cfg(not(feature = "gc-heap"))]
 fn error_name(engine: &mut Engine, error: &Value) -> String {
     match engine
         .interp
@@ -386,16 +390,15 @@ fn error_name(engine: &mut Engine, error: &Value) -> String {
     }
 }
 
+#[cfg(not(feature = "gc-heap"))]
 fn assert_prefix(outcome: &mut Invocation, expected_prefix: &Value, engine: &mut Engine) {
     let mut prefix = outcome.take_prefix();
     assert!(same_js_value(engine, expected_prefix, &prefix[0]));
     prefix.clear();
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+// Reference counting (gc-heap: jit::rooting_tests::named_read_throws_root_their_operands).
+#[cfg(not(feature = "gc-heap"))]
 #[test]
 fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner() {
     let mut engine = Engine::new();

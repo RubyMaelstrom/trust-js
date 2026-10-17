@@ -557,6 +557,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn owner_operation(layout: &crate::value::JitLayout, clone: bool) -> ExecutableBuffer {
         assert!(layout.valid);
         let mut a = asm::Asm::new();
@@ -575,6 +576,7 @@ mod tests {
         executable(a)
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn native_clone(code: &ExecutableBuffer, source: &PackedValue) -> Option<PackedValue> {
         let run: unsafe extern "C" fn(u64, *mut PackedValue) -> u64 =
             unsafe { std::mem::transmute(code.as_ptr()) };
@@ -584,6 +586,7 @@ mod tests {
             .then(|| unsafe { output.assume_init() })
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn native_drop(code: &ExecutableBuffer, value: PackedValue) -> Result<(), PackedValue> {
         let run: unsafe extern "C" fn(u64, *mut u64) -> u64 =
             unsafe { std::mem::transmute(code.as_ptr()) };
@@ -700,10 +703,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    // Reference counting (gc-heap: jit::rooting_tests::self_cycles_in_slots_are_roots).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn native_owner_clone_roots_cycles_until_last_execution_owner_is_released() {
         let mut interp = crate::interpreter::Interp::new();

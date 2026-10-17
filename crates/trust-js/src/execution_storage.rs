@@ -315,9 +315,11 @@ impl std::ops::Deref for DecodedArgs {
 mod tests {
     use super::*;
     use crate::{bytecode::Tier, Completion, Engine};
+    #[cfg(not(feature = "gc-heap"))]
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[cfg(not(feature = "gc-heap"))]
     thread_local! {
         static BOUNDARY_KEY_WEAK: RefCell<Option<crate::value::WeakGc>> = const {
             RefCell::new(None)
@@ -327,6 +329,7 @@ mod tests {
         };
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn boundary_gc_then_call(
         interp: &mut crate::interpreter::Interp,
         this: Value,
@@ -361,6 +364,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn boundary_tail_probe(
         _interp: &mut crate::interpreter::Interp,
         _this: Value,
@@ -389,6 +393,7 @@ mod tests {
         Ok(Value::Undefined)
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     fn boundary_enqueue_tail(
         interp: &mut crate::interpreter::Interp,
         _this: Value,
@@ -491,10 +496,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    // Count churn only; under gc-heap the call's rooting is checked by jit::rooting_tests.
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn compact_native_arguments_move_without_refcount_churn_and_stay_live_for_the_call() {
         let object = crate::value::Object::new(None);
@@ -557,10 +560,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    // Reference counting (gc-heap: jit::rooting_tests::committed_native_call_operands_are_roots).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn committed_native_arguments_remain_rooted_across_collection_callback_throw_and_tail() {
         let mut interp = crate::interpreter::Interp::new();

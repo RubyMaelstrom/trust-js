@@ -461,10 +461,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    // Reference counting (gc-heap: long_callback_calls_root_operands_and_cache_weakly).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn shared_callback_cache_is_weak_and_large_arguments_transfer_exactly_once() {
         let mut engine = Engine::new();
@@ -535,6 +533,104 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.get().callee == 0));
+        assert!(cache.pins.borrow().is_empty());
+    }
+
+    /// gc-heap (the rooting harness `jit::rooting_tests`): a callback with more than four
+    /// arguments goes through `CallbackCache::call_values`'s list arm into the compiled callee,
+    /// which receives the receiver as its record's `this` and the arguments in its record's
+    /// slots. A collection from the callee finds the receiver and an object argument, both fresh
+    /// and held by nothing else but the calling native's frame, marked by those roots, and the
+    /// callee reads them back. Afterwards nothing keeps them, and the shared cache, which cached
+    /// the callee, does not root it: once unnamed it dies, and pruning empties the site.
+    #[cfg(all(
+        feature = "gc-heap",
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    #[test]
+    fn long_callback_calls_root_operands_and_cache_weakly() {
+        use crate::jit::rooting_tests::{
+            assert_tracked_collectable, install, jit_engine, last_census, run, track,
+        };
+        use crate::value::Property;
+        /// `callSix(callee, collect)`: `callee` called back with a fresh receiver `{n: 10,
+        /// collect}` and the arguments 1 to 5 and a fresh `{v: 6}`; with `collect` set, the
+        /// two objects are tracked.
+        fn call_six(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+            let callee = args.first().cloned().unwrap_or(Value::Undefined);
+            let collect = matches!(args.get(1), Some(Value::Bool(true)));
+            let receiver = i.new_object();
+            receiver
+                .borrow_mut()
+                .props
+                .insert("n", Property::plain(Value::Num(10.0)));
+            receiver
+                .borrow_mut()
+                .props
+                .insert("collect", Property::plain(Value::Bool(collect)));
+            let object = i.new_object();
+            object
+                .borrow_mut()
+                .props
+                .insert("v", Property::plain(Value::Num(6.0)));
+            if collect {
+                track(i, Value::Undefined, &[Value::Obj(receiver)])?;
+                track(i, Value::Undefined, &[Value::Obj(object)])?;
+            }
+            let mut arguments: Vec<Value> = (1..=5).map(|n| Value::Num(f64::from(n))).collect();
+            arguments.push(Value::Obj(object));
+            i.call_callback(callee, Value::Obj(receiver), &arguments)
+                .map_err(crate::interpreter::abrupt_value)
+        }
+        let mut engine = jit_engine(0);
+        install(&mut engine, "callSix", 2, call_six);
+        let source = r#"
+            function retained(a, b, c, d, e, f) {
+                'use strict';
+                return (this.collect ? collect() : '-') + ':' + (this.n + a + b + c + d + e + f.v);
+            }
+            for (var k = 0; k < 20; k++) callSix(retained, false);
+            callSix(retained, true);
+        "#;
+        assert_eq!(run(&mut engine, source), "RR:31");
+        assert!(last_census().records >= 1, "the callee's record");
+        // The handles, and the cache entries' raw callee addresses, stay in helper frames.
+        let (pin, cache) = crate::gc_test::in_frame(|| {
+            let env = engine.interp.global_env.clone();
+            let callee = engine
+                .interp
+                .get_var("retained", &env)
+                .ok()
+                .expect("function");
+            let cache = engine
+                .interp
+                .native_callback_cache
+                .clone()
+                .expect("lazy cache");
+            assert!(
+                cache
+                    .site
+                    .entries
+                    .iter()
+                    .any(|entry| entry.get().callee != 0),
+                "the site cached its compiled callee"
+            );
+            (crate::value::Gc::downgrade(callee.as_obj().unwrap()), cache)
+        });
+        assert_tracked_collectable(&mut engine);
+        run(&mut engine, "retained = null; 0;");
+        engine.interp.gc_collect();
+        assert!(
+            !crate::gc_test::alive(&pin),
+            "shared feedback must not root its callback"
+        );
+        cache.prune_dead();
+        assert!(crate::gc_test::in_frame(|| cache
+            .site
+            .entries
+            .iter()
+            .all(|entry| entry.get().callee == 0)));
         assert!(cache.pins.borrow().is_empty());
     }
 

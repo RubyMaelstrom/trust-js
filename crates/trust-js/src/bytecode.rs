@@ -26178,10 +26178,8 @@ mod return_slot_tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    // Reference counting (gc-heap: jit::rooting_tests::context_return_slot_is_a_root).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn jit_return_moves_owners_into_empty_and_occupied_slots() {
         for occupied in [false, true] {
@@ -26207,10 +26205,8 @@ mod return_slot_tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    // Reference counting (gc-heap: jit::rooting_tests::context_return_slot_is_a_root).
+    #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn jit_return_preserves_aliases_and_bare_return_drops_the_old_owner() {
         let object = crate::value::Object::new(None);
