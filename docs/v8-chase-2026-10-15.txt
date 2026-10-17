@@ -2164,3 +2164,80 @@ Step 8 runs as three sequential sub-steps:
   as rooting tests.
 - 8c: runs per-test GC stress over the suite with the verifier and the
   JIT on, with fixes.
+
+Step 8a, admission (28e718a8, 531d01b1, 6121b0b1):
+- Admission: Tier::admitted keeps Jit on the bytecode VM only in an
+  x86-64 gc-heap build, whose backend refuses traced ownership until S6.
+  An ARM64 gc-heap build runs the JIT, and a target without a native
+  backend behaves as in the default build. Jit being the default tier,
+  every ARM64 gc-heap engine that does not choose a tier now runs
+  generated code, so most of the gc-heap lib suite now runs the JIT. The
+  test hook Engine::admit_jit_for_test is retired: the traced, rooting
+  and poll tests select Tier::Jit through set_tier. The engine binary's
+  and difftest's notes come from admitted(): silent on ARM64 gc-heap,
+  unchanged on x86-64 gc-heap.
+- The 38 modules (257 tests) compile wherever the JIT runs: ARM64 in
+  both builds, x86-64 in the default build. 241 pass unchanged. 14
+  asserted counts or release timing and gain gc-heap forms that check
+  the same property through collection: survival across the collections
+  at entry polls (stress 1) or the return test's collection, then
+  collectability; call-cache and inline pins as reserved addresses
+  (is_allocated_word) until the last pin goes; destructor witnesses run
+  by the collection that finds their owner dead; probes that must not
+  touch an owner leave operands and cells intact through a collection
+  and its verifier. 2 stay default-only (native_array_local_tests'
+  foreign-engine pair tests): a destructor writing another Agent's array
+  pins the TDZ pair's count guard, which has no gc-heap meaning (I6).
+- The 31 "needs the JIT" ignores: 27 pass unchanged and 4 gain gc-heap
+  forms (tests::jit_direct_call_releases_the_last_callee_reference_...,
+  stack_trace's shared_inline_sites_keep_positions_live_..., call_guard_
+  tests::checked_calls_borrow_last_callee_owner_..., and value::jit_heap_
+  tests::jit_live_object_counters_..., now with two Engines). On x86-64
+  gc-heap 27 keep an ignore ("needs the JIT; gc-heap keeps x64 on
+  bytecode until S6"), 3 need no JIT and run there, 1 is ARM64-only. The
+  x86-64 cfgs are reasoned, not compiled (this host has only the AArch64
+  backend; S6 validates x64 on zombie).
+- Fixes: none were needed. The first admitted run's 29 failures were the
+  clamp's assertion (8 traced tests and the stress child), 16 count or
+  timing assertions, and 2 crashes in the cross-Agent pair tests now
+  default-only.
+- For 8b, 8c and step 9:
+  - Inline planning depends on collection timing. The planner skips a
+    cached callee whose weak pin no longer resolves; the default build
+    frees acyclic garbage at once, gc-heap at the next collection. So
+    gc-heap compiles vue 56 and react 10 (default 55 and 9: it splices a
+    callee the default build skipped as dead), and djot 160 in both with
+    5 functions planned differently. The guards never match a dead
+    callee; tripwire comparisons should allow for it.
+  - A collection inside a running activation can find stale copies of
+    dead values in live Rust frames, at every tier (seen in Interp::eval,
+    call_inner, call_native_committed). Death assertions run after the
+    activation; 8c will meet this.
+  - Collectability tests keep more than handles out of the test frame: a
+    call-cache entry's copy carries raw callee and environment
+    addresses, and run_classic_program's completion value sits in its
+    caller's frame.
+  - The gc-heap suite's long pole is now jit::int_typed_tests::integer_
+    comparisons_and_branches_match_in_every_tier, about 300 s (254 s in
+    the default build).
+- Gates (rechecked at 6121b0b1):
+  - Code dumps identical to the step-1 baselines (vue 55, react 9, djot
+    160); outputs identical.
+  - Lib suites: embed 2165/0/3; embed,gc-heap 2176/0/82 twice (1890, plus
+    255 module tests and 31 former ignores; ignored 113 - 31).
+  - The stress child alone: 29.4 s.
+  - Fixtures at --tier=jit (no-LTO release): exit 0, gc-heap stdout
+    equal to the default build's apart from elapsed lines; native
+    compiles default 55/9/160, gc-heap 56/10/160, no failures.
+  - difftest --seed 7 --count 150: 138 agree, 12 skipped, 0 crashes in
+    both builds; the gc-heap run no longer notes a clamp.
+  - Clippy clean in both builds; difftest builds in both; rustfmt clean.
+
+Step 8b's scope (from a read-only census of the 47 reference-count
+ignores at f61f10fb): the 20 whose subject is a JIT path. 9 become
+rooting counterparts (8 programs), each mutation-checked; 6 carry stale
+S2 reasons and are lifted (S2's layout probe counted, step 4 removed
+it); 3 get count-free forms; 2 stay default-only. The other 27 test the
+runtime, the VM and the collector; they keep their ignores, recorded
+open with the census's proposed forms (most drop a count line or check
+collectability instead).
