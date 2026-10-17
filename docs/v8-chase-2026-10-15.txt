@@ -1491,3 +1491,29 @@ Step 5b/5c, the remaining exotic tables (gc-heap and default):
   probe, and [[Set]]'s prototype walk uses proxy_at (already guarded).
   Measured against 5a (no-LTO gc-heap, 7 rounds): pa interp -0.8%
   cycles (-0.2% instructions); everything else within +-0.5%.
+
+Exit gate finding, fixed before the gate (pre-existing since S2):
+- The per-test stress run failed one test,
+  bytecode_fragment_cache::shared_syntax_never_shares_fragment_ic_state_
+  between_engines (two engines on one thread run one parsed program,
+  in two rounds). Under GC stress the heap verifier reported a
+  function's `name` holding a cell outside its heap. Labeled tracing
+  located the edge (a props value, key "name"); bisecting located the
+  exposure in 4c (with 4c reverted the test passes; with 4a or 4b
+  reverted it still fails), not the cause.
+- Cause: ast::FunctionMaps, cached on the parsed function and so shared
+  by every engine that runs the code, held `name` strings allocated in
+  the heap that first instantiated the function, pinned by thread-local
+  roots. A second engine copied them into its closures (a cross-heap
+  reference), and after the first engine dropped, freed cells. Page
+  reuse used to land the stale addresses in live pages, hiding them;
+  the page pool changed that, and the verifier saw them.
+- Fix: FunctionMaps records the heap that built it (heap ids are never
+  reused), and its strings are rooted in that heap for the heap's
+  lifetime (GcState.template_strings, traced with the interned
+  strings). Another heap's closures take their own name strings.
+  run_program also enters its interpreter's agent, so a program
+  allocates in its own heap whatever heap was active when it was
+  called. Test function_name_templates_serve_only_their_heap: two
+  engines, the first dropped before the second runs; with the heap
+  check removed, the second's closure names are not cells of its heap.

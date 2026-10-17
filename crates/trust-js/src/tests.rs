@@ -3691,6 +3691,46 @@ fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
     );
 }
 
+/// P1 S4 (gc-heap): parsed code can serve several engines on one thread, one after another. A
+/// closure's `name` is a string of its own engine's heap, never one an AST-level template cached
+/// from the heap that first ran the code (here already dropped).
+#[cfg(feature = "gc-heap")]
+#[test]
+fn function_name_templates_serve_only_their_heap() {
+    let body = crate::parser::parse_script(
+        "var f = function () {}; var g = () => 0; function h() {}",
+        false,
+    )
+    .ok()
+    .expect("source");
+    let name_words = |engine: &mut Engine| -> Vec<u64> {
+        assert!(engine.interp.run_program(&body).is_ok(), "program runs");
+        ["f", "g", "h"]
+            .iter()
+            .map(|binding| {
+                let global = crate::value::Value::Obj(engine.interp.global.clone());
+                let Ok(function) = engine.interp.member_get(&global, binding) else {
+                    panic!("binding {binding}");
+                };
+                match engine.interp.member_get(&function, "name") {
+                    Ok(crate::value::Value::Str(name)) => name.cell_word(),
+                    _ => panic!("{binding}.name is a string"),
+                }
+            })
+            .collect()
+    };
+    let mut first = Engine::new();
+    name_words(&mut first);
+    drop(first);
+    let mut second = Engine::new();
+    for word in name_words(&mut second) {
+        assert!(
+            second.interp.gc_heap.core.borrow().is_allocated_word(word),
+            "a closure's name is a string of its own heap"
+        );
+    }
+}
+
 /// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
 /// kept only by its own wrapped function, stored inside it, is collected.
 #[cfg(feature = "gc-heap")]

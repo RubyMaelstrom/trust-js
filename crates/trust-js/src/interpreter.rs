@@ -7763,7 +7763,7 @@ impl Interp {
                 .take_while(|p| p.default.is_none() && !p.rest)
                 .count();
             let name = Value::lstr(func.name.clone().unwrap_or_default());
-            let pins = crate::rooting::RootedVec::from_vec(vec![name.clone()]);
+            crate::value::pin_template_value(&name);
             let mut p = crate::value::Props::new();
             p.insert(
                 crate::value::fn_key(0), // "length"
@@ -7797,7 +7797,7 @@ impl Interp {
                 function: p,
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
-                pins: std::cell::RefCell::new(pins),
+                heap: crate::value::active_heap_id(),
             })
         });
         let proto_map = &maps.prototype;
@@ -7805,7 +7805,25 @@ impl Interp {
         // method's key (MethodDefinitionEvaluation). A function with its own name keeps it; the
         // template's `name` slot is entry 1 with the "" value.
         let named = name.filter(|_| func.name.is_none());
+        // gc-heap: the templates' name strings are cells of the heap that built them, which
+        // another engine's heap (or a later engine on this thread) must not reference.
+        #[cfg(feature = "gc-heap")]
+        let foreign = maps.heap != crate::value::active_heap_id();
+        #[cfg(not(feature = "gc-heap"))]
+        let foreign = false;
         let fn_map = match named {
+            _ if foreign => {
+                let mut props = maps.function.clone();
+                let text = named.map_or_else(
+                    || func.name.clone().unwrap_or_default().to_string(),
+                    |name| name.to_string(),
+                );
+                assert!(
+                    props.set_value_at(1, Value::lstr(text)),
+                    "function name slot"
+                );
+                props
+            }
             None => maps.function.clone(),
             Some(name) => {
                 let mut named = maps.named.borrow_mut();
@@ -7824,7 +7842,7 @@ impl Interp {
                         );
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
-                            maps.pins.borrow_mut().push(name_value);
+                            crate::value::pin_template_value(&name_value);
                         }
                         props
                     }
@@ -17209,6 +17227,8 @@ impl Interp {
         body: &[Stmt],
         source: Option<Rc<crate::stack_trace::ScriptSource>>,
     ) -> Result<Value, Abrupt> {
+        // The program allocates in this Agent's heap, whichever was active when it was called.
+        let _agent = self.enter_agent();
         // ScriptEvaluation: the Script Record is the ScriptOrModule of its code; its host-
         // defined base is the host's current script base (HTML: the classic script's base URL).
         if let Some(source) = &source {

@@ -2488,6 +2488,10 @@ pub(crate) struct GcState {
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     #[cfg(feature = "gc-heap")]
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
+    /// P1 S4: the strings that AST-level templates built in this heap hold (`ast::FunctionMaps`
+    /// names), roots for the heap's lifetime. A template serves only the heap that built it.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) template_strings: RefCell<Vec<crate::lstr::LStr>>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -2589,6 +2593,9 @@ pub(crate) fn interned_string(
 #[cfg(feature = "gc-heap")]
 pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     for string in heap.interned_strings.borrow().iter().flatten() {
+        sink.word(string.cell_word());
+    }
+    for string in heap.template_strings.borrow().iter() {
         sink.word(string.cell_word());
     }
 }
@@ -3377,11 +3384,29 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         user_fn_desc: descs.user_fn,
         #[cfg(feature = "gc-heap")]
         interned_strings: RefCell::default(),
+        #[cfg(feature = "gc-heap")]
+        template_strings: RefCell::default(),
     })
 }
 
 pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
     heap.heap_id
+}
+
+/// The active Agent heap's identity (never reused).
+pub(crate) fn active_heap_id() -> u64 {
+    with_active_gc_heap(|heap| heap.heap_id)
+}
+
+/// Keep `value`, a string an AST-level template holds, for the active heap's lifetime (gc-heap,
+/// where strings are cells of one heap; the default build's are reference-counted).
+pub(crate) fn pin_template_value(value: &Value) {
+    #[cfg(feature = "gc-heap")]
+    if let Value::Str(string) = value {
+        with_active_gc_heap(|heap| heap.template_strings.borrow_mut().push(string.clone()));
+    }
+    #[cfg(not(feature = "gc-heap"))]
+    let _ = value;
 }
 
 #[inline]

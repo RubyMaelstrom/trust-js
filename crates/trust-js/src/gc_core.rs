@@ -1613,7 +1613,7 @@ impl Heap {
     }
 
     #[cfg(test)]
-    fn is_allocated_word(&self, word: u64) -> bool {
+    pub(crate) fn is_allocated_word(&self, word: u64) -> bool {
         self.locate(word).is_some_and(|cell| match cell.loc {
             Loc::Small { page, index } => self.pages[page as usize]
                 .as_ref()
