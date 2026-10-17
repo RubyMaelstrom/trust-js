@@ -1293,3 +1293,48 @@ Step 3 part 1, the scope registry (gc-heap):
   so about a third more dead environments are alive at the peak, each
   with a 192-byte binding vector (Vec capacity 4 on first push). Part 2
   moves the common binding into the cell.
+
+Step 3 part 2 plan, one binding in the cell (recorded before the work):
+- Census (TRUST_JS_GC_CENSUS, environments added to S3's census;
+  no-LTO gc-heap, dead environments). At interp: block environments
+  hold exactly one binding in 51% (pa, react), 64% (djot), 66% (sa)
+  and 75% (vue), and two in most of the rest (pa and react 48.5%).
+  Function environments: react 98% one binding, vue 58% one and 13.5%
+  two, djot mostly 3-8, pa all 3, sa all 0. Nearly every environment
+  with a binding carries a 192-byte vector beside its cell. Bytecode
+  creates 1-2 orders of magnitude fewer environments and sizes their
+  vectors exactly.
+- Change: under gc-heap a VarMap's entries (Small and Indexed) are an
+  InlineVec with one inline entry (48 B), so the cell goes from 96 to
+  128 B (size class 128, asserted). An environment with one binding
+  then allocates nothing beside its cell. Bytecode activations and
+  block records build their entries in place instead of cloning a
+  vector. The default build keeps its Vec.
+- Expected per dead interp environment: 288 -> 128 B with one binding;
+  -64 B with two (a 96-byte buffer instead of 192); +32 B with none or
+  with 3-4. The native JIT reads Small storage as a Vec; it is refused
+  under gc-heap until S5, so there the layout probe reports none.
+
+Step 3 part 2, one binding in the cell (gc-heap):
+- VarMap's Small and Indexed entries are an InlineVec with one inline
+  entry. InlineVec's buffer pointer now overlays its in-place elements,
+  so its header is two 32-bit words. The environment cell is exactly
+  128 B (asserted); object cells shrink from 192 to 184 B, staying in
+  the same class. Bytecode activations and block records collect their
+  entries in place, and the native JIT's Small-storage probe reports
+  no layout under gc-heap. Census: environments added to S3's census
+  (bindings per record, storage beside the cell).
+- Lib suites: default 2071/0/3, gc-heap 1770/0/109 (one new InlineVec
+  test). Outputs identical to base on every fixture and tier, in both
+  builds.
+- Measured as part 1 (no-LTO gc-heap, base 230d0005, 7 rounds; part 2
+  includes part 1). Cycles at interp: pa -1.1%, sa -4.7%, ms -0.7%,
+  djot -1.4%, react -4.2%, vue -1.9%. At bytecode: pa -4.7%, sa -3.8%,
+  ms -2.7%, djot +0.4%, react -2.1%, vue +0.3%; the two rises are inside
+  run-to-run ranges. Instructions fall everywhere (-0.2..-4.6%)
+  except djot bytecode, unchanged. Peak RSS falls everywhere:
+  interp pa -16.6%, sa -8.1%, ms -13.8%, djot -8.3%, react -19.4%,
+  vue -16.0%; bytecode pa -18.1%, sa -6.3%, ms -3.3%, djot -2.8%,
+  react -9.4%, vue -1.4%. Part 1's RSS rises are gone. sa gives back
+  some of part 1's RSS gain: its 400k empty function environments
+  each grow by 32 B.

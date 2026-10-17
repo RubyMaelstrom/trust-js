@@ -1503,17 +1503,35 @@ impl BindingLayout {
     }
 }
 
-/// The vector is first so its native layout can share the Small storage path.
-/// The probe below verifies that fact against the actual Rust enum layout.
+/// A binding map's ordered entries. P1 S4 (gc-heap): the first entry lives in the environment
+/// cell, so a record with one binding (most block and many function records) allocates nothing
+/// beside it; more move the entries to one heap buffer.
+#[cfg(feature = "gc-heap")]
+pub(crate) type BindingEntries = crate::inline_vec::InlineVec<(Rc<str>, Binding), 1>;
+#[cfg(not(feature = "gc-heap"))]
+pub(crate) type BindingEntries = Vec<(Rc<str>, Binding)>;
+
+/// The bytes of `entries`' storage beside the environment cell.
+fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
+    #[cfg(feature = "gc-heap")]
+    let capacity = entries.heap_capacity();
+    #[cfg(not(feature = "gc-heap"))]
+    let capacity = entries.capacity();
+    capacity.saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>())
+}
+
+/// The vector is first so its native layout can share the Small storage path (default build;
+/// the JIT reads no gc-heap binding storage). The probe below verifies that fact against the
+/// actual Rust enum layout.
 #[repr(C)]
 struct IndexedBindings {
-    entries: Vec<(Rc<str>, Binding)>,
+    entries: BindingEntries,
     layout: Rc<BindingLayout>,
 }
 
 #[repr(u8)]
 enum VarStorage {
-    Small(Vec<(std::rc::Rc<str>, Binding)>),
+    Small(BindingEntries),
     Large(crate::fasthash::FastMap<std::rc::Rc<str>, Binding>),
     Indexed(IndexedBindings),
 }
@@ -1521,7 +1539,7 @@ enum VarStorage {
 impl Default for VarMap {
     fn default() -> Self {
         Self {
-            map: VarStorage::Small(Vec::new()),
+            map: VarStorage::Small(BindingEntries::new()),
             generation: std::cell::Cell::new(0),
             layout_id: 0,
         }
@@ -1600,11 +1618,12 @@ impl VarMap {
             return;
         }
         self.bump();
-        let mut entries = match std::mem::replace(&mut self.map, VarStorage::Small(Vec::new())) {
-            VarStorage::Small(entries) => entries,
-            VarStorage::Large(entries) => entries.into_iter().collect(),
-            VarStorage::Indexed(indexed) => indexed.entries,
-        };
+        let mut entries =
+            match std::mem::replace(&mut self.map, VarStorage::Small(BindingEntries::new())) {
+                VarStorage::Small(entries) => entries,
+                VarStorage::Large(entries) => entries.into_iter().collect(),
+                VarStorage::Indexed(indexed) => indexed.entries,
+            };
         // A linear permutation into the shared ordering, without cloning values
         // or retaining an old activation. All names were validated above.
         for slot in 0..entries.len() {
@@ -1635,7 +1654,7 @@ impl VarMap {
     /// threshold. Structural writes still use `insert`/`remove` and invalidate
     /// the published layout before changing or replacing this storage.
     pub(crate) fn from_fixed_bindings(
-        entries: Vec<(Rc<str>, Binding)>,
+        entries: BindingEntries,
         layout: Option<&Rc<BindingLayout>>,
     ) -> Self {
         debug_assert!(entries
@@ -1678,12 +1697,9 @@ impl VarMap {
     /// because the standard library does not expose their requested layout.
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
         match &self.map {
-            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => (
-                entries
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>()),
-                true,
-            ),
+            VarStorage::Small(entries) | VarStorage::Indexed(IndexedBindings { entries, .. }) => {
+                (binding_entries_heap_bytes(entries), true)
+            }
             VarStorage::Large(entries) => (
                 entries
                     .len()
@@ -1696,7 +1712,7 @@ impl VarMap {
     pub(crate) fn with_capacity(capacity: usize) -> VarMap {
         VarMap {
             map: if capacity <= SMALL_VAR_MAP_CAPACITY {
-                VarStorage::Small(Vec::with_capacity(capacity))
+                VarStorage::Small(BindingEntries::with_capacity(capacity))
             } else {
                 VarStorage::Large(crate::fasthash::FastMap::with_capacity_and_hasher(
                     capacity,
@@ -1857,7 +1873,7 @@ impl VarMap {
         match &mut self.map {
             VarStorage::Small(entries) => entries.clear(),
             VarStorage::Large(entries) => entries.clear(),
-            VarStorage::Indexed(_) => self.map = VarStorage::Small(Vec::new()),
+            VarStorage::Indexed(_) => self.map = VarStorage::Small(BindingEntries::new()),
         }
     }
     /// In-place binding write: entries don't move, so the generation stays (see the type docs).
@@ -1927,6 +1943,16 @@ impl VarMap {
     /// fresh-activation hit additionally requires the same nonzero ordered layout identity.
     /// Unknown compiler layouts simply retain the checked map path.
     pub(crate) fn jit_small_storage_layout() -> Option<(usize, usize, usize, usize)> {
+        // gc-heap keeps the first entry in place, not behind a Vec; the native JIT is refused
+        // there (until S5) and keeps the checked map path.
+        #[cfg(feature = "gc-heap")]
+        return None;
+        #[cfg(not(feature = "gc-heap"))]
+        Self::jit_vec_storage_layout()
+    }
+
+    #[cfg(not(feature = "gc-heap"))]
+    fn jit_vec_storage_layout() -> Option<(usize, usize, usize, usize)> {
         let mut small = Self::with_capacity(1);
         small.insert("probe", Binding::data(Value::Num(7.0), true, true));
         let large = Self::with_capacity(SMALL_VAR_MAP_CAPACITY + 1);
@@ -2320,10 +2346,10 @@ pub struct Scope {
     pub lexical_names: ScopeNames,
 }
 
-/// P1 S4: an environment cell fits the heap's 96-byte size class (without the default build's
-/// registry fields).
+/// P1 S4: an environment cell, with its first binding in place, fills the heap's 128-byte size
+/// class (it has no registry fields under gc-heap).
 #[cfg(feature = "gc-heap")]
-const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 96);
+const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
 
 #[cfg(not(feature = "gc-heap"))]
 impl Drop for Scope {

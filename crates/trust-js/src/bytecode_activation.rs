@@ -152,7 +152,12 @@ impl ActivationPlan {
         this_value: &Value,
         arguments: CallArgs<'_>,
     ) -> Env {
-        let mut vars = VarMap::from_fixed_bindings(self.bindings.clone(), self.layout.as_ref());
+        // A `Vec` (where `to_vec` would do) only in the default build; gc-heap fills an InlineVec.
+        #[allow(clippy::iter_cloned_collect)]
+        let mut vars = VarMap::from_fixed_bindings(
+            self.bindings.iter().cloned().collect(),
+            self.layout.as_ref(),
+        );
         for &(slot, parameter) in &self.parameters {
             vars.initialize_fixed_value(slot, arguments.read(usize::from(parameter)));
         }

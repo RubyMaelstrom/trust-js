@@ -2553,6 +2553,14 @@ fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 /// Release the record's Rust-heap payload when its cell dies.
 #[cfg(feature = "gc-heap")]
 fn finalize_scope_cell(cell: *mut u8) {
+    if layout_census::enabled() {
+        // SAFETY: a dying cell is initialized and borrowed by no one.
+        if let Ok(scope) =
+            unsafe { (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded() }
+        {
+            layout_census::record_env(layout_census::DEAD, scope);
+        }
+    }
     // SAFETY: environment cells are initialized by `Env::new` before any collection.
     unsafe { std::ptr::drop_in_place(cell as *mut RefCell<crate::interpreter::Scope>) };
 }
@@ -2740,7 +2748,8 @@ fn finalize_object_cell(cell: *mut u8) {
 
 /// The S3 layout census (`TRUST_JS_GC_CENSUS=1`, gc-heap; diagnostic only): how many named
 /// properties objects hold, sampled over the live heap after every collection and over objects
-/// as they die, by family. It sizes inline property slots (Decision 3).
+/// as they die, by family. It sizes inline property slots (Decision 3). S4 adds environment
+/// records: bindings per record and the binding storage beside the cell.
 #[cfg(feature = "gc-heap")]
 pub(crate) mod layout_census {
     use super::{Callable, Exotic, GcHeap, Object};
@@ -2771,6 +2780,37 @@ pub(crate) mod layout_census {
     }; 2];
     static SAMPLES: AtomicU64 = AtomicU64::new(0);
 
+    /// Variable environments (function bodies, global, eval) and the rest (blocks, catch, with).
+    const ENV_KINDS: [&str; 2] = ["var", "block"];
+
+    struct EnvPopulation {
+        bindings: [[AtomicU64; BUCKETS]; ENV_KINDS.len()],
+        bindings_total: [AtomicU64; ENV_KINDS.len()],
+        /// Bytes of binding storage allocated beside the cell.
+        storage_bytes: [AtomicU64; ENV_KINDS.len()],
+    }
+
+    static ENV_POPULATIONS: [EnvPopulation; 2] = [const {
+        EnvPopulation {
+            bindings: [const { [const { AtomicU64::new(0) }; BUCKETS] }; ENV_KINDS.len()],
+            bindings_total: [const { AtomicU64::new(0) }; ENV_KINDS.len()],
+            storage_bytes: [const { AtomicU64::new(0) }; ENV_KINDS.len()],
+        }
+    }; 2];
+
+    pub(crate) fn record_env(population: usize, scope: &crate::interpreter::Scope) {
+        let kind = usize::from(!scope.var_boundary);
+        let bindings = scope.vars.iter().count();
+        let bucket = BOUNDS.partition_point(|&bound| bound < bindings);
+        let counts = &ENV_POPULATIONS[population];
+        counts.bindings[kind][bucket].fetch_add(1, Relaxed);
+        counts.bindings_total[kind].fetch_add(bindings as u64, Relaxed);
+        counts.storage_bytes[kind].fetch_add(
+            scope.vars.retained_requested_storage_bytes().0 as u64,
+            Relaxed,
+        );
+    }
+
     pub(crate) fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("TRUST_JS_GC_CENSUS").is_some())
@@ -2798,7 +2838,8 @@ pub(crate) mod layout_census {
         }
     }
 
-    /// Record every live object of `heap`; call right after a collection's sweep.
+    /// Record every live object and environment of `heap`; call right after a collection's
+    /// sweep.
     pub(crate) fn sample_live(heap: &GcHeap) {
         let cells = heap.core.borrow().live_cells(heap.object_desc);
         for cell in cells {
@@ -2807,6 +2848,15 @@ pub(crate) mod layout_census {
                 unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
             {
                 record(LIVE, object);
+            }
+        }
+        let cells = heap.core.borrow().live_cells(heap.scope_desc);
+        for cell in cells {
+            // SAFETY: as above, for environment cells.
+            if let Ok(scope) = unsafe {
+                (*(cell as *const RefCell<crate::interpreter::Scope>)).try_borrow_unguarded()
+            } {
+                record_env(LIVE, scope);
             }
         }
         SAMPLES.fetch_add(1, Relaxed);
@@ -2835,18 +2885,39 @@ pub(crate) mod layout_census {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let environments = |counts: &EnvPopulation| {
+            ENV_KINDS
+                .iter()
+                .enumerate()
+                .map(|(kind, name)| {
+                    let histogram = counts.bindings[kind]
+                        .iter()
+                        .map(|count| count.load(Relaxed).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "\"{name}\":{{\"bindings_histogram\":[{histogram}],\"bindings_total\":{},\"storage_bytes\":{}}}",
+                        counts.bindings_total[kind].load(Relaxed),
+                        counts.storage_bytes[kind].load(Relaxed),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
-            "{{\"live_samples\":{},\"named_bucket_upper_bounds\":[{bounds},null],\"live\":{{{}}},\"dead\":{{{}}}}}",
+            "{{\"live_samples\":{},\"named_bucket_upper_bounds\":[{bounds},null],\"live\":{{{}}},\"dead\":{{{}}},\"environments\":{{\"live\":{{{}}},\"dead\":{{{}}}}}}}",
             SAMPLES.load(Relaxed),
             population(&POPULATIONS[LIVE]),
             population(&POPULATIONS[DEAD]),
+            environments(&ENV_POPULATIONS[LIVE]),
+            environments(&ENV_POPULATIONS[DEAD]),
         )
     }
 }
 
-// S3: the header and its inline named slots fill the 192 B size class exactly; growing either
-// moves every object into the 256 B class. The migration-test `heap-bridge` field is outside
-// the production layout and exempt.
+// S3: the header and its inline named slots fill the 192 B size class (184 B since S4 narrowed
+// the slots' header); growing either past it moves every object into the 256 B class. The
+// migration-test `heap-bridge` field is outside the production layout and exempt.
 #[cfg(all(feature = "gc-heap", not(feature = "heap-bridge")))]
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 

@@ -21223,7 +21223,7 @@ fn push_lexical_scope(chunk: &Chunk, env: &mut Env, scope: u32, catch: bool) {
 fn install_lexical_bindings(
     record: &Env,
     scope: &LexicalScope,
-    bindings: Vec<(Rc<str>, crate::interpreter::Binding)>,
+    bindings: crate::interpreter::BindingEntries,
 ) {
     let mut record = record.borrow_mut();
     record.vars = crate::interpreter::VarMap::from_fixed_bindings(bindings, scope.index.as_ref());

@@ -3,18 +3,24 @@
 //! Up to `N` elements live inside the owning value, so an object cell holding one needs no
 //! second allocation for a few properties. The `N + 1`th element moves all of them to one heap
 //! buffer, which is kept when the length shrinks again: a map that grew past `N` tends to stay
-//! large, and moving back would make every shrink and regrow copy.
+//! large, and moving back would make every shrink and regrow copy. The buffer's pointer takes
+//! the place of the in-place elements (P1 S4), so the header is two 32-bit words.
 
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 
 pub(crate) struct InlineVec<T, const N: usize> {
     len: u32,
     /// Heap capacity once spilled; 0 while the elements are in place.
     cap: u32,
+    data: Data<T, N>,
+}
+
+/// The in-place elements while `cap` is 0, else the heap buffer.
+union Data<T, const N: usize> {
+    inline: ManuallyDrop<[MaybeUninit<T>; N]>,
     heap: *mut T,
-    inline: [MaybeUninit<T>; N],
 }
 
 impl<T, const N: usize> InlineVec<T, N> {
@@ -22,8 +28,9 @@ impl<T, const N: usize> InlineVec<T, N> {
         Self {
             len: 0,
             cap: 0,
-            heap: ptr::null_mut(),
-            inline: [const { MaybeUninit::uninit() }; N],
+            data: Data {
+                inline: ManuallyDrop::new([const { MaybeUninit::uninit() }; N]),
+            },
         }
     }
 
@@ -60,21 +67,33 @@ impl<T, const N: usize> InlineVec<T, N> {
         self.cap != 0
     }
 
+    /// The heap buffer's capacity: 0 while the elements are in place.
+    #[inline]
+    pub(crate) fn heap_capacity(&self) -> usize {
+        self.cap as usize
+    }
+
     #[inline]
     fn as_ptr(&self) -> *const T {
-        if self.cap == 0 {
-            self.inline.as_ptr().cast()
-        } else {
-            self.heap
+        // SAFETY: `cap` says which field of `data` is in use.
+        unsafe {
+            if self.cap == 0 {
+                self.data.inline.as_ptr().cast()
+            } else {
+                self.data.heap
+            }
         }
     }
 
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut T {
-        if self.cap == 0 {
-            self.inline.as_mut_ptr().cast()
-        } else {
-            self.heap
+        // SAFETY: as in `as_ptr`.
+        unsafe {
+            if self.cap == 0 {
+                (*self.data.inline).as_mut_ptr().cast()
+            } else {
+                self.data.heap
+            }
         }
     }
 
@@ -90,12 +109,13 @@ impl<T, const N: usize> InlineVec<T, N> {
             handle_alloc_error(layout);
         }
         // SAFETY: the old storage holds `len` initialized elements; the new buffer has room for
-        // them and does not overlap the old one. They move bitwise; the old copies are forgotten.
+        // them and does not overlap the old one. They move bitwise; the old copies are forgotten
+        // (in-place storage is then overwritten by the buffer's pointer).
         unsafe {
             ptr::copy_nonoverlapping(self.as_ptr(), heap, self.len());
             self.free_heap();
         }
-        self.heap = heap;
+        self.data.heap = heap;
         self.cap = capacity;
     }
 
@@ -106,9 +126,8 @@ impl<T, const N: usize> InlineVec<T, N> {
     unsafe fn free_heap(&mut self) {
         if self.cap != 0 {
             let layout = Layout::array::<T>(self.cap as usize).expect("valid InlineVec layout");
-            // SAFETY: `heap` was allocated by `grow_to` with this layout.
-            unsafe { dealloc(self.heap.cast(), layout) };
-            self.heap = ptr::null_mut();
+            // SAFETY: the buffer was allocated by `grow_to` with this layout.
+            unsafe { dealloc(self.data.heap.cast(), layout) };
             self.cap = 0;
         }
     }
@@ -163,6 +182,24 @@ impl<T, const N: usize> InlineVec<T, N> {
             let base = self.as_mut_ptr();
             let value = base.add(index).read();
             ptr::copy(base.add(index + 1), base.add(index), len - index - 1);
+            self.len -= 1;
+            value
+        }
+    }
+
+    /// Remove the element at `index`, moving the last element into its place.
+    pub(crate) fn swap_remove(&mut self, index: usize) -> T {
+        let len = self.len();
+        assert!(
+            index < len,
+            "InlineVec::swap_remove index {index} out of bounds ({len})"
+        );
+        // SAFETY: `index` and `len - 1` are in bounds; the element read out is replaced by the
+        // last one, which then falls outside the length.
+        unsafe {
+            let base = self.as_mut_ptr();
+            let value = base.add(index).read();
+            ptr::copy(base.add(len - 1), base.add(index), 1);
             self.len -= 1;
             value
         }
@@ -262,6 +299,56 @@ impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
     }
 }
 
+/// The elements of an [`InlineVec`], by value.
+pub(crate) struct IntoIter<T, const N: usize> {
+    vec: InlineVec<T, N>,
+    next: usize,
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.next == self.vec.len() {
+            return None;
+        }
+        // SAFETY: elements `next..len` are initialized and not yet moved out.
+        let element = unsafe { self.vec.as_ptr().add(self.next).read() };
+        self.next += 1;
+        Some(element)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.vec.len() - self.next;
+        (left, Some(left))
+    }
+}
+
+impl<T, const N: usize> Drop for IntoIter<T, N> {
+    fn drop(&mut self) {
+        let (next, len) = (self.next, self.vec.len());
+        // The vector's own drop then only frees the buffer; elements before `next` were moved
+        // out, and the rest are dropped here.
+        self.vec.len = 0;
+        // SAFETY: elements `next..len` are initialized and not yet moved out.
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                self.vec.as_mut_ptr().add(next),
+                len - next,
+            ))
+        };
+    }
+}
+
+impl<T, const N: usize> IntoIterator for InlineVec<T, N> {
+    type Item = T;
+    type IntoIter = IntoIter<T, N>;
+
+    fn into_iter(self) -> IntoIter<T, N> {
+        IntoIter { vec: self, next: 0 }
+    }
+}
+
 impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
@@ -344,6 +431,30 @@ mod tests {
             vec.push(Counted(7, drops.clone()));
             drop(vec);
             assert_eq!(drops.get(), count as usize + 1);
+        }
+    }
+
+    #[test]
+    fn swap_remove_and_owning_iteration_drop_each_element_once() {
+        for count in [1u32, 3, 9] {
+            let drops = Rc::new(Cell::new(0));
+            let mut vec: InlineVec<Counted, 4> =
+                (0..count).map(|i| Counted(i, drops.clone())).collect();
+            assert_eq!(vec.swap_remove(0).0, 0);
+            assert_eq!(drops.get(), 1);
+            let mut expected: Vec<u32> = (1..count).collect();
+            if let Some(last) = expected.pop() {
+                expected.insert(0, last);
+            }
+            assert_eq!(values(&vec), expected);
+            assert_eq!(vec.heap_capacity() != 0, count > 4);
+            // Take some elements by value, then drop the iterator with the rest unread.
+            let mut iter = vec.into_iter();
+            let taken: Vec<u32> = iter.by_ref().take(1).map(|c| c.0).collect();
+            assert_eq!(taken, expected[..taken.len()]);
+            assert_eq!(drops.get(), 1 + taken.len());
+            drop(iter);
+            assert_eq!(drops.get(), count as usize);
         }
     }
 
