@@ -1996,3 +1996,88 @@ Step 6, gc-heap emission (5489ceb6):
   55, react 9, djot 160; word by word the djot address lane of step 3);
   outputs identical; lib embed 2165/0/3, embed,gc-heap 1873/0/113;
   clippy clean in both builds.
+
+Step 7, rooting (64fcd6b9, 9ad0012b):
+- Records: under gc-heap FramePool keeps a registry of every record
+  allocated for its interpreter and not yet freed (JitFrame::alloc
+  registers it; release past FRAME_POOL_LIMIT and FramePool's Drop
+  unregister it; nothing else creates or frees one). A registered record
+  not in pool[..len] is active, since generated code pops with len--,
+  pushes back in the finish stub and never allocates. The collector
+  traces each active record: its context's values precisely and all
+  FRAME_BUF words conservatively as packed words, with no stack pointer
+  (stale words above the operand top, or left by a finished callee, can
+  only retain). Pooled records are not traced. No per-call cost: a
+  collection builds the set of pooled records only when some record is
+  active. JitFrame::alloc zero-fills the words under gc-heap.
+  InterpLayout::frame_pool probes the pool Vec itself (the same offset in
+  the default build). Memory reports count the registry (9ad0012b).
+- Rust entries whose context lives on the native stack register for
+  their native run through an RAII guard (gc_trace::enter_jit_frame,
+  popped on unwind) and are traced with the thread roots: jit::run (its
+  slot Vec; its operand buffer up to max_stack), run_moved_oversized (its
+  n_slots slot words; its operand buffer up to max_stack) and
+  run_borrowed_frame (OSR and continuations: the VM frame's stack over
+  its capacity; drive_vm keeps registering the slots, environments and
+  references, and jit_continuation_operation asserts the buffer never
+  moves). run_moved, run_moved_shared and run_moved_env run on records.
+- Contexts: GcTrace for JitCtx destructures every field. this_val, ret,
+  error, activation and resume_step are traced precisely; each raw
+  identity is kept alive by an owner it names (env_raw by the entry's
+  frame, by the callee closure on the caller's operand stack and in its
+  FnFrame, by the activation, or by drive_vm's registered frame). New
+  traces: NativeActivation (env, cap_env, stack, references,
+  disposal_frames, class_states), Abrupt, VmStep, DisposeCompletion.
+- Never-written memory: records are zero-filled, and under gc-heap a
+  ValueStack's whole capacity is initialized (new capacity zero-filled
+  where it is created or grown; push writes in place at Vec::push's
+  cost), so buffers lent past their length expose only written words.
+- The test hook no longer stops collections: admission_collects
+  replaces admission_refuses_every_collection.
+- jit::rooting_tests (10, gc-heap): a test native collect(), called from
+  JIT code, runs the explicit collection and reports, for each object
+  the program tracked, what marked it first (a root, the stack or a
+  cell, or nothing), so a stale stack copy cannot pass for the JIT root.
+  Values held only in a direct callee's slot, the caller's operand words
+  across a direct call, a record's this_val and ret, a native
+  activation's environments (a per-iteration loop environment, a catch
+  environment), jit::run's buffers (the Script, a function a native calls
+  back, Array.prototype.map callbacks), an oversized frame (300 locals),
+  borrowed frames (an OSR'd Script loop, a generator slice), recursion to
+  depth 300 (301 active records) and a fresh closure called directly are
+  marked by a root and read back; afterwards nothing tracked survives a
+  collection. The same tests and step 6's run again at
+  TRUST_JS_GC_STRESS=1 in a child process: 1,279 collections over 19
+  tests, about 10 s.
+- Mutation check (temporary switches, not committed): dropping the
+  records' trace or word scan, the entries' trace or word ranges, or the
+  NativeActivation trace fails the tests holding values there. With a
+  root removed the values mostly still survived through the conservative
+  stack scan, which is why the tests check what marked them first and
+  not survival alone. Not discriminated: this_val (the caller's operand
+  word also keeps the receiver), ret, error and resume_step (moved out
+  before any safepoint on every path found), and the fresh closure (the
+  direct sequence's FnFrame also roots the callee).
+- Deviation from the design: jit::run's and run_moved_oversized's
+  operand buffers are scanned up to max_stack, not over their capacity
+  (pooled VM buffers can be much larger and hold stale words).
+- Review: checked every site that creates or frees a record; every
+  assignment of a context's raw environment (entries, activations,
+  borrowed continuations, the direct call's callee; each has a traced
+  owner); that no ValueStack growth path is left unzeroed; and that
+  tracing another engine's activations on the same thread is harmless
+  (the sink ignores words that address no cell of the collecting heap).
+  One gap fixed in 9ad0012b: memory reports did not count the registry.
+- For step 7b and 8: generated code's polls still compare only the
+  object count, so collections reach JIT code only through helpers and
+  natives (all now safe). The whole-buffer scans can keep garbage alive
+  while an activation runs (a Script's entry, say); if step 8's memory
+  gates show it, publish the stack pointer at collecting helpers and
+  scan only the live range. x64 uses no records and no direct-call
+  sequence; its calls go through the registered Rust entries.
+- Gates (rechecked at 9ad0012b): code dumps identical to the step-1
+  baselines with each MOVZ/MOVK run compared as one masked address (vue
+  55, react 9, djot 160; word by word the djot address lane of step 3);
+  outputs identical; lib embed 2165/0/3, embed,gc-heap 1883/0/113; the
+  rooting and step-6 tests alone at TRUST_JS_GC_STRESS=1, 20 passed in
+  10 s; clippy clean in both builds; rustfmt clean.
