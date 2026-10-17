@@ -137,7 +137,7 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
     user.func.clone()
 }
 
-fn global_user_callable(it: &mut Interp, name: &str) -> Rc<crate::value::UserCallable> {
+fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
     let env = it.global_env.clone();
     let value = it
         .get_var(name, &env)
@@ -302,7 +302,10 @@ fn shared_snapshot_binding_getters_cache_each_realms_live_closure() {
                 "{tier:?}: snapshot AST is shared"
             );
             assert!(
-                !Rc::ptr_eq(&main_getter, &child_getter),
+                !std::ptr::eq(
+                    crate::value::user_fn_ptr(&main_getter),
+                    crate::value::user_fn_ptr(&child_getter)
+                ),
                 "{tier:?}: cached environments are closure-local"
             );
         });

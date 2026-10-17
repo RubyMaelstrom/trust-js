@@ -1580,7 +1580,12 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let func_probe_word = unsafe { *(&func_probe as *const Rc<[usize; 3]> as *const usize) };
     let func_data_off = (Rc::as_ptr(&func_probe) as usize).wrapping_sub(func_probe_word);
     let scope_under_with = scope_refcell + offset_of!(crate::interpreter::Scope, under_with);
-    let call_probe_valid = callable_ok && func_data_off == rcbox_data && rcbox_data < 256;
+    // gc-heap stores a closure cell, not an `Rc`, behind `Callable::User`: the native JIT
+    // (refused there until S5) gets no code-keyed call probe.
+    let call_probe_valid = !cfg!(feature = "gc-heap")
+        && callable_ok
+        && func_data_off == rcbox_data
+        && rcbox_data < 256;
 
     let valid = strong_ok
         && niche_ok
@@ -1822,12 +1827,28 @@ impl TypeofTest {
     }
 }
 
+/// A closure's [`UserCallable`], shared by handle. P1 S4 (gc-heap): a payload cell that traces
+/// its environment, so creating a closure takes a 32-byte cell instead of a reference-counted
+/// box, and a call copies the handle without touching a count.
+#[cfg(feature = "gc-heap")]
+pub type UserFn = crate::gc_box::GcBox<UserCallable>;
+#[cfg(not(feature = "gc-heap"))]
+pub type UserFn = Rc<UserCallable>;
+
+/// The address of a closure's [`UserCallable`]: its identity.
+pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
+    #[cfg(feature = "gc-heap")]
+    return crate::gc_box::GcBox::as_ptr(user);
+    #[cfg(not(feature = "gc-heap"))]
+    Rc::as_ptr(user)
+}
+
 /// How an object can be called. Most objects are not callable (`None`).
 ///
 /// `repr(u8)` with fixed discriminants gives the enum a defined layout: the discriminant byte
 /// at offset 0 and the single pointer-sized payload at offset 8. The JIT's code-keyed call
 /// probe reads [`Callable::User`]'s tag and its `Rc<UserCallable>` pointer straight from a
-/// callee object (see `JitLayout::obj_call_tag`).
+/// callee object (see `JitLayout::obj_call_tag`; default build).
 #[derive(Clone)]
 #[repr(u8)]
 pub enum Callable {
@@ -1836,7 +1857,7 @@ pub enum Callable {
     /// A native function carrying captured state (see [`NativeClosure`]).
     NativeData(Rc<NativeCallable>) = 2,
     /// An interpreted function: its AST plus the lexical environment it closed over.
-    User(Rc<UserCallable>) = CALLABLE_USER_TAG,
+    User(UserFn) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
     Bound(Box<BoundCallable>) = 4,
     /// A ShadowRealm wrapped function: `target` is a callable inside the realm of the ShadowRealm
@@ -1933,12 +1954,16 @@ pub struct WrappedCrossCallable {
 
 impl Callable {
     pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
-        Callable::User(Rc::new(UserCallable {
+        let user = UserCallable {
             func,
             env,
             realm,
             binding_getter_cache: Cell::new(None),
-        }))
+        };
+        #[cfg(feature = "gc-heap")]
+        return Callable::User(crate::gc_box::new(user));
+        #[cfg(not(feature = "gc-heap"))]
+        Callable::User(Rc::new(user))
     }
 
     pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
@@ -2432,6 +2457,9 @@ pub(crate) struct GcState {
     /// String cells (flat buffers and views).
     #[cfg(feature = "gc-heap")]
     pub(crate) string_desc: crate::gc_core::DescId,
+    /// Closure cells (each a [`UserCallable`]).
+    #[cfg(feature = "gc-heap")]
+    pub(crate) user_fn_desc: crate::gc_core::DescId,
     /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     #[cfg(feature = "gc-heap")]
@@ -2448,6 +2476,7 @@ struct CellDescs {
     bigint: crate::gc_core::DescId,
     symbol: crate::gc_core::DescId,
     string: crate::gc_core::DescId,
+    user_fn: crate::gc_core::DescId,
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
@@ -2471,6 +2500,12 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let bigint = core.register_desc(crate::bigint::cell_layout());
     let symbol = core.register_desc(symbol_cell_layout());
     let string = core.register_desc(crate::lstr::cell_layout());
+    let user_fn = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "closure",
+        trace: trace_user_fn_cell,
+        weak: None,
+        finalize: Some(crate::gc_box::finalize::<UserCallable>),
+    });
     (
         core,
         CellDescs {
@@ -2479,8 +2514,24 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
             bigint,
             symbol,
             string,
+            user_fn,
         },
     )
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_box::Payload for UserCallable {
+    fn desc(heap: &GcState) -> crate::gc_core::DescId {
+        heap.user_fn_desc
+    }
+}
+
+/// A closure cell's one edge: its environment.
+#[cfg(feature = "gc-heap")]
+fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
+    // SAFETY: closure cells are initialized by `gc_box::new` before any collection.
+    let user = unsafe { &*cell.cast::<UserCallable>() };
+    visit(Env::as_ptr(&user.env).cast());
 }
 
 /// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
@@ -2620,7 +2671,8 @@ impl crate::gc_trace::GcTrace for Object {
             | Exotic::Arguments => {}
         }
         match call {
-            Callable::User(user) => sink.env(&user.env),
+            // The closure cell, which traces its environment.
+            Callable::User(user) => sink.word(crate::gc_box::GcBox::as_ptr(user) as u64),
             Callable::Bound(bound) => {
                 sink.object(&bound.target);
                 sink.value(&bound.this);
@@ -3296,6 +3348,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         symbol_desc: descs.symbol,
         #[cfg(feature = "gc-heap")]
         string_desc: descs.string,
+        #[cfg(feature = "gc-heap")]
+        user_fn_desc: descs.user_fn,
         #[cfg(feature = "gc-heap")]
         interned_strings: RefCell::default(),
     })

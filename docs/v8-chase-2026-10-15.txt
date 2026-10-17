@@ -1391,3 +1391,24 @@ Step 4 deviation, recorded before the work: a page pool (4c).
 - 4c: gc_core keeps empty pages in a bounded pool (up to the larger of
   64 pages and the live page count) and reuses them, re-zeroed, before
   allocating; teardown frees the pool. Measured with 4a and 4b.
+
+Step 4 results (gc-heap; parts committed separately):
+- 4a: under gc-heap, a deferred prototype names its function with an
+  untraced handle. Test dead_constructors_leave_no_reserved_cells:
+  1000 dead constructors are freed by the collection that finds them,
+  and with a weak handle restored their cells stay reserved
+  (2052 -> 3054 live cells).
+- 4c: gc_core keeps released pages for reuse, up to the larger of 64
+  and the live page count. Test emptied_pages_are_reused.
+- 4b: a closure's UserCallable is a payload cell (32 B) traced from its
+  function object; it traces its environment. memory.rs identifies it
+  by address; the JIT's code-keyed call probe reports no layout under
+  gc-heap.
+- No-LTO measurement against step 3 (CPU 5, 7 rounds; outputs
+  identical). 4a+4b+4c cycles are within +-1.3% except sa (+2.1%
+  bytecode, +1.3% interp; 4b's cell path for 400k short-lived
+  closures) and react bytecode +1.3%. vue interp -1.3%, djot interp
+  -0.5%. Peak RSS falls: djot -18.3% (interp) / -8.8% (bytecode), ms
+  -11.9/-13.1%, sa -4.1/-2.3%, vue -2.4/-1.8%, react flat, pa +0.8%
+  at interp. Without 4c, 4a and 4b had raised bytecode RSS by 4-6 MiB
+  (vue, djot).

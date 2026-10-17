@@ -7,7 +7,7 @@ use crate::value::{Callable, Value};
 use crate::Engine;
 use std::rc::Rc;
 
-fn subject(i: &mut crate::interpreter::Interp) -> Rc<crate::value::UserCallable> {
+fn subject(i: &mut crate::interpreter::Interp) -> crate::value::UserFn {
     let env = i.global_env.clone();
     let value = i.get_var("subject", &env).ok().unwrap();
     let object = value.as_obj().unwrap().borrow();

@@ -633,7 +633,7 @@ impl Visitor {
                 }
             }
             Callable::User(value) => {
-                let identity = Rc::as_ptr(value) as usize;
+                let identity = crate::value::user_fn_ptr(value) as usize;
                 if self.callable_allocations.insert(identity) {
                     self.callable_metadata = self
                         .callable_metadata

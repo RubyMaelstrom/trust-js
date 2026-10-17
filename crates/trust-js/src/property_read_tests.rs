@@ -51,7 +51,7 @@ fn check(source: &str, expected: &str) {
     }
 }
 
-fn global_user_callable(engine: &mut Engine, name: &str) -> Rc<crate::value::UserCallable> {
+fn global_user_callable(engine: &mut Engine, name: &str) -> crate::value::UserFn {
     let env = engine.interp.global_env.clone();
     let value = engine
         .interp
@@ -109,7 +109,10 @@ fn binding_getter_cache_is_per_closure_and_reads_live_values() {
         );
         assert!(Rc::ptr_eq(&left.func, &right.func), "{tier:?}: shared AST");
         assert!(
-            !Rc::ptr_eq(&left, &right),
+            !std::ptr::eq(
+                crate::value::user_fn_ptr(&left),
+                crate::value::user_fn_ptr(&right)
+            ),
             "{tier:?}: closure state is separate"
         );
         assert_eq!(

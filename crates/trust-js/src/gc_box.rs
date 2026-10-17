@@ -1,9 +1,10 @@
-//! P1 S2: handles to payload cells (feature `gc-heap`): a BigInt's digits, a Symbol's identity.
+//! P1 S2: handles to payload cells (feature `gc-heap`): a BigInt's digits, a Symbol's identity,
+//! and (P1 S4) a closure's `UserCallable`.
 //!
 //! A handle is its cell's address: `Copy`, with no reference count. The cell lives in the
 //! Agent heap that was active when the handle was made, until a collection finds it
 //! unreachable; its descriptor's finalizer then drops the payload. Payload cells have no
-//! outgoing edges.
+//! outgoing edges, except a closure cell's to its environment (see `value::UserFn`).
 
 use std::ptr::NonNull;
 
