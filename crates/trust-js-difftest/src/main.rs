@@ -489,11 +489,63 @@ mod observation_tests {
     }
 }
 
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+
+    /// The verdict when the reruns end as listed, in interp, bytecode and jit.
+    fn verdict(ends: [Run; 3]) -> Verdict {
+        crash_verdict(|tier| match tier {
+            Tier::Interp => ends[0],
+            Tier::Bytecode => ends[1],
+            Tier::Jit => ends[2],
+        })
+    }
+
+    #[test]
+    fn a_compiled_tier_crash_fails_only_when_the_oracle_completes() {
+        use Run::{Completed, Crashed, Exhausted};
+        assert_eq!(
+            verdict([Completed, Crashed, Completed]),
+            Verdict::Crash(Tier::Bytecode)
+        );
+        assert_eq!(
+            verdict([Completed, Exhausted, Crashed]),
+            Verdict::Crash(Tier::Jit)
+        );
+        assert_eq!(
+            verdict([Completed, Exhausted, Exhausted]),
+            Verdict::Inconclusive
+        );
+        // An oracle that ran out of budget, or crashed, never completed: nothing to compare.
+        assert_eq!(
+            verdict([Exhausted, Crashed, Crashed]),
+            Verdict::Inconclusive
+        );
+        assert_eq!(verdict([Crashed, Crashed, Crashed]), Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn a_rerun_completes_runs_out_of_budget_or_crashes() {
+        assert_eq!(run_end(true, ""), Run::Completed);
+        assert_eq!(
+            run_end(false, "memory allocation of 1048576 bytes failed\n"),
+            Run::Exhausted
+        );
+        assert_eq!(
+            run_end(false, "thread 'main' has overflowed its stack\n"),
+            Run::Crashed
+        );
+        assert_eq!(run_end(false, ""), Run::Crashed);
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Verdict {
     Agree,
     Diverge,
-    /// Killed for exceeding the memory/time budget — inconclusive, not a divergence.
+    /// Killed for exceeding the memory/time budget, or crashed where the oracle did not complete
+    /// — inconclusive, not a divergence.
     Inconclusive,
     /// The oracle tier completes on its own but this tier's child crashed (a signal, panic or
     /// abort): a failure, like a divergence.
@@ -518,8 +570,9 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
                 Some(3) => Verdict::Diverge,
                 Some(0) => Verdict::Agree,
                 // Nonzero-but-not-3: a crash or abort somewhere in the run. It is inconclusive
-                // when the oracle crashes too (a stack overflow on a deeply recursive program,
-                // the allocation cap); a tier that crashes where the oracle completes fails.
+                // unless the oracle completes (it crashes too, as on a deeply recursive program's
+                // stack overflow, or runs out of budget); a tier that crashes where the oracle
+                // completes fails.
                 _ => classify_crash(exe, tmp),
             };
         }
@@ -545,23 +598,57 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
     }
 }
 
+/// How a capped `--observe` child ended.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Run {
+    /// It exited normally: the tier ran the program to its end.
+    Completed,
+    /// It ran out of budget: the wall clock, or the allocation cap's abort.
+    Exhausted,
+    /// It died another way: a signal, a panic or an abort.
+    Crashed,
+}
+
+/// How an `--observe` child that exited ended, from its exit status and its stderr, where the
+/// allocation cap's abort reports the failed allocation.
+fn run_end(success: bool, stderr: &str) -> Run {
+    if success {
+        Run::Completed
+    } else if stderr.contains("memory allocation of") {
+        Run::Exhausted
+    } else {
+        Run::Crashed
+    }
+}
+
 /// A `--check` child died: rerun the program (still in `tmp`) one tier at a time (`--observe`,
 /// under the same caps). The first tier that crashes while the oracle completes is the verdict.
 fn classify_crash(exe: &std::path::Path, tmp: &std::path::Path) -> Verdict {
-    if !observe_completes(exe, tmp, "interp") {
+    crash_verdict(|tier| observe_run(exe, tmp, tier))
+}
+
+/// [`classify_crash`]'s decision from how each tier's rerun ends. Only an oracle that completes
+/// can convict a compiled tier: one that runs out of budget or crashes leaves the program
+/// inconclusive, and so does a compiled tier that only runs out of budget.
+fn crash_verdict(mut observe: impl FnMut(Tier) -> Run) -> Verdict {
+    if observe(Tier::Interp) != Run::Completed {
         return Verdict::Inconclusive;
     }
-    for (name, tier) in [("bytecode", Tier::Bytecode), ("jit", Tier::Jit)] {
-        if !observe_completes(exe, tmp, name) {
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        if observe(tier) == Run::Crashed {
             return Verdict::Crash(tier);
         }
     }
     Verdict::Inconclusive
 }
 
-/// Whether a capped `--observe` child running `tmp` in `tier` exits normally. Running out of
-/// budget (the wall clock, or the allocation cap's abort) counts as completing: it is not a crash.
-fn observe_completes(exe: &std::path::Path, tmp: &std::path::Path, tier: &str) -> bool {
+/// Run `tmp` in `tier` in a capped `--observe` child, and say how it ended.
+fn observe_run(exe: &std::path::Path, tmp: &std::path::Path, tier: Tier) -> Run {
+    let tier = match tier {
+        Tier::Interp => "interp",
+        Tier::Bytecode => "bytecode",
+        Tier::Jit => "jit",
+    };
     let err_path = tmp.with_extension("err");
     let mut child = std::process::Command::new(exe)
         .arg("--observe")
@@ -576,13 +663,13 @@ fn observe_completes(exe: &std::path::Path, tmp: &std::path::Path, tier: &str) -
         if let Some(status) = child.try_wait().unwrap() {
             let err = std::fs::read_to_string(&err_path).unwrap_or_default();
             let _ = std::fs::remove_file(&err_path);
-            return status.success() || err.contains("memory allocation of");
+            return run_end(status.success(), &err);
         }
         if start.elapsed().as_millis() as u64 > TIMEOUT_MS {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&err_path);
-            return true;
+            return Run::Exhausted;
         }
         std::thread::sleep(std::time::Duration::from_millis(4));
     }

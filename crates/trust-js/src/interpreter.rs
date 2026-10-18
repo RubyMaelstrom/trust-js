@@ -13265,21 +13265,31 @@ impl Interp {
         // Trampoline: a proper tail call unwound out of the callee re-dispatches here, in the
         // same stack frame, so mutual tail recursion runs in constant stack space.
         while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    let _tail_arguments = crate::rooting::root_slice(&a);
-                    if let Err(e) = self.gc_check_amortized() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a);
-                }
+            match self.run_pending_tail(true) {
+                Some(next) => r = next,
                 None => break,
             }
         }
         self.depth -= 1;
         r
+    }
+
+    /// One step of a proper-tail-call trampoline: take the call a callee left pending, if any,
+    /// and run it after a collection check (amortized or not, as the trampoline's call path
+    /// checks). The argument list leaves `pending_tail`, which the collector traces, for a
+    /// Rust-heap buffer the stack scan cannot see, so it is rooted from here through the check
+    /// and the call (I1): a Proxy callee, say, runs its handler's `apply` getter before it copies
+    /// the arguments out. The callee and receiver are locals of this frame.
+    #[inline]
+    pub(crate) fn run_pending_tail(&mut self, amortized: bool) -> Option<Result<Value, Abrupt>> {
+        let (f, t, a) = *self.pending_tail.take()?;
+        let _tail_arguments = crate::rooting::root_slice(&a);
+        let checked = if amortized {
+            self.gc_check_amortized()
+        } else {
+            self.gc_check()
+        };
+        Some(checked.and_then(|()| self.call_tail(f, t, &a)))
     }
 
     /// GetFunctionRealm: the realm-global pointer of `obj`, unwrapping bound functions and
@@ -14721,15 +14731,8 @@ impl Interp {
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    if let Err(e) = self.gc_check() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a).map(PackedValue::pack);
-                }
+            match self.run_pending_tail(false) {
+                Some(next) => r = next.map(PackedValue::pack),
                 None => break,
             }
         }
@@ -14795,15 +14798,8 @@ impl Interp {
                     self.constructing = saved_ctor;
                     self.new_target = saved_nt;
                     while r.is_ok() {
-                        match self.pending_tail.take() {
-                            Some(bx) => {
-                                let (f, t, a) = *bx;
-                                if let Err(e) = self.gc_check_amortized() {
-                                    r = Err(e);
-                                    break;
-                                }
-                                r = self.call_tail(f, t, &a);
-                            }
+                        match self.run_pending_tail(true) {
+                            Some(next) => r = next,
                             None => break,
                         }
                     }
@@ -14942,15 +14938,8 @@ impl Interp {
         self.new_target = saved_nt;
         // Proper-tail-call trampoline, exactly like `call`.
         while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    if let Err(e) = self.gc_check() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a).map(PackedValue::pack);
-                }
+            match self.run_pending_tail(false) {
+                Some(next) => r = next.map(PackedValue::pack),
                 None => break,
             }
         }
@@ -15702,15 +15691,8 @@ impl Interp {
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    if let Err(e) = self.gc_check() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a);
-                }
+            match self.run_pending_tail(false) {
+                Some(next) => r = next,
                 None => break,
             }
         }
@@ -16065,15 +16047,8 @@ impl Interp {
         self.new_target = saved_nt;
         // Proper-tail-call trampoline, exactly like `call`.
         while r.is_ok() {
-            match self.pending_tail.take() {
-                Some(bx) => {
-                    let (f, t, a) = *bx;
-                    if let Err(e) = self.gc_check() {
-                        r = Err(e);
-                        break;
-                    }
-                    r = self.call_tail(f, t, &a);
-                }
+            match self.run_pending_tail(false) {
+                Some(next) => r = next,
                 None => break,
             }
         }

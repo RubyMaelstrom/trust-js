@@ -22243,9 +22243,7 @@ pub(crate) unsafe extern "C" fn jit_direct_finish(
     i.call_site = crate::stack_trace::NO_POSITION;
     // Proper-tail-call trampoline, exactly like the layered paths.
     if !threw {
-        while let Some(bx) = i.pending_tail.take() {
-            let (f, t, a) = *bx;
-            let r = i.gc_check_amortized().and_then(|()| i.call_tail(f, t, &a));
+        while let Some(r) = i.run_pending_tail(true) {
             match r {
                 Ok(v) => caller.ret = PackedValue::pack(v),
                 Err(e) => {

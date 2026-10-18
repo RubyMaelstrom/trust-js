@@ -3381,3 +3381,82 @@ no-LTO release builds unless noted.
   - gc-heap's peak RSS over the default build's.
   x86-64 under gc-heap runs the bytecode VM until S6's zombie pass, as
   planned.
+
+S5 review fixes (outside review of 37a3e12f, 2026-10-18)
+--------------------------------------------------------
+- [P1] A proper tail call's argument list was unrooted in most of the
+  trampolines that run it. Past the ordinary-call depth (Op::TailDeep)
+  a tail call leaves pending_tail, which the collector traces, holding
+  the callee, the receiver and a Vec<Value> of arguments. A trampoline
+  takes it out, so the list sits in a Rust-heap buffer the stack scan
+  cannot see. Interp::call rooted the list (root_slice) from the take
+  through its GC check and the call. The six JIT trampolines did not:
+  jit_direct_finish, call_jit_committed_packed, call_jit_env_committed_
+  packed, call_native_committed, call_jit_fast and construct_jit_fast.
+  Their GC check could collect the arguments, and so could a Proxy
+  callee's `apply` getter, which runs before the trap's argument array
+  exists.
+  - Fix: every trampoline takes the call through one step,
+    Interp::run_pending_tail. It roots the list from the take through
+    the check (amortized or not, as each path checked before) and the
+    call. Interp::call uses it too.
+  - Reach in the default configuration: direct calls return to the
+    committed path from depth 128 (MAX_DIRECT_CALL_DEPTH), and tail
+    calls are staged only from depth 1024, so jit_direct_finish drains
+    one only with TRUST_JS_TAIL_CALL_DEPTH below 128. The committed,
+    env and fast paths drain them at any depth past 1024.
+    construct_jit_fast never sees one: both construct paths refuse a
+    body with tail calls. Only a test native leaves a pending call with
+    arguments for call_native_committed.
+  - A JavaScript getter can mask the gap in the JIT paths. The callee's
+    frame record returns to the pool, the getter's activation pops it
+    again, and an active record's words are scanned whole. Its stale
+    operand words then hold the arguments.
+  - Test jit::rooting_tests::tail_call_arguments_are_roots_in_the_
+    trampoline (gc-heap, ARM64). At depth 1024, with direct calls let
+    run that deep, strict compiled functions tail-call a Proxy with
+    two fresh objects. A native `apply` getter collects, so no JIT
+    record is active, and reports that roots marked both objects; the
+    trap then reads them back.
+    - The calls drain through Interp::call (a Rust entry and the JIT's
+      generic call), call_jit_fast, call_jit_committed_packed, its env
+      variant, and jit_direct_finish once the callees are settled.
+    - Mutation runs, one at a time: with the root removed from the
+      step, or any one of those five sites taking an unrooted copy of
+      the step, the test dies with SIGSEGV when the trap reads a freed
+      object.
+    - Unrooting call_native_committed or construct_jit_fast changes
+      nothing here (see reach above).
+  - The tree-walker's try/finally also takes pending_tail, keeping it
+    in a Box across its finalizer. HasCallInTailPosition leaves nothing
+    to keep there: a try block runs with tco_ok false, and a catch
+    block keeps it only when there is no finalizer.
+- [P2] difftest: classify_crash convicted a compiled tier whenever the
+  interp oracle's rerun "completed", and running out of budget (the
+  wall clock, or the allocation cap's abort) counted as completing. A
+  program the interpreter could not finish was therefore reported as a
+  crash of the first compiled tier that died on it.
+  - Fix: a rerun now ends Completed, Exhausted or Crashed (Run). Only a
+    Completed oracle can convict a compiled tier, and only one that
+    Crashed. An exhausted or crashed oracle leaves the program
+    inconclusive, as does a compiled tier that only runs out of budget.
+  - The decision is a pure function (crash_verdict) beside run_end, so
+    tests cover it without children: an exhausted or crashed oracle
+    gives Inconclusive whatever the compiled tiers did. The old
+    decision fails the first test (it convicts bytecode under an
+    exhausted oracle).
+- Gates (the working tree on 37a3e12f; no-LTO release builds unless
+  noted):
+  - Lib suites (debug): embed 2184/0/3, embed,gc-heap 2234/0/55 (the
+    new test). Clippy clean for trust-js and trust-js-difftest in both
+    builds; rustfmt clean on the changed files.
+  - GC stress 1 (debug, embed,gc-heap, one process): the tail, rooting
+    and loop-fragment tests, 36 pass. 8c's four slow tail tests run at
+    100: 4 pass. In the lib suite, rooting_holds_under_gc_stress
+    reruns the rooting tests at stress 1, the new one included.
+  - difftest: its own tests 3/0/0 in both builds. --seed 7 --count
+    150: 138 agree, 12 skipped, no crash in both builds, as at the
+    exit gate.
+  - Full Test262 at --tier=jit, both builds: 53,575/53,575 at the
+    default threshold, 53,573/53,575 at threshold 0. All four reports
+    are byte-identical to the S5 exit gate's.

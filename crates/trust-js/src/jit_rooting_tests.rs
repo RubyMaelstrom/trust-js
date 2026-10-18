@@ -1017,6 +1017,91 @@ fn entry_this_is_a_root() {
     assert_tracked_collectable(&mut engine);
 }
 
+/// The Proxy handler's `apply` getter in [`tail_call_arguments_are_roots_in_the_trampoline`]:
+/// `collect()`, its markers stored as the handler's `seen`, then the handler's `trap`. It is
+/// native so that no JIT record is active during the collection: an active record's words are
+/// scanned whole, and a reused one can still hold the stale words of the callee that staged
+/// the tail call.
+fn collecting_apply(i: &mut Interp, handler: Value, _: &[Value]) -> Result<Value, Value> {
+    let marks = collect(i, Value::Undefined, &[])?;
+    let Value::Obj(handler) = handler else {
+        panic!("the getter's receiver is the handler")
+    };
+    let mut handler = handler.borrow_mut();
+    handler
+        .props
+        .insert("seen", Property::data(marks, true, true, true));
+    Ok(handler
+        .props
+        .get("trap")
+        .expect("the handler's trap")
+        .value())
+}
+
+/// (18) A proper tail call's argument list in the trampoline that takes it
+/// (`Interp::run_pending_tail`). Past the ordinary-call depth (`Op::TailDeep`), a strict compiled
+/// function's tail call of a Proxy leaves `pending_tail` holding two fresh objects as its
+/// arguments and retires the function's frame. The trampoline then runs the Proxy's [[Call]],
+/// whose `apply` getter collects before the trap's argument array exists, so the trampoline's
+/// rooting of the list is the objects' only root; each trap reads the objects back. The tail
+/// calls return to compiled callers through the call cache's committed paths and, once the
+/// callees are settled, through the direct call sequence (`jit_direct_finish`), and to a Rust
+/// entry (`invoke`). `tailEnv`'s closure gives it an activation.
+#[test]
+fn tail_call_arguments_are_roots_in_the_trampoline() {
+    let mut engine = jit_engine(0);
+    install(&mut engine, "collectingApply", 0, collecting_apply);
+    let source = r#"
+        var handler = {
+            seen: '',
+            trap: function (target, self, args) { return args[0].tag + args[1].tag; }
+        };
+        Object.defineProperty(handler, 'apply', {get: collectingApply});
+        var proxy = new Proxy(function () {}, handler);
+        function tail(n) {
+            'use strict';
+            return proxy(track({tag: 'P' + n}), track({tag: 'Q' + n}));
+        }
+        function tailEnv(n) {
+            'use strict';
+            var later = function () { return 'F' + n; };
+            return proxy(track({tag: 'E' + n}), track({tag: later()}));
+        }
+        function direct(n) { var r = tail(n); return handler.seen + ':' + r; }
+        function directEnv(n) { var r = tailEnv(n); return handler.seen + ':' + r; }
+        function entered(n) { var r = invoke(tail, n); return handler.seen + ':' + r; }
+        function rounds(n) { return [direct(n), directEnv(n), entered(n)].join(); }
+        rounds(0);
+    "#;
+    let expected = |n: usize| format!("RR:P{n}Q{n},RR:E{n}F{n},RR:P{n}Q{n}");
+    // Run at the depth from which tail calls are staged, without the frames below it, and let
+    // direct calls run that deep (they return to the committed path from depth 128 otherwise).
+    let (depth, direct_depth) = (engine.interp.depth, engine.interp.direct_call_depth);
+    engine.interp.depth = crate::bytecode::ordinary_tail_call_depth();
+    engine.interp.direct_call_depth = u32::MAX;
+    assert_eq!(run(&mut engine, source), expected(0));
+    assert_native(
+        &mut engine,
+        &[
+            "tail",
+            "tailEnv",
+            "direct",
+            "directEnv",
+            "entered",
+            "rounds",
+        ],
+    );
+    for n in 1..3 {
+        assert_eq!(run(&mut engine, &format!("rounds({n});")), expected(n));
+    }
+    settle(&mut engine, "tail");
+    settle(&mut engine, "tailEnv");
+    assert_eq!(direct_round(&mut engine, "rounds(3);", 1), expected(3));
+    engine.interp.depth = depth;
+    engine.interp.direct_call_depth = direct_depth;
+    assert_tracked_collectable(&mut engine);
+}
+
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
 /// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
 /// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, every kind of
