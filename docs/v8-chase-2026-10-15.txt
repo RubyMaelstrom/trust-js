@@ -3044,7 +3044,8 @@ Step 9e, string constants are immediates under gc-heap (5fa62d13):
 - Gates: the agent's, at 5fa62d13. I reran the lib suites, the stress
   child, clippy and rustfmt at the same commit.
   - Lib suites: embed 2184/0/3 (2181 + 3). embed,gc-heap 2233/0/55
-    twice (2227 + 3 + 3). My rerun gave the same counts, with gc-heap run twice.
+    twice (2227 + 3 + 3). My rerun gave the same counts, with
+    gc-heap run twice.
   - Stress child (68 tests: 62 + 6): 31 s alone; 30.2 s on my
     rerun.
   - Targeted per-test stress over the names matching
@@ -3104,3 +3105,146 @@ Step 9e, string constants are immediates under gc-heap (5fa62d13):
     by chunks being shared across Agents or threads. 9e found no such
     sharing at HEAD, and its argument does not rest on it. Reword them
     in S6's cleanup.
+
+Step 9f, Binding.value measured and not packed in S5:
+- The question was whether packing Binding.value under gc-heap pays.
+  The value is a 16-byte Value today; packed, it would be one word.
+  The bar, set before measuring: an estimated saving of at least 2% of
+  instructions at --tier=jit or --tier=bytecode on some fixture, or
+  at least 3% of peak heap bytes. An agent measured at 52aa7a74, with
+  an instrumented source copy that nothing committed. I checked its
+  numbers.
+- 9a's smaller store wins are in. emit_store_name_value puts the
+  incoming word's kind decode, the old-BigInt check and the release
+  under `if own.counted()`. In a gc-heap dump of a vue
+  StoreNameCached site, the generic arm after the Number-over-Number
+  test is a reload, one decode and two stores. The default build's
+  same site has the extra decode, the BigInt check and the release.
+- --tier=jit, gc-heap, the three fixtures:
+  - Executions are measured. Counters on every binding load, store,
+    update and loop-chain path are bumped from generated code,
+    including the shared NameLoad stub. The load counts match the
+    bytecode VM's binding reads: vue 3.22M against 3.14M, react 458K
+    against 458K.
+  - Today's lengths are counted in the uninstrumented dumps. A
+    binding load is 10 instructions for a Number, 12 for an Object
+    and 19-31 for the other kinds; a global property's load is 5. A
+    binding store is 13 (Number over Number) to 40.
+  - The packed lengths are inferred from the existing primitives,
+    and optimistic: 3 for any load, 7 for a binding store.
+  - Saving: vue 31.6M of 3,223.7M instructions (0.98%), react 4.1M of
+    606.8M (0.68%), djot 4.5M of 1,261.2M (0.36%). Most of it is the
+    Object load: vue runs 1.86M of them, at 9 instructions each.
+  - The Rust helper paths at this tier would add 0.02-0.12%.
+- --tier=bytecode, inferred from measured counts:
+  - The VM's binding reads onto its stack (vue 3.14M, react 458K,
+    djot 495K) and writes from it (102K, 9K, 14K) are measured.
+  - The per-access conversion cost comes from a microbenchmark. A
+    read costs 19-35 instructions more than a word copy, and a write
+    10-15 more than a word store. The range allows for the
+    benchmark's out-of-line pack.
+  - Saving: vue 0.79-1.10%, react 0.40-0.54%, djot 0.45-0.60%.
+- Code size, gc-heap dumps:
+  - Inline binding templates would shrink by about 66 words per load,
+    47 per store, 4 per update and 11 per loop-chain read.
+  - Most LoadName sites call the process-wide NameLoad stub and would
+    not change.
+  - Totals: vue 186,070 -> 177,035 words (-4.9%), react 25,278 ->
+    25,146 (-0.5%), djot 1,035,753 -> 1,008,763 (-2.6%).
+- Memory, gc-heap (the S3 census at every collection):
+  - Binding is 32 bytes and would be 24. The environment cell would
+    go from 128 to 120 bytes and stay in the 128-byte class.
+  - Spilled binding buffers beside the cells hold at most 34,896 B
+    (vue at --tier=interp). Packed, they would save 5,816 B, 1.39% of
+    the heap's live bytes at that collection. The other fixtures and
+    tiers: 0.04-0.92%.
+  - At --tier=interp, records that die spill 148 MB (vue), 45 MB
+    (react) and 54 MB (djot) over a run. Packing would cut those
+    bytes by a sixth, but not the allocations.
+- Change size at 52aa7a74, lib code outside tests. It was counted by
+  renaming the field and the accessors and compiling both builds:
+  - 66 reads and writes of Binding.value (65 and a pattern under
+    gc-heap);
+  - 56/57 constructions;
+  - 121/123 VarMap accessor calls.
+  Six JIT templates would need gc-heap-only forms behind a layout
+  fact, and x86-64 would decline them. The tree-walker (eval.rs, 25
+  uses) would pay a conversion per access instead; that cost was not
+  measured.
+- Decision: not taken. No fixture reaches the bar at either tier: the
+  best is vue, at about 1%. Memory moves by at most 1.4% of live heap
+  bytes. Revisit in S6, where one word-slot type replaces the cfg
+  split once the counted build is gone. The code-size saving (-0.5 to
+  -4.9% of gc-heap code words) comes with it.
+- No commits. The code-neutral store-name mark would not have changed
+  any number: a store is emitted at its own op, so map offsets place
+  every store site.
+Step 9's tripwire (2026-10-18, quiet machine: every CPU under 6%
+before the runs, other cores 0.43 busy at the median during them):
+- Binaries: fat LTO, the repo's release profile. Each revision is a
+  fresh git-archive export built in a fresh target dir:
+  - step 8's code, 9d8c20de (default 335c0d88, gc-heap 0145303b);
+  - 9e's, 5fa62d13 (default 49208126, gc-heap e7723d07). 9f added no
+    code.
+  - The gc-heap binaries' dump totals confirm the labels: vue/react
+    229,615/33,677 words at step 8 and 186,110/25,295 at 9e. The
+    no-LTO dumps give 229,659/33,677 and 186,070/25,278; helper
+    addresses take different MOVK counts per binary.
+- Method: tripwire.py. perf stat counts cycles:u and instructions:u
+  with perf and the workload pinned to CPU 5 (armv8_pmuv3_1). Peak
+  RSS comes from wait4. The fixtures run at --tier=jit, 15 rounds,
+  configurations in rotating order; figures are medians.
+- Step 8 -> 9e:
+  - gc-heap: cycles vue -8.2%, react -7.8%, djot -10.5%;
+    instructions -5.80/-12.50/-8.55%; peak RSS -1.2/0.0/-1.9%.
+  - The default build: cycles -0.3/+0.1/-0.6%, instructions within
+    0.07%, peak RSS -3.2..+0.8%.
+  - gc-heap against the default build: at 9e cycles -13.0/-10.5/
+    -6.8% and instructions -9.75/-18.69/-9.31%; at step 8 cycles
+    -5.6/-2.9/+3.6%.
+  - Stdout is equal across all four, with only elapsed_ms removed.
+    Compile counts are unchanged: 55/9/160 in the default build,
+    56/10/160 under gc-heap.
+  - gc-heap's peak RSS stays above the default build's (vue +33.6%,
+    react +135%, djot +9.6%). That is S3's finding, open for S6.
+- Correction to a first run. It was made with the step-8 binaries
+  built hours earlier and 9e's minutes before, and showed peak RSS
+  +1.8..+11.9% in both builds, even on an empty script (+2.3 MiB).
+  Fresh copies of all four binaries removed it: on the empty script,
+  13.6 against 13.5 MiB in the default build. The cause was the page
+  cache. XFS held freshly written files in large folios, which a
+  fault maps whole, so file-backed RSS depended on how each binary
+  had last been written or read. The figures above come from a rerun
+  on fresh copies of all four; its cycles agree with the first run's
+  within 0.3 points.
+- Instruction progression, gc-heap, fat LTO, the same pinning, median
+  of 3 (M). The 9e column comes from a second run, whose 9d agreed
+  with the first within 0.06%.
+                  step 8     9a       9b       9c       9d       9e
+    jit      vue  3,158.6  3,015.2  2,978.7  2,977.0  2,976.6  2,975.6
+           react    653.0    586.0    582.0    582.1    571.3    571.4
+            djot  1,213.8  1,154.9  1,113.2  1,112.8  1,111.0  1,109.5
+    bytecode vue  7,948.9  7,946.4  7,709.2  7,733.2  7,729.0  7,692.9
+           react  2,648.8  2,648.7  2,555.4  2,558.4  2,556.6  2,540.1
+            djot  2,543.9  2,549.9  2,466.4  2,472.7  2,471.9  2,455.7
+  Step 8 -> 9e: jit -5.79/-12.50/-8.59%, bytecode -3.22/-4.10/-3.47%.
+  - React's no-LTO +0.5% at 9b is an artifact of the no-LTO build:
+    fat LTO gives -0.7%.
+  - 9c's no-LTO gain is absent under fat LTO, which had already
+    inlined the drops 9c removed. The bytecode-tier gain shows at 9b.
+    9c costs +0.1..+0.3% at --tier=bytecode, a diffuse inlining shift
+    that no site carries. In perf record, symbols move by at most
+    0.28% of the total, in both directions.
+  - 9e saves 0.4-0.7% at --tier=bytecode under fat LTO; no-LTO showed
+    it on djot only. perf record on react puts -27M in run_vm_inner,
+    where the Op::Add retire went (it tested the two stack tops at
+    every Add). The rest is a diffuse shift, net +11M.
+  - The default build under fat LTO, step 8 -> 9e: instructions within
+    0.1% at both tiers.
+- gc-heap code words, no-LTO dumps, step 8 -> 9e: vue 229,659 ->
+  186,070 (-19.0%), react 33,677 -> 25,278 (-24.9%), djot 1,257,266 ->
+  1,035,753 (-17.6%).
+- S0 proposed an owner threshold for S6: Vue instructions at most
+  2.97e9, -10% against e3310993's 3.298e9. That base matches the
+  default build at --tier=jit (3,298.5M here). gc-heap at --tier=jit
+  is now 2,974.9M, -9.8%: 0.2 points short.
