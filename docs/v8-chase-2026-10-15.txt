@@ -2419,3 +2419,117 @@ gc-heap code-dump words against the step-8 code (no-LTO, ASLR off: vue
 run to run). At the end: fixtures at --tier=jit in both builds (fat
 LTO; cycles, instructions, peak RSS) against step 8's code, and the
 per-test GC stress run with the JIT on over the whole suite.
+
+Forced tier-up baseline (exploratory, after 8c, with 8c's binaries at
+9d8c20de): the suite at TRUST_JS_TIER_THRESHOLD=0, so every eligible
+function compiles at its first call, each lib test in its own process.
+- Without stress: embed,gc-heap 2191 pass, 3 fail, 62 ignored (308 s
+  at 12 processes); embed 2161, 4, 3 (264 s). Each failure is a
+  threshold assumption: eval::prepared_reference::own_tests::prepared_
+  reference_own_cold_global_updates_take_actual_hint_paths_in_every_
+  tier; lazy_snapshot_body_tests::huge_run_once_bootstrap_bodies_are_
+  interpreted_until_the_call_threshold; tests::fragmented_array_
+  buffer_writes_preserve_host_synchronization (0..4093 written, against
+  0..4096); default only, tests::typeof_unresolved_name_does_not_
+  allocate_error_objects (1020 allocations against 1019: one compile
+  allocation).
+- gc-heap debug at stress interval 1 (verifier and poisoning at every
+  collection): 2161 pass, 4 fail, 62 ignored, no crash, no timeout,
+  no verifier report (2720 s at 12 processes); the slow lists pass, 24
+  at 100 and 5 at 1000. The fourth failure, tests::collected_shadow_
+  realm_ends_without_resuming_its_coroutines, fails at stress 1, 2 and
+  10 with threshold 0 and passes with either setting alone:
+  TRUST_JS_GC_LOG shows a stress collection inside the evaluation
+  taking the unreachable realm (objects 2047 -> 1019) before the test
+  checks for its parked module body. A test assumption: 0c834fe7 holds
+  the realm in a global until the check; it passes 5 of 5 under each of
+  those settings and without them, in both builds.
+
+Step 9a, gc-heap emission (09b28cd4):
+- Under Traced, exec_clone, exec_drop_shared, exec_release_word and
+  exec_release_loaded emit nothing, and the 13-instruction owner guard
+  is counted-only. Checks that share a slow path stay (Empty, NO_SLOT,
+  accessor, a kind decode before an encode). What only the owner guard
+  used is counted-only: the checked paths of Dup and of the region's
+  Pop, Dup and pop-condition; a local store that keeps nothing (no
+  guard is left); the SetProp create-commit reload; the numeric chains'
+  slot loads and bail markers; the name load's preferred-Number
+  shortcut; the TDZ pair's register scrub.
+- property_word_guard (jit_exec_values.rs), 3 instructions: movz
+  0xfffa<<48, cmp, b.hs slow; a const assert pins PACK_LAZY_PROTO as
+  the first tag above PACK_OBJ. Emitted only where the key can be
+  "prototype": the GetProp family when the name is prototype; the
+  computed method read always; LoadRef when the Reference's
+  ResolveNameRef (the nearest before the use) names prototype, or none
+  is found; the region's borrowed own and method reads (one shared
+  helper) when the key is prototype. Rechecked: the one creation site
+  (make_function_named, slot 2 = "prototype", non-configurable);
+  unpack, into_value and Clone materialize; the global object, which
+  name loads read, is never a function.
+- The 14 BigInt-only tests are counted-only; the Empty, mutability and
+  ic_plain checks beside them stay, and semantic BigInt routing
+  (equality, ToBoolean, wrapper prototypes) is unchanged. The nullish
+  and strict different-tag equality exits no longer route a BigInt:
+  null == 1n is false (IsLooselyEqual's last step), as is strict
+  equality across tags. In emit_store_local the BigInt test before the
+  slot release and the clone after it went together. The survey missed
+  one site: store-name's decode of the incoming word before the
+  counted release (now counted-only; the later decode guards both
+  stores).
+- The region materialize clone, which has no slow path, receives only
+  tagged homes (frame slots) and borrowed reads, which are guarded
+  wherever the key can be prototype (commented).
+- LoadRef through a with object is reachable only in generators and
+  async functions: functions containing `with` are not compiled, and
+  closures created under `with` stay interpreted.
+- Unchanged: the property stores' lazy old-value paths (SetProp's miss,
+  store-name's H_DROP_PACKED_AT), now the only Traced code that reaches
+  that helper, for 9b; the default build's dead branches; the x64
+  backend (it never runs gc-heap code; reasoned, not compiled here).
+- Tests: jit::traced_tests::traced_ownership_emitters_emit_nothing
+  (every Traced emitter assembles to zero words and no branch) and
+  property_word_guard_routes_exactly_the_tags_above_object (3
+  instructions; all 65,536 tags with a null and a wild payload; the
+  word is preserved), replacing the routing test. New
+  jit::word_routing_tests (both builds; in the stress child): a
+  deferred F.prototype before and after materialization through the
+  named read, the computed method read, LoadRef (in a generator) and
+  the region's own and method reads, each checking identity,
+  constructor and parent and a native-path counter (for example, 10
+  checked named reads and no native hit while deferred, then 10 native
+  hits); BigInts through the baseline and region sites that used to
+  route them, values checked (under gc-heap the property stores and
+  borrowed reads now hit natively). With the guard emitting nothing
+  (a mutation, not committed), four of the prototype tests abort
+  ("malloc(): unaligned tcache chunk detected") and a fifth panics in
+  materialize.
+- Gates (the agent's, at 09b28cd4 on a loaded machine; lib suites,
+  stress child, clippy and rustfmt rechecked at 0c834fe7):
+  - Lib suites: embed 2172/0/3 (2165 + 7 new); embed,gc-heap 2201/0/62
+    twice (2194 + 7 new + 1 guard test - 1 retired routing test). The
+    same at 0c834fe7 (gc-heap twice).
+  - The stress child (34 tests, from 27) alone: 29.5 s (30.3 s at
+    0c834fe7).
+  - Targeted per-test stress (118 tests: traced, rooting, poll,
+    property store, assignment, lazy prototype, BigInt, equality,
+    instanceof): 118 pass at stress 1, and 118 at stress 1 with
+    threshold 0.
+  - Default code dumps norm2-identical to step 1, stdout equal; gc-heap
+    chunks 56/10/160, stdout equal to the default build's.
+  - Fixtures at --tier=jit: exit 0, stdout equal, compiles 55/9/160 and
+    56/10/160, no failure. difftest --seed 7 --count 150: 138 agree, 12
+    skipped, 0 crashes in both builds.
+  - Clippy clean in both builds; rustfmt clean.
+- gc-heap code-dump words (no-LTO, ASLR off), step 8 -> 9a: vue
+  229,659 -> 189,452 (-17.5%; 55 of 56 chunks changed), react 33,677 ->
+  26,017 (-22.7%; 10 of 10), djot 1,257,266 -> 1,059,043 (-15.8%; 158
+  of 160).
+- Instructions (user mode, no-LTO, perf and the workload pinned to CPU
+  5, median of 3), step 8 -> 9a: gc-heap at --tier=jit vue 3,508.7M ->
+  3,363.2M (-4.1%), react 695.7M -> 628.5M (-9.7%), djot 1,384.5M ->
+  1,320.3M (-4.6%); at --tier=bytecode within 0.04%; the default build
+  within 0.1% at both tiers. At --tier=jit gc-heap now runs 7.1% (vue),
+  17.0% (react) and 6.2% (djot) fewer instructions than the default
+  build. Cycles and peak RSS wait for 9f's tripwire. (With only the
+  workload pinned, perf on this machine reports a spurious count on the
+  other core cluster and scales CPU 5's: pin perf too.)
