@@ -2786,3 +2786,160 @@ Step 9c, packed words copy as bits and drop as nothing (e1630212):
   300k prototypes -2.1%, replacing 1M unobserved prototypes -3.1%.
 - For 9d: under gc-heap a packed `this` needs no release, and
   JitFrame::release's reset is one PACK_UNDEFINED store.
+
+Step 9d, `this` travels packed in JIT contexts under gc-heap (e56fb053):
+- Layout (B). Under gc-heap JitCtx holds the packed `this` word at
+  [48] (this_word) in place of this_raw. The wide this_val and the
+  pointer's set-up writes go, and the Rust-only fields after [72]
+  move up 16 bytes; every emitter reaches them through offset_of!.
+  The default build keeps this_raw and this_val. The prefix asserts
+  in jit.rs and the ABI test gain gc-heap forms: the word is at 48
+  and 8 bytes.
+- Rust reaches `this` through four accessors beside JitCtx, not the
+  brief's one or two. this_value returns a wide copy. this_view lends
+  the default build's field without a new owner and without
+  borrowing the context; gc-heap widens the word into the view.
+  set_this and clear_this write it. `type JitThis` is Value, or
+  PackedValue under gc-heap. The nine struct literals still name the
+  cfg'd fields.
+- The fact is JitRepr::ctx_this, JitThisRepr::Wide { value } or
+  Packed. It is derived from the cfg'd layout (JitThisRepr::BUILD),
+  not probed; the prefix asserts pin [48].
+- Emitted sites under gc-heap, instructions per site 9c -> 9d (sites
+  in vue/react/djot):
+  - LoadThis, baseline and region copy: 62 (56 without the end poll)
+    -> 3 (27/6/244).
+  - GetPropThis through the wrapper probe: 20 -> 41 (8/0/226). The
+    packed probe the brief prescribes decodes the word's kind. An
+    object receiver executes 6 instructions instead of 5, with one
+    dependent load fewer.
+  - The other receivers (GetPropThis without the probe, SetPropThis,
+    the region own read, numeric chains): 5 -> 6 (5/0/136). A reused
+    region read stays at 2.
+  - The direct call's move of the receiver: 37 -> 2, or 3 past 30
+    arguments (40/10/281).
+  - The finish stub's reset: strb wzr -> str x5 (9/4/41). x5 holds
+    the complete Undefined word from the ret store just before; a
+    zero word would be +0.0.
+  The site lengths sum to vue -2,784, react -686 and djot -19,157
+  words. The rest of each dump delta (-1, 0, -52) is exactly
+  worddiff's MOVK change.
+- Rust paths.
+  - The moved entries (run_moved, _shared, _env, _inner, _oversized,
+    and the non-JIT stubs) take JitThis. jit::run and
+    run_borrowed_frame pack at entry.
+  - call_jit_env_committed_packed, call_jit_committed_packed and
+    call_jit_fast bind the word with a gc-heap-only
+    Interp::bind_this_word: OrdinaryCallBindThis on the tag, where
+    boxing a primitive is the one widening. It matches
+    bind_compiled_this(.., false), with uses_this = needs_frame_this
+    and strict = is_strict.
+  - construct_jit_fast packs the new object. The arguments-apply
+    forwarder's round trip goes with call_jit_fast's widening.
+  - The property helpers, jit_exec_inner and both VM bridges widen
+    locally through the accessors.
+  - jit_make_run_env_packed widens only when env_this &&
+    !lexical_this, the one case in which either environment path
+    (make_run_env_from, ActivationPlan::instantiate) stores `this`.
+  - JitFrame::release's reset is one store, and GcTrace for JitCtx
+    traces the word.
+  - The VM's `this` stays wide: each bridged operation widens once,
+    and run_borrowed_frame packs once per native slice.
+- x86-64's `this` property forms decline unless the fact is Wide, so
+  under gc-heap they take the checked helper. x86-64 never runs
+  gc-heap code (Tier::admitted); S6's x64 pass needs a packed form.
+- The default build's generated code is unchanged: code dumps are
+  norm2-identical to step 1, and chunk summaries identical to 9c's.
+  Unlike 9c, its Rust .text is not byte-identical:
+  - the emitters read the fact;
+  - four helper sites read this_val through the accessors instead of
+    through this_raw. These are the same reads: at 771b6dcf every
+    this_raw write points it at its own context's this_val, and no
+    context moves afterwards.
+  - the no-LTO, 16-unit build re-partitions inlining in unrelated code
+    (intl, typed arrays).
+  Default instructions are within 0.05%; 9f's fat-LTO tripwire
+  covers it.
+- Tests.
+  - jit::this_tests (7 tests, both builds, also in the stress child)
+    drives every kind of `this` through every site: an object; a
+    primitive into a strict and into a sloppy callee; undefined and
+    null into both. The sites are LoadThis, GetPropThis and
+    SetPropThis (with length), numeric chains, region own reads,
+    direct calls and constructors. An arrow's and a derived
+    constructor's environment `this` are covered too.
+  - Each runs at all three tiers against Node's results. At
+    --tier=jit, counters check the native paths:
+    - direct returns per round, exactly 30, 41 and 26;
+    - property paths;
+    - no set-prop helper call for an object `this`, 20 for a
+      primitive;
+    - borrowed reads;
+    - the test-only TEST_THIS_CHAIN_OPS.
+  - A call of a free name compiles to LoadNameForCall + CallWithThis,
+    which passes Undefined itself. So the receiver-less direct-call
+    check calls through a local binding, then checks that every
+    pooled record holds Undefined.
+  - Rooting (gc-heap): a synthetic context's `this` word is marked by
+    a root and is collectable after clear_this. An object reachable
+    only as a jit::run entry's `this` is marked R and survives
+    stress 1, for a sloppy and a strict callee.
+  - Updated: the context literals, the ABI test, jit_return_tests'
+    pooled-record read, and the traced emitters test. The last pins
+    the packed reset to exactly str x5, [x10, #48].
+- Mutations (a separate source copy; 12 tests, each in its own
+  process, at stress 0 and 1; the control passes 12 of 12 both ways):
+  - A finish stub resetting a zero word fails 3 tests: the
+    receiver-less calls see +0.
+  - A trace that skips the word fails 2: the objects are marked S,
+    not R.
+  - A receiver guard that accepts any tag, in all four sites or in
+    any one alone, makes the relevant test die with SIGSEGV.
+- Gates: the agent's, at e56fb053. I reran the lib suites, the stress
+  child, clippy and rustfmt at the same commit.
+  - Lib suites: embed 2181/0/3 (2174 + 7). embed,gc-heap 2227/0/55
+    twice (2218 + 7 + 2). My rerun gave the same counts, with
+    gc-heap run twice.
+  - Stress child (62 tests: 53 + 9): 31 s alone; 29.7 s on my rerun.
+  - Targeted per-test stress over the names matching
+    jit_call|direct_call|jit_return|call_guard|script_entry|tiering|
+    rooting_tests|this|receiver|construct|traced_tests|poll (260
+    tests; 258 at interval 1, and 2 on 8c's slow list at 100):
+    - At stress 1, 257 pass and 1 is ignored. With threshold 0, the
+      same.
+    - The two slow tests pass at 100 both ways.
+    - The known threshold-0 failure is not in this selection.
+    - No crash and no verifier report.
+  - Test262 at threshold 0, over 12 subsets: language/expressions/
+    this, arrow-function, call, new, super, class and
+    object/method-definition; language/function-code;
+    language/statements/class; built-ins/Function, Reflect and
+    Array/prototype.
+    - Release gc-heap runners at 771b6dcf and e56fb053, and a debug
+      one at e56fb053, pass 13013 of 13013 each.
+    - The base runner is byte-identical to 9c's head runner.
+    - A tier log confirmed native compiles under the runner.
+  - Default code dumps are norm2-identical to step 1, with stdout
+    equal. gc-heap keeps 56/10/160 chunks. Every gc-heap chunk
+    summary changed against 9c, because the later JitCtx fields
+    moved, so 9e compares against dumps/s9d.
+    - Words: vue 188,998 -> 186,213 (-1.47%), react 26,016 -> 25,330
+      (-2.64%), djot 1,056,922 -> 1,037,713 (-1.82%).
+  - Fixtures at --tier=jit: exit 0, stdout equal, compiles 55/9/160
+    and 56/10/160.
+  - difftest --seed 7 --count 150: 138 agree, 12 skipped, 0 crashes
+    in both builds.
+  - Clippy is clean in both builds; rustfmt is clean.
+- Instructions, 9c -> 9d (user mode, no-LTO, perf and the workload
+  pinned to CPU 5, median of 3; my recount agrees with the agent's
+  within 0.03 points):
+  - gc-heap at --tier=jit: vue 3,235.0M -> 3,226.2M (-0.27%), react
+    617.7M -> 606.9M (-1.75%), djot 1,265.1M -> 1,261.9M (-0.25%).
+  - gc-heap at --tier=bytecode: within 0.03%.
+  - The default build: within 0.05% at both tiers.
+  - gc-heap against the default build at --tier=jit: vue -10.8%,
+    react -19.8%, djot -10.4%.
+- Follow-ups:
+  - A cheaper primitive kind test would shrink the 41-instruction
+    wrapper-probe receiver.
+  - S6: x86-64 needs a packed `this` form.
