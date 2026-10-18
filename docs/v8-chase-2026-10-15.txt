@@ -3804,3 +3804,30 @@ in both builds on aarch64, x86-64 and Windows under Wine. Open for
 the owner: whether an interrupted script's queued jobs should survive
 it (the checkpoint clears its queue on an interrupt; the script body's
 path does not).
+
+Step 4 plan (2026-10-18), from a read-only survey of the counted
+collectors at f106392f:
+- The counted collectors are compiled into both builds. Under gc-heap
+  the cycle collector (interpreter.rs, about 1,270 lines with its edge
+  helpers) and the nursery (gc_generational.rs and its bookkeeping in
+  value.rs, about 600) are kept alive by allow(dead_code). Only they
+  use the edge cache (gc_edges.rs), gc_diagnostics.rs, NativeCapture-
+  Snapshot, the host's counted trace arm and the six DirectGcEdges
+  traces.
+- Shared, and kept: the safepoint, task-boundary, host and explicit
+  collection entries; next_threshold, whose default formula moves
+  beside GC_TRIGGER (TRUST_JS_GC_GENERATIONAL=0 also changes the GC
+  heap's trigger today); gc_finish_generation, slimmed.
+- Knobs that go: TRUST_JS_GC_DUMP, TRUST_JS_GC_DUMP_MIN_OBJECTS,
+  TRUST_JS_GC_DUMP_ROOT_LIMIT and TRUST_JS_GC_RETAINING_PATHS
+  (documented in DIAGNOSTICS.md), TRUST_JS_GC_GENERATIONAL, the minor
+  and scope counters, and the scope trigger (a no-op).
+- The counted build ends with this step, fields whose offsets
+  generated code embeds stay until step 8, and the host API keeps
+  is_minor (see the plan's recorded deviations for step 4).
+- Check: the GC heap's fixture code dumps identical to step 0's. At
+  0d8e1d75 they are (vue, react, djot), by codedump_norm2.
+- Open, outside step 4: under the GC heap, TRUST_JS_PERF_METRICS'
+  managed-memory record has said "unavailable" since S2.
+  record_post_gc runs only from the counted collectors, over their
+  object lists.

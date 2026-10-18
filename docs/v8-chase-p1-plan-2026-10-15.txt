@@ -550,6 +550,26 @@ program record):
   Linux natively, Windows as x86_64-pc-windows-msvc cross-built with
   cargo-xwin and run under Wine. Windows gets a stack scanner.
 
+Recorded deviations (S6 step 4, 2026-10-18, before the step):
+
+- The counted build ends with step 4, not step 5. Without its cycle
+  collector it would hold every side-table owner until its Engine
+  drops (its pins are released only by that collector) and lose
+  FinalizationRegistry cleanup; keeping its suite green would take a
+  stub collector and gating about 94 of its tests, all of which step
+  5 throws away when it deletes the counted handles. From step 4,
+  building without gc-heap is a compile error until step 8 removes
+  the flag. The x64 JIT, which runs only in the counted build, then
+  goes untested until step 7 returns it under the GC heap.
+- Step 4 removes no field whose offset generated code embeds (Object,
+  Interp, JitCtx and the like), so that steps 4-6 can each show the
+  GC heap's fixture code dumps identical to step 0's. Such fields go
+  in step 8. The six DirectGcEdges traces, which step 4 leaves
+  without a caller, go in step 4 instead of step 5.
+- The host API keeps HostGcVisitor::is_minor (TRust calls it) and
+  native_old_generation, both always false without a nursery; their
+  fate is the embed API's (step 11), or the nursery's (step 10).
+
 ### Working agreements (all agents)
 
 - Branch `rearch/v8-chase` only; one agent at a time. **Syncing `main`
