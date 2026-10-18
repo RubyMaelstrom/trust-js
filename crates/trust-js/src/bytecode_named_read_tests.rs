@@ -75,8 +75,6 @@ struct Invocation {
     stack: Box<[MaybeUninit<PackedValue>; 4]>,
     initialized: [bool; 4],
     live: usize,
-    #[cfg(not(feature = "gc-heap"))]
-    prefix_len: usize,
     error: Option<Abrupt>,
 }
 
@@ -89,30 +87,8 @@ impl Invocation {
         unsafe { self.stack[index].assume_init_read().into_value() }
     }
 
-    #[cfg(not(feature = "gc-heap"))]
-    fn packed(&self, index: usize) -> &PackedValue {
-        assert!(index < self.live && self.initialized[index]);
-        // SAFETY: the helper's returned SP covers precisely its still-owned packed cells.
-        unsafe { self.stack[index].assume_init_ref() }
-    }
-
     fn take_values(&mut self) -> Vec<Value> {
         (0..self.live).map(|index| self.value(index)).collect()
-    }
-
-    #[cfg(not(feature = "gc-heap"))]
-    fn take_prefix(&mut self) -> Vec<Value> {
-        (0..self.prefix_len)
-            .map(|index| self.value(index))
-            .collect()
-    }
-
-    #[cfg(not(feature = "gc-heap"))]
-    fn drop_slot(&mut self, index: usize) {
-        assert!(index < self.live && self.initialized[index]);
-        self.initialized[index] = false;
-        // SAFETY: this position still contains its one live packed owner.
-        unsafe { self.stack[index].assume_init_drop() };
     }
 }
 
@@ -227,8 +203,6 @@ fn invoke(
         stack,
         initialized: std::array::from_fn(|index| index < live),
         live,
-        #[cfg(not(feature = "gc-heap"))]
-        prefix_len,
         error,
     }
 }
@@ -321,60 +295,6 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
     values.clear();
 }
 
-// Reference counting (gc-heap: jit::rooting_tests::named_read_results_are_roots).
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn named_read_packed_result_and_prefix_are_last_owners_across_collection() {
-    let mut engine = Engine::new();
-    let (mut chunk, site) = read_chunk();
-    use_kind(&mut chunk, site, ReadKind::Local);
-
-    let result = crate::value::Object::new(None);
-    let weak_result = crate::value::Gc::downgrade(&result);
-    let receiver = crate::value::Object::new(None);
-    let weak_receiver = crate::value::Gc::downgrade(&receiver);
-    receiver.borrow_mut().props.insert(
-        "value",
-        crate::value::Property::plain(Value::Obj(result.clone())),
-    );
-    let prefix = crate::value::Object::new(None);
-    let weak_prefix = crate::value::Gc::downgrade(&prefix);
-    let mut outcome = invoke(
-        &mut engine,
-        &chunk,
-        site,
-        ReadKind::Local,
-        Value::Obj(receiver.clone()),
-        Value::Obj(prefix.clone()),
-    );
-    drop(result);
-    drop(receiver);
-    drop(prefix);
-    assert!(outcome.error.is_none());
-    assert!(
-        !crate::gc_test::alive(&weak_receiver),
-        "the local slot was released"
-    );
-
-    engine.interp.gc_collect();
-    assert!(
-        crate::gc_test::alive(&weak_prefix),
-        "the packed prefix remains rooted"
-    );
-    assert!(
-        crate::gc_test::alive(&weak_result),
-        "the packed result owns its value after the receiver and property are gone"
-    );
-    assert!(outcome.packed(0).with_object(|_| ()).is_some());
-    assert!(outcome.packed(1).with_object(|_| ()).is_some());
-
-    outcome.drop_slot(0);
-    outcome.drop_slot(1);
-    engine.interp.gc_collect();
-    assert!(!crate::gc_test::alive(&weak_prefix));
-    assert!(!crate::gc_test::alive(&weak_result));
-}
-
 fn collect_named_read(
     i: &mut crate::interpreter::Interp,
     _: Value,
@@ -382,140 +302,6 @@ fn collect_named_read(
 ) -> Result<Value, Value> {
     i.gc_collect();
     Ok(Value::Undefined)
-}
-
-#[cfg(not(feature = "gc-heap"))]
-fn error_name(engine: &mut Engine, error: &Value) -> String {
-    match engine
-        .interp
-        .get_member_key(error, "name")
-        .ok()
-        .expect("error name read")
-    {
-        Value::Str(name) => name.as_str().to_owned(),
-        _ => panic!("error name is not a string"),
-    }
-}
-
-#[cfg(not(feature = "gc-heap"))]
-fn assert_prefix(outcome: &mut Invocation, expected_prefix: &Value, engine: &mut Engine) {
-    let mut prefix = outcome.take_prefix();
-    assert!(same_js_value(engine, expected_prefix, &prefix[0]));
-    prefix.clear();
-}
-
-// Reference counting (gc-heap: jit::rooting_tests::named_read_throws_root_their_operands).
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn named_read_errors_preserve_prefix_tdz_order_and_release_last_receiver_owner() {
-    let mut engine = Engine::new();
-    engine.interp.def_method(
-        &engine.interp.global.clone(),
-        "collectNamedRead",
-        0,
-        collect_named_read,
-    );
-    evaluate(
-        &mut engine,
-        "var namedSentinel={}; var namedGetter=function(){collectNamedRead();throw namedSentinel;};",
-    );
-    let getter = binding(&mut engine, "namedGetter");
-    let sentinel = binding(&mut engine, "namedSentinel");
-    let (mut chunk, site) = read_chunk();
-
-    // A throwing accessor reenters the engine and collects. Stack/local/this receivers are
-    // consumed or frame-owned through the call; GetMethod deliberately leaves the receiver
-    // packed until the caller's exceptional unwind drops it.
-    for kind in [
-        ReadKind::Stack,
-        ReadKind::This,
-        ReadKind::Local,
-        ReadKind::Method,
-    ] {
-        use_kind(&mut chunk, site, kind);
-        let receiver = crate::value::Object::new(None);
-        receiver.borrow_mut().props.insert(
-            "value",
-            crate::value::Property::accessor_prop(Some(getter.clone()), None, true, true),
-        );
-        let weak_receiver = crate::value::Gc::downgrade(&receiver);
-        let receiver_value = Value::Obj(receiver.clone());
-        drop(receiver);
-        let prefix = crate::value::Object::new(None);
-        let weak_prefix = crate::value::Gc::downgrade(&prefix);
-        let expected_prefix = Value::Obj(prefix.clone());
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            receiver_value,
-            Value::Obj(prefix.clone()),
-        );
-        drop(prefix);
-        let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-            panic!("expected the accessor's exact thrown value for {kind:?}");
-        };
-        assert!(engine.interp.strict_equals(error, &sentinel));
-        assert_prefix(&mut outcome, &expected_prefix, &mut engine);
-        drop(expected_prefix);
-        engine.interp.gc_collect();
-        assert!(
-            !crate::gc_test::alive(&weak_prefix),
-            "the consumed prefix was released"
-        );
-        assert_eq!(
-            crate::gc_test::alive(&weak_receiver),
-            kind.is_method(),
-            "only GetMethod keeps its borrowed receiver until exceptional unwind"
-        );
-        drop(outcome);
-        assert!(
-            !crate::gc_test::alive(&weak_receiver),
-            "the receiver owner was released"
-        );
-    }
-
-    // Nullish reads throw before any property access while retaining only the original prefix;
-    // the method form keeps its borrowed receiver for the unwinder to discard.
-    let null_prefix = crate::value::Object::new(None);
-    let null_prefix_value = Value::Obj(null_prefix.clone());
-    for kind in [
-        ReadKind::Stack,
-        ReadKind::This,
-        ReadKind::Local,
-        ReadKind::Method,
-    ] {
-        use_kind(&mut chunk, site, kind);
-        let mut outcome = invoke(
-            &mut engine,
-            &chunk,
-            site,
-            kind,
-            Value::Null,
-            null_prefix_value.clone(),
-        );
-        assert_prefix(&mut outcome, &null_prefix_value, &mut engine);
-        let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-            panic!("nullish property read must throw for {kind:?}");
-        };
-        assert_eq!(error_name(&mut engine, error), "TypeError");
-    }
-
-    use_kind(&mut chunk, site, ReadKind::Local);
-    let mut outcome = invoke(
-        &mut engine,
-        &chunk,
-        site,
-        ReadKind::Local,
-        Value::Empty,
-        null_prefix_value.clone(),
-    );
-    assert_prefix(&mut outcome, &null_prefix_value, &mut engine);
-    let Some(Abrupt::Throw(error)) = outcome.error.as_ref() else {
-        panic!("an empty local must remain in the temporal dead zone");
-    };
-    assert_eq!(error_name(&mut engine, error), "ReferenceError");
 }
 
 #[test]

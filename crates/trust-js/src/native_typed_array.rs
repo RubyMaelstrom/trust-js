@@ -385,34 +385,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: an object handle does not outlive its Agent's heap under gc-heap (I5)"
-    )]
-    fn native_typed_array_teardown_releases_backing_even_with_external_wrapper() {
-        let mut engine = Engine::new();
-        eval(&mut engine, "var a = new Uint8Array(64);");
-        let view = engine
-            .eval_value("a")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("read view"));
-        let buffer = view
-            .as_obj()
-            .unwrap()
-            .borrow()
-            .native_typed_array
-            .as_ref()
-            .unwrap()
-            .buffer
-            .clone();
-        let storage = Rc::downgrade(buffer.storage.borrow().as_ref().unwrap());
-        drop(buffer);
-        drop(engine);
-        assert!(view.as_obj().unwrap().borrow().native_typed_array.is_none());
-        assert!(!crate::gc_test::alive(&storage));
-    }
-
-    #[test]
     fn native_typed_array_detachment_releases_storage_while_old_views_remain() {
         let mut engine = Engine::new();
         engine.set_tier(Tier::Jit);

@@ -3664,3 +3664,95 @@ GC heap (--features gc-heap), and DIAGNOSTICS.md follows.
   - difftest: 138 agree, 12 skipped, no crash.
 - trust-js-wasm takes the defaults too. Its wasm32 build is not a P1
   target (64-bit only) and was not built.
+
+Step 3, the counted model's tests and heap-bridge (an implementation
+agent's change, reviewed and extended):
+- Removed: the 47 tests the GC heap ignored as the counted model's
+  ("P1 S2:"), the 21 tests compiled only without gc-heap, the counted
+  assertion blocks inside tests with both forms, and heap-bridge: the
+  feature, heap.rs (with its 18 unit tests) and its 10 cfgs in
+  value.rs. Outside tests, only heap-bridge's cfg'd fields and paths
+  and cfg(test) helpers left unused are gone.
+- Ported to the GC heap, where the property still holds once a
+  collection has run (each port failed under a mutation of what it
+  checks, then passed restored): 17 of the 47. Among them: unwind
+  restoration of borrowed bindings; the call-overflow cache's epoch
+  and Realm guards; a host edge from a suspended generator; preview
+  bounds; the computed-key stub cache; Map value release; prepared-
+  reference slot tracing; getter-cache growth under re-entrance;
+  array storage boundaries; four weak-metadata tests (an already-dead
+  subscription, end_job on an empty queue, kept-target retirement,
+  Symbol churn shrinking once collected).
+- Review additions:
+  - Two properties of deleted tests that still hold, restored as
+    tests in both builds: equal string keys allocated separately share
+    one Map entry with one hash (fails with strings compared by
+    identity, and with a second hash); a host GC registration outlives
+    its slot being taken (fails when take drops the registration, and
+    when the sweep visits an absent slot).
+  - weak_metadata_safepoint_honors_suppression_and_validates_cleanup_
+    owners lost its counted suppression block and is renamed
+    weak_metadata_safepoint_validates_cleanup_owners. Under the GC
+    heap deaths are found only by collections, and jit_poll_tests
+    checks that none runs while collections are suppressed.
+  - gc_core's header no longer calls the feature off by default or
+    points at heap.rs.
+- Deleted, with the property gone or checked elsewhere:
+  - contracts S2 removed: edges between Agent heaps (for-in cache,
+    property shapes, native captures), a host omitting its handles, a
+    callable lease rooting captures, a typed array's teardown beside
+    an external wrapper;
+  - the counted cycle collector, its edge cache and its nursery
+    (gc_edges, gc_generational, the mixed native nursery, registry
+    slot reuse, task-pressure and transient-task collection);
+  - reference counts and release timing (array binding, native graph
+    cycles, cold import cells, ordinary data reads, dense shift);
+  - eager death notification (empty safepoints, acyclic ephemerons,
+    separate observer heaps, Symbol destruction during a borrow);
+  - migrated_private_homes_release_overwritten_objects_before_
+    returning: a port found the object, at both tiers and every run,
+    only through a stale word in a still-live frame about 960 B below
+    the test's. "Released before returning" is not a GC-heap
+    guarantee; rooting across the loop is checked elsewhere.
+  - Of the 21 default-only tests, 7 keep their GC-heap form; 10 go
+    to the counterparts their comments name (jit::rooting_tests,
+    jit::traced_tests, a callback test); 4 checked the cycle collector
+    or count guards.
+- Counted forms the counted build still compiles stay until steps 5-6
+  (JitCtx's this_raw and this_val in four JIT test helpers, map_data
+  in gc_edges' setup and the memory inventory, a stack_trace setup).
+- Counts: GC heap 2234/0/55 -> 2235/0/8 (+17 ports, +2 restored,
+  -18 heap.rs tests; the 8 still ignored are benchmarks); counted
+  2184/0/3 -> 2116/0/3. 50 files, about 5,000 lines fewer.
+- Gates:
+  - aarch64: lib suites as counted above; clippy clean in both
+    builds; rustfmt clean; the workspace builds with all targets,
+    without a diagnostic.
+  - Per-test GC stress with the verifier and poisoning, the 21 tests
+    ported, restored or renamed: on x86-64 all 21 pass at interval 1;
+    on aarch64 20 do, and the Symbol churn test (30,000 Symbols) times
+    out there twice (900 s) and passes at interval 100. It joins the
+    stress runs' slow list (interval 100).
+  - x86-64 Linux (zombie): GC heap 1869/0/49, counted 1951/0/3.
+  - Windows under Wine: GC heap 1863 pass, 3 fail, 49 ignored; the
+    3 are step 1's snapshot codec tests.
+- Open:
+  - Two interruption tests can spin forever on a loaded machine
+    (the agent saw them under full swap, with both suites running:
+    tests::interruption_aborts_a_running_microtask_checkpoint in the
+    GC heap, tests::job_callback_context_is_restored_on_host_
+    interruption in the counted model). Each sets a 20 ms deadline and
+    queues a while(true) job. From reading the code: if the deadline
+    expires in the script body after the job is queued,
+    eval_interruptible returns Interrupted and keeps the job (the
+    checkpoint clears its queue on an interrupt; the body's path does
+    not), and the test then clears the deadline and evaluates again,
+    so the job spins with nothing to stop it. Test timing in both
+    models, not the collector; to be reproduced, and the tests made
+    deterministic, in a later commit. Whether an interrupted script's
+    queued jobs should survive it is a question for the owner.
+  - ClearKeptObjects clears only the root interpreter's kept list, so
+    a WeakRef target kept inside a ShadowRealm may live as long as the
+    realm. From reading the code; untested.
+  - gc_core's S1 registration surface (Registration and its root,
+    edge and sweep-hook callbacks) has no user; for step 8.

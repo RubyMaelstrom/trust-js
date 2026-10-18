@@ -190,48 +190,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: a Rust callable lease alone does not root its captures; hold the function"
-    )]
-    fn native_captures_external_callable_leases_remain_roots() {
-        let mut interp = Interp::new();
-        let target = Object::new(None);
-        let callback = interp.new_native_fn_with_captures(
-            "leased",
-            0,
-            returning_capture,
-            vec![Value::Obj(target.clone())],
-        );
-        let lease = object(&callback).borrow().call.clone();
-        target
-            .borrow_mut()
-            .props
-            .insert("callback", Property::builtin(callback.clone()));
-        let weak_target = Gc::downgrade(&target);
-        drop((target, callback));
-        interp.gc_collect_young(GcCause::Explicit);
-        interp.gc_collect();
-        assert!(
-            crate::gc_test::alive(&weak_target),
-            "Rust lease lost its capture"
-        );
-        let result = interp
-            .dispatch_native(&lease, Value::Undefined, &[])
-            .unwrap_or_else(|_| panic!("leased native invocation failed"));
-        assert!(Gc::ptr_eq(
-            object(&result),
-            &weak_target.upgrade().expect("leased capture")
-        ));
-        drop((result, lease));
-        interp.gc_collect();
-        assert!(
-            !crate::gc_test::alive(&weak_target),
-            "dropped lease kept capture alive"
-        );
-    }
-
-    #[test]
     fn native_captures_old_owner_preserves_a_shared_young_payload() {
         let mut interp = Interp::new();
         // Strong handles live only in helper frames (gc-heap scans the stack).
@@ -273,51 +231,6 @@ mod tests {
         assert!(
             !crate::gc_test::alive(&weak_target),
             "cross-generation cycle survived full GC"
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: no edges between Agent heaps (I6); a foreign heap's owner is out of contract"
-    )]
-    fn native_captures_foreign_heap_owner_remains_a_root_until_released() {
-        let mut interp = Interp::new();
-        let target = Object::new(None);
-        let callback = interp.new_native_fn_with_captures(
-            "foreign",
-            0,
-            returning_capture,
-            vec![Value::Obj(target.clone())],
-        );
-        target
-            .borrow_mut()
-            .props
-            .insert("callback", Property::builtin(callback.clone()));
-        let weak_target = Gc::downgrade(&target);
-        let foreign_interp = Interp::new();
-        let foreign_owner = Object::new(None);
-        foreign_owner.borrow_mut().call = object(&callback).borrow().call.clone();
-        drop((target, callback));
-        interp.activate_gc_heap();
-        // Force the uncached full-graph walk as well as the normal collector.
-        interp.gc_collect_with_edge_budget(GcCause::Explicit, 0);
-        assert!(
-            crate::gc_test::alive(&weak_target),
-            "foreign owner lost its capture"
-        );
-        let result = interp
-            .invoke(Value::Obj(foreign_owner.clone()), Value::Null, &[])
-            .unwrap_or_else(|_| panic!("foreign owner's invocation failed"));
-        assert!(Gc::ptr_eq(
-            object(&result),
-            &weak_target.upgrade().expect("foreign capture")
-        ));
-        drop((result, foreign_owner, foreign_interp));
-        interp.gc_collect_with_edge_budget(GcCause::Explicit, 0);
-        assert!(
-            !crate::gc_test::alive(&weak_target),
-            "released foreign owner left a root"
         );
     }
 

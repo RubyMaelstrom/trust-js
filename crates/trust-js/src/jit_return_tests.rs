@@ -146,39 +146,6 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     }
 }
 
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
-    let mut engine = Engine::new();
-    for source in [
-        "function pass(value){return value;}",
-        "function pass(value){return;}",
-        "function pass(value){}",
-    ] {
-        let (chunk, code) = compile_return(&mut engine, source);
-        for occupied in [false, true] {
-            let object = crate::value::Object::new(None);
-            let weak = crate::value::Gc::downgrade(&object);
-            let previous = if occupied {
-                Value::Obj(object.clone())
-            } else {
-                Value::Undefined
-            };
-            let (result, helpers) = enter(&mut engine, &chunk, &code, Value::Obj(object), previous);
-            assert_eq!(helpers, usize::from(occupied), "{source}");
-            if source.contains("return value") {
-                assert!(matches!(result, Value::Obj(_)));
-                assert_eq!(weak.strong_count(), 1);
-            } else {
-                assert!(matches!(result, Value::Undefined));
-                assert_eq!(weak.strong_count(), 0);
-            }
-            drop(result);
-            assert_eq!(weak.strong_count(), 0);
-        }
-    }
-}
-
 /// gc-heap: the returned object survives the collection `enter` runs after the callee's
 /// teardown, and once the test drops the result a collection finds it dead: neither the
 /// occupied result slot nor the native frame keeps a hidden owner.
@@ -221,43 +188,6 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
             );
         }
     }
-}
-
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
-    let mut engine = Engine::new();
-    let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
-    let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
-    let weak = crate::value::Gc::downgrade(&object);
-    object.borrow_mut().props.insert(
-        "self",
-        crate::value::Property::plain(Value::Obj(object.clone())),
-    );
-    let (result, helpers) = enter(
-        &mut engine,
-        &chunk,
-        &code,
-        Value::Obj(object),
-        Value::Undefined,
-    );
-    assert_eq!(helpers, 0);
-    assert_eq!(
-        weak.strong_count(),
-        2,
-        "one return owner plus its self edge"
-    );
-    let returned = result.as_obj().unwrap();
-    let self_value = returned.borrow().props.get("self").unwrap().value();
-    assert!(matches!(&self_value, Value::Obj(value) if crate::value::Gc::ptr_eq(value, returned)));
-    drop(self_value);
-    drop(result);
-    engine.interp.gc_collect();
-    assert_eq!(
-        weak.strong_count(),
-        0,
-        "a dropped result must not leave a hidden native owner"
-    );
 }
 
 /// gc-heap: a cyclic object whose only owner is the return word survives the collection `enter`

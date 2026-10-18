@@ -735,10 +735,6 @@ mod computed_read_cache_tests {
         let long = crate::lstr::LStr::from("k".repeat(1024));
         cache.insert(&long, state);
         assert!(cache.raw_sets.is_null());
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert_eq!(long.strong_count(), 1);
-        }
         let spare = crate::lstr::LStr::from("s".repeat(255)).concat_grown("k");
         assert_eq!(spare.len(), 256);
         assert!(spare.retained_requested_bytes() > ComputedReadCache::MAX_KEY_ALLOCATION);
@@ -747,17 +743,9 @@ mod computed_read_cache_tests {
             cache.raw_sets.is_null(),
             "spare capacity counts against the retention cap"
         );
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert_eq!(spare.strong_count(), 1);
-        }
         let mut key = crate::lstr::LStr::from("method");
         cache.insert(&key, state);
         cache.insert(&key, IcState { slot: 9, ..state });
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert_eq!(key.strong_count(), 2, "refill must not duplicate its pin");
-        }
         assert!(
             !key.append_in_place("changed"),
             "cache identity must remain immutable"
@@ -774,19 +762,6 @@ mod computed_read_cache_tests {
         let sets = &cache.storage.as_ref().unwrap().sets;
         assert_eq!(sets.len(), ComputedReadCache::MAX_SETS);
         assert_eq!(sets.as_ptr(), cache.raw_sets);
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert!(keys.iter().filter(|key| key.strong_count() > 1).count() <= 4096);
-        }
-        drop(cache);
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert_eq!(key.strong_count(), 1);
-        }
-        // Reference counts show the pins (gc-heap has none: pins are roots).
-        if cfg!(not(feature = "gc-heap")) {
-            assert!(keys.iter().all(|key| key.strong_count() == 1));
-        }
     }
 
     #[test]
@@ -1426,12 +1401,12 @@ mod call_overflow_tests {
         );
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// A secondary entry hits only for its callee, Realm (global environment) and epoch, and a
+    /// refill for another Realm or epoch replaces the callee's entry within the one bounded
+    /// allocation. The entry's pin is weak; jit::cache_tests checks that a collection retires a
+    /// dead callee's entry with its pin.
     #[test]
-    fn secondary_cache_guards_epochs_realms_and_owns_only_weak_pins() {
+    fn secondary_cache_guards_epochs_and_realms() {
         let mut cache = CallOverflow::default();
         assert_eq!(cache.retained_bytes(), 0);
         let object = crate::value::Object::new(None);
@@ -1451,7 +1426,6 @@ mod call_overflow_tests {
             bytes,
             CALL_OVERFLOW_SETS * std::mem::size_of::<CallOverflowSet>()
         );
-        assert_eq!(crate::value::Gc::strong_count(&object), 1);
         assert!(cache.lookup(key, 10, 20).is_some());
         assert!(cache.lookup(key, 11, 20).is_none());
         assert!(cache.lookup(key, 10, 21).is_none());
@@ -1462,17 +1436,10 @@ mod call_overflow_tests {
                 epoch: 21,
                 ..CallIc::EMPTY
             },
-            pin.clone(),
+            pin,
         );
         assert!(cache.lookup(key, 10, 20).is_none());
         assert!(cache.lookup(key, 11, 21).is_some());
-        drop(object);
-        assert!(
-            pin.upgrade().is_none(),
-            "cache must not retain the function object"
-        );
-        cache.prune_dead();
-        assert!(cache.lookup(key, 11, 21).is_none());
         assert_eq!(
             cache.retained_bytes(),
             bytes,
@@ -26242,53 +26209,6 @@ mod return_slot_tests {
         }
     }
 
-    // Reference counting (gc-heap: jit::rooting_tests::context_return_slot_is_a_root).
-    #[cfg(not(feature = "gc-heap"))]
-    #[test]
-    fn jit_return_moves_owners_into_empty_and_occupied_slots() {
-        for occupied in [false, true] {
-            let displaced = crate::value::Object::new(None);
-            let displaced_weak = crate::value::Gc::downgrade(&displaced);
-            let mut ctx = context(if occupied {
-                Value::Obj(displaced)
-            } else {
-                drop(displaced);
-                Value::Undefined
-            });
-            let returned = crate::value::Object::new(None);
-            let returned_weak = crate::value::Gc::downgrade(&returned);
-            let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(returned))]);
-            let base = operand.as_mut_ptr();
-            let result = unsafe { jit_return(&mut ctx, 1, base.add(1)) };
-            assert_eq!(result, base);
-            assert_eq!(displaced_weak.strong_count(), 0);
-            assert_eq!(returned_weak.strong_count(), 1);
-            assert!(matches!(ctx.ret.unpack(), Value::Obj(_)));
-            drop(ctx);
-            assert_eq!(returned_weak.strong_count(), 0);
-        }
-    }
-
-    // Reference counting (gc-heap: jit::rooting_tests::context_return_slot_is_a_root).
-    #[cfg(not(feature = "gc-heap"))]
-    #[test]
-    fn jit_return_preserves_aliases_and_bare_return_drops_the_old_owner() {
-        let object = crate::value::Object::new(None);
-        let weak = crate::value::Gc::downgrade(&object);
-        let mut ctx = context(Value::Obj(object.clone()));
-        let mut operand = ManuallyDrop::new([PackedValue::pack(Value::Obj(object))]);
-        let base = operand.as_mut_ptr();
-        assert_eq!(weak.strong_count(), 2);
-        assert_eq!(unsafe { jit_return(&mut ctx, 1, base.add(1)) }, base);
-        assert_eq!(weak.strong_count(), 1);
-        // A bare return must not dereference or consume the operand pointer.
-        let unused = std::ptr::NonNull::<PackedValue>::dangling().as_ptr();
-        assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
-        assert!(ctx.ret.is_undefined());
-        assert_eq!(weak.strong_count(), 0);
-        assert_eq!(unsafe { jit_return(&mut ctx, 0, unused) }, unused);
-    }
-
     #[test]
     fn packed_return_helper_preserves_empty_and_canonical_hostile_nan_words() {
         // Empty is an internal execution sentinel, never a valid JS local read.
@@ -26322,86 +26242,6 @@ mod return_slot_tests {
                 assert_eq!(moved.bits(), expected);
             }
         }
-    }
-
-    /// The native ABI's prefix offsets and sizes, and the drop helpers' boundaries: each returns
-    /// the word it was given; `jit_drop_packed_at` releases a packed owner (an object's count, or
-    /// a deferred prototype's box with its key layout) and `jit_drop_at` a wide one.
-    #[cfg(not(feature = "gc-heap"))]
-    #[test]
-    fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
-        use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<PackedValue>(), 8);
-        assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
-        if size_of::<usize>() == 8 {
-            assert_eq!(offset_of!(JitCtx, helpers), 0);
-            assert_eq!(offset_of!(JitCtx, stack_base), 8);
-            assert_eq!(offset_of!(JitCtx, final_sp), 16);
-            assert_eq!(offset_of!(JitCtx, slots), 24);
-            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
-            assert_eq!(offset_of!(JitCtx, env_raw), 40);
-            assert_eq!(offset_of!(JitCtx, this_raw), 48);
-            assert_eq!(offset_of!(JitCtx, global_body), 56);
-            assert_eq!(offset_of!(JitCtx, genv), 64);
-            assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
-        }
-        let object = crate::value::Object::new(None);
-        let weak = crate::value::Gc::downgrade(&object);
-        let mut packed = ManuallyDrop::new(PackedValue::pack(Value::Obj(object.clone())));
-        let mut wide = ManuallyDrop::new(Value::Obj(object));
-        let packed_ptr = &raw mut *packed;
-        let wide_ptr = &raw mut *wide;
-        assert_eq!(weak.strong_count(), 2);
-        assert_eq!(
-            unsafe { jit_drop_packed_at(std::ptr::null_mut(), 0, packed_ptr) },
-            packed_ptr
-        );
-        assert_eq!(weak.strong_count(), 1);
-        assert_eq!(
-            unsafe { jit_drop_at(std::ptr::null_mut(), 0, wide_ptr) },
-            wide_ptr
-        );
-        assert_eq!(weak.strong_count(), 0);
-        // A function's deferred prototype is the one packed word that owns something besides a
-        // value: its `Rc` box, which owns the key layout. `jit_drop_packed_at` releases it.
-        let keys = crate::value::new_property_layout(vec![Rc::from("constructor")]);
-        let owner = crate::value::Object::new(None);
-        let mut property = crate::value::Property::plain(Value::Undefined);
-        property.defer_function_prototype(
-            &owner,
-            crate::value::Object::new(None),
-            &crate::value::Props::with_layout(0, Some(keys.clone())),
-        );
-        assert_eq!(
-            Rc::strong_count(&keys),
-            2,
-            "the lazy prototype owns the key layout"
-        );
-        // Move the property's word out, at the offset generated stores address it by.
-        let entry_value = crate::value::jit_layout(&owner).entry_value;
-        let mut packed = unsafe {
-            let word = (&raw mut property)
-                .cast::<u8>()
-                .add(entry_value)
-                .cast::<PackedValue>();
-            let packed = ManuallyDrop::new(word.read());
-            word.write(PackedValue::pack(Value::Undefined));
-            packed
-        };
-        assert_eq!(
-            packed.bits() & !0xffff_ffff_ffff,
-            crate::value::PACK_LAZY_PROTO
-        );
-        let packed_ptr = &raw mut *packed;
-        assert_eq!(
-            unsafe { jit_drop_packed_at(std::ptr::null_mut(), 0, packed_ptr) },
-            packed_ptr
-        );
-        assert_eq!(
-            Rc::strong_count(&keys),
-            1,
-            "releasing the word dropped the lazy prototype"
-        );
     }
 
     /// gc-heap: the same prefix offsets and sizes, with the packed `this` word itself at [48].

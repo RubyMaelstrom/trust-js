@@ -130,7 +130,6 @@ mod gc_sweep;
 mod gc_trace;
 #[cfg(test)]
 mod group_by_tests;
-mod heap;
 mod host;
 mod host_collections;
 mod host_memory;

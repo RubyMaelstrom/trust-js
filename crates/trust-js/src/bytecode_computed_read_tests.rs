@@ -127,62 +127,6 @@ fn invoke(
     (values, ctx.error.take())
 }
 
-// Reference counting (gc-heap: jit::rooting_tests::computed_read_operands_are_roots).
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn computed_read_helper_canonical_stack_all_tags_and_last_owners() {
-    let mut engine = Engine::new();
-    evaluate(&mut engine, "var token=Symbol('computed');");
-    let values = [
-        Value::Undefined,
-        Value::Null,
-        Value::Bool(false),
-        Value::Bool(true),
-        Value::Num(-0.0),
-        Value::Num(f64::from_bits(0xffff_ffff_ffff_ffff)),
-        Value::Num(f64::INFINITY),
-        Value::Num(-1.25),
-        Value::Str("owned".into()),
-        binding(&mut engine, "token"),
-        Value::Obj(crate::value::Object::new(None)),
-        Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
-    ];
-    for op in [Op::GetElem, Op::GetElemLocal(0), Op::GetMethodElem] {
-        for value in &values {
-            let object = crate::value::Object::new(None);
-            object
-                .borrow_mut()
-                .props
-                .insert("value", crate::value::Property::plain(value.clone()));
-            let weak = crate::value::Gc::downgrade(&object);
-            let (result, error) = invoke(
-                &mut engine,
-                op,
-                Value::Obj(object),
-                Value::Str("value".into()),
-                Value::Str("prefix".into()),
-            );
-            assert!(error.is_none());
-            assert!(matches!(&result[0], Value::Str(s) if s.as_str()=="prefix"));
-            let actual = result.last().unwrap();
-            engine.interp.gc_collect();
-            match (value, actual) {
-                (Value::Num(a), Value::Num(b)) => {
-                    assert!(a.is_nan() && b.is_nan() || a.to_bits() == b.to_bits())
-                }
-                _ => assert!(engine.interp.strict_equals(value, actual)),
-            }
-            assert_eq!(
-                crate::gc_test::alive(&weak),
-                matches!(op, Op::GetMethodElem),
-                "only a method Reference retains its consumed receiver"
-            );
-            drop(result);
-            assert!(!crate::gc_test::alive(&weak));
-        }
-    }
-}
-
 #[test]
 fn computed_read_helper_errors_consume_operands_not_prefix_or_local() {
     let mut engine = Engine::new();

@@ -8435,8 +8435,6 @@ mod direct_call_tests {
             ));
             for value in [Value::Num(29.0), Value::Str(key.clone()), receiver.clone()] {
                 holder.borrow_mut().props.set_value(&key, value.clone());
-                #[cfg(not(feature = "gc-heap"))]
-                let owners = key.strong_count();
                 let mut operands = [
                     PackedValue::pack(receiver.clone()),
                     PackedValue::pack(Value::Str(key.clone())),
@@ -8454,12 +8452,6 @@ mod direct_call_tests {
                     _ => panic!("wrong computed value"),
                 }
                 drop(operands);
-                #[cfg(not(feature = "gc-heap"))]
-                assert_eq!(
-                    key.strong_count(),
-                    owners,
-                    "key operand leaked or was dropped twice"
-                );
                 // gc-heap owners carry no count: the probe leaves the key's, the holder's and
                 // the receiver's cells intact, which a collection (and, in debug builds, its
                 // heap verifier) confirms.

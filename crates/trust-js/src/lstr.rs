@@ -856,20 +856,6 @@ mod tests {
         let appended = prefix.concat_owned(&LStr::from("!"));
         assert_eq!(appended.as_str(), format!("{}!", "x".repeat(900)));
         assert_eq!(alias.len(), 900);
-        // Reference counts release the owner as its views go; gc-heap has none to observe.
-        #[cfg(not(feature = "gc-heap"))]
-        {
-            let count = source.strong_count();
-            let packed = crate::value::PackedValue::pack(crate::value::Value::Str(nested));
-            let cloned = packed.clone();
-            drop(packed);
-            drop(cloned);
-            assert_eq!(source.strong_count(), count - 1);
-            drop(alias);
-            if cfg!(not(feature = "gc-heap")) {
-                assert_eq!(source.strong_count(), 1);
-            }
-        }
         assert_eq!(std::mem::offset_of!(View, header), 0);
     }
 
@@ -881,25 +867,16 @@ mod tests {
             let slice = source.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
             assert_eq!(slice.as_str(), &source[start..end]);
-            if cfg!(not(feature = "gc-heap")) {
-                assert_eq!(source.strong_count(), 1);
-            }
         }
         let shared = source.slice_bytes(0, 900);
         assert!(shared.view_owner().is_some());
         drop(shared);
-        if cfg!(not(feature = "gc-heap")) {
-            assert_eq!(source.strong_count(), 1);
-        }
         // A large owner is pinned only by a slice covering at least half of it.
         let large = LStr::from("x".repeat(VIEW_PIN_BYTES + 4096));
         for (start, end) in [(0, 900), (1024, 300_000)] {
             let slice = large.slice_bytes(start, end);
             assert!(slice.view_owner().is_none());
             assert_eq!(slice.as_str(), &large[start..end]);
-            if cfg!(not(feature = "gc-heap")) {
-                assert_eq!(large.strong_count(), 1);
-            }
         }
         assert!(large
             .slice_bytes(0, large.len() / 2 + 1024)

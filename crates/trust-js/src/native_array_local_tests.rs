@@ -4,93 +4,9 @@
 //! live ordinary own dense data element; every uncertain case replays the
 //! original LoadLocal/LoadLocal/op sequence.
 
-#[cfg(not(feature = "gc-heap"))]
-use std::cell::RefCell;
 use std::{cell::Cell, rc::Rc};
 
-#[cfg(not(feature = "gc-heap"))]
-use crate::value::Value;
 use crate::{bytecode::Tier, Completion, Engine};
-
-// Default build only: the foreign array's write runs when the JIT releases the last owner
-// (the reference-count mechanism these tests pin), and under gc-heap an Agent's values never
-// reach another Agent's heap (I6).
-#[cfg(not(feature = "gc-heap"))]
-struct ForeignArrayWriteOnDrop {
-    engine: Rc<RefCell<Engine>>,
-    receiver: Value,
-    drops: Rc<Cell<usize>>,
-}
-
-#[cfg(not(feature = "gc-heap"))]
-struct ForeignArrayDropState {
-    engine: Rc<RefCell<Engine>>,
-    drops: Rc<Cell<usize>>,
-}
-
-// The foreign Engine is a separate Agent: none of this Agent's values.
-#[cfg(not(feature = "gc-heap"))]
-crate::value_free!(ForeignArrayDropState);
-
-#[cfg(not(feature = "gc-heap"))]
-impl Drop for ForeignArrayWriteOnDrop {
-    fn drop(&mut self) {
-        let mut engine = self.engine.borrow_mut();
-        let _agent = engine.interp.enter_agent();
-        if engine
-            .interp
-            .member_set(&self.receiver, "1", Value::Num(99.0))
-            .is_ok()
-        {
-            self.drops.set(self.drops.get() + 1);
-        }
-    }
-}
-
-#[cfg(not(feature = "gc-heap"))]
-fn install_foreign_array_dropper(
-    engine: &mut Engine,
-    foreign: Rc<RefCell<Engine>>,
-    drops: Rc<Cell<usize>>,
-) {
-    engine.interp.op_state().put(ForeignArrayDropState {
-        engine: foreign,
-        drops,
-    });
-    engine.interp.def_method(
-        &engine.interp.global,
-        "makeForeignArrayDropper",
-        1,
-        make_foreign_array_dropper,
-    );
-}
-
-#[cfg(not(feature = "gc-heap"))]
-fn make_foreign_array_dropper(
-    interp: &mut crate::interpreter::Interp,
-    _: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let state = interp
-        .host::<ForeignArrayDropState>()
-        .expect("foreign array dropper state");
-    let receiver = args.first().cloned().unwrap_or(Value::Undefined);
-    let captures = Rc::new(crate::gc_test::CapturedValues(vec![receiver.clone()]));
-    let payload = ForeignArrayWriteOnDrop {
-        engine: state.engine.clone(),
-        receiver,
-        drops: state.drops.clone(),
-    };
-    Ok(Value::Obj(interp.make_native_closure(
-        "foreign-array-dropper",
-        0,
-        Rc::new(move |_, _, _| {
-            let _keep_payload = &payload;
-            Ok(Value::Undefined)
-        }),
-        crate::value::NativeCaptures::Reported(captures),
-    )))
-}
 
 struct NativeTdzDropWitness(Rc<Cell<usize>>);
 
@@ -225,15 +141,13 @@ fn tdz_tagged_write_releases_last_owner_before_collection() {
         let mut engine = engine(tier);
         assert_eq!(eval(&mut engine, source), "undefined", "{tier:?}");
         let before = super::test_tdz_effect_paths();
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(eval(&mut engine, "releaseAtNextTdz();"), "true", "{tier:?}");
+        eval(&mut engine, "releaseAtNextTdz();");
         // gc-heap: the collection inside the loop can still find the witness through a stale
         // word in the live native frames above it (the stack is scanned conservatively, at
         // every tier); once the activation has finished, a collection finds it dead and runs
         // its destructor.
         #[cfg(feature = "gc-heap")]
         {
-            eval(&mut engine, "releaseAtNextTdz();");
             engine.interp.gc_collect();
             assert_eq!(
                 eval(
@@ -410,150 +324,6 @@ fn pair_proxy_and_coercible_key_fallback_preserve_has_get_conversion_order() {
     "#,
         "7:key:string;has:0;key:string;get:0;",
     );
-}
-
-// Pins the count guard of the TDZ pair (see the foreign dropper above).
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn pair_final_owner_release_falls_back_before_foreign_engine_mutation() {
-    let mut engine = engine(Tier::Jit);
-    let foreign = Rc::new(RefCell::new(Engine::new()));
-    let drops = Rc::new(Cell::new(0usize));
-    install_foreign_array_dropper(&mut engine, foreign, drops.clone());
-    assert_eq!(
-        eval(
-            &mut engine,
-            r#"
-            let pairInput = [0, 22];
-            pairInput[0] = makeForeignArrayDropper(pairInput);
-            void 0;
-            "#
-        ),
-        "undefined"
-    );
-
-    let before = super::test_tdz_array_pair_hits();
-    assert_eq!(
-        eval(
-            &mut engine,
-            r#"
-            function runForeignDropPair(input) {
-                let seen = '';
-                let result = input.filter(function(value, index, receiver) {
-                    if (index === 0) {
-                        delete receiver[0];
-                        return false;
-                    }
-                    seen += value;
-                    return true;
-                });
-                return seen + '|' + result.join(',') + '|' + input[1];
-            }
-            runForeignDropPair(pairInput);
-            "#
-        ),
-        "99|99|99"
-    );
-    let after = super::test_tdz_array_pair_hits();
-    assert_eq!(drops.get(), 1, "the native capture destructor did not run");
-    assert_eq!(
-        after[0] - before[0],
-        1,
-        "index 0 should hit; index 1's last-owner TDZ must take the checked path: before={before:?}, after={after:?}"
-    );
-}
-
-// Pins the count guard of the TDZ pair (see the foreign dropper above).
-#[cfg(not(feature = "gc-heap"))]
-#[test]
-fn pair_same_object_two_owners_falls_back_and_three_owners_admit() {
-    for keep_third_owner in [false, true] {
-        let mut engine = engine(Tier::Jit);
-        let foreign = Rc::new(RefCell::new(Engine::new()));
-        let drops = Rc::new(Cell::new(0usize));
-        install_foreign_array_dropper(&mut engine, foreign, drops.clone());
-        let setup = if keep_third_owner {
-            r#"
-                let pairKeep = pairInput[0];
-            "#
-        } else {
-            ""
-        };
-        assert_eq!(
-            eval(
-                &mut engine,
-                &format!(
-                    r#"
-                    let pairInput = [0, 22];
-                    pairInput[0] = makeForeignArrayDropper(pairInput);
-                    let pairSink = new Proxy({{}}, {{ defineProperty() {{ return true; }} }});
-                    pairInput.constructor = {{
-                        [Symbol.species]: function PairSink() {{ return pairSink; }}
-                    }};
-                    {setup}
-                    void 0;
-                    "#
-                )
-            ),
-            "undefined",
-            "keep_third_owner={keep_third_owner}"
-        );
-        let before = super::test_tdz_array_pair_hits();
-        assert_eq!(
-            eval(
-                &mut engine,
-                if keep_third_owner {
-                    r#"
-                    function runPairOwnerCase(input) {
-                        let seen = '';
-                        input.map(function(value, index, receiver) {
-                            if (index === 0) {
-                                delete receiver[0];
-                                return value;
-                            }
-                            seen += value;
-                            return value;
-                        });
-                        let beforeRelease = input[1];
-                        pairKeep = null;
-                        return seen + '|' + beforeRelease + '|' + input[1];
-                    }
-                    runPairOwnerCase(pairInput);
-                    "#
-                } else {
-                    r#"
-                    function runPairOwnerCase(input) {
-                        let seen = '';
-                        input.map(function(value, index, receiver) {
-                            if (index === 0) {
-                                delete receiver[0];
-                                return value;
-                            }
-                            seen += value;
-                            return value;
-                        });
-                        return seen + '|' + input[1];
-                    }
-                    runPairOwnerCase(pairInput);
-                    "#
-                }
-            ),
-            if keep_third_owner {
-                "22|22|99"
-            } else {
-                "99|99"
-            },
-            "keep_third_owner={keep_third_owner}"
-        );
-        let after = super::test_tdz_array_pair_hits();
-        assert_eq!(drops.get(), 1, "native capture destructor count");
-        let expected_pair_hits = if keep_third_owner { 2 } else { 1 };
-        assert_eq!(
-            after[0] - before[0],
-            expected_pair_hits,
-            "same-object owner admission with keep_third_owner={keep_third_owner}: before={before:?}, after={after:?}"
-        );
-    }
 }
 
 #[test]

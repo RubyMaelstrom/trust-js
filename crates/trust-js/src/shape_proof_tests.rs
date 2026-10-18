@@ -130,9 +130,6 @@ fn uncacheable_shapes_do_not_allocate_computed_cache_or_replace_valid_ways() {
     };
     cache.insert(&key, invalid);
     assert!(cache.raw_sets.is_null());
-    if cfg!(not(feature = "gc-heap")) {
-        assert_eq!(key.strong_count(), 1);
-    }
     cache.insert(&key, state());
     cache.insert(&key, invalid);
     assert!(cache.lookup(key.as_ptr() as usize, UNKNOWN).is_none());
@@ -143,9 +140,6 @@ fn uncacheable_shapes_do_not_allocate_computed_cache_or_replace_valid_ways() {
             .holder_shape,
         23
     );
-    if cfg!(not(feature = "gc-heap")) {
-        assert_eq!(key.strong_count(), 2);
-    }
 }
 
 #[test]

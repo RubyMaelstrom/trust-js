@@ -700,36 +700,11 @@ mod tests {
         assert!(data.index.is_empty());
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// Equal strings allocated separately are one key: the second insert hashes once and
+    /// replaces the first entry's value instead of adding a bucket.
     #[test]
-    fn ordered_collection_single_probe_preserves_key_and_releases_replaced_values() {
-        let key = crate::value::Object::new(None);
-        let first = crate::value::Object::new(None);
-        let second = crate::value::Object::new(None);
-        let first_weak = Gc::downgrade(&first);
-        let second_weak = Gc::downgrade(&second);
+    fn ordered_collection_equal_strings_share_an_entry_and_hash_once() {
         let mut data = OrderedCollection::new(CollectionKind::Map);
-        data.insert(Value::Obj(key.clone()), Value::Obj(first));
-        assert_eq!(Gc::strong_count(&key), 2);
-        data.insert(Value::Obj(key.clone()), Value::Obj(second));
-        assert_eq!(Gc::strong_count(&key), 2, "index never owns another key");
-        assert!(
-            first_weak.upgrade().is_none(),
-            "replaced payload drops once"
-        );
-        assert!(second_weak.upgrade().is_some());
-        assert_eq!(data.len(), 1);
-        assert!(data.delete(&Value::Obj(key.clone())));
-        assert_eq!(Gc::strong_count(&key), 1);
-        assert!(
-            second_weak.upgrade().is_none(),
-            "deleted payload drops once"
-        );
-
-        // Equal separately allocated strings hit the original entry, not a second bucket.
         let text = "wide string key ".repeat(128);
         let first_key = Value::lstr(text.clone());
         let another_key = Value::lstr(text);
@@ -740,6 +715,37 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(number(data.get(&another_key).unwrap()), 8);
         assert!(data.delete(&another_key));
+    }
+
+    /// Map.prototype.set over a present key replaces its value in place, and delete removes the
+    /// entry (leaving a hole while other entries remain): neither the replaced nor the deleted
+    /// value, nor a deleted key, stays reachable from the Map, so a collection finds each dead
+    /// while the current entries live on.
+    #[test]
+    fn ordered_collection_replaced_and_deleted_values_are_released() {
+        let mut engine = crate::Engine::new();
+        let mut run = |source: &str| match engine.eval(source, false).expect("Map fixture parses") {
+            crate::Completion::Value(value) => value,
+            crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
+        };
+        run("var key={}, other={}, map=new Map([[key,{}],[other,{}]]);\
+             var replaced=new WeakRef(map.get(key)); map.set(key,{});\
+             var current=new WeakRef(map.get(key)), keyRef=new WeakRef(key); key=null; 0");
+        assert_eq!(
+            run(
+                "$262.gc(); [replaced.deref()===undefined, current.deref()!==undefined,\
+                 keyRef.deref()!==undefined, map.size].join()"
+            ),
+            "true,true,true,2"
+        );
+        run("map.delete(keyRef.deref()); 0");
+        assert_eq!(
+            run(
+                "$262.gc(); [current.deref()===undefined, keyRef.deref()===undefined, map.size,\
+                 map.get(other)!==undefined].join()"
+            ),
+            "true,true,1,true"
+        );
     }
 
     #[test]

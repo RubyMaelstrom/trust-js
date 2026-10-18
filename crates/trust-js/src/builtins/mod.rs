@@ -5739,12 +5739,6 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
     })
 }
 
-/// Whether `value` is %ArrayIteratorPrototype%.next of some Realm.
-#[cfg(test)]
-pub(crate) fn is_array_values_next(value: &Value) -> bool {
-    is_native_function(value, array_iter_next)
-}
-
 /// Closed, non-exhausting Array binding prefix of `count` elements. No lookup here may invoke
 /// author code: under the intrinsic protocol (see [`ArrayIterationProof`]) every index below
 /// `count` is an own data property, so each step reads it without code, and IteratorClose

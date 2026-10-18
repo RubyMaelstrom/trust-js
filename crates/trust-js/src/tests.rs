@@ -3600,22 +3600,7 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
             &crate::value::active_gc_heap(),
             &engine.interp.gc_heap
         ));
-        return;
     }
-    let parent_snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
-    let child_snapshot = crate::value::heap_gc_snapshot(&child.gc_heap);
-    assert!(parent_snapshot
-        .iter()
-        .any(|object| crate::value::Gc::ptr_eq(object, &parent_object)));
-    assert!(!child_snapshot
-        .iter()
-        .any(|object| crate::value::Gc::ptr_eq(object, &parent_object)));
-    assert!(child_snapshot
-        .iter()
-        .any(|object| crate::value::Gc::ptr_eq(object, &child_object)));
-    assert!(!parent_snapshot
-        .iter()
-        .any(|object| crate::value::Gc::ptr_eq(object, &child_object)));
 }
 
 /// The completion value of `source`, or a panic naming what it threw.
@@ -6195,65 +6180,6 @@ fn gc_reclaims_cycles() {
     );
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-)]
-#[cfg(feature = "embed")]
-#[test]
-fn task_pressure_collects_the_nursery_and_released_documents_the_whole_heap() {
-    // A retained page heap is not rescanned for each task's growth: young cycles are
-    // reclaimed by a nursery collection (ECMA-262 #sec-liveness permits any non-maximal
-    // set), while a released document's old graph still gets a full collection.
-    let mut engine = Engine::new();
-    engine
-        .eval_value_interruptible(
-            "var page=[];for(var i=0;i<60000;i++){var n={};n.self=n;page.push(n);}",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("page fixture threw"));
-    engine.collect_garbage_at_idle();
-    let minor = |engine: &Engine| crate::value::heap_minor_collections(&engine.interp.gc_heap);
-    assert_eq!(minor(&engine), 0);
-    engine
-        .eval_value_interruptible(
-            "for(var i=0;i<15000;i++){var o={};o.self=o;}o=null;\n\
-             var weak=new WeakRef(page[0]);",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("garbage fixture threw"));
-    let before = engine.ctx().live_object_count();
-    engine.run_microtasks_interruptible().unwrap();
-    assert_eq!(minor(&engine), 1, "task pressure took the nursery path");
-    assert!(engine.ctx().live_object_count() + 14_000 < before);
-    assert!(matches!(
-        engine
-            .eval_value_interruptible("weak.deref()===page[0]")
-            .unwrap()
-            .unwrap_or_else(|_| panic!("weak result threw")),
-        crate::value::Value::Bool(true)
-    ));
-
-    // Release an old Realm: its graph is only reachable by a full collection.
-    let abandoned = engine.ctx().create_embed_realm();
-    let abandoned_ptr = engine.ctx().object_addr(&abandoned).unwrap();
-    assert!(engine
-        .ctx()
-        .with_embed_realm(&abandoned, |ctx| ctx.set_host_job_context(91))
-        .is_ok());
-    engine.collect_garbage_at_idle();
-    engine.run_microtasks_interruptible().unwrap();
-    assert!(engine.ctx().release_host_job_context(91));
-    drop(abandoned);
-    assert!(engine.collect_pending_task_garbage() > 0);
-    assert_eq!(
-        minor(&engine),
-        0,
-        "a released document forces a full collection"
-    );
-    assert!(!engine.ctx().realms.contains_key(&abandoned_ptr));
-}
-
 #[cfg(feature = "embed")]
 #[test]
 fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
@@ -6598,63 +6524,6 @@ fn host_weak_map_lookup_uses_intrinsic_brand_and_storage() {
     assert!(engine.ctx().map_get(&set, &key).is_err());
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-)]
-#[cfg(feature = "embed")]
-#[test]
-fn transient_tasks_avoid_full_heap_scans_and_small_cycles_stay_bounded() {
-    let mut engine = Engine::new();
-    engine.set_tier(crate::bytecode::Tier::Jit);
-    engine.set_tier_threshold(0);
-    engine
-        .eval_value_interruptible("var anchors=[];for(var i=0;i<60000;i++)anchors.push({i});")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    engine.ctx().collect_garbage_for_host();
-    let baseline = engine.ctx().live_object_count();
-    engine
-        .eval_value_interruptible(
-            "var dead={};dead.self=dead;var weak=new WeakRef(dead);dead=null;\n\
-         for(var i=0;i<20000;i++){var temporary={i};}temporary=null;",
-        )
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    engine.run_microtasks_interruptible().unwrap();
-    assert_eq!(
-        engine.interp.gc_task_live, baseline,
-        "transient churn scanned the retained heap"
-    );
-    let value = engine
-        .eval_value_interruptible("weak.deref()!==undefined")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    assert!(matches!(value, crate::value::Value::Bool(true)));
-    // ClearKeptObjects after deref.
-    engine.run_microtasks_interruptible().unwrap();
-    // Each task allocates less than the old per-task trigger. Cumulative retained
-    // growth must still collect, without approaching the ordinary doubling limit.
-    for _ in 0..20 {
-        engine
-            .eval_value_interruptible(
-                "for(var i=0;i<1500;i++){var cycle={};cycle.self=cycle;}cycle=null;",
-            )
-            .unwrap()
-            .unwrap_or_else(|_| panic!("GC fixture threw"));
-        engine.run_microtasks_interruptible().unwrap();
-        assert!(engine.ctx().live_object_count() < baseline + 12_000);
-    }
-    let value = engine
-        .eval_value_interruptible("weak.deref()===undefined")
-        .unwrap()
-        .unwrap_or_else(|_| panic!("GC fixture threw"));
-    assert!(
-        matches!(value, crate::value::Value::Bool(true)),
-        "cycles were not collected"
-    );
-}
-
 #[cfg(feature = "embed")]
 #[test]
 fn error_diagnostics_do_not_execute_author_code() {
@@ -6977,36 +6846,6 @@ fn gc_keeps_reachable_cycles() {
         ),
         "true"
     );
-}
-
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-)]
-#[test]
-fn gc_registry_reuses_dead_object_slots() {
-    let (slots_before, _) = crate::value::gc_registry_stats();
-    for _ in 0..200_000 {
-        drop(crate::value::Object::new(None));
-    }
-    let (slots_after, free_after) = crate::value::gc_registry_stats();
-    assert!(
-        slots_after <= slots_before + 1,
-        "registry grew with cumulative churn: {slots_before} -> {slots_after}"
-    );
-    assert!(free_after > 0);
-
-    // A live weak slot must become a strong snapshot handle, then tombstone synchronously when
-    // the final owner disappears; the same slot can be reused without retaining the dead RcBox.
-    let object = crate::value::Object::new(None);
-    let ptr = crate::value::Gc::as_ptr(&object);
-    let snapshot = crate::value::gc_snapshot();
-    assert!(snapshot.iter().any(|o| crate::value::Gc::as_ptr(o) == ptr));
-    drop(snapshot);
-    drop(object);
-    let (slots_final, free_final) = crate::value::gc_registry_stats();
-    assert_eq!(slots_final, slots_after);
-    assert_eq!(free_final, free_after);
 }
 
 #[test]
@@ -18984,14 +18823,8 @@ fn weakmap_uses_ephemeron_liveness() {
 #[test]
 fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
-    // gc-heap keeps a Map's or Set's data in its cell, not in `map_data`.
-    #[cfg(not(feature = "gc-heap"))]
-    let map_data_len = |engine: &Engine| engine.interp.map_data.len();
-    #[cfg(feature = "gc-heap")]
-    let map_data_len = |_: &Engine| 0;
     let before = [
         engine.interp.gc_pins.len(),
-        map_data_len(&engine),
         engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
@@ -19024,7 +18857,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        map_data_len(&engine),
         engine.interp.collection_iterators.len(),
         engine.interp.array_buffers.len(),
         engine.interp.typed_arrays.len(),
@@ -29887,8 +29719,8 @@ base-x|base-x|other-x|other:o|other-x|other-x|b|SyntaxError|base-x";
 }
 
 /// A method that cannot observe its [[HomeObject]] must not retain the object literal that
-/// defines it: otherwise every literal with a method would be a reference cycle reclaimed only
-/// by the cycle collector. A literal whose method uses `super` is reclaimed by that collector.
+/// defines it: a live method keeps its literal alive only when it uses `super`, and once the
+/// method is gone too a collection reclaims the literal either way.
 #[test]
 fn object_literal_methods_without_super_do_not_form_cycles() {
     use crate::bytecode::Tier;
@@ -29923,15 +29755,14 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                         .unwrap_or_else(|_| panic!("o"));
                     crate::value::Gc::downgrade(value.as_obj().unwrap())
                 });
-                run_in(&mut engine, "o = null;");
-                // Without a cycle the last reference count frees it at once; a tracing heap
-                // (gc-heap) reclaims it at the collection below.
-                if !needs_home && !cfg!(feature = "gc-heap") {
-                    assert!(
-                        !crate::gc_test::alive(&weak),
-                        "tier {tier:?} threshold {threshold}: {source}"
-                    );
-                }
+                run_in(&mut engine, "var m = o.m; o = null;");
+                engine.interp.gc_collect();
+                assert_eq!(
+                    crate::gc_test::alive(&weak),
+                    needs_home,
+                    "tier {tier:?} threshold {threshold}: {source}"
+                );
+                run_in(&mut engine, "m = null;");
                 engine.interp.gc_collect();
                 assert!(!crate::gc_test::alive(&weak), "tier {tier:?}: {source}");
             }

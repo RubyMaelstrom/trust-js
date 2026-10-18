@@ -3,49 +3,38 @@
 use super::*;
 use crate::{bytecode::Tier, Completion, Engine};
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-)]
+/// A host-made array on each side of its storage boundaries (empty, inline, boxed packed, past
+/// 32 elements) is an Array exotic object with %Array.prototype%, a writable non-enumerable
+/// non-configurable length and writable enumerable configurable elements, each the value it
+/// was given, stored compactly up to 32 elements.
 #[test]
-fn host_arrays_move_owners_and_preserve_descriptors_at_storage_boundaries() {
+fn host_arrays_preserve_descriptors_at_storage_boundaries() {
     let engine = Engine::new();
     for len in [0, 1, 10, 11, 32, 33] {
         let owner = engine.interp.new_object();
-        let weak = Gc::downgrade(&owner);
         let array = engine
             .interp
             .make_array((0..len).map(|_| Value::Obj(owner.clone())).collect());
-        assert_eq!(Gc::strong_count(&owner), len + 1);
-        {
-            let array = array.as_obj().unwrap().borrow();
-            assert!(Gc::ptr_eq(
-                array.proto.as_ref().unwrap(),
-                &engine.interp.array_proto
-            ));
-            assert!(matches!(array.exotic, Exotic::Array));
-            let length = array.props.length_property().unwrap();
-            assert_eq!(length.number_value(), Some(len as f64));
-            assert!(length.writable() && !length.enumerable() && !length.configurable());
-            for index in 0..len {
-                let property = array.props.get_index(index as u32).unwrap();
-                assert!(property.writable() && property.enumerable() && property.configurable());
-                assert!(Gc::ptr_eq(property.value().as_obj().unwrap(), &owner));
-            }
-            if (1..=32).contains(&len) {
-                assert!(
-                    array.props.elems.packed_ref().is_some(),
-                    "host path actually uses compact storage"
-                );
-            }
+        let array = array.as_obj().unwrap().borrow();
+        assert!(Gc::ptr_eq(
+            array.proto.as_ref().unwrap(),
+            &engine.interp.array_proto
+        ));
+        assert!(matches!(array.exotic, Exotic::Array));
+        let length = array.props.length_property().unwrap();
+        assert_eq!(length.number_value(), Some(len as f64));
+        assert!(length.writable() && !length.enumerable() && !length.configurable());
+        for index in 0..len {
+            let property = array.props.get_index(index as u32).unwrap();
+            assert!(property.writable() && property.enumerable() && property.configurable());
+            assert!(Gc::ptr_eq(property.value().as_obj().unwrap(), &owner));
         }
-        drop(owner);
-        assert_eq!(weak.strong_count(), len);
-        drop(array);
-        assert!(
-            weak.upgrade().is_none(),
-            "the array relinquishes every moved owner exactly once"
-        );
+        if (1..=32).contains(&len) {
+            assert!(
+                array.props.elems.packed_ref().is_some(),
+                "host path actually uses compact storage"
+            );
+        }
     }
 }
 

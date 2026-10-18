@@ -197,10 +197,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
     #[test]
     fn workload_name_classifier_tracks_depth_tdz_import_and_shadowing() {
         let outer = new_scope(None);
@@ -228,13 +224,7 @@ mod tests {
             .borrow_mut()
             .vars
             .insert("value", Binding::data(Value::Num(9.0), true, true));
-        let count = crate::interpreter::Env::strong_count(&inner);
         assert_eq!(classify_name(&inner, "value"), (NamePath::Declarative, 0));
-        assert_eq!(
-            crate::interpreter::Env::strong_count(&inner),
-            count,
-            "no retained scope handles"
-        );
     }
 
     #[test]

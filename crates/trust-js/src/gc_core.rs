@@ -1,6 +1,6 @@
 //! P1-S1 heap core: pointer-based mark-sweep heap for the GC-managed
 //! object model (docs/v8-chase-p1-plan-2026-10-15.txt, Decisions 0–4).
-//! Feature `gc-heap`, default off; nothing executes on this heap yet.
+//! Feature `gc-heap`: the object model's heap, the default since S6 step 2.
 //!
 //! Design summary:
 //! - Cells live in 64 KiB pages segregated by (size class, descriptor);
@@ -23,8 +23,8 @@
 //!   the remaining cells and frees all heap memory (I5 teardown).
 //! - Debug builds poison freed cells and verify the marked graph.
 
-// Until S2 wires execution to this heap, most of the surface is used
-// only from tests (same posture as heap.rs/tagged.rs).
+// Part of the S1 surface (Registration and its callbacks among it) has
+// no user in the object model.
 #![allow(dead_code)]
 
 use crate::fasthash::FastMap;

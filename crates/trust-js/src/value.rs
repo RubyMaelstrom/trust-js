@@ -612,8 +612,7 @@ mod packed_value_tests {
 
     /// Number and emptiness inspection reads a word's bits and nothing else: every word keeps
     /// its bits, a Number's (or NaN's) value comes back exactly, and an object's word still
-    /// names its object. The default build also keeps the object's owner count; a gc-heap word
-    /// owns nothing, so its bits are all there is to keep.
+    /// names its object. A gc-heap word owns nothing, so its bits are all there is to keep.
     #[test]
     fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
         for number in [
@@ -647,15 +646,11 @@ mod packed_value_tests {
             let is_object = matches!(value, Value::Obj(_));
             let packed = PackedValue::pack(value);
             let bits = packed.bits();
-            #[cfg(not(feature = "gc-heap"))]
-            let owners = Gc::strong_count(&object);
             for _ in 0..20 {
                 assert!(packed.number().is_none());
                 assert_eq!(packed.is_empty(), empty);
             }
             assert_eq!(packed.bits(), bits);
-            #[cfg(not(feature = "gc-heap"))]
-            assert_eq!(Gc::strong_count(&object), owners);
             if is_object {
                 assert!(
                     matches!(packed.unpack(), Value::Obj(actual) if Gc::ptr_eq(&actual, &object))
@@ -722,36 +717,25 @@ mod packed_value_tests {
     }
 
     /// Packing moves a handle into a word and `into_value` moves it back out, the same handle.
-    /// Default build: the word's owner is the moved one (one count, no bump either way). gc-heap:
-    /// the word is the object tag over the cell's address, and the type has no drop glue, so a
-    /// move needs no drop of its source.
+    /// gc-heap: the word is the object tag over the cell's address, and the type has no drop
+    /// glue, so a move needs no drop of its source.
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
-        #[cfg(not(feature = "gc-heap"))]
-        let before = Gc::strong_count(&obj);
         let packed = PackedValue::pack(Value::Obj(obj.clone()));
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Gc::strong_count(&obj), before + 1);
         #[cfg(feature = "gc-heap")]
         {
             assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
             assert!(!std::mem::needs_drop::<PackedValue>());
         }
         let out = packed.into_value();
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Gc::strong_count(&obj), before + 1);
         assert!(matches!(&out, Value::Obj(actual) if Gc::ptr_eq(actual, &obj)));
         drop(out);
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Gc::strong_count(&obj), before);
     }
 
     /// A clone of a word has its exact bits, for every kind, and dropping clones leaves the
-    /// originals' values intact. Default build: a clone of an object, string or Symbol word
-    /// retains its owner once, and dropping it releases that retain. gc-heap: a clone is a bit
-    /// copy of a word over a cell's address, which owns nothing, so there is nothing to retain
-    /// or release.
+    /// originals' values intact. gc-heap: a clone is a bit copy of a word over a cell's
+    /// address, which owns nothing, so there is nothing to retain or release.
     #[test]
     fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
         for value in [
@@ -790,35 +774,11 @@ mod packed_value_tests {
                 PACK_SYM | symbol_identity(&symbol) as u64
             ]
         );
-        #[cfg(not(feature = "gc-heap"))]
-        let before = [
-            Gc::strong_count(&object),
-            string.strong_count(),
-            symbol_strong_count(&symbol),
-        ];
         let copies = original.clone();
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(
-            [
-                Gc::strong_count(&object),
-                string.strong_count(),
-                symbol_strong_count(&symbol)
-            ],
-            before.map(|n| n + 1)
-        );
         for (a, b) in original.iter().zip(&copies) {
             assert_eq!(a.bits(), b.bits());
         }
         drop(copies);
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(
-            [
-                Gc::strong_count(&object),
-                string.strong_count(),
-                symbol_strong_count(&symbol)
-            ],
-            before
-        );
         assert!(matches!(
             original[0].unpack(),
             Value::Obj(actual) if Gc::ptr_eq(&actual, &object)
@@ -871,14 +831,12 @@ mod packed_value_tests {
         assert_eq!(PackedValue::scalar_bits(&Value::lstr("not copyable")), None);
     }
 
-    /// Raw frame-word reads, writes, `replace_raw` and `drop_in_place` move the one owner without
-    /// retain or loss and leave the other words intact; gc-heap handles hold no count, so there
-    /// the words and identities alone.
+    /// Raw frame-word reads, writes, `replace_raw` and `drop_in_place` move an object's word and
+    /// leave the other words intact; gc-heap handles hold no count, so the test checks the words
+    /// and identities alone.
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
         let obj = Object::new(None);
-        #[cfg(not(feature = "gc-heap"))]
-        let before = Gc::strong_count(&obj);
         let mut frame: [std::mem::MaybeUninit<PackedValue>; 5] =
             std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
         let base = frame.as_mut_ptr().cast::<PackedValue>();
@@ -890,18 +848,12 @@ mod packed_value_tests {
             base.add(3).write(PackedValue::pack(Value::Null));
             base.add(4).write(PackedValue::pack(Value::Num(-0.0)));
         }
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Gc::strong_count(&obj), before + 1);
         unsafe {
             let moved = base.add(1).read();
             base.add(1).write(PackedValue::pack(Value::Undefined));
-            #[cfg(not(feature = "gc-heap"))]
-            assert_eq!(Gc::strong_count(&obj), before + 1);
             assert_eq!((*base).bits(), 1.5f64.to_bits());
             assert!(matches!(moved.unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             PackedValue::replace_raw(base.add(3).cast(), moved.into_value());
-            #[cfg(not(feature = "gc-heap"))]
-            assert_eq!(Gc::strong_count(&obj), before + 1);
             #[cfg(feature = "gc-heap")]
             assert!(matches!((*base.add(3)).unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
@@ -913,8 +865,6 @@ mod packed_value_tests {
                 std::ptr::drop_in_place(base.add(k));
             }
         }
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Gc::strong_count(&obj), before);
     }
 
     #[test]
@@ -964,36 +914,6 @@ mod packed_value_tests {
         assert!(
             weak_heap.upgrade().is_none(),
             "layout cache retained its Agent"
-        );
-    }
-
-    #[cfg(feature = "heap-bridge")]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
-    #[test]
-    fn object_allocations_attach_and_release_central_handles() {
-        let object = Object::new(None);
-        let heap = object.borrow().gc_heap.clone();
-        let reference = object
-            .borrow()
-            .central_ref
-            .get()
-            .expect("bridge-enabled object lacks a central handle");
-        assert_eq!(
-            heap.central.borrow().header(reference).unwrap().size_units,
-            0
-        );
-        assert_eq!(
-            heap.central.borrow().header(reference).unwrap().generation,
-            crate::heap::HeapGeneration::Young
-        );
-        assert_eq!(heap.central.borrow().requested_bytes(), 0);
-        drop(object);
-        assert_eq!(
-            heap.central.borrow().payload(reference),
-            Err(crate::heap::HeapError::InvalidReference)
         );
     }
 }
@@ -1083,12 +1003,6 @@ pub(crate) fn symbol_downgrade(symbol: &SymbolRef) -> WeakSymbol {
     return Rc::downgrade(symbol);
     #[cfg(feature = "gc-heap")]
     WeakSymbol(crate::gc_handle::WeakRef::to(symbol_identity(symbol)))
-}
-
-/// Tests observing reference counts: the Symbol's strong count (gc-heap Symbols have none).
-#[cfg(all(test, not(feature = "gc-heap")))]
-pub(crate) fn symbol_strong_count(symbol: &SymbolRef) -> usize {
-    Rc::strong_count(symbol)
 }
 
 #[cfg(feature = "gc-heap")]
@@ -2498,10 +2412,6 @@ pub struct Object {
     /// snapshot index during marking. Kept apart from `gc_internal` (it fits in existing
     /// padding), so the registry slot is never overwritten and needs no restoring pass.
     pub(crate) gc_scratch: Cell<u32>,
-    /// Opt-in central-heap identity used during the `heap-bridge` migration. The existing Rc
-    /// object remains authoritative until all fields and roots have relocation-aware descriptors.
-    #[cfg(feature = "heap-bridge")]
-    pub(crate) central_ref: Cell<Option<crate::tagged::HeapRef>>,
 }
 
 impl Object {
@@ -2581,16 +2491,6 @@ impl Object {
                 &exotic,
                 props.entries.capacity(),
             );
-            #[cfg(feature = "heap-bridge")]
-            let central_ref = heap
-                .central
-                .borrow_mut()
-                .allocate_tagged_fields(
-                    crate::heap::LayoutId::new(1),
-                    Vec::new(),
-                    crate::heap::HeapGeneration::Young,
-                )
-                .expect("central heap handle space exhausted during bridge allocation");
             let obj = Gc::new_in(
                 &heap,
                 RefCell::new(Object {
@@ -2607,8 +2507,6 @@ impl Object {
                     gc_weak_observed: Cell::new(false),
                     gc_internal: Cell::new(slot_u32),
                     gc_scratch: Cell::new(0),
-                    #[cfg(feature = "heap-bridge")]
-                    central_ref: Cell::new(Some(central_ref)),
                 }),
             );
             reg.publish(slot, Gc::as_ptr(&obj));
@@ -2708,10 +2606,6 @@ impl Drop for Object {
             if let Some(observers) = observers {
                 observers.notify();
             }
-        }
-        #[cfg(feature = "heap-bridge")]
-        if let Some(reference) = self.central_ref.take() {
-            let _ = self.gc_heap.central.borrow_mut().free(reference);
         }
         self.gc_heap.live.set(self.gc_heap.live.get() - 1);
     }
@@ -2869,8 +2763,6 @@ pub(crate) struct GcState {
     array_length_shape: Cell<u32>,
     live: LiveCount,
     allocated: Cell<u64>,
-    #[cfg(feature = "heap-bridge")]
-    pub(crate) central: RefCell<crate::heap::CentralHeap>,
     /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
     /// `new_object_heap`); collections run at interpreter safepoints, which supply the roots.
     #[cfg(feature = "gc-heap")]
@@ -3186,8 +3078,6 @@ impl crate::gc_trace::GcTrace for Object {
             gc_weak_observed: _,
             gc_internal: _,
             gc_scratch: _,
-            #[cfg(feature = "heap-bridge")]
-                central_ref: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);
@@ -3520,9 +3410,8 @@ pub(crate) mod layout_census {
 }
 
 // S3: the header and its inline named slots fill the 192 B size class (184 B since S4 narrowed
-// the slots' header); growing either past it moves every object into the 256 B class. The
-// migration-test `heap-bridge` field is outside the production layout and exempt.
-#[cfg(all(feature = "gc-heap", not(feature = "heap-bridge")))]
+// the slots' header); growing either past it moves every object into the 256 B class.
+#[cfg(feature = "gc-heap")]
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
@@ -3660,10 +3549,6 @@ pub(crate) fn scan_gc_heap_retained_memory(
                 .map(crate::weak_metadata::DeathObservers::allocated_bytes)
                 .sum::<usize>(),
         );
-    }
-    #[cfg(feature = "heap-bridge")]
-    {
-        bytes = bytes.saturating_add(heap.central.borrow().requested_bytes());
     }
     let shapes = heap.shapes.borrow();
     bytes = bytes.saturating_add(
@@ -3886,8 +3771,6 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         array_length_shape: Cell::new(SHAPE_EMPTY),
         live: LiveCount::new(0),
         allocated: Cell::new(0),
-        #[cfg(feature = "heap-bridge")]
-        central: RefCell::new(crate::heap::CentralHeap::new()),
         #[cfg(feature = "gc-heap")]
         core: RefCell::new(core),
         #[cfg(feature = "gc-heap")]
@@ -4153,6 +4036,7 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
 
 #[cfg(all(
     test,
+    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -4162,7 +4046,6 @@ mod jit_heap_tests {
     /// gc-heap: an allocation counts in the active Agent's heap, and a collection counts its
     /// own heap's deaths in that heap's counter, whichever Agent is active (a tracing heap
     /// frees at collections).
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
         // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
@@ -4205,45 +4088,6 @@ mod jit_heap_tests {
         assert!(!alive(&first_object));
         assert_eq!(counts(), (first_base, second_base));
     }
-
-    #[cfg(not(feature = "gc-heap"))]
-    #[test]
-    fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
-        // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
-        // share a native thread. A captured JIT counter must keep tracking its owning heap.
-        let first = new_gc_heap();
-        let second = new_gc_heap();
-        let first_symbols = new_symbol_agent();
-        let second_symbols = new_symbol_agent();
-        let _first_active = enter_agent(&first, &first_symbols);
-        let first_counter = live_objects_ptr(&first);
-        // Explicit heap selection must also work while a different Agent is surrounding.
-        let second_counter = live_objects_ptr(&second);
-        assert_ne!(first_counter, second_counter);
-
-        let first_object = Object::new(None);
-        {
-            let _second_active = enter_agent(&second, &second_symbols);
-            let second_object = Object::new(None);
-            // SAFETY: both heap owners remain alive throughout these counter reads.
-            assert_eq!(unsafe { (*first_counter, *second_counter) }, (1, 1));
-            drop(first_object);
-            assert_eq!(unsafe { (*first_counter, *second_counter) }, (0, 1));
-            drop(second_object);
-        }
-
-        let first_object = Object::new(None);
-        assert_eq!(unsafe { (*first_counter, *second_counter) }, (1, 0));
-        drop(first_object);
-        assert_eq!(unsafe { (*first_counter, *second_counter) }, (0, 0));
-    }
-}
-
-/// Strong handles to every currently-live heap object. Registry slots are non-owning weak
-/// references tombstoned synchronously by `Object::drop`.
-#[cfg(test)]
-pub fn gc_snapshot() -> Vec<Gc> {
-    heap_gc_snapshot(&active_gc_heap())
 }
 
 /// A strong handle to a registered object.
@@ -4341,12 +4185,6 @@ pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
         heap.minor_collections
             .set(heap.minor_collections.get().saturating_add(1));
     }
-}
-
-/// Nursery collections since the last full one.
-#[cfg(all(test, feature = "embed"))]
-pub(crate) fn heap_minor_collections(heap: &GcHeap) -> u8 {
-    heap.minor_collections.get()
 }
 
 pub(crate) fn gc_major_due(heap: &GcHeap, nursery_floor: i64) -> bool {
@@ -4457,13 +4295,6 @@ pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
         .into_iter()
         .map(|cell| unsafe { Env::from_raw(cell as *const RefCell<crate::interpreter::Scope>) })
         .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn gc_registry_stats() -> (usize, usize) {
-    let heap = active_gc_heap();
-    let reg = heap.registry.borrow();
-    (reg.entries.len(), reg.free.len())
 }
 
 /// The element type of a TypedArray.

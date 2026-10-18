@@ -31,10 +31,6 @@ embed = []
 bench = []
 # Allocation/call-cache observations compiled out of ordinary engine builds.
 architecture-diagnostics = []
-# Opt-in central-heap handle bridge used by migration tests. It records one checked handle per
-# live object while the existing `Rc<RefCell<Object>>` graph remains authoritative; never enabled
-# by the default production build until relocation and differential gates are complete.
-heap-bridge = []
 # P1 (rearch/v8-chase) GC heap: the object model by default since S6 step 2. Without it the old
 # reference-counted model builds until its deletion (S6 steps 3-6); the flag goes in step 8. See
 # docs/v8-chase-p1-plan-2026-10-15.txt.

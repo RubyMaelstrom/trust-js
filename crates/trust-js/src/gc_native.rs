@@ -182,43 +182,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
-    #[test]
-    fn native_graph_traces_mixed_cycles_without_strong_handles() {
-        let left = Value::Obj(Object::new(None));
-        let right = Value::Obj(Object::new(None));
-        let left_id = crate::value::Gc::as_ptr(left.as_obj().unwrap()) as usize;
-        let right_id = crate::value::Gc::as_ptr(right.as_obj().unwrap()) as usize;
-        let before = crate::value::Gc::strong_count(left.as_obj().unwrap());
-        let mut graph = NativeGcGraph::default();
-        graph.js_to_native(&left, node(1, 1));
-        graph.native_edge(node(1, 1), node(1, 2));
-        graph.native_edge(node(1, 2), node(1, 1));
-        graph.native_to_js(node(1, 2), &right);
-        graph.js_to_native(&right, node(1, 3));
-        graph.native_to_js(node(1, 3), &left);
-        graph.native_edge(node(2, 1), node(2, 2));
-        assert_eq!(
-            crate::value::Gc::strong_count(left.as_obj().unwrap()),
-            before
-        );
-        let mut reachable = Vec::new();
-        graph.trace_roots(&mut reachable);
-        assert!(reachable.is_empty());
-        assert!(!graph.is_live(node(1, 1)));
-        graph.trace_js(left_id, &mut reachable);
-        assert_eq!(reachable, [right_id]);
-        graph.trace_js(reachable.pop().unwrap(), &mut reachable);
-        assert_eq!(reachable, [left_id]);
-        graph.trace_js(reachable.pop().unwrap(), &mut reachable);
-        assert!(reachable.is_empty());
-        assert!(graph.is_live(node(1, 3)));
-        assert!(!graph.is_live(node(2, 1)));
-    }
-
     #[test]
     fn native_minor_old_prefix_activates_foreign_edges_without_enumerating_old_heap() {
         let live = Value::Obj(Object::new(None));
@@ -387,53 +350,6 @@ mod tests {
                 .unwrap()
                 .live_native,
             [false; 4]
-        );
-    }
-
-    #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount collector's nursery, disabled under gc-heap"
-    )]
-    fn mixed_native_nursery_preserves_old_js_owner_edges_and_sweeps_unrooted_young_islands() {
-        let mut engine = crate::Engine::new();
-        let owner = Value::Obj(Object::new(None));
-        engine.interp.gc_collect();
-        let key = Value::Obj(Object::new(None));
-        let dead1 = Value::Obj(Object::new(None));
-        let dead2 = Value::Obj(Object::new(None));
-        let weak: Vec<_> = [&key, &dead1, &dead2]
-            .iter()
-            .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
-            .collect();
-        engine.interp.op_state().put(MixedHost {
-            values: vec![owner, key, dead1, dead2],
-            root: false,
-            live_native: Vec::new(),
-        });
-        engine.interp.op_state().register_gc::<MixedHost>();
-        engine
-            .interp
-            .gc_collect_young(crate::value::GcCause::Explicit);
-        assert!(
-            crate::gc_test::alive(&weak[0]),
-            "old owner logically roots young target"
-        );
-        assert!(!crate::gc_test::alive(&weak[1]));
-        assert!(!crate::gc_test::alive(&weak[2]));
-        assert_eq!(
-            engine
-                .interp
-                .op_state()
-                .get::<MixedHost>()
-                .unwrap()
-                .live_native,
-            [true, true, false, false]
-        );
-        engine.interp.gc_collect();
-        assert!(
-            !crate::gc_test::alive(&weak[0]),
-            "major revisits the unrooted old owner"
         );
     }
 }

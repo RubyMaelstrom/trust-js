@@ -196,46 +196,60 @@ fn prepared_reference_object_record_get_and_set_repeat_has_not_unscopables() {
     );
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+/// gc-heap: a slot reports its Reference's environment to the collector, and replacing the
+/// Reference drops the old one in place: once its handles are gone a collection finds the old
+/// environment dead, while the slot keeps the new one alive.
+#[cfg(feature = "gc-heap")]
 #[test]
-fn prepared_reference_slot_replacement_and_drop_release_exact_owners() {
+fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
+    struct Words(Vec<u64>);
+    impl crate::gc_trace::GcSink for Words {
+        fn word(&mut self, word: u64) {
+            self.0.push(word);
+        }
+    }
+    let mut engine = Engine::new();
     let mut slot = PreparedReferenceSlot::default();
     assert!(slot.as_ref().is_none());
-    let scope = new_scope(None);
-    scope
-        .borrow_mut()
-        .vars
-        .insert("x", Binding::data(Value::Num(1.0), true, true));
-    let weak = Env::downgrade(&scope);
-    slot.set(PreparedReference::scope(Rc::from("x"), scope, false));
-    assert!(crate::gc_test::alive(&weak));
-    let next = new_scope(None);
-    next.borrow_mut()
-        .vars
-        .insert("x", Binding::data(Value::Num(2.0), true, true));
-    let next_weak = Env::downgrade(&next);
-    slot.set(PreparedReference::scope(Rc::from("x"), next, true));
+    // Each environment's handles live only in a helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let scope = new_scope(None);
+        scope
+            .borrow_mut()
+            .vars
+            .insert("x", Binding::data(Value::Num(1.0), true, true));
+        slot.set(PreparedReference::scope(
+            Rc::from("x"),
+            scope.clone(),
+            false,
+        ));
+        Env::downgrade(&scope)
+    });
+    let next_weak = crate::gc_test::in_frame(|| {
+        let next = new_scope(None);
+        next.borrow_mut()
+            .vars
+            .insert("x", Binding::data(Value::Num(2.0), true, true));
+        slot.set(PreparedReference::scope(Rc::from("x"), next.clone(), true));
+        Env::downgrade(&next)
+    });
+    engine.interp.gc_collect();
     assert!(
         !crate::gc_test::alive(&weak),
-        "old Reference released exactly once"
+        "the replaced Reference released its environment"
     );
-    let mut objects = Vec::new();
-    let mut scopes = Vec::new();
-    slot.as_ref()
-        .unwrap()
-        .trace_gc(&mut crate::gc_edges::DirectGcEdges {
-            objects: &mut objects,
-            scopes: &mut scopes,
-        });
-    assert_eq!(scopes.len(), 1);
-    scopes.clear();
-    drop(slot);
     assert!(
-        !crate::gc_test::alive(&next_weak),
-        "slot Drop releases its live Reference"
+        crate::gc_test::alive(&next_weak),
+        "the slot keeps its live Reference"
+    );
+    let reported = crate::gc_test::in_frame(|| {
+        let mut words = Words(Vec::new());
+        crate::gc_trace::GcTrace::trace_gc(&slot, &mut words);
+        words.0 == [Env::as_ptr(&next_weak.upgrade().unwrap()) as u64]
+    });
+    assert!(
+        reported,
+        "the slot reports exactly its Reference's environment"
     );
 }
 

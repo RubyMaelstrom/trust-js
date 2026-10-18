@@ -459,7 +459,7 @@ impl Interp {
 mod tests {
     use super::*;
     use crate::bytecode::Tier;
-    use crate::value::{GcCause, Object, Property};
+    use crate::value::GcCause;
     use crate::{Completion, Engine};
 
     fn eval(engine: &mut Engine, source: &str, expected: &str) {
@@ -471,97 +471,6 @@ mod tests {
 
     fn young(interp: &mut Interp) {
         interp.gc_collect_young(GcCause::Explicit);
-    }
-
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-    )]
-    #[test]
-    fn nursery_collects_new_cycles_without_snapshotting_retained_old_objects() {
-        let mut engine = Engine::new();
-        eval(
-            &mut engine,
-            "var old = []; for (var i=0;i<20000;i++) old.push({id:i}); true",
-            "true",
-        );
-        engine.interp.gc_collect();
-        assert!(crate::value::heap_young_snapshot(&engine.interp.gc_heap)
-            .0
-            .is_empty());
-        let mut dead = Vec::new();
-        for _ in 0..2000 {
-            let object = Object::new(None);
-            object
-                .borrow_mut()
-                .props
-                .insert("self", Property::builtin(Value::Obj(object.clone())));
-            dead.push(Gc::downgrade(&object));
-        }
-        let (objects, scopes) = crate::value::heap_young_snapshot(&engine.interp.gc_heap);
-        assert_eq!(objects.len(), 2000);
-        assert!(scopes.is_empty());
-        drop((objects, scopes));
-        young(&mut engine.interp);
-        assert!(dead.iter().all(|object| object.upgrade().is_none()));
-        assert!(crate::value::heap_young_snapshot(&engine.interp.gc_heap)
-            .0
-            .is_empty());
-        eval(
-            &mut engine,
-            "[old.length, old[0].id, old[19999].id].join(',')",
-            "20000,0,19999",
-        );
-    }
-
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-    )]
-    #[test]
-    fn nursery_preserves_old_to_young_edges_and_major_collects_cross_generation_cycles() {
-        let mut engine = Engine::new();
-        let old = Object::new(None);
-        engine.interp.gc_collect();
-        let child = Object::new(None);
-        old.borrow_mut()
-            .props
-            .insert("child", Property::builtin(Value::Obj(child.clone())));
-        child
-            .borrow_mut()
-            .props
-            .insert("parent", Property::builtin(Value::Obj(old.clone())));
-        let old_weak = Gc::downgrade(&old);
-        let child_weak = Gc::downgrade(&child);
-        drop(child);
-        young(&mut engine.interp);
-        assert!(child_weak.upgrade().is_some());
-        drop(old);
-        young(&mut engine.interp);
-        assert!(
-            old_weak.upgrade().is_some(),
-            "minor must not sweep its old generation"
-        );
-        engine.interp.gc_collect();
-        assert!(old_weak.upgrade().is_none());
-        assert!(child_weak.upgrade().is_none());
-    }
-
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: tests the refcount cycle collector, disabled under gc-heap"
-    )]
-    #[test]
-    fn nursery_acyclic_churn_does_not_accumulate_weak_allocation_headers() {
-        let mut engine = Engine::new();
-        engine.interp.gc_collect();
-        for _ in 0..50000 {
-            let object = Object::new(None);
-            drop(object);
-        }
-        let (objects, scopes) = crate::value::heap_young_snapshot(&engine.interp.gc_heap);
-        assert!(objects.is_empty());
-        assert!(scopes.is_empty());
     }
 
     #[test]

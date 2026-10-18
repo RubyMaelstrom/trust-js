@@ -255,7 +255,8 @@ pub(crate) fn stress_active() -> bool {
 }
 
 /// The JavaScript values a test's native closure captures, reported for it
-/// (`NativeCaptures::Reported`).
+/// (`NativeCaptures::Reported`; its users are gc-heap tests).
+#[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
 pub(crate) struct CapturedValues(pub(crate) Vec<crate::value::Value>);
 
 impl crate::value::NativeCallableRetained for CapturedValues {

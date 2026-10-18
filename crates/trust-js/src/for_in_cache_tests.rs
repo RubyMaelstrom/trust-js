@@ -29,36 +29,6 @@ fn owned_value(engine: &mut Engine, source: &str) -> Value {
         .expect("evaluate")
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: no edges between Agent heaps (I6); objects shared across Engines are out of contract"
-)]
-#[test]
-#[cfg(feature = "embed")]
-fn for_in_cache_distinguishes_foreign_heaps_and_mixed_prototypes() {
-    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
-        let mut first = Engine::new();
-        let mut second = Engine::new();
-        let a = owned_value(&mut first, "({alpha:1})");
-        let b = owned_value(&mut second, "({beta:2})");
-        assert_ne!(
-            a.as_obj().unwrap().borrow().props.shape(),
-            b.as_obj().unwrap().borrow().props.shape(),
-            "foreign key sequences must have distinct global identities"
-        );
-        let mut reader = Engine::new();
-        reader.set_tier(tier);
-        reader.set_tier_threshold(0);
-        let global = reader.global_this();
-        assert!(reader.ctx().set_member_key(&global, "first", a).is_ok());
-        assert!(reader.ctx().set_member_key(&global, "second", b).is_ok());
-        assert_eq!(run(&mut reader, "function keys(o){var out='';for(var k in o)out+=k+',';return out;}keys(first)+'|'+keys(second)+'|'+keys(first)"),
-            "alpha,|beta,|alpha,", "{tier:?}");
-        assert_eq!(run(&mut reader, "var a=Object.create(first),b=Object.create(second);a.own=1;b.own=2;keys(a)+'|'+keys(b)+'|'+keys(a)"),
-            "own,alpha,|own,beta,|own,alpha,", "{tier:?}");
-    }
-}
-
 #[test]
 #[cfg(feature = "embed")]
 fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {

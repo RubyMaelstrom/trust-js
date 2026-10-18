@@ -89,25 +89,6 @@ fn layout_is_valid_with_the_build_ownership() {
         stored(&object) + layout.gc_data_off,
         Gc::as_ptr(&object) as usize
     );
-    #[cfg(not(feature = "gc-heap"))]
-    {
-        let crate::jit::JitOwnership::Refcount { strong_off } = layout.ownership() else {
-            panic!("the default build counts owners")
-        };
-        let count = || read::<usize>(stored(&object), strong_off as usize);
-        assert_eq!(count(), Gc::strong_count(&object));
-        let extra = object.clone();
-        assert_eq!(count(), Gc::strong_count(&object));
-        drop(extra);
-        assert_eq!(count(), Gc::strong_count(&object));
-        assert!(matches!(layout.repr.props_fields, JitVecLayout::Vec { .. }));
-        assert!(matches!(entries_of(&layout), JitVecLayout::Vec { .. }));
-        assert_eq!(
-            (layout.repr.slot_memo_width, layout.repr.slot_memo_none),
-            (4, u32::MAX)
-        );
-        assert_eq!(layout.repr.exotic_collection_tag, None);
-    }
     #[cfg(feature = "gc-heap")]
     {
         assert_eq!(layout.ownership(), crate::jit::JitOwnership::Traced);

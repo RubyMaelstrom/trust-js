@@ -151,14 +151,6 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     drop(subject);
     assert!(engine.interp.release_host_job_context(41));
     engine.interp.switch_host_job_context(42);
-    // A reference count frees the old settings environment with its last owner; gc-heap
-    // frees it at the collection below.
-    #[cfg(not(feature = "gc-heap"))]
-    assert_eq!(
-        retired_env.strong_count(),
-        0,
-        "callee/code do not retain the old settings environment"
-    );
     let before = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
     #[cfg(feature = "gc-heap")]

@@ -153,58 +153,67 @@ mod tests {
     use super::*;
     use crate::interpreter::{new_scope, Binding};
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    /// A Rust unwind out of a borrowed scope restores every parked binding from its slot, with
+    /// the binding's attributes, and leaves no stale slot pointer. The object the slot held
+    /// before its overwrite is then reachable from neither, so a collection frees it.
     #[test]
     fn transferred_owners_and_binding_attributes_restore_on_unwind() {
+        let mut engine = crate::Engine::new();
         let environment = new_scope(None);
-        let old = crate::value::Object::new(None);
-        let weak = crate::value::Gc::downgrade(&old);
-        environment
-            .borrow_mut()
-            .vars
-            .insert("old", Binding::data(Value::Obj(old.clone()), false, true));
-        environment
-            .borrow_mut()
-            .vars
-            .insert("later", Binding::data(Value::Undefined, true, false));
-        let slots = [
-            PackedValue::pack(Value::Obj(old)),
-            PackedValue::pack(Value::Empty),
-        ];
-        let homes = [
-            (environment.clone(), Rc::from("old"), 0),
-            (environment.clone(), Rc::from("later"), 1),
-        ];
         let registry = Registry::default();
-        assert_eq!(weak.strong_count(), 2);
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _scope = unsafe { registry.enter(&homes, &slots) };
-            assert_eq!(weak.strong_count(), 1, "only the slot retains its owner");
-            {
-                let parked = environment.borrow();
-                let old = parked.vars.get("old").unwrap();
-                assert!(matches!(old.value, Value::Undefined));
-                assert!(old.initialized && !old.mutable && old.strict_immutable);
-                assert!(!parked.vars.get("later").unwrap().initialized);
-            }
-            slots[0].replace_value(Value::Num(7.0));
-            assert_eq!(weak.strong_count(), 0, "overwrite releases the old owner");
-            panic!("test restoration on Rust unwind");
-        }));
-        assert!(unwind.is_err());
+        // The object's handles and the slots live only in this helper frame (gc-heap scans the
+        // stack).
+        let weak = crate::gc_test::in_frame(|| {
+            let old = crate::value::Object::new(None);
+            let weak = crate::value::Gc::downgrade(&old);
+            environment
+                .borrow_mut()
+                .vars
+                .insert("old", Binding::data(Value::Obj(old.clone()), false, true));
+            environment
+                .borrow_mut()
+                .vars
+                .insert("later", Binding::data(Value::Undefined, true, false));
+            let slots = [
+                PackedValue::pack(Value::Obj(old)),
+                PackedValue::pack(Value::Empty),
+            ];
+            let homes = [
+                (environment.clone(), Rc::from("old"), 0),
+                (environment.clone(), Rc::from("later"), 1),
+            ];
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = unsafe { registry.enter(&homes, &slots) };
+                {
+                    let parked = environment.borrow();
+                    let old = parked.vars.get("old").unwrap();
+                    assert!(matches!(old.value, Value::Undefined));
+                    assert!(old.initialized && !old.mutable && old.strict_immutable);
+                    assert!(!parked.vars.get("later").unwrap().initialized);
+                }
+                slots[0].replace_value(Value::Num(7.0));
+                panic!("test restoration on Rust unwind");
+            }));
+            assert!(unwind.is_err());
+            weak
+        });
         assert!(
             registry.0.borrow().is_empty(),
             "no stale slot pointer survives"
         );
-        let restored = environment.borrow();
-        let old = restored.vars.get("old").unwrap();
-        assert!(matches!(old.value, Value::Num(7.0)));
-        assert!(old.initialized && !old.mutable && old.strict_immutable);
-        let later = restored.vars.get("later").unwrap();
-        assert!(!later.initialized && later.mutable);
-        assert!(matches!(later.value, Value::Empty));
+        {
+            let restored = environment.borrow();
+            let old = restored.vars.get("old").unwrap();
+            assert!(matches!(old.value, Value::Num(7.0)));
+            assert!(old.initialized && !old.mutable && old.strict_immutable);
+            let later = restored.vars.get("later").unwrap();
+            assert!(!later.initialized && later.mutable);
+            assert!(matches!(later.value, Value::Empty));
+        }
+        engine.interp.gc_collect();
+        assert!(
+            !crate::gc_test::alive(&weak),
+            "the overwritten object is released"
+        );
     }
 }

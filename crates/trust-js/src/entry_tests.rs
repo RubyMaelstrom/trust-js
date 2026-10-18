@@ -470,14 +470,6 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
             weak
         });
         evaluate(&mut engine, "named=null;");
-        // Without a cycle the last reference count releases it at once; a tracing heap
-        // (gc-heap) reclaims it at the next collection, checked below.
-        if enabled && !cfg!(feature = "gc-heap") {
-            assert!(
-                !crate::gc_test::alive(&weak),
-                "unused self binding kept a cycle alive"
-            );
-        }
         engine.interp.gc_collect();
         assert!(!crate::gc_test::alive(&weak));
     }

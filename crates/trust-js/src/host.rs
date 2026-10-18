@@ -752,14 +752,10 @@ mod tests {
         values: Vec<Value>,
         edges: Vec<(usize, usize)>,
         roots: Vec<usize>,
-        busy: bool,
     }
 
     impl HostTrace for NativeCache {
         fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
-            if self.busy {
-                return;
-            }
             for value in &self.values {
                 visitor.internal(value);
             }
@@ -866,48 +862,42 @@ mod tests {
             .all(|value| matches!(value, Value::Undefined)));
     }
 
+    /// A GC registration belongs to its Rust type, not to the slot it was made beside: a
+    /// collection skips the taken slot and sweeps a later slot of the type.
     #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: a host omitting its handles keeps no roots under gc-heap (mandatory enumeration)"
-    )]
-    fn host_gc_busy_fallback_and_replaced_slots_remain_safe() {
+    fn host_gc_registration_outlives_a_taken_slot() {
         let mut engine = crate::Engine::new();
         engine.interp.op_state().register_gc::<NativeCache>();
-        // A registration is attached to a Rust type, not to the old slot's address.
         engine.interp.op_state().put(NativeCache::default());
         engine.interp.op_state().take::<NativeCache>();
         engine.interp.gc_collect();
-        let value = Value::Obj(engine.interp.new_object());
-        let weak = engine.interp.downgrade_object_value(&value).unwrap();
-        engine.interp.op_state().put(NativeCache {
-            values: vec![value],
-            busy: true,
-            ..Default::default()
+        // The value's handles live only in this helper frame (gc-heap scans the stack).
+        crate::gc_test::in_frame(|| {
+            let value = Value::Obj(engine.interp.new_object());
+            engine.interp.op_state().put(NativeCache {
+                values: vec![value],
+                ..Default::default()
+            });
         });
         engine.interp.gc_collect();
         assert!(
-            crate::gc_test::alive(&weak),
-            "undiscounted handle remains a root"
-        );
-        engine
-            .interp
-            .op_state()
-            .get_mut::<NativeCache>()
-            .unwrap()
-            .busy = false;
-        engine.interp.gc_collect();
-        assert!(
-            !crate::gc_test::alive(&weak),
-            "idle, unrooted cache entry is released"
+            matches!(
+                engine
+                    .interp
+                    .op_state()
+                    .get::<NativeCache>()
+                    .unwrap()
+                    .values[..],
+                [Value::Undefined]
+            ),
+            "the later slot's unrooted value is swept"
         );
     }
 
+    /// A host edge from a suspended generator shares its owner with the generator's
+    /// continuation: while the generator lives, both its captured payload and the host's target
+    /// do, and once it is unreachable a collection frees both and its continuation.
     #[test]
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: a host omitting its handles keeps no roots under gc-heap (mandatory enumeration)"
-    )]
     fn host_gc_and_continuations_share_an_owner_without_losing_either_edge() {
         let mut engine = crate::Engine::new();
         engine
@@ -922,21 +912,25 @@ mod tests {
                 false,
             )
             .unwrap();
-        let global = Value::Obj(engine.interp.global.clone());
-        let owner = engine
-            .interp
-            .member_get(&global, "mixedOwner")
-            .unwrap_or_else(|_| panic!("generator owner"));
-        let owner_weak = engine.interp.downgrade_object_value(&owner).unwrap();
-        let native_target = Value::Obj(engine.interp.new_object());
-        let native_weak = engine
-            .interp
-            .downgrade_object_value(&native_target)
-            .unwrap();
-        engine.interp.op_state().put(NativeCache {
-            values: vec![owner, native_target],
-            edges: vec![(0, 1)],
-            ..Default::default()
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let (owner_weak, native_weak) = crate::gc_test::in_frame(|| {
+            let global = Value::Obj(engine.interp.global.clone());
+            let owner = engine
+                .interp
+                .member_get(&global, "mixedOwner")
+                .unwrap_or_else(|_| panic!("generator owner"));
+            let owner_weak = engine.interp.downgrade_object_value(&owner).unwrap();
+            let native_target = Value::Obj(engine.interp.new_object());
+            let native_weak = engine
+                .interp
+                .downgrade_object_value(&native_target)
+                .unwrap();
+            engine.interp.op_state().put(NativeCache {
+                values: vec![owner, native_target],
+                edges: vec![(0, 1)],
+                ..Default::default()
+            });
+            (owner_weak, native_weak)
         });
         engine.interp.op_state().register_gc::<NativeCache>();
         engine.interp.gc_collect();
@@ -949,21 +943,6 @@ mod tests {
             crate::Completion::Throw { name, message } => panic!("{name}: {message}"),
         }
         engine.eval("mixedOwner = null", false).unwrap();
-        engine
-            .interp
-            .op_state()
-            .get_mut::<NativeCache>()
-            .unwrap()
-            .busy = true;
-        engine.interp.gc_collect();
-        assert!(crate::gc_test::alive(&owner_weak));
-        assert!(crate::gc_test::alive(&native_weak));
-        engine
-            .interp
-            .op_state()
-            .get_mut::<NativeCache>()
-            .unwrap()
-            .busy = false;
         engine.interp.gc_collect();
         assert!(!crate::gc_test::alive(&owner_weak));
         assert!(!crate::gc_test::alive(&native_weak));

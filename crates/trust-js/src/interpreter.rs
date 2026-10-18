@@ -427,12 +427,10 @@ fn trace_bound_array_state(call_id: u64, phase: &str, value: Option<&Value>) {
 mod bound_trace_tests {
     use super::*;
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// A preview names an accessor without reading it, notes a borrowed object instead of
+    /// borrowing it, and stays short for a long string.
     #[test]
-    fn native_previews_are_bounded_and_do_not_retain_objects() {
+    fn native_previews_are_bounded_and_skip_accessors() {
         let object = Object::new(None);
         object.borrow_mut().exotic = Exotic::Array;
         object
@@ -440,10 +438,8 @@ mod bound_trace_tests {
             .props
             .insert("0", Property::accessor_prop(None, None, true, true));
         let value = Value::Obj(object.clone());
-        let count = Gc::strong_count(&object);
         let preview = bound_trace_preview(&value, 0);
         assert!(preview.contains("<accessor>"));
-        assert_eq!(Gc::strong_count(&object), count);
         let borrowed = object.borrow_mut();
         assert!(bound_trace_preview(&value, 0).contains("(borrowed)"));
         drop(borrowed);
@@ -462,12 +458,10 @@ mod bound_trace_tests {
         assert_eq!(trace.history.back().map(String::as_str), Some("399"));
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// An array-state preview reads every element up to the length bound, naming accessors and
+    /// holes, and skips an array it cannot borrow or one beyond the bound.
     #[test]
-    fn array_state_previews_skip_accessors_and_do_not_retain_values() {
+    fn array_state_previews_skip_accessors_and_bound_their_arrays() {
         let owner = Object::new(None);
         let array = Object::new(None);
         array.borrow_mut().exotic = Exotic::Array;
@@ -487,9 +481,7 @@ mod bound_trace_tests {
             .borrow_mut()
             .props
             .insert("bank", Property::builtin(Value::Obj(array.clone())));
-        let count = Gc::strong_count(&array);
         let values = bound_trace_arrays(&Value::Obj(owner.clone()));
-        assert_eq!(Gc::strong_count(&array), count);
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].2[0], "<accessor>");
         assert_eq!(values[0].2[1], "<hole>");
@@ -2093,36 +2085,6 @@ pub(crate) struct JitBindingStorage {
 mod binding_layout_tests {
     use super::*;
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
-    #[test]
-    fn cold_import_cells_keep_independent_environment_owners_and_shared_names() {
-        #[cfg(target_pointer_width = "64")]
-        {
-            assert_eq!(std::mem::size_of::<Binding>(), 32);
-            assert_eq!(std::mem::size_of::<(Rc<str>, Binding)>(), 48);
-        }
-        let exporter = new_scope(None);
-        let mut first = Binding::data(Value::Undefined, false, true);
-        first.set_import_reference(Some((exporter.clone(), "source".into())));
-        let before = Env::strong_count(&exporter);
-        let second = first.clone();
-        assert_eq!(Env::strong_count(&exporter), before + 1);
-        let left = first.import_ref.as_deref().unwrap();
-        let right = second.import_ref.as_deref().unwrap();
-        assert!(
-            !std::ptr::eq(left, right),
-            "collector edges own separate handles"
-        );
-        assert!(Rc::ptr_eq(&left.1, &right.1));
-        drop(second);
-        assert_eq!(Env::strong_count(&exporter), before);
-        first.set_import_reference(None);
-        assert_eq!(Env::strong_count(&exporter), 1);
-    }
-
     #[test]
     fn cold_import_cells_trace_exporters_and_keep_cached_reads_live() {
         for tier in [
@@ -2970,10 +2932,9 @@ mod constructor_transfer_tests;
 mod computed_key_cache_tests {
     use super::*;
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// The stub cache keys computed resolutions by their name text, not the key's address: a key
+    /// allocation reused for another name misses. Only the text and validated layout metadata
+    /// are kept, and a key too large to keep is not cached.
     #[test]
     fn computed_key_stub_cache_owns_text_and_rejects_reused_addresses() {
         let mut engine = crate::Engine::new();
@@ -3011,18 +2972,11 @@ mod computed_key_cache_tests {
         let read = i.get_prop_keyed(&base, &key, &cells[0]);
         assert!(matches!(read, Ok(Value::Num(9.0))));
         assert!(i.stub_cache_get(shape, &key).is_some());
-        // Only name text and validated layout metadata are retained, never the receiver.
-        assert_eq!(Gc::strong_count(&object), 2);
         let computed_key = crate::lstr::LStr::from("alpha");
         assert!(matches!(
             i.get_computed_property(&base, &computed_key),
             Ok(Value::Num(7.0))
         ));
-        assert_eq!(
-            Gc::strong_count(&object),
-            2,
-            "computed resolutions cannot root their receiver"
-        );
 
         let long_key = "k".repeat(COMPUTED_STUB_KEY_MAX_BYTES + 1);
         object

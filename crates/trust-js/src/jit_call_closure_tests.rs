@@ -351,18 +351,7 @@ out.join('|');
     );
 }
 
-#[cfg(all(target_arch = "aarch64", not(feature = "gc-heap")))]
-fn owners(engine: &mut Engine, name: &str) -> usize {
-    use crate::value::Value;
-    let env = engine.interp.global_env.clone();
-    match engine.interp.get_var(name, &env).ok().expect("binding") {
-        Value::Obj(object) => crate::value::Gc::strong_count(&object) - 1,
-        Value::Str(text) => text.strong_count() - 1,
-        _ => panic!("{name} is not an owner"),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
 fn settle(engine: &mut Engine, name: &str) {
     let env = engine.interp.global_env.clone();
     let function = engine.interp.get_var(name, &env).ok().expect("function");
@@ -384,7 +373,7 @@ fn settle(engine: &mut Engine, name: &str) {
 /// Callees with every slot count from 1 to 13 holding the owner `a` at the first, middle and
 /// last slot, each with a driver that calls it `n` times: the program (after `prelude`, which
 /// binds `token` and `text`) and the (callee, driver) names.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
 fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
     let mut source = String::from(prelude);
     let mut names = Vec::new();
@@ -460,48 +449,4 @@ fn direct_calls_release_slot_owners_exactly_once() {
     );
     assert_eq!(run(&mut engine, "token=null;text=null;0"), "0");
     assert_tracked_collectable(&mut engine);
-}
-
-/// The shared finish stub scans every callee slot: a slot count of any residue, with an owner
-/// at any position (first or second word of a pair, the odd tail, beside negative Numbers
-/// that take the slow pair path), releases that owner exactly once.
-#[cfg(all(target_arch = "aarch64", not(feature = "gc-heap")))]
-#[test]
-fn direct_calls_release_slot_owners_exactly_once() {
-    let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
-    engine.set_tier_threshold(0);
-    let (source, names) = slot_owner_program(
-        "var token={}, text='abc'+String(Math.random()), big=12345678901234567890n, sym=Symbol('s');\n",
-    );
-    evaluate(&mut engine, &source);
-    for (_, driver) in &names {
-        evaluate(&mut engine, &format!("{driver}(2);"));
-    }
-    for (name, driver) in &names {
-        settle(&mut engine, name);
-        settle(&mut engine, driver);
-    }
-    let token = owners(&mut engine, "token");
-    let text = owners(&mut engine, "text");
-    // Another test may exhaust the process-wide call-cache epoch while this one runs, which
-    // sends calls through the checked helper for a moment; retry until the whole batch has
-    // gone through the direct sequence. Ownership must be exact after every round.
-    let mut direct = false;
-    for _ in 0..200 {
-        super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
-        for (_, driver) in &names {
-            assert_eq!(evaluate(&mut engine, &format!("{driver}(40);")), "0");
-        }
-        assert_eq!(owners(&mut engine, "token"), token);
-        assert_eq!(owners(&mut engine, "text"), text);
-        if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) >= names.len() * 40 {
-            direct = true;
-            break;
-        }
-    }
-    assert!(
-        direct,
-        "the callees must run through the direct-call sequence"
-    );
 }

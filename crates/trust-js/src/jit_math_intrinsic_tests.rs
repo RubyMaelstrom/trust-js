@@ -12,13 +12,6 @@ fn evaluate(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-#[cfg(not(feature = "gc-heap"))]
-fn function_owners(engine: &mut Engine) -> usize {
-    let env = engine.interp.global_env.clone();
-    let value = engine.interp.get_var("builtin", &env).ok().unwrap();
-    crate::value::Gc::strong_count(value.as_obj().unwrap()) - 1
-}
-
 fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) {
     let env = engine.interp.global_env.clone();
     let function = engine.interp.get_var(name, &env).ok().unwrap();
@@ -89,18 +82,10 @@ fn math_intrinsics_release_aliased_and_distinct_operand_owners() {
                     assert_native_intrinsic(&mut engine, name, intrinsic);
                 }
             }
-            #[cfg(not(feature = "gc-heap"))]
-            let owners = function_owners(&mut engine);
             for name in ["alias", "distinct", "alias", "distinct"] {
                 assert_eq!(
                     evaluate(&mut engine, &format!("{name}(256)")),
                     (result * 256).to_string()
-                );
-                #[cfg(not(feature = "gc-heap"))]
-                assert_eq!(
-                    function_owners(&mut engine),
-                    owners,
-                    "{tier:?} {expression} {name}"
                 );
                 #[cfg(feature = "gc-heap")]
                 {

@@ -447,7 +447,7 @@ fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
 /// null in both orders, strict `===` across different tags, and stores over a BigInt in a
 /// global property and in a closure binding. Results and the BigInt's value are checked after
 /// every store and compare. Under gc-heap the property stores run inline (no set-property
-/// helper call); the default build keeps the helper for its BigInt owner.
+/// helper call).
 #[test]
 fn bigints_take_the_baseline_fast_paths_with_their_values() {
     const SOURCE: &str = r#"
@@ -511,8 +511,9 @@ fn bigints_take_the_baseline_fast_paths_with_their_values() {
                 ],
             );
             // The retained store of a BigInt and the store over one.
-            let expected = if cfg!(feature = "gc-heap") { 0 } else { 1 };
-            assert_eq!((helpers[2], helpers[3]), (expected, expected));
+            if cfg!(feature = "gc-heap") {
+                assert_eq!((helpers[2], helpers[3]), (0, 0));
+            }
         }
     }
 }
@@ -601,11 +602,6 @@ fn bigints_take_the_region_fast_paths_with_their_values() {
             if cfg!(feature = "gc-heap") {
                 assert_eq!(borrowed, 20, "a BigInt property is borrowed in the region");
                 assert!(fused > 0, "the fused pair admits BigInt elements");
-            } else {
-                assert_eq!(
-                    borrowed, 0,
-                    "counted ownership leaves the region for a BigInt"
-                );
             }
         }
     }

@@ -263,35 +263,28 @@ fn record_getter_specialization_retains_foreign_async_class_and_proxy_calls() {
     );
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+/// A cached read's owned snapshot is two words, as is its Option, and finishing it yields the
+/// snapshotted value after its property is gone. That the snapshot alone keeps its value alive
+/// across a collection is checked by
+/// `getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_drops`.
 #[test]
-fn getter_cache_owned_snapshot_stays_two_words_and_retains_exactly_one_owner() {
+fn getter_cache_owned_snapshot_stays_two_words() {
     assert_eq!(std::mem::size_of::<CachedGet>(), 16);
     assert_eq!(std::mem::size_of::<Option<CachedGet>>(), 16);
     let mut engine = Engine::new();
     let object = Object::new(None);
-    let weak = Gc::downgrade(&object);
-    let property = Property::plain(Value::Obj(object));
-    assert_eq!(weak.strong_count(), 1);
+    let property = Property::plain(Value::Obj(object.clone()));
     let read = engine
         .interp
         .snapshot_cached_get(&property, "value", 0, 0, false)
         .unwrap();
-    assert_eq!(weak.strong_count(), 2);
     drop(property);
-    engine.interp.gc_collect();
-    assert_eq!(weak.strong_count(), 1);
     let value = engine
         .interp
         .finish_cached_get(read, &Value::Undefined, None)
         .ok()
         .unwrap();
-    assert_eq!(weak.strong_count(), 1);
-    drop(value);
-    assert!(!crate::gc_test::alive(&weak));
+    assert!(matches!(&value, Value::Obj(actual) if Gc::ptr_eq(actual, &object)));
 }
 
 #[test]
@@ -527,51 +520,54 @@ fn getter_cache_array_holder_uses_live_key_checks_and_computed_keys() {
     }
 }
 
-#[cfg_attr(
-    feature = "gc-heap",
-    ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-)]
+/// A getter whose own computed reads grow the cache that holds its resolution, and which then
+/// replaces itself with a data property and collects, still returns its result; the next read
+/// finds the data property without calling the getter, and a collection frees the getter.
 #[test]
 fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacement() {
     let mut engine = Engine::new();
     let object = Object::new(None);
     let key = crate::lstr::LStr::from("cached");
     let called = Rc::new(Cell::new(0));
-    let counter = called.clone();
-    let getter = engine.interp.new_native_fn(
-        "get cached",
-        0,
-        Rc::new(move |interp, this, _| {
-            counter.set(counter.get() + 1);
-            // The outer resolution has already been cached. Recursive reads fill
-            // and resize that table before this getter returns its owned result.
-            let other = Value::Obj(Object::new(None));
-            for k in 0..5000 {
-                let transient = crate::lstr::LStr::from(format!("absent{k}"));
-                assert!(matches!(
-                    interp.get_computed_property(&other, &transient),
-                    Ok(Value::Undefined)
-                ));
-            }
-            assert_eq!(
-                interp.computed_reads.mask as usize + 1,
-                crate::bytecode::ComputedReadCache::MAX_SETS
-            );
-            this.as_obj()
-                .unwrap()
-                .borrow_mut()
-                .props
-                .insert("cached", Property::plain(Value::Num(47.0)));
-            interp.gc_collect();
-            Ok(this)
-        }),
-        crate::value::NativeCaptures::None,
-    );
-    let weak = Gc::downgrade(getter.as_obj().unwrap());
-    object.borrow_mut().props.insert(
-        "cached",
-        Property::accessor_prop(Some(getter), None, true, true),
-    );
+    // The getter lives only in this helper frame (gc-heap scans the stack).
+    let weak = crate::gc_test::in_frame(|| {
+        let counter = called.clone();
+        let getter = engine.interp.new_native_fn(
+            "get cached",
+            0,
+            Rc::new(move |interp, this, _| {
+                counter.set(counter.get() + 1);
+                // The outer resolution has already been cached. Recursive reads fill
+                // and resize that table before this getter returns its owned result.
+                let other = Value::Obj(Object::new(None));
+                for k in 0..5000 {
+                    let transient = crate::lstr::LStr::from(format!("absent{k}"));
+                    assert!(matches!(
+                        interp.get_computed_property(&other, &transient),
+                        Ok(Value::Undefined)
+                    ));
+                }
+                assert_eq!(
+                    interp.computed_reads.mask as usize + 1,
+                    crate::bytecode::ComputedReadCache::MAX_SETS
+                );
+                this.as_obj()
+                    .unwrap()
+                    .borrow_mut()
+                    .props
+                    .insert("cached", Property::plain(Value::Num(47.0)));
+                interp.gc_collect();
+                Ok(this)
+            }),
+            crate::value::NativeCaptures::None,
+        );
+        let weak = Gc::downgrade(getter.as_obj().unwrap());
+        object.borrow_mut().props.insert(
+            "cached",
+            Property::accessor_prop(Some(getter), None, true, true),
+        );
+        weak
+    });
     let base = Value::Obj(object.clone());
     let result = engine
         .interp
@@ -580,7 +576,11 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
         .unwrap();
     assert!(Gc::ptr_eq(result.as_obj().unwrap(), &object));
     assert_eq!(called.get(), 1);
-    assert!(!crate::gc_test::alive(&weak));
+    engine.interp.gc_collect();
+    assert!(
+        !crate::gc_test::alive(&weak),
+        "the replaced getter is released"
+    );
     assert!(matches!(
         engine.interp.get_computed_property(&base, &key),
         Ok(Value::Num(47.0))

@@ -3220,8 +3220,6 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let after = measure(&engine.interp, &objects, &scopes);
 
-        #[cfg(not(feature = "gc-heap"))]
-        assert!(!engine.interp.map_data.is_empty());
         assert!(!engine.interp.collection_iterators.is_empty());
         assert!(!engine.interp.weak_collection_data.is_empty());
         assert!(!engine.interp.weak_collection_index.is_empty());

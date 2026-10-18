@@ -214,8 +214,6 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     for generation in [0, 1, u32::MAX - 1, u32::MAX] {
         holder.borrow_mut().vars.set_generation_for_test(generation);
         let reference = PreparedReference::scope(Rc::from("outer"), holder.clone(), true);
-        #[cfg(not(feature = "gc-heap"))]
-        let count = Env::strong_count(&holder);
         assert_eq!(
             unsafe { probe(&reference) },
             if generation == u32::MAX {
@@ -224,8 +222,6 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
                 reference.binding as usize
             }
         );
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(Env::strong_count(&holder), count);
         assert_eq!(reference.generation, generation);
     }
     let object = crate::value::Object::new(None);
@@ -236,14 +232,10 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     let mut reference = PreparedReference::object(Rc::from("outer"), object.clone(), false);
     reference.slot = object.borrow().props.slot_of("outer").unwrap();
     reference.shape = object.borrow().props.shape();
-    #[cfg(not(feature = "gc-heap"))]
-    let count = crate::value::Gc::strong_count(&object);
     assert_ne!(unsafe { probe(&reference) }, 0);
     for shape in [0, u32::MAX] {
         reference.shape = shape;
         assert_eq!(unsafe { probe(&reference) }, 0);
-        #[cfg(not(feature = "gc-heap"))]
-        assert_eq!(crate::value::Gc::strong_count(&object), count);
         assert_eq!(reference.shape, shape);
     }
     // gc-heap owners carry no count: the probes leave both bases intact, which a collection

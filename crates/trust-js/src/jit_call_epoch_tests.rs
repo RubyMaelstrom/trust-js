@@ -280,12 +280,6 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
             .is_none());
     }
     engine.interp.call_overflow.raw_sets = original_sets;
-    #[cfg(not(feature = "gc-heap"))]
-    assert_eq!(
-        crate::value::Gc::strong_count(&object),
-        2,
-        "the probe must not consume the callee owner"
-    );
     // gc-heap owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
     #[cfg(feature = "gc-heap")]
