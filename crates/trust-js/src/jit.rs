@@ -186,6 +186,14 @@ mod word_routing_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_this_tests.rs"]
+mod this_tests;
+
+#[cfg(all(
+    test,
     feature = "gc-heap",
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -389,6 +397,11 @@ impl crate::value::JitLayout {
     /// The ownership description the ownership emitters read.
     pub(crate) fn ownership(&self) -> JitOwnership {
         self.repr.ownership
+    }
+
+    /// How a [`JitCtx`] holds `this` at [48], which the `this` emitters read.
+    pub(crate) fn ctx_this(&self) -> JitThisRepr {
+        self.repr.ctx_this
     }
 }
 
@@ -1834,9 +1847,15 @@ pub struct JitCtx {
     /// [40] `Rc::as_ptr` of the activation env — what the inline LoadName template compares
     /// against the per-site name cache (see `bytecode::NameIc`).
     pub env_raw: *const u8,
-    /// [48] Points at `this_val` below (set after construction): the inline LoadThis template
-    /// copies the 16-byte Value and bumps its refcount from machine code.
+    /// [48] Default build: points at this context's own `this_val` below, set once the context
+    /// is in place. Generated code reads `this` through it as a wide Value (see
+    /// [`JitThisRepr::Wide`]).
+    #[cfg(not(feature = "gc-heap"))]
     pub this_raw: *const Value,
+    /// [48] gc-heap: the activation's `this` itself, as a packed word that owns nothing (see
+    /// [`JitThisRepr::Packed`]). Rust reads and writes it through the `this` accessors below.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) this_word: PackedValue,
     /// [56] The current realm's global `Object` (through the Rc and RefCell): the LoadName
     /// templates' global-mode path validates the cached shape/slot against it.
     pub global_body: *const u8,
@@ -1846,6 +1865,8 @@ pub struct JitCtx {
     // ---- Rust-only fields ----
     pub interp: *mut Interp,
     pub chunk: *const Chunk,
+    /// Default build: the activation's `this` (gc-heap keeps it at [48] instead).
+    #[cfg(not(feature = "gc-heap"))]
     pub this_val: Value,
     pub n_slots: usize,
     /// Active catch/finally/iterator regions, shared with bytecode completion routing.
@@ -1891,6 +1912,129 @@ pub struct JitCtx {
     pub accessor_slot: u32,
 }
 
+/// `this` as the moved JIT entries (`run_moved` and its forms) take it and a [`JitCtx`] holds
+/// it: a wide Value in the default build, the packed word under gc-heap ([`JitThisRepr`]).
+#[cfg(not(feature = "gc-heap"))]
+pub(crate) type JitThis = Value;
+#[cfg(feature = "gc-heap")]
+pub(crate) type JitThis = PackedValue;
+
+/// How a [`JitCtx`] holds the activation's `this` at [48] (`JitRepr::ctx_this`). Generated code
+/// chooses its LoadThis, receiver, direct-call and finish-stub forms from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JitThisRepr {
+    /// Default build: [48] points at the context's own wide `this_val` (its tag word, then its
+    /// payload word), which lies `value` bytes into the context. A direct call writes a callee
+    /// record's `this` at `value` and the finish stub resets it there.
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
+    Wide { value: usize },
+    /// gc-heap: [48] is the packed `this` word itself; it owns nothing.
+    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+    Packed,
+}
+
+impl JitThisRepr {
+    /// This build's representation, derived from the cfg'd [`JitCtx`] layout (the prefix
+    /// assertions pin [48]).
+    #[cfg(not(feature = "gc-heap"))]
+    pub(crate) const BUILD: JitThisRepr = JitThisRepr::Wide {
+        value: std::mem::offset_of!(JitCtx, this_val),
+    };
+    #[cfg(feature = "gc-heap")]
+    pub(crate) const BUILD: JitThisRepr = JitThisRepr::Packed;
+
+    /// The byte offset of a context's own `this`: the wide value, or [48].
+    pub(crate) fn record_offset(self) -> usize {
+        match self {
+            JitThisRepr::Wide { value } => value,
+            JitThisRepr::Packed => 48,
+        }
+    }
+}
+
+/// An activation's `this` lent to Rust code that takes a `&Value` (see [`JitCtx::this_view`]):
+/// the default build's view points at the context's wide field, a gc-heap view holds the
+/// widened word.
+pub(crate) struct JitThisView {
+    #[cfg(not(feature = "gc-heap"))]
+    this: *const Value,
+    #[cfg(feature = "gc-heap")]
+    this: Value,
+}
+
+impl std::ops::Deref for JitThisView {
+    type Target = Value;
+
+    #[inline]
+    fn deref(&self) -> &Value {
+        #[cfg(feature = "gc-heap")]
+        return &self.this;
+        // SAFETY: `JitCtx::this_view`'s contract keeps the pointed-to field alive and unchanged.
+        #[cfg(not(feature = "gc-heap"))]
+        unsafe {
+            &*self.this
+        }
+    }
+}
+
+// The activation's `this`, wherever the build keeps it. Rust reads and writes it only here.
+impl JitCtx {
+    /// The activation's `this` as a wide Value: a clone of the default build's field, or the
+    /// gc-heap word widened.
+    #[inline]
+    pub(crate) fn this_value(&self) -> Value {
+        #[cfg(feature = "gc-heap")]
+        return self.this_word.unpack();
+        #[cfg(not(feature = "gc-heap"))]
+        self.this_val.clone()
+    }
+
+    /// Lend the activation's `this` as a wide Value without taking a new owner (default build)
+    /// and without borrowing the context, so the caller can lend the context's other fields
+    /// beside it. gc-heap widens the word into the view.
+    ///
+    /// # Safety
+    /// Default build: the view points into this context, which must stay alive and keep its
+    /// `this` unreplaced while the view is used.
+    #[inline]
+    pub(crate) unsafe fn this_view(&self) -> JitThisView {
+        JitThisView {
+            #[cfg(not(feature = "gc-heap"))]
+            this: &self.this_val,
+            #[cfg(feature = "gc-heap")]
+            this: self.this_word.unpack(),
+        }
+    }
+
+    /// Install the activation's `this`, releasing the previous one (the default build's owner;
+    /// a gc-heap word owns nothing).
+    #[inline]
+    pub(crate) fn set_this(&mut self, this: JitThis) {
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            self.this_val = this;
+        }
+        #[cfg(feature = "gc-heap")]
+        {
+            self.this_word = this;
+        }
+    }
+
+    /// Reset the activation's `this` to Undefined, a pooled record's invariant, releasing the
+    /// previous one (gc-heap: one store of the complete Undefined word).
+    #[inline]
+    pub(crate) fn clear_this(&mut self) {
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            self.this_val = Value::Undefined;
+        }
+        #[cfg(feature = "gc-heap")]
+        {
+            self.this_word = PackedValue::pack(Value::Undefined);
+        }
+    }
+}
+
 impl JitCtx {
     #[inline]
     pub(crate) fn take_ret(&mut self) -> PackedValue {
@@ -1923,12 +2067,11 @@ impl crate::gc_trace::GcTrace for JitCtx {
             // keeps on the caller's operand stack and in its FnFrame, by `activation`, or by
             // the VM frame a borrowed entry runs (registered by `drive_vm`).
             env_raw: _,
-            this_raw: _,    // points at `this_val`
+            this_word,
             global_body: _, // the realm's global object and scope
             genv: _,
             interp: _,
             chunk: _, // code, not cells
-            this_val,
             n_slots: _,
             handlers: _, // pcs and depths
             handler_floor: _,
@@ -1952,7 +2095,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             accessor_holder: _, // consumed before any JavaScript runs
             accessor_slot: _,
         } = self;
-        this_val.trace_gc(sink);
+        this_word.trace_gc(sink);
         ret.trace_gc(sink);
         error.trace_gc(sink);
         activation.trace_gc(sink);
@@ -2586,6 +2729,14 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, intrinsic) == 96);
     const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, realm) == 104);
     const _: () = assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 112);
+    // [48]: the default build's pointer to its wide `this`, or gc-heap's 8-byte packed word.
+    #[cfg(not(feature = "gc-heap"))]
+    const _: () = assert!(std::mem::offset_of!(JitCtx, this_raw) == 48);
+    #[cfg(feature = "gc-heap")]
+    const _: () = assert!(
+        std::mem::offset_of!(JitCtx, this_word) == 48
+            && std::mem::size_of::<crate::value::PackedValue>() == 8
+    );
     const _: () = assert!(std::mem::offset_of!(JitCtx, genv) == 64);
     // 3b reads Interp state from machine code through ctx.interp.
     const _: () = assert!(std::mem::offset_of!(JitCtx, interp) == 72);
@@ -4921,6 +5072,7 @@ fn compile_entry(
             &mut a,
             ilayout,
             layout.ownership(),
+            layout.ctx_this(),
             rc_ok && layout.ownership().count_first(),
         );
     }
@@ -5465,7 +5617,8 @@ fn emit_load_active_proto(a: &mut asm::Asm, proto_off: usize) {
 enum PropRecv {
     /// Operand stack top (classic GetProp/GetMethod): consumed, refcount-managed.
     Stack,
-    /// The frame's `this` binding (`ctx.this_val`): owned by the frame, no refcounting.
+    /// The frame's `this` binding (read at [48] of the context, see [`JitThisRepr`]): owned
+    /// by the frame, no refcounting.
     This,
     /// A local slot (alive for the whole frame): no refcounting.
     Slot(u32),
@@ -5933,6 +6086,17 @@ fn emit_prop_load_inline(
             if !method {
                 // receiver refcount > 1 (so the pop-drop below never frees)
                 rc_guard_nonfinal(a, own, 10, 9, 1, slow);
+            }
+        }
+        PropRecv::This if layout.ctx_this() == JitThisRepr::Packed => {
+            // The packed word at [48]: the slot form's guard and payload, and its packed probe
+            // for primitive receivers.
+            emit_exec_word_load(a, 9, 19, 48); // ctx.this_word
+            if wrap_ok {
+                emit_packed_probe_receiver(a);
+            } else {
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+                emit_exec_payload(a, 9, 10);
             }
         }
         PropRecv::This => {
@@ -7747,7 +7911,7 @@ fn direct_call_supported(
         && fits8(il.new_target + 8)
         // The handlers Vec's length-word offset within JitCtx (per-instantiation, probed).
         && jit_handlers_len_offset().is_some_and(fits8)
-        && fits8(offset_of!(JitCtx, this_val))
+        && fits8(layout.ctx_this().record_offset())
         && fits8(offset_of!(JitCtx, ret))
         && fits8(offset_of!(JitCtx, live_objects))
         && attempted_off < 4096
@@ -7836,7 +8000,8 @@ fn emit_direct_call(
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_code_base = offset_of!(JitCtx, code_base) as u32;
     let cx_pc_offsets = offset_of!(JitCtx, pc_offsets) as u32;
-    let cx_this = offset_of!(JitCtx, this_val) as u32;
+    let ctx_this = layout.ctx_this();
+    let cx_this = ctx_this.record_offset() as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
     // Same ownership contract as the templates (layout.valid checked upstream).
     let own = layout.ownership();
@@ -7887,7 +8052,7 @@ fn emit_direct_call(
         a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
     }
     a.bind(this_ok);
-    if with_this {
+    if with_this && ctx_this != JitThisRepr::Packed {
         // Decode before committing any state. x0/x1 retain this moved wide pair until
         // installation; the mutation sequence below touches only x3..x17.
         a.sub_imm(3, 20, ((argc + 2) * 8) as u32);
@@ -8053,8 +8218,9 @@ fn emit_direct_call(
     a.bind(init_done);
 
     // ---- install the callee's per-frame fields in its own record ----
-    // Interpreter-constant fields (helpers, interp, counters, slots, this_raw) were written when
-    // the record was created; this_val/ret/error/handlers are vacant while it is pooled.
+    // Interpreter-constant fields (helpers, interp, counters, slots, the default build's
+    // this_raw) were written when the record was created; this/ret/error/handlers are vacant
+    // while it is pooled.
     // stack_base = slots + n_slots*8
     a.movz(4, 8, 0);
     a.madd(3, 5, 4, 15);
@@ -8079,7 +8245,18 @@ fn emit_direct_call(
     a.str_imm(4, 9, 56);
     a.ldr_imm(4, 19, 64);
     a.str_imm(4, 9, 64);
-    if with_this {
+    if with_this && ctx_this == JitThisRepr::Packed {
+        // gc-heap: move the receiver's word as it is into the callee's [48], even when the
+        // callee never reads `this`: it owns nothing, and the finish stub resets it.
+        let receiver = ((argc + 2) * 8) as u32;
+        if receiver <= 256 {
+            a.ldur(4, 20, -(receiver as i32));
+        } else {
+            a.sub_imm(4, 20, receiver);
+            a.ldr_imm(4, 4, 0);
+        }
+        a.str_imm(4, 9, cx_this);
+    } else if with_this {
         // ALWAYS move the receiver into the callee's this_val — even when the callee never
         // reads `this` — because the finish stub's release of that binding is what consumes it
         // (skipping it would leak the receiver on every this-less method call).
@@ -8163,6 +8340,8 @@ fn emit_direct_call(
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Numeric-chain property operations compiled with `this` as their receiver.
+    static TEST_THIS_CHAIN_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -8774,12 +8953,14 @@ fn emit_direct_finish_stub(
     il: &crate::interpreter::InterpLayout,
     // The ownership the inline teardown releases slots and `this` with.
     own: JitOwnership,
+    // How the record holds `this` (`JitLayout::ctx_this`).
+    this: JitThisRepr,
     // The templates' rc contract (strong at payload+0) — without it every teardown takes the
     // helper (which falls back to real drops).
     rc_dec_ok: bool,
 ) {
     use std::mem::offset_of;
-    let cx_this = offset_of!(JitCtx, this_val) as u32;
+    let cx_this = this.record_offset() as u32;
     let cx_slots = offset_of!(JitCtx, slots) as u32;
     let cx_n_slots = offset_of!(JitCtx, n_slots) as u32;
     let cx_ret = offset_of!(JitCtx, ret) as u32;
@@ -8856,9 +9037,9 @@ fn emit_direct_finish_stub(
         // record's `this` binding to Undefined (a pooled invariant) on every path:
         // `jit_drop_at` destroys the Value in place without overwriting it, so a
         // last-reference receiver (`new C().m()`) left the record naming a freed object; the
-        // record's next entry, finish or release then dropped it again.
-        frame_this_release(a, own, cx_this);
-        a.strb_imm(31, 10, cx_this);
+        // record's next entry, finish or release then dropped it again. x5 still holds the
+        // complete Undefined word a packed `this` takes.
+        frame_this_reset(a, own, this, 5);
         frame_slots_release(a, own, cx_slots, cx_n_slots);
         // Bookkeeping (x14/x16/x7 may be stale after helper drops: re-read everything).
         a.ldr_imm(14, 19, 72); // ctx.interp
@@ -9773,6 +9954,11 @@ fn emit_set_prop_inline(
             emit_exec_payload(a, 9, 10); // receiver rc_ptr
                                          // receiver refcount > 1 (so the pop-drop below never frees)
             rc_guard_nonfinal(a, own, 10, 9, 1, slow);
+        }
+        PropRecv::This if layout.ctx_this() == JitThisRepr::Packed => {
+            emit_exec_word_load(a, 9, 19, 48); // ctx.this_word
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+            emit_exec_payload(a, 9, 10);
         }
         PropRecv::This => {
             a.ldr_imm(14, 19, 48); // ctx.this_raw
@@ -11622,6 +11808,7 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
             &mut a,
             context.ilayout?,
             layout.ownership(),
+            layout.ctx_this(),
             rc_ok && layout.ownership().count_first(),
         );
     }
@@ -14332,7 +14519,15 @@ fn emit_chain_marked(
                 // Receiver-direct compact property probe. Unlike the ordinary property
                 // template, a successful read never materializes a wide Value or adjusts a
                 // refcount: the numeric payload enters the chain's FP register stack directly.
+                #[cfg(all(test, target_arch = "aarch64"))]
                 if off == u32::MAX {
+                    TEST_THIS_CHAIN_OPS.with(|ops| ops.set(ops.get() + 1));
+                }
+                if off == u32::MAX && layout.ctx_this() == JitThisRepr::Packed {
+                    a.ldr_imm(10, 19, 48); // ctx.this_word
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
+                    emit_exec_payload(a, 10, 10);
+                } else if off == u32::MAX {
                     a.ldr_imm(14, 19, 48); // ctx.this_raw
                     a.ldrb_imm(9, 14, 0);
                     a.cmp_imm_w(9, 8);
@@ -14420,7 +14615,15 @@ fn emit_chain_marked(
             }
             ChainOp::StoreProp(off, st) => {
                 let (dv, _) = vregs.pop().expect("chain vstack");
+                #[cfg(all(test, target_arch = "aarch64"))]
                 if off == u32::MAX {
+                    TEST_THIS_CHAIN_OPS.with(|ops| ops.set(ops.get() + 1));
+                }
+                if off == u32::MAX && layout.ctx_this() == JitThisRepr::Packed {
+                    a.ldr_imm(10, 19, 48); // ctx.this_word
+                    emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
+                    emit_exec_payload(a, 10, 10);
+                } else if off == u32::MAX {
                     a.ldr_imm(14, 19, 48); // ctx.this_raw
                     a.ldrb_imm(9, 14, 0);
                     a.cmp_imm_w(9, 8);
@@ -18592,11 +18795,16 @@ pub(crate) unsafe fn run_borrowed_frame(
         slots: slots.as_ptr().cast_mut(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(env) as *const u8,
+        #[cfg(not(feature = "gc-heap"))]
         this_raw: std::ptr::null(),
+        // The VM frame's `this` stays wide; the native run reads it packed.
+        #[cfg(feature = "gc-heap")]
+        this_word: PackedValue::pack(this_val.clone()),
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
         interp: i,
         chunk,
+        #[cfg(not(feature = "gc-heap"))]
         this_val: this_val.clone(),
         n_slots: slots.len(),
         handlers: std::mem::take(handlers),
@@ -18619,7 +18827,10 @@ pub(crate) unsafe fn run_borrowed_frame(
         resume_pc: *pc,
         resume_step: None,
     };
-    ctx.this_raw = &ctx.this_val;
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        ctx.this_raw = &ctx.this_val;
+    }
     stack.set_len(0);
     // gc-heap: the lent operand words leave the VM frame's traced length for the native run,
     // so they are this context's roots until it ends: the buffer's whole capacity, which covers
@@ -18744,7 +18955,10 @@ pub fn run(
         stack_base,
         final_sp: stack_base,
         env_raw,
+        #[cfg(not(feature = "gc-heap"))]
         this_raw: std::ptr::null(),
+        #[cfg(feature = "gc-heap")]
+        this_word: PackedValue::pack(this_val),
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
         env_parent_raw,
@@ -18755,6 +18969,7 @@ pub fn run(
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
+        #[cfg(not(feature = "gc-heap"))]
         this_val,
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
@@ -18773,7 +18988,10 @@ pub fn run(
         error: None,
         ret: PackedValue::pack(Value::Undefined),
     };
-    ctx.this_raw = &ctx.this_val as *const Value;
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        ctx.this_raw = &ctx.this_val as *const Value;
+    }
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // gc-heap: the pooled buffers are this context's roots for the native run (the stack scan
     // sees the context itself): every slot, initialized above, and the operand words up to
@@ -18829,12 +19047,14 @@ pub(crate) const FRAME_POOL_LIMIT: usize = 256;
 /// calls alike — so entering a frame writes only the callee's per-frame fields. Nothing is
 /// saved, swapped into a shared context, or restored afterwards. Interpreter-constant fields
 /// (helper table, interpreter, live-object counter, IC-safety byte, diagnostic switches and the
-/// `slots`/`this_raw` self-pointers) are written once, when the record is created; a record never
-/// leaves its interpreter's pool.
+/// `slots` self-pointer, and in the default build the `this_raw` one) are written once, when the
+/// record is created; a record never leaves its interpreter's pool.
 ///
-/// Pooled records hold: `this_val` and `ret` Undefined; `error`, `activation` and `resume_step`
-/// None; an empty `handlers` Vec (capacity retained); null resume/reference pointers; and a zero
-/// handler floor. Generated code relies on these to skip the corresponding stores on entry.
+/// Pooled records hold: `this` (the default build's `this_val`, gc-heap's complete Undefined
+/// word at [48]) and `ret` Undefined; `error`, `activation` and `resume_step` None; an empty
+/// `handlers` Vec (capacity retained); null resume/reference pointers; and a zero handler floor.
+/// Generated code relies on these to skip the corresponding stores on entry: a receiver-less
+/// direct call leaves the callee's `this` as the pool left it.
 ///
 /// gc-heap rooting: the interpreter's `FramePool` registers every record, and the collector
 /// traces each one that is not pooled — from the pop that starts an activation (by a Rust entry
@@ -18882,11 +19102,15 @@ impl JitFrame {
                 slots: words,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 env_raw: std::ptr::null(),
+                #[cfg(not(feature = "gc-heap"))]
                 this_raw: std::ptr::null(),
+                #[cfg(feature = "gc-heap")]
+                this_word: PackedValue::pack(Value::Undefined),
                 global_body: std::ptr::null(),
                 genv: 0,
                 interp: i as *mut Interp,
                 chunk: std::ptr::null(),
+                #[cfg(not(feature = "gc-heap"))]
                 this_val: Value::Undefined,
                 n_slots: 0,
                 handlers: Vec::new(),
@@ -18909,7 +19133,10 @@ impl JitFrame {
                 accessor_holder: 0,
                 accessor_slot: 0,
             });
-            (*base).ctx.this_raw = std::ptr::addr_of!((*base).ctx.this_val);
+            #[cfg(not(feature = "gc-heap"))]
+            {
+                (*base).ctx.this_raw = std::ptr::addr_of!((*base).ctx.this_val);
+            }
             std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
         };
         #[cfg(feature = "gc-heap")]
@@ -18928,7 +19155,7 @@ impl JitFrame {
         ctx.handlers.clear();
         ctx.handler_floor = 0;
         // Owned values are released here, not by the next user of the record.
-        ctx.this_val = Value::Undefined;
+        ctx.clear_this();
         drop(ctx.take_ret());
         ctx.error = None;
         ctx.activation = None;
@@ -18970,7 +19197,7 @@ pub(crate) unsafe fn run_moved(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: Value,
+    this_val: JitThis,
     args: *mut PackedValue,
     argc: usize,
     // `chunk.jit_frame()`, precomputed by the caller (the cached call reads it from its IC).
@@ -19002,7 +19229,7 @@ pub(crate) unsafe fn run_moved_shared(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: Value,
+    this_val: JitThis,
     args: *mut PackedValue,
     argc: usize,
     frame: (usize, usize),
@@ -19037,7 +19264,7 @@ pub(crate) unsafe fn run_moved_env(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     definition_env: *const Env,
-    this_val: Value,
+    this_val: JitThis,
     args: *mut PackedValue,
     argc: usize,
     frame: (usize, usize),
@@ -19084,7 +19311,7 @@ unsafe fn run_moved_inner(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: Value,
+    this_val: JitThis,
     args: *mut PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
@@ -19149,7 +19376,7 @@ unsafe fn run_moved_inner(
     ctx.global_body = jit_global_body(i, code);
     ctx.genv = Env::as_ptr(&i.global_env) as usize;
     ctx.chunk = Rc::as_ptr(chunk);
-    ctx.this_val = this_val;
+    ctx.set_this(this_val);
     ctx.n_slots = n_slots;
     ctx.code_base = code.mem;
     ctx.pc_offsets = code.pc_offsets.as_ptr();
@@ -19198,7 +19425,7 @@ unsafe fn run_moved_oversized(
     chunk: &Rc<Chunk>,
     code: &JitCode,
     env: *const Env,
-    this_val: Value,
+    this_val: JitThis,
     args: *mut PackedValue,
     argc: usize,
     (n_params, n_slots): (usize, usize),
@@ -19237,7 +19464,10 @@ unsafe fn run_moved_oversized(
         stack_base,
         final_sp: stack_base,
         env_raw: Env::as_ptr(env) as *const u8,
+        #[cfg(not(feature = "gc-heap"))]
         this_raw: std::ptr::null(),
+        #[cfg(feature = "gc-heap")]
+        this_word: this_val,
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
         env_parent_raw: jit_env_parent_raw(env),
@@ -19248,6 +19478,7 @@ unsafe fn run_moved_oversized(
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
+        #[cfg(not(feature = "gc-heap"))]
         this_val,
         slots: slots_ptr,
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
@@ -19266,7 +19497,10 @@ unsafe fn run_moved_oversized(
         error: None,
         ret: PackedValue::pack(Value::Undefined),
     };
-    ctx.this_raw = &ctx.this_val as *const Value;
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        ctx.this_raw = &ctx.this_val as *const Value;
+    }
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // gc-heap: as in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
     // above, are named here; the operand words are initialized up to `max_stack`.
@@ -19343,7 +19577,7 @@ pub(crate) unsafe fn run_moved(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: Value,
+    _this_val: JitThis,
     _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
@@ -19368,7 +19602,7 @@ pub(crate) unsafe fn run_moved_shared(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: Value,
+    _this_val: JitThis,
     _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),
@@ -19392,7 +19626,7 @@ pub(crate) unsafe fn run_moved_env(
     _chunk: &Rc<Chunk>,
     _code: &JitCode,
     _env: *const Env,
-    _this_val: Value,
+    _this_val: JitThis,
     _args: *mut PackedValue,
     _argc: usize,
     _frame: (usize, usize),

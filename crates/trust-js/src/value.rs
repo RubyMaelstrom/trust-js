@@ -1532,6 +1532,10 @@ pub(crate) struct JitRepr {
     /// alone), so one unsigned range test can admit them. Probed: Collection's tag must directly
     /// follow None's.
     pub(crate) exotic_ordinary_contiguous: bool,
+    /// How a `JitCtx` holds the activation's `this` at [48]: a pointer to its wide `this_val`
+    /// in the default build, the packed word itself under gc-heap. Derived from the build's
+    /// cfg'd context layout, which the prefix assertions pin (not probed).
+    pub(crate) ctx_this: crate::jit::JitThisRepr,
     /// The ownership, PropertyLayout count, named-field and Collection-tag probes held: a
     /// `JitLayout` is valid only if they did.
     pub(crate) valid: bool,
@@ -1649,6 +1653,7 @@ fn probe_jit_repr() -> JitRepr {
         slot_memo_none,
         exotic_collection_tag,
         exotic_ordinary_contiguous,
+        ctx_this: crate::jit::JitThisRepr::BUILD,
         valid: ownership_ok
             && layout_rc_strong_off.is_some()
             && props_fields.is_some()
@@ -3318,6 +3323,16 @@ impl PackedValue {
             }
             _ => self.with_object_edge(|object| sink.object(object)),
         }
+    }
+
+    /// Whether this word is undefined or null. Reads no payload.
+    pub(crate) fn is_nullish(&self) -> bool {
+        matches!(self.tag(), PACK_UNDEFINED | PACK_NULL)
+    }
+
+    /// Whether this word is an object's (a deferred prototype's is not). Reads no payload.
+    pub(crate) fn is_object(&self) -> bool {
+        self.tag() == PACK_OBJ
     }
 }
 

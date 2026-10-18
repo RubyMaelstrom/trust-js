@@ -1449,6 +1449,13 @@ fn emit_borrowed_own_read(
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
     let reused = previous_cache.is_some();
     match receiver {
+        PropRecv::This if layout.ctx_this() == JitThisRepr::Packed => {
+            emit_exec_word_load(a, 9, 19, 48); // ctx.this_word, which this activation keeps
+            if !reused {
+                emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, fail);
+            }
+            emit_exec_payload(a, 9, 10);
+        }
         PropRecv::This => {
             a.ldr_imm(14, 19, 48); // wide ctx.this_raw; owned by this activation
             if !reused {
@@ -3851,6 +3858,12 @@ fn emit_effect(
         return;
     }
     match *op {
+        Op::LoadThis if fast & 32768 != 0 && layout.ctx_this() == JitThisRepr::Packed => {
+            // As in the baseline template: [48] is the packed word, which owns nothing.
+            a.ldr_imm(12, 19, 48); // ctx.this_word
+            emit_exec_word_store(a, 12, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
         Op::LoadThis if fast & 32768 != 0 => {
             let slow = a.new_label();
             let done = a.new_label();

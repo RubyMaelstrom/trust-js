@@ -455,7 +455,8 @@ fn maps_and_sets_take_the_ordinary_object_paths() {
 /// The `Traced` arm of every ownership emitter that takes a [`super::JitOwnership`] emits
 /// nothing: the count emitters, the execution-word clone, shared drop and releases (whose
 /// owner guard is counted-only, so no tag reaches a checked path through them), and the frame
-/// teardown.
+/// teardown. A finished direct callee's packed `this` (gc-heap's [48]) is released by nothing:
+/// the finish stub's reset is one store of the complete Undefined word it holds in x5.
 #[test]
 fn traced_ownership_emitters_emit_nothing() {
     use super::JitOwnership::Traced;
@@ -482,6 +483,13 @@ fn traced_ownership_emitters_emit_nothing() {
     frame_slots_release(&mut a, Traced, 64, 72);
     assert!(a.buf.is_empty(), "{} words emitted", a.buf.len());
     assert!(!a.label_referenced(label), "a Traced arm branches");
+    let layout = crate::value::jit_layout(&crate::value::Object::new(None));
+    assert_eq!(layout.ctx_this(), JitThisRepr::Packed);
+    let mut reset = asm::Asm::new();
+    frame_this_reset(&mut reset, Traced, layout.ctx_this(), 5);
+    let mut store = asm::Asm::new();
+    store.str_imm(5, 10, 48);
+    assert_eq!(reset.finish(), store.finish(), "one store of x5 over [48]");
 }
 
 /// The two property stores whose old word can be a function's deferred prototype (step 9b),

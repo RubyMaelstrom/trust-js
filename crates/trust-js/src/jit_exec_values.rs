@@ -1,5 +1,6 @@
-//! ARM64 compact execution-word primitives. Canonical local/operand owners are one
-//! PackedValue; wide `this`, return fields and lexical Binding cells are separate ABIs.
+//! ARM64 compact execution-word primitives. Canonical local/operand owners and a context's return
+//! slot (`ret`) are one PackedValue, as is its `this` under gc-heap; the default build's `this`
+//! and lexical Binding cells are wide Values, separate ABIs.
 //! ECMA-262 §6.1.6.1 (snapshot e28783d5): preserve signed zero/infinities; NaN payload
 //! canonicalization is allowed and prevents numeric bits from aliasing internal tags.
 

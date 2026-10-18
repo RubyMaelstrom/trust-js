@@ -458,6 +458,14 @@ fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
     }
 }
 
+/// Whether a property template can take `recv`: the `this` form reads [r12+0x30] as the default
+/// build's pointer to a wide `this` (`JitThisRepr::Wide`); gc-heap's packed word keeps the
+/// checked helper until the x64 pass of S6.
+fn this_form_ok(layout: &crate::value::JitLayout, recv: PropRecv) -> bool {
+    !matches!(recv, PropRecv::This)
+        || matches!(layout.ctx_this(), crate::jit::JitThisRepr::Wide { .. })
+}
+
 /// Probe the live property IC, including fills made after this machine body was compiled.
 /// Receiver, cache, bounds, descriptor and owner checks precede the single clone/push commit.
 /// The canonical local/this owner keeps the receiver alive throughout the borrowed lookup.
@@ -472,6 +480,9 @@ fn emit_prop_own(
     let Some((fields_len, fields_ptr)) = vec_fields(layout) else {
         return false;
     };
+    if !this_form_ok(layout, recv) {
+        return false;
+    }
     let offsets = [
         layout.obj_from_rc,
         layout.obj_exotic,
@@ -628,6 +639,7 @@ fn emit_prop_num(
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
         || layout.entry_size.checked_mul(st.slot as usize).is_none()
+        || !this_form_ok(layout, recv)
     {
         return false;
     }

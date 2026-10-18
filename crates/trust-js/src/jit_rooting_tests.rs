@@ -673,12 +673,11 @@ fn return_context() -> super::JitCtx {
         slots: std::ptr::null_mut(),
         inline_ic_safe: std::ptr::null(),
         env_raw: std::ptr::null(),
-        this_raw: std::ptr::null(),
+        this_word: PackedValue::pack(Value::Undefined),
         global_body: std::ptr::null(),
         genv: 0,
         interp: std::ptr::null_mut(),
         chunk: std::ptr::null(),
-        this_val: Value::Undefined,
         n_slots: 0,
         handlers: Vec::new(),
         handler_floor: 0,
@@ -917,9 +916,111 @@ fn committed_native_call_operands_are_roots() {
     assert_tracked_collectable(&mut engine);
 }
 
+/// One round of [`context_this_word_is_a_root`].
+#[inline(never)]
+fn this_round(i: &mut Interp) {
+    let mut ctx = return_context();
+    let this = track_into(i, &mut ctx.this_word, "this");
+    let _frame = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
+        ctx: &ctx,
+        words: [(std::ptr::null(), 0), (std::ptr::null(), 0)],
+    });
+    collect_here(i);
+    assert_eq!(
+        weak_marker(&i.gc_heap, &this),
+        'R',
+        "the context's `this` word keeps it"
+    );
+    assert_eq!(tag_of(&ctx.this_word).as_deref(), Some("this"));
+    ctx.clear_this();
+    assert!(ctx.this_word.is_undefined());
+    collect_here(i);
+    assert_eq!(
+        weak_marker(&i.gc_heap, &this),
+        'D',
+        "a cleared `this` lets it go"
+    );
+}
+
+/// (16) A context's `this`, the packed word at [48], through a synthetic context registered as a
+/// Rust entry's activation (`gc_trace::enter_jit_frame`): the object it names, which nothing else
+/// roots, is marked first by the context, a root, while the context is registered (the context
+/// itself lies on the native stack, whose scan comes after the roots); once `this` is cleared to
+/// Undefined, as a pooled record's is, the object is collectable.
+#[test]
+fn context_this_word_is_a_root() {
+    let mut engine = jit_engine(0);
+    this_round(&mut engine.interp);
+    assert_tracked_collectable(&mut engine);
+}
+
+/// A fresh object `{tag}` for [`call_on`], made and tracked in a frame of its own.
+#[inline(never)]
+fn fresh_this(i: &mut Interp, tag: Value) -> Value {
+    let object = i.new_object();
+    object
+        .borrow_mut()
+        .props
+        .insert("tag", Property::plain(tag));
+    track(i, Value::Undefined, &[Value::Obj(object)]).unwrap_or(Value::Undefined)
+}
+
+/// `callOn(f, tag)`: call `f` from Rust with a fresh object `{tag}` as `this` and 40 as its
+/// argument. The object exists only in this native's Rust frames until the call binds it as
+/// the callee's `this`.
+fn call_on(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    let callee = args.first().cloned().unwrap_or(Value::Undefined);
+    let this = fresh_this(i, args.get(1).cloned().unwrap_or(Value::Undefined));
+    i.call(callee, this, &[Value::Num(40.0)])
+        .map_err(crate::interpreter::abrupt_value)
+}
+
+/// (17) An object reachable only as a running activation's `this`: a native makes it and calls a
+/// compiled function with it as `this` from Rust, so `jit::run` binds it in the context of its
+/// registered entry and nothing else roots it (the native's frames are stack). The function
+/// collects (marked first by a root: the context's `this` word), allocates 40 objects, which
+/// collect at every allocation under `TRUST_JS_GC_STRESS=1`, and reads `this.tag` back, for a
+/// sloppy and a strict callee.
+#[test]
+fn entry_this_is_a_root() {
+    let mut engine = jit_engine(0);
+    install(&mut engine, "callOn", 2, call_on);
+    let source = r#"
+        function check(n) {
+            var marks = collect(), junk = [];
+            for (var k = 0; k < n; k++) junk.push({k: k});
+            return marks + ':' + this.tag + ':' + junk.length;
+        }
+        function strictCheck(n) {
+            'use strict';
+            var marks = collect(), junk = [];
+            for (var k = 0; k < n; k++) junk.push({k: k});
+            return marks + ':' + this.tag + ':' + junk.length;
+        }
+        function entries(n) {
+            return callOn(check, 'E' + n) + ',' + callOn(strictCheck, 'S' + n);
+        }
+        entries(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "R:E0:40,R:S0:40");
+    assert_native(&mut engine, &["check", "strictCheck", "entries"]);
+    for n in 1..3 {
+        assert_eq!(
+            run(&mut engine, &format!("entries({n});")),
+            format!("R:E{n}:40,R:S{n}:40")
+        );
+        assert!(
+            !last_census().entries.is_empty(),
+            "the callee ran on a registered Rust entry"
+        );
+    }
+    assert_tracked_collectable(&mut engine);
+}
+
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
 /// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
-/// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, the deferred
+/// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, every kind of
+/// `this` through the sites of `jit::this_tests`, the deferred
 /// prototypes' cells (their lifetime, trace, materialization and Rust overwrites, the packed
 /// drop boundary and a deferred prototype's memory report), the reads that materialize a
 /// deferred prototype as they copy it out and the bit-copy words of packed and execution
@@ -939,6 +1040,7 @@ fn rooting_holds_under_gc_stress() {
             "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
             "jit::traced_tests::",
             "jit::word_routing_tests::",
+            "jit::this_tests::",
             "value::lazy_function_prototype::tests::dead_constructors_leave_no_reserved_cells",
             "value::lazy_function_prototype::tests::deferred_prototype",
             "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes",

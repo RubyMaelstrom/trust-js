@@ -457,6 +457,30 @@ pub(super) fn frame_this_release(a: &mut asm::Asm, own: JitOwnership, cx_this: u
     a.bind(this_done);
 }
 
+/// Release a finished direct callee's `this` (record in x10) and leave Undefined in its place on
+/// every path: the pooled invariant a receiver-less direct call relies on, since it does not
+/// write the callee's `this`. A wide binding (the default build) takes [`frame_this_release`] and
+/// then the Undefined tag byte. A packed word (gc-heap) owns nothing, so nothing is released, and
+/// it becomes the complete PACK_UNDEFINED word, which the caller passes in `undefined` (a zero
+/// word would be +0.0). Clobbers what `frame_this_release` does; a packed reset clobbers nothing.
+pub(super) fn frame_this_reset(
+    a: &mut asm::Asm,
+    own: JitOwnership,
+    this: JitThisRepr,
+    undefined: u32,
+) {
+    match this {
+        JitThisRepr::Wide { value } => {
+            frame_this_release(a, own, value as u32);
+            a.strb_imm(31, 10, value as u32);
+        }
+        JitThisRepr::Packed => {
+            assert!(!own.counted(), "a packed `this` is traced");
+            a.str_imm(undefined, 10, this.record_offset() as u32);
+        }
+    }
+}
+
 /// Release every slot of a finished direct callee's record (x10; slot base at `cx_slots`,
 /// count at `cx_n_slots`). The strong count is re-read PER VALUE, after all earlier
 /// decrements: two slots aliasing one object (`a = b = new X` seeds several slots from one

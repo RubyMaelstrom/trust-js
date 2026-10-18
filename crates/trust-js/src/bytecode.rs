@@ -20582,13 +20582,21 @@ impl Chunk {
 
     /// Seed captured owners directly from the still-live caller operand list. The ordinary
     /// frame subsequently consumes those words; the environment owns only its captured copies.
+    /// Under gc-heap `this` arrives packed and is widened only for an activation that binds it
+    /// (an inner arrow chain reads it).
     pub(crate) fn jit_make_run_env_packed(
         &self,
         i: &mut Interp,
         env: &Env,
-        this_val: &Value,
+        this_val: &crate::jit::JitThis,
         args: &[PackedValue],
     ) -> Env {
+        #[cfg(feature = "gc-heap")]
+        let this_val = &if self.env_this && !self.lexical_this {
+            this_val.unpack()
+        } else {
+            Value::Undefined
+        };
         self.make_run_env_from(i, env, this_val, CallArgs::Packed(args))
     }
     /// (pops, pushes) of the op at `pc`, for the static stack-depth analysis. `None` = an op the
@@ -21033,6 +21041,7 @@ unsafe fn jit_continuation_operation(
     let result = if next == chunk.ops.len() {
         Ok(VmStep::Done(Value::Undefined))
     } else {
+        let this = ctx.this_view();
         run_vm(
             &mut *ctx.interp,
             chunk,
@@ -21042,7 +21051,7 @@ unsafe fn jit_continuation_operation(
             std::slice::from_raw_parts(ctx.slots, ctx.n_slots),
             stack,
             &mut next,
-            &ctx.this_val,
+            &this,
             &mut ctx.handlers,
             &mut *state.disposal_frames,
             &mut *state.class_states,
@@ -21363,6 +21372,7 @@ unsafe fn jit_vm_operation(
     }
     jit_opstat(ctx, pc);
     ensure_native_activation(ctx);
+    let this = ctx.this_view();
     let activation = ctx
         .activation
         .as_mut()
@@ -21382,7 +21392,7 @@ unsafe fn jit_vm_operation(
         std::slice::from_raw_parts(ctx.slots, ctx.n_slots),
         &mut activation.stack,
         &mut next,
-        &ctx.this_val,
+        &this,
         &mut ctx.handlers,
         &mut activation.disposal_frames,
         &mut activation.class_states,
@@ -23310,7 +23320,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
         Op::SetPropThisDrop(n, c) => {
             sp = sp.sub(1);
             let v = sp.read().into_value();
-            let this = (*ctx.this_raw).clone();
+            let this = ctx.this_value();
             set_named_property(
                 i,
                 chunk,
@@ -23647,24 +23657,30 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                 Ok(())
             }
             Op::GetPropThis(n, c) => {
-                let this = &*ctx.this_raw;
+                let this = ctx.this_view();
                 jit_propstat(
                     ctx,
                     i,
-                    this,
+                    &this,
                     &chunk.names[n as usize],
                     &chunk.caches[c as usize],
                     pc,
                 );
                 let v = match unsafe {
-                    jit_accessor_fast(accessor_validated, i, chunk, &chunk.names[n as usize], this)
+                    jit_accessor_fast(
+                        accessor_validated,
+                        i,
+                        chunk,
+                        &chunk.names[n as usize],
+                        &this,
+                    )
                 } {
                     Some(r) => r?,
                     None => get_named_property(
                         i,
                         chunk,
                         pc as usize,
-                        this,
+                        &this,
                         &chunk.names[n as usize],
                         &chunk.caches[c as usize],
                     )?,
@@ -24764,7 +24780,7 @@ unsafe fn jit_exec_inner(
             let v = pop!();
             chunk.store_name_ic(i, env, n, c, v)?;
         }
-        Op::LoadThis => push!(ctx.this_val.clone()),
+        Op::LoadThis => push!(ctx.this_value()),
         Op::GetProp(n, c) => {
             let obj = pop!();
             jit_propstat(
@@ -24786,7 +24802,7 @@ unsafe fn jit_exec_inner(
             push!(v);
         }
         Op::GetPropThis(n, c) => {
-            let this = (*ctx.this_raw).clone();
+            let this = ctx.this_value();
             jit_propstat(
                 ctx,
                 i,
@@ -24863,7 +24879,7 @@ unsafe fn jit_exec_inner(
         }
         Op::SetPropThisDrop(n, c) => {
             let v = pop!();
-            let this = (*ctx.this_raw).clone();
+            let this = ctx.this_value();
             set_named_property(
                 i,
                 chunk,
@@ -26161,11 +26177,15 @@ mod return_slot_tests {
             slots: std::ptr::null_mut(),
             inline_ic_safe: std::ptr::null(),
             env_raw: std::ptr::null(),
+            #[cfg(not(feature = "gc-heap"))]
             this_raw: std::ptr::null(),
+            #[cfg(feature = "gc-heap")]
+            this_word: PackedValue::pack(Value::Undefined),
             global_body: std::ptr::null(),
             genv: 0,
             interp: std::ptr::null_mut(),
             chunk: std::ptr::null(),
+            #[cfg(not(feature = "gc-heap"))]
             this_val: Value::Undefined,
             n_slots: 0,
             handlers: Vec::new(),
@@ -26352,18 +26372,22 @@ mod return_slot_tests {
         );
     }
 
-    /// gc-heap: the same prefix offsets and sizes. No word owns anything, so no generated code
-    /// calls `jit_drop_packed_at` (debug builds assert it). A function's deferred prototype,
-    /// the one packed word that owned a box, names a cell in its function's heap: overwriting
-    /// the word releases nothing (the cell still owns its key layout), and the next collection
-    /// frees the cell, whose finalizer drops the layout. `jit_drop_at` returns the value it was
-    /// given.
+    /// gc-heap: the same prefix offsets and sizes, with the packed `this` word itself at [48].
+    /// No word owns anything, so no generated code calls `jit_drop_packed_at` (debug builds
+    /// assert it). A function's deferred prototype, the one packed word that owned a box, names
+    /// a cell in its function's heap: overwriting the word releases nothing (the cell still owns
+    /// its key layout), and the next collection frees the cell, whose finalizer drops the layout.
+    /// `jit_drop_at` returns the value it was given.
     #[cfg(feature = "gc-heap")]
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<PackedValue>(), 8);
         assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
+        assert_eq!(
+            std::mem::size_of_val(&context(Value::Undefined).this_word),
+            8
+        );
         if size_of::<usize>() == 8 {
             assert_eq!(offset_of!(JitCtx, helpers), 0);
             assert_eq!(offset_of!(JitCtx, stack_base), 8);
@@ -26371,7 +26395,7 @@ mod return_slot_tests {
             assert_eq!(offset_of!(JitCtx, slots), 24);
             assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
             assert_eq!(offset_of!(JitCtx, env_raw), 40);
-            assert_eq!(offset_of!(JitCtx, this_raw), 48);
+            assert_eq!(offset_of!(JitCtx, this_word), 48);
             assert_eq!(offset_of!(JitCtx, global_body), 56);
             assert_eq!(offset_of!(JitCtx, genv), 64);
             assert_eq!(size_of::<crate::jit::SpFlag>(), 16);

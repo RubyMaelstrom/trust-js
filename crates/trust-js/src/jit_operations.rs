@@ -165,9 +165,15 @@ pub(super) fn emit(
             }
             a.bind(done);
         }
+        Op::LoadThis if fast & 32768 != 0 && rc_ok && layout.ctx_this() == JitThisRepr::Packed => {
+            // [48] is the packed `this` word, which owns nothing: push a copy.
+            a.ldr_imm(12, 19, 48); // ctx.this_word
+            emit_exec_word_store(a, 12, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
         Op::LoadThis if fast & 32768 != 0 && rc_ok => {
-            // `this_raw` is deliberately a wide host-boundary Value; encode before
-            // acquiring the compact operand owner. BigInt uses the checked helper.
+            // [48] points at the context's wide `this` Value: encode it into a word, then
+            // acquire the operand's owner. BigInt uses the checked helper.
             let slow = a.new_label();
             let done = a.new_label();
             a.ldr_imm(9, 19, 48); // ctx.this_raw

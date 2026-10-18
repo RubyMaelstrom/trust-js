@@ -14092,6 +14092,24 @@ impl Interp {
         }
     }
 
+    /// gc-heap: OrdinaryCallBindThis on a moved operand word, for a compiled callee that a
+    /// moved entry runs (`jit::run_moved` and its forms take `this` packed): Undefined when the
+    /// body never reads `this` (`uses_this`), the word itself for a strict callee, and for a
+    /// sloppy one the global object for undefined or null, an object word unchanged, and a
+    /// primitive boxed. Boxing is the one case that widens the word.
+    #[cfg(feature = "gc-heap")]
+    fn bind_this_word(&mut self, this: PackedValue, uses_this: bool, strict: bool) -> PackedValue {
+        if !uses_this {
+            PackedValue::pack(Value::Undefined)
+        } else if strict || this.is_object() {
+            this
+        } else if this.is_nullish() {
+            PackedValue::pack(Value::Obj(self.global.clone()))
+        } else {
+            PackedValue::pack(crate::builtins::box_primitive_pub(self, this.into_value()))
+        }
+    }
+
     /// Whether `chunk` may run (or be compiled to) native code on this run. A loop-free body
     /// first runs `jit_admit_runs` times on the bytecode VM (see [`Interp::jit_admit_runs`]);
     /// a forced tier (`tier_threshold` 0) admits at once.
@@ -14669,19 +14687,24 @@ impl Interp {
         // belongs to whichever closure instance filled the entry).
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(env_ptr) });
         let chunk = unsafe { &*ic.chunk };
-        let this_read = unsafe { this_slot.read() }.into_value();
-        let this_val = if !ic.uses_this {
-            drop(this_read);
-            Value::Undefined
-        } else if ic.strict {
-            this_read
-        } else {
-            match this_read {
-                Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-                other @ Value::Obj(_) => other,
-                prim => crate::builtins::box_primitive_pub(self, prim),
+        #[cfg(not(feature = "gc-heap"))]
+        let this_val = {
+            let this_read = unsafe { this_slot.read() }.into_value();
+            if !ic.uses_this {
+                drop(this_read);
+                Value::Undefined
+            } else if ic.strict {
+                this_read
+            } else {
+                match this_read {
+                    Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+                    other @ Value::Obj(_) => other,
+                    prim => crate::builtins::box_primitive_pub(self, prim),
+                }
             }
         };
+        #[cfg(feature = "gc-heap")]
+        let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved_env(
                 self,
@@ -14883,20 +14906,25 @@ impl Interp {
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(ic.env) });
         let chunk = unsafe { &*ic.chunk };
         // OrdinaryCallBindThis on the moved `this` (bind_compiled_this, inlined over `ic.strict`
-        // and the fill-time `uses_this`).
-        let this_read = unsafe { this_slot.read() }.into_value();
-        let this_val = if !ic.uses_this {
-            drop(this_read);
-            Value::Undefined
-        } else if ic.strict {
-            this_read
-        } else {
-            match this_read {
-                Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-                other @ Value::Obj(_) => other,
-                prim => crate::builtins::box_primitive_pub(self, prim),
+        // and the fill-time `uses_this`); gc-heap binds the packed word on its tag.
+        #[cfg(not(feature = "gc-heap"))]
+        let this_val = {
+            let this_read = unsafe { this_slot.read() }.into_value();
+            if !ic.uses_this {
+                drop(this_read);
+                Value::Undefined
+            } else if ic.strict {
+                this_read
+            } else {
+                match this_read {
+                    Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
+                    other @ Value::Obj(_) => other,
+                    prim => crate::builtins::box_primitive_pub(self, prim),
+                }
             }
         };
+        #[cfg(feature = "gc-heap")]
+        let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved(
                 self,
@@ -15614,6 +15642,9 @@ impl Interp {
         } else {
             Value::Undefined
         };
+        // gc-heap: the moved entries take `this` packed.
+        #[cfg(feature = "gc-heap")]
+        let tv = PackedValue::pack(tv);
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder
                 .then(|| unsafe {
@@ -15978,11 +16009,18 @@ impl Interp {
             construct: false,
             extra: None,
         });
+        #[cfg(not(feature = "gc-heap"))]
         let this_val = self.bind_compiled_this(
             &func,
             chunk,
             unsafe { this_slot.read() }.into_value(),
             false,
+        );
+        #[cfg(feature = "gc-heap")]
+        let this_val = self.bind_this_word(
+            unsafe { this_slot.read() },
+            chunk.needs_frame_this(),
+            func.is_strict,
         );
         // A successful cache fill is a native entry just like the next cache hit. Its
         // original code lease stays live even if the checkpoint invalidates the fresh IC.

@@ -51,11 +51,15 @@ fn enter(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         env_raw: Env::as_ptr(&env) as *const u8,
+        #[cfg(not(feature = "gc-heap"))]
         this_raw: std::ptr::null(),
+        #[cfg(feature = "gc-heap")]
+        this_word: PackedValue::pack(Value::Undefined),
         global_body: super::jit_global_body(i, code),
         genv: Env::as_ptr(&env) as usize,
         interp: i as *mut Interp,
         chunk,
+        #[cfg(not(feature = "gc-heap"))]
         this_val: Value::Undefined,
         n_slots: count,
         handlers: Vec::new(),
@@ -78,7 +82,10 @@ fn enter(
         resume_pc: 0,
         resume_step: None,
     };
-    ctx.this_raw = &ctx.this_val;
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        ctx.this_raw = &ctx.this_val;
+    }
     crate::bytecode::TEST_JIT_RETURN_HELPERS.with(|calls| calls.set(0));
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     let status = entry(&mut ctx);
@@ -531,7 +538,9 @@ fn direct_finish_vacates_a_last_reference_receiver() {
             .interp
             .frame_pool
             .iter()
-            .filter(|record| unsafe { !matches!(record.as_ref().ctx.this_val, Value::Undefined) })
+            .filter(|record| unsafe {
+                !matches!(record.as_ref().ctx.this_value(), Value::Undefined)
+            })
             .count(),
         0,
         "a pooled record must not retain a `this` binding"
