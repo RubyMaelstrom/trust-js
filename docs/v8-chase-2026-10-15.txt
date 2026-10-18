@@ -3248,3 +3248,127 @@ before the runs, other cores 0.43 busy at the median during them):
   2.97e9, -10% against e3310993's 3.298e9. That base matches the
   default build at --tier=jit (3,298.5M here). gc-heap at --tier=jit
   is now 2,974.9M, -9.8%: 0.2 points short.
+
+S5 exit gate (2026-10-18)
+-------------------------
+Builds: main = e3310993; branch = cadd2ddc plus this commit (records
+only), whose engine code is 5fa62d13's. crystal aarch64, rustc 1.99.0;
+no-LTO release builds unless noted.
+- Lib suites (debug, each run twice): --features embed 2184/0/3 (S4:
+  2153/0/3), embed,gc-heap 2233/0/55 (S4: 1850/0/114). The default
+  build's 3 ignored are object_alloc_bench's benchmarks. gc-heap's 55
+  are those 3, gc_core's 5 benchmarks and 47 tests of the
+  reference-count model, each ignored with its reason: the cycle
+  collector and its nursery 12, observed reference counts 11, release
+  timing 8, eager death notification 8, edges between Agent heaps 4,
+  hosts omitting their handles 2, a handle outliving its heap 1, a
+  callable lease 1. S6 deletes or rewrites them with that model.
+  Clippy clean for both feature sets; rustfmt clean on the files
+  changed since e3310993.
+- difftest --seed 7 --count 150 (the interp oracle against bytecode
+  and jit, crashes counted): 138 agree, 12 skipped for their budget,
+  no crash, in both builds. gc-heap's jit tier compiles now; at S5's
+  base it ran as bytecode.
+- Fixtures at --tier=jit: exit 0; native compiles vue 55, react 9 and
+  djot 160 in the default build, 56, 10 and 160 under gc-heap, none
+  failed. Stdout is equal between the builds and to S5's base apart
+  from elapsed_ms: vue observed 30016, invocations 12359; react
+  checksum 2124760, as expected; djot the same HTML.
+- Per-test GC stress + verifier + poisoning with the JIT on (debug,
+  embed,gc-heap, each lib test in its own process, 900 s each): 2233
+  pass, 55 ignored, 0 fail, no crash, timeout or verifier report; 2204
+  at interval 1, 24 at 100 and 5 at 1000 (8c: 2194; 2165, 24, 5).
+- Forced tier-up (TRUST_JS_TIER_THRESHOLD=0, each lib test in its own
+  process): without stress, gc-heap 2230/3/55 and default 2180/4/3;
+  at the stress intervals above, gc-heap 2230 pass (2201, 24, 5) and
+  the same 3 fail. Each failure is a threshold assumption recorded
+  after 8c.
+- Test262, full (no-LTO release runners from cadd2ddc, gc-heap and
+  default, TRUST_JS_TIER=jit, T262_WORKERS=6; annexB, built-ins,
+  harness, intl402, language, staging):
+  - At the default threshold, 53,575 of 53,575 executed pass in each
+    build, and both reports are byte-identical to S4's gate reports
+    (interp and bytecode), and so to main's.
+  - At threshold 0, 53,573 pass in each build, and the two reports are
+    byte-identical. The two failures, staging/sm/extensions/
+    arguments-property-access-in-function.js and function-
+    properties.js, read a running function's legacy f.arguments.
+    A compiled body keeps no lazy arguments stash (a divergence
+    documented at the lean activation in interpreter.rs), so the read
+    gives null in any compiled frame. In both builds the interpreter
+    passes the two and the bytecode tier at threshold 0 fails them
+    too. Fresh engine builds of S5's base (b6749db9) and of main give
+    the same nulls. At the default threshold a function that has
+    tiered up shows it as well: of 40 calls, 8 see their arguments and
+    32 see null. Pre-existing, recorded open.
+- Downstream suites (debug, both builds): at the default threshold,
+  host 36/0/0, timers 5/0/0, fs (no tests), web 61/0/1, node 42/0/0
+  and runtime 182/0/1 (45 test binaries) in each, as at S4's gate.
+  The JIT now runs under gc-heap here too, and at threshold 0 every
+  eligible function compiles at its first call. At threshold 0 all
+  pass except two trust-js-web tests that count what a Wasm store
+  still holds: exported_function_keeps_weak_native_import_callback_
+  callable (both builds) and wasm_weak_caches_and_finalizers_release_
+  unreachable_store_graphs (the default build). At threshold 0 their
+  IIFE runs compiled, and a compiled closure keeps only the names it
+  uses, so the import callback no longer holds the IIFE's scope and
+  the module and instance wrappers die sooner:
+  - the first test, after its collections, finds 0 modules and 1 root
+    (the exported function's) where it expects 1 and 6. The store
+    entities, the callback and the buffer are alive, and the call
+    reaches the callback;
+  - the second finds the weakly held callback already dead by its
+    count at its first check, before any collection. The
+    interpreter's callback, which holds the IIFE's scope, is still
+    alive there.
+  The interpreter passes both at threshold 0, and the bytecode tier
+  fails them the same way. S5's base (b6749db9) fails them at
+  bytecode threshold 0 in both builds, with the same counts. These
+  are test assumptions about the interpreter's captures, recorded
+  open.
+- Stage tripwire: S5's base (b6749db9) against its end (5fa62d13), in
+  both builds.
+  - Binaries: fat LTO, the repo's release profile. Each revision is a
+    fresh git-archive export built in a fresh target dir: default
+    0a773418 and 49208126, gc-heap 9ba34cca and e7723d07.
+  - Revision checks: the base gc-heap binary compiles nothing at
+    --tier=jit, and the base default binary lacks S5's symbols
+    (jit::ownership, probe_jit_repr).
+  - Method: fresh copies of all four, perf stat on CPU 5, the
+    fixtures at each tier, 5 rounds, medians. Stdout is equal
+    everywhere.
+  - Load: the other cores were 3.6 busy at the median (a game), so
+    no cycles are recorded from this run. Instructions and peak RSS
+    do not depend on the load.
+  - The default build, base -> end: instructions within 0.13% at every
+    tier but djot at jit, +0.37% (+4.5M). That is compile work in
+    S5's emitter layers. In a synthetic run, 402 compiles of a small
+    function cost 575K more instructions; without the compiles, the
+    same run costs 36K more. djot compiles 160 larger functions
+    (1.33M words of code). Its generated code is unchanged, and so
+    are its startup (14.57M instructions on an empty script) and its
+    bytecode and interp runs. Peak RSS -4.3..+2.8%, within the runs'
+    spread.
+  - gc-heap, base -> end:
+    - At jit, where the base ran bytecode: instructions vue -62.5%,
+      react -78.4%, djot -56.3%; peak RSS +5.3/+5.0/+14.8%.
+    - At bytecode: -3.1/-3.9/-3.3%, mostly step 9b; peak RSS
+      -4.2..+0.9%.
+    - At interp: within 0.3%; peak RSS -2.6..+1.4%.
+  - gc-heap against the default build, at the end:
+    - Instructions at jit -9.8/-18.7/-9.4%, at bytecode -8.4/-14.2/
+      -8.3%, at interp +12.8/+10.2/+9.1%. The interp cost is S2-S4's,
+      unchanged by S5.
+    - Peak RSS +8.0..+143.3%, highest on react. That is S3's finding,
+      open for S6.
+    - Against the base's default build at jit: -9.8/-18.7/-9.0%. S0's
+      threshold (i), vue at most 2.97e9, stands at 2,974.3M.
+  - Cycles: step 9's quiet tripwire has them for step 8 -> 9e in both
+    builds, and for gc-heap against the default build at 9e. Base ->
+    end cycles wait for a quiet machine.
+- Open, none of them caused by S5:
+  - the two threshold-0 findings above;
+  - step 9e's follow-ups, and 9f's Binding.value, to revisit in S6;
+  - gc-heap's peak RSS over the default build's.
+  x86-64 under gc-heap runs the bytecode VM until S6's zombie pass, as
+  planned.
