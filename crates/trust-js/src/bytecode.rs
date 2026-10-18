@@ -16833,26 +16833,33 @@ fn run_vm_inner<S: StoredValue>(
                 stack.push(m);
             }
             Op::Add => {
-                // A following local store retires an owner of the old left string. Both
-                // operands are already evaluated; only the non-coercing, non-throwing string
-                // case may release that owner before addition. The existing Add/Store ops and
-                // feedback remain intact, and real aliases still prevent in-place mutation.
-                if let (Some(Value::Str(left)), Some(Value::Str(right))) =
-                    (stack.get(stack.len().saturating_sub(2)), stack.last())
+                // A following local store retires an owner of the old left string, so that a
+                // counted string can be unique and append in place. Both operands are already
+                // evaluated; only the non-coercing, non-throwing string case may release that
+                // owner before addition. The existing Add/Store ops and feedback remain intact,
+                // and real aliases still prevent in-place mutation. gc-heap appends at its
+                // buffer's frontier, which needs no uniqueness.
+                #[cfg(not(feature = "gc-heap"))]
                 {
-                    if left.len().saturating_add(right.len()) <= crate::interpreter::MAX_STR_LEN {
-                        match chunk.ops.get(op_pc + 1) {
-                            Some(Op::StoreLocal(slot)) => {
-                                if matches!(slots.read_value(*slot as usize), Value::Str(current)
-                                    if crate::lstr::LStr::ptr_eq(&current, &left))
-                                {
-                                    slots.write_value(*slot as usize, Value::Undefined);
+                    if let (Some(Value::Str(left)), Some(Value::Str(right))) =
+                        (stack.get(stack.len().saturating_sub(2)), stack.last())
+                    {
+                        if left.len().saturating_add(right.len()) <= crate::interpreter::MAX_STR_LEN
+                        {
+                            match chunk.ops.get(op_pc + 1) {
+                                Some(Op::StoreLocal(slot)) => {
+                                    if matches!(slots.read_value(*slot as usize), Value::Str(current)
+                                        if crate::lstr::LStr::ptr_eq(&current, &left))
+                                    {
+                                        slots.write_value(*slot as usize, Value::Undefined);
+                                    }
                                 }
+                                Some(Op::StoreCap(name)) => {
+                                    chunk
+                                        .release_overwritten_captured_string(cap_env, *name, &left);
+                                }
+                                _ => {}
                             }
-                            Some(Op::StoreCap(name)) => {
-                                chunk.release_overwritten_captured_string(cap_env, *name, &left);
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -19429,6 +19436,8 @@ fn bin_num<S: StoredValue>(
 /// ECMA-262 assignment evaluation still reads the left value before the RHS, and conversion
 /// hooks must still see the binding: callers restrict this to already-primitive strings after
 /// the length guard. No JS, coercion, safepoint or recoverable error may occur before the store.
+/// Counted strings only: a gc-heap string appends without uniqueness.
+#[cfg(not(feature = "gc-heap"))]
 #[inline]
 fn release_overwritten_string_local(slot: &mut Value, left: &crate::lstr::LStr) {
     if matches!(slot, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, left)) {
@@ -20058,6 +20067,7 @@ impl Chunk {
     /// The captured-cell equivalent of the adjacent Add/StoreLocal ownership handoff.
     /// Only initialized mutable declarative cells qualify; name resolution, globals, imports,
     /// TDZ and immutable stores retain their ordinary paths (ECMA-262 SetMutableBinding).
+    #[cfg(not(feature = "gc-heap"))]
     fn release_overwritten_captured_string(&self, env: &Env, n: u32, left: &crate::lstr::LStr) {
         let binding = unsafe { &mut *self.cap_binding_ptr(env, n) };
         if binding.initialized && binding.mutable && binding.import_ref.is_none() {
@@ -20542,12 +20552,27 @@ impl Chunk {
     pub(crate) fn jit_const_packed_bits(&self, k: u32) -> Option<u64> {
         PackedValue::scalar_bits(&self.consts[k as usize])
     }
-    /// Stable address of const `k` (the chunk is pinned by any code that runs it): the JIT's
-    /// string-const template copies the Value and bumps its refcount inline.
+    /// The execution word of string const `k` under gc-heap, `PACK_STR | cell`, which generated
+    /// code pushes as an immediate; `None` for any other const. The word owns nothing. It names
+    /// a live cell for as long as code compiled from this chunk can run: the constant pool roots
+    /// the cell while the chunk lives, the chunk owns that code, and cells never move. So only
+    /// code this chunk owns may embed it, never a process-wide shared stub.
+    #[cfg(feature = "gc-heap")]
+    pub(crate) fn jit_const_str_word(&self, k: u32) -> Option<u64> {
+        match &self.consts[k as usize] {
+            Value::Str(string) => Some(crate::value::PACK_STR | string.cell_word()),
+            _ => None,
+        }
+    }
+    /// Stable address of const `k` (the chunk is pinned by any code that runs it). Under counted
+    /// ownership the JIT's string-const template loads the payload from this Value and bumps its
+    /// count inline: a word pushed without its count would let a release free the constant while
+    /// the pool still holds it. Traced ownership pushes `jit_const_str_word` instead.
     pub(crate) fn jit_const_ptr(&self, k: u32) -> *const Value {
         &self.consts[k as usize] as *const Value
     }
-    /// Whether const `k` is a string (payload strong count at offset 0 — the template's bump).
+    /// Whether const `k` is a string: the string-const templates push it (the counted one bumps
+    /// the payload's strong count at offset 0).
     pub(crate) fn jit_const_is_str(&self, k: u32) -> bool {
         matches!(self.consts[k as usize], Value::Str(_))
     }

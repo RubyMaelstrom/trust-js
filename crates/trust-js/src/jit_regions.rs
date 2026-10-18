@@ -3889,6 +3889,16 @@ fn emit_effect(
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }
+        // As in the baseline template: under traced ownership the constant's word is an
+        // immediate that owns nothing.
+        #[cfg(feature = "gc-heap")]
+        Op::Const(k)
+            if fast & 128 != 0 && !layout.ownership().counted() && chunk.jit_const_is_str(k) =>
+        {
+            a.mov_imm64(9, chunk.jit_const_str_word(k).unwrap());
+            emit_exec_word_store(a, 9, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
         Op::Const(k)
             if fast & 128 != 0 && layout.ownership().count_first() && chunk.jit_const_is_str(k) =>
         {

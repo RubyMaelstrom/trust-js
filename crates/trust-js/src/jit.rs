@@ -194,6 +194,14 @@ mod this_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_string_constant_tests.rs"]
+mod string_constant_tests;
+
+#[cfg(all(
+    test,
     feature = "gc-heap",
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -362,9 +370,10 @@ impl JitOwnership {
         }
     }
 
-    /// Whether the count is the payload's first word, the contract the string-constant,
+    /// Whether the count is the payload's first word, the contract the counted string-constant,
     /// `typeof`, inline-intrinsic and direct-finish templates were written against. Traced
-    /// ownership has no count instruction.
+    /// ownership has no count instruction, and its string constants are immediates that skip
+    /// the counted template (see `Chunk::jit_const_str_word`).
     pub(crate) fn count_first(self) -> bool {
         match self {
             JitOwnership::Refcount { strong_off } => strong_off == 0,

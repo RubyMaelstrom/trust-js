@@ -585,3 +585,241 @@ fn property_word_guard_routes_exactly_the_tags_above_object() {
     let mut output = 0;
     assert_eq!(unsafe { run(PACK_LAZY_PROTO | 8, &mut output) }, 0);
 }
+
+/// Under traced ownership every site of a string literal pushes the literal's word as an
+/// immediate: `mov_imm64 x9, word`, `str x9, [x20]` and `add x20, x20, #8`, where the word is
+/// the one the bytecode VM pushes for the constant (`PACK_STR | cell`). No site materializes the
+/// constant's pool slot, from which the counted template loads the payload. The literal before
+/// the loop has its baseline site; the one inside has the baseline's and the loop region's.
+/// `string_constant_region_copy_pushes_an_immediate` runs this again with the regions' own copy
+/// of the template.
+#[test]
+fn string_constant_sites_push_an_immediate() {
+    use super::*;
+    use crate::bytecode::Op;
+    let source = r#"
+        function sites(n) {
+            var s = 'outside', hits = 0;
+            for (var i = 0; i < n; i++) {
+                s = 'inside';
+                if (s.length === 6) hits++;
+            }
+            return s + hits;
+        }
+        sites(100);
+    "#;
+    let regions = regions::executed_regions();
+    let mut jit = agree(source, "inside100", &["sites"]);
+    assert!(
+        regions::executed_regions() > regions,
+        "the loop runs as a register region"
+    );
+    let sites = with_chunk(&mut jit, "sites", |chunk| {
+        let code = chunk.jit.get().flatten().expect("native code");
+        // SAFETY: the executable mapping lives as long as `code`.
+        let words = unsafe { std::slice::from_raw_parts(code.mem as *const u32, code.len / 4) };
+        let count = |pattern: &[u32]| {
+            words
+                .windows(pattern.len())
+                .filter(|w| *w == pattern)
+                .count()
+        };
+        let strings = chunk.jit_ops().iter().filter_map(|op| match *op {
+            Op::Const(k) if chunk.jit_const_is_str(k) => Some(k),
+            _ => None,
+        });
+        strings
+            .map(|k| {
+                let mut slot = asm::Asm::new();
+                slot.mov_imm64(9, chunk.jit_const_ptr(k) as u64);
+                assert_eq!(
+                    count(&slot.finish()),
+                    0,
+                    "a site loads constant {k} from its slot"
+                );
+                // SAFETY: the slot lives as long as the chunk.
+                let value = unsafe { &*chunk.jit_const_ptr(k) }.clone();
+                let mut site = asm::Asm::new();
+                site.mov_imm64(9, crate::value::PackedValue::pack(value).bits());
+                site.str_imm(9, 20, 0);
+                site.add_imm(20, 20, 8);
+                count(&site.finish())
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        sites,
+        [1, 2],
+        "the literal before the loop at its baseline site, the one inside also in the region"
+    );
+}
+
+/// The regions' own copy of the string-constant template (the vocabulary of
+/// `regions::emit_effect` that `TRUST_JS_SHARED_NATIVE_OPERATIONS=0` selects; the setting is
+/// read once per process): `string_constant_sites_push_an_immediate` in a process of its own.
+#[test]
+fn string_constant_region_copy_pushes_an_immediate() {
+    const CHILD: &str = "TRUST_JS_TEST_REGION_VOCABULARY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "jit::traced_tests::string_constant_sites_push_an_immediate",
+        ])
+        .env(CHILD, "1")
+        .env("TRUST_JS_SHARED_NATIVE_OPERATIONS", "0")
+        .output()
+        .expect("a child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The 64-bit values the move-wide sequences in `words` materialize: a MOVZ or MOVN, then the
+/// MOVKs that follow it into the same register.
+fn materialized(words: &[u32]) -> Vec<u64> {
+    let mut values = Vec::new();
+    let mut current: Option<(u32, u64)> = None;
+    for &word in words {
+        let register = word & 31;
+        let shift = ((word >> 21) & 3) * 16;
+        let lane = u64::from((word >> 5) & 0xffff) << shift;
+        let start = match word & 0xff80_0000 {
+            0xd280_0000 => Some(lane),
+            0x9280_0000 => Some(!lane),
+            0xf280_0000 => match &mut current {
+                Some((target, value)) if *target == register => {
+                    *value = (*value & !(0xffff << shift)) | lane;
+                    continue;
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        values.extend(current.take().map(|(_, value)| value));
+        current = start.map(|value| (register, value));
+    }
+    values.extend(current.map(|(_, value)| value));
+    values
+}
+
+/// No shared stub embeds a string constant. A process-wide stub serves every chunk (see
+/// `global_stub_address`), so it may hold no chunk's constant: every stub, assembled as
+/// `assemble_global_stub` assembles it (with the stubs it requests and a direct call's finish
+/// stub), materializes no string word (the string tag over a nonzero payload), and none of the
+/// words, cells or pool slots of the string constants of a chunk that requests shared stubs.
+#[test]
+fn shared_stubs_embed_no_string_constant() {
+    use super::*;
+    use crate::bytecode::Op;
+    let source = r#"
+        var o = { name: 'a' };
+        function stubs(n) {
+            var s = '';
+            for (var i = 0; i < n; i++) s = o.name + 'b' + String(i).length;
+            return s;
+        }
+        stubs(3);
+    "#;
+    let mut jit = agree(source, "ab1", &["stubs"]);
+    let layout = crate::value::jit_layout(&jit.interp.object_proto);
+    let ilayout = crate::interpreter::interp_layout(&mut jit.interp);
+    let (forbidden, offsets) = with_chunk(&mut jit, "stubs", |chunk| {
+        let mut forbidden = Vec::new();
+        for op in chunk.jit_ops() {
+            if let Op::Const(k) = *op {
+                if let Some(word) = chunk.jit_const_str_word(k) {
+                    let cell = word & !crate::value::PACK_STR;
+                    forbidden.extend([word, cell, chunk.jit_const_ptr(k) as u64]);
+                }
+            }
+        }
+        let offsets = (
+            chunk.jit_inline_attempted_off(),
+            chunk.jit_runs_off(),
+            chunk.jit_inline_retry_at_off(),
+        );
+        (forbidden, offsets)
+    });
+    assert_eq!(forbidden.len(), 3 * 2, "the chunk's two string constants");
+    let mut stubs = 0;
+    for base in [
+        SharedStub::NAME_VALUE_PTR,
+        SharedStub::PROP_WAYS,
+        SharedStub::CALL_SECONDARY,
+        SharedStub::DIRECT_CALL,
+        SharedStub::NAME_VALUE_PTR_IN,
+        SharedStub::INTRINSICS1,
+        SharedStub::INTRINSICS2,
+        SharedStub::NAME_LOAD,
+        SharedStub::HELPER,
+        SharedStub::TYPED_ELEMENT,
+        SharedStub::NAME_ELEMENT,
+    ] {
+        // Every parameter combination of the kind (the low byte; duplicates are harmless) that a
+        // site can request.
+        for low in 0..=0xff {
+            let key = base | low;
+            if let SharedStub::DirectCall { argc, .. } = SharedStub::from_key(key) {
+                let (attempted, runs, retry) = offsets;
+                let argc = usize::from(argc);
+                if !direct_call_supported(&ilayout, &layout, attempted, runs, retry, argc) {
+                    continue;
+                }
+            }
+            let mut a = asm::Asm::new();
+            let finish = a.new_label();
+            let context = StubContext {
+                layout: &layout,
+                ilayout: Some(&ilayout),
+                direct: Some(DirectCallContext {
+                    attempted_off: offsets.0,
+                    runs_off: offsets.1,
+                    retry_off: offsets.2,
+                    finish_stub: finish,
+                }),
+            };
+            SharedStub::from_key(key).emit(&mut a, &context);
+            loop {
+                let requested = a.take_shared_stubs();
+                if requested.is_empty() {
+                    break;
+                }
+                for (nested, label) in requested {
+                    a.bind(label);
+                    SharedStub::from_key(nested).emit(&mut a, &context);
+                }
+            }
+            a.bind(finish);
+            if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
+                emit_direct_finish_stub(
+                    &mut a,
+                    &ilayout,
+                    layout.ownership(),
+                    layout.ctx_this(),
+                    layout.ownership().count_first(),
+                );
+            }
+            let words = a.finish();
+            assert!(!words.is_empty(), "stub {key:#x}");
+            for value in materialized(&words) {
+                assert!(
+                    value >> 48 != crate::value::PACK_STR >> 48 || value & 0xffff_ffff_ffff == 0,
+                    "stub {key:#x} materializes the string word {value:#x}"
+                );
+                assert!(
+                    !forbidden.contains(&value),
+                    "stub {key:#x} materializes {value:#x}, of a string constant"
+                );
+            }
+            stubs += 1;
+        }
+    }
+    // Direct calls of up to 64 arguments, with and without `this`.
+    assert_eq!(stubs, 10 * 256 + 2 * 65);
+}

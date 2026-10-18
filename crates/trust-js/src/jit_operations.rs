@@ -681,6 +681,17 @@ pub(super) fn emit(
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }
+        // Traced ownership: the constant's word owns nothing and names a cell the chunk's pool
+        // roots while this code can run, so it is an immediate (see `jit_const_str_word`).
+        #[cfg(feature = "gc-heap")]
+        Op::Const(k) if fast & 128 != 0 && !own.counted() && chunk.jit_const_is_str(*k) => {
+            let Some(word) = chunk.jit_const_str_word(*k) else {
+                return false;
+            };
+            a.mov_imm64(9, word);
+            emit_exec_word_store(a, 9, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
         Op::Const(k)
             if fast & 128 != 0
                 && rc_ok

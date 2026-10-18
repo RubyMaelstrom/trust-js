@@ -1020,7 +1020,8 @@ fn entry_this_is_a_root() {
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
 /// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
 /// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, every kind of
-/// `this` through the sites of `jit::this_tests`, the deferred
+/// `this` through the sites of `jit::this_tests`, the string constants that generated code
+/// pushes as immediates (`jit::string_constant_tests`), the deferred
 /// prototypes' cells (their lifetime, trace, materialization and Rust overwrites, the packed
 /// drop boundary and a deferred prototype's memory report), the reads that materialize a
 /// deferred prototype as they copy it out and the bit-copy words of packed and execution
@@ -1041,6 +1042,7 @@ fn rooting_holds_under_gc_stress() {
             "jit::traced_tests::",
             "jit::word_routing_tests::",
             "jit::this_tests::",
+            "jit::string_constant_tests::",
             "value::lazy_function_prototype::tests::dead_constructors_leave_no_reserved_cells",
             "value::lazy_function_prototype::tests::deferred_prototype",
             "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes",
