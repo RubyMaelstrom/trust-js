@@ -3887,7 +3887,8 @@ fn shadow_realm_kept_only_through_itself_is_collected() {
 
 /// P1 S4 (I5): a collected ShadowRealm ends without resuming its suspended coroutines, here a
 /// module body parked at a top-level await (`VmCoro::resume` asserts that no coroutine resumes
-/// in the collector's eviction step).
+/// in the collector's eviction step). A global holds the realm until the parked body is seen:
+/// under GC stress a collection inside the evaluation may take an unreachable realm earlier.
 #[test]
 fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
     let mut engine = Engine::new();
@@ -3901,7 +3902,7 @@ fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
     });
     eval_to_string(
         &mut engine,
-        "(() => { new ShadowRealm().importValue('parked', 'ready'); })(); 0",
+        "globalThis.held = new ShadowRealm(); held.importValue('parked', 'ready'); 0",
     );
     let parked: usize = engine
         .interp
@@ -3910,6 +3911,7 @@ fn collected_shadow_realm_ends_without_resuming_its_coroutines() {
         .map(|realm| realm.generators.len())
         .sum();
     assert!(parked > 0, "the realm holds a parked module body");
+    eval_to_string(&mut engine, "held = undefined; 0");
     engine.interp.gc_collect();
     assert!(engine.interp.shadow_realms.is_empty());
 }
