@@ -3278,6 +3278,51 @@ mod tests {
         assert!(snapshot.engine_caches.bytes >= stub_bytes);
     }
 
+    /// A function's deferred prototype counts once, in property storage, as its own
+    /// `LazyFunctionPrototype` payload: 48 requested bytes in both builds, as before the
+    /// payload became a gc-heap cell (no report counts gc-heap cells by bytes, so the cell is
+    /// not counted twice). Measuring does not materialize it. Of functions made by one
+    /// expression (their prototype template's key layout is counted with the template),
+    /// replacing one's `prototype`, after a warm-up replacement and with the garbage
+    /// collected, lowers property storage by exactly that payload.
+    #[test]
+    fn deferred_prototype_payload_is_counted_once_in_property_storage() {
+        let mut engine = crate::Engine::new();
+        let run = |engine: &mut crate::Engine, source: &str| {
+            engine
+                .eval(source, false)
+                .expect("memory fixture evaluates");
+            engine.interp.gc_collect();
+        };
+        let property_storage = |engine: &crate::Engine| {
+            let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+            let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+            measure(&engine.interp, &objects, &scopes)
+                .property_storage
+                .bytes
+        };
+        run(
+            &mut engine,
+            "function make() { return function () {}; } \
+             var F = make(), G = make(), H = make(); \
+             Object.defineProperty(H, 'prototype', { value: null }); 0",
+        );
+        let materialized = crate::value::prototypes_materialized();
+        let before = property_storage(&engine);
+        run(
+            &mut engine,
+            "Object.defineProperty(F, 'prototype', { value: null }); 0",
+        );
+        let after = property_storage(&engine);
+        assert_eq!(crate::value::DEFERRED_PROTOTYPE_BYTES, 48);
+        assert_eq!(before - after, crate::value::DEFERRED_PROTOTYPE_BYTES);
+        assert_eq!(
+            crate::value::prototypes_materialized() - materialized,
+            1,
+            "only the store materialized (F's prototype, through its descriptor snapshot)"
+        );
+    }
+
     #[test]
     fn realm_metadata_accounts_console_and_import_string_capacity() {
         let mut interp = Interp::new();

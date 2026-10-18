@@ -9808,9 +9808,10 @@ fn emit_set_prop_inline(
     // all of them, so the template must too or a rotating store site helper-calls forever):
     // depth 0, shape match, slot bounds, data+writable, old-value droppability. Guard misses
     // jump to the next way, the last way's to the helper. Register results consumed by the
-    // commit below: x13 slot, x15 entry, w9 old tag, x12 old payload, x14 old strong.
-    // `cache_ptr` = the IcState cell address, or 0 for "x12 already holds it" (the way loop
-    // keeps its cursor in x8: the body clobbers x12 on the old-value path).
+    // commit below: x13 slot, x15 entry and, under counted ownership, w9 old tag, x12 old
+    // payload, x14 old strong. `cache_ptr` = the IcState cell address, or 0 for "x12 already
+    // holds it" (the way loop keeps its cursor in x8: the body clobbers x12 on the old-value
+    // path).
     let commit = a.new_label();
     let way = |a: &mut asm::Asm, cache_ptr: usize, miss: usize| {
         if cache_ptr != 0 {
@@ -9832,24 +9833,22 @@ fn emit_set_prop_inline(
         guard_prop_data(a, 9, 15, ea, miss);
         guard_prop_writable(a, 9, 15, ew, miss);
         // old value: trivially droppable (tag ≤ 4), or refcounted with strong > 1 (inline
-        // dec); BigInt or a last reference → helper. An old value that IS the receiver
-        // (`o.x === o`) also bails: its dec and the receiver dec below hit the same counter,
-        // and the two independent strong > 1 guards would let the pair scribble it to 0
-        // without running the destructor. Traced ownership drops the old value by
-        // overwriting it: only the lazy-prototype exclusion remains, and the commit reads
-        // no marker.
+        // dec); BigInt, a function's deferred prototype (its word owns an Rc) or a last
+        // reference → helper. An old value that IS the receiver (`o.x === o`) also bails: its
+        // dec and the receiver dec below hit the same counter, and the two independent
+        // strong > 1 guards would let the pair scribble it to 0 without running the
+        // destructor. Traced ownership drops every old value by overwriting it, a deferred
+        // prototype included (a cell, which dies once no word names it): the way reads no old
+        // value, and the commit reads no marker.
         if layout.entry_accessor == layout.entry_value + 8 {
-            a.ldur(12, 15, ev);
-            a.lsr_imm(9, 12, 48);
             if own.counted() {
-                a.movz(14, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-                a.cmp_reg_x(9, 14);
-                a.b_cond(C_EQ, miss);
-            }
-            a.movz(14, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
-            a.cmp_reg_x(9, 14);
-            a.b_cond(C_EQ, miss); // lazy storage has an owning Rc destructor
-            if own.counted() {
+                a.ldur(12, 15, ev);
+                a.lsr_imm(9, 12, 48);
+                for tag in [crate::value::PACK_BIGINT, crate::value::PACK_LAZY_PROTO] {
+                    a.movz(14, (tag >> 48) as u32, 0);
+                    a.cmp_reg_x(9, 14);
+                    a.b_cond(C_EQ, miss);
+                }
                 let old_ref = a.new_label();
                 let old_plain = a.new_label();
                 for tag in [
@@ -10606,14 +10605,15 @@ fn emit_store_name_value(
     // Both stores own the same compact word; no repacking or allocation is necessary.
     emit_exec_word_load(a, 10, 20, -8);
     // Release the old packed owner. Scalars need nothing; common refcounted values decrement
-    // inline, while BigInt or a last owner uses the exact packed destructor. Traced
-    // ownership releases every execution kind (BigInt included) by overwriting it; a lazy
-    // prototype still takes the destructor.
-    a.ldur(16, 14, 0);
-    a.lsr_imm(9, 16, 48);
-    let old_ref = a.new_label();
-    let old_drop = a.new_label();
+    // inline, while BigInt, a last owner or a function's deferred prototype uses the exact
+    // packed destructor. Traced ownership releases every old word by overwriting it, a
+    // deferred prototype included (a cell, which dies once no word names it): no load, test
+    // or helper call.
     if own.counted() {
+        a.ldur(16, 14, 0);
+        a.lsr_imm(9, 16, 48);
+        let old_ref = a.new_label();
+        let old_drop = a.new_label();
         for tag in [crate::value::PACK_STR, crate::value::PACK_SYM] {
             a.movz(13, (tag >> 48) as u32, 0);
             a.cmp_reg_w(9, 13);
@@ -10622,25 +10622,22 @@ fn emit_store_name_value(
         a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
         a.cmp_reg_w(9, 13);
         a.b_cond(C_EQ, old_ref);
-        a.movz(13, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-        a.cmp_reg_w(9, 13);
-        a.b_cond(C_EQ, old_drop);
-    }
-    a.movz(13, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_EQ, old_drop);
-    a.b(packed_commit);
-    if own.counted() {
+        for tag in [crate::value::PACK_BIGINT, crate::value::PACK_LAZY_PROTO] {
+            a.movz(13, (tag >> 48) as u32, 0);
+            a.cmp_reg_w(9, 13);
+            a.b_cond(C_EQ, old_drop);
+        }
+        a.b(packed_commit);
         a.bind(old_ref);
         a.lsl_imm(11, 16, 16);
         a.lsr_imm(11, 11, 16);
         rc_release_unless_last(a, own, 11, 12, old_drop);
         a.b(packed_commit);
+        a.bind(old_drop);
+        // A last owner, a BigInt, or a deferred prototype (an owning Rc that is not a value
+        // owner): this helper call is not only ownership work.
+        drop_helper_call(a, H_DROP_PACKED_AT, Some((10, 14)), |a| a.mov(2, 14));
     }
-    a.bind(old_drop);
-    // A last owner, a BigInt (counted ownership), or a lazy prototype (an owning Rc that is
-    // not a value owner): this helper call is not only ownership work.
-    drop_helper_call(a, H_DROP_PACKED_AT, Some((10, 14)), |a| a.mov(2, 14));
     a.bind(packed_commit);
     a.stur(10, 14, 0);
     a.sub_imm(20, 20, 8);

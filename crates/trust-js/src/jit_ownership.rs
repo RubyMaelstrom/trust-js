@@ -9,7 +9,8 @@
 //!
 //! Tag guards that only decide whether a word owns anything ([`exec_owner_guard`]) are kept
 //! apart from the count work, and the drop helpers ([`drop_helper_call`]) are Rust destructors
-//! that some sites also need for words that are not reference-counted (a lazy prototype).
+//! that some counted sites also need for a word that is not a value owner (a function's
+//! deferred prototype, whose word owns an `Rc` in the default build).
 //!
 //! Not value ownership: a `PropertyLayout` key buffer is an `Rc<PropertyLayoutData>` in every
 //! build. Its count changes only through the `layout_rc_*` emitters at the end of this file,
@@ -25,9 +26,11 @@
 //! word owns nothing: every `Traced` arm below emits nothing, the execution-word clone, drop and
 //! release included, so none branches to a site's slow path. Logic that sites keep beside these
 //! emitters only for counted owners (alias compares, old-value markers, the direct call's
-//! surplus counter, BigInt exclusions, a checked path or load that only an owner guard used) is
-//! emitted only while owners are counted ([`JitOwnership::counted`]). A property word that can
-//! be a function's deferred `prototype` is kept out of execution by [`property_word_guard`]: a
+//! surplus counter, BigInt and deferred-prototype exclusions, a checked path or load that only
+//! an owner guard used) is emitted only while owners are counted ([`JitOwnership::counted`]).
+//! No traced code calls a drop helper: a property store overwrites its old word, a deferred
+//! prototype's included (a cell under gc-heap). A property word that can be a function's
+//! deferred `prototype` is kept out of execution by [`property_word_guard`]: a
 //! materialization boundary, not ownership.
 
 use super::*;
@@ -318,6 +321,7 @@ pub(super) fn rc_release_unless_last(
 /// helpers run only Rust destruction (no author code, allocation of JS values, or unwinding),
 /// which may cascade through an object graph; they clobber x0..x17, x30 and NZCV, and the
 /// frame registers x19..x22 survive. `spill` pushes that register pair around the call.
+/// Counted ownership only: no `Traced` site emits it (`jit_drop_packed_at` asserts so).
 #[inline]
 pub(super) fn drop_helper_call(
     a: &mut asm::Asm,

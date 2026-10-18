@@ -919,10 +919,12 @@ fn committed_native_call_operands_are_roots() {
 
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
 /// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
-/// (`jit::traced_tests`) and the owner-free words of `jit::word_routing_tests` again at
-/// `TRUST_JS_GC_STRESS=1`, which collects at every safepoint
-/// that follows an allocation (the calls, polls and natives JIT code reaches throughout,
-/// besides `collect()`), in a process of their own: the setting is read once per process.
+/// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests` and the deferred
+/// prototypes' cells (their lifetime, trace, materialization and Rust overwrites, the packed
+/// drop boundary and a deferred prototype's memory report) again at `TRUST_JS_GC_STRESS=1`,
+/// which collects at every safepoint that follows an allocation (the calls, polls and natives
+/// JIT code reaches throughout, besides `collect()`), in a process of their own: the setting
+/// is read once per process.
 #[test]
 fn rooting_holds_under_gc_stress() {
     const CHILD: &str = "TRUST_JS_TEST_ROOTING_STRESS_CHILD";
@@ -936,6 +938,11 @@ fn rooting_holds_under_gc_stress() {
             "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
             "jit::traced_tests::",
             "jit::word_routing_tests::",
+            "value::lazy_function_prototype::tests::dead_constructors_leave_no_reserved_cells",
+            "value::lazy_function_prototype::tests::deferred_prototype",
+            "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes",
+            "bytecode::return_slot_tests::packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries",
+            "memory::tests::deferred_prototype_payload_is_counted_once_in_property_storage",
             "--skip",
             "rooting_holds_under_gc_stress",
         ])

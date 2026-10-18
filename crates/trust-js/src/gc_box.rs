@@ -1,10 +1,12 @@
 //! P1 S2: handles to payload cells (feature `gc-heap`): a BigInt's digits, a Symbol's identity,
-//! and (P1 S4) a closure's `UserCallable`.
+//! (P1 S4) a closure's `UserCallable` and (P1 S5) a function's deferred `prototype`.
 //!
 //! A handle is its cell's address: `Copy`, with no reference count. The cell lives in the
 //! Agent heap that was active when the handle was made, until a collection finds it
 //! unreachable; its descriptor's finalizer then drops the payload. Payload cells have no
-//! outgoing edges, except a closure cell's to its environment (see `value::UserFn`).
+//! outgoing edges, except a closure cell's to its environment (see `value::UserFn`) and a
+//! deferred prototype's to its function and to the prototype's parent or, once materialized,
+//! the prototype (see `value::LazyProto`).
 
 use std::ptr::NonNull;
 

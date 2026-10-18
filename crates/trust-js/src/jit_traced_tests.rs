@@ -484,6 +484,57 @@ fn traced_ownership_emitters_emit_nothing() {
     assert!(!a.label_referenced(label), "a Traced arm branches");
 }
 
+/// The two property stores whose old word can be a function's deferred prototype (step 9b),
+/// the SetProp template (each receiver kind, with and without a retained result) and the name
+/// and Reference store, load neither drop helper (`H_DROP_PACKED_AT`, `H_DROP_AT`) under
+/// traced ownership: they overwrite the old word. Every other drop-helper call is in an
+/// emitter that is counted-only (`traced_ownership_emitters_emit_nothing`), so no traced code
+/// reaches either helper.
+#[test]
+fn traced_property_stores_call_no_drop_helper() {
+    use super::*;
+    let layout = crate::value::jit_layout(&crate::value::Object::new(None));
+    assert!(!layout.ownership().counted(), "gc-heap layouts are traced");
+    // The helper-table load a drop-helper call begins with, as `drop_helper_call` emits it.
+    let helper_load = |helper: usize| {
+        let mut a = asm::Asm::new();
+        a.ldr_imm(16, 21, (helper * 8) as u32);
+        a.finish()[0]
+    };
+    let drops = [helper_load(H_DROP_PACKED_AT), helper_load(H_DROP_AT)];
+    let mut a = asm::Asm::new();
+    drop_helper_call(&mut a, H_DROP_PACKED_AT, None, |_| {});
+    assert!(
+        a.finish().contains(&drops[0]),
+        "the scan sees a drop-helper call"
+    );
+    let mut templates = Vec::new();
+    for (recv, keep) in [
+        (PropRecv::Stack, false),
+        (PropRecv::Stack, true),
+        (PropRecv::This, false),
+        (PropRecv::Slot(16), false),
+    ] {
+        let mut a = asm::Asm::new();
+        let unwind = a.new_label();
+        emit_set_prop_inline(&mut a, &layout, 0x1000, "prototype", 0, unwind, recv, keep);
+        a.bind(unwind);
+        templates.push(a.finish());
+    }
+    let mut a = asm::Asm::new();
+    let (slow, done) = (a.new_label(), a.new_label());
+    emit_store_name_value(&mut a, &layout, slow, done);
+    a.bind(slow);
+    a.bind(done);
+    templates.push(a.finish());
+    for words in &templates {
+        assert!(!words.is_empty());
+        for drop in drops {
+            assert!(!words.contains(&drop), "a traced store loads a drop helper");
+        }
+    }
+}
+
 /// The property-word guard is three instructions and sends exactly the words whose tag is above
 /// Object (PACK_LAZY_PROTO, a function's deferred `prototype`, and every other property-only or
 /// unknown tag) to the slow path, over all 65,536 tags, each with a null and a wild payload:

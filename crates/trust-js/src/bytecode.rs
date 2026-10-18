@@ -21581,12 +21581,16 @@ pub(crate) unsafe extern "C" fn jit_drop_at(
 }
 
 /// Drop one NaN-boxed execution or property owner at `word`. Generated stores use this only
-/// after all observable guards pass; packed destruction cannot execute JavaScript.
+/// after all observable guards pass; packed destruction cannot execute JavaScript. Counted
+/// ownership only: under gc-heap no word owns anything, so no generated code calls it.
 pub(crate) unsafe extern "C" fn jit_drop_packed_at(
     _ctx: *mut crate::jit::JitCtx,
     _imm: u32,
     word: *mut PackedValue,
 ) -> *mut PackedValue {
+    if cfg!(all(feature = "gc-heap", debug_assertions)) {
+        panic!("gc-heap generated code dropped a packed word");
+    }
     unsafe { crate::value::PackedValue::drop_raw(word.cast::<u64>()) };
     word
 }
@@ -26260,6 +26264,9 @@ mod return_slot_tests {
         }
     }
 
+    /// The native ABI's prefix offsets and sizes, and the drop helpers' boundaries: each returns
+    /// the word it was given; `jit_drop_packed_at` releases a packed owner (an object's count, or
+    /// a deferred prototype's box with its key layout) and `jit_drop_at` a wide one.
     #[cfg(not(feature = "gc-heap"))]
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
@@ -26295,30 +26302,8 @@ mod return_slot_tests {
             wide_ptr
         );
         assert_eq!(weak.strong_count(), 0);
-    }
-
-    /// gc-heap: the same prefix offsets and sizes. Values hold no count, and the one packed
-    /// word that still owns is a lazy prototype's (an `Rc` in both builds): `jit_drop_packed_at`
-    /// releases its one owner, which drops the lazy prototype and with it its owner of the key
-    /// layout. Both drop helpers return the word they were given.
-    #[cfg(feature = "gc-heap")]
-    #[test]
-    fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
-        use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<PackedValue>(), 8);
-        assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
-        if size_of::<usize>() == 8 {
-            assert_eq!(offset_of!(JitCtx, helpers), 0);
-            assert_eq!(offset_of!(JitCtx, stack_base), 8);
-            assert_eq!(offset_of!(JitCtx, final_sp), 16);
-            assert_eq!(offset_of!(JitCtx, slots), 24);
-            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
-            assert_eq!(offset_of!(JitCtx, env_raw), 40);
-            assert_eq!(offset_of!(JitCtx, this_raw), 48);
-            assert_eq!(offset_of!(JitCtx, global_body), 56);
-            assert_eq!(offset_of!(JitCtx, genv), 64);
-            assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
-        }
+        // A function's deferred prototype is the one packed word that owns something besides a
+        // value: its `Rc` box, which owns the key layout. `jit_drop_packed_at` releases it.
         let keys = crate::value::new_property_layout(vec![Rc::from("constructor")]);
         let owner = crate::value::Object::new(None);
         let mut property = crate::value::Property::plain(Value::Undefined);
@@ -26357,7 +26342,87 @@ mod return_slot_tests {
             1,
             "releasing the word dropped the lazy prototype"
         );
-        let mut wide = ManuallyDrop::new(Value::Obj(owner));
+    }
+
+    /// gc-heap: the same prefix offsets and sizes. No word owns anything, so no generated code
+    /// calls `jit_drop_packed_at` (debug builds assert it). A function's deferred prototype,
+    /// the one packed word that owned a box, names a cell in its function's heap: overwriting
+    /// the word releases nothing (the cell still owns its key layout), and the next collection
+    /// frees the cell, whose finalizer drops the layout. `jit_drop_at` returns the value it was
+    /// given.
+    #[cfg(feature = "gc-heap")]
+    #[test]
+    fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PackedValue>(), 8);
+        assert_eq!(std::mem::size_of_val(&context(Value::Undefined).ret), 8);
+        if size_of::<usize>() == 8 {
+            assert_eq!(offset_of!(JitCtx, helpers), 0);
+            assert_eq!(offset_of!(JitCtx, stack_base), 8);
+            assert_eq!(offset_of!(JitCtx, final_sp), 16);
+            assert_eq!(offset_of!(JitCtx, slots), 24);
+            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
+            assert_eq!(offset_of!(JitCtx, env_raw), 40);
+            assert_eq!(offset_of!(JitCtx, this_raw), 48);
+            assert_eq!(offset_of!(JitCtx, global_body), 56);
+            assert_eq!(offset_of!(JitCtx, genv), 64);
+            assert_eq!(size_of::<crate::jit::SpFlag>(), 16);
+        }
+        let mut engine = crate::Engine::new();
+        engine.interp.activate_gc_heap();
+        let lazy_cells = |engine: &crate::Engine| {
+            let heap = &engine.interp.gc_heap;
+            heap.core.borrow().live_count(heap.lazy_proto_desc)
+        };
+        engine.interp.gc_collect();
+        let before = lazy_cells(&engine);
+        let keys = crate::value::new_property_layout(vec![Rc::from("constructor")]);
+        // The property lives in a box and the word is inspected in helper frames: the
+        // conservative stack scan would keep a cell this frame names.
+        let mut property = Box::new(crate::value::Property::plain(Value::Undefined));
+        let deferred = crate::gc_test::in_frame(|| {
+            let owner = crate::value::Object::new(None);
+            property.defer_function_prototype(
+                &owner,
+                crate::value::Object::new(None),
+                &crate::value::Props::with_layout(0, Some(keys.clone())),
+            );
+            let entry_value = crate::value::jit_layout(&owner).entry_value;
+            // The word at the offset generated stores address it by.
+            let word = unsafe {
+                (&raw const *property)
+                    .cast::<u8>()
+                    .add(entry_value)
+                    .cast::<u64>()
+                    .read()
+            };
+            word & !0xffff_ffff_ffff == crate::value::PACK_LAZY_PROTO
+        });
+        assert!(deferred, "the property holds a lazy word");
+        assert_eq!(
+            lazy_cells(&engine),
+            before + 1,
+            "one cell per deferred prototype"
+        );
+        assert_eq!(Rc::strong_count(&keys), 2, "the cell owns the key layout");
+        crate::gc_test::in_frame(|| property.set_value(Value::Undefined));
+        assert_eq!(
+            Rc::strong_count(&keys),
+            2,
+            "overwriting the lazy word released nothing"
+        );
+        engine.interp.gc_collect();
+        assert_eq!(
+            lazy_cells(&engine),
+            before,
+            "the cell died at the next collection"
+        );
+        assert_eq!(
+            Rc::strong_count(&keys),
+            1,
+            "its finalizer dropped the key layout"
+        );
+        let mut wide = ManuallyDrop::new(Value::Obj(crate::value::Object::new(None)));
         let wide_ptr = &raw mut *wide;
         assert_eq!(
             unsafe { jit_drop_at(std::ptr::null_mut(), 0, wide_ptr) },

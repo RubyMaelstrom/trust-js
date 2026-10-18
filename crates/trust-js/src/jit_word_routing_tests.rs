@@ -10,6 +10,9 @@
 //! - A BigInt used to leave the fast path wherever its owner needed the checked one. Each test
 //!   drives a BigInt through such a site and checks the results and the BigInt's value after
 //!   every store or compare.
+//! - Under gc-heap a deferred prototype's word names a cell and owns nothing either (step 9b):
+//!   the native property stores that used to send a lazy old value to the checked store or to a
+//!   drop helper overwrite it, materializing nothing, and the old cell dies at a collection.
 //!
 //! Programs run at every tier with the same expected results; at `Tier::Jit` the functions named
 //! ran as native code and, where a test counter records it, the native path ran (or, for a
@@ -322,6 +325,120 @@ fn deferred_prototype_region_method_reads_are_not_borrowed() {
             );
         }
     }
+}
+
+/// The deferred-prototype cells `engine`'s heap holds (gc-heap).
+#[cfg(feature = "gc-heap")]
+fn lazy_cells(engine: &Engine) -> usize {
+    let heap = &engine.interp.gc_heap;
+    heap.core.borrow().live_count(heap.lazy_proto_desc)
+}
+
+/// gc-heap: `F.prototype = p` over unobserved deferred prototypes through the generated SetProp
+/// template (a warmed, compiled `setPrototype`): every store completes in the template, with no
+/// set-property helper call (so no checked store, and no drop helper, which gc-heap code never
+/// calls), no old prototype is materialized (the probe), the new value reads back, and the old
+/// cells are gone after the next collection.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
+    let source = format!(
+        "{FUNCTIONS}
+        function setPrototype(F, p) {{ F.prototype = p; }}
+        function setAll(fns, p, n) {{ for (var i = 0; i < n; i++) setPrototype(fns[i], p); }}
+        function check(fns, p, n) {{
+            for (var i = 0; i < n; i++) if (fns[i].prototype !== p) return false;
+            return true;
+        }}
+        var p = {{}}, fns = null;
+        setAll(fresh(8), p, 8); setAll(fresh(8), p, 8);
+        0;"
+    );
+    let set_helpers =
+        || crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get) as u64;
+    let mut engine = engine(Tier::Jit);
+    eval(&mut engine, &source);
+    engine.interp.gc_collect();
+    let cells = lazy_cells(&engine);
+    eval(&mut engine, "fns = fresh(10); 0");
+    assert_eq!(
+        lazy_cells(&engine),
+        cells + 10,
+        "one cell per fresh function"
+    );
+    let materialized = crate::value::prototypes_materialized();
+    let helpers = delta(set_helpers, || {
+        eval(&mut engine, "setAll(fns, p, 10); 0");
+    });
+    assert_native(&mut engine, &["setPrototype", "setAll"]);
+    assert_eq!(helpers, 0, "every store over a lazy word is native");
+    assert_eq!(
+        crate::value::prototypes_materialized(),
+        materialized,
+        "no old prototype is materialized"
+    );
+    assert_eq!(eval(&mut engine, "check(fns, p, 10)"), "true");
+    engine.interp.gc_collect();
+    assert_eq!(
+        lazy_cells(&engine),
+        cells,
+        "the old cells died by the next collection"
+    );
+}
+
+/// gc-heap: `prototype = p` inside `with (F)` over unobserved deferred prototypes (`StoreRef`
+/// through the with object's Reference; a generator, whose resumable body compiles `with`):
+/// every store completes natively (the native Reference-store counter) and overwrites the lazy
+/// word with no drop helper (which gc-heap code never calls), no old prototype is materialized
+/// (the probe), the new value reads back, and the old cells are gone after the next collection.
+#[cfg(feature = "gc-heap")]
+#[test]
+fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
+    let source = format!(
+        "{FUNCTIONS}
+        function* withStore(F, p) {{ with (F) {{ prototype = p; }} yield 0; }}
+        function viaWith(F, p) {{ withStore(F, p).next(); }}
+        function storeAll(fns, p, n) {{ for (var i = 0; i < n; i++) viaWith(fns[i], p); }}
+        function check(fns, p, n) {{
+            for (var i = 0; i < n; i++) if (fns[i].prototype !== p) return false;
+            return true;
+        }}
+        var p = {{}}, fns = null;
+        storeAll(fresh(8), p, 8); storeAll(fresh(8), p, 8);
+        0;"
+    );
+    let stores = || super::names::TEST_NATIVE_REFERENCES.with(|counts| counts[2].get() as u64);
+    let mut engine = engine(Tier::Jit);
+    eval(&mut engine, &source);
+    engine.interp.gc_collect();
+    let cells = lazy_cells(&engine);
+    eval(&mut engine, "fns = fresh(10); 0");
+    assert_eq!(
+        lazy_cells(&engine),
+        cells + 10,
+        "one cell per fresh function"
+    );
+    let materialized = crate::value::prototypes_materialized();
+    let native = delta(stores, || {
+        eval(&mut engine, "storeAll(fns, p, 10); 0");
+    });
+    assert_native(&mut engine, &["withStore", "viaWith", "storeAll"]);
+    assert_eq!(
+        native, 10,
+        "every Reference store over a lazy word is native"
+    );
+    assert_eq!(
+        crate::value::prototypes_materialized(),
+        materialized,
+        "no old prototype is materialized"
+    );
+    assert_eq!(eval(&mut engine, "check(fns, p, 10)"), "true");
+    engine.interp.gc_collect();
+    assert_eq!(
+        lazy_cells(&engine),
+        cells,
+        "the old cells died by the next collection"
+    );
 }
 
 /// BigInts through the baseline templates that used to send a BigInt to their checked path

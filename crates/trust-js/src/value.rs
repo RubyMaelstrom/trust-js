@@ -211,7 +211,23 @@ pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 #[path = "lazy_function_prototype.rs"]
 mod lazy_function_prototype;
+#[cfg(test)]
+pub(crate) use lazy_function_prototype::materialized as prototypes_materialized;
 use lazy_function_prototype::LazyFunctionPrototype;
+
+/// The requested bytes a deferred prototype's payload adds to property storage (tests).
+#[cfg(test)]
+pub(crate) const DEFERRED_PROTOTYPE_BYTES: usize = std::mem::size_of::<LazyFunctionPrototype>();
+
+/// The handle a PACK_LAZY_PROTO word holds: a function's deferred `prototype`. P1 S5
+/// (gc-heap): a payload cell that traces the function and the prototype's parent (or, once
+/// materialized, the prototype), so the word owns nothing and dropping or overwriting it
+/// releases nothing; the cell dies at the first collection that finds no word naming it. The
+/// default build keeps a reference-counted box, which the word owns.
+#[cfg(feature = "gc-heap")]
+type LazyProto = crate::gc_box::GcBox<LazyFunctionPrototype>;
+#[cfg(not(feature = "gc-heap"))]
+type LazyProto = Rc<LazyFunctionPrototype>;
 
 impl PackedValue {
     /// Borrow the encoded bits without transferring their reference ownership. Generated code
@@ -396,13 +412,14 @@ impl PackedValue {
             PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
             PACK_LAZY_PROTO => {
                 let prototype = {
-                    let lazy = std::mem::ManuallyDrop::new(unsafe {
-                        self.read_word::<Rc<LazyFunctionPrototype>>()
-                    });
+                    let lazy =
+                        std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
                     lazy.materialize()
                 };
                 // Promotion is representation-only, invokes no JS and preserves the descriptor
                 // and identity. Subsequent native reads see an ordinary PACK_OBJ, not a thunk.
+                // Dropping the replaced lazy word releases its box (default build); under
+                // gc-heap it releases nothing, and the cell dies once no word names it.
                 let bits = PACK_OBJ | unsafe { Self::into_word(prototype.clone()) };
                 drop(PackedValue(Cell::new(self.0.replace(bits))));
                 Value::Obj(prototype)
@@ -412,7 +429,9 @@ impl PackedValue {
     }
 
     /// Lend the strong object edge this word owns (an object, or a deferred prototype's single
-    /// stored edge) without a reference-count round trip. Never materializes a prototype.
+    /// stored edge: the logical edge from its function) without a reference-count round trip.
+    /// Never materializes a prototype. Under gc-heap a deferred prototype is a cell of its own,
+    /// which marking reaches through `PackedValue::trace_gc_edges`, not through this edge.
     #[inline]
     fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
         match self.tag() {
@@ -421,9 +440,7 @@ impl PackedValue {
                 f(&object)
             }
             PACK_LAZY_PROTO => {
-                let lazy = std::mem::ManuallyDrop::new(unsafe {
-                    self.read_word::<Rc<LazyFunctionPrototype>>()
-                });
+                let lazy = std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
                 lazy.with_gc_edge(f)
             }
             _ => {}
@@ -445,7 +462,7 @@ impl PackedValue {
             PACK_SYM => Value::Sym(unsafe { this.read_word() }),
             PACK_OBJ => Value::Obj(unsafe { this.read_word() }),
             PACK_LAZY_PROTO => {
-                let lazy = unsafe { this.read_word::<Rc<LazyFunctionPrototype>>() };
+                let lazy = unsafe { this.read_word::<LazyProto>() };
                 Value::Obj(lazy.materialize())
             }
             _ => Value::Num(f64::from_bits(this.0.get())),
@@ -504,7 +521,8 @@ impl Drop for PackedValue {
             PACK_STR => unsafe { self.drop_word::<crate::lstr::LStr>() },
             PACK_SYM => unsafe { self.drop_word::<SymbolRef>() },
             PACK_OBJ => unsafe { self.drop_word::<Gc>() },
-            PACK_LAZY_PROTO => unsafe { self.drop_word::<Rc<LazyFunctionPrototype>>() },
+            // The default build's box; a gc-heap cell handle has nothing to release.
+            PACK_LAZY_PROTO => unsafe { self.drop_word::<LazyProto>() },
             _ => {}
         }
     }
@@ -2796,6 +2814,9 @@ pub(crate) struct GcState {
     /// Closure cells (each a [`UserCallable`]).
     #[cfg(feature = "gc-heap")]
     pub(crate) user_fn_desc: crate::gc_core::DescId,
+    /// Deferred-prototype cells (each a function's [`LazyFunctionPrototype`]).
+    #[cfg(feature = "gc-heap")]
+    pub(crate) lazy_proto_desc: crate::gc_core::DescId,
     /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     #[cfg(feature = "gc-heap")]
@@ -2890,6 +2911,7 @@ struct CellDescs {
     symbol: crate::gc_core::DescId,
     string: crate::gc_core::DescId,
     user_fn: crate::gc_core::DescId,
+    lazy_proto: crate::gc_core::DescId,
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
@@ -2919,6 +2941,13 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         weak: None,
         finalize: Some(crate::gc_box::finalize::<UserCallable>),
     });
+    // The finalizer drops the cell's `PropertyLayout`, its only Rust-heap owner.
+    let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "lazy prototype",
+        trace: lazy_function_prototype::trace_cell,
+        weak: None,
+        finalize: Some(crate::gc_box::finalize::<LazyFunctionPrototype>),
+    });
     (
         core,
         CellDescs {
@@ -2928,6 +2957,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
             symbol,
             string,
             user_fn,
+            lazy_proto,
         },
     )
 }
@@ -2936,6 +2966,13 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
 impl crate::gc_box::Payload for UserCallable {
     fn desc(heap: &GcState) -> crate::gc_core::DescId {
         heap.user_fn_desc
+    }
+}
+
+#[cfg(feature = "gc-heap")]
+impl crate::gc_box::Payload for LazyFunctionPrototype {
+    fn desc(heap: &GcState) -> crate::gc_core::DescId {
+        heap.lazy_proto_desc
     }
 }
 
@@ -3200,11 +3237,13 @@ impl crate::gc_trace::GcTrace for NativeCallable {
 
 #[cfg(feature = "gc-heap")]
 impl PackedValue {
-    /// Report this word's strong edge: a payload cell, an object, or a deferred prototype's
-    /// edge.
+    /// Report this word's strong edge: a payload cell (a deferred prototype's included, which
+    /// traces its function and its parent or prototype itself) or an object.
     pub(crate) fn trace_gc_edges(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self.tag() {
-            PACK_BIGINT | PACK_SYM | PACK_STR => sink.word(self.0.get() & PACK_PAYLOAD),
+            PACK_BIGINT | PACK_SYM | PACK_STR | PACK_LAZY_PROTO => {
+                sink.word(self.0.get() & PACK_PAYLOAD)
+            }
             _ => self.with_object_edge(|object| sink.object(object)),
         }
     }
@@ -3775,6 +3814,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         string_desc: descs.string,
         #[cfg(feature = "gc-heap")]
         user_fn_desc: descs.user_fn,
+        #[cfg(feature = "gc-heap")]
+        lazy_proto_desc: descs.lazy_proto,
         #[cfg(feature = "gc-heap")]
         interned_strings: RefCell::default(),
         #[cfg(feature = "gc-heap")]
@@ -4572,6 +4613,9 @@ impl Drop for Property {
 }
 
 impl Property {
+    /// The requested bytes this property owns: its accessor pair and a deferred prototype's
+    /// payload. A lazy word's box (or gc-heap cell) is its own, since copying the word
+    /// materializes it, so counting the payload per word counts each allocation once.
     fn retained_requested_storage_bytes(&self) -> usize {
         self.accessors()
             .map_or(0, |_| std::mem::size_of::<Accessors>())
@@ -4721,23 +4765,29 @@ impl Property {
     /// Collector-only owning edge, lent without a reference-count round trip. A deferred
     /// prototype owns its realm parent until first observation; afterward it owns the
     /// materialized prototype instead. Do not allocate or change the reference graph during
-    /// collector counting/marking.
+    /// collector counting/marking. This is the object graph's logical edge, which the
+    /// reference-counting collectors walk (`Interp::visit_object_edges`); gc-heap marking
+    /// reports a deferred prototype's cell instead (see `PackedValue::trace_gc_edges`).
     #[inline]
     pub(crate) fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
         self.packed.with_object_edge(f)
     }
     pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
         if self.packed.tag() == PACK_LAZY_PROTO {
-            let lazy = std::mem::ManuallyDrop::new(unsafe {
-                self.packed.read_word::<Rc<LazyFunctionPrototype>>()
-            });
+            let lazy = std::mem::ManuallyDrop::new(unsafe { self.packed.read_word::<LazyProto>() });
             lazy.visit_retained_memory(visitor);
         } else {
             visitor.value(&self.value());
         }
     }
+    /// Make this property's value `owner`'s deferred MakeConstructor prototype: a lazy word
+    /// naming a new [`LazyProto`] (under gc-heap a cell in the active heap, which is `owner`'s).
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
-        let lazy = Rc::new(LazyFunctionPrototype::new(owner, parent, template));
+        let lazy = LazyFunctionPrototype::new(owner, parent, template);
+        #[cfg(feature = "gc-heap")]
+        let lazy: LazyProto = crate::gc_box::new(lazy);
+        #[cfg(not(feature = "gc-heap"))]
+        let lazy: LazyProto = Rc::new(lazy);
         self.packed = PackedValue(Cell::new(
             PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) },
         ));
