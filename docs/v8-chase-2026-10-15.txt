@@ -3335,37 +3335,46 @@ no-LTO release builds unless noted.
     --tier=jit, and the base default binary lacks S5's symbols
     (jit::ownership, probe_jit_repr).
   - Method: fresh copies of all four, perf stat on CPU 5, the
-    fixtures at each tier, 5 rounds, medians. Stdout is equal
+    fixtures at each tier, 15 rounds, medians. Stdout is equal
     everywhere.
-  - Load: the other cores were 3.6 busy at the median (a game), so
-    no cycles are recorded from this run. Instructions and peak RSS
-    do not depend on the load.
-  - The default build, base -> end: instructions within 0.13% at every
-    tier but djot at jit, +0.37% (+4.5M). That is compile work in
-    S5's emitter layers. In a synthetic run, 402 compiles of a small
-    function cost 575K more instructions; without the compiles, the
-    same run costs 36K more. djot compiles 160 larger functions
-    (1.33M words of code). Its generated code is unchanged, and so
-    are its startup (14.57M instructions on an empty script) and its
-    bytecode and interp runs. Peak RSS -4.3..+2.8%, within the runs'
-    spread.
+  - Load: the run waited for a quiet minute. Cycles come only from
+    runs with at most one other core busy: at jit 13-15 per
+    configuration, at bytecode 11-12 (the other cores 0.46 and 0.48
+    busy at the median). The interp rounds saw 1.99, so no interp
+    cycles are recorded. Instructions and peak RSS do not depend on
+    the load; a first run of 5 rounds under a game's load agreed.
+  - The default build, base -> end (vue/react/djot):
+    - Instructions within 0.02% at every tier but djot at jit, +0.36%
+      (+4.4M). That is compile work in S5's emitter layers. In a
+      synthetic run, 402 compiles of a small function cost 575K more
+      instructions; without the compiles, the same run costs 36K
+      more. djot compiles 160 larger functions (1.33M words of code).
+      Its generated code is unchanged, and so are its startup (14.57M
+      instructions on an empty script) and its bytecode and interp
+      runs.
+    - Cycles at jit +0.7/+0.0/+0.3%, at bytecode -1.1/-4.2/-1.1%.
+      React's bytecode cycles spread widely (549.6-597.5M across the
+      base's runs), and its -4.2% comes with equal instructions; S4
+      recorded +3.1..3.6% there with 0.2% fewer.
+    - Peak RSS -2.1..+1.1%, within the runs' spread.
   - gc-heap, base -> end:
-    - At jit, where the base ran bytecode: instructions vue -62.5%,
-      react -78.4%, djot -56.3%; peak RSS +5.3/+5.0/+14.8%.
-    - At bytecode: -3.1/-3.9/-3.3%, mostly step 9b; peak RSS
-      -4.2..+0.9%.
-    - At interp: within 0.3%; peak RSS -2.6..+1.4%.
+    - At jit, where the base ran bytecode: cycles -57.7/-79.5/-42.8%,
+      instructions -62.5/-78.4/-56.3%, peak RSS +4.2/+3.6/+15.1%.
+    - At bytecode: cycles -3.8/-5.0/-3.4%, instructions -3.0/-3.9/
+      -3.3%, mostly step 9b; peak RSS -2.6..0%.
+    - At interp: instructions within 0.3%; peak RSS 0..+1.2%.
   - gc-heap against the default build, at the end:
-    - Instructions at jit -9.8/-18.7/-9.4%, at bytecode -8.4/-14.2/
-      -8.3%, at interp +12.8/+10.2/+9.1%. The interp cost is S2-S4's,
-      unchanged by S5.
-    - Peak RSS +8.0..+143.3%, highest on react. That is S3's finding,
+    - At jit: cycles -13.2/-10.7/-6.9% (step 9's tripwire at 9e:
+      -13.0/-10.5/-6.8%), instructions -9.8/-18.7/-9.3%.
+    - At bytecode: cycles -10.4/-13.3/-7.7%, instructions -8.3/-14.2/
+      -8.3%.
+    - At interp: instructions +12.8/+10.2/+9.1%. That is S2-S4's
+      cost, unchanged by S5.
+    - Peak RSS +9.5..+145.6%, highest on react. That is S3's finding,
       open for S6.
-    - Against the base's default build at jit: -9.8/-18.7/-9.0%. S0's
-      threshold (i), vue at most 2.97e9, stands at 2,974.3M.
-  - Cycles: step 9's quiet tripwire has them for step 8 -> 9e in both
-    builds, and for gc-heap against the default build at 9e. Base ->
-    end cycles wait for a quiet machine.
+    - Against the base's default build at jit: cycles -12.6/-10.7/
+      -6.7%, instructions -9.8/-18.7/-9.0%. S0's threshold (i), vue at
+      most 2.97e9, stands at 2,974.2M.
 - Open, none of them caused by S5:
   - the two threshold-0 findings above;
   - step 9e's follow-ups, and 9f's Binding.value, to revisit in S6;
