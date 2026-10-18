@@ -3460,3 +3460,110 @@ S5 review fixes (outside review of 37a3e12f, 2026-10-18)
   - Full Test262 at --tier=jit, both builds: 53,575/53,575 at the
     default threshold, 53,573/53,575 at threshold 0. All four reports
     are byte-identical to the S5 exit gate's.
+
+S6 flip, deletion and acceptance (started 2026-10-18)
+-----------------------------------------------------
+Stage boundary: main has no commits past the merge base e3310993.
+
+Plan, recorded before the work. Two read-only surveys (the counted
+model's deletion inventory; the embed API, x86-64 and GC policy)
+found:
+- Gates: 772 gc-heap mentions in 77 files, all in crates/trust-js/src
+  (about 442 production, 330 test), and 10 heap-bridge mentions, all
+  in value.rs. Downstream manifests only forward gc-heap (host,
+  difftest, fs, timers, runtime, web, node).
+- The counted model, to delete:
+  - the cycle collector and its edge helpers (interpreter.rs, about
+    1,200 lines), the counted nursery (gc_generational.rs), and the
+    counted parts of gc_edges.rs and gc_diagnostics.rs;
+  - six DirectGcEdges traces; the counted Gc, Env and LStr handles;
+    the Rc payload aliases; PackedValue's counted Clone and Drop;
+    the scope registry; the map_data table; the VM string-add
+    retire; 8 production count observers;
+  - the JIT's Refcount ownership: jit_ownership.rs's counted arms and
+    52 counted() blocks; on x64, 7 rc_* sites;
+  - heap.rs (heap-bridge);
+  - 21 default-only tests, and 48 gc-heap-ignored tests of the
+    counted model.
+- Open beyond deletion:
+  - Only Linux and macOS have a conservative stack scanner
+    (gc_core.rs), so a gc-heap build never collects on Windows or
+    wasm32.
+  - x86-64 under gc-heap has never been compiled or run: neither the
+    scanner's spill and scrub assembly nor the x64 JIT, which is
+    refused under gc-heap.
+  - The embed API hands out raw cell handles, with no rooted handle
+    type. A Value kept in Rust-heap storage, or past its Engine,
+    dangles. Cross-Engine use is unchecked, and Gc derefs to
+    RefCell<Object>.
+  - TRust (/big/Code/TRust) builds against main's embed API.
+- Criteria unmet at S5's exit: peak RSS +9.5..+146% against +25%; GC
+  share 29-38% on sustained allocation against 5% (main spends 25-28%
+  there); Vue instructions 2,974.2M against 2,970M.
+
+Owner decisions (2026-10-18):
+- The plan's non-goal "generational collection" is lifted. With
+  full-heap collection, lowering the budget floor for RSS means more
+  full marks of the whole live heap, and raising it costs RSS. A
+  nursery removes that trade. S0 measured high infant mortality: on
+  Vue, 85k of 151k deaths within 16 allocations of birth.
+- Order: flip and delete first, so a write barrier goes into one model
+  only. Then two cheap levers, measured: the byte budget replaces the
+  inherited 100k-object trigger, and marking finds a cell's page
+  directly instead of hashing every edge. Then the nursery, as its own
+  step.
+- 64-bit targets only. wasm32 leaves P1's acceptance (its criterion
+  retires), and trust-js-wasm's wasm32 build stops being a P1 target.
+- zombie (ruby@zombie, x86-64 Linux) validates x86-64 natively. It
+  also validates Windows: x86_64-pc-windows-msvc, cross-built there
+  with cargo-xwin and run under Wine.
+
+Steps (each leaves the workspace building, with its gates green):
+- Step 0, baselines: gc-heap code dumps, Test262 reports, lib and
+  downstream counts and fixture outputs, so that deletions can be
+  shown to change nothing. Also a trust-js tree and toolchain on
+  zombie.
+- Step 1, portability before the flip:
+  - x86-64 Linux gc-heap on zombie at interp and bytecode: lib suites
+    in both builds, per-test GC stress with the verifier, the
+    scanner's adversarial tests, and Test262.
+  - A Windows scanner: stack bounds from GetCurrentThreadStackLimits,
+    a Win64 register spill (xmm6-xmm15 included), and stacker's fiber
+    stacks. Cross-built and run under Wine on zombie.
+- Step 2, flip: gc-heap is the default model.
+- Step 3, the counted model's tests and heap-bridge: delete them,
+  porting any test whose property still holds.
+- Step 4, the counted collectors and their knobs.
+- Step 5, the counted handles, payloads and count observers.
+- Step 6, the JIT's Refcount ownership on ARM64. gc-heap code dumps
+  must stay identical to step 0's.
+- Step 7, the x64 JIT under gc-heap on zombie: Traced arms, InlineVec
+  fields, the packed `this`, string immediates and due-word polls.
+  The clamp is lifted and the x64-ignored tests return.
+- Step 8, the gc-heap and heap-bridge features removed from every
+  manifest, and their cfgs unwrapped.
+- Step 9, the two cheap collector levers, measured against the RSS
+  and GC-time bounds.
+- Step 10, the nursery:
+  - non-moving, with sticky mark bits: young means not yet marked by
+    a full collection;
+  - a write barrier, chiefly at borrow_mut (a per-object dirty mark),
+    plus environment raw writes and VM and JIT stores;
+  - the verifier checks, at every minor collection, that no old->young
+    edge goes unrecorded;
+  - weak refs, WeakMap ephemerons, FinalizationRegistry and owner
+    eviction, all correct in minor collections.
+- Step 11, the embed API: an opaque strong handle registered as a
+  root in its Agent's heap. It carries the heap id, rejects other
+  Engines, and is inert rather than dangling once its Engine drops.
+  Value stops being a storable raw handle, and the runtime's and
+  N-API's workarounds migrate. TRust's port is decided with the
+  owner.
+- Step 12, criterion closure: the execution word literally Copy;
+  Binding.value and the VM's `this` packed (9f's revisit); no
+  PropertyLayout count traffic in generated code; Object's
+  Rc<GcState> and the slot registry replaced. How far the Value enum
+  recedes in Rust and the embed API is decided with the owner, and
+  recorded.
+- Exit gate: all Success Criteria (wasm32 retired), on aarch64 and on
+  zombie. Merge review with the owner.
