@@ -2656,3 +2656,133 @@ Step 9b, deferred prototypes as payload cells (b155ff10):
   packed `this` word itself at [48], in place of this_raw. The pointer
   and its four set-up writes go, saving one dependent load per access
   of `this`. The default build keeps this_raw and the wide this_val.
+
+Step 9c, packed words copy as bits and drop as nothing (e1630212):
+- Under gc-heap PackedValue has no Drop, and its Clone copies the
+  bits. A const assertion pins that the type needs no drop. The
+  default build keeps both impls: its .text is byte-identical to 9b's
+  (only panic line numbers in .data.rel.ro differ).
+- The explicit read is PackedValue::clone_materialized, in both
+  builds. A deferred prototype materializes and the source word is
+  promoted in place, as unpack does; any other word is cloned. In the
+  default build it is Clone, whose lazy arm does the same.
+  Property::clone and Property::clone_value_packed use it; value,
+  into_value and take_value already materialized. Property::clone
+  keeps materializing: 9a's guards rest on a lazy word living only in
+  its function's prototype slot.
+- The gc-heap Clone debug-asserts that the word is not a deferred
+  prototype.
+- The clone sites were found by removing Clone from PackedValue,
+  Property and every container of properties, and compiling all
+  targets under six feature sets.
+  - Those that can see a lazy word read through Property::clone or
+    clone_value_packed: [[GetOwnProperty]] snapshots, the OrdinaryGet
+    and OrdinarySet chain walks (Reflect.get and Reflect.set),
+    ValidateAndApplyPropertyDescriptor, the interpreter's [[Set]]
+    chain walks, super() to a native parent (which grafts the made
+    function's properties), and snapshot_cached_get (VM and JIT named
+    reads).
+  - Six direct clones read execution storage: Dup, Dup2 and LoadLocal
+    in drive_vm and jit_exec_inner. Execution storage never holds a
+    lazy word: words enter it as packed Values, cached-get snapshots
+    and moves, or by generated loads, which 9a guards wherever the key
+    can be "prototype".
+  - The other property clones cannot see one: builtin method aliases,
+    the mapped arguments object, internal and private slots, class
+    private methods, module namespaces, function templates (whose
+    prototype slot is an Undefined placeholder) and object-literal
+    templates.
+- The teardown loops compile to nothing under gc-heap; the optimizer
+  removes them, and nothing is cfg'd. In 9b each drop dispatched on
+  the tag and called an out-of-line drop_word that only returned.
+  No-LTO objdump, gc-heap 9b -> 9c instructions (packed-drop calls):
+  jit_direct_finish 431 -> 242 (20 -> 0), jit::run 581 -> 532
+  (20 -> 0), run_moved_inner 574 -> 364 (25 -> 0),
+  run_moved_oversized 643 -> 375 (30 -> 0).
+- jit_add_strings' retire of the owner that the next StoreLocal or
+  StoreCap overwrites is default-only: gc-heap appends at the buffer's
+  frontier and needs no uniqueness (242 -> 181 instructions).
+  clone_raw is default-only. The VM's own Op::Add retire in drive_vm
+  is the same count-only logic and still runs under gc-heap.
+- clippy::drop_non_drop joins the crate's gc-heap allowances, beside
+  those for Copy handles.
+- Tests. The gc-heap ones all run in the stress child at stress 1.
+  - Seven tests ignored under gc-heap since S2 have gc-heap forms:
+    three in value.rs and four in execution_storage.rs. They check
+    exact bits (an object word is the tag over the cell's address),
+    bitwise clones, values intact after their copies drop, and that
+    drops and replacements release nothing.
+  - object_allocations_attach_and_release_central_handles stays
+    ignored: it tests heap-bridge's central handle, not packed words,
+    and compiles only with heap-bridge.
+  - In both builds and at every tier, each of the five reads
+    materializes a function's deferred prototype exactly once
+    (prototypes_materialized). An object word comes out, the property
+    holds it, and constructor and the parent hold; a second read and a
+    script's read materialize nothing more. take_value leaves
+    undefined.
+  - gc-heap debug builds: copying a lazy word with Clone trips the
+    assertion.
+- Mutations (a separate source copy; each test in its own process, at
+  stress 0 and 1; the control passes 22 of 22 with debug assertions
+  and 21 of 21 without):
+  - Property::clone without the explicit read: with debug assertions
+    6 tests fail and 1 aborts, the transfer test among them; without,
+    3 fail.
+  - clone_value_packed without it: 7 fail and 1 aborts; without debug
+    assertions 5 fail.
+  - The gc-heap Clone keeping its lazy arm fails the should-panic
+    test.
+  The aborts are the assertion firing inside extern "C" helpers.
+- Gates: the agent's, at e1630212. I reran the lib suites, the stress
+  child, clippy and rustfmt at the same commit.
+  - Lib suites: embed 2174/0/3 (2173 plus the transfer test);
+    embed,gc-heap 2218/0/55 twice (2209, plus 7 returned and 2 new;
+    62 - 7 ignored). My rerun gave the same counts, with gc-heap run
+    twice.
+  - Stress child (53 tests: 44 + 7 + 2): 29.0 s alone; 29.8 s
+    on my rerun.
+  - Targeted per-test stress over the names matching
+    execution_storage|borrowed_parameters|property_read|value::|
+    payload|lazy|prototype|traced_tests|rooting_tests|poll (236
+    tests, 235 at interval 1):
+    - At stress 1, 226 pass and 9 are ignored.
+    - At stress 1 with threshold 0, the same, apart from the known
+      threshold assumption (lazy_snapshot_body_tests::huge_run_once_
+      bootstrap_bodies_are_interpreted_until_the_call_threshold).
+    - tests::proxy_prototype_cycles_throw_range_error_instead_of_
+      overflowing, on 8c's slow list, passes at 100 both ways.
+    - No crash and no verifier report.
+  - Test262 (built-ins/Function, Object and Reflect;
+    language/expressions and language/statements, class and function),
+    default tier: release gc-heap runners at 21252744 and e1630212,
+    and a debug gc-heap runner at e1630212 with the assertion live,
+    13214 of 13214 each.
+  - Default code dumps are norm2-identical to step 1, stdout equal.
+    gc-heap: chunks 56/10/160, and every chunk's summary is identical
+    to 9b's. Raw words: vue 189,014 -> 188,998, react 26,017 ->
+    26,016, djot 1,056,905 -> 1,056,922. My word diff puts the whole
+    difference in MOVK counts of materialized helper addresses, which
+    follow the binary's layout; the generated code is unchanged.
+  - Fixtures at --tier=jit: exit 0, stdout equal, compiles 55/9/160
+    and 56/10/160.
+  - difftest --seed 7 --count 150: 138 agree, 12 skipped, 0 crashes
+    in both builds.
+  - Clippy clean in both builds; rustfmt clean.
+- Instructions, 9b -> 9c (user mode, no-LTO, perf and the workload
+  pinned to CPU 5, median of 3; my recheck agrees with the agent's
+  within 0.07 points):
+  - gc-heap at --tier=jit: vue 3,347.5M -> 3,235.2M (-3.4%), react
+    631.7M -> 617.6M (-2.2%), djot 1,302.0M -> 1,265.0M (-2.8%).
+  - gc-heap at --tier=bytecode: vue -5.0%, react -9.4%, djot -5.5%.
+  - The default build is within 0.1%, with identical code.
+  - gc-heap against the default build at --tier=jit: vue -10.5%,
+    react -18.4%, djot -10.1%.
+  Much of the gain is 9b's out-of-line drop_word calls, which fat LTO
+  may already inline; 9f's fat-LTO tripwire measures it.
+- Microbenchmarks at --tier=jit, gc-heap 9b -> 9c (the default build is
+  unchanged; checksums agree): creating 2M closures with deferred
+  prototypes -3.1%, the arrow-function control -3.5%, materializing
+  300k prototypes -2.1%, replacing 1M unobserved prototypes -3.1%.
+- For 9d: under gc-heap a packed `this` needs no release, and
+  JitFrame::release's reset is one PACK_UNDEFINED store.
