@@ -492,7 +492,7 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{Gc, GcCause, Object};
+    use crate::value::{Gc, Object};
     use crate::{Completion, Engine};
 
     fn eval(engine: &mut Engine, source: &str, expected: &str) {
@@ -716,7 +716,7 @@ mod tests {
                 "true",
             );
             assert!(engine.interp.kept_alive.is_empty());
-            engine.interp.gc_collect_young(GcCause::Explicit);
+            engine.interp.gc_collect();
             assert_eq!(engine.interp.weak_metadata.cleared_subscribers, 5);
             assert_eq!(engine.interp.weak_metadata.targets.len(), stable_count);
             assert_eq!(
@@ -776,7 +776,7 @@ mod tests {
                     .values()
                     .flatten()
                     .all(|(_, value)| matches!(value, Value::Undefined)));
-                engine.interp.gc_collect_young(GcCause::Explicit);
+                engine.interp.gc_collect();
                 assert!(engine
                     .interp
                     .weak_collection_data
@@ -1088,7 +1088,7 @@ mod tests {
         engine.interp.gc_collect();
         eval(&mut engine, "typeof reference.deref()", "symbol");
         eval(&mut engine, "holder=null;true", "true");
-        engine.interp.gc_collect_young(GcCause::Explicit);
+        engine.interp.gc_collect();
         eval(&mut engine, "String(reference.deref()===undefined)", "true");
     }
 }

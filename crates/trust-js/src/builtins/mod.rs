@@ -8285,10 +8285,6 @@ impl FromAsyncCoro {
         }
     }
 
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        self.visit_values(|value| edges.value(value));
-    }
-
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         self.visit_values(|value| visitor.value(value));
         std::mem::size_of::<FromAsyncCoro>()

@@ -326,13 +326,6 @@ mod cell {
             WeakGc::of(this)
         }
 
-        /// The GC heap has no reference counts: only the disabled cycle collector and
-        /// refcount-observing tests ask, so reaching this is a bug.
-        #[track_caller]
-        pub fn strong_count(_: &Gc) -> usize {
-            panic!("Gc::strong_count: the gc-heap object model has no reference counts")
-        }
-
         /// Releasing a handle never destroys anything on a tracing heap.
         #[inline]
         pub fn outlives_release(_: &Gc, _: usize) -> bool {

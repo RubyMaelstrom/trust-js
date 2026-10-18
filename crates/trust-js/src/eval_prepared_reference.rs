@@ -164,15 +164,6 @@ impl PreparedReference {
         }
     }
 
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        if let Some(scope) = &self.scope {
-            edges.scope(scope);
-        }
-        if let Some(object) = &self.object {
-            edges.object(object);
-        }
-    }
-
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         visitor.rc_str(&self.name);
         if let Some(object) = &self.object {

@@ -57,9 +57,6 @@ fn numeric_array_shift_keeps_warm_native_views_coherent_across_gc_and_append() {
             );
             entered(tier);
             assert_eq!(eval(&mut engine, "a.shift()"), "1");
-            engine
-                .interp
-                .gc_collect_young(crate::value::GcCause::Explicit);
             engine.interp.gc_collect();
             reset_entries();
             assert_eq!(
@@ -122,9 +119,6 @@ fn numeric_front_edits_reload_native_views_within_the_same_activation() {
                 ),
                 "64:1:64"
             );
-            engine
-                .interp
-                .gc_collect_young(crate::value::GcCause::Explicit);
             engine.interp.gc_collect();
         }
     }

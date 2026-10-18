@@ -5,8 +5,8 @@
 //!
 //! ## Shape
 //! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
-//! - [`value`] is the prototype-based object model (`Rc<RefCell<Object>>`) with a cycle collector
-//!   and bounded live-object pressure.
+//! - [`value`] is the prototype-based object model: `RefCell<Object>` cells on a mark-sweep heap
+//!   (conservative only for the native stack), with bounded live-object pressure.
 //! - [`builtins`] installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
 //!   constructors, global functions).
 //!
@@ -31,6 +31,11 @@
         clippy::drop_non_drop
     )
 )]
+
+#[cfg(not(feature = "gc-heap"))]
+compile_error!(
+    "trust-js needs its default `gc-heap` feature: the reference-counted object model has no collector"
+);
 
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
 /// read is cached, because a libc environment lookup scans every variable under a lock and the
@@ -118,9 +123,6 @@ fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
     gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
     result
 }
-mod gc_diagnostics;
-mod gc_edges;
-mod gc_generational;
 mod gc_handle;
 mod gc_native;
 #[cfg(test)]
@@ -158,6 +160,7 @@ mod loop_fragment_tests;
 mod lstr;
 mod memory;
 mod modules;
+#[cfg(test)]
 mod native_captures;
 #[cfg(all(test, feature = "embed"))]
 mod native_constructor_tests;

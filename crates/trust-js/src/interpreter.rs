@@ -3575,7 +3575,7 @@ pub struct Interp {
     /// Live generator coroutines, keyed by the generator object's pointer. Each owns an explicit
     /// heap VM continuation that parks at `yield`/`await` without reserving an OS thread stack.
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
-    /// Live-object count above which the next allocation safe point runs the cycle collector.
+    /// Live-object count above which the next allocation safe point runs a collection.
     pub(crate) gc_next: i64,
     /// Live-object ceiling for this engine; see [`MIN_LIVE_OBJECT_LIMIT`]. Defaults to
     /// [`default_live_object_limit`] and is configurable by the embedder.
@@ -3599,12 +3599,11 @@ pub struct Interp {
     /// Allocation safepoints and their existing limits remain enabled.
     pub(crate) gc_task_deferred: bool,
     pub(crate) gc_task_pending: bool,
-    /// The pending task collection must revisit the complete graph: the host released old
-    /// objects (a discarded document) that a nursery collection would not reach.
+    /// Unused: kept until P1 S6 step 8, since generated code embeds Interp's field offsets.
+    #[allow(dead_code)]
     pub(crate) gc_task_major: bool,
-    /// Prune the scope registry once its entry count passes this floating threshold (default
-    /// build: gc-heap keeps no scope registry).
-    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
+    /// Unused: kept until P1 S6 step 8, since generated code embeds Interp's field offsets.
+    #[allow(dead_code)]
     pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
     /// build a wrapper object instead of returning a primitive).
@@ -3933,7 +3932,7 @@ pub(crate) struct ShadowHome {
 /// the JS call stack. Holds the realm's agent active until it drops.
 pub(crate) struct ShadowEntry {
     sub: *mut Interp,
-    /// Keeps the owner alive meanwhile (the default build's cycle collector sees a holder).
+    /// Keeps the owner alive meanwhile (entries are locals, which the stack scan finds).
     _owner: Gc,
     _agent: crate::value::AgentActivationGuard,
 }
@@ -4117,30 +4116,9 @@ pub struct PromiseState {
 
 /// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
 /// The pointer-keyed `Interp` tables whose values are strong internal-slot edges of their key
-/// object, as walked by `Interp::visit_object_edges`. Expands `$callback!(table, ...)`. Keep
-/// this list and that walker identical; debug builds assert that a collector never skips an
-/// owner of one of these tables.
-#[cfg(not(feature = "gc-heap"))]
-macro_rules! gc_side_slot_tables {
-    ($callback:ident) => {
-        $callback!(
-            class_info,
-            module_ns,
-            map_data,
-            collection_iterators,
-            ta_buffer,
-            proxies,
-            host_indexed,
-            promises,
-            promise_forward,
-            async_gen_queue,
-            finalization_registries,
-            mapped_arguments,
-        )
-    };
-}
-
-/// gc-heap keeps a Map's or Set's [[MapData]]/[[SetData]] in its cell, not in `map_data`.
+/// object, traced once that object is marked (`Interp::trace_owner_slots`). Expands
+/// `$callback!(table, ...)`. A Map's or Set's [[MapData]]/[[SetData]] is in its cell, not in
+/// `map_data`.
 #[cfg(feature = "gc-heap")]
 macro_rules! gc_side_slot_tables {
     ($callback:ident) => {
@@ -4470,8 +4448,8 @@ pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 /// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
-/// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), the
-/// cycle collector runs; if it can't get back under, a RangeError is thrown rather than exhausting
+/// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), a
+/// collection runs; if it can't get back under, a RangeError is thrown rather than exhausting
 /// RAM. This bounds genuine retention; transient cyclic garbage is reclaimed and doesn't count.
 pub const MIN_LIVE_OBJECT_LIMIT: i64 = 3_000_000;
 /// Largest automatically derived ceiling. An embedder may configure a larger explicit value.
@@ -4501,8 +4479,13 @@ pub(crate) fn default_live_object_limit() -> i64 {
 pub const GC_TRIGGER: i64 = 100_000;
 /// Layered calls check allocation counters once per 256 calls (see `gc_check_amortized`).
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
-/// Scope-registry entry count that arms a registry prune.
-const SCOPE_GC_TRIGGER: usize = 65_536;
+
+/// The live-object threshold after a collection that left `live` objects: an eighth more, and at
+/// least [`GC_TRIGGER`] more, clamped to `[GC_TRIGGER, limit]`.
+pub(crate) fn next_threshold(live: i64, limit: i64) -> i64 {
+    live.saturating_add((live / 8).max(GC_TRIGGER))
+        .clamp(GC_TRIGGER, limit.max(GC_TRIGGER))
+}
 
 /// ArrayBuffer data allocated since the last collection that triggers another, at least. A
 /// backing store is freed only when the collector finds its buffer unreachable, and a buffer is
@@ -4888,7 +4871,6 @@ impl Interp {
         // objects and the current job: this only coalesces a collection request,
         // honoring the host's existing task deferral and ClearKeptObjects order.
         self.gc_task_pending = true;
-        self.gc_task_major = true;
         true
     }
 
@@ -5533,7 +5515,7 @@ impl Interp {
             gc_task_deferred: false,
             gc_task_pending: false,
             gc_task_major: false,
-            scope_gc_next: SCOPE_GC_TRIGGER,
+            scope_gc_next: 0,
             constructing: false,
             super_call_ok: false,
             fn_frames: Vec::new(),
@@ -6517,7 +6499,7 @@ impl Interp {
             .is_some_and(|ptr| self.proxies.contains_key(&ptr))
     }
 
-    /// Run TRust JS's cycle collector and return the number of reclaimed heap objects.
+    /// Run a full collection and return the number of reclaimed heap objects.
     /// Inlined: the stack below the host's frame is zeroed before the collection's frames are
     /// built (see `gc_collect`).
     #[inline(always)]
@@ -6528,19 +6510,21 @@ impl Interp {
         let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         let live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+        self.gc_next = next_threshold(live, self.live_object_limit);
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
     }
 
-    /// Diagnostic nursery collection for embedder graph/barrier conformance tests.
-    /// Unlike the normal host collector, this deliberately preserves every old object.
-    /// It is not a replacement for major/idle collection or a supported scheduling API.
+    /// Diagnostic collection for embedder graph/barrier conformance tests. There is no nursery:
+    /// this runs a full collection, as [`Interp::collect_garbage_for_host`] does. It is not a
+    /// supported scheduling API.
     #[doc(hidden)]
     pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_collect_young(crate::value::GcCause::Explicit);
+        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
     }
 
@@ -11291,14 +11275,6 @@ impl Interp {
             return Ok(());
         }
         self.gc_weak_metadata_safepoint(false);
-        // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
-        // allocating few objects, and each dead weak registry entry pins its allocation. (gc-heap:
-        // environments are cells, so the heap's byte budget bounds their churn.)
-        #[cfg(not(feature = "gc-heap"))]
-        if crate::value::gc_scope_registry_len(&self.gc_heap) > self.scope_gc_next {
-            let live = crate::value::gc_scope_registry_prune(&self.gc_heap);
-            self.scope_gc_next = live.saturating_mul(2).max(SCOPE_GC_TRIGGER);
-        }
         // Only a collection the live-object threshold makes due enforces the limit: GC stress and
         // the cell heap's byte budget also collect here, and must not throw again inside the
         // handler the re-armed threshold below leaves room for.
@@ -11334,7 +11310,7 @@ impl Interp {
         // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit]. A
         // collection the threshold did not trigger keeps the threshold the collector left.
         if threshold_due {
-            self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+            self.gc_next = next_threshold(live, self.live_object_limit);
         }
         Ok(())
     }
@@ -11394,7 +11370,7 @@ impl Interp {
                 self.generators.len()
             );
         }
-        self.gc_next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+        self.gc_next = next_threshold(live, self.live_object_limit);
         before.saturating_sub(live)
     }
 
@@ -11468,313 +11444,8 @@ impl Interp {
         t
     }
 
-    /// All strong side-table families used by the two object edge walkers.
-    /// Keep this inventory paired with those walkers when adding a new family.
-    /// The existing snapshot index is reused; no second owner hash map or
-    /// duplicated payload graph is constructed. Weak collections remain in
-    /// the separate ephemeron walk, not in this strong-edge absence proof.
-    /// Test-only inventory for the withdrawn sparse-mask runtime experiment.
-    #[cfg(test)]
-    pub(crate) fn gc_slot_owner_mask(
-        &self,
-        live_index: &crate::fasthash::FastMap<usize, usize>,
-    ) -> crate::gc_edges::GcSlotOwnerMask {
-        macro_rules! owners {
-            ($($table:ident),+ $(,)?) => {{
-                let entries = 0usize$(.saturating_add(self.$table.len()))+;
-                let mut mask = crate::gc_edges::GcSlotOwnerMask::new(live_index.len(), entries);
-                if mask.enabled() {
-                    $(for owner in self.$table.keys() {
-                        if let Some(&index) = live_index.get(owner) {
-                            mask.note_owner(index);
-                        }
-                    })+
-                }
-                mask
-            }};
-        }
-        gc_side_slot_tables!(owners)
-    }
-
-    /// A collection-local proof that an unpinned object cannot own any of the
-    /// strong side slots below. Use the existing ownership registry rather
-    /// than allocating an owner index or adding metadata to every object.
-    ///
-    /// Pins alone are NOT an absence proof: embed/test paths can attach slots
-    /// to an unpinned owner. Check every actual table's keys first, and retain
-    /// the complete walk whenever that precondition or the sparsity gate fails.
-    /// ECMA-262 #sec-liveness: this only avoids empty lookups; no graph edge,
-    /// root, ephemeron condition or weak-target clearing may be omitted.
-    /// Test-only: runtime use was withdrawn after startup/RSS regression gates
-    /// failed. Preserve the ownership proof for future collector experiments.
-    #[cfg(test)]
-    pub(crate) fn gc_can_skip_unpinned_slots(&self, object_count: usize) -> bool {
-        if object_count < 4096 || self.gc_pins.len() > object_count / 4 {
-            return false;
-        }
-        macro_rules! pinned {
-            ($($table:ident),+ $(,)?) => {
-                $(self.$table.keys().all(|owner| self.gc_pins.contains_key(owner)))&&+
-            };
-        }
-        // Keep this complete alongside BOTH edge walkers and the test-only
-        // slot inventory above. Any unrecognized owner keeps the full trace.
-        gc_side_slot_tables!(pinned)
-    }
-
-    /// Report every strong graph edge `o` owns to `sink`: its prototype, property values and
-    /// accessor functions, the internal slots stored in the object itself, and (when
-    /// `side_slots`) the pointer-keyed internal-slot tables listed in
-    /// [`Interp::side_slot_owners`]. Coroutine continuations are traced separately by each
-    /// collector. Both collectors and the diagnostics walker share this one inventory.
-    ///
-    /// `side_slots` may be false only when the caller has proven that `o` keys none of those
-    /// tables during this collection (see [`Interp::side_slot_owners`]).
-    pub(crate) fn visit_object_edges(
-        &self,
-        o: &Gc,
-        side_slots: bool,
-        sink: &mut impl crate::gc_edges::GcEdgeSink,
-    ) {
-        {
-            let b = o.borrow();
-            if let Some(p) = &b.proto {
-                sink.object(p);
-            }
-            for prop in b.props.values().chain(b.internal_slots().values()) {
-                prop.with_object_edge(|p| sink.object(p));
-                if let Some(Value::Obj(p)) = prop.getter() {
-                    sink.object(p);
-                }
-                if let Some(Value::Obj(p)) = prop.setter() {
-                    sink.object(p);
-                }
-            }
-            // [[IteratedArrayLike]] is a graph edge owned by the iterator, even
-            // though it is deliberately absent from the ordinary property map.
-            match &b.exotic {
-                Exotic::ArrayIterator(state) => sink.value(&state.target),
-                // gc-heap: a Map's or Set's entries, in its cell.
-                #[cfg(feature = "gc-heap")]
-                Exotic::Collection(entries) => {
-                    for (key, value) in entries.iter() {
-                        sink.value(key);
-                        sink.value(value);
-                    }
-                }
-                _ => {}
-            }
-            match &b.call {
-                // A user function's closure environment.
-                Callable::User(user) => sink.scope(&user.env),
-                Callable::Bound(bound) => {
-                    sink.object(&bound.target);
-                    sink.value(&bound.this);
-                    for a in &bound.args {
-                        sink.value(a);
-                    }
-                }
-                // ShadowRealm and cross-Realm callable wrappers own their target
-                // as an internal slot. Keep that target graph edge visible to the
-                // cycle collector; otherwise a live wrapper can retain a callable
-                // whose object is swept and later reports "value is not a
-                // function" when invoked. (ECMA-262 [[Call]] wrapper target.) A
-                // ShadowRealm wrapper also keeps its ShadowRealm object, and so the realm.
-                Callable::WrappedShadow(shadow) => {
-                    sink.object(&shadow.realm);
-                    sink.value(&shadow.target);
-                }
-                Callable::WrappedCross(cross) => sink.value(&cross.target),
-                _ => {}
-            }
-        }
-
-        // Pointer-keyed tables implement internal slots. Their strong values are graph edges from
-        // the owner object, not collector roots merely because Rust stores them in `Interp`.
-        // Keep this list identical to `side_slot_owners`.
-        let ptr = Gc::as_ptr(o) as usize;
-        if !side_slots {
-            debug_assert!(
-                !self.has_side_slots(ptr),
-                "collector skipped an internal-slot table owner"
-            );
-            return;
-        }
-        if let Some(class) = self.class_info.get(&ptr) {
-            for field in class.fields.iter() {
-                for transform in &field.transforms {
-                    sink.value(transform);
-                }
-            }
-            for initializer in &class.instance_initializers {
-                sink.value(initializer);
-            }
-            for (_, property) in &class.private_members {
-                property.with_object_edge(|p| sink.object(p));
-                if let Some(getter) = property.getter() {
-                    sink.value(getter);
-                }
-                if let Some(setter) = property.setter() {
-                    sink.value(setter);
-                }
-            }
-            // A class constructor's field-initializer environment.
-            sink.scope(&class.field_env);
-        }
-        if let Some(bindings) = self.module_ns.get(&ptr) {
-            for binding in bindings.values() {
-                match binding {
-                    crate::modules::NsBinding::Static(value) => sink.value(value),
-                    crate::modules::NsBinding::Live(env, _) => sink.scope(env),
-                }
-            }
-        }
-        #[cfg(not(feature = "gc-heap"))]
-        if let Some(entries) = self.map_data.get(&ptr) {
-            for (key, value) in entries.iter() {
-                sink.value(key);
-                sink.value(value);
-            }
-        }
-        if let Some(iterator) = self.collection_iterators.get(&ptr) {
-            if let Some(target) = &iterator.target {
-                sink.object(target);
-            }
-        }
-        if let Some(value) = self.ta_buffer.get(&ptr) {
-            sink.value(value);
-        }
-        if let Some((target, handler)) = self.proxies.get(&ptr) {
-            sink.value(target);
-            sink.value(handler);
-        }
-        if let Some(properties) = self.host_indexed.get(&ptr) {
-            sink.value(&properties.getter);
-            if let Some(live) = &properties.live {
-                sink.value(&live.state);
-                if let Some(getter) = &live.named_getter {
-                    sink.value(getter);
-                }
-            }
-        }
-        if let Some(promise) = self.promises.get(&ptr) {
-            sink.value(&promise.value);
-            for (fulfilled, rejected, result, _) in &promise.reactions {
-                sink.value(&fulfilled.callback);
-                sink.value(&rejected.callback);
-                if let Some(global) = &fulfilled.script_caller {
-                    sink.object(global);
-                }
-                if let Some(global) = &rejected.script_caller {
-                    sink.object(global);
-                }
-                sink.value(result);
-            }
-        }
-        if let Some(value) = self.promise_forward.get(&ptr) {
-            sink.value(value);
-        }
-        if let Some(queue) = self.async_gen_queue.get(&ptr) {
-            for (promise, resume) in queue {
-                sink.value(promise);
-                match resume {
-                    crate::coroutine::Resume::Next(value)
-                    | crate::coroutine::Resume::Return(value)
-                    | crate::coroutine::Resume::Throw(value) => sink.value(value),
-                    crate::coroutine::Resume::Terminate => {}
-                }
-            }
-        }
-        if let Some(registry) = self.finalization_registries.get(&ptr) {
-            sink.value(&registry.cleanup_callback.callback);
-            if let Some(global) = &registry.cleanup_callback.script_caller {
-                sink.object(global);
-            }
-            for cell in registry.cells.iter() {
-                sink.value(&cell.held_value);
-            }
-        }
-        // A mapped `arguments` object's aliased parameter scope.
-        if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
-            sink.scope(env);
-        }
-    }
-
-    /// Whether `ptr` keys any internal-slot table walked by [`Interp::visit_object_edges`].
-    fn has_side_slots(&self, ptr: usize) -> bool {
-        macro_rules! any_table {
-            ($($table:ident),+ $(,)?) => { false $(|| self.$table.contains_key(&ptr))+ };
-        }
-        gc_side_slot_tables!(any_table)
-    }
-
-    /// Snapshot members (by `index`, pointer → position) that key any internal-slot table
-    /// walked by [`Interp::visit_object_edges`], plus coroutine owners when `generators`.
-    /// Every other member can skip those probes for this collection: the tables are not
-    /// modified while a collector runs, and the flags are rebuilt from the actual entries
-    /// each time, never from a persistent per-object bit. Returns `None` (probe everything)
-    /// when the tables are large relative to the snapshot, so that collections of a small
-    /// nursery never scale with long-lived side-table state.
-    pub(crate) fn side_slot_owners(
-        &self,
-        index: &crate::fasthash::FastMap<usize, usize>,
-        len: usize,
-        generators: bool,
-    ) -> Option<Vec<bool>> {
-        macro_rules! entries {
-            ($($table:ident),+ $(,)?) => { 0usize $(.saturating_add(self.$table.len()))+ };
-        }
-        let mut entries = gc_side_slot_tables!(entries);
-        if generators {
-            entries = entries.saturating_add(self.generators.len());
-        }
-        if len == 0 || entries > len.saturating_mul(2) {
-            return None;
-        }
-        let mut owners = vec![false; len];
-        macro_rules! flag {
-            ($($table:ident),+ $(,)?) => {
-                $(for owner in self.$table.keys() {
-                    if let Some(&position) = index.get(owner) {
-                        owners[position] = true;
-                    }
-                })+
-            };
-        }
-        gc_side_slot_tables!(flag);
-        if generators {
-            flag!(generators);
-        }
-        Some(owners)
-    }
-
-    /// Append object and environment references held directly by `o` into reusable scratch
-    /// vectors (cleared first). Each vector receives its own handle clones.
-    pub(crate) fn object_edges_into(&self, o: &Gc, objects: &mut Vec<Gc>, scopes: &mut Vec<Env>) {
-        objects.clear();
-        scopes.clear();
-        self.visit_object_edges(
-            o,
-            true,
-            &mut crate::gc_edges::DirectGcEdges { objects, scopes },
-        );
-    }
-
-    pub(crate) fn obj_refs_into(&self, o: &Gc, refs: &mut Vec<Gc>) {
-        let mut scopes = Vec::new();
-        self.object_edges_into(o, refs, &mut scopes);
-    }
-
-    /// The scopes `o` refers to: a user function's closure environment, a mapped `arguments`
-    /// object's aliased parameter scope, a class constructor's field-initializer environment
-    /// and a module namespace's live bindings.
-    pub(crate) fn obj_scope_refs_into(&self, o: &Gc, out: &mut Vec<Env>) {
-        let mut objects = Vec::new();
-        self.object_edges_into(o, &mut objects, out);
-    }
-
-    /// Sweep one already-proven non-live set. Full and nursery collectors share atomic weak
-    /// clearing and internal-slot eviction (ECMA-262 #sec-weakref-execution).
+    /// Sweep one already-proven non-live set: atomic weak clearing and internal-slot eviction
+    /// (ECMA-262 #sec-weakref-execution).
     pub(crate) fn gc_sweep_dead_objects(
         &mut self,
         garbage_objects: &crate::fasthash::FastSet<usize>,
@@ -11807,9 +11478,8 @@ impl Interp {
         self.gc_drain_weak_deaths();
         self.gc_schedule_finalization_cleanup(garbage_objects);
 
-        // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
-        // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
-        // future object reusing the address can't inherit stale metadata.
+        // Evict the dead from pointer-keyed side tables, so that a future object reusing an
+        // address can't inherit stale metadata.
         self.native_function_realms.get_mut().retain(|_, (pin, _)| {
             pin.upgrade().is_some_and(|function| {
                 !garbage_objects.contains(&(Gc::as_ptr(&function) as usize))
@@ -11818,7 +11488,8 @@ impl Interp {
         // Evict the chosen dead set in batches. Probing all internal-slot tables for each
         // ordinary function/prototype makes closure churn pay for unrelated platform state.
         // Small dead sets keep directed removal; dense churn scans each table only once.
-        // The heap/scope snapshots keep identities alive, and weak targets were cleared above.
+        // Dead cells stay intact until the heap frees them after this sweep, and weak targets
+        // were cleared above.
         self.gc_evict_dead_owners(garbage_objects);
     }
 
@@ -11826,7 +11497,7 @@ impl Interp {
     /// a new field does not compile until it is classified. A table keyed by an object's
     /// address evicts a dead object's entries here: a later object at the same address must
     /// not inherit them. Every other field keeps its keys alive, pins them weakly, is swept by
-    /// an earlier step, or is not keyed by object addresses. Shared by both collectors.
+    /// an earlier step, or is not keyed by object addresses.
     fn gc_evict_dead_owners(&mut self, dead: &crate::fasthash::FastSet<usize>) {
         let _evicting = crate::gc_sweep::Evicting::enter();
         let Interp {
@@ -12106,9 +11777,7 @@ impl Interp {
     #[inline(always)]
     pub(crate) fn gc_collect(&mut self) {
         #[cfg(feature = "gc-heap")]
-        return self.gc_heap_collect_explicit();
-        #[cfg(not(feature = "gc-heap"))]
-        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
+        self.gc_heap_collect_explicit();
     }
 
     /// Account for `len` bytes of new ArrayBuffer data, first collecting once enough has been
@@ -12153,923 +11822,11 @@ impl Interp {
 
     pub(crate) fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
         self.buffer_gc.since_gc = 0;
-        // P1 S2: the refcount cycle collector below must never see cell handles.
-        if cfg!(feature = "gc-heap") {
-            #[cfg(feature = "gc-heap")]
-            if matches!(cause, crate::value::GcCause::Explicit) {
-                self.gc_heap_collect_explicit();
-            } else {
-                self.gc_heap_collect(cause);
-            }
-            return;
-        }
-        // Allocation and task-boundary pressure usually visit only newly allocated objects,
-        // with bounded major-collection debt: a retained page heap is not rescanned for each
-        // 1/8 of growth. Explicit/idle collections and released documents revisit everything.
-        let young_cause = match cause {
-            crate::value::GcCause::AllocationThreshold => true,
-            crate::value::GcCause::TaskBoundary => !self.gc_task_major,
-            crate::value::GcCause::Explicit => false,
-        };
-        if young_cause
-            && crate::gc_generational::enabled()
-            && crate::value::heap_live_objects(&self.gc_heap) < self.live_object_limit
-            && !crate::value::gc_major_due(&self.gc_heap, GC_TRIGGER)
-        {
-            self.gc_collect_young(cause);
-            return;
-        }
-        self.gc_collect_with_edge_budget(cause, crate::gc_edges::EDGE_CACHE_BYTES);
-    }
-
-    pub(crate) fn gc_collect_with_edge_budget(
-        &mut self,
-        cause: crate::value::GcCause,
-        edge_budget: usize,
-    ) {
-        // P1 S2: the refcount cycle collector must never see cell handles. A thin entry (the
-        // cycle collector's frame is large): see `Interp::gc_heap_collect_explicit`.
         #[cfg(feature = "gc-heap")]
-        {
-            let _ = edge_budget;
-            self.gc_collect_with_cause(cause)
-        }
-        #[cfg(not(feature = "gc-heap"))]
-        self.gc_collect_with_edge_budget_rc(cause, edge_budget)
-    }
-
-    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
-    fn gc_collect_with_edge_budget_rc(&mut self, cause: crate::value::GcCause, edge_budget: usize) {
-        // Read-only collector passes touch every object's scratch cells. Borrowing through the
-        // RefCell flag would write (and dirty) each object's header twice per pass; the
-        // collector holds no mutable object borrow during these passes, so read the cells
-        // without the guard.
-        #[inline(always)]
-        fn cells(object: &Gc) -> &Object {
-            // SAFETY: the reference only reads or sets `Cell` scratch fields and is dropped
-            // before any `borrow_mut` of the object; an outstanding mutable borrow panics
-            // exactly as `borrow()` would.
-            unsafe { object.try_borrow_unguarded() }.expect("object mutably borrowed during GC")
-        }
-        let gc_dump = std::env::var_os("TRUST_JS_GC_DUMP").is_some();
-        let performance_started = crate::value::gc_performance_metrics_start();
-        let live = crate::value::heap_gc_snapshot(&self.gc_heap);
-        // Scopes are graph nodes too: a closure's captured environment references objects (its
-        // bindings) and vice versa (`Callable::User`), so cycles routinely pass through them.
-        let scopes = crate::value::gc_scope_snapshot(&self.gc_heap);
-        let performance_objects_before = live.len();
-        let performance_scopes_before = scopes.len();
-        let sidx: crate::fasthash::FastMap<usize, usize> = scopes
-            .iter()
-            .enumerate()
-            .map(|(k, e)| (Env::as_ptr(e) as usize, k))
-            .collect();
-        let mut s_internal = vec![0u32; scopes.len()];
-        let mut s_mark = vec![false; scopes.len()];
-
-        // Reset scratch, then count references between heap nodes (objects and scopes).
-        for o in &live {
-            let b = cells(o);
-            b.gc_mark.set(false);
-            b.gc_scratch.set(0);
-        }
-        let live_index: crate::fasthash::FastMap<usize, usize> = live
-            .iter()
-            .enumerate()
-            .map(|(index, object)| (Gc::as_ptr(object) as usize, index))
-            .collect();
-        // Most objects key no internal-slot table; skip those probes for them.
-        let side_slots = self.side_slot_owners(&live_index, live.len(), false);
-        let mut object_refs = Vec::new();
-        let mut scope_refs = Vec::new();
-        let mut edge_objects = Vec::new();
-        let mut edge_scopes = Vec::new();
-        let mut edge_cache = crate::gc_edges::GcEdgeCache::new(live.len(), edge_budget);
-        let mut native_captures = crate::native_captures::NativeCaptureSnapshot::empty();
-        for (index, o) in live.iter().enumerate() {
-            native_captures.observe(o, cells(o));
-            self.visit_object_edges(
-                o,
-                side_slots.as_ref().is_none_or(|owners| owners[index]),
-                &mut crate::gc_edges::CountedEdges {
-                    objects: &mut edge_objects,
-                    scopes: &mut edge_scopes,
-                    scope_index: &sidx,
-                    scope_internal: &mut s_internal,
-                },
-            );
-            let cached = edge_cache.prepare(edge_objects.len(), edge_scopes.len());
-            edge_cache.record(cached, &mut edge_objects, &mut edge_scopes);
-        }
-        for e in &scopes {
-            let b = e.borrow();
-            if let Some(p) = &b.parent {
-                if let Some(&k) = sidx.get(&(Env::as_ptr(p) as usize)) {
-                    s_internal[k] += 1;
-                }
-            }
-            if let Some(Value::Obj(o)) = &b.with_obj {
-                let ob = o.borrow();
-                ob.gc_scratch.set(ob.gc_scratch.get() + 1);
-            }
-            for bind in b.vars.values() {
-                if let Value::Obj(o) = &bind.value {
-                    let ob = o.borrow();
-                    ob.gc_scratch.set(ob.gc_scratch.get() + 1);
-                }
-                if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Env::as_ptr(ie) as usize)) {
-                        s_internal[k] += 1;
-                    }
-                }
-            }
-        }
-
-        // ECMAScript's GetTemplateObject cache is a per-Realm internal slot.  The cache is
-        // stored on the interpreter for fast lookup, so account for its values as internal
-        // edges and index them by their owning Realm global.  This keeps a retired browsing
-        // context from becoming an accidental Rust root while still making its template arrays
-        // live for as long as that Realm is live (ECMA-262 GetTemplateObject, [[TemplateMap]]).
-        let mut template_cache_members: crate::fasthash::FastMap<usize, Vec<usize>> =
-            Default::default();
-        for ((realm_key, _site), value) in &self.template_cache {
-            if let Value::Obj(object) = value {
-                let ptr = Gc::as_ptr(object) as usize;
-                object
-                    .borrow()
-                    .gc_scratch
-                    .set(object.borrow().gc_scratch.get().saturating_add(1));
-                template_cache_members
-                    .entry(*realm_key)
-                    .or_default()
-                    .push(ptr);
-            }
-        }
-
-        // RealmState is a pointer-keyed internal-slot group, not an immortal root. Count each of
-        // its Rust handles as an internal edge and remember every intrinsic/scope that can prove
-        // the realm live. Marking any member activates the whole group; when no member is live the
-        // realm global (the table key) is swept with the rest of the group.
-        let mut realm_members: crate::fasthash::FastMap<usize, usize> = Default::default();
-        let mut realm_scope_members: crate::fasthash::FastMap<usize, usize> = Default::default();
-        // Intrinsic tables are shared by reference (see `IntrinsicMap`): each distinct table
-        // owns one handle per intrinsic, however many Realm states point at it.
-        let mut counted_tables: crate::fasthash::FastSet<usize> = Default::default();
-        for (realm_key, realm) in &self.realms {
-            let fixed = [
-                &realm.global,
-                &realm.object_proto,
-                &realm.function_proto,
-                &realm.array_proto,
-                &realm.string_proto,
-                &realm.number_proto,
-                &realm.boolean_proto,
-                &realm.symbol_proto,
-            ];
-            let tables = [&realm.error_protos, &realm.extra_protos];
-            let owned =
-                tables.map(|table| counted_tables.insert(Rc::as_ptr(table) as *const () as usize));
-            let fixed = fixed
-                .into_iter()
-                .chain(realm.array_ctor.iter())
-                .chain(realm.eval_fn.iter())
-                .map(|object| (object, true));
-            let tabled = tables
-                .into_iter()
-                .zip(owned)
-                .flat_map(|(table, owned)| table.values().map(move |object| (object, owned)));
-            for (object, owned) in fixed.chain(tabled) {
-                let ptr = Gc::as_ptr(object) as usize;
-                realm_members.insert(ptr, *realm_key);
-                if owned {
-                    let borrowed = object.borrow();
-                    borrowed
-                        .gc_scratch
-                        .set(borrowed.gc_scratch.get().saturating_add(1));
-                }
-            }
-            let scope_ptr = Env::as_ptr(&realm.global_env) as usize;
-            realm_scope_members.insert(scope_ptr, *realm_key);
-            if let Some(&index) = sidx.get(&scope_ptr) {
-                s_internal[index] = s_internal[index].saturating_add(1);
-            }
-        }
-
-        // [[Realm]] is a logical edge, not a strong Rust reference in this weak table.
-        // In particular, detaching a built-in's prototype cannot detach its realm.
-        for (&function, (_, realm)) in self.native_function_realms.get_mut().iter() {
-            realm_members.insert(function, *realm);
-        }
-
-        // A pin is bookkeeping, not a real holder: count it like an internal reference so a
-        // pinned-but-unreachable object is still collectable (the sweep evicts its entries).
-        for o in self.gc_pins.values() {
-            let b = o.borrow();
-            b.gc_scratch.set(b.gc_scratch.get() + 1);
-        }
-        // WeakMap values are ephemeron edges: their Rust handles must not look like external
-        // roots, but marking them is deferred until both their owner and weak key are live.
-        for entries in self.weak_collection_data.values() {
-            for (_, value) in entries {
-                if let Value::Obj(object) = value {
-                    let b = object.borrow();
-                    b.gc_scratch.set(b.gc_scratch.get() + 1);
-                }
-            }
-        }
-        // Host caches are internal owners too. Keep their graph as identities into `live`,
-        // not extra Rc handles that could distort the root count. Native roots and edges
-        // participate in this same mark, including WeakMap ephemerons and realm ownership.
-        #[derive(Default)]
-        struct AuxiliaryEdges {
-            edges: crate::fasthash::FastMap<usize, Vec<usize>>,
-            roots: Vec<usize>,
-            native: crate::gc_native::NativeGcGraph,
-        }
-        impl crate::host::HostGcVisitor for AuxiliaryEdges {
-            fn supports_native(&self) -> bool {
-                true
-            }
-            fn native_edge(&mut self, from: crate::host::NativeGcId, to: crate::host::NativeGcId) {
-                self.native.native_edge(from, to);
-            }
-            fn js_to_native(&mut self, owner: &Value, to: crate::host::NativeGcId) {
-                self.native.js_to_native(owner, to);
-            }
-            fn native_to_js(&mut self, from: crate::host::NativeGcId, value: &Value) {
-                self.native.native_to_js(from, value);
-            }
-            fn native_root(&mut self, id: crate::host::NativeGcId) {
-                self.native.native_root(id);
-            }
-            fn internal(&mut self, value: &Value) {
-                if let Value::Obj(object) = value {
-                    let b = object.borrow();
-                    b.gc_scratch.set(b.gc_scratch.get().saturating_add(1));
-                }
-            }
-            fn edge(&mut self, owner: &Value, value: &Value) {
-                if let (Value::Obj(owner), Value::Obj(value)) = (owner, value) {
-                    self.edges
-                        .entry(Gc::as_ptr(owner) as usize)
-                        .or_default()
-                        .push(Gc::as_ptr(value) as usize);
-                }
-            }
-            fn root(&mut self, value: &Value) {
-                if let Value::Obj(object) = value {
-                    self.roots.push(Gc::as_ptr(object) as usize);
-                }
-            }
-        }
-        let mut auxiliary_edges = AuxiliaryEdges::default();
-        self.host_state.trace_gc(&mut auxiliary_edges);
-        native_captures.trace(&mut auxiliary_edges);
-        // A continuation owns its stored values/environments on behalf of its generator
-        // or result promise. Count the actual payloads once, instead of probing this table
-        // for every ordinary object. The existing auxiliary-owner lookup also dispatches
-        // their marking below. Only an empty owner entry is stored here, not a second edge
-        // cache; large suspended stacks keep the scratch-only tracing fallback.
-        for (&owner, coroutine) in &self.generators {
-            auxiliary_edges.edges.entry(owner).or_default();
-            coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges {
-                objects: &mut object_refs,
-                scopes: &mut scope_refs,
-            });
-            for object in object_refs.drain(..) {
-                let b = object.borrow();
-                b.gc_scratch.set(b.gc_scratch.get().saturating_add(1));
-            }
-            for scope in scope_refs.drain(..) {
-                if let Some(&index) = sidx.get(&(Env::as_ptr(&scope) as usize)) {
-                    s_internal[index] = s_internal[index].saturating_add(1);
-                }
-            }
-        }
-        // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
-        // Interp's own fields and module/realm registries). `strong_count`
-        // includes exactly one clone held by the snapshot, so external refs == strong - internal - 1.
-        let mut stack: Vec<Gc> = Vec::new();
-        let mut sstack: Vec<Env> = Vec::new();
-        // The reference counts are no longer needed after root classification (unless a debug
-        // dump reports them below). Reuse that scratch word to locate cached edges without
-        // another per-node hash lookup; the strong heap snapshot keeps every object alive until
-        // registry slots are restored.
-        let index_during_roots = !gc_dump;
-        for (index, o) in live.iter().enumerate() {
-            let b = cells(o);
-            let internal = b.gc_scratch.get() as usize;
-            if index_during_roots {
-                b.gc_scratch.set(index as u32);
-            }
-            if Gc::strong_count(o) > internal + 1 {
-                b.gc_mark.set(true);
-                stack.push(o.clone());
-            }
-        }
-        for (k, e) in scopes.iter().enumerate() {
-            if Env::strong_count(e) > s_internal[k] as usize + 1 {
-                s_mark[k] = true;
-                sstack.push(e.clone());
-            }
-        }
-        auxiliary_edges
-            .native
-            .trace_roots(&mut auxiliary_edges.roots);
-        // A JS owner in another heap is outside this collection's non-live candidate set.
-        // Preserve its native graph just as we preserve its ordinary outgoing strong edges.
-        let foreign_native_owners: Vec<_> = auxiliary_edges
-            .native
-            .js_owners()
-            .filter(|owner| !live_index.contains_key(owner))
-            .collect();
-        for owner in foreign_native_owners {
-            auxiliary_edges
-                .native
-                .trace_js(owner, &mut auxiliary_edges.roots);
-        }
-        for ptr in &auxiliary_edges.roots {
-            if let Some(&index) = live_index.get(ptr) {
-                let object = &live[index];
-                if !object.borrow().gc_mark.get() {
-                    object.borrow().gc_mark.set(true);
-                    stack.push(object.clone());
-                }
-            }
-        }
-        // Debug: `TRUST_JS_GC_DUMP=1` prints each external-rooted object's shape (its first prop
-        // names) with strong/internal counts — the fastest way to see WHAT pins a leaked graph.
-        if gc_dump
-            && live.len()
-                >= std::env::var("TRUST_JS_GC_DUMP_MIN_OBJECTS")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(0)
-        {
-            // Internal tags and captured metadata only: no author getters,
-            // value serialization, or extra heap roots. Counts describe the
-            // pre-sweep snapshot and its initially classified roots, not the
-            // final reachable graph. The optional floor keeps pressure runs
-            // from dumping every ordinary small collection.
-            let mut kinds = std::collections::BTreeMap::<&str, (usize, usize)>::new();
-            let mut functions =
-                crate::fasthash::FastMap::<usize, (String, usize, usize)>::default();
-            let mut omitted_function_instances = 0;
-            let mut root_array_sizes = std::collections::BTreeMap::<&str, usize>::new();
-            let mut max_array_length = 0.0_f64;
-            for object in &live {
-                let b = object.borrow();
-                let kind = match &b.call {
-                    Callable::User(user) => {
-                        let key = Rc::as_ptr(&user.func) as usize;
-                        if functions.len() < 1024 || functions.contains_key(&key) {
-                            let entry = functions.entry(key).or_insert_with(|| {
-                                (
-                                    user.func
-                                        .name
-                                        .as_deref()
-                                        .unwrap_or("<anonymous>")
-                                        .chars()
-                                        .take(80)
-                                        .collect(),
-                                    user.func.source.as_ref().map_or(0, |source| source.len()),
-                                    0,
-                                )
-                            });
-                            entry.2 += 1;
-                        } else {
-                            omitted_function_instances += 1;
-                        }
-                        "user_function"
-                    }
-                    Callable::Native(_) | Callable::NativeData(_) => "native_function",
-                    Callable::Bound(_) => "bound_function",
-                    Callable::None => match &b.exotic {
-                        Exotic::Array => {
-                            if let Some(Value::Num(length)) =
-                                b.props.length_property().map(Property::value)
-                            {
-                                max_array_length = max_array_length.max(length);
-                                if b.gc_mark.get() {
-                                    let bucket = match length as u64 {
-                                        0 => "0",
-                                        1 => "1",
-                                        2 => "2",
-                                        3 => "3",
-                                        4..=8 => "4-8",
-                                        9..=64 => "9-64",
-                                        65..=1024 => "65-1024",
-                                        _ => "1025+",
-                                    };
-                                    *root_array_sizes.entry(bucket).or_default() += 1;
-                                }
-                            }
-                            "array"
-                        }
-                        Exotic::StrWrap(_) => "string_wrapper",
-                        Exotic::Error(_) => "error",
-                        Exotic::Arguments => "arguments",
-                        Exotic::None => "object",
-                        _ => "primitive_wrapper",
-                    },
-                    _ => "other_callable",
-                };
-                let entry = kinds.entry(kind).or_default();
-                entry.0 += 1;
-                entry.1 += usize::from(b.gc_mark.get());
-            }
-            let mut functions: Vec<_> = functions.into_values().collect();
-            functions.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
-            functions.truncate(6);
-            eprintln!(
-                "[gc-dump-summary] objects={} scopes={} root_scopes={} kept_objects={} pooled_values={} max_array_length={max_array_length} kinds_total_roots={kinds:?} root_array_sizes={root_array_sizes:?} function_instances={functions:?} omitted_function_instances={omitted_function_instances}",
-                live.len(), scopes.len(), s_mark.iter().filter(|marked| **marked).count(),
-                self.kept_alive.len(),
-                self.vm_pool.iter().map(|(slots, stack)| slots.len() + stack.len()).sum::<usize>()
-                    + self.native_arg_pool.iter().map(Vec::len).sum::<usize>(),
-            );
-            if let Some(trace) = self.capture_stack_trace(crate::stack_trace::Skip::None) {
-                eprintln!("[gc-dump-stack] {}", trace.formatted());
-            }
-            let root_limit = std::env::var("TRUST_JS_GC_DUMP_ROOT_LIMIT")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(60)
-                .clamp(1, 16_384);
-            let mut shown = 0;
-            for o in &live {
-                let b = o.borrow();
-                if !b.gc_mark.get() {
-                    continue;
-                }
-                let internal = b.gc_scratch.get() as usize;
-                let strong = Gc::strong_count(o);
-                let keys: Vec<&str> = b.props.iter().take(4).map(|(k, _)| &**k).collect();
-                // Both the heap snapshot and the already classified mark stack
-                // hold one temporary reference here. Zero external references
-                // identifies a root reached only through the native host graph.
-                let external = strong.saturating_sub(internal + 2);
-                let identity = Gc::as_ptr(o) as usize;
-                let node = b
-                    .props
-                    .get("__id")
-                    .and_then(|property| property.value().as_num_opt());
-                let mut prototype = b.proto.clone();
-                let mut prototype_realm = None;
-                for _ in 0..32 {
-                    let Some(object) = prototype else { break };
-                    if let Some(realm) = realm_members.get(&(Gc::as_ptr(&object) as usize)) {
-                        prototype_realm = Some(*realm);
-                        break;
-                    }
-                    prototype = object.borrow().proto.clone();
-                }
-                eprintln!("[gc-dump] root id={identity:x} strong={strong} internal={internal} external={external} node={node:?} prototype_realm={prototype_realm:x?} pinned={} weakref={} finalizer={} props={keys:?}", self.gc_pins.contains_key(&identity), self.weak_refs.contains_key(&identity), self.finalization_registries.contains_key(&identity));
-                shown += 1;
-                if shown >= root_limit {
-                    break;
-                }
-            }
-            let mut sshown = 0;
-            for (k, e) in scopes.iter().enumerate() {
-                let internal = s_internal[k] as usize;
-                let strong = Env::strong_count(e);
-                if strong <= internal + 1 {
-                    continue;
-                }
-                let b = e.borrow();
-                let vars: Vec<&str> = b.vars.keys().take(6).map(|k| &**k).collect();
-                eprintln!("[gc-dump] scope-root strong={strong} internal={internal} vars={vars:?}");
-                sshown += 1;
-                if sshown >= 40 {
-                    break;
-                }
-            }
-        }
-
-        if !index_during_roots {
-            for (index, object) in live.iter().enumerate() {
-                cells(object).gc_scratch.set(index as u32);
-            }
-        }
-
-        // Root classification is complete, so temporary clones can no longer distort it. These
-        // compact groups let either an intrinsic object or its global scope activate the realm in
-        // time proportional to that realm's intrinsic set.
-        let mut realm_groups: crate::fasthash::FastMap<usize, (Vec<Gc>, Env)> = Default::default();
-        for (realm_key, realm) in &self.realms {
-            let mut objects = vec![
-                realm.global.clone(),
-                realm.object_proto.clone(),
-                realm.function_proto.clone(),
-                realm.array_proto.clone(),
-                realm.string_proto.clone(),
-                realm.number_proto.clone(),
-                realm.boolean_proto.clone(),
-                realm.symbol_proto.clone(),
-            ];
-            objects.extend(realm.array_ctor.iter().cloned());
-            objects.extend(realm.error_protos.values().cloned());
-            objects.extend(realm.eval_fn.iter().cloned());
-            objects.extend(realm.extra_protos.values().cloned());
-            realm_groups.insert(*realm_key, (objects, realm.global_env.clone()));
-        }
-        let mut activated_realms: crate::fasthash::FastSet<usize> = Default::default();
-
-        if std::env::var_os("TRUST_JS_GC_RETAINING_PATHS").is_some()
-            && (15_000..=500_000).contains(&live.len())
-        {
-            crate::gc_diagnostics::Snapshot {
-                objects: &live,
-                scopes: &scopes,
-                object_roots: &stack,
-                scope_roots: &sstack,
-                native: &auxiliary_edges.native,
-                host_edges: &auxiliary_edges.edges,
-                realm_members: &realm_members,
-                realm_scope_members: &realm_scope_members,
-                realm_groups: &realm_groups,
-                templates: &template_cache_members,
-            }
-            .dump_realm_paths(self);
-        }
-
-        // Index the two-input ephemeron condition in both directions. When either an owner or an
-        // object key is marked, the second condition is one O(1) mark-bit test; every WeakMap edge
-        // is considered at most twice rather than rescanning every collection to a fixed point.
-        let mut ephemerons_by_owner: crate::fasthash::FastMap<usize, Vec<(Option<Gc>, Gc)>> =
-            Default::default();
-        let mut ephemerons_by_key: crate::fasthash::FastMap<usize, Vec<(usize, Gc)>> =
-            Default::default();
-        for (owner, entries) in &self.weak_collection_data {
-            for (key, value) in entries {
-                let Value::Obj(value) = value else { continue };
-                match key.upgrade() {
-                    Some(Value::Obj(key)) => {
-                        ephemerons_by_owner
-                            .entry(*owner)
-                            .or_default()
-                            .push((Some(key.clone()), value.clone()));
-                        ephemerons_by_key
-                            .entry(Gc::as_ptr(&key) as usize)
-                            .or_default()
-                            .push((*owner, value.clone()));
-                    }
-                    // Symbol collection is conservative until the Agent-owned symbol-registry
-                    // sweep. A live collection therefore activates a still-existing symbol key.
-                    Some(Value::Sym(_)) => ephemerons_by_owner
-                        .entry(*owner)
-                        .or_default()
-                        .push((None, value.clone())),
-                    _ => {}
-                }
-            }
-        }
-
-        // Which snapshot objects key any of the per-owner side tables consulted while marking.
-        // Most objects key none, so marking skips those hash probes; an object outside the
-        // snapshot (no valid index) probes every table as before.
-        const AUX_NATIVE: u8 = 1;
-        const AUX_EDGES: u8 = 2;
-        const AUX_REALM: u8 = 4;
-        const AUX_TEMPLATES: u8 = 8;
-        const AUX_EPHEMERON_OWNER: u8 = 16;
-        const AUX_EPHEMERON_KEY: u8 = 32;
-        const AUX_ALL: u8 = 63;
-        let mut aux_flags = vec![0u8; live.len()];
-        {
-            let mut flag = |ptr: usize, bit: u8| {
-                if let Some(&index) = live_index.get(&ptr) {
-                    aux_flags[index] |= bit;
-                }
-            };
-            for owner in auxiliary_edges.native.js_owners() {
-                flag(owner, AUX_NATIVE);
-            }
-            for &owner in auxiliary_edges.edges.keys() {
-                flag(owner, AUX_EDGES);
-            }
-            for &member in realm_members.keys() {
-                flag(member, AUX_REALM);
-            }
-            for &realm in template_cache_members.keys() {
-                flag(realm, AUX_TEMPLATES);
-            }
-            for &owner in ephemerons_by_owner.keys() {
-                flag(owner, AUX_EPHEMERON_OWNER);
-            }
-            for &key in ephemerons_by_key.keys() {
-                flag(key, AUX_EPHEMERON_KEY);
-            }
-        }
-
-        // Mark everything reachable from roots across object/scope nodes and ephemeron edges. A
-        // value->key cycle cannot bootstrap itself because neither directional index activates
-        // until the owner and key have independently acquired a mark.
-        loop {
-            if let Some(o) = stack.pop() {
-                let index = cells(&o).gc_scratch.get() as usize;
-                let in_snapshot = live.get(index).is_some_and(|entry| Gc::ptr_eq(entry, &o));
-                let aux = if in_snapshot {
-                    aux_flags[index]
-                } else {
-                    AUX_ALL
-                };
-                let cached = in_snapshot.then(|| edge_cache.get(index)).flatten();
-                if let Some((edge_objects, edge_scopes)) = cached {
-                    for &p in edge_objects {
-                        // SAFETY: a counted edge of a snapshot object (see `ObjectEdge`); the
-                        // snapshot still owns that object and nothing has mutated the graph.
-                        let pb = unsafe { (*p).try_borrow_unguarded() }
-                            .expect("object mutably borrowed during GC");
-                        if !pb.gc_mark.get() {
-                            pb.gc_mark.set(true);
-                            // SAFETY: as above; the new handle owns its own strong reference.
-                            stack.push(unsafe { Gc::clone_from_raw(p) });
-                        }
-                    }
-                    for &k in edge_scopes {
-                        let k = k as usize;
-                        if !s_mark[k] {
-                            s_mark[k] = true;
-                            sstack.push(scopes[k].clone());
-                        }
-                    }
-                } else {
-                    // Budget overflow or a foreign-heap object: preserve the original trace.
-                    object_refs.clear();
-                    scope_refs.clear();
-                    self.visit_object_edges(
-                        &o,
-                        !in_snapshot || side_slots.as_ref().is_none_or(|owners| owners[index]),
-                        &mut crate::gc_edges::DirectGcEdges {
-                            objects: &mut object_refs,
-                            scopes: &mut scope_refs,
-                        },
-                    );
-                    for p in object_refs.drain(..) {
-                        if !p.borrow().gc_mark.get() {
-                            p.borrow().gc_mark.set(true);
-                            stack.push(p);
-                        }
-                    }
-                    for e in scope_refs.drain(..) {
-                        if let Some(&k) = sidx.get(&(Env::as_ptr(&e) as usize)) {
-                            if !s_mark[k] {
-                                s_mark[k] = true;
-                                sstack.push(e);
-                            }
-                        }
-                    }
-                }
-
-                let ptr = Gc::as_ptr(&o) as usize;
-                if aux == 0 {
-                    continue;
-                }
-                auxiliary_edges.roots.clear();
-                if aux & AUX_NATIVE != 0 {
-                    auxiliary_edges
-                        .native
-                        .trace_js(ptr, &mut auxiliary_edges.roots);
-                }
-                for target in &auxiliary_edges.roots {
-                    if let Some(&index) = live_index.get(target) {
-                        let object = &live[index];
-                        if !object.borrow().gc_mark.get() {
-                            object.borrow().gc_mark.set(true);
-                            stack.push(object.clone());
-                        }
-                    }
-                }
-                if let Some(targets) = (aux & AUX_EDGES != 0)
-                    .then(|| auxiliary_edges.edges.get(&ptr))
-                    .flatten()
-                {
-                    for target in targets {
-                        if let Some(&index) = live_index.get(target) {
-                            let object = &live[index];
-                            if !object.borrow().gc_mark.get() {
-                                object.borrow().gc_mark.set(true);
-                                stack.push(object.clone());
-                            }
-                        }
-                    }
-                    if let Some(coroutine) = self.generators.get(&ptr) {
-                        coroutine.trace_gc(&mut crate::gc_edges::DirectGcEdges {
-                            objects: &mut object_refs,
-                            scopes: &mut scope_refs,
-                        });
-                        for object in object_refs.drain(..) {
-                            if !object.borrow().gc_mark.get() {
-                                object.borrow().gc_mark.set(true);
-                                stack.push(object);
-                            }
-                        }
-                        for scope in scope_refs.drain(..) {
-                            if let Some(&index) = sidx.get(&(Env::as_ptr(&scope) as usize)) {
-                                if !s_mark[index] {
-                                    s_mark[index] = true;
-                                    sstack.push(scope);
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(&realm_key) = (aux & AUX_REALM != 0)
-                    .then(|| realm_members.get(&ptr))
-                    .flatten()
-                {
-                    if activated_realms.insert(realm_key) {
-                        if let Some((objects, env)) = realm_groups.get(&realm_key) {
-                            for object in objects {
-                                if !object.borrow().gc_mark.get() {
-                                    object.borrow().gc_mark.set(true);
-                                    stack.push(object.clone());
-                                }
-                            }
-                            if let Some(&index) = sidx.get(&(Env::as_ptr(env) as usize)) {
-                                if !s_mark[index] {
-                                    s_mark[index] = true;
-                                    sstack.push(env.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                // A live Realm owns the frozen template arrays cached for its parse sites.  Use
-                // the snapshot index rather than cloning another Rc during root classification;
-                // the cache itself is the sole internal edge for these values.
-                if let Some(template_objects) = (aux & AUX_TEMPLATES != 0)
-                    .then(|| template_cache_members.get(&ptr))
-                    .flatten()
-                {
-                    for template_ptr in template_objects {
-                        if let Some(&index) = live_index.get(template_ptr) {
-                            let template = &live[index];
-                            if !template.borrow().gc_mark.get() {
-                                template.borrow().gc_mark.set(true);
-                                stack.push(template.clone());
-                            }
-                        }
-                    }
-                }
-                if let Some(entries) = (aux & AUX_EPHEMERON_OWNER != 0)
-                    .then(|| ephemerons_by_owner.get(&ptr))
-                    .flatten()
-                {
-                    for (key, value) in entries {
-                        let key_live = key.as_ref().is_none_or(|key| key.borrow().gc_mark.get());
-                        if key_live && !value.borrow().gc_mark.get() {
-                            value.borrow().gc_mark.set(true);
-                            stack.push(value.clone());
-                        }
-                    }
-                }
-                if let Some(entries) = (aux & AUX_EPHEMERON_KEY != 0)
-                    .then(|| ephemerons_by_key.get(&ptr))
-                    .flatten()
-                {
-                    for (owner, value) in entries {
-                        let owner_live = self
-                            .gc_pins
-                            .get(owner)
-                            .is_some_and(|owner| owner.borrow().gc_mark.get());
-                        if owner_live && !value.borrow().gc_mark.get() {
-                            value.borrow().gc_mark.set(true);
-                            stack.push(value.clone());
-                        }
-                    }
-                }
-                continue;
-            }
-            let Some(e) = sstack.pop() else { break };
-            if let Some(&realm_key) = realm_scope_members.get(&(Env::as_ptr(&e) as usize)) {
-                if activated_realms.insert(realm_key) {
-                    if let Some((objects, env)) = realm_groups.get(&realm_key) {
-                        for object in objects {
-                            if !object.borrow().gc_mark.get() {
-                                object.borrow().gc_mark.set(true);
-                                stack.push(object.clone());
-                            }
-                        }
-                        if let Some(&index) = sidx.get(&(Env::as_ptr(env) as usize)) {
-                            if !s_mark[index] {
-                                s_mark[index] = true;
-                                sstack.push(env.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            let b = e.borrow();
-            if let Some(p) = &b.parent {
-                if let Some(&k) = sidx.get(&(Env::as_ptr(p) as usize)) {
-                    if !s_mark[k] {
-                        s_mark[k] = true;
-                        sstack.push(p.clone());
-                    }
-                }
-            }
-            if let Some(Value::Obj(o)) = &b.with_obj {
-                if !o.borrow().gc_mark.get() {
-                    o.borrow().gc_mark.set(true);
-                    stack.push(o.clone());
-                }
-            }
-            for bind in b.vars.values() {
-                if let Value::Obj(o) = &bind.value {
-                    if !o.borrow().gc_mark.get() {
-                        o.borrow().gc_mark.set(true);
-                        stack.push(o.clone());
-                    }
-                }
-                if let Some((ie, _)) = bind.import_ref.as_deref() {
-                    if let Some(&k) = sidx.get(&(Env::as_ptr(ie) as usize)) {
-                        if !s_mark[k] {
-                            s_mark[k] = true;
-                            sstack.push(ie.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        drop(edge_cache);
-
-        // One pass finds the unmarked objects; the clearing pass below visits only those.
-        let dead: Vec<&Gc> = live
-            .iter()
-            .filter(|object| !cells(object).gc_mark.get())
-            .collect();
-        let garbage_objects: crate::fasthash::FastSet<usize> = dead
-            .iter()
-            .map(|object| Gc::as_ptr(object) as usize)
-            .collect();
-
-        self.gc_sweep_dead_objects(&garbage_objects, &auxiliary_edges.native);
-        #[cfg(not(target_arch = "wasm32"))]
-        let garbage = dead.len();
-        for o in dead {
-            let mut b = o.borrow_mut();
-            b.props.clear();
-            b.proto = None;
-            b.call = Callable::None;
-            b.exotic = Exotic::None;
-            b.native_typed_array = None;
-        }
-        // Sweep garbage scopes the same way: emptying them breaks env-involving cycles.
-        for (k, e) in scopes.iter().enumerate() {
-            if !s_mark[k] {
-                let mut b = e.borrow_mut();
-                b.vars.clear();
-                b.parent = None;
-                b.with_obj = None;
-            }
-        }
-        self.gc_prune_dead_pins();
-        // Release the snapshot handles first: only then do swept objects and their property
-        // buffers reach the allocator's free lists. A high threshold confines the expensive
-        // platform pressure-relief call to phase changes, not ordinary generational churn.
-        drop(ephemerons_by_owner);
-        drop(ephemerons_by_key);
-        drop(realm_groups);
-        drop(live);
-        drop(scopes);
-        self.gc_drain_weak_deaths();
-        self.gc_schedule_finalization_cleanup(&garbage_objects);
-        crate::value::gc_finish_generation(&self.gc_heap, true);
-        self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_task_pending = false;
-        self.gc_task_major = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        if garbage >= 50_000 {
-            crate::fastalloc::trim();
-        }
-        if let Some(started) = performance_started {
-            let objects_after = crate::value::heap_live_objects(&self.gc_heap);
-            let scopes_after = crate::value::gc_scope_registry_prune(&self.gc_heap);
-            crate::value::gc_performance_metrics_finish(
-                started,
-                performance_objects_before,
-                objects_after,
-                performance_scopes_before,
-                scopes_after,
-                cause,
-                None,
-            );
-            // One Agent snapshot must observe every ShadowRealm after collection, not a freshly
-            // swept root mixed with stale sub-heaps. Ownership is a tree, so children recursively
-            // collect their descendants before the root uses one shared identity registry.
-            for sub in self.shadow_realms.values_mut() {
-                sub.gc_collect_with_cause(cause);
-            }
-            // Keep diagnostic traversal outside the collector pause measurement. It runs only
-            // under TRUST_JS_PERF_METRICS and records a post-sweep Agent safepoint, so ordinary
-            // execution and reported GC pause time do not absorb visitor overhead.
-            let objects = crate::value::heap_gc_snapshot(&self.gc_heap);
-            let scopes = crate::value::gc_scope_snapshot(&self.gc_heap);
-            crate::memory::record_post_gc(self, &objects, &scopes);
+        if matches!(cause, crate::value::GcCause::Explicit) {
+            self.gc_heap_collect_explicit();
+        } else {
+            self.gc_heap_collect(cause);
         }
     }
 

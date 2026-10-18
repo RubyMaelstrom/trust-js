@@ -131,11 +131,6 @@ pub(crate) struct ModuleCoro {
 }
 
 impl ModuleCoro {
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        let Self { body, key: _ } = self;
-        body.trace_gc(edges);
-    }
-
     fn new(body: crate::bytecode::VmCoro, key: String) -> ModuleCoro {
         ModuleCoro { body, key }
     }
@@ -1072,7 +1067,7 @@ impl Interp {
         }
         ns.borrow().ic_plain.set(false);
         // `module_ns` is keyed only by object address. Pin the namespace until
-        // the cycle collector can evict the side-table entry atomically; a
+        // the collector can evict the side-table entry atomically; a
         // released per-Document module map may otherwise drop the last strong
         // namespace handle and let an unrelated allocation reuse its address.
         self.gc_pin(ns);

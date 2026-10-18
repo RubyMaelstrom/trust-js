@@ -82,19 +82,8 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
                 .interp
                 .set_member_key(&receiver, "value", expected.clone())
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
-            let object_owners = match &expected {
-                Value::Obj(object) => Some(crate::value::Gc::strong_count(object)),
-                _ => None,
-            };
             let result = run(&mut engine, &chunk, &code, &receiver, this);
             assert!(crate::builtins::same_value_pub(&result, &expected));
-            if let (Some(before), Value::Obj(object)) = (object_owners, &result) {
-                assert_eq!(
-                    crate::value::Gc::strong_count(object),
-                    before + 1,
-                    "native read must retain one result owner"
-                );
-            }
             // Removing the property owner must leave the returned value intact through collection.
             engine
                 .interp

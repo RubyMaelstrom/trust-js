@@ -1,4 +1,4 @@
-//! Transient mixed-heap graph shared by the full and nursery collectors.
+//! Transient mixed-heap graph of one collection.
 //!
 //! Native nodes cost no JavaScript object or permanent anchor. JavaScript owners, native roots,
 //! and native edges participate in the same mark fixed point as ordinary objects and ephemerons.
@@ -25,9 +25,6 @@ const END: usize = usize::MAX;
 #[derive(Clone, Default)]
 pub(crate) struct NativeGcGraph {
     ids: FastMap<NativeGcId, usize>,
-    /// Compact native remembered-set declarations. Only represented old sources are visited;
-    /// a large unchanged old DOM never needs a graph node solely to express its age.
-    old_prefixes: FastMap<(&'static str, usize), usize>,
     /// Flat intrusive adjacency avoids an allocation per DOM node/wrapper during marking.
     edges: Vec<Edge>,
     heads: Vec<usize>,
@@ -38,22 +35,6 @@ pub(crate) struct NativeGcGraph {
 }
 
 impl NativeGcGraph {
-    pub(crate) fn declare_old_generation(
-        &mut self,
-        domain: &'static str,
-        owner: usize,
-        first_young_id: usize,
-    ) {
-        let prefix = self.old_prefixes.entry((domain, owner)).or_default();
-        *prefix = (*prefix).max(first_young_id);
-    }
-
-    fn is_old(&self, id: NativeGcId) -> bool {
-        self.old_prefixes
-            .get(&(id.domain, id.owner))
-            .is_some_and(|&end| id.id < end)
-    }
-
     fn index(&mut self, id: NativeGcId) -> usize {
         if let Some(&index) = self.ids.get(&id) {
             return index;
@@ -117,21 +98,13 @@ impl NativeGcGraph {
         self.roots.push(index);
     }
 
-    /// Nursery collections conservatively activate native edges from old JavaScript owners,
-    /// including those outside the young-object snapshot; major collections do the exact mark.
+    /// The JavaScript owners of native edges, traced once the owner is marked.
     pub(crate) fn js_owners(&self) -> impl Iterator<Item = usize> + '_ {
         self.js_edges.keys().copied()
     }
 
     pub(crate) fn trace_roots(&mut self, javascript: &mut Vec<usize>) {
         self.pending.extend_from_slice(&self.roots);
-        // Trace happens after ALL hosts have reported. A foreign host may add an edge
-        // whose source belongs to an unchanged old domain declared by an earlier host.
-        for (&id, &index) in &self.ids {
-            if self.is_old(id) {
-                self.pending.push(index);
-            }
-        }
         self.drain(javascript);
     }
 
@@ -165,14 +138,13 @@ impl NativeGcGraph {
     }
 
     pub(crate) fn is_live(&self, id: NativeGcId) -> bool {
-        self.is_old(id) || self.ids.get(&id).is_some_and(|&index| self.marked[index])
+        self.ids.get(&id).is_some_and(|&index| self.marked[index])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::Object;
 
     fn node(owner: usize, id: usize) -> NativeGcId {
         NativeGcId {
@@ -180,57 +152,6 @@ mod tests {
             owner,
             id,
         }
-    }
-
-    #[test]
-    fn native_minor_old_prefix_activates_foreign_edges_without_enumerating_old_heap() {
-        let live = Value::Obj(Object::new(None));
-        let dead = Value::Obj(Object::new(None));
-        let live_pointer = crate::value::Gc::as_ptr(live.as_obj().unwrap()) as usize;
-        let mut graph = NativeGcGraph::default();
-        graph.declare_old_generation("test.dom", 1, 100_000);
-        assert!(
-            graph.ids.is_empty(),
-            "old prefix declaration must be constant-space"
-        );
-        // Another host reports these edges AFTER the DOM's declaration. The old
-        // source was not in the DOM's own mutation journal, but is still live.
-        graph.native_edge(node(1, 23), node(2, 100_001));
-        graph.native_to_js(node(2, 100_001), &live);
-        graph.native_to_js(node(1, 100_000), &dead);
-        graph.native_to_js(node(2, 23), &dead);
-        let unrelated = NativeGcId {
-            domain: "other.dom",
-            owner: 1,
-            id: 23,
-        };
-        graph.native_to_js(unrelated, &dead);
-        let mut reached = Vec::new();
-        graph.trace_roots(&mut reached);
-        assert_eq!(reached, [live_pointer]);
-        assert!(
-            graph.is_live(node(1, 99_999)),
-            "unrepresented old IDs stay live"
-        );
-        assert!(graph.is_live(node(2, 100_001)));
-        assert!(!graph.is_live(node(1, 100_000)), "frontier itself is young");
-        assert!(!graph.is_live(node(2, 23)), "owner identities do not alias");
-        assert!(!graph.is_live(unrelated), "domains do not alias");
-        assert_eq!(
-            graph.ids.len(),
-            5,
-            "work scales with represented changed state"
-        );
-
-        let mut major = NativeGcGraph::default();
-        major.native_edge(node(1, 23), node(2, 100_001));
-        major.native_to_js(node(2, 100_001), &live);
-        major.trace_roots(&mut reached);
-        assert!(
-            !major.is_live(node(1, 23)),
-            "major remains exact without old prefixes"
-        );
-        assert!(!major.is_live(node(2, 100_001)));
     }
 
     #[test]

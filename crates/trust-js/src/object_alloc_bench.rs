@@ -105,13 +105,12 @@ fn object_layout_sizes() {
     );
 }
 
-/// Collector throughput on a mixed heap: a retained old generation, then young objects, arrays,
-/// closures (environment records) and cyclic garbage. Run with
+/// Collector throughput on a mixed heap: a retained heap, then new objects, arrays, closures
+/// (environment records) and cyclic garbage. Run with
 /// `cargo test --release -p trust-js --lib gc_collection_bench -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn gc_collection_bench() {
-    use crate::value::GcCause;
     use crate::{Completion, Engine};
     fn run(engine: &mut Engine, source: &str) {
         match engine.eval(source, false).expect("benchmark source parses") {
@@ -142,13 +141,6 @@ fn gc_collection_bench() {
         }
         true
     "#;
-    let mut minor = Vec::new();
-    for _ in 0..5 {
-        run(&mut engine, young_source);
-        let started = std::time::Instant::now();
-        engine.interp.gc_collect_young(GcCause::Explicit);
-        minor.push(started.elapsed().as_secs_f64() * 1e3);
-    }
     let mut major = Vec::new();
     for _ in 0..3 {
         run(&mut engine, young_source);
@@ -158,6 +150,5 @@ fn gc_collection_bench() {
     }
     let live = crate::value::heap_live_objects(&engine.interp.gc_heap);
     println!("gc bench: live objects after {live}");
-    println!("minor ms {minor:.2?}");
     println!("major ms {major:.2?}");
 }

@@ -186,13 +186,6 @@ mod cell {
             WeakEnv(WeakRef::to(this.0.as_ptr() as usize))
         }
 
-        /// The GC heap has no reference counts: only the disabled cycle collector and
-        /// refcount-observing tests ask, so reaching this is a bug.
-        #[track_caller]
-        pub fn strong_count(_: &Env) -> usize {
-            panic!("Env::strong_count: the gc-heap object model has no reference counts")
-        }
-
         #[track_caller]
         pub fn weak_count(_: &Env) -> usize {
             panic!("Env::weak_count: the gc-heap object model has no reference counts")

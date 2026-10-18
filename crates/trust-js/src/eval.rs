@@ -128,41 +128,6 @@ struct PreparedDecoratorValue {
 }
 
 impl PreparedClassEvaluation {
-    pub(crate) fn trace_gc(&self, edges: &mut crate::gc_edges::DirectGcEdges<'_>) {
-        // Exhaustive inventory: adding retained state must update this ownership walk.
-        let Self {
-            outer_class_env,
-            class_env,
-            proto_parent,
-            ctor_parent,
-            derived: _,
-            keys: _,
-            decorator_values,
-        } = self;
-        edges.scope(outer_class_env);
-        edges.scope(class_env);
-        if let Some(parent) = proto_parent {
-            edges.object(parent);
-        }
-        if let Some(parent) = ctor_parent {
-            edges.value(parent);
-        }
-        if let Some(decorators) = decorator_values {
-            for decorator in decorators
-                .class
-                .iter()
-                .chain(decorators.members.iter().flatten())
-            {
-                let PreparedDecoratorValue {
-                    callback,
-                    this_value,
-                } = decorator;
-                edges.value(callback);
-                edges.value(this_value);
-            }
-        }
-    }
-
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) -> usize {
         let mut bytes = self
             .keys
@@ -1252,7 +1217,7 @@ impl Interp {
             }
         };
         loop {
-            // Safe point: run the cycle collector / enforce the live-object ceiling. Catches tight
+            // Safe point: collect when due / enforce the live-object ceiling. Catches tight
             // loops (`for(;;){ x = {}; }`) that never call a function.
             self.interrupt_poll()?;
             self.gc_check()?;

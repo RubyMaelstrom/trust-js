@@ -31,8 +31,8 @@ embed = []
 bench = []
 # Allocation/call-cache observations compiled out of ordinary engine builds.
 architecture-diagnostics = []
-# P1 (rearch/v8-chase) GC heap: the object model by default since S6 step 2. Without it the old
-# reference-counted model builds until its deletion (S6 steps 3-6); the flag goes in step 8. See
+# P1 (rearch/v8-chase) GC heap: the object model by default since S6 step 2. Building without it
+# is a compile error from S6 step 4; the flag goes in step 8. See
 # docs/v8-chase-p1-plan-2026-10-15.txt.
 gc-heap = []
 

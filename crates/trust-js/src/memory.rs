@@ -2435,6 +2435,10 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     }
 }
 
+/// Record the managed-memory snapshot of a finished collection, for `TRUST_JS_PERF_METRICS`.
+/// Only the reference-counted collectors called it: under the GC heap the record says
+/// "unavailable" (open since P1 S2; see docs/v8-chase-2026-10-15.txt, S6 step 4).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn record_post_gc(interp: &Interp, objects: &[Gc], scopes: &[Env]) {
     let snapshot = measure(interp, objects, scopes);
     let heap_id = crate::value::heap_id(&interp.gc_heap);

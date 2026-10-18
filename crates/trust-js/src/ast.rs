@@ -1496,7 +1496,7 @@ impl Function {
     /// but the slot is observable only through `super` references and direct `eval` in the
     /// method's own code (see [`SCAN_HOME`]). Leaving it unset otherwise avoids retaining the home
     /// object from each of its methods: an object literal and its methods would form a
-    /// reference cycle that only the cycle collector could reclaim.
+    /// reference cycle that only a collection could reclaim.
     pub(crate) fn observes_home_object(&self) -> bool {
         self.scan_flags() & SCAN_HOME != 0
     }

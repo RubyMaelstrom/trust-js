@@ -1,101 +1,20 @@
-//! Native functions' explicit JavaScript captures are internal graph edges.
+//! Native functions' explicit JavaScript captures are internal graph edges (traced with their
+//! payload, `GcTrace for NativeCallable`), which these tests check.
 //!
 //! ECMA-262 #sec-liveness / #sec-weakref-execution, local snapshot e28783d5:
 //! preserve observable captures, but do not turn unreachable callable cycles
 //! into external roots. A shared native payload owns its Value handles once,
 //! even when several function objects share it. Active Rust leases are roots.
 
-use crate::fasthash::FastMap;
-use crate::host::HostGcVisitor;
-use crate::value::{Callable, Gc, NativeCallable, NativeCallableBody, Value};
-use std::rc::Rc;
-
-struct CaptureGroup {
-    callable: Rc<NativeCallable>,
-    owners: Vec<Gc>,
-}
-
-pub(crate) struct NativeCaptureSnapshot {
-    groups: FastMap<usize, CaptureGroup>,
-}
-
-impl NativeCaptureSnapshot {
-    pub(crate) fn empty() -> Self {
-        Self {
-            groups: FastMap::default(),
-        }
-    }
-
-    /// Record `owner` (whose body is `object`) if it is a native function with explicit
-    /// captures. Lets a collector pass that already visits every object build the snapshot.
-    pub(crate) fn observe(&mut self, owner: &Gc, object: &crate::value::Object) {
-        let Callable::NativeData(callable) = &object.call else {
-            return;
-        };
-        let NativeCallableBody::Captured { captures, .. } = &callable.body else {
-            return;
-        };
-        if captures.is_empty() {
-            return;
-        }
-        self.groups
-            .entry(Rc::as_ptr(callable) as usize)
-            .or_insert_with(|| CaptureGroup {
-                callable: callable.clone(),
-                owners: Vec::new(),
-            })
-            .owners
-            .push(owner.clone());
-    }
-
-    /// Consume the snapshot before the collector classifies ordinary Rc roots:
-    /// its owner handles must not inflate that classification. No author code
-    /// runs and no JavaScript handles are added to the identity-only edge sink.
-    pub(crate) fn trace(self, visitor: &mut dyn HostGcVisitor) {
-        for group in self.groups.into_values() {
-            let NativeCallableBody::Captured { captures, .. } = &group.callable.body else {
-                unreachable!("snapshot only records explicit captures");
-            };
-            // One temporary Rc belongs to this snapshot. Any remaining owner
-            // not represented by a candidate Object is an active Rust lease,
-            // foreign-heap owner, or old-generation owner during a minor GC.
-            // Leave its captures conservative roots rather than discounting
-            // them. This requires no old-heap scan or mutable write barrier.
-            let internal_only = Rc::strong_count(&group.callable) == group.owners.len() + 1;
-            for value in captures {
-                if internal_only {
-                    visitor.internal(value);
-                }
-                for owner in &group.owners {
-                    visitor.edge(&Value::Obj(owner.clone()), value);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::*;
     use crate::interpreter::Interp;
-    use crate::value::{GcCause, Object, Property};
+    use crate::value::{Gc, Object, Property, Value};
 
     fn object(value: &Value) -> &Gc {
         let Value::Obj(object) = value else {
             panic!("fixture must be an object");
         };
         object
-    }
-
-    /// Inlined, so the collections' stack scrub runs from the test's frame: a frame of its own
-    /// would sit where `in_frame`'s closure left its handles (x86-64, gc-heap).
-    #[inline(always)]
-    fn collect(interp: &mut Interp, minor: bool) {
-        if minor {
-            interp.gc_collect_young(GcCause::Explicit);
-        } else {
-            interp.gc_collect();
-        }
     }
 
     fn returning_capture(
@@ -108,35 +27,33 @@ mod tests {
     }
 
     #[test]
-    fn native_captures_collect_cycles_and_count_repeated_handles_in_both_collectors() {
-        for minor in [false, true] {
-            let mut interp = Interp::new();
-            interp.gc_collect();
-            // Strong handles live only in this helper frame (gc-heap scans the stack).
-            let (weak_target, weak_callback) = crate::gc_test::in_frame(|| {
-                let target = Object::new(None);
-                let callback = interp.new_native_fn_with_captures(
-                    "capture",
-                    0,
-                    returning_capture,
-                    vec![Value::Obj(target.clone()), Value::Obj(target.clone())],
-                );
-                target
-                    .borrow_mut()
-                    .props
-                    .insert("callback", Property::builtin(callback.clone()));
-                (Gc::downgrade(&target), Gc::downgrade(object(&callback)))
-            });
-            collect(&mut interp, minor);
-            assert!(
-                !crate::gc_test::alive(&weak_target),
-                "capture cycle survived minor={minor}"
+    fn native_captures_collect_cycles_and_count_repeated_handles() {
+        let mut interp = Interp::new();
+        interp.gc_collect();
+        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        let (weak_target, weak_callback) = crate::gc_test::in_frame(|| {
+            let target = Object::new(None);
+            let callback = interp.new_native_fn_with_captures(
+                "capture",
+                0,
+                returning_capture,
+                vec![Value::Obj(target.clone()), Value::Obj(target.clone())],
             );
-            assert!(
-                !crate::gc_test::alive(&weak_callback),
-                "callback cycle survived minor={minor}"
-            );
-        }
+            target
+                .borrow_mut()
+                .props
+                .insert("callback", Property::builtin(callback.clone()));
+            (Gc::downgrade(&target), Gc::downgrade(object(&callback)))
+        });
+        interp.gc_collect();
+        assert!(
+            !crate::gc_test::alive(&weak_target),
+            "capture cycle survived"
+        );
+        assert!(
+            !crate::gc_test::alive(&weak_callback),
+            "callback cycle survived"
+        );
     }
 
     #[test]
@@ -170,7 +87,6 @@ mod tests {
                     };
                     (live, Gc::downgrade(&target))
                 });
-                interp.gc_collect_young(GcCause::Explicit);
                 interp.gc_collect();
                 let result = interp
                     .invoke(live.clone(), Value::Null, &[])
@@ -205,7 +121,7 @@ mod tests {
                     vec![Value::Obj(target.clone())],
                 );
                 // Internal construction can share a newly allocated payload with an
-                // existing function object. A minor snapshot sees only young_owner.
+                // existing function object.
                 old_owner.borrow_mut().call = object(&young_owner).borrow().call.clone();
                 target
                     .borrow_mut()
@@ -213,7 +129,7 @@ mod tests {
                     .insert("callback", Property::builtin(young_owner.clone()));
                 Gc::downgrade(&target)
             });
-            interp.gc_collect_young(GcCause::Explicit);
+            interp.gc_collect();
             assert!(
                 crate::gc_test::alive(&weak_target),
                 "old native owner lost young captures"
@@ -244,7 +160,6 @@ mod tests {
         ) -> Result<Value, Value> {
             let target = &captures[0];
             interp.member_set(target, "calls", Value::Num(1.))?;
-            interp.gc_collect_young(GcCause::Explicit);
             interp.gc_collect();
             assert_eq!(interp.member_get(target, "calls")?.as_num_opt(), Some(1.));
             if matches!(captures[1], Value::Bool(true)) {

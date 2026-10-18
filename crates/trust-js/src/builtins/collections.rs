@@ -1041,8 +1041,7 @@ pub(crate) fn nf_weak_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Resul
     }
     if weak_entry_index(i, ptr, &key).is_none() {
         // ECMA-262 #sec-weakset.prototype.add stores only weak membership, unlike a
-        // WeakMap's ephemeron value. A strong dummy copy would keep acyclic symbols
-        // alive and make an old WeakSet conservatively root young objects in a minor GC.
+        // WeakMap's ephemeron value. A strong dummy copy would keep the member alive.
         weak_insert(i, ptr, key, Value::Undefined);
     }
     Ok(this)

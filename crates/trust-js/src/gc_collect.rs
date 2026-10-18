@@ -381,9 +381,9 @@ impl Interp {
         if crate::value::layout_census::enabled() {
             crate::value::layout_census::sample_live(&heap);
         }
-        crate::value::gc_finish_generation(&heap, true);
+        crate::value::gc_finish_generation(&heap);
         let live = crate::value::heap_live_objects(&heap);
-        let next = crate::gc_generational::next_threshold(live, self.live_object_limit);
+        let next = next_threshold(live, self.live_object_limit);
         // Over the live-object limit, keep the room gc_check re-armed for the handler of the
         // limit's RangeError: a stress or byte-budget collection must not take it away.
         self.gc_next = if live > self.live_object_limit {
@@ -412,10 +412,7 @@ impl Interp {
                 started,
                 objects_before.max(0) as usize,
                 live,
-                0,
-                0,
                 cause,
-                None,
             );
         }
     }
@@ -493,7 +490,6 @@ impl Interp {
         self.gc_schedule_finalization_cleanup(garbage);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_task_pending = false;
-        self.gc_task_major = false;
         self.buffer_gc.since_gc = 0;
         for child in self.shadow_realms.values_mut() {
             child.gc_heap_after_sweep(garbage);
@@ -815,5 +811,144 @@ impl Interp {
         borrowed_parameters.trace_gc(sink);
         module_source_objs.trace_gc(sink);
         pending_finalization_cleanup.trace_gc(sink);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bytecode::Tier;
+    use crate::value::Value;
+    use crate::{Completion, Engine};
+
+    fn eval(engine: &mut Engine, source: &str, expected: &str) {
+        match engine.eval(source, false).expect("GC fixture parses") {
+            Completion::Value(value) => assert_eq!(value, expected),
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    #[test]
+    fn collection_keeps_live_call_frames_scopes_weak_targets_and_side_tables_all_tiers() {
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            engine
+                .interp
+                .def_method(&engine.interp.global, "collect", 0, |interp, _, _| {
+                    interp.gc_collect();
+                    Ok(Value::Undefined)
+                });
+            engine.interp.gc_collect();
+            eval(
+                &mut engine,
+                r#"
+                function factory(n) {
+                    let o = {n:n};
+                    let map = new Map([[o, o]]), set = new Set([o]);
+                    let weak = new WeakRef(o), weakMap = new WeakMap([[o, {owner:o}]]);
+                    let bytes = new Uint8Array([n]);
+                    function closure() {
+                        collect();
+                        return [o.n, map.get(o).n, set.has(o), weak.deref() === o,
+                            weakMap.get(o).owner === o, bytes[0]].join(',');
+                    }
+                    collect();
+                    return closure;
+                }
+                var closures = [];
+                for (var i=0; i<20; i++) closures.push(factory(i));
+                closures[7]() + ':' + closures[19]()
+            "#,
+                "7,7,true,true,true,7:19,19,true,true,true,19",
+            );
+            engine.interp.gc_collect();
+            eval(&mut engine, "closures[3]()", "3,3,true,true,true,3");
+        }
+    }
+
+    #[test]
+    fn finalizer_targets_clear_together_and_ready_cells_are_removed() {
+        let mut engine = Engine::new();
+        engine.interp.gc_collect();
+        eval(
+            &mut engine,
+            r#"
+            var finalized = [], first, second;
+            var registry = new FinalizationRegistry(function(value) { finalized.push(value); });
+            (function() {
+                var target = {}; target.self = target;
+                first = new WeakRef(target); second = new WeakRef(target);
+                registry.register(target, 91, target);
+            })(); true
+        "#,
+            "true",
+        );
+        engine.interp.gc_collect();
+        eval(&mut engine, "true", "true");
+        eval(&mut engine, "[first.deref() === undefined, second.deref() === undefined, finalized.join(',')].join(':')", "true:true:91");
+    }
+
+    /// Owners of every internal-slot family keep their table edges across a collection, and
+    /// cycles that pass only through those tables (or a suspended coroutine) are reclaimed: with
+    /// few table entries, and beside 4,000 older Maps' entries, on every tier.
+    #[test]
+    fn side_slot_owners_keep_table_edges_with_sparse_and_dense_tables() {
+        for dense_old_tables in [false, true] {
+            for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+                let mut engine = Engine::new();
+                engine.set_tier(tier);
+                engine.set_tier_threshold(0);
+                if dense_old_tables {
+                    eval(
+                        &mut engine,
+                        "var oldMaps = []; for (var i = 0; i < 4000; i++) oldMaps.push(new Map([[i, {i}]])); true",
+                        "true",
+                    );
+                }
+                engine.interp.gc_collect();
+                eval(
+                    &mut engine,
+                    r#"
+                    var weak = [];
+                    var keep = (function () {
+                        var m = new Map(), key = {k: 1}; m.set(key, {v: 2});
+                        var s = new Set([{s: 3}]);
+                        var proxy = new Proxy({t: 5}, {});
+                        function* gen() { var held = {g: 6}; yield held.g; yield held.g + 1; }
+                        var it = gen(); it.next();
+                        class C { x = {f: 7}; #p = {q: 9}; q() { return this.#p.q; } }
+                        var args = (function (a) { return arguments; })({a: 8});
+                        var pending = new Promise(function () {});
+                        var reaction = {r: 4};
+                        pending.then(function () { return reaction; });
+                        var ta = new Uint8Array([10]);
+                        return {m, key, s, proxy, it, C, args, ta};
+                    })();
+                    (function () {
+                        var cyclic = new Map(); cyclic.set('self', cyclic);
+                        var set = new Set(); set.add(set);
+                        var it2 = (function* () { var me = it2; yield 1; })(); it2.next();
+                        var target = {}; var p = new Proxy(target, {h: target}); target.p = p;
+                        weak.push(new WeakRef(cyclic), new WeakRef(set), new WeakRef(it2),
+                                  new WeakRef(target));
+                    })();
+                    true
+                "#,
+                    "true",
+                );
+                engine.interp.gc_collect();
+                eval(&mut engine, "true", "true");
+                eval(
+                    &mut engine,
+                    r#"[keep.m.get(keep.key).v, [...keep.s][0].s, keep.proxy.t,
+                        keep.it.next().value, new keep.C().x.f, new keep.C().q(),
+                        keep.args[0].a, keep.ta[0],
+                        weak.map(function (w) { return w.deref() === undefined; }).join('/')
+                       ].join(',')"#,
+                    "2,3,5,7,7,9,8,10,true/true/true/true",
+                );
+            }
+        }
     }
 }

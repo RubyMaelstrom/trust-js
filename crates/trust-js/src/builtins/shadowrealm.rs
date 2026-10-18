@@ -18,7 +18,7 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
         let obj = Object::new(i.extra_protos.get("ShadowRealm").cloned());
         let p = Gc::as_ptr(&obj) as usize;
         // The realm lives in a pointer-keyed internal-slot table. Pin the owner against allocator
-        // address reuse; the cycle collector evicts the Box before releasing the pin.
+        // address reuse; the collector evicts the Box before releasing the pin.
         i.gc_pin(&obj);
         let realm = Interp::new_shadow(i, &obj);
         i.shadow_realms.insert(p, Box::new(realm));

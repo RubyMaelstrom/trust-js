@@ -2403,14 +2403,15 @@ pub struct Object {
     pub(crate) native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
     /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
     pub(crate) is_constructor: bool,
+    /// Unused: kept until P1 S6 step 8, since generated code embeds Object's field offsets.
+    #[allow(dead_code)]
     pub(crate) gc_mark: Cell<bool>,
     gc_weak_observed: Cell<bool>,
     /// The object's slot in its heap's registry, fixed for its lifetime (`Object::drop` and
     /// weak-target watches key on it).
     pub(crate) gc_internal: Cell<u32>,
-    /// Full-collection scratch: internal-reference count during root classification, then
-    /// snapshot index during marking. Kept apart from `gc_internal` (it fits in existing
-    /// padding), so the registry slot is never overwritten and needs no restoring pass.
+    /// Unused: kept until P1 S6 step 8, since generated code embeds Object's field offsets.
+    #[allow(dead_code)]
     pub(crate) gc_scratch: Cell<u32>,
 }
 
@@ -2611,19 +2612,13 @@ impl Drop for Object {
     }
 }
 
-// The GC is a refcount-based cycle collector (TRust JS has no tracing GC). Every heap object is
-// registered through a non-owning slot and the live count is maintained via Object::new / Drop.
-// `Object::drop` clears its slot before the allocation is released, so every non-null entry names
-// a live object; the registry itself never touches reference counts (a `Weak` per object cost a
-// weak-count update at both allocation and destruction). `Interp::gc_collect` reclaims objects
-// referenced only by other (also-unreachable) objects — see interpreter.rs.
+// Every heap object is registered through a non-owning slot and the live count is maintained via
+// Object::new / Drop. `Object::drop` clears its slot before the allocation is released, so every
+// non-null entry names a live object; the registry itself never touches reference counts (a
+// `Weak` per object cost a weak-count update at both allocation and destruction).
 struct SlotRegistry<T> {
     entries: Vec<*const RefCell<T>>,
     free: Vec<usize>,
-    /// Dense nursery membership, removed synchronously with destruction, so acyclic allocation
-    /// churn cannot accumulate entries between collections.
-    young_slots: Vec<usize>,
-    young_positions: Vec<usize>,
 }
 
 impl<T> SlotRegistry<T> {
@@ -2631,8 +2626,6 @@ impl<T> SlotRegistry<T> {
         Self {
             entries: Vec::new(),
             free: Vec::new(),
-            young_slots: Vec::new(),
-            young_positions: Vec::new(),
         }
     }
 
@@ -2644,18 +2637,15 @@ impl<T> SlotRegistry<T> {
             None => {
                 let slot = self.entries.len();
                 self.entries.push(std::ptr::null());
-                self.young_positions.push(usize::MAX);
                 slot
             }
         }
     }
 
-    /// Register a reserved slot as a live, young entry.
+    /// Register a reserved slot as a live entry.
     #[inline]
     fn publish(&mut self, slot: usize, entry: *const RefCell<T>) {
         self.entries[slot] = entry;
-        self.young_positions[slot] = self.young_slots.len();
-        self.young_slots.push(slot);
     }
 
     /// Remove a live entry synchronously with its destruction. Stale or foreign slots are ignored.
@@ -2665,14 +2655,6 @@ impl<T> SlotRegistry<T> {
             || std::mem::replace(&mut self.entries[slot], std::ptr::null()).is_null()
         {
             return;
-        }
-        let position = self.young_positions[slot];
-        if position != usize::MAX {
-            self.young_slots.swap_remove(position);
-            if let Some(&moved) = self.young_slots.get(position) {
-                self.young_positions[moved] = position;
-            }
-            self.young_positions[slot] = usize::MAX;
         }
         self.free.push(slot);
     }
@@ -2691,32 +2673,15 @@ impl<T> SlotRegistry<T> {
             .filter(|entry| !entry.is_null())
     }
 
-    /// The live young entries' addresses.
-    #[cfg(feature = "gc-heap")]
-    fn young_entry_ptrs(&self) -> impl Iterator<Item = *const RefCell<T>> + '_ {
-        self.young_slots
-            .iter()
-            .map(|&slot| self.entries[slot])
-            .filter(|entry| !entry.is_null())
-    }
-
     fn requested_bytes(&self) -> usize {
         self.entries
             .capacity()
             .saturating_mul(std::mem::size_of::<*const RefCell<T>>())
             .saturating_add(
-                (self.free.capacity()
-                    + self.young_slots.capacity()
-                    + self.young_positions.capacity())
-                .saturating_mul(std::mem::size_of::<usize>()),
+                self.free
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
             )
-    }
-
-    /// End the nursery: every current entry becomes old.
-    fn clear_young(&mut self) {
-        while let Some(slot) = self.young_slots.pop() {
-            self.young_positions[slot] = usize::MAX;
-        }
     }
 
     /// Strong handles to every live entry.
@@ -2732,19 +2697,6 @@ impl<T> SlotRegistry<T> {
         }
         live
     }
-
-    /// Strong handles to the live young entries.
-    #[cfg(not(feature = "gc-heap"))]
-    fn young_snapshot(&self) -> Vec<Rc<RefCell<T>>> {
-        self.young_slots
-            .iter()
-            .filter_map(|&slot| {
-                let entry = self.entries[slot];
-                // SAFETY: as in `snapshot`.
-                (!entry.is_null()).then(|| unsafe { upgrade_registered(entry) })
-            })
-            .collect()
-    }
 }
 
 pub(crate) struct GcState {
@@ -2757,8 +2709,6 @@ pub(crate) struct GcState {
     /// gc-heap environments are cells, which the heap enumerates itself.
     #[cfg(not(feature = "gc-heap"))]
     scopes: RefCell<SlotRegistry<crate::interpreter::Scope>>,
-    minor_collections: Cell<u8>,
-    major_live: Cell<i64>,
     shapes: RefCell<ShapeTable>,
     array_length_shape: Cell<u32>,
     live: LiveCount,
@@ -3608,13 +3558,6 @@ static GC_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static GC_OBJECTS_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PEAK_OBJECTS_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_LAST_OBJECTS_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_SCOPES_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_PEAK_SCOPES_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_LAST_SCOPES_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_MINOR_COLLECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_MINOR_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GC_MINOR_SCOPES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Internal collection trigger for diagnostics. Collection scheduling is not observable
 /// ECMAScript behavior; retaining the reason lets tuning distinguish allocation pressure from a
@@ -3642,18 +3585,13 @@ pub(crate) fn gc_performance_metrics_finish(
     started: std::time::Instant,
     objects_before: usize,
     objects_after: i64,
-    scopes_before: usize,
-    scopes_after: usize,
     cause: GcCause,
-    nursery_scanned: Option<(usize, usize)>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
     let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let objects_before = saturating_u64(objects_before);
     let objects_after = u64::try_from(objects_after).unwrap_or(0);
-    let scopes_before = saturating_u64(scopes_before);
-    let scopes_after = saturating_u64(scopes_after);
     let bucket = GC_PAUSE_BUCKET_UPPER_NANOS.partition_point(|upper| elapsed > *upper);
 
     GC_COLLECTIONS.fetch_add(1, Relaxed);
@@ -3661,22 +3599,10 @@ pub(crate) fn gc_performance_metrics_finish(
     GC_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
     GC_MAX_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
     GC_PAUSE_BUCKET_COUNTS[bucket].fetch_add(1, Relaxed);
-    let (objects_seen, scopes_seen) = nursery_scanned
-        .map(|(objects, scopes)| (saturating_u64(objects), saturating_u64(scopes)))
-        .unwrap_or((objects_before, scopes_before));
-    if nursery_scanned.is_some() {
-        GC_MINOR_COLLECTIONS.fetch_add(1, Relaxed);
-        GC_MINOR_OBJECTS_SEEN.fetch_add(objects_seen, Relaxed);
-        GC_MINOR_SCOPES_SEEN.fetch_add(scopes_seen, Relaxed);
-    }
-    GC_OBJECTS_SEEN.fetch_add(objects_seen, Relaxed);
+    GC_OBJECTS_SEEN.fetch_add(objects_before, Relaxed);
     GC_OBJECTS_RECLAIMED.fetch_add(objects_before.saturating_sub(objects_after), Relaxed);
     GC_PEAK_OBJECTS_BEFORE.fetch_max(objects_before, Relaxed);
     GC_LAST_OBJECTS_AFTER.store(objects_after, Relaxed);
-    GC_SCOPES_SEEN.fetch_add(scopes_seen, Relaxed);
-    GC_SCOPES_RECLAIMED.fetch_add(scopes_before.saturating_sub(scopes_after), Relaxed);
-    GC_PEAK_SCOPES_BEFORE.fetch_max(scopes_before, Relaxed);
-    GC_LAST_SCOPES_AFTER.store(scopes_after, Relaxed);
 }
 
 /// The S3 layout census as a JSON field, when it was requested (gc-heap).
@@ -3707,15 +3633,8 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         .join(",");
     let pause_nanos = GC_PAUSE_NANOS.load(Relaxed);
     let max_pause_nanos = GC_MAX_PAUSE_NANOS.load(Relaxed);
-    let nursery_fields = format!(
-        "\"gc_minor_collections\":{},\"gc_minor_objects_seen\":{},\"gc_minor_scopes_seen\":{}{}",
-        GC_MINOR_COLLECTIONS.load(Relaxed),
-        GC_MINOR_OBJECTS_SEEN.load(Relaxed),
-        GC_MINOR_SCOPES_SEEN.load(Relaxed),
-        layout_census_field(),
-    );
     format!(
-        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{},\"gc_scopes_seen\":{},\"gc_scopes_reclaimed\":{},\"gc_peak_scopes_before\":{},\"gc_last_scopes_after\":{},{nursery_fields}",
+        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{}{}",
         GC_COLLECTIONS.load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::AllocationThreshold as usize].load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::TaskBoundary as usize].load(Relaxed),
@@ -3726,10 +3645,7 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         GC_OBJECTS_RECLAIMED.load(Relaxed),
         GC_PEAK_OBJECTS_BEFORE.load(Relaxed),
         GC_LAST_OBJECTS_AFTER.load(Relaxed),
-        GC_SCOPES_SEEN.load(Relaxed),
-        GC_SCOPES_RECLAIMED.load(Relaxed),
-        GC_PEAK_SCOPES_BEFORE.load(Relaxed),
-        GC_LAST_SCOPES_AFTER.load(Relaxed),
+        layout_census_field(),
     )
 }
 
@@ -3765,8 +3681,6 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         weak_observers: RefCell::new(Default::default()),
         #[cfg(not(feature = "gc-heap"))]
         scopes: RefCell::new(SlotRegistry::new()),
-        minor_collections: Cell::new(0),
-        major_live: Cell::new(0),
         shapes: RefCell::new(ShapeTable::new()),
         array_length_shape: Cell::new(SHAPE_EMPTY),
         live: LiveCount::new(0),
@@ -4132,69 +4046,16 @@ pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
         .collect()
 }
 
-/// Snapshot just the nursery. Old-to-young strong references are conservatively roots in the
-/// refcount-based nursery collector, so no uninstrumented native/property write can lose one.
-pub(crate) fn heap_young_snapshot(heap: &GcHeap) -> (Vec<Gc>, Vec<Env>) {
-    #[cfg(not(feature = "gc-heap"))]
-    let objects = heap
-        .registry
-        .borrow()
-        .young_snapshot()
-        .into_iter()
-        .map(Gc::from_rc)
-        .collect();
-    // SAFETY: registry entries are live object cells (removed by `Object::drop`).
-    #[cfg(feature = "gc-heap")]
-    let objects = heap
-        .registry
-        .borrow()
-        .young_entry_ptrs()
-        .map(|entry| unsafe { Gc::from_raw(entry) })
-        .collect();
-    #[cfg(not(feature = "gc-heap"))]
-    let scopes = heap
-        .scopes
-        .borrow()
-        .young_snapshot()
-        .into_iter()
-        .map(Env::from_rc)
-        .collect();
-    // gc-heap keeps no nursery list of environments; the refcount nursery collector this
-    // serves never runs there.
-    #[cfg(feature = "gc-heap")]
-    let scopes = gc_scope_snapshot(heap);
-    (objects, scopes)
-}
-
-/// Promote survivors in one pass over the nursery, not the retained old heap. A periodic major
-/// collection revisits inter-generational cycles and conservatively retained ephemeron values.
-pub(crate) fn gc_finish_generation(heap: &GcHeap, major: bool) {
+/// The end of a collection: the architecture-diagnostics reports, if built.
+pub(crate) fn gc_finish_generation(heap: &GcHeap) {
     #[cfg(feature = "architecture-diagnostics")]
     {
         heap.diagnostics.borrow_mut().finish_generation();
         allocation_diagnostics::report(heap);
         crate::bytecode::call_cache_diagnostics::report();
     }
-    heap.registry.borrow_mut().clear_young();
-    #[cfg(not(feature = "gc-heap"))]
-    heap.scopes.borrow_mut().clear_young();
-    if major {
-        heap.minor_collections.set(0);
-        heap.major_live.set(heap.live.get());
-    } else {
-        heap.minor_collections
-            .set(heap.minor_collections.get().saturating_add(1));
-    }
-}
-
-pub(crate) fn gc_major_due(heap: &GcHeap, nursery_floor: i64) -> bool {
-    heap.minor_collections.get() >= 7
-        || heap.live.get()
-            > heap
-                .major_live
-                .get()
-                .saturating_mul(2)
-                .max(nursery_floor * 2)
+    #[cfg(not(feature = "architecture-diagnostics"))]
+    let _ = heap;
 }
 
 /// Dismantle the object/environment graph when its owning interpreter is destroyed.
@@ -4258,20 +4119,6 @@ pub(crate) fn gc_register_scope(scope: &Env) {
 #[cfg(not(feature = "gc-heap"))]
 pub(crate) fn gc_unregister_scope(heap: &GcHeap, slot: u32) {
     heap.scopes.borrow_mut().remove(slot as usize);
-}
-
-/// The live environment-record count (gc-heap: environment cells not yet swept).
-pub(crate) fn gc_scope_registry_len(heap: &GcHeap) -> usize {
-    #[cfg(not(feature = "gc-heap"))]
-    return heap.scopes.borrow().live_len();
-    #[cfg(feature = "gc-heap")]
-    heap.core.borrow().live_count(heap.scope_desc)
-}
-
-/// Environment records unregister synchronously on destruction, so there are no dead entries to
-/// purge; this reports the live count for callers that used to prune.
-pub(crate) fn gc_scope_registry_prune(heap: &GcHeap) -> usize {
-    gc_scope_registry_len(heap)
 }
 
 /// The live scopes owned by `heap`.
@@ -4683,16 +4530,6 @@ impl Property {
             self.packed.number()
         }
     }
-    /// Collector-only owning edge, lent without a reference-count round trip. A deferred
-    /// prototype owns its realm parent until first observation; afterward it owns the
-    /// materialized prototype instead. Do not allocate or change the reference graph during
-    /// collector counting/marking. This is the object graph's logical edge, which the
-    /// reference-counting collectors walk (`Interp::visit_object_edges`); gc-heap marking
-    /// reports a deferred prototype's cell instead (see `PackedValue::trace_gc_edges`).
-    #[inline]
-    pub(crate) fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
-        self.packed.with_object_edge(f)
-    }
     pub(crate) fn visit_retained_value(&self, visitor: &mut crate::memory::Visitor) {
         if self.packed.tag() == PACK_LAZY_PROTO {
             let lazy = std::mem::ManuallyDrop::new(unsafe { self.packed.read_word::<LazyProto>() });
@@ -5100,6 +4937,7 @@ impl DenseStorage {
     fn pop(&mut self) -> Option<u32> {
         self.0.as_deref_mut().and_then(|d| d.elems.pop())
     }
+    #[cfg(test)]
     fn clear(&mut self) {
         self.0 = None;
     }
@@ -5384,6 +5222,7 @@ impl NamedEntries {
         layout.keys.truncate(retained);
         layout.rebuild_index();
     }
+    #[cfg(test)]
     fn clear(&mut self) {
         self.fields.clear();
         self.layout = None;
@@ -7117,8 +6956,8 @@ impl Props {
         // No JavaScript, collection or fallible semantic operation follows the
         // proof. Rotate owning words, not Properties: this keeps each index's
         // attributes, transfers every reference once, and returns the original
-        // first owner from the removed tail. Rc counts (the nursery's conservative
-        // remembered set) stay correct without per-element retain/drop round trips.
+        // first owner from the removed tail. Reference counts stay correct without
+        // per-element retain/drop round trips.
         let mirror_flags = if self.mirror_flags & MIRROR_OK != 0 && self.elems.mirror_len() == len {
             self.elems.buffers_mut().mirror.rotate_left(1);
             self.mirror_flags
@@ -7632,7 +7471,8 @@ impl Props {
     pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
         self.entries.fields.get(slot)
     }
-    /// Drop every property (used by the GC to break a garbage object's reference cycles).
+    /// Drop every property.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.note_structural();
         self.entries.clear();

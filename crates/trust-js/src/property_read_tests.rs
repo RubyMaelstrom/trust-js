@@ -30,15 +30,6 @@ fn check(source: &str, expected: &str) {
                     i.gc_collect();
                     Ok(Value::Undefined)
                 });
-            engine.interp.def_method(
-                &engine.interp.global,
-                "collectGetterYoungTest",
-                0,
-                |i, _, _| {
-                    i.gc_collect_young(crate::value::GcCause::Explicit);
-                    Ok(Value::Undefined)
-                },
-            );
             assert_eq!(
                 evaluate(&mut engine, source),
                 expected,
@@ -635,7 +626,7 @@ fn getter_cache_reentrancy_replacement_throw_and_gc_keep_exactly_one_call() {
         var reads=0,nested=0,mode=0,token={},o={};
         function named(x){return x.value}
         function keyed(x,k){return x[k]}
-        function get(){reads++;collectGetterYoungTest();
+        function get(){reads++;collectGetterTest();
             if(mode===1){mode=0;nested+=named(o);return 3;}
             if(mode===2){delete o.value;collectGetterTest();
                 Object.defineProperty(o,'value',{get(){reads++;return 9},configurable:true});return token;}

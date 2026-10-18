@@ -3831,3 +3831,105 @@ collectors at f106392f:
   managed-memory record has said "unavailable" since S2.
   record_post_gc runs only from the counted collectors, over their
   object lists.
+
+Step 4, the counted collectors and their knobs (an implementation
+agent's change, reviewed and amended):
+- Deleted:
+  - the cycle collector with its edge helpers (interpreter.rs, about
+    1,300 lines), the nursery (gc_generational.rs), the edge cache
+    with DirectGcEdges (gc_edges.rs) and gc_diagnostics.rs; the six
+    DirectGcEdges traces, NativeCaptureSnapshot, the host's counted
+    trace arm, the native graph's old-generation prefixes, and the GC
+    heap's panicking Gc and Env strong_count;
+  - work the GC heap did for them that nothing read: the registry's
+    nursery membership (kept on every allocation and death),
+    GcState's minor-collection fields, writes to Interp's
+    gc_task_major;
+  - knobs: TRUST_JS_GC_DUMP (with _MIN_OBJECTS and _ROOT_LIMIT),
+    TRUST_JS_GC_RETAINING_PATHS, TRUST_JS_GC_GENERATIONAL, the scope
+    registry's trigger (a no-op), and seven PERF_METRICS fields that
+    the GC heap left at zero (gc_scopes_seen, gc_scopes_reclaimed,
+    gc_peak_scopes_before, gc_last_scopes_after, gc_minor_collections,
+    gc_minor_objects_seen, gc_minor_scopes_seen). Nothing tracked
+    parses them; dated benchmark records keep them as data.
+- next_threshold moved beside GC_TRIGGER with its default formula,
+  checked equal to the old one on about 20 million inputs.
+- Kept:
+  - The public API's signatures. is_minor and native_old_generation
+    return false and their docs say there is no nursery;
+    unstable_collect_young_for_host_tests is still a full collection
+    after an entry scrub, as under the GC heap before.
+  - For layout, unused until step 8 (allow(dead_code)): Interp's
+    gc_task_major and scope_gc_next, Object's gc_mark and gc_scratch.
+    Removing the two Interp fields changed all three fixtures' dumps.
+- Tests: 3 deleted (two for the withdrawn sparse-mask experiment, one
+  for native old-generation prefixes). gc_edges' six continuation
+  tests moved to coroutine::tests and gc_generational's three to
+  gc_collect::tests (without "nursery" in their names), running the
+  explicit collection where they ran counted ones; apart from the
+  edge-budget loop, their sources and expected values are unchanged.
+  Tests that called gc_collect_young (under the GC heap a full
+  collection) call Interp::gc_collect: native_captures (now a
+  test-only module), weak_metadata, jit_numeric_array_tests,
+  iterator_result_tests, array_shift_tests, property_read_tests, and
+  object_alloc_bench, whose minor timing went.
+- Review changes:
+  - With the counted collectors gone, record_post_gc has no caller
+    outside tests. The agent made the retained-memory accounting
+    test-only (about 100 cfg(test) gates in 23 files); the review put
+    it back as it was, with one allow(dead_code) on record_post_gc,
+    until the record is wired to the GC heap or replaced. Props::clear
+    and two clear helpers it calls, which only the counted sweep used,
+    are cfg(test): two tests use them.
+  - The docs of HostGcVisitor::internal (no effect) and register_gc
+    (no cycle collection), and nine comments that described the
+    deleted collectors, the crate doc among them.
+  - An x86-64-only test, own_data_reads_warm_after_native_compilation_
+    and_clone_live_value_kinds (ignored until step 7), called the
+    deleted strong_count; zombie's build found it. Its reference-count
+    check went; its GC-heap check stays (the result survives a
+    collection once its owner is cleared).
+- Code dumps (dumps-vs-base.sh): vue, react and djot identical to
+  step 0's. The agent's tree differed in djot (9 of 160 chunks), and
+  so does HEAD (492d88ad) built with 15 codegen units instead of 16,
+  from a fresh export: its djot dumps are byte-identical to the
+  agent's. Under TRUST_JS_GC_LOG, djot's first collection (at 33,785
+  objects) keeps 6,643 in step 0's binary, 5,285 in the agent's and
+  5,286 in HEAD's at 15 codegen units; later collections and djot's
+  inline planning follow, and the last keeps 1,305 in each. A codegen
+  change alone moves retention, so this is the conservative stack
+  scan's (a build's stack contents), not a layout change. The plan's
+  dump check for steps 4-6 now allows this form (recorded deviation).
+- Gates:
+  - aarch64: lib 2232/0/8 (2235 less the 3 deleted); clippy clean
+    for embed, embed with architecture-diagnostics, default features,
+    the small build and embed with bench; rustfmt clean; the workspace
+    builds with all targets without a diagnostic. Building without
+    gc-heap fails with the compile_error (and two unused-parameter
+    warnings, from bodies that are gc-heap-only until step 8).
+  - Downstream suites as at step 2: host 36/0/0, timers 5/0/0, fs (no
+    tests), web 61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0 (masked md5 65b1faf9, 05a89273, 9cad1fec);
+    difftest 138 agree, 12 skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, the 24 moved,
+    retargeted or touched tests. aarch64: 23 pass at interval 1; weak_
+    metadata_minor_work_depends_on_dead_subscribers_not_stable_old_
+    targets, on the slow list since S5, times out there (900 s) and
+    passes at its interval 100. x86-64: the 22 it compiles pass at
+    interval 1 (two numeric-array JIT tests are compiled out there
+    until step 7).
+  - x86-64 Linux (zombie): lib 1867/0/49 (step 3's 1869, plus the r15
+    test, less the 3 deleted); clippy clean.
+  - Windows under Wine: 1860 pass, 3 fail, 49 ignored; the 3 are step
+    1's snapshot codec tests.
+- Open:
+  - The managed-memory record (open since S2): its accounting now has
+    no production caller. Wiring record_post_gc to the GC heap's
+    collections is not free: engine-matrix.json runs the JIT with
+    TRUST_JS_PERF_METRICS=1, and the walk runs at every collection.
+  - Public items the agent found removable, for step 11: is_minor,
+    native_old_generation, unstable_collect_young_for_host_tests and
+    HostGcVisitor::internal.
+  - trust-js-difftest's header still says a dropped Engine leaks its
+    realm through the Rc heap; for step 8's documentation pass.

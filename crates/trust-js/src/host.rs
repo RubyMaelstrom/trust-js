@@ -131,16 +131,16 @@ pub struct NativeGcId {
 }
 
 pub trait HostGcVisitor {
-    /// Nursery collections conservatively retain old JavaScript and native owners. A host
-    /// may enumerate only its young and remembered state when it can prove all omitted
-    /// handles/edges are old. The default keeps existing embedders on the full graph path.
+    /// Whether this is a minor (nursery) collection, for which a host could enumerate only its
+    /// young and remembered state. There is no nursery: every collection visits the whole
+    /// graph, so this is false. A future nursery may use it.
     fn is_minor(&self) -> bool {
         false
     }
-    /// Declare the old prefix of a host's monotonic native identity domain. During a minor
-    /// collection every ID below `first_young_id` is conservatively live, including sources
-    /// later reported by another host. Returning false requires the ordinary full graph.
-    /// Do not clear journals or promote young state until the corresponding sweep succeeds.
+    /// Declare the old prefix of a host's monotonic native identity domain (every ID below
+    /// `first_young_id`) for a minor collection. False means the collection needs the host's
+    /// full native graph; there is no nursery, so every collector returns false. A future
+    /// nursery may use it.
     fn native_old_generation(
         &mut self,
         _domain: &'static str,
@@ -149,7 +149,8 @@ pub trait HostGcVisitor {
     ) -> bool {
         false
     }
-    /// Discount exactly one native-owned strong handle during root classification.
+    /// Has no effect and keeps nothing alive. (Reference counting used it to discount a
+    /// native-owned handle.)
     fn internal(&mut self, value: &Value);
     /// A logical (non-Rc-owning) edge from a live owner to a retained value.
     fn edge(&mut self, owner: &Value, value: &Value);
@@ -180,10 +181,6 @@ fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisi
 
 #[derive(Clone, Copy)]
 struct GcReporter {
-    /// The counted build's cycle collector traces registered caches only (gc-heap traces every
-    /// slot through its `HostTrace`).
-    #[cfg_attr(feature = "gc-heap", allow(dead_code))]
-    trace: fn(&dyn Any, &mut dyn HostGcVisitor),
     end_job: fn(&mut dyn Any),
     sweep_native: fn(&mut dyn Any, &dyn Fn(&Value) -> bool, &dyn Fn(NativeGcId) -> bool),
 }
@@ -420,13 +417,13 @@ impl OpState {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
-    /// Opt an installed host type into cycle collection. Replacing a slot of the same
-    /// Rust type preserves this registration; an absent slot is simply not visited.
+    /// Opt an installed host type into the collector's [`HostGc`] callbacks (job end and
+    /// sweep). Replacing a slot of the same Rust type preserves this registration; an absent
+    /// slot is simply not visited.
     pub fn register_gc<T: Any + HostGc>(&mut self) {
         self.gc_reporters.insert(
             TypeId::of::<T>(),
             GcReporter {
-                trace: |value, visitor| value.downcast_ref::<T>().unwrap().trace_gc(visitor),
                 end_job: |value| value.downcast_mut::<T>().unwrap().end_job(),
                 sweep_native: |value, is_live, native_is_live| {
                     value
@@ -438,9 +435,8 @@ impl OpState {
         );
     }
 
-    /// Report the host's JavaScript values: every slot's and resource's [`HostTrace`] (gc-heap:
-    /// these are the host roots), or the registered [`HostGc`] caches' (reference counting
-    /// keeps every other host handle alive).
+    /// Report the host's JavaScript values: every slot's and resource's [`HostTrace`], the
+    /// host roots.
     pub(crate) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         #[cfg(feature = "gc-heap")]
         {
@@ -450,12 +446,6 @@ impl OpState {
                 }
             }
             self.resources.trace_gc(visitor);
-        }
-        #[cfg(not(feature = "gc-heap"))]
-        for (key, reporter) in &self.gc_reporters {
-            if let Some(value) = self.map.get(key) {
-                (reporter.trace)(value.as_ref(), visitor);
-            }
         }
     }
 

@@ -6178,7 +6178,7 @@ fn for_var_heads_preserve_parameter_bindings_at_instantiation() {
 #[test]
 fn gc_reclaims_cycles() {
     // Each iteration creates an unreachable reference cycle (o <-> a). Reference counting alone
-    // never frees these; the cycle collector must, or live objects would climb without bound.
+    // never frees these; the collector must, or live objects would climb without bound.
     let mut e = Engine::new();
     match e
         .eval(
