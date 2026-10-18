@@ -10,8 +10,8 @@
 //   target/release/trust-js --tier=bytecode benchmarks/sustained-allocation.js
 //
 // with the same build settings, tier and CPU affinity (see README.md). For the collector's
-// share, add TRUST_JS_PERF_METRICS=1 (pause total, maximum and histogram); under the gc-heap
-// feature TRUST_JS_GC_LOG=1 adds live bytes and pages after each collection.
+// share, add TRUST_JS_PERF_METRICS=1 (pause total, maximum and histogram); TRUST_JS_GC_LOG=1
+// adds live bytes and pages after each collection.
 
 function churn(rounds, retained) {
     let sum = 0;

@@ -3644,3 +3644,23 @@ Step 1, x86-64 Linux and Windows on zombie:
   stress with the verifier on x86-64, full Test262 on x86-64 at every
   tier, and the scanner tests in release, fat LTO and an opt-level
   matrix on x86-64 and Windows.
+
+Step 2, the flip: gc-heap is in trust-js's default features. Every
+workspace crate takes the defaults, so all of them build the GC heap.
+The counted model builds only without default features
+(--no-default-features --features intl,embed) until steps 3-6 delete
+it; the flag goes in step 8. The small build's instructions keep the
+GC heap (--features gc-heap), and DIAGNOSTICS.md follows.
+- Gates (aarch64):
+  - lib suites: default (+embed) 2234/0/55, gc-heap's counts; counted
+    2184/0/3. Clippy clean for both.
+  - The workspace builds with all targets, without a diagnostic.
+  - Downstream suites with default features: host 36/0/0, timers
+    5/0/0, fs (no tests), web 61/0/1, node 42/0/0, runtime 182/0/1, as
+    at S5's exit under gc-heap.
+  - Fixtures at --tier=jit from a default release binary: compiles
+    56/10/160; outputs as at S0 (masked md5 65b1faf9, 05a89273,
+    9cad1fec).
+  - difftest: 138 agree, 12 skipped, no crash.
+- trust-js-wasm takes the defaults too. Its wasm32 build is not a P1
+  target (64-bit only) and was not built.

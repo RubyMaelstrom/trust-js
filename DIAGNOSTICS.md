@@ -100,12 +100,14 @@ comment/example in the same change.
 - `TRUST_JS_FEEDBACK_PROFILE=1` enables the detailed per-site feedback vector; it changes
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
-- `TRUST_JS_GC_LOG=1` logs collections; `TRUST_JS_GC_DUMP=1` dumps external-root shapes
-  (bounded by `TRUST_JS_GC_DUMP_MIN_OBJECTS`/`TRUST_JS_GC_DUMP_ROOT_LIMIT`), and
+- `TRUST_JS_GC_LOG=1` logs collections. In the reference-counted model (built without the
+  default `gc-heap` feature until P1 S6 deletes it), `TRUST_JS_GC_DUMP=1` dumps external-root
+  shapes (bounded by `TRUST_JS_GC_DUMP_MIN_OBJECTS`/`TRUST_JS_GC_DUMP_ROOT_LIMIT`), and
   `TRUST_JS_GC_RETAINING_PATHS=1` adds retaining paths.
-- With the `gc-heap` feature (P1): `TRUST_JS_GC_STRESS=N` collects at the first safepoint
-  after every N cell allocations and polls at every call (N=1 finds unrooted values; run
-  each test in its own process, since a use-after-free can take down the whole run).
+- In the GC heap (the default object model, P1): `TRUST_JS_GC_STRESS=N` collects at the
+  first safepoint after every N cell allocations and polls at every call (N=1 finds unrooted
+  values; run each test in its own process, since a use-after-free can take down the whole
+  run).
   `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
   each) and released pages kept for reuse (`spare`) after each collection.
   `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget, for
