@@ -2943,3 +2943,164 @@ Step 9d, `this` travels packed in JIT contexts under gc-heap (e56fb053):
   - A cheaper primitive kind test would shrink the 41-instruction
     wrapper-probe receiver.
   - S6: x86-64 needs a packed `this` form.
+
+Step 9e, string constants are immediates under gc-heap (5fa62d13):
+- Under traced ownership both string-constant templates push the
+  constant's word, PACK_STR | cell, as an immediate: mov_imm64 (3
+  words in its MOVN form, else 4), the store and the add, with no
+  load. The templates are the baseline's (jit_operations.rs) and the
+  region copy (jit_regions.rs emit_effect). At 9d each was 8 words,
+  with a dependent load of the cell from the constant's pool slot.
+  The counted template is unchanged byte for byte (11 words in the
+  default build, with its count increment).
+- The region copy got the same change rather than being retired.
+  Retiring it would change the default build's code under
+  TRUST_JS_SHARED_NATIVE_OPERATIONS=0, or send gc-heap's constants to
+  H_EXEC there. Neither new arm checks rc_ok: like a scalar
+  constant's, the word depends on no probed layout.
+- Chunk::jit_const_str_word (gc-heap only) gives the word.
+  jit_const_copyable and PackedValue::scalar_bits are unchanged.
+- Soundness, re-verified at HEAD:
+  - The pool (consts) is a RootedVec, built once and only read
+    afterwards. It roots its cells until the chunk drops. Chunk has no
+    custom Drop, so no safepoint runs between the pool's drop and its
+    code's.
+  - The chunk owns its code (Chunk::jit and its OSR sidecar). Each
+    compile commits into its own chunk's slot, and Chunk is not Clone.
+  - Cells never move: the heap is a non-moving mark-sweep.
+  - No code is shared between chunks or Agents. The fragment cache is
+    per Interp, and a Plan owns its Rc<Chunk>. Static snapshots decode
+    per Agent, with empty code cells. An inlined callee compiles into
+    the caller's own pool. No thread-local holds a chunk or an AST.
+  - GLOBAL_STUBS is process-wide, and SharedStub::emit takes no chunk.
+  - Word 0 of a gc-heap string cell is the frontier, not a count. A
+    constant is allocated at exact capacity (LStr::from), so any
+    non-empty append copies.
+  - So the immediate is as valid as the pool's own Value, which the
+    VM's Op::Const pushes.
+- The VM's Op::Add retire (run_vm_inner) and its two helpers are
+  default-only, as 9c made jit_add_strings'. gc-heap appends at the
+  buffer's frontier and needs no uniqueness, so under gc-heap nothing
+  retires the old string of `s += x` any more. 2M `s += 'x'` into a
+  local at --tier=bytecode: gc-heap 3,160.7M -> 2,802.8M instructions
+  (-11.3%); the default build is unchanged.
+- Code, gc-heap dumps against 9d's:
+  - String-constant sites 60/18/924 in vue/react/djot, 8 words each
+    -> 5 or 6: vue 480 -> 337 words, react 144 -> 92, djot 7,392 ->
+    5,432.
+  - Dump words: vue 186,213 -> 186,070, react 25,330 -> 25,278, djot
+    1,037,713 -> 1,035,753. In every chunk the word change equals its
+    sites' change. Chunk summaries changed in exactly the 12/2/105
+    chunks with sites.
+  - The default build's sites (60/18/929, 11 words) are as at 9d. Its
+    929 djot sites against gc-heap's 924 predate 9e: four chunks
+    compile to different code in the two builds (e.g. 10,466 against
+    3,301 words).
+- Tests.
+  - jit::string_constant_tests (3 tests, both builds, every tier, also
+    in the stress child):
+    - A literal evaluates to its chunk's constant, the same string at
+      each evaluation, in a function and in a loop region. It is ===
+      and == to a string built at run time, across collections. Under
+      gc-heap the immediate equals the word the VM pushes.
+    - Appending to a local or a captured binding that starts as a
+      literal copies out of it. The literal reads the same on the next
+      evaluation, the grown buffer is not the literal's, and the
+      constant has no spare capacity.
+    - An inlined callee's literal is the caller's own constant, a
+      separate cell. After the callee is collected (its function
+      object and AST dropped), that constant is intact and caller()
+      returns the replacement's string.
+  - jit::traced_tests (3 tests, gc-heap):
+    - In real generated code each string literal's sites are exactly
+      the immediate, the store and the add: 1 site before a loop, 2
+      inside it (baseline and region). No site materializes the pool
+      slot's address.
+    - The same check in a child process, with the regions' own
+      vocabulary.
+    - All 2,690 stub variants a site can request are assembled. None
+      materializes a string word, or the word, cell or pool slot of any
+      of a chunk's string constants. The test lists the shared stub
+      kinds, so a new kind must be added to it.
+  - Deviation from the brief, which asked that the caller's spliced
+    code still push its string after the callee became unreachable.
+    That cannot happen: the inline guard compares the callee's
+    identity, and a dead cell named by a weak pin stays reserved, so
+    the spliced body never runs again. The test checks the constant
+    instead.
+- Mutations (a separate source copy; 6 tests, each in its own process,
+  at stress 0 and 1; the control passes 6 of 6 both ways):
+  - The Symbol tag instead of the string tag fails all 6.
+  - The pool slot's address instead of the cell fails all 6 (some
+    abort).
+  - A wrong tag in the region copy alone fails the region-copy child
+    test.
+  - An unrooted copy of the string, standing in for a constant's cell
+    freed while code embeds it, fails 5 at stress 0 and all 6 at
+    stress 1.
+  - With the direct comparison of the immediate against the VM's word
+    disabled, the 3 both-builds tests still catch the tag, slot and
+    unrooted mutations.
+- Gates: the agent's, at 5fa62d13. I reran the lib suites, the stress
+  child, clippy and rustfmt at the same commit.
+  - Lib suites: embed 2184/0/3 (2181 + 3). embed,gc-heap 2233/0/55
+    twice (2227 + 3 + 3). My rerun gave the same counts, with gc-heap run twice.
+  - Stress child (68 tests: 62 + 6): 31 s alone; 30.2 s on my
+    rerun.
+  - Targeted per-test stress over the names matching
+    const|string|lstr|concat|append|literal|traced_tests|
+    rooting_tests|poll (295 tests, 289 + 6, none on 8c's slow lists):
+    295 pass at stress 1, and 295 at stress 1 with threshold 0. No
+    crash, timeout or verifier report.
+  - Test262 at threshold 0 over built-ins/String, language/literals/
+    string and language/expressions/addition, compound-assignment and
+    template-literal:
+    - Release gc-heap runners at 5c984843 and 5fa62d13, and a debug
+      one at 5fa62d13, pass 1855 of 1855 each.
+    - The base runner is byte-identical to 9d's head runner.
+    - A tier log showed 390 native compiles in one subset.
+  - Default code dumps are norm2-identical to step 1, and chunk
+    summaries identical to 9d's. gc-heap keeps 56/10/160 chunks.
+  - Fixtures at --tier=jit: exit 0, stdout equal with only elapsed_ms
+    removed, compiles 55/9/160 and 56/10/160.
+  - difftest --seed 7 --count 150: 138 agree, 12 skipped, 0 crashes
+    in both builds.
+  - Clippy is clean in both builds; rustfmt is clean.
+  - The default build's Rust .text is byte-identical to 9d's. Only
+    .data.rel.ro differs (766 bytes: panic line numbers, shifted by
+    the bytecode.rs hunks).
+- Instructions, 9d -> 9e (user mode, no-LTO, perf and the workload
+  pinned to CPU 5, median of 3; my recount agrees with the agent's
+  within 0.05 points):
+  - gc-heap at --tier=jit: vue 3,227.3M -> 3,224.1M (-0.10%), react
+    606.9M -> 606.8M (-0.01%), djot 1,261.8M -> 1,261.2M (-0.05%).
+  - gc-heap at --tier=bytecode: djot 2,869.3M -> 2,859.7M (-0.34%);
+    vue and react within 0.01%.
+  - The default build: within 0.01% at both tiers.
+  - gc-heap against the default build at --tier=jit: vue -10.9%,
+    react -19.9%, djot -10.4%.
+  - 4M string-constant pushes in a loop region: 233.7M -> 225.7M
+    instructions, 2.0 fewer per push.
+- Correction, fixture output checks. Each fixture prints one JSON
+  line, which includes elapsed_ms. Three of this stage's scripts
+  masked stdout by dropping every line containing "elapsed":
+  - the step 4-5 verify script;
+  - 8a's fixture script, used through 9d;
+  - step 9's dump script.
+  For vue, react and djot their "stdout equal" therefore compared
+  empty text. The other scripts masked only the field.
+  - Rechecked with only elapsed_ms removed: all 50 saved outputs per
+    fixture are identical, from S5's base and step 3's baseline
+    through 9d, in both builds.
+  - vue: observed 30016, invocations 12359. react: checksum 2124760,
+    as expected. djot: the same HTML.
+  - The scripts now remove only the field.
+- Follow-ups:
+  - BigInt constants still go through H_EXEC. The same immediate,
+    PACK_BIGINT | cell, would be sound.
+  - x86-64 declines string constants to H_EXEC (S6).
+  - The doc comments on value.rs live_objects_ptr and on
+    JitCtx::live_objects justify capturing the counter at activation
+    by chunks being shared across Agents or threads. 9e found no such
+    sharing at HEAD, and its argument does not rest on it. Reword them
+    in S6's cleanup.
