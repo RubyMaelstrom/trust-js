@@ -1642,20 +1642,40 @@ fn cancellation_crosses_threads_and_interrupts_jit_code() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }
 
+/// `armDeadline()`: this engine's execution deadline, 20 ms ahead. A job that arms its own
+/// deadline is interrupted while it runs. Armed before the evaluation, the deadline could expire
+/// in the script body on a slow machine, and an interrupted body leaves the jobs it queued to the
+/// next evaluation's checkpoint, where nothing would stop a spinning job.
+fn arm_deadline(
+    i: &mut crate::interpreter::Interp,
+    _this: crate::value::Value,
+    _args: &[crate::value::Value],
+) -> Result<crate::value::Value, crate::value::Value> {
+    i.runtime_interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    ));
+    Ok(crate::value::Value::Undefined)
+}
+
+fn define_arm_deadline(engine: &mut Engine) {
+    let global = engine.interp.global.clone();
+    engine
+        .interp
+        .def_method(&global, "armDeadline", 0, arm_deadline);
+}
+
 #[test]
 fn interruption_aborts_a_running_microtask_checkpoint() {
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);
     engine.set_tier_threshold(0);
     let interrupt = engine.interrupt_handle();
-    interrupt.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_millis(20),
-    ));
+    define_arm_deadline(&mut engine);
     let outcome = engine
         .eval_interruptible(
             r#"
             var caught = 0, finalized = 0, later = 0;
-            function spin() { while (true) {} }
+            function spin() { armDeadline(); while (true) {} }
             Promise.resolve().then(() => {
                 try { spin(); }
                 catch (error) { caught = 1; }
@@ -4925,11 +4945,9 @@ fn job_callback_context_is_restored_on_host_interruption() {
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             engine.set_job_callback_script_caller_capture(true);
-            run_in(&mut engine, "var caught = 0, later = 0; function spin() { try { while(true) {} } catch (_) { caught++; } }");
+            define_arm_deadline(&mut engine);
+            run_in(&mut engine, "var caught = 0, later = 0; function spin() { armDeadline(); try { while(true) {} } catch (_) { caught++; } }");
             let interrupt = engine.interrupt_handle();
-            interrupt.set_deadline(Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(20),
-            ));
             let source = if thenable {
                 "Promise.resolve({then: spin}).then(() => later++);"
             } else {

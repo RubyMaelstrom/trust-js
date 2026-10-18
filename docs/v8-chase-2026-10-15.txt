@@ -3789,3 +3789,18 @@ x86-64, rustc 1.99.1):
   on the collection path saves r15 itself, where the stack scan finds
   it. System V's callee-saved registers are all general-purpose,
   which optimized frames commonly save.
+
+Interruption tests made deterministic (2026-10-18). tests::
+interruption_aborts_a_running_microtask_checkpoint and tests::job_
+callback_context_is_restored_on_host_interruption (step 3's open item)
+armed a 20 ms deadline before evaluating a script that queues a
+spinning job. Reproduced with an experiment test (not kept): a script
+body interrupted after queuing a job leaves the job to the next
+evaluation's checkpoint, at bytecode and at jit. In these tests that
+job spins, and the test clears the deadline before evaluating again.
+Their spinning jobs now arm the deadline themselves (armDeadline(), a
+test native), so it can expire only while a job runs. Both tests pass
+in both builds on aarch64, x86-64 and Windows under Wine. Open for
+the owner: whether an interrupted script's queued jobs should survive
+it (the checkpoint clears its queue on an interrupt; the script body's
+path does not).
