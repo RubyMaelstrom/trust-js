@@ -272,11 +272,19 @@ fn visit_scope_edges(scope: &Env, sink: &mut impl GcEdgeSink) {
 }
 
 impl Interp {
+    /// Inlined: under gc-heap an explicit request zeroes the stack below the caller's frame
+    /// before the collection's frames are built (see `Interp::gc_collect`).
+    #[inline(always)]
     pub(crate) fn gc_collect_young(&mut self, cause: crate::value::GcCause) {
         // P1 S2: the refcount nursery must never see cell handles; gc-heap collects in full.
-        // A thin entry (the nursery's frame is large): see `Interp::gc_heap_collect_explicit`.
         #[cfg(feature = "gc-heap")]
-        return self.gc_collect_with_cause(cause);
+        {
+            #[cfg(not(target_arch = "wasm32"))]
+            if matches!(cause, crate::value::GcCause::Explicit) {
+                crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+            }
+            self.gc_collect_with_cause(cause);
+        }
         #[cfg(not(feature = "gc-heap"))]
         self.gc_collect_young_rc(cause)
     }

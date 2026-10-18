@@ -3567,3 +3567,80 @@ Steps (each leaves the workspace building, with its gates green):
   recorded.
 - Exit gate: all Success Criteria (wasm32 retired), on aarch64 and on
   zombie. Merge review with the owner.
+
+Step 0, baselines (0c66177e, no-LTO release binaries in fresh target
+dirs):
+- gc-heap code dumps of the fixtures at --tier=jit (ASLR off, every
+  chunk normalized by codedump_norm2): vue 56 chunks (186,071 words),
+  react 10 (25,278), djot 160 (1,048,035), identical run to run. Kept
+  in target/s6-base for the deletion steps.
+- Fixture outputs and native compiles as at S5's exit (55/9/160 in the
+  default build, 56/10/160 under gc-heap). Test262: the S5 review
+  fixes' jit reports and main's interp and bytecode reports. Lib
+  suites: default 2184/0/3, gc-heap 2234/0/55.
+- zombie: each revision is exported to ~/trust-js-p1/<rev> (git archive,
+  sources touched, so a shared target dir cannot hand back an older
+  build). ~/trust-js-p1/dev mirrors the working tree's tracked files for
+  iterative work. rustc 1.99.1; Test262 d86b2294 copied.
+
+Step 1, x86-64 Linux and Windows on zombie:
+- x86-64 Linux, the gc-heap build's first compile there: both builds
+  compile. Lib suites: default 2014/0/3, gc-heap 1862/18/84.
+  - 12 failures are x64 JIT tests that need native code, which gc-heap
+    refuses on x86-64 until step 7 (one also asks Gc::strong_count).
+    They carry the existing x86-64 ignore and return with step 7.
+  - 6 failures are tests that expect an object dead and find it held by
+    a stale stack word ("outside the traced frames").
+    - 5: an explicit collection zeroed the stack only from inside its
+      own frames (gc_collect, gc_heap_collect_explicit). Those frames
+      are built over the region a finished callee has just used, and
+      keep their unwritten slots as they were. On x86-64 such slots
+      held dead cells' addresses; aarch64's frame layout happened not
+      to. The explicit entries are now inlined and zero the stack from
+      their caller's frame: Interp::gc_collect, gc_heap_collect_
+      explicit, collect_garbage_for_host, gc_collect_young (explicit
+      requests), Engine::collect_garbage_at_idle and Engine::collect_
+      pending_task_garbage.
+    - 1: first_window_context_does_not_retain_realm_bootstrap_state read
+      the host-settings table in its own frame, and a slot of that
+      frame, which the scan covers legitimately, kept a word equal to
+      the realm handle's address. The reads moved into in_frame, as the
+      gc_test module's rule asks.
+  - The change surfaced one more test of the same kind (native_
+    captures_collect_cycles_and_count_repeated_handles_in_both_
+    collectors, through gc_collect_young); its collect helper is
+    inlined too.
+  - After: default 2014/0/3, gc-heap 1868/0/96, in two runs.
+  - Clippy with -Dwarnings had never run on x86-64 and failed in both
+    builds on items only the ARM64 JIT or aarch64-only tests use. They
+    carry the existing cfg_attr(not(target_arch = "aarch64"),
+    allow(dead_code)), the JIT-support impl Chunk block as a whole.
+    Clean on both architectures in both builds.
+- Windows (x86_64-pc-windows-msvc, cross-built on zombie with
+  cargo-xwin, run under Wine 11.19):
+  - The scanner covers Windows. GetCurrentThreadStackLimits gives the
+    thread's stack top, and inside a stacker segment (a fiber on
+    Windows) the segment's exact bounds. The Win64 callee-saved
+    registers are spilled, xmm6-xmm15 included (28 words).
+  - zero_below_sp and the x86-64 test helpers are declared sysv64:
+    their assembly reads the first argument from rdi, where Win64 would
+    pass it in rcx.
+  - New tests: reference_only_in_xmm6_is_found (a reference held only
+    in xmm6 across a collection; it fails with xmm6 left out of the
+    spill) and registered_segment_bounds_match_the_allocation (a fiber
+    segment's registered bounds equal its VirtualQuery allocation, at
+    64 KiB, 100,000 B and 1 MiB).
+  - Lib suites under Wine: gc-heap 1862 pass, 3 fail, 96 ignored, with
+    every scanner test passing. The 3 (snapshot codec tests that expect
+    stack growth on a small native stack) fail the same way in the
+    default build. The default build also fails creation_caches_do_
+    not_trust_a_reused_prototype_address and aborts in execution_
+    stack_resource_exhaustion_unwinds_and_recovers (a panic past a JIT
+    frame that cannot unwind). Wine's stacks and the default build's
+    x64 JIT, not the collector; recorded open.
+- aarch64, this tree: lib suites default 2184/0/3, gc-heap 2234/0/55;
+  clippy clean in both builds.
+- Running when committed, recorded with their results: per-test GC
+  stress with the verifier on x86-64, full Test262 on x86-64 at every
+  tier, and the scanner tests in release, fat LTO and an opt-level
+  matrix on x86-64 and Windows.

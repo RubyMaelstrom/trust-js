@@ -60,8 +60,10 @@ const HDR: usize = std::mem::size_of::<Header>();
 pub(crate) const LEN_OFF: usize = std::mem::offset_of!(Header, len);
 /// Byte offset of `cap` (which carries [`ASCII_HINT`] in its top bit) — the JIT's charCodeAt
 /// intrinsic tests the hint from machine code.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const CAP_OFF: usize = std::mem::offset_of!(Header, cap);
 /// Byte offset of the first content byte in a flat buffer. Views require checked resolution.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const DATA_OFF: usize = HDR;
 /// Top bit of `cap`: the content is KNOWN all-ASCII (byte index == UTF-16 unit index, and every
 /// byte IS its unit). Purely a hint — never set for non-ASCII content, may be clear for ASCII

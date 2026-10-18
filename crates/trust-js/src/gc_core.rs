@@ -1889,10 +1889,11 @@ unsafe extern "C" fn zero_below_sp(bytes: usize) {
 }
 
 /// Zero `bytes` (a multiple of 16) below the caller's stack pointer, sparing the return address
-/// the call pushed. A leaf with no frame, so nothing of its own is left in the zeroed range.
+/// the call pushed. A leaf with no frame, so nothing of its own is left in the zeroed range. The
+/// System V convention on every OS, Windows included: the argument arrives in rdi, and rcx is free.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-unsafe extern "C" fn zero_below_sp(bytes: usize) {
+unsafe extern "sysv64" fn zero_below_sp(bytes: usize) {
     std::arch::naked_asm!(
         "lea rcx, [rsp + 8]",
         "sub rcx, rdi",
@@ -1938,7 +1939,7 @@ pub(crate) fn grow<R, F: FnOnce() -> R>(stack_size: usize, f: F) -> R {
 }
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
 mod native {
@@ -1952,9 +1953,16 @@ mod native {
     //!   its successor was entered, after the same register spill as a
     //!   collection: stacker's own frames below that SP are not scanned, and
     //!   they may save and reuse callee-saved registers.
+    //! - Windows: stacker runs a segment on a fiber, and the system reports a
+    //!   fiber's (or the thread's) stack bounds exactly.
     use std::cell::RefCell;
 
+    /// Words for the callee-saved registers: AAPCS64 x19–x30 and d8–d15 (20), System V rbx,
+    /// rbp and r12–r15 (6), Win64 rbx, rbp, rdi, rsi, r12–r15 and xmm6–xmm15 (28).
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
     pub(super) const SPILL_WORDS: usize = 24;
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(super) const SPILL_WORDS: usize = 28;
 
     #[derive(Clone, Copy)]
     struct Region {
@@ -1993,10 +2001,8 @@ mod native {
         }
     }
 
-    /// System V callee-saved registers. Not compiled or run on the aarch64
-    /// development host (its LLVM has no x86 backend): validate on x64
-    /// before this heap is authoritative there (S6).
-    #[cfg(target_arch = "x86_64")]
+    /// System V callee-saved registers.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
     #[inline(always)]
     pub(super) fn spill_registers(buf: &mut [u64; SPILL_WORDS]) {
         // SAFETY: stores rbx, rbp, r12–r15 into the first 6 words of `buf`.
@@ -2008,6 +2014,39 @@ mod native {
                 "mov [{buf} + 24], r13",
                 "mov [{buf} + 32], r14",
                 "mov [{buf} + 40], r15",
+                buf = in(reg) buf.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Win64 callee-saved registers, xmm6–xmm15 included: the compiler may keep a 16-byte
+    /// value, a cell address in its low half, in one across a call.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[inline(always)]
+    pub(super) fn spill_registers(buf: &mut [u64; SPILL_WORDS]) {
+        // SAFETY: stores rbx, rbp, rdi, rsi and r12–r15 into the first 8 words of `buf`, and
+        // xmm6–xmm15 into the 20 after them.
+        unsafe {
+            std::arch::asm!(
+                "mov [{buf}], rbx",
+                "mov [{buf} + 8], rbp",
+                "mov [{buf} + 16], rdi",
+                "mov [{buf} + 24], rsi",
+                "mov [{buf} + 32], r12",
+                "mov [{buf} + 40], r13",
+                "mov [{buf} + 48], r14",
+                "mov [{buf} + 56], r15",
+                "movdqu [{buf} + 64], xmm6",
+                "movdqu [{buf} + 80], xmm7",
+                "movdqu [{buf} + 96], xmm8",
+                "movdqu [{buf} + 112], xmm9",
+                "movdqu [{buf} + 128], xmm10",
+                "movdqu [{buf} + 144], xmm11",
+                "movdqu [{buf} + 160], xmm12",
+                "movdqu [{buf} + 176], xmm13",
+                "movdqu [{buf} + 192], xmm14",
+                "movdqu [{buf} + 208], xmm15",
                 buf = in(reg) buf.as_mut_ptr(),
                 options(nostack, preserves_flags),
             );
@@ -2036,6 +2075,7 @@ mod native {
         sp
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn page_size() -> usize {
         static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *PAGE.get_or_init(|| {
@@ -2167,6 +2207,26 @@ mod native {
         (top != 0).then_some(top)
     }
 
+    /// The bounds of the stack in use: the thread's, or on a stacker segment its fiber's
+    /// (SwitchToFiber swaps the bounds the system reports).
+    #[cfg(target_os = "windows")]
+    fn stack_limits() -> (usize, usize) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+        }
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the current stack's bounds into the two locals.
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+        (low, high)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn thread_stack_top() -> Option<usize> {
+        let (_, high) = stack_limits();
+        (high != 0).then_some(high)
+    }
+
     struct SegmentScope;
 
     impl Drop for SegmentScope {
@@ -2199,6 +2259,7 @@ mod native {
     /// usable area is max(1, ceil(size / page)) pages (stacker 0.1.25; the
     /// bounds-precision test checks this against the mapping). A mismatch
     /// yields an empty region: collections inside then defer.
+    #[cfg(not(target_os = "windows"))]
     fn segment_region(stack_size: usize, resume_sp: usize) -> Region {
         let sp = current_sp();
         let page = page_size();
@@ -2226,6 +2287,26 @@ mod native {
         }
     }
 
+    /// Bounds of the stacker segment we are running on: on Windows stacker runs it on a fiber,
+    /// whose stack the system reports exactly (the bounds-precision test checks them against
+    /// the allocation). A mismatch yields an empty region: collections inside then defer.
+    #[cfg(target_os = "windows")]
+    fn segment_region(_stack_size: usize, resume_sp: usize) -> Region {
+        let sp = current_sp();
+        let (lo, hi) = stack_limits();
+        if (lo..hi).contains(&sp) {
+            return Region { lo, hi, resume_sp };
+        }
+        if cfg!(debug_assertions) {
+            panic!("could not derive stacker segment bounds");
+        }
+        Region {
+            lo: usize::MAX,
+            hi: 0,
+            resume_sp,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn innermost_region() -> Option<(usize, usize)> {
         REGIONS.with(|regions| regions.borrow().last().map(|r| (r.lo, r.hi)))
@@ -2233,7 +2314,7 @@ mod native {
 }
 
 #[cfg(not(all(
-    any(target_os = "linux", target_os = "macos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 )))]
 mod native {
@@ -2835,10 +2916,10 @@ mod tests {
     }
 
     /// Fill `bytes` (a multiple of 16) below the caller's stack pointer with `marker`, sparing
-    /// the return address.
+    /// the return address. System V convention on every OS, like `zero_below_sp`.
     #[cfg(target_arch = "x86_64")]
     #[unsafe(naked)]
-    unsafe extern "C" fn fill_below_sp(bytes: usize, marker: u64) {
+    unsafe extern "sysv64" fn fill_below_sp(bytes: usize, marker: u64) {
         std::arch::naked_asm!(
             "lea rcx, [rsp + 8]",
             "sub rcx, rdi",
@@ -2854,10 +2935,10 @@ mod tests {
     }
 
     /// The nonzero words among the `bytes` below the caller's stack pointer, but for the
-    /// return address of this call.
+    /// return address of this call. System V convention on every OS.
     #[cfg(target_arch = "x86_64")]
     #[unsafe(naked)]
-    unsafe extern "C" fn nonzero_below_sp(bytes: usize) -> usize {
+    unsafe extern "sysv64" fn nonzero_below_sp(bytes: usize) -> usize {
         std::arch::naked_asm!(
             "lea rcx, [rsp + 8]",
             "sub rcx, rdi",
@@ -3296,6 +3377,57 @@ mod tests {
         black_box(&top);
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    extern "C" fn collect_trampoline(heap: *mut std::ffi::c_void) {
+        let heap = unsafe { &mut *(heap as *mut Heap) };
+        assert!(heap.collect());
+    }
+
+    /// Collect while the only reference sits in xmm6, a register Win64 makes callee-saved and
+    /// no Rust frame on the collection path saves: only the register spill can find it.
+    /// Returns xmm6's low half after the call.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[inline(never)]
+    fn collect_with_reference_only_in_xmm6(heap: &mut Heap, hidden: u64) -> u64 {
+        let found: u64;
+        unsafe {
+            std::arch::asm!(
+                "mov rax, {hidden}",
+                "not rax",
+                "movq xmm6, rax",
+                "sub rsp, 32", // the callee's shadow space
+                "call {trampoline}",
+                "add rsp, 32",
+                "movq rax, xmm6",
+                hidden = in(reg) hidden,
+                trampoline = sym collect_trampoline,
+                in("rcx") heap as *mut Heap as *mut std::ffi::c_void,
+                lateout("rax") found,
+                out("xmm6") _,
+                clobber_abi("C"),
+            );
+        }
+        found
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn reference_only_in_xmm6_is_found() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+        scrub_stack();
+        let found = collect_with_reference_only_in_xmm6(&mut fx.heap, hidden);
+        assert_eq!(found, !hidden, "xmm6 is callee-saved");
+        assert_eq!(fx.heap.stats().collections, 1);
+        assert!(
+            fx.heap.is_allocated_word(found),
+            "register spill missed xmm6"
+        );
+        black_box(&top);
+    }
+
     #[test]
     fn collecting_on_registered_segments_scans_every_stack_below() {
         let mut fx = Fixture::new();
@@ -3361,6 +3493,61 @@ mod tests {
             });
             assert!(region.is_some());
             assert_eq!(region, mapping, "segment of {size} bytes");
+        }
+        black_box(&top);
+    }
+
+    /// The reservation holding `addr`: its allocation base, and the end of the last region
+    /// with that base (VirtualQuery, independent of the stack bounds the scanner uses).
+    #[cfg(target_os = "windows")]
+    fn allocation_containing(addr: usize) -> Option<(usize, usize)> {
+        #[repr(C)]
+        struct MemoryBasicInformation {
+            base_address: usize,
+            allocation_base: usize,
+            allocation_protect: u32,
+            partition_id: u16,
+            region_size: usize,
+            state: u32,
+            protect: u32,
+            kind: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualQuery(
+                address: *const std::ffi::c_void,
+                buffer: *mut MemoryBasicInformation,
+                length: usize,
+            ) -> usize;
+        }
+        let query = |at: usize| {
+            let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::uninit();
+            let size = std::mem::size_of::<MemoryBasicInformation>();
+            // SAFETY: VirtualQuery writes at most `size` bytes into `info`.
+            let written = unsafe { VirtualQuery(at as *const _, info.as_mut_ptr(), size) };
+            // SAFETY: a nonzero return means `info` was filled.
+            (written != 0).then(|| unsafe { info.assume_init() })
+        };
+        let base = query(addr)?.allocation_base;
+        let mut end = base;
+        while let Some(info) = query(end).filter(|info| info.allocation_base == base) {
+            end = info.base_address + info.region_size;
+        }
+        Some((base, end))
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn registered_segment_bounds_match_the_allocation() {
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        for size in [64 * 1024, 100_000, 1 << 20] {
+            let (region, allocation) = grow(size, || {
+                let sp = native::current_sp();
+                (native::innermost_region(), allocation_containing(sp))
+            });
+            assert!(region.is_some());
+            assert_eq!(region, allocation, "segment of {size} bytes");
         }
         black_box(&top);
     }

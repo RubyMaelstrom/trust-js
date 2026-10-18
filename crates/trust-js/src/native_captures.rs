@@ -87,6 +87,9 @@ mod tests {
         object
     }
 
+    /// Inlined, so the collections' stack scrub runs from the test's frame: a frame of its own
+    /// would sit where `in_frame`'s closure left its handles (x86-64, gc-heap).
+    #[inline(always)]
     fn collect(interp: &mut Interp, minor: bool) {
         if minor {
             interp.gc_collect_young(GcCause::Explicit);

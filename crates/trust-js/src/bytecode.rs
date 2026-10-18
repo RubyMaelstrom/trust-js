@@ -581,8 +581,11 @@ impl ComputedReadCache {
     pub(crate) const MAX_SETS: usize = 1024;
     pub(crate) const WAYS: usize = 4;
     pub(crate) const SET_STRIDE: usize = std::mem::size_of::<ComputedReadSet>();
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const WAY_STRIDE: usize = std::mem::size_of::<ComputedReadWay>();
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const KEY_OFF: usize = std::mem::offset_of!(ComputedReadWay, key);
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const STATE_OFF: usize = std::mem::offset_of!(ComputedReadWay, state);
     const MAX_KEY_ALLOCATION: usize = 512;
 
@@ -1227,7 +1230,9 @@ pub(crate) struct CallOverflow {
 }
 
 impl CallOverflow {
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const SET_STRIDE: usize = std::mem::size_of::<CallOverflowSet>();
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const ENTRY_STRIDE: usize = std::mem::size_of::<CallOverflowEntry>();
 
     fn set_index(key: usize, shift: u32) -> usize {
@@ -2285,6 +2290,7 @@ impl SourcePositions {
 pub struct Chunk {
     /// Byte offset of the source function's first token and its source length (diagnostics:
     /// `TRUST_JS_JIT_MAP` reports them so a profiler sample joins back to the script text).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) debug_origin: (u32, u32),
     /// The caller must complete FunctionDeclarationInstantiation before running this body.
     /// The existing activation, including mapped arguments and parameter-expression scopes,
@@ -2318,6 +2324,7 @@ pub struct Chunk {
     /// Slot names, for TDZ ReferenceError messages.
     slot_names: Vec<Rc<str>>,
     /// Borrowed entries publish these normally private homes around author observations.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     borrowed_parameter_aliases: bool,
     /// Exact settled AST phases from which a live ordinary function may enter its whole
     /// bytecode body. The syntax address is compared only while its owning Function is live.
@@ -19614,6 +19621,8 @@ fn bin_cmp<S: StoredValue>(
 // flow never reaches here — jumps, returns and try bookkeeping are real branches in the JIT.
 // ---------------------------------------------------------------------------------------------
 
+// The ARM64 templates read most of these; the x86-64 backend, a subset.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 impl Chunk {
     pub(crate) fn jit_ops(&self) -> &[Op] {
         &self.ops
@@ -26635,6 +26644,7 @@ impl crate::gc_trace::GcTrace for NativeActivation {
 #[cfg(all(test, feature = "gc-heap"))]
 impl NativeActivation {
     /// The running environment's cell (tests).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn env_address(&self) -> usize {
         Env::as_ptr(&self.env) as usize
     }

@@ -2959,6 +2959,7 @@ const _: () = assert!(
 /// Whether the cell heap has a collection due, as generated code reads it (gc-heap tests; see
 /// [`LiveCount`]).
 #[cfg(all(test, feature = "gc-heap"))]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
     heap.live.due.get() != 0
 }
@@ -5710,6 +5711,7 @@ pub(crate) fn proto_epoch() -> u32 {
 }
 
 /// Stable address used by the ARM64 creation-IC template for the same relaxed epoch check.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 pub(crate) fn proto_epoch_ptr() -> *const u32 {
     PROTO_EPOCH.as_ptr()
@@ -6515,6 +6517,7 @@ impl Props {
     /// entry/dense vectors. Keep this deliberately tiny: an untouched `new Array(n)` must not
     /// turn a length word into an unbounded allocation, and eight slots cap the speculative
     /// footprint at 128 bytes while becoming smaller than the classic representation once filled.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn reserve_small_holes(&mut self, len: usize) {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| std::env::var_os("TRUST_JS_JIT_NO_PACKED_HOLES").is_none())
@@ -6757,11 +6760,13 @@ impl Props {
     }
     /// The named-field count and capacity, as the JIT's storage emitters read them.
     #[cfg(test)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn named_len(&self) -> usize {
         self.entries.len()
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn named_capacity(&self) -> usize {
         self.entries.capacity()
     }

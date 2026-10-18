@@ -20442,16 +20442,19 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
             .is_ok());
         child_ptr
     });
-    assert!(!engine
-        .ctx()
-        .host_settings_states
-        .keys()
-        .any(|(realm, context)| *realm == child_ptr.get() && *context == 0));
-    assert!(engine
-        .ctx()
-        .host_settings_states
-        .keys()
-        .any(|(realm, context)| *realm == child_ptr.get() && *context == 71));
+    // The table is read in a helper frame too: its iterators left a word equal to a cell
+    // address in this frame on x86-64 (gc-heap), which the stack scan took for a root.
+    let (bootstrap, window) = crate::gc_test::in_frame(|| {
+        let states = &engine.ctx().host_settings_states;
+        let has = |context| {
+            states
+                .keys()
+                .any(|(realm, key)| *realm == child_ptr.get() && *key == context)
+        };
+        (has(0), has(71))
+    });
+    assert!(!bootstrap);
+    assert!(window);
 
     engine.ctx().release_host_job_context(71);
     engine.ctx().collect_garbage_for_host();

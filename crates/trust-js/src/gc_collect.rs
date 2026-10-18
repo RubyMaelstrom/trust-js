@@ -343,10 +343,11 @@ impl Interp {
             || self.gc_heap.core.borrow().collection_due()
     }
 
-    /// An explicit collection (a host or test request), entered through thin frames: it
-    /// usually comes from just above a finished job, whose frames left stale cell addresses in
-    /// the stack the collection's own frames are about to reuse. Zero that region first.
-    #[inline(never)]
+    /// An explicit collection (a host or test request). It usually comes from just above a
+    /// finished job, whose frames left stale cell addresses in the stack the collection's own
+    /// frames are about to reuse. Zero that region first, from the caller's frame (inlined,
+    /// see `Interp::gc_collect`).
+    #[inline(always)]
     pub(crate) fn gc_heap_collect_explicit(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(EXPLICIT_SCRUB_BYTES);

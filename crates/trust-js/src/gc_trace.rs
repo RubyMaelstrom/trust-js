@@ -301,6 +301,7 @@ pub(crate) fn enter_jit_frame(roots: JitFrameRoots) -> JitFrameGuard {
 
 /// The contexts of the Rust entries' JIT activations registered on this thread (tests).
 #[cfg(test)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn jit_frame_contexts() -> Vec<*const crate::jit::JitCtx> {
     JIT_FRAMES.with(|frames| frames.borrow().iter().map(|frame| frame.ctx).collect())
 }
@@ -308,6 +309,7 @@ pub(crate) fn jit_frame_contexts() -> Vec<*const crate::jit::JitCtx> {
 /// The word-range lengths of each Rust entry's JIT activation registered on this thread
 /// (tests).
 #[cfg(test)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn jit_frames_registered() -> Vec<[usize; 2]> {
     JIT_FRAMES.with(|frames| {
         frames

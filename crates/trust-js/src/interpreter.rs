@@ -1395,6 +1395,7 @@ impl FramePool {
 
     /// How many records are registered, pooled or active (tests).
     #[cfg(test)]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn registered(&self) -> usize {
         self.records.len()
     }
@@ -6563,7 +6564,12 @@ impl Interp {
     }
 
     /// Run TRust JS's cycle collector and return the number of reclaimed heap objects.
+    /// Inlined: the stack below the host's frame is zeroed before the collection's frames are
+    /// built (see `gc_collect`).
+    #[inline(always)]
     pub fn collect_garbage_for_host(&mut self) -> i64 {
+        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
@@ -12138,6 +12144,12 @@ impl Interp {
             .retain(|_, symbol| symbol.strong_count() != 0);
     }
 
+    /// An explicit collection (a test or host request). Inlined, like `gc_heap_collect_explicit`,
+    /// so that its stack scrub runs from the caller's frame: the collection's frames are then
+    /// built on zeroed stack. A frame of their own, built first, keeps any slot it leaves
+    /// unwritten as it was, and on x86-64 such slots held the address of a cell the caller's
+    /// finished callee had used, which the scan took for a root.
+    #[inline(always)]
     pub(crate) fn gc_collect(&mut self) {
         #[cfg(feature = "gc-heap")]
         return self.gc_heap_collect_explicit();

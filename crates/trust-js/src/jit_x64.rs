@@ -1410,6 +1410,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(feature = "gc-heap", target_arch = "x86_64"),
+        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
+    )]
     fn finally_completions_remain_native_and_preserve_abrupt_precedence() {
         // ECMA-262 e28783d5, sec-try-statement-runtime-semantics-evaluation:
         // normal finally completion preserves the body completion; abrupt finally replaces it.
@@ -1446,6 +1450,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(feature = "gc-heap", target_arch = "x86_64"),
+        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
+    )]
     fn labelled_break_runs_finally_then_closes_iterators_inside_out() {
         // ECMA-262 e28783d5, sec-iteratorclose and TryStatement Evaluation: preserve
         // the pending break while running every intervening cleanup in nesting order.
@@ -1476,6 +1484,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(feature = "gc-heap", target_arch = "x86_64"),
+        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
+    )]
     fn packed_numeric_and_boolean_operands_preserve_number_semantics() {
         let mut engine = engine();
         assert_eq!(evaluate(&mut engine,
@@ -1491,6 +1503,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(feature = "gc-heap", target_arch = "x86_64"),
+        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
+    )]
     fn packed_heap_owners_survive_local_overwrites_calls_and_unwind() {
         let mut engine = engine();
         assert_eq!(

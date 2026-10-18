@@ -1467,6 +1467,7 @@ impl Engine {
     ///
     /// This complements allocation-triggered task checks: cyclic garbage spread across many
     /// individually low-churn timer tasks is reclaimed once, at the natural idle boundary.
+    #[inline(always)]
     pub fn collect_garbage_at_idle(&mut self) -> i64 {
         self.interp.collect_garbage_for_host()
     }
@@ -1487,11 +1488,15 @@ impl Engine {
     /// Service a deferred request between host tasks, after their microtask
     /// checkpoints. Returns zero while deferral remains enabled or no request
     /// is pending. Unlike an explicit idle collection, this never forces a scan
-    /// of an otherwise quiet heap.
+    /// of an otherwise quiet heap. Inlined: the stack below the host's frame is zeroed before
+    /// the boundary's frames are built (see `Interp::gc_collect`).
+    #[inline(always)]
     pub fn collect_pending_task_garbage(&mut self) -> i64 {
         if !self.interp.gc_task_pending || self.interp.gc_task_deferred {
             return 0;
         }
+        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
         self.interp.activate_gc_heap();
         self.interp.gc_task_boundary()
     }
