@@ -918,8 +918,9 @@ fn committed_native_call_operands_are_roots() {
 }
 
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
-/// under gc-heap (a callback's long argument list, an OSR entry's operand prefix) and step 6's
-/// (`jit::traced_tests`) again at `TRUST_JS_GC_STRESS=1`, which collects at every safepoint
+/// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
+/// (`jit::traced_tests`) and the owner-free words of `jit::word_routing_tests` again at
+/// `TRUST_JS_GC_STRESS=1`, which collects at every safepoint
 /// that follows an allocation (the calls, polls and natives JIT code reaches throughout,
 /// besides `collect()`), in a process of their own: the setting is read once per process.
 #[test]
@@ -934,6 +935,7 @@ fn rooting_holds_under_gc_stress() {
             "callback::tests::long_callback_calls_root_operands_and_cache_weakly",
             "bytecode::osr_tests::osr_entry_operand_prefix_is_a_root",
             "jit::traced_tests::",
+            "jit::word_routing_tests::",
             "--skip",
             "rooting_holds_under_gc_stress",
         ])

@@ -178,6 +178,14 @@ mod loop_latch_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_word_routing_tests.rs"]
+mod word_routing_tests;
+
+#[cfg(all(
+    test,
     feature = "gc-heap",
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -318,8 +326,8 @@ pub(crate) enum JitOwnership {
     #[cfg_attr(feature = "gc-heap", allow(dead_code))]
     Refcount { strong_off: i32 },
     /// gc-heap: values carry no count; the collector traces what is reachable, so taking or
-    /// releasing an owner needs no instruction. The ARM64 emitters' `Traced` arms emit none and
-    /// keep only the tag routing that exists for other reasons (see `jit_ownership.rs`). The x64
+    /// releasing an owner needs no instruction and an execution word owns nothing. The ARM64
+    /// emitters' `Traced` arms emit nothing, tag routing included (see `jit_ownership.rs`). The x64
     /// backend refuses it: its `Traced` arms are unreachable until S6, since `Tier::admitted`
     /// keeps gc-heap engines on x86-64 on the bytecode VM.
     #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
@@ -330,7 +338,8 @@ impl JitOwnership {
     /// Whether owners hold counts (`Refcount`). Sites emit their count-only logic beside the
     /// ownership emitters (an alias compare that keeps a shared count above zero, a marker or
     /// register that carries a count to a later decrement, the direct call's surplus-argument
-    /// counter) only then; traced ownership needs none of it.
+    /// counter, a BigInt exclusion, a checked path only an owner guard reaches) only then;
+    /// traced ownership needs none of it.
     pub(crate) fn counted(self) -> bool {
         matches!(self, JitOwnership::Refcount { .. })
     }
@@ -6137,7 +6146,7 @@ fn emit_prop_load_inline(
     // 6. x11 = holder base: bounds-check the cached slot against the live entries length
     //    (defense in depth — fills only record exact-slot holders, but an OOB read through a
     //    stale cache would be memory-unsafe, so verify), then entry = entries + slot*size;
-    //    data property; non-BigInt
+    //    data property; non-BigInt (counted ownership) and never a deferred prototype
     let val = a.new_label();
     let val_body = a.new_label();
     let accessor_hit = a.new_label();
@@ -6169,7 +6178,13 @@ fn emit_prop_load_inline(
         a.ldur(13, 15, ev + 8);
         emit_exec_encode_wide(a, 9, 13, 12, 16, 17, 0, slow);
     }
-    exec_clone(a, own, 12, 13, 16, slow);
+    if own.counted() {
+        // The owner guard also sends a deferred `prototype` to the helper.
+        exec_clone(a, own, 12, 13, 16, slow);
+    } else if name == "prototype" {
+        // Only this key can hold a function's deferred prototype.
+        property_word_guard(a, 12, 13, slow);
+    }
     // --- commit: everything validated; from here only writes ---
     if !matches!(recv, PropRecv::Stack) {
         // this/slot receivers were never on the stack: just push the value.
@@ -6526,7 +6541,13 @@ fn emit_computed_method_inline(
     guard_prop_data(a, 9, 15, layout.entry_accessor as u32, slow);
     a.ldur(12, 15, layout.entry_value as i32);
     let own = layout.ownership();
-    exec_clone(a, own, 12, 13, 16, slow);
+    if own.counted() {
+        // The owner guard also sends a deferred `prototype` to the helper.
+        exec_clone(a, own, 12, 13, 16, slow);
+    } else {
+        // The key is known only at run time: it may be `prototype` on a function.
+        property_word_guard(a, 12, 13, slow);
+    }
     // A hit owns a cache pin of this exact LStr, so the operand cannot be its final owner.
     // Clone the result first (it may alias the key); preserve the original receiver for Call.
     // Traced ownership releases the key by overwriting it.
@@ -8644,6 +8665,8 @@ fn emit_discard_local_read(a: &mut asm::Asm, off: u32, pc: u32, l_unwind: usize)
 /// Move the stack's top value into a local, optionally retaining the expression result.
 /// `pcs` is the exact unfused sequence for a guard miss. No guard follows an ownership
 /// mutation; dropping a last reference uses the existing non-JavaScript destructor helper.
+/// Traced ownership: the store is a move and the retained copy a bit copy, so only an Empty
+/// (TDZ) result replays the original sequence.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -8657,6 +8680,8 @@ fn emit_store_local(
     keep: bool,
     rc_ok: bool,
 ) {
+    let own = layout.ownership();
+    let traced = rc_ok && !own.counted();
     let slow = a.new_label();
     let done = a.new_label();
     if keep {
@@ -8666,13 +8691,17 @@ fn emit_store_local(
         emit_exec_kind(a, 9, 10, 11, slow);
         a.cmp_imm_w(10, 1);
         a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(10, if rc_ok { 5 } else { 4 });
-        a.b_cond(if rc_ok { C_EQ } else { C_HI }, slow);
+        // Goes with the clone below: its fallback runs only after the slot's release has
+        // committed, so a BigInt leaves here. Traced: neither the release nor the clone emits.
+        if !traced {
+            a.cmp_imm_w(10, if rc_ok { 5 } else { 4 });
+            a.b_cond(if rc_ok { C_EQ } else { C_HI }, slow);
+        }
     }
-    a.ldr_imm(9, 22, off);
     if rc_ok {
-        exec_release_loaded(a, layout.ownership(), 22, off as i32);
+        exec_release_word(a, own, 22, off as i32);
     } else {
+        a.ldr_imm(9, 22, off);
         emit_exec_kind(a, 9, 10, 11, slow);
         a.cmp_imm_w(10, 4);
         a.b_cond(C_HI, slow);
@@ -8681,16 +8710,19 @@ fn emit_store_local(
     if keep && rc_ok {
         // The pre-mutation kind guard excludes BigInt/Empty. Non-JavaScript
         // destruction of the previous slot cannot change the rooted stack word.
-        exec_clone(a, layout.ownership(), 9, 10, 11, slow);
+        exec_clone(a, own, 9, 10, 11, slow);
     }
     a.str_imm(9, 22, off);
     if !keep {
         a.sub_imm(20, 20, 8);
     }
-    a.b(done);
-    a.bind(slow);
-    for &pc in pcs {
-        emit_exec(a, pc, l_unwind);
+    // A traced store with nothing kept has no guard, hence no checked path.
+    if keep || !traced {
+        a.b(done);
+        a.bind(slow);
+        for &pc in pcs {
+            emit_exec(a, pc, l_unwind);
+        }
     }
     a.bind(done);
 }
@@ -9410,18 +9442,21 @@ fn emit_instanceof_inline(
     // ordinary-constructor guards below pass; accepting it here avoids a helper call for the
     // ubiquitous linked-list tail check `atom instanceof Pair`. Shared strings/symbols can be
     // released inline; BigInt and unknown tags retain the checked path. w7 keeps the LHS tag.
+    // Traced ownership releases nothing, so every LHS kind (BigInt included) is admitted.
     emit_exec_word_load(a, 8, 20, -16);
     emit_exec_kind(a, 8, 7, 9, slow);
-    let lhs_tag_ok = a.new_label();
-    a.cmp_imm_w(7, 8);
-    a.b_cond(C_EQ, lhs_tag_ok);
-    a.cmp_imm_w(7, 4);
-    a.b_cond(C_LS, lhs_tag_ok);
-    a.cmp_imm_w(7, 6);
-    a.b_cond(C_LO, slow);
-    a.cmp_imm_w(7, 7);
-    a.b_cond(C_HI, slow);
-    a.bind(lhs_tag_ok);
+    if own.counted() {
+        let lhs_tag_ok = a.new_label();
+        a.cmp_imm_w(7, 8);
+        a.b_cond(C_EQ, lhs_tag_ok);
+        a.cmp_imm_w(7, 4);
+        a.b_cond(C_LS, lhs_tag_ok);
+        a.cmp_imm_w(7, 6);
+        a.b_cond(C_LO, slow);
+        a.cmp_imm_w(7, 7);
+        a.b_cond(C_HI, slow);
+        a.bind(lhs_tag_ok);
+    }
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     a.ldr_imm(9, 19, 32); // ctx.inline_ic_safe
@@ -9718,14 +9753,16 @@ fn emit_set_prop_inline(
     let slow = a.new_label();
     let done = a.new_label();
     if keep {
-        // A retained RHS needs two owners. Keep BigInt's checked clone and
-        // never admit TDZ/property-only words as a JavaScript result.
+        // A retained RHS needs two owners. Keep BigInt's checked clone (counted
+        // ownership) and never admit TDZ/property-only words as a JavaScript result.
         emit_exec_word_load(a, 16, 20, -8);
         emit_exec_kind(a, 16, 9, 14, slow);
         a.cmp_imm_w(9, 1);
         a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
+        if own.counted() {
+            a.cmp_imm_w(9, 5);
+            a.b_cond(C_EQ, slow);
+        }
     }
     // Stack form: [obj @ -16, v @ -8], both owned; this/slot forms
     // have [v @ -8] only and the frame owns the receiver.
@@ -9799,14 +9836,16 @@ fn emit_set_prop_inline(
         // (`o.x === o`) also bails: its dec and the receiver dec below hit the same counter,
         // and the two independent strong > 1 guards would let the pair scribble it to 0
         // without running the destructor. Traced ownership drops the old value by
-        // overwriting it: only the BigInt and lazy-prototype exclusions remain, and the
-        // commit reads no marker.
+        // overwriting it: only the lazy-prototype exclusion remains, and the commit reads
+        // no marker.
         if layout.entry_accessor == layout.entry_value + 8 {
             a.ldur(12, 15, ev);
             a.lsr_imm(9, 12, 48);
-            a.movz(14, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-            a.cmp_reg_x(9, 14);
-            a.b_cond(C_EQ, miss);
+            if own.counted() {
+                a.movz(14, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+                a.cmp_reg_x(9, 14);
+                a.b_cond(C_EQ, miss);
+            }
             a.movz(14, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
             a.cmp_reg_x(9, 14);
             a.b_cond(C_EQ, miss); // lazy storage has an owning Rc destructor
@@ -9917,10 +9956,10 @@ fn emit_set_prop_inline(
     if create_ok {
         use crate::bytecode::IC_OFF_HOLDER_SHAPE;
         a.bind(create_commit);
-        if keep {
-            // All creation proofs are complete. Preserve x7 (layout), x12
-            // (IC), x13 (length) and x10/x11 (receiver); acquire RHS ownership
-            // before installing the replacement layout or publishing a field.
+        // All creation proofs are complete. Preserve x7 (layout), x12 (IC), x13 (length) and
+        // x10/x11 (receiver); acquire RHS ownership before installing the replacement layout
+        // or publishing a field. Traced: there is no owner to acquire.
+        if keep && own.counted() {
             emit_exec_word_load(a, 16, 20, -8);
             exec_clone(a, own, 16, 6, 17, slow);
         }
@@ -9980,10 +10019,11 @@ fn emit_set_prop_inline(
 /// unequal); loose nullish operands resolve by the other side's tag; same-tag Bools compare
 /// payloads; same-tag Sym/Obj compare identity; same-tag Strs compare identity, then length (a
 /// length mismatch is a definitive "not equal"; equal lengths fall to the helper's content
-/// compare); strict different-tag pairs are unequal outright. Everything else — BigInt, coercing
-/// mixed-type pairs, a refcounted operand that is a last reference (its drop runs a real
-/// destructor), a loose nullish-vs-object compare on a non-ordinary object (`ic_plain` off —
-/// which includes the `[[IsHTMLDDA]]` object) — takes the helper. Every guard branches to `slow`
+/// compare); strict different-tag pairs are unequal outright. Everything else — BigInt pairs,
+/// coercing mixed-type pairs, a refcounted operand that is a last reference (its drop runs a
+/// real destructor), a loose nullish-vs-object compare on a non-ordinary object (`ic_plain` off —
+/// which includes the `[[IsHTMLDDA]]` object) — takes the helper; under counted ownership so
+/// does a BigInt beside a nullish or different-tag operand (its drop). Every guard branches to `slow`
 /// before any state is written. With `branch`, the result drives a fused `JumpIfFalse` directly
 /// (no Bool materializes); otherwise the Bool pushes in place of the operands.
 #[cfg(all(
@@ -10092,8 +10132,12 @@ fn emit_eq_inline(
         a.b_cond(C_EQ, l_true);
         a.cmp_imm_w(10, 2);
         a.b_cond(C_EQ, l_true);
-        a.cmp_imm_w(10, 5);
-        a.b_cond(C_EQ, slow); // BigInt → helper
+        // Counted: BigInt → helper (its drop). Traced: a BigInt drops nothing and is unequal
+        // to nullish like Bool/Num, so it falls into the scalar arm.
+        if own.counted() {
+            a.cmp_imm_w(10, 5);
+            a.b_cond(C_EQ, slow);
+        }
         a.cmp_imm_w(10, 6);
         a.b_cond(C_LO, l_false); // Bool/Num: no drop needed
         emit_exec_word_load(a, 13, 20, -8);
@@ -10108,10 +10152,13 @@ fn emit_eq_inline(
         a.bind(la_drop);
         rc_release_shared(a, own, 13, 14, slow);
         a.b(l_false);
-        // b is nullish (a is not): false, dropping a refcounted a.
+        // b is nullish (a is not): false, dropping a refcounted a (counted: a BigInt a takes
+        // the helper; traced: it is unequal like Bool/Num).
         a.bind(lb_null);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
+        if own.counted() {
+            a.cmp_imm_w(9, 5);
+            a.b_cond(C_EQ, slow);
+        }
         a.cmp_imm_w(9, 6);
         a.b_cond(C_LO, l_false);
         emit_exec_word_load(a, 12, 20, -16);
@@ -10186,14 +10233,15 @@ fn emit_eq_inline(
     a.b(l_false);
     if strict {
         // Different tags (both-number already peeled off): strictly unequal. Guard BOTH drops
-        // before either dec so the slow fallback re-runs the op against untouched state.
-        // Traced ownership drops nothing: only the BigInt exclusions remain.
+        // before either dec so the slow fallback re-runs the op against untouched state; a
+        // BigInt's drop takes the helper. Traced ownership drops nothing, so the result is
+        // false whatever the operands are.
         a.bind(l_diff);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
-        a.cmp_imm_w(10, 5);
-        a.b_cond(C_EQ, slow);
         if own.counted() {
+            a.cmp_imm_w(9, 5);
+            a.b_cond(C_EQ, slow);
+            a.cmp_imm_w(10, 5);
+            a.b_cond(C_EQ, slow);
             let ga = a.new_label();
             a.cmp_imm_w(9, 6);
             a.b_cond(C_LO, ga);
@@ -10559,8 +10607,8 @@ fn emit_store_name_value(
     emit_exec_word_load(a, 10, 20, -8);
     // Release the old packed owner. Scalars need nothing; common refcounted values decrement
     // inline, while BigInt or a last owner uses the exact packed destructor. Traced
-    // ownership releases a String/Symbol/Object by overwriting it; BigInt and a lazy
-    // prototype still take the destructor.
+    // ownership releases every execution kind (BigInt included) by overwriting it; a lazy
+    // prototype still takes the destructor.
     a.ldur(16, 14, 0);
     a.lsr_imm(9, 16, 48);
     let old_ref = a.new_label();
@@ -10574,10 +10622,10 @@ fn emit_store_name_value(
         a.movz(13, (crate::value::PACK_OBJ >> 48) as u32, 0);
         a.cmp_reg_w(9, 13);
         a.b_cond(C_EQ, old_ref);
+        a.movz(13, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+        a.cmp_reg_w(9, 13);
+        a.b_cond(C_EQ, old_drop);
     }
-    a.movz(13, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-    a.cmp_reg_w(9, 13);
-    a.b_cond(C_EQ, old_drop);
     a.movz(13, (crate::value::PACK_LAZY_PROTO >> 48) as u32, 0);
     a.cmp_reg_w(9, 13);
     a.b_cond(C_EQ, old_drop);
@@ -10590,8 +10638,8 @@ fn emit_store_name_value(
         a.b(packed_commit);
     }
     a.bind(old_drop);
-    // A last owner, a BigInt, or a lazy prototype (an owning Rc that is not a value owner):
-    // this helper call is not only ownership work.
+    // A last owner, a BigInt (counted ownership), or a lazy prototype (an owning Rc that is
+    // not a value owner): this helper call is not only ownership work.
     drop_helper_call(a, H_DROP_PACKED_AT, Some((10, 14)), |a| a.mov(2, 14));
     a.bind(packed_commit);
     a.stur(10, 14, 0);
@@ -10601,7 +10649,7 @@ fn emit_store_name_value(
     // Wide scope binding: validate mutability. The incoming Value moves from the operand stack
     // into the binding, so it needs no refcount bump. A refcounted old value can be released
     // inline when another strong owner keeps its allocation alive; BigInt and last-reference
-    // drops retain the checked destructor path.
+    // drops retain the checked destructor path (counted ownership).
     a.bind(scope);
     a.ldrb_imm(
         9,
@@ -10630,14 +10678,17 @@ fn emit_store_name_value(
         a.b(done);
         a.bind(generic);
     }
-    emit_exec_kind(a, 8, 9, 11, slow);
-    a.ldurb(9, 14, 0);
-    a.cmp_imm_w(9, 5);
-    a.b_cond(C_EQ, slow);
-    // A traced old value is released by overwriting it: no count, no last owner.
+    // Counted ownership: the incoming word's decode precedes the old value's release, and a
+    // BigInt old value keeps its checked destructor. A traced old value is released by
+    // overwriting it (no count, no last owner, no BigInt exclusion), and the decode below
+    // precedes both stores.
     let old_scalar = a.new_label();
     let old_last_ref = a.new_label();
     if own.counted() {
+        emit_exec_kind(a, 8, 9, 11, slow);
+        a.ldurb(9, 14, 0);
+        a.cmp_imm_w(9, 5);
+        a.b_cond(C_EQ, slow);
         a.cmp_imm_w(9, 6);
         a.b_cond(C_LO, old_scalar);
         a.ldur(11, 14, 8);
@@ -10726,7 +10777,7 @@ fn emit_load_name_inline_marked(
     }
     // Validate the cache and leave a pointer to the resolved Value in x14 (either mode).
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
-    emit_load_name_value(a, layout, preferred_number, slow, for_call);
+    emit_load_name_value(a, layout, preferred_number, slow, for_call, false);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
@@ -10762,7 +10813,7 @@ fn emit_load_name_in_inline(
     } else {
         emit_name_ic_value_ptr_in(a, layout, slow, true, NameEnv::InX9);
     }
-    emit_load_name_value(a, layout, preferred_number, slow, for_call);
+    emit_load_name_value(a, layout, preferred_number, slow, for_call, false);
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
@@ -10770,6 +10821,9 @@ fn emit_load_name_in_inline(
 }
 
 /// Clone from a checked x14 value address into the canonical operand stack (x7=storage kind).
+/// `prototype_key`: a `LoadRef` whose Reference names `prototype`. Its packed holder can be a
+/// `with` object that is a function whose prototype is still deferred; the packed holder of a
+/// free-name read is the global object, never a function.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -10780,6 +10834,7 @@ fn emit_load_name_value(
     preferred_number: Option<u64>,
     slow: usize,
     for_call: bool,
+    prototype_key: bool,
 ) {
     // Lexical Binding.value stays wide; object properties already share execution encoding.
     let own = layout.ownership();
@@ -10788,15 +10843,20 @@ fn emit_load_name_value(
         let wide = a.new_label();
         a.cbz(7, false, wide);
         a.ldur(12, 14, 0);
-        if let Some(bits) = preferred_number {
-            let generic = a.new_label();
-            a.mov_imm64(16, bits);
-            a.cmp_reg_x(12, 16);
-            a.b_cond(C_NE, generic);
-            a.b(loaded); // exact known Number needs no ownership traffic
-            a.bind(generic);
+        if own.counted() {
+            if let Some(bits) = preferred_number {
+                let generic = a.new_label();
+                a.mov_imm64(16, bits);
+                a.cmp_reg_x(12, 16);
+                a.b_cond(C_NE, generic);
+                a.b(loaded); // exact known Number needs no ownership traffic
+                a.bind(generic);
+            }
+            // The owner guard also sends a deferred `prototype` to the checked operation.
+            exec_clone(a, own, 12, 13, 16, slow);
+        } else if prototype_key {
+            property_word_guard(a, 12, 13, slow);
         }
-        exec_clone(a, own, 12, 13, 16, slow);
         a.b(loaded);
         a.bind(wide);
         // The wide lexical binding of a closure variable usually holds a Number (a counter, a
@@ -11144,7 +11204,7 @@ impl SharedStub {
             SharedStub::NameLoad { for_call } => {
                 let miss = a.new_label();
                 emit_name_ic_value_ptr_body(a, layout, miss, true);
-                emit_load_name_value(a, layout, None, miss, for_call);
+                emit_load_name_value(a, layout, None, miss, for_call, false);
                 a.movz(9, 1, 0);
                 a.ret();
                 a.bind(miss);
@@ -12681,7 +12741,14 @@ fn emit_define_elem_inline(
     a.b_cond(C_NE, slow);
     emit_exec_word_load(a, 13, 20, -8);
     a.lsr_imm(14, 13, 48);
-    for tag in [crate::value::PACK_EMPTY, crate::value::PACK_LAZY_PROTO] {
+    // V is an operand word, which is never property-only: traced ownership checks the TDZ
+    // marker alone (the counted build keeps its defensive lazy-prototype check).
+    let tags: &[u64] = if own.counted() {
+        &[crate::value::PACK_EMPTY, crate::value::PACK_LAZY_PROTO]
+    } else {
+        &[crate::value::PACK_EMPTY]
+    };
+    for &tag in tags {
         a.mov_imm64(15, tag >> 48);
         a.cmp_reg_w(14, 15);
         a.b_cond(C_EQ, slow);
@@ -13292,13 +13359,17 @@ fn emit_local_own_dense_data_guard(
     a.bind(entry_ready);
     // PackedValue's Empty word is the deleted-slot marker, not a language value. BigInt
     // remains valid for ordinary Get but the existing native clone template deliberately
-    // uses its checked destructor path, so leave it to the original sequence too.
+    // uses its checked destructor path, so leave it to the original sequence too (counted
+    // ownership: the clone after both releases has no other fallback; traced, nothing is
+    // cloned).
     a.mov_imm64(14, crate::value::PACK_EMPTY);
     a.cmp_reg_x(12, 14);
     a.b_cond(C_EQ, slow);
-    emit_exec_kind(a, 12, 13, 14, slow);
-    a.cmp_imm_w(13, 5); // Value::BigInt's compact execution kind.
-    a.b_cond(C_EQ, slow);
+    if layout.ownership().counted() {
+        emit_exec_kind(a, 12, 13, 14, slow);
+        a.cmp_imm_w(13, 5); // Value::BigInt's compact execution kind.
+        a.b_cond(C_EQ, slow);
+    }
 }
 
 /// After the two TDZ releases, reconstruct the already-guarded descriptor address from
@@ -13370,7 +13441,7 @@ fn emit_local_assumed_dense_data_value(
 /// drop host closures, whose Rust destructors may use a foreign `Ctx` to mutate another live
 /// heap object. Refuse the fused path if either release could be final; if both slots own the
 /// same object, one additional owner beyond those two is required. Traced ownership destroys
-/// nothing at a clear: only the rejection of property-only tags remains, for both locals.
+/// nothing at a clear, and frame slots never hold a property-only word: emits nothing.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13382,21 +13453,14 @@ pub(super) fn emit_tdz_objects_nonfinal(
     second_off: u32,
     slow: usize,
 ) {
-    let first_not_object = a.new_label();
-    let done = a.new_label();
     let own = layout.ownership();
-    let object_tag = (crate::value::PACK_OBJ >> 48) as u32;
-
     if !own.counted() {
-        for off in [first_off, second_off] {
-            emit_exec_word_load(a, 9, 22, off as i32);
-            a.lsr_imm(13, 9, 48);
-            a.movz(14, object_tag, 0);
-            a.cmp_reg_x(13, 14);
-            a.b_cond(C_HI, slow); // reject property-only tags such as PACK_LAZY_PROTO.
-        }
         return;
     }
+    let first_not_object = a.new_label();
+    let done = a.new_label();
+    let object_tag = (crate::value::PACK_OBJ >> 48) as u32;
+
     emit_exec_word_load(a, 9, 22, first_off as i32);
     a.lsr_imm(13, 9, 48);
     a.movz(14, object_tag, 0);
@@ -14901,8 +14965,11 @@ fn emit_chain_marked(
                     }
                 }
                 let (dv, _) = vregs.pop().expect("chain vstack");
-                a.ldr_imm(9, 22, off);
-                exec_drop_shared(a, own, 9, 10, 11, guard!());
+                // Traced: the overwrite is the old word's release; no bail is needed.
+                if own.counted() {
+                    a.ldr_imm(9, 22, off);
+                    exec_drop_shared(a, own, 9, 10, 11, guard!());
+                }
                 emit_exec_number_store(a, dv, 22, off as i32, 9);
                 free.push(dv);
             }
@@ -16496,19 +16563,18 @@ fn emit_linked_scan_region(
 
     // Pin the old slot owners for one-time replacement.  Reject BigInt and any reference whose
     // decrement might invoke a destructor; the baseline path remains untouched on rejection.
-    // Traced ownership has no destructor to avoid: only the tag and BigInt guards remain.
+    // Traced ownership has no destructor to avoid: only the Object tag guard on `next`, the
+    // walk's first node, remains; the old `peek` word is simply overwritten.
     a.ldr_imm(9, 22, plan.next_off);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, plain_h);
     emit_exec_payload(a, 9, 3);
     rc_guard_nonfinal(a, own, 3, 9, 1, plain_h);
-    a.ldr_imm(9, 22, plan.peek_off);
-    emit_exec_kind(a, 9, 4, 10, plain_h);
     if own.counted() {
+        a.ldr_imm(9, 22, plan.peek_off);
+        emit_exec_kind(a, 9, 4, 10, plain_h);
         emit_exec_payload(a, 9, 5);
-    }
-    a.cmp_imm_w(4, 5);
-    a.b_cond(C_EQ, plain_h); // BigInt has a different ownership representation
-    if own.counted() {
+        a.cmp_imm_w(4, 5);
+        a.b_cond(C_EQ, plain_h); // BigInt has a different ownership representation
         let peek_safe = a.new_label();
         a.cmp_imm_w(4, 6);
         a.b_cond(C_LO, peek_safe);
@@ -16710,8 +16776,8 @@ fn emit_loop_chain(
         }
     }
     for s in &plan.slots {
-        if s.virgin {
-            // The old value must be drop-free so flushes can plain-overwrite.
+        // The old value must be drop-free so flushes can plain-overwrite. Traced: every word is.
+        if s.virgin && own.counted() {
             a.ldr_imm(9, 22, s.off);
             emit_exec_kind(a, 9, 10, 11, pre_fail);
             a.cmp_imm_w(10, 5);
@@ -17576,8 +17642,11 @@ fn emit_loop_chain(
                             },
                             SlotRes::None => {
                                 let dv = to_d!(v);
-                                a.ldr_imm(9, 22, off);
-                                exec_drop_shared(a, own, 9, 10, 11, guard!());
+                                // Traced: the overwrite is the old word's release.
+                                if own.counted() {
+                                    a.ldr_imm(9, 22, off);
+                                    exec_drop_shared(a, own, 9, 10, 11, guard!());
+                                }
                                 emit_exec_number_store(a, dv, 22, off as i32, 9);
                                 dead.push(LV::D(dv, false));
                             }

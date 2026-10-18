@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::value::{
-    PACK_BIGINT, PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_STR, PACK_SYM,
-    PACK_UNDEFINED,
+    PACK_BIGINT, PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_LAZY_PROTO, PACK_NULL, PACK_OBJ,
+    PACK_STR, PACK_SYM, PACK_UNDEFINED,
 };
 
 /// Decode the semantic discriminant (wide Value ABI 0..=8) without acquiring an
@@ -129,6 +129,24 @@ pub(super) fn emit_exec_tag_guard(a: &mut asm::Asm, raw: u32, tag: u64, scratch:
     a.logic_x(2, scratch, raw, scratch);
     a.lsr_imm(scratch, scratch, 48);
     a.cbnz(scratch, true, fail);
+}
+
+/// Branch to `slow` if `raw`, a word just read from a property, has a tag above PACK_OBJ: a
+/// property-only word (a function's deferred `prototype`, PACK_LAZY_PROTO), which must not
+/// become an execution word. The site's checked operation reads the property in Rust, which
+/// materializes the prototype and leaves an ordinary Object word in the property. This is a
+/// materialization boundary, not ownership: a site emits it where traced ownership clones no
+/// owner (and so routes no tag) and the property read can be keyed "prototype". Every other
+/// word (scalars, BigInt, String, Symbol, Object) falls through with its payload unread. Raw
+/// is preserved; scratch and NZCV are clobbered.
+pub(super) fn property_word_guard(a: &mut asm::Asm, raw: u32, scratch: u32, slow: usize) {
+    assert_ne!(raw, scratch);
+    // One unsigned compare: PACK_LAZY_PROTO's tag is the first above Object's, so every word
+    // with a higher tag is at least PACK_LAZY_PROTO and every other word is below it.
+    const _: () = assert!(PACK_LAZY_PROTO == PACK_OBJ + (1 << 48));
+    a.mov_imm64(scratch, PACK_LAZY_PROTO);
+    a.cmp_reg_x(raw, scratch);
+    a.b_cond(C_HS, slow);
 }
 
 /// Extract a borrowed 48-bit heap payload; raw==dst is allowed, flags are preserved.

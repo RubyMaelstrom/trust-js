@@ -151,15 +151,18 @@ pub(super) fn emit(
         }
         Op::Dup if fast & 64 != 0 && rc_ok => {
             // Copy the top value; refcounted payloads bump inline, BigInt takes the helper.
+            // Traced words are copied as they are: only the owner guard reached the helper.
             let slow = a.new_label();
             let done = a.new_label();
             emit_exec_word_load(a, 9, 20, -8);
             exec_clone(a, own, 9, 10, 11, slow);
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
+            if own.counted() {
+                a.b(done);
+                a.bind(slow);
+                emit_exec(a, pc as u32, unwind);
+            }
             a.bind(done);
         }
         Op::LoadThis if fast & 32768 != 0 && rc_ok => {

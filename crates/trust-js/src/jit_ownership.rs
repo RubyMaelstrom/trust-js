@@ -21,14 +21,14 @@
 //!
 //! Every emitter that takes a [`JitOwnership`] has a `Traced` arm: the gc-heap build, whose
 //! values carry no count. The collector traces the cells reachable from the words generated
-//! code stores, so acquiring or releasing an owner emits no instruction there. What a `Traced`
-//! arm keeps is the tag routing that exists for other reasons: [`exec_owner_guard`] still sends
-//! BigInt (whose checked path is kept), property-only and unknown tags to the checked path,
-//! since a lazy prototype owns an `Rc` in both builds, and a word release still runs
-//! `H_DROP_PACKED_AT` on those. Count guards never branch, so a site's slow path is reached
-//! only through its other guards. Count-only logic that sites keep beside these emitters (alias
-//! compares, old-value markers, the direct call's surplus counter) is emitted only while owners
-//! are counted ([`JitOwnership::counted`]).
+//! code stores, so acquiring or releasing an owner emits no instruction there, and an execution
+//! word owns nothing: every `Traced` arm below emits nothing, the execution-word clone, drop and
+//! release included, so none branches to a site's slow path. Logic that sites keep beside these
+//! emitters only for counted owners (alias compares, old-value markers, the direct call's
+//! surplus counter, BigInt exclusions, a checked path or load that only an owner guard used) is
+//! emitted only while owners are counted ([`JitOwnership::counted`]). A property word that can
+//! be a function's deferred `prototype` is kept out of execution by [`property_word_guard`]: a
+//! materialization boundary, not ownership.
 
 use super::*;
 use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
@@ -41,7 +41,8 @@ use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
 /// representation, otherwise leave scalar owners alone. Both scratch registers and NZCV
 /// are clobbered, raw is untouched. Execution storage never contains lazy prototypes, but a
 /// property word can: PACK_LAZY_PROTO and every other property-only or unknown tag go to
-/// `slow` without inspecting the payload, which the clones of property words rely on.
+/// `slow` without inspecting the payload, which the counted clones of property words rely on.
+/// Counted ownership only: the `Refcount` arms below emit it.
 pub(super) fn exec_owner_guard(
     a: &mut asm::Asm,
     raw: u32,
@@ -76,8 +77,9 @@ pub(super) fn exec_owner_guard(
 
 /// Acquire one owner of raw. Guards precede all changes; slow must clone via the checked
 /// operation. Preserve raw, clobber exactly ptr/count/NZCV. The word itself is not stored.
-/// Traced: the owner guard alone (BigInt, property-only and unknown tags to `slow`); a heap kind
-/// or scalar falls through with nothing acquired. Same clobbers.
+/// Traced: emits nothing (an execution word owns nothing, so there is nothing to acquire and
+/// `slow` is never taken). A site that clones a property word which can be a function's
+/// deferred `prototype` emits [`property_word_guard`] in its place.
 pub(super) fn exec_clone(
     a: &mut asm::Asm,
     own: JitOwnership,
@@ -86,22 +88,22 @@ pub(super) fn exec_clone(
     count: u32,
     slow: usize,
 ) {
+    if !own.counted() {
+        return;
+    }
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
     a.bind(heap);
-    if own.counted() {
-        emit_exec_payload(a, raw, ptr);
-        rc_inc(a, own, ptr, count, 1);
-    }
+    emit_exec_payload(a, raw, ptr);
+    rc_inc(a, own, ptr, count, 1);
     a.bind(done);
 }
 
 /// Release one non-final owner. BigInt and last references branch before any decrement;
 /// the checked path must run the real destructor. Raw and its physical word are unchanged
 /// so the caller can retire/replace the slot only after success. ptr/count/NZCV clobbered.
-/// Traced: the owner guard alone (BigInt, property-only and unknown tags to `slow`); a heap kind
-/// or scalar falls through with nothing released. Same clobbers.
+/// Traced: emits nothing (dropping the word is its release; `slow` is never taken).
 pub(super) fn exec_drop_shared(
     a: &mut asm::Asm,
     own: JitOwnership,
@@ -110,14 +112,15 @@ pub(super) fn exec_drop_shared(
     count: u32,
     slow: usize,
 ) {
+    if !own.counted() {
+        return;
+    }
     let heap = a.new_label();
     let done = a.new_label();
     exec_owner_guard(a, raw, ptr, count, heap, done, slow);
     a.bind(heap);
-    if own.counted() {
-        emit_exec_payload(a, raw, ptr);
-        rc_release_shared(a, own, ptr, count, slow);
-    }
+    emit_exec_payload(a, raw, ptr);
+    rc_release_shared(a, own, ptr, count, slow);
     a.bind(done);
 }
 
@@ -126,15 +129,22 @@ pub(super) fn exec_drop_shared(
 /// needs its destructor goes to `H_DROP_PACKED_AT`, which runs only Rust destruction (no author
 /// code, allocation of JS values, or unwinding). The word is left moved-from: the caller must
 /// overwrite or pop it. Scratch x9..x11; the helper path clobbers x0..x17 (the frame registers
-/// x19..x22 are preserved). Traced: heap kinds and scalars need nothing; BigInt, property-only
-/// and unknown tags still take `H_DROP_PACKED_AT` (see [`exec_drop_shared`]).
+/// x19..x22 are preserved). Traced: emits nothing, not even the load (overwriting or popping
+/// the word is its release).
 pub(super) fn exec_release_word(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
+    if !own.counted() {
+        return;
+    }
     emit_exec_word_load(a, 9, base, off);
     exec_release_loaded(a, own, base, off);
 }
 
-/// [`exec_release_word`] after its load: x9 already holds the word at `[base + off]`.
+/// [`exec_release_word`] after its load: x9 already holds the word at `[base + off]`. Traced:
+/// emits nothing.
 pub(super) fn exec_release_loaded(a: &mut asm::Asm, own: JitOwnership, base: u32, off: i32) {
+    if !own.counted() {
+        return;
+    }
     let release = a.new_label();
     let done = a.new_label();
     exec_drop_shared(a, own, 9, 10, 11, release);

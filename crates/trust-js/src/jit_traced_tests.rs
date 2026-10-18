@@ -452,9 +452,12 @@ fn maps_and_sets_take_the_ordinary_object_paths() {
     assert_eq!(paths, [50 * 6, 0, 0], "Collection receivers hit natively");
 }
 
-/// The `Traced` arms of the count emitters and the frame teardown emit nothing.
+/// The `Traced` arm of every ownership emitter that takes a [`super::JitOwnership`] emits
+/// nothing: the count emitters, the execution-word clone, shared drop and releases (whose
+/// owner guard is counted-only, so no tag reaches a checked path through them), and the frame
+/// teardown.
 #[test]
-fn traced_count_emitters_emit_nothing() {
+fn traced_ownership_emitters_emit_nothing() {
     use super::JitOwnership::Traced;
     use super::*;
     let mut a = asm::Asm::new();
@@ -468,54 +471,58 @@ fn traced_count_emitters_emit_nothing() {
     rc_dec_nonfinal_scaled(&mut a, Traced, 1, 2);
     rc_release_shared(&mut a, Traced, 1, 2, label);
     rc_release_unless_last(&mut a, Traced, 1, 2, label);
+    exec_clone(&mut a, Traced, 0, 2, 3, label);
+    exec_drop_shared(&mut a, Traced, 0, 2, 3, label);
+    exec_release_word(&mut a, Traced, 20, -8);
+    exec_release_word(&mut a, Traced, 22, 16);
+    exec_release_loaded(&mut a, Traced, 22, 16);
     frame_surplus_release(&mut a, Traced);
     frame_callee_release(&mut a, Traced, 3);
     frame_this_release(&mut a, Traced, 64);
     frame_slots_release(&mut a, Traced, 64, 72);
     assert!(a.buf.is_empty(), "{} words emitted", a.buf.len());
+    assert!(!a.label_referenced(label), "a Traced arm branches");
 }
 
-/// Traced clone and shared drop keep the owner guard alone: every scalar and every String,
-/// Symbol or Object word passes without its payload being read; BigInt, lazy prototypes and
-/// every other tag above Object take the checked path. The word itself is preserved.
+/// The property-word guard is three instructions and sends exactly the words whose tag is above
+/// Object (PACK_LAZY_PROTO, a function's deferred `prototype`, and every other property-only or
+/// unknown tag) to the slow path, over all 65,536 tags, each with a null and a wild payload:
+/// no payload is read. The word is preserved on both paths.
 #[test]
-fn traced_owner_operations_route_only_bigint_and_property_tags() {
+fn property_word_guard_routes_exactly_the_tags_above_object() {
     use super::*;
-    use crate::value::{PACK_BIGINT, PACK_OBJ, PACK_STR, PACK_SYM};
-    for clone in [true, false] {
-        let mut a = asm::Asm::new();
-        let slow = a.new_label();
-        if clone {
-            exec_clone(&mut a, JitOwnership::Traced, 0, 2, 3, slow);
-        } else {
-            exec_drop_shared(&mut a, JitOwnership::Traced, 0, 2, 3, slow);
-        }
-        a.str_imm(0, 1, 0);
-        a.movz(0, 1, 0);
-        a.ret();
-        a.bind(slow);
-        a.movz(0, 0, 0);
-        a.ret();
-        let bytes: Vec<u8> = a.finish().into_iter().flat_map(u32::to_le_bytes).collect();
-        let code = ExecutableBuffer::from_bytes(&bytes).unwrap();
-        let run: unsafe extern "C" fn(u64, *mut u64) -> u64 =
-            unsafe { std::mem::transmute(code.as_ptr()) };
-        for high in 0..=u16::MAX as u64 {
-            let tag = high << 48;
-            // A null or wild payload: a passing word must not be dereferenced.
-            for payload in [0u64, 0x0000_dead_beef_0008] {
-                let raw = tag | payload;
-                let mut output = !raw;
-                let passed = unsafe { run(raw, &mut output) } == 1;
-                let expected = !(tag == PACK_BIGINT || tag > PACK_OBJ);
-                assert_eq!(passed, expected, "clone={clone} {raw:016x}");
-                assert_eq!(output, if passed { raw } else { !raw });
-            }
-        }
-        // The heap kinds pass like scalars.
-        for tag in [PACK_STR, PACK_SYM, PACK_OBJ] {
-            let mut output = 0;
-            assert_eq!(unsafe { run(tag | 8, &mut output) }, 1);
+    use crate::value::{PACK_BIGINT, PACK_LAZY_PROTO, PACK_OBJ, PACK_STR, PACK_SYM};
+    let mut a = asm::Asm::new();
+    let slow = a.new_label();
+    property_word_guard(&mut a, 0, 2, slow);
+    assert_eq!(a.buf.len(), 3, "property-word guard size");
+    a.str_imm(0, 1, 0);
+    a.movz(0, 1, 0);
+    a.ret();
+    a.bind(slow);
+    a.str_imm(0, 1, 0);
+    a.movz(0, 0, 0);
+    a.ret();
+    let bytes: Vec<u8> = a.finish().into_iter().flat_map(u32::to_le_bytes).collect();
+    let code = ExecutableBuffer::from_bytes(&bytes).unwrap();
+    let run: unsafe extern "C" fn(u64, *mut u64) -> u64 =
+        unsafe { std::mem::transmute(code.as_ptr()) };
+    for high in 0..=u16::MAX as u64 {
+        let tag = high << 48;
+        // A null or wild payload: no word's payload may be dereferenced.
+        for payload in [0u64, 0x0000_dead_beef_0008] {
+            let raw = tag | payload;
+            let mut output = !raw;
+            let passed = unsafe { run(raw, &mut output) } == 1;
+            assert_eq!(passed, tag <= PACK_OBJ, "{raw:016x}");
+            assert_eq!(output, raw, "{raw:016x} preserved");
         }
     }
+    // Every execution kind passes, BigInt included; the deferred prototype does not.
+    for tag in [PACK_BIGINT, PACK_STR, PACK_SYM, PACK_OBJ] {
+        let mut output = 0;
+        assert_eq!(unsafe { run(tag | 8, &mut output) }, 1);
+    }
+    let mut output = 0;
+    assert_eq!(unsafe { run(PACK_LAZY_PROTO | 8, &mut output) }, 0);
 }

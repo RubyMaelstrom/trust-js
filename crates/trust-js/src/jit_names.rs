@@ -244,6 +244,23 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.bind(done);
 }
 
+/// Whether the Reference `reference` read at `pc` can name `prototype`, the one key whose value
+/// can be a function's deferred prototype. The compiler gives every `ResolveNameRef` a fresh
+/// Reference, emitted before the Reference's uses, so the nearest one before `pc` names it; a
+/// Reference whose `ResolveNameRef` is not found is treated as if it could.
+fn reference_may_name_prototype(chunk: &Chunk, pc: usize, reference: u16) -> bool {
+    chunk.jit_ops()[..pc]
+        .iter()
+        .rev()
+        .find_map(|op| match *op {
+            crate::bytecode::Op::ResolveNameRef(name, resolved) if resolved == reference => {
+                Some(chunk.jit_name(name) == "prototype")
+            }
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
 /// Whole-operation native Reference template. All proof/owner guards precede mutation. The
 /// canonical slot owns the base/name across RHS effects; no hint miss restarts resolution.
 pub(super) fn emit_reference_op(
@@ -334,7 +351,8 @@ pub(super) fn emit_reference_op(
         Op::LoadRef(_) => {
             emit_reference_target_ptr(a, layout, slow);
             emit_target_value_ptr(a, layout, slow);
-            emit_load_name_value(a, layout, None, slow, false);
+            let prototype_key = reference_may_name_prototype(chunk, pc as usize, reference);
+            emit_load_name_value(a, layout, None, slow, false, prototype_key);
             a.b(fast_done);
         }
         Op::StoreRef(_) => {

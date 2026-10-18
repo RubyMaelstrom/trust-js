@@ -35,11 +35,24 @@ thread_local! {
     static PROPERTY_PATHS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
 }
 
-/// Property paths recorded so far on this thread (see `PROPERTY_PATHS`; gc-heap tests only, the
-/// default build's tests read the counter directly).
-#[cfg(all(test, feature = "gc-heap"))]
+/// Property paths recorded so far on this thread (see `PROPERTY_PATHS`; tests only).
+#[cfg(test)]
 pub(super) fn property_paths() -> [u64; 7] {
     PROPERTY_PATHS.with(std::cell::Cell::get)
+}
+
+/// Borrowed own reads, receiver-guard reuses and whole-load value CSEs executed so far on this
+/// thread (see `BORROWED_READS`; tests only).
+#[cfg(test)]
+pub(super) fn borrowed_reads() -> (u64, u64, u64) {
+    BORROWED_READS.with(std::cell::Cell::get)
+}
+
+/// Guarded-region events recorded so far on this thread (see `GUARDED_REGIONS`; event 3 is a
+/// borrowed method read that passed its guards; tests only).
+#[cfg(test)]
+pub(super) fn guarded_regions() -> [u64; 4] {
+    GUARDED_REGIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1019,9 +1032,10 @@ struct ScalarState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operand {
     Canonical,
-    /// Non-owning view of a tagged home. LoadLocal rejects Empty/BigInt before
-    /// creating this view. Every effect or control-flow edge clones it into a
-    /// canonical owner before any source local can be replaced or observed by GC.
+    /// Non-owning view of a tagged home. LoadLocal rejects Empty (and, under counted
+    /// ownership, BigInt) before creating this view. Every effect or control-flow edge
+    /// clones it into a canonical owner before any source local can be replaced or observed
+    /// by GC.
     Borrowed(u32),
     /// A live data-property value, rooted by a canonical receiver and its data
     /// descriptor until the next effect. Unlike a home, this uses its own stack
@@ -1250,9 +1264,15 @@ fn materialize(
                     _ => reg,
                 };
                 a.fmov_x_d(9, source);
-                // The originating read guard excludes BigInt, Empty and all
-                // property-only tags such as lazy function prototypes.
-                // All remaining compact frame kinds are immediate or shared Rc.
+                // This clone has no checked fallback: its slow label is the fall-through.
+                // The word is a tagged home's (a frame slot: execution storage, never a
+                // property-only word) or a borrowed data-property read's (an own read or a
+                // method read). Counted ownership: the originating read guard excludes
+                // BigInt, Empty and every tag above Object, so what remains is immediate or
+                // a shared Rc. Traced: the clone emits nothing, and a property-only word,
+                // which exists only as a function's deferred `prototype`, cannot arrive: the
+                // borrowed reads keyed "prototype" take the property-word guard, and no
+                // other key holds one.
                 // Clone cannot call author code, allocate, or invalidate another
                 // virtual register; the canonical local continues to own the source.
                 let cloned = a.new_label();
@@ -1411,15 +1431,18 @@ impl OwnReadFacts {
 
 /// Borrow an ordinary own data value without touching its reference count. All
 /// guards fail at the original Get PC, before any observable operation commits.
-/// Accessors, exotics, inherited properties, BigInts and lazy-prototype sentinels
-/// keep the complete existing checked templates. Reload the *live* property even
-/// when a preceding read proved the receiver's type/shape.
+/// Accessors, exotics, inherited properties and lazy-prototype sentinels keep the
+/// complete existing checked templates, as do BigInts under counted ownership.
+/// Reload the *live* property even when a preceding read proved the receiver's
+/// type/shape. `prototype_key`: the site reads `prototype`, the one key whose value
+/// can be a function's deferred prototype (traced ownership guards only that key).
 fn emit_borrowed_own_read(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     receiver: PropRecv,
     cache: usize,
     previous_cache: Option<usize>,
+    prototype_key: bool,
     output: u32,
     fail: usize,
 ) {
@@ -1482,18 +1505,7 @@ fn emit_borrowed_own_read(
     // encode (key, PropClass) per slot, so (shape, slot) proves this entry
     // is a data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
-    a.lsr_imm(9, 12, 48);
-    for tag in [crate::value::PACK_BIGINT, crate::value::PACK_EMPTY] {
-        a.movz(14, (tag >> 48) as u32, 0);
-        a.cmp_reg_w(9, 14);
-        a.b_cond(C_EQ, fail);
-    }
-    // Negative tagged words above Obj are property-only internal values, not
-    // cloneable execution words. Ordinary numbers (including -NaN canonicalized
-    // on heap stores) and every public compact kind remain eligible.
-    a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_w(9, 14);
-    a.b_cond(C_HI, fail);
+    emit_borrowed_word_guard(a, layout, prototype_key, fail);
     a.fmov_d_x(output, 12);
     #[cfg(test)]
     {
@@ -1539,12 +1551,14 @@ fn borrowed_own_state(chunk: &Chunk, op: &Op) -> Option<crate::bytecode::IcState
 /// Every prototype pointer is followed again, not pinned from the feedback. No getter,
 /// allocation, helper or owner overwrite occurs between this read and its materialization.
 /// Consequently the canonical receiver also retains the holder through its live chain.
+/// `prototype_key`: the method's name is `prototype` (see [`emit_borrowed_own_read`]).
 fn emit_borrowed_method(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     state: crate::bytecode::IcState,
     stack: &[Operand],
     physical: usize,
+    prototype_key: bool,
     fail: usize,
 ) {
     let depth = stack.len();
@@ -1588,18 +1602,45 @@ fn emit_borrowed_method(
     // shapes encode (key, PropClass) per slot, so (shape, slot) proves a
     // data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
+    emit_borrowed_word_guard(a, layout, prototype_key, fail);
+    a.fmov_d_x(16 + depth as u32, 12);
+    #[cfg(test)]
+    emit_guarded_event(a, 3);
+}
+
+/// Admit the data-property word a borrowed read loaded into x12 as a borrowed operand, or
+/// branch to `fail`. Empty (a deleted slot's marker, not a language value) always fails.
+/// Counted ownership: so do BigInt and every tag above Object, since [`materialize`] clones the
+/// operand without a checked fallback. Traced: nothing is cloned, so a BigInt passes; only a read
+/// keyed `prototype` (`prototype_key`) can see a property-only word (a function's deferred
+/// prototype), which [`property_word_guard`] sends to `fail`. Clobbers x9, x14 and NZCV.
+fn emit_borrowed_word_guard(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    prototype_key: bool,
+    fail: usize,
+) {
     a.lsr_imm(9, 12, 48);
+    if !layout.ownership().counted() {
+        a.movz(14, (crate::value::PACK_EMPTY >> 48) as u32, 0);
+        a.cmp_reg_w(9, 14);
+        a.b_cond(C_EQ, fail);
+        if prototype_key {
+            property_word_guard(a, 12, 14, fail);
+        }
+        return;
+    }
     for tag in [crate::value::PACK_BIGINT, crate::value::PACK_EMPTY] {
         a.movz(14, (tag >> 48) as u32, 0);
         a.cmp_reg_w(9, 14);
         a.b_cond(C_EQ, fail);
     }
+    // Negative tagged words above Obj are property-only internal values, not
+    // cloneable execution words. Ordinary numbers (including -NaN canonicalized
+    // on heap stores) and every public compact kind remain eligible.
     a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
     a.cmp_reg_w(9, 14);
     a.b_cond(C_HI, fail);
-    a.fmov_d_x(16 + depth as u32, 12);
-    #[cfg(test)]
-    emit_guarded_event(a, 3);
 }
 
 /// ECMA-262 ToInt32/ToUint32 and NumberBitwiseOp (local snapshot e28783d5):
@@ -1659,8 +1700,12 @@ fn region_mark(op: &Op) -> &'static str {
 
 /// Branch to `fail` unless the frame slot at `offset` owns nothing: its word is a Number or one
 /// of the immediate kinds (undefined, empty, null, Boolean), never a BigInt, String, Symbol or
-/// Object reference whose release a plain overwrite would skip.
-fn emit_slot_owns_nothing(a: &mut asm::Asm, offset: i32, fail: usize) {
+/// Object reference whose release a plain overwrite would skip. Traced: every frame word owns
+/// nothing (a plain overwrite is its release), so this emits nothing.
+fn emit_slot_owns_nothing(a: &mut asm::Asm, own: JitOwnership, offset: i32, fail: usize) {
+    if !own.counted() {
+        return;
+    }
     emit_exec_word_load(a, 9, 22, offset);
     a.lsr_imm(10, 9, 48);
     a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
@@ -2225,7 +2270,7 @@ fn emit_name_element_fallback(
     a.b(common);
     a.bind(f.value_miss);
     prefix(a);
-    emit_load_name_value(a, layout, f.preferred, full, false);
+    emit_load_name_value(a, layout, f.preferred, full, false, false);
     a.bind(common);
     a.add_imm(20, 20, 8 * (1 + u32::from(f.set)));
     if f.set {
@@ -2522,9 +2567,12 @@ pub(super) fn emit(
                 // The helper on a last-owner packed drop may clobber every caller-saved
                 // register. No borrowed descriptor or object pointer may survive either
                 // ordered release; the rooted receiver and preserved numeric key are
-                // reloaded only after both TDZ stores below.
-                for register in 9..=17 {
-                    a.movz(register, 0, 0);
+                // reloaded only after both TDZ stores below. Traced ownership releases
+                // nothing (the stores alone clear the slots), so no helper runs here.
+                if layout.ownership().counted() {
+                    for register in 9..=17 {
+                        a.movz(register, 0, 0);
+                    }
                 }
                 for slot in [pattern.value, pattern.mapped] {
                     let offset = slot as i32 * 8;
@@ -3017,7 +3065,7 @@ pub(super) fn emit(
                     // return or throw template, including pending finally/iterator semantics.
                     a.b(bailout);
                 }
-                Op::GetMethod(_, cache)
+                Op::GetMethod(name, cache)
                     if fast & 256 != 0
                         && get_prop_inlinable(layout)
                         && plan.borrowed_methods.contains(&pc)
@@ -3030,6 +3078,7 @@ pub(super) fn emit(
                         borrowed_method_state(chunk, cache).unwrap(),
                         &stack,
                         physical,
+                        chunk.jit_name(name) == "prototype",
                         bailout,
                     );
                     // The method word is a new BorrowedValue producer: no CSE
@@ -3087,6 +3136,7 @@ pub(super) fn emit(
                             receiver,
                             cache,
                             previous,
+                            chunk.jit_name(name) == "prototype",
                             16 + depth as u32,
                             bailout,
                         );
@@ -3161,16 +3211,20 @@ pub(super) fn emit(
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(10, 9);
                     a.b_cond(C_EQ, bailout);
-                    a.lsr_imm(9, 10, 48);
-                    a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 11);
-                    a.b_cond(C_EQ, bailout);
+                    // Counted ownership: `materialize` has no checked clone for a BigInt.
+                    if layout.ownership().counted() {
+                        a.lsr_imm(9, 10, 48);
+                        a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
+                        a.cmp_reg_x(9, 11);
+                        a.b_cond(C_EQ, bailout);
+                    }
                     stack.push(Operand::Borrowed(home));
                 }
                 Op::LoadLocal(slot) if slot < 256 => {
                     // Make the local's one canonical stack owner without a helper. No author
-                    // code executes, so numeric homes need no spill/reload. BigInt cloning
-                    // and TDZ errors retain the exact original-op fallback.
+                    // code executes, so numeric homes need no spill/reload. TDZ errors (and,
+                    // under counted ownership, BigInt cloning) retain the exact original-op
+                    // fallback.
                     let off = slot as i32 * 8;
                     emit_exec_word_load(a, 10, 22, off);
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
@@ -3208,13 +3262,13 @@ pub(super) fn emit(
                         && stack[depth - 1].numeric() =>
                 {
                     // A Number into a frame slot that is not a numeric home. The old word owns
-                    // nothing (a slot holding a reference leaves the region instead), so the
-                    // store is a plain overwrite; no author code runs, and the slot's own-read
-                    // facts end here.
+                    // nothing (counted ownership: a slot holding a reference leaves the region
+                    // instead), so the store is a plain overwrite; no author code runs, and the
+                    // slot's own-read facts end here.
                     saved_work += 3;
                     own_facts.clear();
                     number(a, &mut stack, physical, depth - 1, bailout);
-                    emit_slot_owns_nothing(a, slot as i32 * 8, bailout);
+                    emit_slot_owns_nothing(a, layout.ownership(), slot as i32 * 8, bailout);
                     emit_exec_number_store(a, 15 + depth as u32, 22, slot as i32 * 8, 9);
                     stack.pop();
                     numeric_locals.insert(slot);
@@ -3738,16 +3792,23 @@ pub(super) fn emit(
 /// ToBoolean followed by consuming the canonical owner. The peek emitter preserves w1;
 /// shared-owner dropping only uses x9..x11/NZCV. The rare last-owner/BigInt fallback
 /// repeats only ToBoolean (never author code), before any ownership mutation commits.
+/// Traced ownership drops by popping, so it has no fallback.
 fn emit_pop_cond(a: &mut asm::Asm, layout: &crate::value::JitLayout, unwind: usize) {
+    let own = layout.ownership();
     let slow = a.new_label();
     let done = a.new_label();
     emit_peek_cond_inline(a, layout, false, unwind);
-    emit_exec_word_load(a, 9, 20, -8);
-    exec_drop_shared(a, layout.ownership(), 9, 10, 11, slow);
+    // Traced: popping the word is its release; only the owner guard reached the fallback.
+    if own.counted() {
+        emit_exec_word_load(a, 9, 20, -8);
+        exec_drop_shared(a, own, 9, 10, 11, slow);
+    }
     a.sub_imm(20, 20, 8);
-    a.b(done);
-    a.bind(slow);
-    emit_cond(a, COND_POP_TRUTHY, unwind);
+    if own.counted() {
+        a.b(done);
+        a.bind(slow);
+        emit_cond(a, COND_POP_TRUTHY, unwind);
+    }
     a.bind(done);
 }
 
@@ -4010,9 +4071,14 @@ fn emit_effect(
             a.sub_imm(20, 20, 8);
         }
         Op::Pop | Op::Dup if fast & 64 != 0 => {
+            // Traced: the words are popped or copied as they are; only the owner guard reached
+            // the checked operation.
+            let counted = layout.ownership().counted();
             let slow = a.new_label();
             let done = a.new_label();
-            emit_exec_word_load(a, 9, 20, -8);
+            if counted || matches!(op, Op::Dup) {
+                emit_exec_word_load(a, 9, 20, -8);
+            }
             if matches!(op, Op::Pop) {
                 exec_drop_shared(a, layout.ownership(), 9, 10, 11, slow);
                 a.sub_imm(20, 20, 8);
@@ -4021,9 +4087,11 @@ fn emit_effect(
                 emit_exec_word_store(a, 9, 20, 0);
                 a.add_imm(20, 20, 8);
             }
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc_u32, unwind);
+            if counted {
+                a.b(done);
+                a.bind(slow);
+                emit_exec(a, pc_u32, unwind);
+            }
             a.bind(done);
         }
         Op::Not if fast & 131072 != 0 && eq_inlinable(layout) => {
