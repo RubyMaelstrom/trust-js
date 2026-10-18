@@ -348,6 +348,7 @@ impl PackedValue {
         T::clone(&value)
     }
 
+    #[cfg(not(feature = "gc-heap"))]
     unsafe fn drop_word<T>(&mut self) {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<usize>());
         let word = (self.0.get() & PACK_PAYLOAD) as usize;
@@ -447,6 +448,21 @@ impl PackedValue {
         }
     }
 
+    /// Copy a property's word out of its property: a deferred prototype materializes, and this
+    /// word is promoted in place to the prototype's object word (as `unpack` does); any other
+    /// word is cloned. Every copy of a word that can be a property's (a descriptor snapshot, a
+    /// read into execution storage) goes through here: a deferred prototype is a property-only
+    /// word that lives only in its function's `prototype` slot, and a plain copy could carry it
+    /// into execution or under another key. The default build's `Clone` materializes too.
+    #[inline]
+    pub(crate) fn clone_materialized(&self) -> PackedValue {
+        #[cfg(feature = "gc-heap")]
+        if self.tag() == PACK_LAZY_PROTO {
+            return PackedValue::pack(self.unpack());
+        }
+        self.clone()
+    }
+
     /// Consume the packed owner without a refcount round trip. Pointer payload bits become the
     /// returned `Value`'s ownership; `ManuallyDrop` prevents this container from releasing them.
     #[inline]
@@ -475,16 +491,20 @@ impl PackedValue {
     }
 
     /// Clone one packed owner out of raw frame storage into a wide execution value.
+    #[cfg(not(feature = "gc-heap"))]
     pub(crate) unsafe fn clone_raw(word: *const u64) -> Value {
         unsafe { &*(word as *const PackedValue) }.unpack()
     }
 
     /// Replace one packed owner with a moved wide value and drop the previous owner.
+    #[cfg_attr(feature = "gc-heap", allow(dead_code))] // the default build's string-add retire
     pub(crate) unsafe fn replace_raw(word: *mut u64, value: Value) {
         unsafe { &*(word as *const PackedValue) }.replace_value(value);
     }
 }
 
+/// Default build: a word owns its payload's reference, and a clone retains it.
+#[cfg(not(feature = "gc-heap"))]
 impl Clone for PackedValue {
     #[inline]
     fn clone(&self) -> Self {
@@ -495,14 +515,8 @@ impl Clone for PackedValue {
         // here rather than accidentally admitting a thunk into execution storage.
         unsafe {
             match self.tag() {
-                // A BigInt cell (gc-heap) needs no retain.
-                #[cfg(not(feature = "gc-heap"))]
                 PACK_BIGINT => std::mem::forget(self.clone_word::<crate::bigint::JsBigInt>()),
-                // A string cell (gc-heap) needs no retain.
-                #[cfg(not(feature = "gc-heap"))]
                 PACK_STR => std::mem::forget(self.clone_word::<crate::lstr::LStr>()),
-                // A Symbol cell (gc-heap) needs no retain.
-                #[cfg(not(feature = "gc-heap"))]
                 PACK_SYM => std::mem::forget(self.clone_word::<SymbolRef>()),
                 PACK_OBJ => std::mem::forget(self.clone_word::<Gc>()),
                 PACK_LAZY_PROTO => return PackedValue::pack(self.unpack()),
@@ -513,6 +527,24 @@ impl Clone for PackedValue {
     }
 }
 
+/// gc-heap: a word owns nothing (its payload is a cell address or a scalar), so a clone copies
+/// its bits. A deferred prototype is a property-only word that must not be copied as is:
+/// property reads copy words with [`PackedValue::clone_materialized`]. Debug builds assert it.
+#[cfg(feature = "gc-heap")]
+impl Clone for PackedValue {
+    #[inline]
+    fn clone(&self) -> Self {
+        debug_assert_ne!(
+            self.tag(),
+            PACK_LAZY_PROTO,
+            "a deferred prototype's word copied without materializing"
+        );
+        PackedValue(Cell::new(self.0.get()))
+    }
+}
+
+/// Default build: a word owns its payload's reference, which a drop releases.
+#[cfg(not(feature = "gc-heap"))]
 impl Drop for PackedValue {
     #[inline]
     fn drop(&mut self) {
@@ -521,12 +553,16 @@ impl Drop for PackedValue {
             PACK_STR => unsafe { self.drop_word::<crate::lstr::LStr>() },
             PACK_SYM => unsafe { self.drop_word::<SymbolRef>() },
             PACK_OBJ => unsafe { self.drop_word::<Gc>() },
-            // The default build's box; a gc-heap cell handle has nothing to release.
             PACK_LAZY_PROTO => unsafe { self.drop_word::<LazyProto>() },
             _ => {}
         }
     }
 }
+
+// gc-heap: a word owns nothing, so it has no drop glue; dropping or overwriting one, and every
+// teardown loop over execution words, compiles to nothing.
+#[cfg(feature = "gc-heap")]
+const _: () = assert!(!std::mem::needs_drop::<PackedValue>());
 
 #[cfg(test)]
 mod packed_value_tests {
@@ -574,10 +610,10 @@ mod packed_value_tests {
         );
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// Number and emptiness inspection reads a word's bits and nothing else: every word keeps
+    /// its bits, a Number's (or NaN's) value comes back exactly, and an object's word still
+    /// names its object. The default build also keeps the object's owner count; a gc-heap word
+    /// owns nothing, so its bits are all there is to keep.
     #[test]
     fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
         for number in [
@@ -608,15 +644,23 @@ mod packed_value_tests {
             Value::Obj(object.clone()),
         ] {
             let empty = matches!(value, Value::Empty);
+            let is_object = matches!(value, Value::Obj(_));
             let packed = PackedValue::pack(value);
             let bits = packed.bits();
+            #[cfg(not(feature = "gc-heap"))]
             let owners = Gc::strong_count(&object);
             for _ in 0..20 {
                 assert!(packed.number().is_none());
                 assert_eq!(packed.is_empty(), empty);
             }
             assert_eq!(packed.bits(), bits);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(Gc::strong_count(&object), owners);
+            if is_object {
+                assert!(
+                    matches!(packed.unpack(), Value::Obj(actual) if Gc::ptr_eq(&actual, &object))
+                );
+            }
         }
     }
 
@@ -677,26 +721,37 @@ mod packed_value_tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// Packing moves a handle into a word and `into_value` moves it back out, the same handle.
+    /// Default build: the word's owner is the moved one (one count, no bump either way). gc-heap:
+    /// the word is the object tag over the cell's address, and the type has no drop glue, so a
+    /// move needs no drop of its source.
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
+        #[cfg(not(feature = "gc-heap"))]
         let before = Gc::strong_count(&obj);
         let packed = PackedValue::pack(Value::Obj(obj.clone()));
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Gc::strong_count(&obj), before + 1);
+        #[cfg(feature = "gc-heap")]
+        {
+            assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
+            assert!(!std::mem::needs_drop::<PackedValue>());
+        }
         let out = packed.into_value();
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Gc::strong_count(&obj), before + 1);
+        assert!(matches!(&out, Value::Obj(actual) if Gc::ptr_eq(actual, &obj)));
         drop(out);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(Gc::strong_count(&obj), before);
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// A clone of a word has its exact bits, for every kind, and dropping clones leaves the
+    /// originals' values intact. Default build: a clone of an object, string or Symbol word
+    /// retains its owner once, and dropping it releases that retain. gc-heap: a clone is a bit
+    /// copy of a word over a cell's address, which owns nothing, so there is nothing to retain
+    /// or release.
     #[test]
     fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
         for value in [
@@ -727,12 +782,22 @@ mod packed_value_tests {
             PackedValue::pack(Value::Str(string.clone())),
             PackedValue::pack(Value::Sym(symbol.clone())),
         ];
+        #[cfg(feature = "gc-heap")]
+        assert_eq!(
+            [original[0].bits(), original[2].bits()],
+            [
+                PACK_OBJ | Gc::as_ptr(&object) as u64,
+                PACK_SYM | symbol_identity(&symbol) as u64
+            ]
+        );
+        #[cfg(not(feature = "gc-heap"))]
         let before = [
             Gc::strong_count(&object),
             string.strong_count(),
             symbol_strong_count(&symbol),
         ];
         let copies = original.clone();
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(
             [
                 Gc::strong_count(&object),
@@ -745,6 +810,7 @@ mod packed_value_tests {
             assert_eq!(a.bits(), b.bits());
         }
         drop(copies);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(
             [
                 Gc::strong_count(&object),
@@ -753,6 +819,19 @@ mod packed_value_tests {
             ],
             before
         );
+        assert!(matches!(
+            original[0].unpack(),
+            Value::Obj(actual) if Gc::ptr_eq(&actual, &object)
+        ));
+        assert!(matches!(
+            original[1].unpack(),
+            Value::Str(actual) if crate::lstr::LStr::ptr_eq(&actual, &string)
+                && &*actual == "packed clone owner"
+        ));
+        assert!(matches!(
+            original[2].unpack(),
+            Value::Sym(actual) if symbol_ptr_eq(&actual, &symbol)
+        ));
         let integer = crate::bigint::JsBigInt::parse_dec("123456789012345678901234567890").unwrap();
         let packed = PackedValue::pack(Value::BigInt(integer.clone()));
         let copied = packed.clone();
@@ -1006,17 +1085,10 @@ pub(crate) fn symbol_downgrade(symbol: &SymbolRef) -> WeakSymbol {
     WeakSymbol(crate::gc_handle::WeakRef::to(symbol_identity(symbol)))
 }
 
-/// Tests observing reference counts: the Symbol's strong count (none under gc-heap).
-#[cfg(test)]
-#[track_caller]
+/// Tests observing reference counts: the Symbol's strong count (gc-heap Symbols have none).
+#[cfg(all(test, not(feature = "gc-heap")))]
 pub(crate) fn symbol_strong_count(symbol: &SymbolRef) -> usize {
-    #[cfg(not(feature = "gc-heap"))]
-    return Rc::strong_count(symbol);
-    #[cfg(feature = "gc-heap")]
-    {
-        let _ = symbol;
-        panic!("symbol_strong_count: gc-heap Symbols have no reference counts")
-    }
+    Rc::strong_count(symbol)
 }
 
 #[cfg(feature = "gc-heap")]
@@ -4597,7 +4669,9 @@ impl Clone for Property {
             Box::into_raw(Box::new(acc.clone())) as usize | flags
         };
         Property {
-            packed: self.packed.clone(),
+            // A snapshot can be stored under another key or on another object (a descriptor
+            // define, a property copy), where a deferred prototype must not travel unmaterialized.
+            packed: self.packed.clone_materialized(),
             meta,
         }
     }
@@ -4735,12 +4809,12 @@ impl Property {
     pub(crate) fn value(&self) -> Value {
         self.packed.unpack()
     }
-    /// An owning OrdinaryGet value snapshot with no wide-value round trip.
-    /// PackedValue::clone materializes a deferred MakeConstructor prototype just
-    /// like value(), so execution storage never receives a property-only thunk.
+    /// An owning OrdinaryGet value snapshot with no wide-value round trip. It materializes a
+    /// deferred MakeConstructor prototype just like value(), so execution storage never
+    /// receives a property-only thunk.
     #[inline]
     pub(crate) fn clone_value_packed(&self) -> PackedValue {
-        self.packed.clone()
+        self.packed.clone_materialized()
     }
     /// Whether this data property holds exactly the object at `expected`, compared without
     /// creating an owner. A deferred prototype has no address yet and never matches.

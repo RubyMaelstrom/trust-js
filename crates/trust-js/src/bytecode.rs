@@ -21686,30 +21686,38 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         return crate::jit::SpFlag { sp: base, flag: 1 };
     }
 
-    let ctx = unsafe { &mut *ctx };
-    let chunk = unsafe { &*ctx.chunk };
-    if let Some(Op::StoreLocal(slot)) = chunk.ops.get(pc as usize + 1) {
-        // Inspect/retire this one packed owner. The operand `left` keeps it alive here.
-        let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
-        let current = unsafe { crate::value::PackedValue::clone_raw(word) };
-        let same =
-            matches!(&current, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left));
-        drop(current);
-        if same {
-            unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
+    // Retire the owner of `left` that the next store overwrites, so that a counted string can be
+    // unique and append in place. gc-heap appends at its buffer's frontier, which needs no
+    // uniqueness.
+    #[cfg(not(feature = "gc-heap"))]
+    {
+        let ctx = unsafe { &mut *ctx };
+        let chunk = unsafe { &*ctx.chunk };
+        if let Some(Op::StoreLocal(slot)) = chunk.ops.get(pc as usize + 1) {
+            // Inspect/retire this one packed owner. The operand `left` keeps it alive here.
+            let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
+            let current = unsafe { crate::value::PackedValue::clone_raw(word) };
+            let same = matches!(
+                &current,
+                Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left)
+            );
+            drop(current);
+            if same {
+                unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
+            }
+        } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
+            // As in jit_exec_inner, env_raw is the running environment swapped for this native
+            // frame, not a borrowed pointer to the caller's environment. Its existing owner
+            // outlives the call. The captured binding lives in the body's activation record,
+            // which env_raw leaves inside a block or `with` scope.
+            let env = std::mem::ManuallyDrop::new(unsafe {
+                crate::interpreter::Env::from_raw(
+                    ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+                )
+            });
+            let cap_env = unsafe { jit_cap_env(ctx, &env) };
+            chunk.release_overwritten_captured_string(cap_env, *name, &left);
         }
-    } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
-        // As in jit_exec_inner, env_raw is the running environment swapped for this native
-        // frame, not a borrowed pointer to the caller's environment. Its existing owner outlives
-        // the call. The captured binding lives in the body's activation record, which env_raw
-        // leaves inside a block or `with` scope.
-        let env = std::mem::ManuallyDrop::new(unsafe {
-            crate::interpreter::Env::from_raw(
-                ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
-            )
-        });
-        let cap_env = unsafe { jit_cap_env(ctx, &env) };
-        chunk.release_overwritten_captured_string(cap_env, *name, &left);
     }
 
     unsafe { base.write(PackedValue::pack(Value::Str(left.concat_owned(&right)))) };

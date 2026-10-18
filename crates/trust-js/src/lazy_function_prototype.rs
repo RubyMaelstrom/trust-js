@@ -14,8 +14,9 @@ enum State {
 
 pub(super) struct LazyFunctionPrototype {
     /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
-    /// A lazy word lives only in that function's properties (cloning one materializes it), so
-    /// the function is alive whenever the prototype materializes. gc-heap: a traced edge of
+    /// A lazy word lives only in that function's properties (copying one out of its property
+    /// materializes it: `PackedValue::clone_materialized`), so the function is alive whenever
+    /// the prototype materializes. gc-heap: a traced edge of
     /// this cell ([`trace_cell`]). The function and its cell form a cycle that dies in one
     /// collection, and a stale stack word that conservatively keeps the cell keeps the
     /// function too. A weak handle would allocate a weak cell per constructor and keep a dead
@@ -556,6 +557,133 @@ mod tests {
                 "{store}: the old cells died by the next collection"
             );
         }
+    }
+
+    /// Every read that copies or moves a deferred prototype's word out of its property
+    /// materializes it: `PackedValue::clone_materialized`, a descriptor snapshot
+    /// (`Property::clone`), a value snapshot (`Property::clone_value_packed`), `Property::value`
+    /// and a move (`Property::take_value`), each on a function of its own, at every tier. The
+    /// first read materializes the prototype exactly once and yields its object, as an object
+    /// word from the word reads, and the property's word is then that object's. A second read,
+    /// and a script's read of the property, materialize nothing and yield the same object. Its
+    /// `constructor` is the function and its prototype is `Object.prototype`. A move leaves
+    /// `undefined` in the property instead.
+    #[test]
+    fn deferred_prototype_transfers_materialize_once_through_each_explicit_read() {
+        type Read = fn(&Gc) -> (Option<u64>, Value);
+        fn property<R>(function: &Gc, read: impl FnOnce(&Property) -> R) -> R {
+            read(
+                function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .expect("a prototype"),
+            )
+        }
+        const MOVE: &str = "Property::take_value";
+        let reads: [(&str, Read); 5] = [
+            ("PackedValue::clone_materialized", |function| {
+                let word = property(function, |stored| stored.packed.clone_materialized());
+                (Some(word.tag()), word.into_value())
+            }),
+            ("Property::clone", |function| {
+                let snapshot = property(function, Property::clone);
+                (Some(snapshot.packed.tag()), snapshot.value())
+            }),
+            ("Property::clone_value_packed", |function| {
+                let word = property(function, Property::clone_value_packed);
+                (Some(word.tag()), word.into_value())
+            }),
+            ("Property::value", |function| {
+                (None, property(function, Property::value))
+            }),
+            (MOVE, |function| {
+                let value = function.borrow_mut().props.take_value("prototype");
+                (None, value.expect("a prototype"))
+            }),
+        ];
+        let functions: String = (0..reads.len())
+            .map(|k| format!("function F{k}() {{}} "))
+            .collect();
+        for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(0);
+            eval(&mut engine, &format!("{functions}0"));
+            for (k, (read_name, read)) in reads.iter().enumerate() {
+                let label = format!("{tier:?} {read_name}");
+                let name = format!("F{k}");
+                let function = object(&mut engine, &name);
+                let tag = || property(&function, |stored| stored.packed.tag());
+                assert_eq!(tag(), PACK_LAZY_PROTO, "{label}");
+                let before = super::materialized();
+                let (word, first) = read(&function);
+                assert_eq!(super::materialized() - before, 1, "{label}: materialized");
+                if let Some(word) = word {
+                    assert_eq!(word, PACK_OBJ, "{label}: an object word");
+                }
+                let Value::Obj(prototype) = first else {
+                    panic!("{label}: not an object")
+                };
+                let constructor = prototype
+                    .borrow()
+                    .props
+                    .get("constructor")
+                    .map(Property::value);
+                assert!(
+                    matches!(constructor, Some(Value::Obj(c)) if Gc::ptr_eq(&c, &function)),
+                    "{label}: constructor"
+                );
+                assert!(
+                    prototype
+                        .borrow()
+                        .proto
+                        .as_ref()
+                        .is_some_and(|parent| Gc::ptr_eq(parent, &engine.interp.object_proto)),
+                    "{label}: parent"
+                );
+                if *read_name == MOVE {
+                    assert!(matches!(
+                        property(&function, Property::value),
+                        Value::Undefined
+                    ));
+                    assert_eq!(eval(&mut engine, &format!("{name}.prototype")), "undefined");
+                } else {
+                    assert_eq!(tag(), PACK_OBJ, "{label}: the property's word");
+                    let (_, second) = read(&function);
+                    assert!(
+                        matches!(second, Value::Obj(o) if Gc::ptr_eq(&o, &prototype)),
+                        "{label}: a second read"
+                    );
+                    eval(&mut engine, &format!("var seen = {name}.prototype; 0"));
+                    assert!(
+                        Gc::ptr_eq(&object(&mut engine, "seen"), &prototype),
+                        "{label}: a script's read"
+                    );
+                }
+                assert_eq!(
+                    super::materialized() - before,
+                    1,
+                    "{label}: later reads materialize nothing"
+                );
+            }
+        }
+    }
+
+    /// P1 S5 (gc-heap, debug builds): copying a deferred prototype's word with `Clone`, a bit
+    /// copy under gc-heap, instead of `PackedValue::clone_materialized` trips a debug assertion
+    /// before the property-only word can leave its property.
+    #[cfg(all(feature = "gc-heap", debug_assertions))]
+    #[test]
+    #[should_panic(expected = "a deferred prototype's word copied without materializing")]
+    fn deferred_prototype_word_copied_as_bits_trips_the_debug_assertion() {
+        let mut engine = Engine::new();
+        eval(&mut engine, "function F() {} 0");
+        let function = object(&mut engine, "F");
+        let body = function.borrow();
+        let property = body.props.get("prototype").expect("a prototype");
+        assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
+        let _copy = property.packed.clone();
     }
 
     #[test]

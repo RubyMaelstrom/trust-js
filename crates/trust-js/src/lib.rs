@@ -19,11 +19,17 @@
 // on purpose: converting an object can run user `valueOf`/`toString`/getters, which mutate the
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
-// Under the P1 gc-heap object model (S2) handles are `Copy`: code shared with the default build
-// still clones, drops or forgets them where an `Rc` handle must be retained or released.
+// Under the P1 gc-heap object model handles are `Copy` (S2) and packed words have no drop glue
+// (S5): code shared with the default build still clones, drops or forgets them where an `Rc`
+// handle must be retained or released.
 #![cfg_attr(
     feature = "gc-heap",
-    allow(dropping_copy_types, forgetting_copy_types, clippy::clone_on_copy)
+    allow(
+        dropping_copy_types,
+        forgetting_copy_types,
+        clippy::clone_on_copy,
+        clippy::drop_non_drop
+    )
 )]
 
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first

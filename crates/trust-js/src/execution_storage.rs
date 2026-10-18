@@ -419,26 +419,38 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// An operand stack and shared slots keep scalar bits exactly (-0, infinities, NaN) and an
+    /// object's identity through pushes, pops, an argument decode and a split. Default build:
+    /// the stack's word owns the object once, a decoded argument once more for the call, and
+    /// moving words out or overwriting a slot releases each owner exactly once. gc-heap: the
+    /// stack's word is the object tag over the cell's address and stays so through the decode,
+    /// and nothing is retained or released.
     #[test]
     fn compact_storage_preserves_scalar_bits_and_heap_ownership() {
         assert_eq!(std::mem::size_of::<PackedValue>(), 8);
         let interp = crate::interpreter::Interp::new();
         let object = interp.new_object();
+        #[cfg(not(feature = "gc-heap"))]
         let baseline = crate::value::Gc::strong_count(&object);
         let mut stack = ValueStack::<PackedValue>::default();
         stack.push(Value::Obj(object.clone()));
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
+        #[cfg(feature = "gc-heap")]
+        let word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&object) as u64;
+        #[cfg(feature = "gc-heap")]
+        assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.with_tail(0, |args| {
             assert!(
                 matches!(&args[0], Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
             );
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline + 2);
         });
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
+        #[cfg(feature = "gc-heap")]
+        assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.push(Value::Num(-0.0));
         assert!(
             matches!(stack.pop(), Some(Value::Num(value)) if value.to_bits() == (-0.0f64).to_bits())
@@ -455,32 +467,43 @@ mod tests {
         }
         let moved = stack.split_off(0);
         assert!(stack.is_empty());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), baseline + 1);
+        assert!(matches!(
+            moved.as_slice(),
+            [Value::Obj(actual)] if crate::value::Gc::ptr_eq(actual, &object)
+        ));
         drop(moved);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), baseline);
 
         let slots = [PackedValue::pack(Value::Obj(object.clone()))];
         slots.write_value(0, Value::Empty);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         assert!(matches!(slots.read_value(0), Value::Empty));
         slots.write_value(0, Value::Undefined);
         assert!(matches!(slots.read_value(0), Value::Undefined));
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: observes reference counts; gc-heap handles have none"
-    )]
+    /// Decoding an argument list makes one Value per argument, on the Rust stack up to four,
+    /// each the argument's object, and leaves the words as they were. Default build: each
+    /// decoded Value is one more owner, released with the decode, and the words' owners go
+    /// with the words. gc-heap: the words keep their bits through the decode, and neither the
+    /// decode nor the words have anything to release.
     #[test]
     fn compact_storage_decodes_only_argument_owners_with_exact_lifetime() {
         let object = crate::value::Object::new(None);
+        #[cfg(not(feature = "gc-heap"))]
         let baseline = crate::value::Gc::strong_count(&object);
+        let word = PackedValue::pack(Value::Obj(object.clone())).bits();
         for count in 0..=8 {
             let packed: Vec<_> = (0..count)
                 .map(|_| PackedValue::pack(Value::Obj(object.clone())))
                 .collect();
             let decoded = DecodedArgs::new(&packed);
             assert_eq!(decoded.len(), count);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(
                 crate::value::Gc::strong_count(&object),
                 baseline + count * 2
@@ -490,8 +513,11 @@ mod tests {
                 .iter()
                 .all(|value| matches!(value, Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))));
             drop(decoded);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline + count);
+            assert!(packed.iter().all(|packed| packed.bits() == word));
             drop(packed);
+            #[cfg(not(feature = "gc-heap"))]
             assert_eq!(crate::value::Gc::strong_count(&object), baseline);
         }
     }
@@ -647,10 +673,12 @@ mod tests {
         BOUNDARY_RECEIVER_WEAK.with(|weak| *weak.borrow_mut() = None);
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    /// Slot-to-stack copies (LoadLocal, Dup) and stack-to-slot moves (StoreLocal) of an object's
+    /// word, with no wide Value between them: every copy and move has the source word's bits.
+    /// Default build: each copy retains the object once, a move neither retains nor releases,
+    /// and each drop or overwrite releases one owner, the last one freeing the object. gc-heap:
+    /// copies are bit copies and drops and overwrites release nothing, so the object outlives
+    /// every word until a collection finds it dead.
     #[test]
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
         let object = crate::value::Object::new(None);
@@ -659,53 +687,80 @@ mod tests {
             PackedValue::pack(Value::Obj(object)),
             PackedValue::pack(Value::Empty),
         ];
+        let word = slots[0].bits();
         let mut stack = ValueStack::<PackedValue>::default();
         assert!(slots[1].is_empty());
         stack.push_stored(slots[0].clone());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(weak.strong_count(), 2);
         stack.push_stored(stack.last_stored().unwrap().clone());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(weak.strong_count(), 3);
+        assert!(stack.raw_slice().iter().all(|copy| copy.bits() == word));
         slots[1].replace_stored(stack.pop_stored().unwrap());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(
             weak.strong_count(),
             3,
             "slot move does not retain or release"
         );
+        assert_eq!(slots[1].bits(), word);
         drop(stack.pop_stored());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(weak.strong_count(), 2);
         slots[0].replace_stored(PackedValue::pack(Value::Undefined));
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(weak.strong_count(), 1);
         drop(slots);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(weak.strong_count(), 0);
+        #[cfg(feature = "gc-heap")]
+        assert!(crate::gc_test::alive(&weak), "a word released its object");
     }
 
-    #[cfg_attr(
-        feature = "gc-heap",
-        ignore = "P1 S2: asserts reference-count release timing; gc-heap releases at collections"
-    )]
+    /// A shared alias of a slot (a mapped parameter's) observes a replacement written through
+    /// the slice, and a replacement through the alias empties the slot. Default build: each
+    /// replacement releases the replaced owner at once, and the alias's decoded Value is one
+    /// more owner. gc-heap: the alias's word is the replacement's bits, and replacements
+    /// release nothing: both objects outlive their words until a collection.
     #[test]
     fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
         let first = crate::value::Object::new(None);
         let first_weak = crate::value::Gc::downgrade(&first);
         let second = crate::value::Object::new(None);
         let second_weak = crate::value::Gc::downgrade(&second);
+        #[cfg(feature = "gc-heap")]
+        let second_word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&second) as u64;
         let slots = [PackedValue::pack(Value::Obj(first))];
         let shared = &slots[..];
         let alias = &shared[0];
         shared.write_value(0, Value::Obj(second));
-        assert_eq!(first_weak.strong_count(), 0);
-        assert_eq!(second_weak.strong_count(), 1);
+        #[cfg(not(feature = "gc-heap"))]
+        {
+            assert_eq!(first_weak.strong_count(), 0);
+            assert_eq!(second_weak.strong_count(), 1);
+        }
+        #[cfg(feature = "gc-heap")]
+        assert_eq!(alias.bits(), second_word);
         let seen = alias.unpack();
         assert!(crate::value::Gc::ptr_eq(
             seen.as_obj().unwrap(),
             &second_weak.upgrade().unwrap()
         ));
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(second_weak.strong_count(), 2);
         alias.replace_value(Value::Empty);
         assert!(shared[0].is_empty());
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(second_weak.strong_count(), 1);
         drop(seen);
+        #[cfg(not(feature = "gc-heap"))]
         assert_eq!(second_weak.strong_count(), 0);
+        #[cfg(feature = "gc-heap")]
+        assert!(
+            crate::gc_test::alive(&first_weak) && crate::gc_test::alive(&second_weak),
+            "a replacement released its object"
+        );
     }
 
     /// The raw literal factories (inline, heap-packed and large arrays; templated objects) move

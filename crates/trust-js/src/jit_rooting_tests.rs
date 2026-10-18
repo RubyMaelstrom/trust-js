@@ -919,12 +919,13 @@ fn committed_native_call_operands_are_roots() {
 
 /// These programs, the rooting tests that use this harness beside the tests they stand in for
 /// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
-/// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests` and the deferred
+/// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, the deferred
 /// prototypes' cells (their lifetime, trace, materialization and Rust overwrites, the packed
-/// drop boundary and a deferred prototype's memory report) again at `TRUST_JS_GC_STRESS=1`,
-/// which collects at every safepoint that follows an allocation (the calls, polls and natives
-/// JIT code reaches throughout, besides `collect()`), in a process of their own: the setting
-/// is read once per process.
+/// drop boundary and a deferred prototype's memory report), the reads that materialize a
+/// deferred prototype as they copy it out and the bit-copy words of packed and execution
+/// storage again at `TRUST_JS_GC_STRESS=1`, which collects at every safepoint that follows an
+/// allocation (the calls, polls and natives JIT code reaches throughout, besides `collect()`),
+/// in a process of their own: the setting is read once per process.
 #[test]
 fn rooting_holds_under_gc_stress() {
     const CHILD: &str = "TRUST_JS_TEST_ROOTING_STRESS_CHILD";
@@ -943,6 +944,13 @@ fn rooting_holds_under_gc_stress() {
             "value::lazy_function_prototype::tests::rust_overwrites_of_deferred_prototypes",
             "bytecode::return_slot_tests::packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries",
             "memory::tests::deferred_prototype_payload_is_counted_once_in_property_storage",
+            "value::packed_value_tests::packed_numeric_inspection_is_non_owning_and_preserves_number_bits",
+            "value::packed_value_tests::packed_value_moves_reference_ownership_without_a_bump",
+            "value::packed_value_tests::packed_value_direct_clones_preserve_bits_and_exact_owner_counts",
+            "execution_storage::tests::compact_storage_preserves_scalar_bits_and_heap_ownership",
+            "execution_storage::tests::compact_storage_decodes_only_argument_owners_with_exact_lifetime",
+            "execution_storage::tests::compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary",
+            "execution_storage::tests::compact_storage_shared_alias_observes_replacement_and_exact_owner_release",
             "--skip",
             "rooting_holds_under_gc_stress",
         ])
