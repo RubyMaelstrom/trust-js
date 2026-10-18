@@ -3756,3 +3756,36 @@ agent's change, reviewed and extended):
     realm. From reading the code; untested.
   - gc_core's S1 registration surface (Registration and its root,
     edge and sweep-hook callbacks) has no user; for step 8.
+
+Step 1, the runs still going at its commit, and a follow-up (zombie,
+x86-64, rustc 1.99.1):
+- Per-test GC stress with the heap verifier and freed-cell poisoning
+  (debug gc-heap lib tests from the step 1 tree, each test in its own
+  process, as the S5 exit gate ran them on aarch64): of 1964 tests,
+  1844 pass at interval 1, the 20 slow ones at interval 100 and 4 at
+  interval 1000, and 96 are the suite's x86-64 gc-heap ignores. None
+  fail or time out.
+- Full Test262 (annexB, built-ins, harness, intl402, language,
+  staging; no-LTO release runners from the step 1 tree): 53,575/53,575
+  excluding skipped, in both builds at interp, bytecode and jit. All
+  six summaries are byte-identical to the aarch64 references: main's
+  at interp and bytecode, the S5 exit gate's at jit. On x86-64 the GC
+  heap's jit tier still runs bytecode until step 7; the default
+  build's runs the x64 JIT.
+- The scanner tests (gc_core) in optimizing builds, on x86-64 Linux
+  and on Windows under Wine, as S2 step 2 ran them on aarch64:
+  - in-tree at f32b1fd6, the lib tests filtered to gc_core:: in the
+    no-LTO release build and the repo's release profile (fat LTO):
+    Linux 39 pass and Windows 40, with 5 ignored timing probes each;
+  - gc_core.rs and fasthash.rs unchanged in a crate of their own, in
+    debug and in release at opt-level 0/1/2/3/s/z, target-cpu=native
+    and fat LTO: all pass on both (41 and 42 in debug, 39 and 40 in
+    release). The Windows register and segment tests ran in each.
+- Follow-up: x86-64 Linux had no register-only test (aarch64 hides a
+  reference in d8, Windows in xmm6). reference_only_in_r15_is_found
+  hides one in r15, callee-saved under System V. It passes in-tree in
+  debug and, standalone, in every configuration above. With r15 left
+  out of the spill it fails in debug only: in release builds a frame
+  on the collection path saves r15 itself, where the stack scan finds
+  it. System V's callee-saved registers are all general-purpose,
+  which optimized frames commonly save.

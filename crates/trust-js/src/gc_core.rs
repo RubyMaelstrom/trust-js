@@ -3377,7 +3377,7 @@ mod tests {
         black_box(&top);
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    #[cfg(target_arch = "x86_64")]
     extern "C" fn collect_trampoline(heap: *mut std::ffi::c_void) {
         let heap = unsafe { &mut *(heap as *mut Heap) };
         assert!(heap.collect());
@@ -3424,6 +3424,49 @@ mod tests {
         assert!(
             fx.heap.is_allocated_word(found),
             "register spill missed xmm6"
+        );
+        black_box(&top);
+    }
+
+    /// Collect while the only reference sits in r15, which System V makes callee-saved. A frame
+    /// on the collection path that uses r15 saves it where the stack scan finds it; where none
+    /// does, as in debug builds, only the register spill can. Returns r15 after the call.
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    #[inline(never)]
+    fn collect_with_reference_only_in_r15(heap: &mut Heap, hidden: u64) -> u64 {
+        let found: u64;
+        unsafe {
+            std::arch::asm!(
+                "mov rax, {hidden}",
+                "not rax",
+                "mov r15, rax",
+                "call {trampoline}",
+                "mov rax, r15",
+                hidden = in(reg) hidden,
+                trampoline = sym collect_trampoline,
+                in("rdi") heap as *mut Heap as *mut std::ffi::c_void,
+                lateout("rax") found,
+                out("r15") _,
+                clobber_abi("C"),
+            );
+        }
+        found
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+    fn reference_only_in_r15_is_found() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+        scrub_stack();
+        let found = collect_with_reference_only_in_r15(&mut fx.heap, hidden);
+        assert_eq!(found, !hidden, "r15 is callee-saved");
+        assert_eq!(fx.heap.stats().collections, 1);
+        assert!(
+            fx.heap.is_allocated_word(found),
+            "register spill missed r15"
         );
         black_box(&top);
     }
