@@ -2533,3 +2533,126 @@ Step 9a, gc-heap emission (09b28cd4):
   build. Cycles and peak RSS wait for 9f's tripwire. (With only the
   workload pinned, perf on this machine reports a spurious count on the
   other core cluster and scales CPU 5's: pin perf too.)
+
+Step 9b, deferred prototypes as payload cells (b155ff10):
+- Under gc-heap a function's deferred prototype (PACK_LAZY_PROTO) is a
+  payload cell in the Agent heap, as S4 made a closure's UserCallable.
+  value::LazyProto is GcBox<LazyFunctionPrototype> under gc-heap and
+  Rc in the default build, whose types and code are unchanged. The
+  cell is 48 bytes, in the 48-byte class with no slack.
+- The cell's descriptor, "lazy prototype", traces the function and the
+  State edge: the parent, or the materialized prototype. It reads the
+  state without a borrow guard and panics if it is mutably borrowed:
+  materialize holds its borrow across one allocation, which never
+  collects (I9). Its finalizer drops the key layout.
+- PackedValue::trace_gc_edges reports the cell. The function is now a
+  traced edge, so a stale stack word that keeps a cell keeps its
+  function too.
+- with_object_edge still lends the State edge, the logical edge that
+  the reference-counting collectors walk (Interp::visit_object_edges:
+  the rc collectors, the nursery's counting pass and the realm-path
+  diagnostics). All of them compile under gc-heap, but none runs
+  there: gc_collect dispatches to gc_heap_collect first.
+- No packed word owns anything under gc-heap.
+  - Under Traced, SetProp's way and the name/Reference store neither
+    load nor test the old word (5 and 13 instructions fewer per site).
+    An overwritten deferred prototype materializes nothing, and its
+    cell dies at the next collection.
+  - No Traced code calls H_DROP_PACKED_AT or H_DROP_AT, and
+    jit_drop_packed_at panics in gc-heap debug builds. jit_drop_at
+    stays callable, since the gc-heap ABI test calls it directly.
+  - x86-64 compiles none of these templates (reasoned, not compiled
+    here).
+- Unchanged: Object.defineProperty and Reflect.set over a deferred
+  prototype materialize it through their descriptor snapshot
+  (Property::clone), in both builds, as before. Clone and unpack still
+  materialize; that is 9c's.
+- Memory reports count 48 bytes per lazy word in property storage,
+  once; no report counts gc-heap cells by bytes. Replacing one lazy
+  word lowers property storage by 48 bytes, as at 78b705e7.
+- Tests. The gc-heap ones all run in the stress child at stress 1.
+  - Cells live and die with their functions: 256 functions keep 256
+    cells across 3 collections with nothing materialized; a cell's
+    first marker is its function; all are gone one collection after
+    release.
+  - The trace reports [function, Object.prototype] while deferred and
+    [function, prototype] after materializing.
+  - Prototypes of a function of this realm, a function made by a
+    $262.createRealm() realm's Function, and a generator of that realm
+    each materialize once after collections. Identity, constructor
+    and the creation realm's parent hold.
+  - Rust overwrites free the old cells (and materialize, as above).
+  - Native SetProp and with-object StoreRef overwrites, 10 each:
+    no set-property helper call, 10 native Reference stores, no
+    materialization, and the old cells are freed.
+  - A static check that the Traced SetProp and store templates load no
+    drop helper.
+  - In both builds, the memory report's 48 bytes.
+  - The step 8b ABI test's lazy Rc check is default-only. Its gc-heap
+    form overwrites a lazy word, which releases nothing, and frees the
+    cell at the next collection, when the finalizer drops the layout.
+- Mutations (a separate source copy; 21 tests, each in its own
+  process; the control passes 21 of 21):
+  - Marking through with_object_edge instead of the cell fails 5 tests
+    without stress and 18 at stress 1 (swept, poisoned cells).
+  - A trace without the owner, or without the State edge, fails the
+    trace test.
+  - Traced SetProp retesting a lazy old value fails the SetProp test.
+  - The Traced store calling H_DROP_PACKED_AT fails the static test,
+    and the StoreRef test aborts on the debug panic.
+- Gates: the agent's, at b155ff10. I reran the lib suites, the stress
+  child, clippy and rustfmt at the same commit.
+  - Lib suites: embed 2173/0/3 (2172 plus the memory test);
+    embed,gc-heap 2209/0/62 twice (2201 plus 8 new; the ABI test was
+    adapted in place). My rerun gave the same counts, with gc-heap run
+    twice.
+  - Stress child (44 tests, from 34): 29.8 s; 31.2 s on my
+    rerun.
+  - Targeted per-test stress, 382 tests (8c's 368, adjusted for 9a,
+    plus the new ones):
+    - At stress 1, 377 pass and 4 are ignored.
+    - At stress 1 with threshold 0, the same, apart from one threshold
+      assumption (lazy_snapshot_body_tests::huge_run_once_bootstrap_
+      bodies_are_interpreted_until_the_call_threshold).
+    - tests::proxy_prototype_cycles_throw_range_error_instead_of_
+      overflowing, which is on 8c's slow list, passes at 100 (253 s;
+      250 s with threshold 0).
+    - No crash and no verifier report.
+  - Default code dumps are norm2-identical to step 1, stdout equal.
+    gc-heap: chunks 56/10/160, stdout equal to the default build's.
+  - Fixtures at --tier=jit: exit 0, stdout equal, compiles 55/9/160
+    and 56/10/160, no failure.
+  - Functions with a prototype, both builds: vue 1,000 of 26,480 user
+    functions, react 2 of 4,502, djot 277 of 2,920.
+  - difftest --seed 7 --count 150: 138 agree, 12 skipped, 0 crashes
+    in both builds.
+  - Clippy clean in both builds; rustfmt clean.
+- gc-heap code-dump words, 9a -> 9b: vue 189,452 -> 189,014 (-0.23%;
+  18 chunks changed), react 26,017 unchanged (0 changed), djot
+  1,059,043 -> 1,056,905 (-0.20%; 89). Against step 8: vue -17.7%,
+  react -22.8%, djot -15.9%.
+- Instructions, 9a -> 9b (user mode, no-LTO, perf and the workload
+  pinned to CPU 5, median of 3; my recheck agrees with the agent's
+  within 0.15%):
+  - gc-heap at --tier=jit: vue 3,363.1M -> 3,347.0M (-0.5%), react
+    628.4M -> 631.7M (+0.5%), djot 1,320.1M -> 1,302.0M (-1.4%).
+  - gc-heap at --tier=bytecode: vue +0.1%, react -0.4%, djot -0.1%.
+  - The default build is within 0.1%.
+  - React's generated code is word-identical. A sampled profile puts
+    the change in Rust code (Property's drop glue and its callers
+    inline differently in this no-LTO build); 9f's fat-LTO tripwire
+    measures it.
+- Microbenchmarks at --tier=jit, gc-heap 9a -> 9b (the default build is
+  unchanged):
+  - creating 2M closures, each with a deferred prototype: -3.7%
+    (11,685M -> 11,255M);
+  - the arrow-function control: -1.5%, with the same 87 collections.
+    into_value, without an Rc arm, now inlines into jit_call_hit;
+  - materializing 300k prototypes: +0.6%;
+  - replacing 1M unobserved prototypes: -5.0%.
+  The cell measures well, so the plan's alternative (Property owns the
+  Rc) is not taken.
+- For 9d, layout (B) of the survey: under gc-heap, JitCtx holds the
+  packed `this` word itself at [48], in place of this_raw. The pointer
+  and its four set-up writes go, saving one dependent load per access
+  of `this`. The default build keeps this_raw and the wide this_val.
