@@ -4035,3 +4035,26 @@ implementation agent's change, reviewed):
   machine, the worker's also on a quiet one; the TLS server test
   can hang (its server waits for one client, which the test starts
   after a fixed 750 ms).
+
+Step 6 plan (2026-10-19), from a read-only survey of the JIT's
+Refcount ownership at ebc4f537:
+- Under the GC heap JitRepr's ownership is Traced and its `this` form
+  Packed, fixed once per process. Every JitOwnership::Refcount arm,
+  counted() block (59, and one test's), Wide `this` arm and
+  count-only gate (fits_unscaled, count_first) is compiled but never
+  taken, and of the 128 ownership emitter calls on ARM64 only
+  frame_this_reset emits anything (one store). After step 5 the
+  JIT's cfg(not(gc-heap)) group (25 items in jit.rs, 3 in
+  interpreter.rs, the JitCtx test helpers) is the last counted code.
+- x64's three reference-count emitters and their seven sites go too:
+  `mod x64` compiles in every test build, aarch64's included (see the
+  plan's recorded deviations for step 6).
+- Stays: every Traced alternative (the property-word guard, the TDZ
+  and Empty checks, semantic tag routing), the PropertyLayout count
+  emitters (step 12), the helper table's two drop slots and every
+  embedded offset (step 8), and the count-motivated guards the GC
+  heap still emits (step 12).
+- Tests: three that build a Refcount layout or classify counted
+  owners go; two Traced tests lose their counted calibrations.
+- Check: the fixtures' code dumps identical to step 0's, plain and
+  with the shared stubs, as from step 5's review.
