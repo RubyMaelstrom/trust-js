@@ -11,28 +11,24 @@
 //! - References are direct pointers (never handle-table indices); a
 //!   tagged execution word masks to the same pointer (payload mask).
 //! - Tracing is precise inside the heap (per-descriptor trace functions)
-//!   and for registered Rust-heap roots, owner-conditional for side tables
-//!   (edge sources), and conservative only for the native stack and
-//!   registers, per the Decision 0 scanning contract (see `native`).
+//!   and for the roots the embedder reports through its [`MarkClient`],
+//!   owner-conditional for its side tables, and conservative only for the
+//!   native stack and registers, per the Decision 0 scanning contract (see
+//!   `native`).
 //! - Weak slots and ephemerons are rediscovered every collection from
 //!   reachable holders. Nothing weak is registered globally, so a reused
 //!   cell address can neither revive a dead entry nor be clobbered by one.
 //! - Collection honors I9: it never runs inside a no-GC region or while a
 //!   GcCell borrow is outstanding (deferred via a pending flag; the borrow
 //!   case asserts in debug builds), and cells are allocated zeroed.
-//! - Every registration is an RAII handle. Dropping the heap finalizes
-//!   the remaining cells and frees all heap memory (I5 teardown).
+//! - Dropping the heap finalizes the remaining cells and frees all heap
+//!   memory (I5 teardown).
 //! - Debug builds poison freed cells and verify the marked graph.
-
-// Part of the S1 surface (Registration and its callbacks among it) has
-// no user in the object model.
-#![allow(dead_code)]
 
 use crate::fasthash::FastMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -84,7 +80,7 @@ pub(crate) type TraceFn = fn(*const u8, &mut dyn FnMut(*const u8));
 /// Weak callback: report the cell's weak slots and ephemeron entries
 /// through the [`WeakSink`]. Called once per collection for each reachable
 /// cell of the descriptor; same state tolerance as [`TraceFn`].
-pub(crate) type WeakFn = fn(*mut u8, &mut WeakSink<'_>);
+pub(crate) type WeakFn = fn(*mut u8, &mut WeakSink);
 /// Finalize callback for a dead cell, run during sweep or heap teardown.
 /// Must not allocate from this heap, resurrect the cell, or read other
 /// cells (they may already be finalized); same state tolerance as
@@ -101,15 +97,18 @@ pub(crate) struct LayoutDesc {
     pub(crate) finalize: Option<FinalizeFn>,
 }
 
-/// Receives one reachable cell's weak data during marking.
-pub(crate) struct WeakSink<'a> {
-    weak_slots: &'a mut Vec<*mut u64>,
-    ephemerons: &'a mut Vec<(*mut u64, *mut u64)>,
+/// Receives one reachable cell's weak data during marking, into buffers the
+/// marker lends it and takes back. Only the tests' descriptors report any:
+/// the engine's have no [`WeakFn`].
+pub(crate) struct WeakSink {
+    weak_slots: Vec<*mut u64>,
+    ephemerons: Vec<(*mut u64, *mut u64)>,
 }
 
-impl WeakSink<'_> {
+impl WeakSink {
     /// `slot`, a word inside the cell, holds a weak reference: it is zeroed
     /// when its target does not survive the collection.
+    #[cfg(test)]
     pub(crate) fn weak_slot(&mut self, slot: *mut u64) {
         self.weak_slots.push(slot);
     }
@@ -118,12 +117,13 @@ impl WeakSink<'_> {
     /// while the key word's target is. When the key dies both words are
     /// zeroed, so the holder reads the entry as empty. A zero key is an
     /// empty entry; a key that is not a heap reference never dies.
+    #[cfg(test)]
     pub(crate) fn ephemeron(&mut self, key: *mut u64, value: *mut u64) {
         self.ephemerons.push((key, value));
     }
 }
 
-/// Receives the edges an edge source keeps off-heap.
+/// Receives the edges a [`MarkClient`] keeps off-heap, in its side tables.
 pub(crate) struct EdgeSink<'a> {
     edges: &'a mut Vec<SourceEdge>,
 }
@@ -148,7 +148,8 @@ impl EdgeSink<'_> {
 
     /// `value` is reachable only while both `owner` and `key` are (a WeakMap
     /// entry). A zero key is an empty entry and is skipped. Pruning entries
-    /// whose key or owner died is the table's sweep hook's job.
+    /// whose key or owner died is the embedder's job: it sweeps its tables
+    /// between the phases (see [`Heap::start_marking`]).
     pub(crate) fn ephemeron(&mut self, owner: *const u8, key: u64, value: u64) {
         if key != 0 {
             self.edges.push(SourceEdge {
@@ -157,133 +158,6 @@ impl EdgeSink<'_> {
                 value,
             });
         }
-    }
-}
-
-/// Registration table shared by the heap and the RAII handles that own its
-/// entries, so a handle can be dropped while the heap is borrowed elsewhere.
-struct Registry<T> {
-    entries: RefCell<Vec<Option<T>>>,
-    free: RefCell<Vec<usize>>,
-    /// Removals requested while the collector was iterating `entries`.
-    deferred: RefCell<Vec<usize>>,
-}
-
-impl<T> Default for Registry<T> {
-    fn default() -> Self {
-        Self {
-            entries: RefCell::new(Vec::new()),
-            free: RefCell::new(Vec::new()),
-            deferred: RefCell::new(Vec::new()),
-        }
-    }
-}
-
-impl<T> Registry<T> {
-    fn insert(self: &Rc<Self>, entry: T) -> Registration<T> {
-        let mut entries = self
-            .entries
-            .try_borrow_mut()
-            .expect("GC registration added during collection");
-        let index = match self.free.borrow_mut().pop() {
-            Some(index) => {
-                entries[index] = Some(entry);
-                index
-            }
-            None => {
-                entries.push(Some(entry));
-                entries.len() - 1
-            }
-        };
-        Registration {
-            registry: Rc::clone(self),
-            index,
-        }
-    }
-
-    fn remove(&self, index: usize) {
-        if let Ok(mut entries) = self.entries.try_borrow_mut() {
-            entries[index] = None;
-            self.free.borrow_mut().push(index);
-        } else {
-            self.deferred.borrow_mut().push(index);
-        }
-    }
-
-    /// Visit live entries. An entry whose handle is dropped meanwhile (from
-    /// inside a callback) is skipped for the rest of the pass and removed
-    /// after it.
-    fn for_each(&self, mut f: impl FnMut(&mut T)) {
-        {
-            let mut entries = self.entries.borrow_mut();
-            for index in 0..entries.len() {
-                if self.deferred.borrow().contains(&index) {
-                    continue;
-                }
-                if let Some(entry) = entries[index].as_mut() {
-                    f(entry);
-                }
-            }
-        }
-        let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
-        for index in deferred {
-            self.remove(index);
-        }
-    }
-}
-
-/// Owns one registration; dropping it unregisters.
-pub(crate) struct Registration<T> {
-    registry: Rc<Registry<T>>,
-    index: usize,
-}
-
-impl<T> Drop for Registration<T> {
-    fn drop(&mut self) {
-        self.registry.remove(self.index);
-    }
-}
-
-pub(crate) struct RootRangeEntry {
-    name: &'static str,
-    lo: *const u64,
-    hi: *const u64,
-}
-
-pub(crate) struct TraceRootEntry {
-    name: &'static str,
-    trace: Box<dyn FnMut(&mut dyn FnMut(*const u8))>,
-}
-
-pub(crate) struct EdgeSourceEntry {
-    name: &'static str,
-    report: Box<dyn FnMut(&mut EdgeSink<'_>)>,
-}
-
-pub(crate) struct SweepHookEntry {
-    name: &'static str,
-    hook: Box<dyn FnMut(&dyn Fn(*const u8) -> bool)>,
-}
-
-pub(crate) type RootRange = Registration<RootRangeEntry>;
-pub(crate) type TraceRoot = Registration<TraceRootEntry>;
-pub(crate) type EdgeSource = Registration<EdgeSourceEntry>;
-pub(crate) type SweepHook = Registration<SweepHookEntry>;
-
-impl Registration<RootRangeEntry> {
-    /// Re-point the range after its container reallocated.
-    ///
-    /// # Safety
-    /// As for [`Heap::add_root_range`].
-    pub(crate) unsafe fn set(&self, lo: *const u64, hi: *const u64) {
-        let mut entries = self
-            .registry
-            .entries
-            .try_borrow_mut()
-            .expect("root range re-pointed during collection");
-        let entry = entries[self.index].as_mut().expect("registered root range");
-        entry.lo = lo;
-        entry.hi = hi;
     }
 }
 
@@ -397,7 +271,8 @@ pub(crate) trait MarkClient {
     fn ephemerons(&self, sink: &mut EdgeSink<'_>);
 }
 
-/// The client of a collection driven by the heap itself (registered roots only).
+/// The client of a collection driven by the heap itself. It reports nothing: such a collection
+/// has no roots but the native stack, when it scans that.
 struct NoClient;
 
 impl MarkClient for NoClient {
@@ -407,10 +282,12 @@ impl MarkClient for NoClient {
     fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
 }
 
-/// Why a cell was marked: retention diagnostics (see [`Heap::set_retention_tracing`]).
+/// Why a cell was marked: retention diagnostics (see [`Heap::set_retention_tracing`]). Only
+/// tests read them, so only test builds record them.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum MarkSource {
-    /// A registered root range or trace root, or the embedder's roots.
+    /// The embedder's roots ([`MarkClient::roots`]).
     #[default]
     Root,
     /// The native stack word (or spilled register) at this address.
@@ -419,8 +296,9 @@ pub(crate) enum MarkSource {
     Cell(usize),
     /// A side-table slot of this owner.
     SideSlots(usize),
-    /// A conditional edge (ephemeron, side-table edge source) and its conditions.
-    Conditional { owner: usize, key: usize },
+    /// A conditional edge (an ephemeron, or a side-table edge from [`EdgeSink`]) and its
+    /// owner (0 for none).
+    Conditional { owner: usize },
 }
 
 /// Per-collection marking state. Built fresh every cycle, so nothing in it
@@ -428,7 +306,9 @@ pub(crate) enum MarkSource {
 #[derive(Default)]
 struct Marker {
     /// What is marking now, and (when retention tracing) each cell's first marker.
+    #[cfg(test)]
     source: MarkSource,
+    #[cfg(test)]
     parents: Option<FastMap<usize, MarkSource>>,
     worklist: Vec<(usize, DescId)>,
     edges: Vec<CondEdge>,
@@ -481,10 +361,6 @@ pub(crate) struct Heap {
     larges: BTreeMap<usize, LargeObj>,
     /// Address span of all large objects: cheap rejection of stack words.
     large_span: (usize, usize),
-    root_ranges: Rc<Registry<RootRangeEntry>>,
-    trace_roots: Rc<Registry<TraceRootEntry>>,
-    edge_sources: Rc<Registry<EdgeSourceEntry>>,
-    sweep_hooks: Rc<Registry<SweepHookEntry>>,
     /// Shared with NoGcScope/BorrowScope guards so a guard can be alive
     /// while `alloc(&mut self)` runs.
     control: Rc<Control>,
@@ -507,11 +383,14 @@ pub(crate) struct Heap {
     /// sweeping and the settings recompute it).
     due_check_bytes: usize,
     stats: GcStats,
+    #[cfg(test)]
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
+    #[cfg(test)]
     last_parents: FastMap<usize, MarkSource>,
     /// The last traced collection's frame-pointer chain, (frame record, return address), from
     /// the collector's frame outwards (aarch64 retention diagnostics).
+    #[cfg(test)]
     last_frames: Vec<(usize, usize)>,
 }
 
@@ -534,10 +413,6 @@ impl Heap {
             page_map: FastMap::default(),
             larges: BTreeMap::new(),
             large_span: (usize::MAX, 0),
-            root_ranges: Rc::default(),
-            trace_roots: Rc::default(),
-            edge_sources: Rc::default(),
-            sweep_hooks: Rc::default(),
             control: Rc::default(),
             allocated_bytes: 0,
             trigger_bytes: DEFAULT_MIN_TRIGGER,
@@ -549,8 +424,11 @@ impl Heap {
             due_word: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
+            #[cfg(test)]
             retention_tracing: false,
+            #[cfg(test)]
             last_parents: FastMap::default(),
+            #[cfg(test)]
             last_frames: Vec::new(),
         }
     }
@@ -563,65 +441,9 @@ impl Heap {
         id
     }
 
-    /// Register a Rust-heap root range of tagged words (VM operand stacks,
-    /// frame slot arrays). Words are recognized like stack words: anything
-    /// whose payload addresses a cell, interior addresses included.
-    ///
-    /// # Safety
-    /// `[lo, hi)` must stay readable, u64-aligned memory until the handle is
-    /// dropped or re-pointed with `RootRange::set`.
-    pub(crate) unsafe fn add_root_range(
-        &self,
-        name: &'static str,
-        lo: *const u64,
-        hi: *const u64,
-    ) -> RootRange {
-        self.root_ranges.insert(RootRangeEntry { name, lo, hi })
-    }
-
-    /// Register a traced Rust-heap container root (Decision 2 registry).
-    /// Its edges are unconditional; data owned by a cell belongs in an
-    /// edge source instead, or it would outlive (and leak) its owner.
-    pub(crate) fn add_trace_root(
-        &self,
-        name: &'static str,
-        trace: impl FnMut(&mut dyn FnMut(*const u8)) + 'static,
-    ) -> TraceRoot {
-        self.trace_roots.insert(TraceRootEntry {
-            name,
-            trace: Box::new(trace),
-        })
-    }
-
-    /// Register a side table whose edges are conditional on cells (Decision
-    /// 2): Map/Set data keyed by owner, WeakMap entries, FinalizationRegistry
-    /// held values. Reported once per collection, at the start of marking.
-    pub(crate) fn add_edge_source(
-        &self,
-        name: &'static str,
-        report: impl FnMut(&mut EdgeSink<'_>) + 'static,
-    ) -> EdgeSource {
-        self.edge_sources.insert(EdgeSourceEntry {
-            name,
-            report: Box::new(report),
-        })
-    }
-
-    /// Register a pre-sweep hook for address-keyed side tables (I8). The
-    /// hook receives `is_live(cell_start)`, valid for this collection.
-    pub(crate) fn add_sweep_hook(
-        &self,
-        name: &'static str,
-        hook: impl FnMut(&dyn Fn(*const u8) -> bool) + 'static,
-    ) -> SweepHook {
-        self.sweep_hooks.insert(SweepHookEntry {
-            name,
-            hook: Box::new(hook),
-        })
-    }
-
     /// Record why each cell is marked, for [`Heap::retention_path`] (diagnostics: costs a map
     /// entry per marked cell).
+    #[cfg(test)]
     pub(crate) fn set_retention_tracing(&mut self, on: bool) {
         self.retention_tracing = on;
         self.last_parents = FastMap::default();
@@ -630,6 +452,7 @@ impl Heap {
     /// For the last collection with retention tracing on: what marked the cell containing
     /// `addr`, then what marked that, back to a root or the native stack. Empty when the cell
     /// was not marked.
+    #[cfg(test)]
     pub(crate) fn retention_path(&self, addr: usize) -> Vec<(usize, &'static str, MarkSource)> {
         let mut path = Vec::new();
         let mut next = addr;
@@ -643,18 +466,17 @@ impl Heap {
             path.push((cell.start, self.descs[cell.desc.0 as usize].name, source));
             next = match source {
                 MarkSource::Cell(parent) | MarkSource::SideSlots(parent) => parent,
-                MarkSource::Conditional { owner, .. } if owner != 0 => owner,
+                MarkSource::Conditional { owner } if owner != 0 => owner,
                 _ => break,
             };
         }
         path
     }
 
-    /// The function owning the native-stack word at `addr` in the last traced collection: the
-    /// return address its callee saved (symbolize with addr2line against the binary). `None`
-    /// when no frame record covers `addr`.
     /// The return address into the function whose frame holds stack word `addr` in the last
-    /// traced collection, and how far below that frame's record the word lies.
+    /// traced collection (symbolize it with addr2line against the binary), and how far below
+    /// that frame's record the word lies. `None` when no frame record covers `addr`.
+    #[cfg(test)]
     pub(crate) fn frame_return_address(&self, addr: usize) -> Option<(usize, usize)> {
         // A frame record sits at the top of its frame: the owner of `addr` has the lowest
         // record at or above it; the record below that one holds the return into the owner.
@@ -763,6 +585,7 @@ impl Heap {
     /// collection requests are deferred, and a deferred collection runs at
     /// the next allocation or collection request after the outermost
     /// region exits, never at region exit itself (exit is not a safepoint).
+    #[cfg(test)]
     pub(crate) fn nogc(&self) -> NoGcScope {
         self.control
             .nogc_depth
@@ -775,6 +598,7 @@ impl Heap {
     /// I9 hook for S2's GcCell: hold one scope per outstanding Ref/RefMut.
     /// A collection requested meanwhile asserts in debug builds and defers
     /// in release builds.
+    #[cfg(test)]
     pub(crate) fn borrow_scope(&self) -> BorrowScope {
         self.control.borrows.set(self.control.borrows.get() + 1);
         BorrowScope {
@@ -800,6 +624,7 @@ impl Heap {
 
     /// A collection was requested but deferred; it runs at the next
     /// allocation or explicit request (wasm32: the next VM safepoint).
+    #[cfg(test)]
     pub(crate) fn collection_pending(&self) -> bool {
         self.control.pending_collect.get()
     }
@@ -1027,6 +852,7 @@ impl Heap {
 
     fn mark_cell(&mut self, cell: CellRef, m: &mut Marker) {
         if let Some(has_waiters) = self.mark(&cell) {
+            #[cfg(test)]
             if let Some(parents) = &mut m.parents {
                 parents.insert(cell.start, m.source);
             }
@@ -1047,13 +873,13 @@ impl Heap {
     }
 
     /// Request a collection with conservative native roots (Decision 0):
-    /// registered roots plus this thread's registered native stack chain
-    /// and a register snapshot. Returns false when the request is deferred
+    /// this thread's registered native stack chain and a register snapshot,
+    /// its only roots. Returns false when the request is deferred
     /// (pending until the next allocation or request): inside a no-GC
     /// region; while a GcCell borrow is outstanding (debug builds assert,
     /// I9); or when the native stack cannot be scanned soundly — no stack
-    /// registered on this thread (see [`enter_native_stack`]), SP outside
-    /// every registered region (e.g. an unregistered `stacker::grow`
+    /// registered on this thread (see [`register_thread_native_stack`]), SP
+    /// outside every registered region (e.g. an unregistered `stacker::grow`
     /// segment), or no scanner for this target (wasm32).
     pub(crate) fn collect(&mut self) -> bool {
         if self.blocked() {
@@ -1067,11 +893,12 @@ impl Heap {
         true
     }
 
-    /// Collect at a precise safepoint: registered roots only, no native
-    /// stack or registers. The caller guarantees no heap reference is held
-    /// solely in native frames or registers (wasm32 VM safepoints per the
-    /// S0 decision, task boundaries, tests). Deferred like [`Heap::collect`]
-    /// inside no-GC regions and while borrows are outstanding.
+    /// Collect with no roots at all (no native stack or registers, and no
+    /// embedder to report any), so every cell dies: for tests of what a
+    /// collection does rather than what it keeps. Deferred like
+    /// [`Heap::collect`] inside no-GC regions and while borrows are
+    /// outstanding.
+    #[cfg(test)]
     pub(crate) fn collect_at_safepoint(&mut self) -> bool {
         if self.blocked() {
             return self.defer(false);
@@ -1081,8 +908,8 @@ impl Heap {
         true
     }
 
-    /// Phase 1 of an embedder-driven collection: mark from the registered roots, `client`
-    /// and, when `native_roots`, this thread's native stack (deferred as for
+    /// Phase 1 of an embedder-driven collection: mark from `client`'s roots, side slots and
+    /// ephemerons and, when `native_roots`, this thread's native stack (deferred as for
     /// [`Heap::collect`] when it cannot be scanned soundly). Marks stay set until
     /// [`Heap::finish_collection`]; meanwhile the embedder sweeps its own tables using
     /// [`Heap::dead_cells`] and [`Heap::is_dead_target`]. Returns false when deferred, in
@@ -1098,9 +925,9 @@ impl Heap {
         true
     }
 
-    /// Phase 2: run sweep hooks, finalize the newly dead cells and free them, except those
-    /// whose address `pinned` reports still held by a weak handle (they become zombies until
-    /// a later collection finds them unpinned).
+    /// Phase 2: finalize the newly dead cells and free them, except those whose address
+    /// `pinned` reports still held by a weak handle (they become zombies until a later
+    /// collection finds them unpinned).
     pub(crate) fn finish_collection(&mut self, pinned: &dyn Fn(usize) -> bool) {
         assert!(
             self.control.collecting.get(),
@@ -1130,6 +957,7 @@ impl Heap {
 
     /// The allocated, non-zombie cells of `desc`: after a collection, the live ones.
     /// How many cells [`Heap::live_cells`] would list.
+    #[cfg(test)]
     pub(crate) fn live_count(&self, desc: DescId) -> usize {
         let paged: usize = self
             .pages
@@ -1207,17 +1035,19 @@ impl Heap {
         self.control.pending_collect.set(false);
         self.refresh_due();
         self.stats.collections += 1;
-        let mut m = Marker {
-            parents: self.retention_tracing.then(FastMap::default),
-            ..Marker::default()
-        };
-        self.mark_root_ranges(&mut m);
-        self.mark_trace_roots(&mut m);
+        let mut m = Marker::default();
+        #[cfg(test)]
+        {
+            m.parents = self.retention_tracing.then(FastMap::default);
+        }
         client.roots(&mut |word| self.mark_word(word, &mut m));
         if native_roots {
             self.mark_native_stack(&mut m);
         }
-        m.source = MarkSource::Root;
+        #[cfg(test)]
+        {
+            m.source = MarkSource::Root;
+        }
         self.add_source_edges(&mut m, client);
         client.side_slot_owners(&mut |owner| {
             // An owner outside this heap is not a condition: its slots are traced now.
@@ -1236,15 +1066,16 @@ impl Heap {
         });
         self.drain(&mut m, client);
         self.clear_dead_weak(&m);
-        #[cfg(debug_assertions)]
-        self.verify(&m);
+        if cfg!(debug_assertions) {
+            self.verify(&m);
+        }
+        #[cfg(test)]
         if let Some(parents) = m.parents.take() {
             self.last_parents = parents;
         }
     }
 
     fn sweep_phase(&mut self, pinned: &dyn Fn(usize) -> bool) {
-        self.run_sweep_hooks();
         let live_bytes = self.sweep(pinned);
         self.allocated_bytes = live_bytes;
         let budget =
@@ -1257,26 +1088,6 @@ impl Heap {
         self.refresh_due();
     }
 
-    fn mark_root_ranges(&mut self, m: &mut Marker) {
-        Rc::clone(&self.root_ranges).for_each(|range| {
-            let mut p = range.lo;
-            while p < range.hi {
-                // SAFETY: registered ranges are readable (add_root_range contract).
-                let word = unsafe { std::ptr::read(p) };
-                self.mark_word(word, m);
-                p = p.wrapping_add(1);
-            }
-        });
-    }
-
-    fn mark_trace_roots(&mut self, m: &mut Marker) {
-        let mut edges: Vec<*const u8> = Vec::new();
-        Rc::clone(&self.trace_roots).for_each(|root| (root.trace)(&mut |cell| edges.push(cell)));
-        for cell in edges {
-            self.mark_word(cell as u64, m);
-        }
-    }
-
     /// Decision 0 spill protocol. Never inlined: callee-saved registers are
     /// spilled into this frame, then the scan starts at this frame's SP, so
     /// every value a caller keeps in a callee-saved register is in `regs`,
@@ -1287,7 +1098,7 @@ impl Heap {
         let mut regs = [0u64; native::SPILL_WORDS];
         native::spill_registers(&mut regs);
         let sp = native::current_sp();
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(test, target_arch = "aarch64"))]
         if self.retention_tracing {
             self.last_frames.clear();
             let mut fp: usize;
@@ -1318,7 +1129,10 @@ impl Heap {
                 // and grow contracts); volatile keeps the compiler from reasoning
                 // about reads of other frames.
                 let word = unsafe { std::ptr::read_volatile(p as *const u64) };
-                m.source = MarkSource::Stack(p);
+                #[cfg(test)]
+                {
+                    m.source = MarkSource::Stack(p);
+                }
                 self.mark_word(word, m);
                 p += 8;
             }
@@ -1328,11 +1142,6 @@ impl Heap {
 
     fn add_source_edges(&mut self, m: &mut Marker, client: &dyn MarkClient) {
         let mut reported = Vec::new();
-        Rc::clone(&self.edge_sources).for_each(|source| {
-            (source.report)(&mut EdgeSink {
-                edges: &mut reported,
-            })
-        });
         client.ephemerons(&mut EdgeSink {
             edges: &mut reported,
         });
@@ -1357,7 +1166,10 @@ impl Heap {
     fn drain(&mut self, m: &mut Marker, client: &dyn MarkClient) {
         loop {
             while let Some((cell, desc)) = m.worklist.pop() {
-                m.source = MarkSource::Cell(cell);
+                #[cfg(test)]
+                {
+                    m.source = MarkSource::Cell(cell);
+                }
                 let desc = &self.descs[desc.0 as usize];
                 let (trace, weak) = (desc.trace, desc.weak);
                 let mut edges = std::mem::take(&mut m.trace_scratch);
@@ -1379,17 +1191,17 @@ impl Heap {
     }
 
     fn visit_weak(&mut self, cell: usize, weak: WeakFn, m: &mut Marker, client: &dyn MarkClient) {
-        let mut slots = std::mem::take(&mut m.slot_scratch);
-        let mut pairs = std::mem::take(&mut m.pair_scratch);
-        slots.clear();
-        pairs.clear();
-        weak(
-            cell as *mut u8,
-            &mut WeakSink {
-                weak_slots: &mut slots,
-                ephemerons: &mut pairs,
-            },
-        );
+        let mut sink = WeakSink {
+            weak_slots: std::mem::take(&mut m.slot_scratch),
+            ephemerons: std::mem::take(&mut m.pair_scratch),
+        };
+        sink.weak_slots.clear();
+        sink.ephemerons.clear();
+        weak(cell as *mut u8, &mut sink);
+        let WeakSink {
+            weak_slots: slots,
+            ephemerons: pairs,
+        } = sink;
         debug_assert!(
             slots
                 .iter()
@@ -1445,22 +1257,30 @@ impl Heap {
             }
         }
         m.edges[index as usize].fired = true;
-        let start = |cell: Option<CellRef>| cell.map_or(0, |cell| cell.start);
+        #[cfg(test)]
         let saved = m.source;
         match value {
             EdgeValue::Word(word) => {
-                m.source = MarkSource::Conditional {
-                    owner: start(conditions[0]),
-                    key: start(conditions[1]),
-                };
+                #[cfg(test)]
+                {
+                    m.source = MarkSource::Conditional {
+                        owner: conditions[0].map_or(0, |cell| cell.start),
+                    };
+                }
                 self.mark_word(word, m);
             }
             EdgeValue::SideSlots(owner) => {
-                m.source = MarkSource::SideSlots(owner);
+                #[cfg(test)]
+                {
+                    m.source = MarkSource::SideSlots(owner);
+                }
                 client.trace_side_slots(owner, &mut |word| self.mark_word(word, m));
             }
         }
-        m.source = saved;
+        #[cfg(test)]
+        {
+            m.source = saved;
+        }
     }
 
     fn wait_on(&mut self, cell: &CellRef, edge: u32, m: &mut Marker) {
@@ -1554,17 +1374,6 @@ impl Heap {
                 );
             }
         }
-    }
-
-    /// Exact liveness for side-table keys: `addr` must be a cell start.
-    fn is_live(&self, addr: usize) -> bool {
-        self.locate(addr as u64)
-            .is_some_and(|cell| cell.start == addr && self.is_marked(&cell))
-    }
-
-    fn run_sweep_hooks(&self) {
-        Rc::clone(&self.sweep_hooks)
-            .for_each(|entry| (entry.hook)(&|cell| self.is_live(cell as usize)));
     }
 
     /// Finalize, poison (debug) and free unmarked cells, release empty
@@ -1781,10 +1590,12 @@ pub(crate) struct Control {
 /// RAII no-GC region (I9). Collection requests inside are deferred.
 /// Holds only the shared control block, so `alloc(&mut Heap)` remains
 /// callable while the guard is alive.
+#[cfg(test)]
 pub(crate) struct NoGcScope {
     control: Rc<Control>,
 }
 
+#[cfg(test)]
 impl Drop for NoGcScope {
     fn drop(&mut self) {
         self.control
@@ -1794,10 +1605,12 @@ impl Drop for NoGcScope {
 }
 
 /// An outstanding GcCell borrow (I9); see [`Heap::borrow_scope`].
+#[cfg(test)]
 pub(crate) struct BorrowScope {
     control: Rc<Control>,
 }
 
+#[cfg(test)]
 impl Drop for BorrowScope {
     fn drop(&mut self) {
         self.control.borrows.set(self.control.borrows.get() - 1);
@@ -1808,9 +1621,10 @@ impl Drop for BorrowScope {
 /// top, as holding heap references (Decision 0). Conservative collections
 /// on this thread scan it, plus segments entered through [`grow`]; without
 /// a declaration they defer. Nested declarations are no-ops.
+#[cfg(test)]
 pub(crate) struct NativeStackScope {
     registered: bool,
-    _thread: PhantomData<*const ()>,
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 /// # Safety
@@ -1818,13 +1632,15 @@ pub(crate) struct NativeStackScope {
 /// frame that holds heap references across collections while the scope is
 /// alive, and the scope must be dropped on this thread outside any segment
 /// entered through [`grow`].
+#[cfg(test)]
 pub(crate) unsafe fn enter_native_stack(top: *const u8) -> NativeStackScope {
     NativeStackScope {
         registered: native::enter(top as usize),
-        _thread: PhantomData,
+        _thread: std::marker::PhantomData,
     }
 }
 
+#[cfg(test)]
 impl Drop for NativeStackScope {
     fn drop(&mut self) {
         if self.registered {
@@ -2144,6 +1960,7 @@ mod native {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn exit() {
         REGIONS.with(|regions| {
             let mut regions = regions.borrow_mut();
@@ -2320,9 +2137,7 @@ mod native {
 )))]
 mod native {
     //! No conservative scanner for this target (wasm32 cannot scan its
-    //! stack): `Heap::collect` always defers, and collections run only at
-    //! precise safepoints (`Heap::collect_at_safepoint`), per the S0 wasm32
-    //! decision.
+    //! stack): every collection that would scan the native stack defers.
     pub(super) const SPILL_WORDS: usize = 1;
 
     pub(super) fn spill_registers(_: &mut [u64; SPILL_WORDS]) {}
@@ -2339,10 +2154,12 @@ mod native {
         None
     }
 
+    #[cfg(test)]
     pub(super) fn enter(_: usize) -> bool {
         false
     }
 
+    #[cfg(test)]
     pub(super) fn exit() {}
 
     pub(super) fn enter_thread() -> bool {
@@ -2363,6 +2180,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -2382,12 +2200,12 @@ mod tests {
     fn trace_none(_: *const u8, _: &mut dyn FnMut(*const u8)) {}
 
     /// WeakRef-like cell: word 0 is a weak target slot.
-    fn weak_target(cell: *mut u8, sink: &mut WeakSink<'_>) {
+    fn weak_target(cell: *mut u8, sink: &mut WeakSink) {
         sink.weak_slot(cell as *mut u64);
     }
 
     /// WeakMap-like cell: four (key, value) ephemeron entries.
-    fn weak_entries(cell: *mut u8, sink: &mut WeakSink<'_>) {
+    fn weak_entries(cell: *mut u8, sink: &mut WeakSink) {
         let words = cell as *mut u64;
         for entry in 0..4 {
             unsafe { sink.ephemeron(words.add(2 * entry), words.add(2 * entry + 1)) };
@@ -2408,7 +2226,8 @@ mod tests {
         leaf: DescId,
         weakref: DescId,
         table: DescId,
-        _roots: RootRange,
+        /// The words the Fixture's client reports as roots. Boxed, off the native stack: a
+        /// collection the heap drives itself, which has no client, does not see them.
         roots: Box<[u64; 64]>,
     }
 
@@ -2439,19 +2258,13 @@ mod tests {
                 weak: Some(weak_entries),
                 finalize: None,
             });
-            let roots = Box::new([0u64; 64]);
-            // SAFETY: `roots` is declared after `_roots`, so it outlives it.
-            let _roots = unsafe {
-                heap.add_root_range("test-roots", roots.as_ptr(), roots.as_ptr().add(64))
-            };
             Self {
                 heap,
                 node,
                 leaf,
                 weakref,
                 table,
-                _roots,
-                roots,
+                roots: Box::new([0; 64]),
             }
         }
 
@@ -2479,16 +2292,61 @@ mod tests {
             word(p, 1)
         }
 
-        /// Precise collection: native frames are not roots, so death
-        /// assertions do not depend on what registers happen to retain.
+        /// Precise collection through the Fixture's client: native frames are
+        /// not roots, so death assertions do not depend on what registers
+        /// happen to retain.
         fn collect(&mut self) {
-            assert!(self.heap.collect_at_safepoint());
+            self.collect_with(&no_edges);
+        }
+
+        /// [`Fixture::collect`] whose client also reports side-table edges
+        /// and ephemerons through `edges`.
+        fn collect_with(&mut self, edges: &dyn Fn(&mut EdgeSink<'_>)) {
+            assert!(self.start_marking(edges));
+            self.heap.finish_collection(&|_| false);
+        }
+
+        /// Phase 1 of [`Fixture::collect_with`], without native roots.
+        fn start_marking(&mut self, edges: &dyn Fn(&mut EdgeSink<'_>)) -> bool {
+            let client = FixtureClient {
+                roots: &self.roots[..],
+                edges,
+            };
+            self.heap.start_marking(false, &client)
         }
 
         fn live(&self) -> usize {
             self.heap.stats().live_cells
         }
     }
+
+    /// The Fixture's embedder, as the interpreter is the engine's: it reports
+    /// the Fixture's root words, and through `edges` the edges and ephemerons
+    /// of side tables, which reach the heap through the EdgeSink the engine's
+    /// client uses.
+    struct FixtureClient<'a> {
+        roots: &'a [u64],
+        edges: &'a dyn Fn(&mut EdgeSink<'_>),
+    }
+
+    impl MarkClient for FixtureClient<'_> {
+        fn roots(&self, sink: &mut dyn FnMut(u64)) {
+            for &root in self.roots {
+                sink(root);
+            }
+        }
+
+        fn side_slot_owners(&self, _: &mut dyn FnMut(usize)) {}
+
+        fn trace_side_slots(&self, _: usize, _: &mut dyn FnMut(u64)) {}
+
+        fn ephemerons(&self, sink: &mut EdgeSink<'_>) {
+            (self.edges)(sink);
+        }
+    }
+
+    /// The side tables of a client that has none.
+    fn no_edges(_: &mut EdgeSink<'_>) {}
 
     fn word(p: *const u8, index: usize) -> u64 {
         unsafe { std::ptr::read((p as *const u64).add(index)) }
@@ -2701,29 +2559,30 @@ mod tests {
     #[test]
     fn edge_sources_trace_side_tables_through_their_owners() {
         let mut fx = Fixture::new();
-        // Map-like side table: (owner, value), pruned by its sweep hook.
-        let table: Rc<RefCell<Vec<(usize, u64)>>> = Rc::default();
-        let entries = Rc::clone(&table);
-        let _source = fx.heap.add_edge_source("map-data", move |sink| {
-            for &(owner, value) in entries.borrow().iter() {
+        // Map-like side table: (owner, value), reported through the client's
+        // EdgeSink and pruned between the phases, as the engine prunes its own.
+        let table: RefCell<Vec<(usize, u64)>> = RefCell::default();
+        let edges = |sink: &mut EdgeSink<'_>| {
+            for &(owner, value) in table.borrow().iter() {
                 sink.edge(owner as *const u8, value);
             }
-        });
-        let entries = Rc::clone(&table);
-        let _hook = fx.heap.add_sweep_hook("map-data", move |is_live| {
-            entries
+        };
+        let collect = |fx: &mut Fixture| {
+            assert!(fx.start_marking(&edges));
+            table
                 .borrow_mut()
-                .retain(|&(owner, _)| is_live(owner as *const u8));
-        });
+                .retain(|&(owner, _)| !fx.heap.is_dead_target(owner));
+            fx.heap.finish_collection(&|_| false);
+        };
         let owner = fx.alloc_node(0, 1);
         // The value points back at its owner: a cycle through the table.
         let value = fx.alloc_node(tagged(owner), 2);
         table.borrow_mut().push((owner as usize, tagged(value)));
         fx.roots[0] = tagged(owner);
-        fx.collect();
+        collect(&mut fx);
         assert_eq!(fx.live(), 2);
         fx.roots[0] = 0;
-        fx.collect();
+        collect(&mut fx);
         assert_eq!(fx.live(), 0, "a cycle through a side table is collected");
         assert!(table.borrow().is_empty());
     }
@@ -2731,13 +2590,14 @@ mod tests {
     #[test]
     fn source_ephemerons_need_both_owner_and_key() {
         let mut fx = Fixture::new();
-        let table: Rc<RefCell<Vec<(usize, u64, u64)>>> = Rc::default();
-        let entries = Rc::clone(&table);
-        let _source = fx.heap.add_edge_source("weak-collection", move |sink| {
-            for &(owner, key, value) in entries.borrow().iter() {
+        // WeakMap-like side table: (owner, key, value), reported through the
+        // client's EdgeSink.
+        let table: RefCell<Vec<(usize, u64, u64)>> = RefCell::default();
+        let ephemerons = |sink: &mut EdgeSink<'_>| {
+            for &(owner, key, value) in table.borrow().iter() {
                 sink.ephemeron(owner as *const u8, key, value);
             }
-        });
+        };
         let [map, key, value, dead_map, key2, value2] = [0; 6].map(|_| fx.heap.alloc(fx.leaf, 16));
         table.borrow_mut().extend([
             (map as usize, tagged(key), tagged(value)),
@@ -2746,16 +2606,16 @@ mod tests {
         for (slot, cell) in [map, key, key2].into_iter().enumerate() {
             fx.roots[slot] = tagged(cell);
         }
-        fx.collect();
+        fx.collect_with(&ephemerons);
         assert!(fx.heap.is_allocated_word(value as u64), "live map and key");
         assert!(!fx.heap.is_allocated_word(value2 as u64), "dead map");
         fx.roots[1] = 0;
         table.borrow_mut().truncate(1);
-        fx.collect();
+        fx.collect_with(&ephemerons);
         assert!(!fx.heap.is_allocated_word(value as u64), "dead key");
     }
 
-    /// A side table still holding a freed cell (a source bug) must not hang
+    /// A side table still holding a freed cell (a client bug) must not hang
     /// marking, as the old ephemeron loop did; debug verification reports it.
     #[test]
     #[cfg_attr(
@@ -2768,10 +2628,7 @@ mod tests {
         let freed = fx.heap.alloc(fx.leaf, 16) as u64;
         fx.roots[0] = tagged(anchor);
         fx.collect();
-        let _source = fx.heap.add_edge_source("stale", move |sink| {
-            sink.ephemeron(std::ptr::null(), tagged(anchor), freed);
-        });
-        fx.collect();
+        fx.collect_with(&|sink| sink.ephemeron(std::ptr::null(), tagged(anchor), freed));
         assert_eq!(fx.live(), 1);
     }
 
@@ -2981,11 +2838,7 @@ mod tests {
         let anchor = fx.heap.alloc(fx.leaf, 4096);
         fx.roots[0] = tagged(anchor);
         let pinned = fx.heap.alloc(fx.leaf, 4096) as usize;
-        let client = TableClient {
-            roots: Vec::new(),
-            side_slots: Vec::new(),
-        };
-        assert!(fx.heap.start_marking(false, &client));
+        assert!(fx.start_marking(&no_edges));
         assert_eq!(fx.heap.dead_cells(fx.leaf), vec![pinned]);
         fx.heap.finish_collection(&|addr| addr == pinned);
         assert_eq!(FIN_COUNT.with(|c| c.get()), 1, "finalized when it died");
@@ -3000,7 +2853,7 @@ mod tests {
                 "no reuse while pinned"
             );
         }
-        assert!(fx.heap.start_marking(false, &client));
+        assert!(fx.start_marking(&no_edges));
         assert!(
             fx.heap.dead_cells(fx.leaf).len() >= 14,
             "zombies are not reported as newly dead"
@@ -3150,40 +3003,21 @@ mod tests {
     }
 
     #[test]
-    fn sweep_hook_sees_liveness_for_side_tables() {
-        let mut fx = Fixture::new();
-        let live = fx.alloc_node(0, 1);
-        let dead = fx.alloc_node(0, 2);
-        let table: Rc<RefCell<FastMap<usize, u64>>> = Rc::default();
-        table.borrow_mut().insert(live as usize, 10);
-        table.borrow_mut().insert(dead as usize, 20);
-        let t = Rc::clone(&table);
-        let _hook = fx.heap.add_sweep_hook("test-table", move |is_live| {
-            t.borrow_mut().retain(|&addr, _| is_live(addr as *const u8));
-        });
-        fx.roots[0] = tagged(live);
-        fx.collect();
-        let t = table.borrow();
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[&(live as usize)], 10);
-    }
-
-    #[test]
     fn stress_graph_survives_collect_every_alloc() {
         let mut fx = Fixture::new();
         let top = 0u64;
         let _stack = unsafe { enter_native_stack(stack_top(&top)) };
         fx.heap.set_stress_every(1);
-        // Build a 200-node chain under stress, rooting the head and keeping
-        // every intermediate reachable through the chain.
+        // Build a 200-node chain under stress, keeping every intermediate
+        // reachable through the chain. The allocation-triggered collections
+        // find the head in this frame; the final precise one in roots[0].
         let mut head: *mut u8 = fx.alloc_node(0, 0);
-        fx.roots[0] = tagged(head);
         for i in 1..200u64 {
             head = fx.alloc_node(tagged(head), i);
-            fx.roots[0] = tagged(head);
             let _garbage = fx.heap.alloc(fx.leaf, 16);
         }
         assert!(fx.heap.stats().collections >= 398);
+        fx.roots[0] = tagged(head);
         fx.collect();
         assert_eq!(fx.live(), 200);
         let mut p = head as *const u8;
@@ -3597,65 +3431,6 @@ mod tests {
     }
 
     #[test]
-    fn dropping_or_repointing_a_root_range_takes_effect() {
-        let mut fx = Fixture::new();
-        let a = fx.heap.alloc(fx.leaf, 16);
-        let first = Box::new([a as u64]);
-        let range = unsafe {
-            fx.heap
-                .add_root_range("r", first.as_ptr(), first.as_ptr().add(1))
-        };
-        fx.collect();
-        assert!(fx.heap.is_allocated_word(a as u64));
-        let b = fx.heap.alloc(fx.leaf, 16);
-        let second = Box::new([b as u64]);
-        unsafe { range.set(second.as_ptr(), second.as_ptr().add(1)) };
-        fx.collect();
-        assert!(!fx.heap.is_allocated_word(a as u64));
-        assert!(fx.heap.is_allocated_word(b as u64));
-        drop(range);
-        fx.collect();
-        assert_eq!(fx.live(), 0);
-    }
-
-    #[test]
-    fn dropped_trace_roots_and_sources_stop_rooting() {
-        let mut fx = Fixture::new();
-        let a = fx.heap.alloc(fx.leaf, 16) as u64;
-        let b = fx.heap.alloc(fx.leaf, 16) as u64;
-        let root = fx
-            .heap
-            .add_trace_root("a", move |visit| visit(a as *const u8));
-        let source = fx
-            .heap
-            .add_edge_source("b", move |sink| sink.edge(std::ptr::null(), b));
-        fx.collect();
-        assert_eq!(fx.live(), 2);
-        drop((root, source));
-        fx.collect();
-        assert_eq!(fx.live(), 0);
-    }
-
-    #[test]
-    fn a_hook_dropping_another_hook_mid_pass_is_deferred() {
-        let mut fx = Fixture::new();
-        let calls = Rc::new(Cell::new(0));
-        let victim: Rc<RefCell<Option<SweepHook>>> = Rc::default();
-        let slot = Rc::clone(&victim);
-        let _killer = fx.heap.add_sweep_hook("killer", move |_| {
-            slot.borrow_mut().take();
-        });
-        let counter = Rc::clone(&calls);
-        *victim.borrow_mut() = Some(fx.heap.add_sweep_hook("victim", move |_| {
-            counter.set(counter.get() + 1);
-        }));
-        fx.collect();
-        fx.collect();
-        assert_eq!(calls.get(), 0);
-        assert!(victim.borrow().is_none());
-    }
-
-    #[test]
     fn dropping_the_heap_finalizes_every_remaining_cell() {
         FIN_COUNT.with(|c| c.set(0));
         {
@@ -3701,7 +3476,8 @@ mod tests {
         let mut fx = Fixture::new();
         let top = 0u64;
         let _stack = unsafe { enter_native_stack(stack_top(&top)) };
-        fx.build_chain(1 << 18); // 4 MiB live
+        // The allocation-triggered collections find the chain's head in this frame.
+        let head = fx.build_chain(1 << 18); // 4 MiB live
         let before = fx.heap.stats().collections;
         for _ in 0..1 << 19 {
             black_box(fx.heap.alloc(fx.leaf, 16)); // 8 MiB of garbage
@@ -3711,7 +3487,7 @@ mod tests {
             during <= 3,
             "8 MiB churn over a 4 MiB live heap took {during} collections"
         );
-        black_box(&top);
+        black_box((&top, &head));
     }
 
     #[test]
@@ -3719,16 +3495,17 @@ mod tests {
         let mut fx = Fixture::new();
         let top = 0u64;
         let _stack = unsafe { enter_native_stack(stack_top(&top)) };
-        for slot in 0..16 {
-            let p = fx.heap.alloc(fx.leaf, 2 << 20);
-            fx.roots[slot] = tagged(p);
+        // Retained in this frame, where the allocation-triggered collections find them.
+        let mut held = [0u64; 16];
+        for slot in &mut held {
+            *slot = tagged(fx.heap.alloc(fx.leaf, 2 << 20));
         }
         let collections = fx.heap.stats().collections;
         assert!(
             collections <= 6,
             "16 retained 2 MiB allocations took {collections} collections"
         );
-        black_box(&top);
+        black_box((&top, &held));
     }
 
     #[test]
@@ -3793,7 +3570,8 @@ mod tests {
         let top = 0u64;
         let _stack = unsafe { enter_native_stack(stack_top(&top)) };
         let start = Instant::now();
-        fx.build_chain(1 << 20);
+        // The allocation-triggered collections find the chain's head in this frame.
+        let head = fx.build_chain(1 << 20);
         let build = start.elapsed();
         let before = fx.heap.stats().collections;
         let start = Instant::now();
@@ -3805,30 +3583,7 @@ mod tests {
             start.elapsed(),
             fx.heap.stats().collections - before
         );
-        black_box(&top);
-    }
-
-    #[test]
-    #[ignore]
-    fn perf_collect_with_sweep_hook() {
-        let mut fx = Fixture::new();
-        {
-            let _scope = fx.heap.nogc();
-            fx.build_chain(1 << 20);
-        }
-        fx.collect();
-        let start = Instant::now();
-        fx.collect();
-        let bare = start.elapsed();
-        let _hook = fx.heap.add_sweep_hook("noop", |is_live| {
-            black_box(is_live(std::ptr::null()));
-        });
-        let start = Instant::now();
-        fx.collect();
-        eprintln!(
-            "perf collect, 1M live cells: no hooks {bare:?}, one no-op hook {:?}",
-            start.elapsed()
-        );
+        black_box((&top, &head));
     }
 
     #[test]
@@ -3841,16 +3596,20 @@ mod tests {
                     let _scope = heap.nogc();
                     (0..count).map(|_| heap.alloc(blob, size) as u64).collect()
                 };
-                let noise: Vec<u64> = (0..32768u64).map(|i| i * 0x9e37_79b9).collect();
-                let _objects = unsafe {
-                    heap.add_root_range("objects", objects.as_ptr(), objects.as_ptr().add(count))
+                let noise = (0..32768u64).map(|i| i * 0x9e37_79b9);
+                // Rooted like the Fixture: the objects and the noise are its client's roots.
+                let roots: Vec<u64> = objects.into_iter().chain(noise).collect();
+                let client = FixtureClient {
+                    roots: &roots,
+                    edges: &no_edges,
                 };
-                let _noise = unsafe {
-                    heap.add_root_range("noise", noise.as_ptr(), noise.as_ptr().add(noise.len()))
+                let mut collect = || {
+                    assert!(heap.start_marking(false, &client));
+                    heap.finish_collection(&|_| false);
                 };
-                heap.collect_at_safepoint();
+                collect();
                 let start = Instant::now();
-                heap.collect_at_safepoint();
+                collect();
                 eprintln!(
                     "perf {label} x {count} + 32k words: collect {:?}",
                     start.elapsed()

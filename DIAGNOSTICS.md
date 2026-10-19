@@ -110,10 +110,10 @@ comment/example in the same change.
   collector tuning. `TRUST_JS_GC_CENSUS=1` adds a
   `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
-  heap at each collection; diagnostic only). `TRUST_JS_GC_WHY=1` records why each cell
-  was marked; tests print the path with `gc_test::why`/`why_address` (a stack root names
-  its frame's return address, for `addr2line`, and its depth below that frame's record).
-  In test builds, `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.
+  heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records
+  why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a
+  stack root names its frame's return address, for `addr2line`, and its depth below that
+  frame's record), and `TRUST_JS_SEGV_BACKTRACE=1` prints a backtrace on a fault.
 - On GNU/Linux, `TRUST_JS_JIT_GPROFNG=1 gprofng collect app -o profile.er ...`
   registers live generated-code symbols with the already-loaded gprofng collector.
   Labels show the chunk's first local names, not source function names. This is

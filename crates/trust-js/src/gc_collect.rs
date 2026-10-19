@@ -64,7 +64,8 @@ fn gc_min_heap_bytes() -> usize {
 pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_heap_growth(gc_min_heap_bytes(), 100);
     core.set_stress_every(gc_stress());
-    // `TRUST_JS_GC_WHY=1`: record retention paths (see `gc_test::why`).
+    // `TRUST_JS_GC_WHY=1`: record retention paths, which only tests read (see `gc_test::why`).
+    #[cfg(test)]
     if std::env::var_os("TRUST_JS_GC_WHY").is_some() {
         core.set_retention_tracing(true);
     }

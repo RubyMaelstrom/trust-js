@@ -4544,3 +4544,82 @@ The move_collection fix (step 8's recorded deviation, after 8b):
     its baseline; under Wine 2068 pass, 3 fail (step 1's snapshot
     codec tests) and 8 are ignored. Both lists step 8b's plus the
     new test.
+
+Step 8c, gc_core's registration surface gone, its tests re-rooted
+(an implementation agent's change, reviewed):
+- Deleted: the S1 surface for registered Rust-heap roots, which
+  nothing outside gc_core used (Registry, Registration and its Drop,
+  the RootRange, TraceRoot, EdgeSource and SweepHook entries, the
+  four add_* methods, the heap's four registry fields, the marking
+  of root ranges and trace roots, the edge-source loop, the sweep
+  hooks), with the docs that described it; Heap::is_live and
+  MarkSource::Conditional's key, which nothing else read.
+- The module-wide allow(dead_code) went with it (the recorded
+  deviation): 39 items and statements only tests use are now
+  cfg(test), among them collect_at_safepoint, nogc, borrow_scope,
+  enter_native_stack and retention tracing. configure_heap reads
+  TRUST_JS_GC_WHY in test builds only, and other builds' marking
+  keeps no record of what marked each cell. The debug verifier is
+  called under `if cfg!(debug_assertions)`, so release builds
+  compile it too, and WeakSink owns the marker's two scratch vectors
+  while a weak callback runs.
+- Tests: the fixture's 64 root words reach the heap through a test
+  MarkClient, and its collections run start_marking and
+  finish_collection, as the engine's do. Five tests of the deleted
+  surface went (root ranges re-pointed and dropped, trace roots and
+  sources dropped, a hook dropping another, sweep-hook liveness, the
+  ignored sweep-hook perf test). Three side-table tests report
+  through the client's EdgeSink instead, pruning between the phases
+  as the engine does, with their assertions unchanged. Four tests
+  whose collections the heap drives (stress, the budget, retained
+  large objects, perf churn) hold their roots in their own frames,
+  where the conservative scan finds them.
+- Mutation check: with the fixture's client reporting no roots, 16
+  of the 38 gc_core tests that run in debug fail, survival tests
+  among them.
+- Review: TRUST_JS_GC_WHY's read moved under cfg(test) in
+  configure_heap, replacing a set_retention_tracing that did nothing
+  outside tests; DIAGNOSTICS.md says it is a test-build diagnostic;
+  frame_return_address's two doc comments merged into one.
+- Open, for step 10's plan: the in-cell weak callbacks have no
+  engine user either. Every engine descriptor has `weak: None`, and
+  only gc_core's tests report weak slots or ephemerons through a
+  WeakSink. The nursery's plan decides whether they stay.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2227/0/7, its test list the parent's less the five
+    tests that went; clippy clean in the five configurations;
+    rustfmt clean; the workspace builds with all targets without a
+    diagnostic; rustdoc's 40 warnings are 8b's. gc_core's tests in
+    release, no-LTO and fat LTO: 36 pass, 4 ignored.
+  - gc_core.rs and fasthash.rs in a crate of their own: 38 pass in
+    debug and 36 in release, 4 ignored each.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1 (load average up to 56).
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash. The
+    fixtures' code dumps are the parent's, plain and with the shared
+    stubs in both modes.
+  - Per-test GC stress with the verifier and poisoning, aarch64, the
+    960 tests whose names match the JIT's, the stack's and the
+    collector's areas: 936 pass at interval 1 (5 are ignored), the
+    slow lists' 15 at 100 and 3 at 1000. One,
+    tests::weakmap_uses_ephemeron_liveness, ran out its 900 s at
+    interval 1 with the load average up to 56. Alone it passes in
+    both builds: side by side at interval 1 the parent took 823 s
+    and 8c 855 s, and at interval 20 their user instructions and
+    cycles agree within 0.1% (147.5e9 and 147.6e9 instructions, two
+    runs each). Its 10,000-link ephemeron chain makes it the slowest
+    test at interval 1; zombie passes it there.
+  - x86-64 (zombie): clippy clean; lib 2071/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2064 pass, 3 fail
+    (step 1's snapshot codec tests) and 7 are ignored. Both lists the
+    parent's less the five tests that went.
+  - The scanner tests (gc_core) on x86-64 Linux and on Windows under
+    Wine: in-tree in the no-LTO release build and with fat LTO, 36
+    pass and 4 are ignored on each; gc_core.rs and fasthash.rs in a
+    crate of their own pass on both in debug (38) and in release at
+    opt-level 0/1/2/3/s/z, target-cpu=native and fat LTO (36).
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2078 tests: 2045 pass and 7 are
+    ignored at interval 1 (3,862 s); the slow lists' 22 pass at 100
+    and their 4 at 1000.
