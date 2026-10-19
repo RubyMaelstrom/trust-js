@@ -280,7 +280,7 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
             .is_none());
     }
     engine.interp.call_overflow.raw_sets = original_sets;
-    // gc-heap owners carry no count: the probe leaves the callee's operand word and cell
+    // Owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
     assert!(
         matches!(&operand[0].unpack(), Value::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),

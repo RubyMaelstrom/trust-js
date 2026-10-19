@@ -399,7 +399,7 @@ pub(crate) fn object_own_property_keys(
     if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
         return proxy_own_keys(i, &target, &handler);
     }
-    // Rooted (gc-heap): callers walk the keys while running traps and getters.
+    // Rooted: callers walk the keys while running traps and getters.
     let mut out: crate::rooting::RootedVec = if let Some(info) = ta_info(i, o) {
         (0..i.ta_len(&info).unwrap_or(0))
             .map(|k| Value::lstr(k.to_string()))
@@ -1964,7 +1964,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         }
     }
     let proxy = proxy_pair(i, obj);
-    // A Symbol key's cell (gc-heap) stays rooted while the traps below run.
+    // A Symbol key's cell stays rooted while the traps below run.
     let mut key_roots = crate::rooting::ValueRoots::new();
     let keys: Vec<crate::value::PropertyKey> = if let Some((t, h)) = &proxy {
         let mut ks = Vec::new();
@@ -2068,7 +2068,7 @@ fn object_define_properties(
     who: &str,
 ) -> Result<(), Value> {
     let props = Value::Obj(to_object_arg(i, props_arg, who)?);
-    // Rooted (gc-heap): a Symbol key's cell outlives traps and getters, which may delete it.
+    // Rooted: a Symbol key's cell outlives traps and getters, which may delete it.
     let keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
         crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &props) {
             let mut ks = Vec::new();
@@ -4530,7 +4530,7 @@ fn install_object(it: &mut Interp) {
         }
         if let Some(length) = i.host_indexed_len(&o) {
             let own_keys = ordinary_own_keys_ordered(i, &o)?;
-            // Rooted (gc-heap): the platform getter below runs between keys.
+            // Rooted: the platform getter below runs between keys.
             let mut keys = crate::rooting::RootedVec::from_vec(Vec::with_capacity(
                 own_keys.len().max(length as usize),
             ));
@@ -9291,7 +9291,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     };
     // Open the inputs in order, GetIteratorFlattenable each as it is read. The lists are
     // rooted across the author code each step runs (I1).
-    // Rooted (gc-heap): a Symbol key's cell, like the iterators, outlives author code.
+    // Rooted: a Symbol key's cell, like the iterators, outlives author code.
     let mut keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
         crate::rooting::Rooted::new(Vec::new());
     let mut iters = crate::rooting::RootedVec::new();
@@ -11585,7 +11585,7 @@ fn install_string(it: &mut Interp) {
         // error timing.  If a surrogate boundary needs canonicalization, fall back immediately
         // to the old stepwise path; otherwise each intermediate byte length is just the sum and
         // all pieces can be copied once into one LStr allocation.
-        // Rooted (gc-heap): ToString of a later argument may run user code.
+        // Rooted: ToString of a later argument may run user code.
         let mut parts = crate::rooting::Rooted::new(Vec::with_capacity(args.len() + 1));
         parts.push(s);
         let mut total = parts[0].len();

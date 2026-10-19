@@ -175,7 +175,7 @@ impl Interp {
     /// `finish_cached_accessor`. `None` declines to the ordinary resolution.
     ///
     /// # Safety
-    /// `holder` must be the `Rc::as_ptr` of an object on `receiver`'s live prototype
+    /// `holder` must be the `Gc::as_ptr` of an object on `receiver`'s live prototype
     /// chain (or the receiver itself), published by the template during this synchronous
     /// helper call. The caller roots `receiver`, which transitively keeps the holder
     /// alive for the read, exactly as in `ic_shape_probe`'s raw chain walk.

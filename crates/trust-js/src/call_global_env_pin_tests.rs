@@ -62,8 +62,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     // The program's function AST, unlike its per-Realm callable, survives the settings change.
     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     let program = engine.interp.shared_snapshot_program(bytes).unwrap();
-    // The completion value (the caller function) stays in a helper frame: gc-heap scans the
-    // stack.
+    // The completion value (the caller function) stays in a helper frame: the collector scans
+    // the stack.
     assert!(crate::gc_test::in_frame(|| engine
         .interp
         .run_classic_program(&program, None)
@@ -75,7 +75,7 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
         );
     }
     // Handles and addresses of the old settings environment's objects stay in helper frames:
-    // gc-heap scans the stack.
+    // the collector scans the stack.
     let (subject, function) = crate::gc_test::in_frame(|| {
         let subject = engine
             .interp

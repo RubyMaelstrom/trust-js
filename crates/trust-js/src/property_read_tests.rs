@@ -281,8 +281,8 @@ fn getter_cache_owned_snapshot_stays_two_words() {
 #[test]
 fn getter_cache_packed_data_snapshot_materializes_lazy_prototype_before_owner_drops() {
     let mut engine = Engine::new();
-    // Strong handles live only in helper frames (gc-heap scans the stack): the outer one keeps
-    // the snapshot, the inner one the function.
+    // Strong handles live only in helper frames (the collector scans the stack): the outer one
+    // keeps the snapshot, the inner one the function.
     let weak = crate::gc_test::in_frame(|| {
         let (read, weak) = crate::gc_test::in_frame(|| {
             let function = engine
@@ -328,7 +328,7 @@ fn getter_cache_records_all_live_chain_levels_and_releases_getter_owners() {
     for depth in 0..=6 {
         let cache = [const { Cell::new(IcState::EMPTY) }; PROP_IC_WAYS];
         let holder = Object::new(None);
-        // The getter lives only in this helper frame (gc-heap scans the stack).
+        // The getter lives only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let getter = engine.interp.new_native_fn(
                 "get cached",
@@ -520,7 +520,7 @@ fn getter_cache_reentrant_computed_growth_keeps_owned_result_and_live_replacemen
     let object = Object::new(None);
     let key = crate::lstr::LStr::from("cached");
     let called = Rc::new(Cell::new(0));
-    // The getter lives only in this helper frame (gc-heap scans the stack).
+    // The getter lives only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         let counter = called.clone();
         let getter = engine.interp.new_native_fn(

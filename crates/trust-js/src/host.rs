@@ -167,7 +167,7 @@ pub trait HostGcVisitor {
     fn native_root(&mut self, _id: NativeGcId) {}
 }
 
-/// A host value's [`HostTrace`], recorded when it is stored (gc-heap).
+/// A host value's [`HostTrace`], recorded when it is stored.
 type HostTracer = fn(&dyn Any, &mut dyn HostGcVisitor);
 
 fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisitor) {
@@ -318,7 +318,7 @@ pub struct OpState {
     managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
     gc_reporters: HashMap<TypeId, GcReporter>,
-    /// Every slot's [`HostTrace`] (gc-heap: the host roots of a collection).
+    /// Every slot's [`HostTrace`] (the host roots of a collection).
     tracers: crate::fasthash::FastMap<TypeId, HostTracer>,
     pub resources: ResourceTable,
 }
@@ -553,7 +553,7 @@ pub struct ResourceTable {
     retained_reporters: HashMap<ResourceId, RetainedReporter>,
     managed_reporters: HashMap<ResourceId, ManagedReporter>,
     external_reporters: HashMap<ResourceId, ExternalReporter>,
-    /// Every resource's [`HostTrace`] (gc-heap).
+    /// Every resource's [`HostTrace`].
     tracers: HashMap<ResourceId, HostTracer>,
 }
 
@@ -619,7 +619,7 @@ impl ResourceTable {
         self.external_reporters.insert(rid, report_external::<T>);
         rid
     }
-    /// Report every open resource's JavaScript values (gc-heap).
+    /// Report every open resource's JavaScript values.
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         for (rid, tracer) in &self.tracers {
             if let Some(resource) = self.map.get(rid) {
@@ -769,7 +769,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let (target_weak, payload_weak) = crate::gc_test::in_frame(|| {
             let global = Value::Obj(engine.interp.global.clone());
             let owner = engine
@@ -846,7 +846,7 @@ mod tests {
         engine.interp.op_state().put(NativeCache::default());
         engine.interp.op_state().take::<NativeCache>();
         engine.interp.gc_collect();
-        // The value's handles live only in this helper frame (gc-heap scans the stack).
+        // The value's handles live only in this helper frame (the collector scans the stack).
         crate::gc_test::in_frame(|| {
             let value = Value::Obj(engine.interp.new_object());
             engine.interp.op_state().put(NativeCache {
@@ -887,7 +887,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let (owner_weak, native_weak) = crate::gc_test::in_frame(|| {
             let global = Value::Obj(engine.interp.global.clone());
             let owner = engine
@@ -1012,7 +1012,7 @@ mod resource_id_tests {
     }
 }
 
-/// P1 S2: under gc-heap a host's JavaScript values live exactly as its [`HostTrace`] reports.
+/// P1 S2: a host's JavaScript values live exactly as its [`HostTrace`] reports.
 #[cfg(test)]
 mod host_trace_tests {
     use super::*;

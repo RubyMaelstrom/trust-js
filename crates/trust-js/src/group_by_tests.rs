@@ -278,7 +278,7 @@ fn group_by_cached_callees_keep_then_release_their_final_owners() {
                 position=0;'ready'
             "#;
             assert!(matches!(engine.eval(setup, false), Ok(Completion::Value(v)) if v == "ready"));
-            // Strong handles live only in this helper frame (gc-heap scans the stack).
+            // Strong handles live only in this helper frame (the collector scans the stack).
             let (weak_callees, weak_fields) = crate::gc_test::in_frame(|| {
                 let mut weak_callees = Vec::new();
                 let mut weak_fields = Vec::new();

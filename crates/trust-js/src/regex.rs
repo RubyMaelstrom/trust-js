@@ -1958,7 +1958,7 @@ fn elem_of_cp(cp: u32) -> char {
 }
 
 /// The source string a prepared subject keeps (and its window's parent's), the GC edges of a
-/// cached subject (gc-heap).
+/// cached subject.
 impl crate::gc_trace::GcTrace for ReText {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         crate::gc_trace::GcTrace::trace_gc(&self.ascii_src, sink);
@@ -2074,7 +2074,7 @@ impl ReText {
         }
     }
 
-    /// Prepare `s` for matching, keeping the caller's `Rc` for zero-copy ASCII slicing.
+    /// Prepare `s` for matching, keeping the caller's string for zero-copy ASCII slicing.
     pub fn new_rc(unicode: bool, s: &crate::lstr::LStr) -> ReText {
         // Engine strings maintain an exact one-way ASCII hint in their allocation header.
         // RegExp workloads commonly stream many distinct ASCII subjects through the tiny

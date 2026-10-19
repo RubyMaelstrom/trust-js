@@ -25,8 +25,8 @@ fn old_global_environment_keeps_detached_callables_creation_realm_live() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        // Strong handles and the Realm's address live only in this helper frame (gc-heap scans
-        // the stack).
+        // Strong handles and the Realm's address live only in this helper frame (the collector
+        // scans the stack).
         let (weak_global, old_environment, hidden_key) = crate::gc_test::in_frame(|| {
             let realm = engine.interp.create_realm();
             let global = realm.as_obj().expect("Realm global");

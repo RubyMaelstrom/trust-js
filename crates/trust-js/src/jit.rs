@@ -1752,17 +1752,17 @@ pub struct JitCtx {
     /// [32] Points at `Interp::inline_ic_safe` (a `Cell<bool>` byte): raw prototype-walk
     /// templates read it live and fall to the helper after a Proxy is created.
     pub inline_ic_safe: *const u8,
-    /// [40] `Rc::as_ptr` of the activation env — what the inline LoadName template compares
+    /// [40] `Env::as_ptr` of the activation env — what the inline LoadName template compares
     /// against the per-site name cache (see `bytecode::NameIc`).
     pub env_raw: *const u8,
     /// [48] The activation's `this` itself, as a packed word that owns nothing. Generated code
     /// chooses its LoadThis, receiver, direct-call and finish-stub forms for it; Rust reads and
     /// writes it through the `this` accessors below.
     pub(crate) this_word: PackedValue,
-    /// [56] The current realm's global `Object` (through the Rc and RefCell): the LoadName
+    /// [56] The current realm's global `Object` (inside its cell's RefCell): the LoadName
     /// templates' global-mode path validates the cached shape/slot against it.
     pub global_body: *const u8,
-    /// [64] `Rc::as_ptr` of the active realm's global scope: the call template's inline probe
+    /// [64] `Env::as_ptr` of the active realm's global scope: the call template's inline probe
     /// compares it against the CallIc's fill-time `global_env` (the same-realm proof).
     pub genv: usize,
     // ---- Rust-only fields ----
@@ -1782,7 +1782,7 @@ pub struct JitCtx {
     /// Owned native return slot. Vacant is the complete PACK_UNDEFINED word, never a
     /// zero tag byte; direct calls move it back to the packed operand stack unchanged.
     pub ret: PackedValue,
-    /// Parent of `env_raw` as an `Rc::as_ptr`, or null. Depth-1 free-name caches use this to
+    /// Parent of `env_raw` as an `Env::as_ptr`, or null. Depth-1 free-name caches use this to
     /// validate a fresh activation without baking that per-call allocation's identity.
     pub env_parent_raw: *const u8,
     /// Hoisted process-wide debug switch. Keeping it in the activation avoids a `OnceLock`
@@ -1793,8 +1793,8 @@ pub struct JitCtx {
     pub inline_recompile_at: u32,
     /// Address of the executing thread's live-object counter. Compiled chunks may cross thread
     /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
-    /// when an activation starts rather than embedded while machine code is compiled. Under
-    /// gc-heap the heap's due word follows the count (`value::LiveCount`): polls load both.
+    /// when an activation starts rather than embedded while machine code is compiled. The
+    /// heap's due word follows the count (`value::LiveCount`): polls load both.
     pub live_objects: *const i64,
     pub(crate) activation: Option<Box<crate::bytecode::NativeActivation>>,
     /// Native slices borrow VmCoro's authoritative heap state only while running. Ordinary
@@ -1804,7 +1804,7 @@ pub struct JitCtx {
     pub(crate) resume_step: Option<crate::bytecode::VmStep>,
     /// Canonical Reference owners for this frame; null until a fresh activation needs them.
     pub(crate) references_raw: *mut crate::eval::PreparedReferenceSlot,
-    /// Validated accessor holder (`Rc::as_ptr` as usize) and slot, set by the ARM64
+    /// Validated accessor holder (`Gc::as_ptr` as usize) and slot, set by the ARM64
     /// property template's accessor landing immediately before it calls `jit_get_prop`.
     /// The helper consumes (clears) both before any JavaScript can run, so no validated
     /// state can outlive the synchronous helper call that observed it. 0 = none.
@@ -1876,7 +1876,7 @@ impl JitCtx {
     }
 }
 
-/// gc-heap: the values a running context holds in its own fields, traced precisely. Whoever
+/// The values a running context holds in its own fields, traced precisely. Whoever
 /// makes the context a root scans its slot and operand words: an active [`JitFrame`] record its
 /// whole word buffer, a Rust entry the ranges it registers (`gc_trace::JitFrameRoots`). The raw
 /// identities it caches are kept alive by their owners, as classified below.
@@ -2634,7 +2634,7 @@ mod asm {
         /// Immutable scalar original-PC/slot/exit-label plans; no JavaScript owners.
         /// Checked numeric replay uses the same before-read transaction as ordinary entry.
         string_accumulations: Vec<(u32, u16, usize)>,
-        /// gc-heap: the code being emitted is a chunk body's baseline code, where a call to an
+        /// Whether the code being emitted is a chunk body's baseline code, where a call to an
         /// allocating helper ends in the explicit poll (see `super::emit_helper_end_poll`).
         /// Clear in region code, shared stubs and loose test assemblies.
         end_polls: bool,
@@ -2663,7 +2663,7 @@ mod asm {
                 end_polls: false,
             }
         }
-        /// gc-heap: set whether helper calls emitted from here on end in the explicit poll (see
+        /// Set whether helper calls emitted from here on end in the explicit poll (see
         /// the `end_polls` field); returns the previous setting.
         pub fn set_end_polls(&mut self, on: bool) -> bool {
             std::mem::replace(&mut self.end_polls, on)
@@ -4143,7 +4143,7 @@ fn compile_entry(
     let mut region_copy_bytes = 0usize;
     let mut stronger_header_cache = vec![None; ops.len()];
     let in_loop = loop_body_mask(ops);
-    // gc-heap: the body's baseline templates end each call to an allocating helper in the
+    // The body's baseline templates end each call to an allocating helper in the
     // explicit poll; region emission clears this for its own code.
     a.set_end_polls(true);
     for (pc, op) in ops.iter().enumerate() {
@@ -4737,10 +4737,10 @@ fn compile_entry(
             }
             Op::InlineGuard(t, target) => {
                 let it = chunk.jit_inline_target(*t);
-                // A Value::Obj payload holds the STORED Rc pointer (the RcBox base), not
-                // `Rc::as_ptr` — read the expected stored word out of an Option<Gc> exactly
-                // like `value::jit_layout` probes it. A dead callee (or an unprobed layout)
-                // degrades to the generic call unconditionally.
+                // A Value::Obj payload holds the stored handle word, the cell's address: read
+                // the expected stored word out of an Option<Gc> exactly like `value::jit_layout`
+                // probes it. A dead callee (or an unprobed layout) degrades to the generic call
+                // unconditionally.
                 let stored = it.pin.upgrade().filter(|_| layout.valid).map(|o| {
                     let some: Option<crate::value::Gc> = Some(o);
                     unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
@@ -5216,7 +5216,7 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         // property/name/element operations on their checked paths; unrelated JIT templates stay
         // enabled. In the old wide layout `meta` followed the full 16-byte Value.
         && layout.entry_accessor >= layout.entry_value + 8
-        && layout.obj_from_rc < 4096
+        && layout.obj_from_cell < 4096
         && layout.obj_exotic < 4096
         && layout.obj_ic_plain < 4096
         && sh.is_multiple_of(4)
@@ -5265,12 +5265,11 @@ fn guard_prop_writable(a: &mut asm::Asm, reg: u32, base: u32, flags: u32, slow: 
     a.cbz(reg, false, slow);
 }
 
-/// Whether generated code admits a Map's or Set's `Exotic::Collection` (gc-heap) wherever it
+/// Whether generated code admits a Map's or Set's `Exotic::Collection` wherever it
 /// admits an ordinary object: [`crate::value::Exotic::is_ordinary`] accepts it, and the
 /// interpreter's caches treat its named fields and elements as ordinary. Its tag must directly
 /// follow None's (`JitRepr::exotic_ordinary_contiguous`) for one range test to admit both;
-/// otherwise, and in the default build (which has no such variant), a Collection takes the
-/// checked path. Both backends' ordinary-object guards ask it.
+/// otherwise a Collection takes the checked path. Both backends' ordinary-object guards ask it.
 #[cfg(any(
     test,
     all(
@@ -5283,8 +5282,8 @@ fn exotic_collection_admitted(layout: &crate::value::JitLayout) -> bool {
 }
 
 /// Branch to `ok` when the exotic discriminant byte loaded in `reg` is one
-/// [`crate::value::Exotic::is_ordinary`] accepts; otherwise fall through. Default build:
-/// `cmp reg, #none; b.eq ok`. With Collection admitted ([`exotic_collection_admitted`]), one
+/// [`crate::value::Exotic::is_ordinary`] accepts; otherwise fall through. Without Collection
+/// admitted: `cmp reg, #none; b.eq ok`. With it ([`exotic_collection_admitted`]), one
 /// unsigned range test from None's tag: `sub scratch, reg, #none; cmp scratch, #1; b.ls ok`,
 /// which preserves `reg` unless `scratch` is `reg`. Clobbers NZCV and `scratch`.
 #[cfg(all(
@@ -5359,7 +5358,7 @@ fn guard_exotic_ordinary_or_array(
 }
 
 /// Branch to `miss` unless the exotic discriminant byte already loaded in `reg` is ordinary
-/// (`Exotic::None`, or under gc-heap a Collection: see [`branch_exotic_ordinary`]) or an
+/// (`Exotic::None`, or a Collection: see [`branch_exotic_ordinary`]) or an
 /// admitted primitive-wrapper tag. Wrapper tags are admitted only at sites whose compile-time
 /// name passed the wrapper name gates (not `length`/`description`, not digit-leading): StrWrap
 /// answers those names outside its entries, Num/Bool wrappers answer none. Shape, `ic_plain`,
@@ -5461,7 +5460,7 @@ struct PropProbeFlags {
 }
 
 /// One generic property-cache way probe: x12 = the way's `IcState` cell, x10 = the receiver's
-/// stored Rc pointer (preserved). A validated data hit branches to `load` (x11 = holder object
+/// cell address (preserved). A validated data hit branches to `load` (x11 = holder object
 /// base, x13 = slot), a key-checked holder to `load_kc` (same registers; the site verifies the
 /// entry key), a validated cached absence to `absent_hit`; anything else to `miss`. Clobbers
 /// x9, x11..x17 only.
@@ -5489,7 +5488,7 @@ fn emit_prop_way_probe(
         method,
         kc,
     } = flags;
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
@@ -5503,7 +5502,7 @@ fn emit_prop_way_probe(
     // shape; or a primitive wrapper when `wrap_ok` — StrWrap intercepts only index and
     // `length` reads and Num/Bool wrappers intercept none, all excluded by the wrap_ok
     // name gates), plain, shape == recv_shape; x11 = receiver object base
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(14, 11, ex);
     if arr_ok || wrap_ok {
         let ex_ok = a.new_label();
@@ -5567,7 +5566,7 @@ fn emit_prop_way_probe(
     // depth-3 first intermediate hop.
     a.ldr_imm(17, 11, pr);
     a.cbz(17, true, miss);
-    a.add_imm(11, 17, rcv);
+    a.add_imm(11, 17, obj_off);
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
@@ -5579,7 +5578,7 @@ fn emit_prop_way_probe(
     // depth-3 second intermediate hop; the common holder validation follows at d1.
     a.ldr_imm(17, 11, pr);
     a.cbz(17, true, miss);
-    a.add_imm(11, 17, rcv);
+    a.add_imm(11, 17, obj_off);
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
@@ -5595,7 +5594,7 @@ fn emit_prop_way_probe(
     // depth-2 mid hop: follow the live proto, validate against mid_shape
     a.ldr_imm(17, 11, pr); // Option<Gc> niche: pointer or 0
     a.cbz(17, true, miss);
-    a.add_imm(11, 17, rcv);
+    a.add_imm(11, 17, obj_off);
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
@@ -5608,7 +5607,7 @@ fn emit_prop_way_probe(
     a.bind(d1);
     a.ldr_imm(17, 11, pr);
     a.cbz(17, true, miss);
-    a.add_imm(11, 17, rcv);
+    a.add_imm(11, 17, obj_off);
     a.ldrb_imm(14, 11, ex);
     guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
     a.ldrb_imm(14, 11, plain);
@@ -5646,7 +5645,7 @@ fn emit_prop_way_probe(
             a.b_cond(C_LO, chain_end);
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss); // chain ended before the recorded level count
-            a.add_imm(11, 17, rcv);
+            a.add_imm(11, 17, obj_off);
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
             a.ldrb_imm(14, 11, plain);
@@ -5677,7 +5676,7 @@ fn emit_prop_way_probe(
         // re-checked, which is what makes an array holder's slot trustworthy at all)
         a.ldr_imm(17, 11, pr);
         a.cbz(17, true, miss);
-        a.add_imm(11, 17, rcv);
+        a.add_imm(11, 17, obj_off);
         a.ldrb_imm(14, 11, ex);
         guard_exotic_ordinary_or_array(a, layout, 14, 15, miss);
         a.ldrb_imm(14, 11, plain);
@@ -5794,7 +5793,7 @@ fn emit_prop_load_inline(
     arr_ok: bool,
     recv: PropRecv,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
@@ -5938,7 +5937,7 @@ fn emit_prop_load_inline(
         None => Vec::new(),
     };
     let emit_baked = |a: &mut asm::Asm, st: crate::bytecode::IcState, miss: usize| {
-        a.add_imm(11, 10, rcv);
+        a.add_imm(11, 10, obj_off);
         a.ldrb_imm(14, 11, ex);
         if arr_ok || wrap_ok {
             let recv_exotic_ok = a.new_label();
@@ -5969,7 +5968,7 @@ fn emit_prop_load_inline(
         if st.depth >= 1 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
-            a.add_imm(11, 17, rcv);
+            a.add_imm(11, 17, obj_off);
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
@@ -5987,7 +5986,7 @@ fn emit_prop_load_inline(
         if st.depth >= 2 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
-            a.add_imm(11, 17, rcv);
+            a.add_imm(11, 17, obj_off);
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
@@ -6005,7 +6004,7 @@ fn emit_prop_load_inline(
         if st.depth == 3 {
             a.ldr_imm(17, 11, pr);
             a.cbz(17, true, miss);
-            a.add_imm(11, 17, rcv);
+            a.add_imm(11, 17, obj_off);
             a.ldrb_imm(14, 11, ex);
             guard_exotic_none_or_wrap(a, layout, 14, 15, wrap_ok, wrap_ok, miss);
             a.ldrb_imm(14, 11, plain);
@@ -6202,10 +6201,10 @@ fn emit_prop_load_inline(
     // `jit_get_prop`'s validated accessor path, then take the ordinary helper call. No
     // JavaScript can run between the validation above and the helper consuming these.
     a.bind(accessor_hit);
-    // x11 is the Object base; the helper wants the `Rc::as_ptr` form (the RefCell),
-    // which sits `obj_from_rc - gc_data_off` (the RefCell value offset) before it.
-    debug_assert!(layout.gc_data_off <= rcv as usize);
-    a.sub_imm(9, 11, rcv - layout.gc_data_off as u32);
+    // x11 is the Object base; the helper wants the `Gc::as_ptr` form (the RefCell),
+    // which sits `obj_from_cell - gc_data_off` (the RefCell value offset) before it.
+    debug_assert!(layout.gc_data_off <= obj_off as usize);
+    a.sub_imm(9, 11, obj_off - layout.gc_data_off as u32);
     a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
     a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
     a.bind(slow);
@@ -6233,7 +6232,7 @@ fn emit_method_elem_dense(
     slow: usize,
     done: usize,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -6251,9 +6250,9 @@ fn emit_method_elem_dense(
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
-    // Object base; exotic must be ordinary (None, or a gc-heap Map/Set) or Array, and plain
+    // Object base; exotic must be ordinary (None, or a Map/Set) or Array, and plain
     // (no side-table behavior).
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -6338,7 +6337,7 @@ fn emit_computed_method_inline(
     let shape = (layout.obj_props + layout.props_shape) as u32;
     let exotic = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
-    let object_data = layout.obj_from_rc as u32;
+    let object_data = layout.obj_from_cell as u32;
     if get_elem_inlinable(layout) {
         // A Number key is an element read of a dense array: `table[i & mask](args)`, the
         // shape of every function-table and virtual call of Emscripten output.
@@ -6545,9 +6544,9 @@ fn emit_call_inline_marked(
                 a.ldr_imm(9, 9, 0);
             }
             emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
-            emit_exec_payload(a, 9, 10); // callee payload (stored Rc ptr)
-                                         // the payload is the STORED RcBox pointer; as_ptr sits one probed
-                                         // header further (comparing them raw was a silent 100% miss)
+            // x10 = the callee's payload, its cell address; x13 = its `Gc::as_ptr` identity,
+            // which the ways record, `gc_data_off` (0) bytes on.
+            emit_exec_payload(a, 9, 10);
             a.add_imm(13, 10, layout.gc_data_off as u32);
             // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
             // loop over a handful of receiver classes — otherwise pays the full
@@ -6566,7 +6565,7 @@ fn emit_call_inline_marked(
             let l_hit = a.new_label();
             let l_primary_hit = a.new_label();
             a.bind(l_probe);
-            a.ldur(11, 12, 0); // ic.callee (an Rc::as_ptr identity)
+            a.ldur(11, 12, 0); // ic.callee (a `Gc::as_ptr` identity)
             a.cmp_reg_x(13, 11);
             a.b_cond(C_NE, l_next);
             a.ldr_w_imm(11, 12, 56); // ic.epoch
@@ -6796,7 +6795,7 @@ fn emit_call_inline_marked(
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.bind(done);
-    // gc-heap: every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
+    // Every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
     // call) lands here with its result pushed. A native or intrinsic can allocate after the
     // call's last safepoint.
     emit_helper_end_poll(a, l_unwind);
@@ -6809,7 +6808,7 @@ fn emit_call_inline_marked(
 ))]
 /// Inline Math numeric intrinsics (ECMA-262 §21.3.2: floor, ceil, trunc, abs, fround, clz32,
 /// imul, max, min) at a `CallWithThis(argc)` hit whose call IC proved the exact builtin
-/// (x9 = its `INTRINSIC_MATH_*` id, x10 = the callee's stored Rc pointer). Stack, top last:
+/// (x9 = its `INTRINSIC_MATH_*` id, x10 = the callee's cell address). Stack, top last:
 /// `[this, callee, args...]`. Every guard precedes the single commit: all arguments must be
 /// Numbers (so ToNumber/ToInt32 run no author code) and `this` must be Undefined (a plain
 /// identifier call, `U(a, b)`) or an Object (`Math.f(x)`); any other shape takes `hit_slow`,
@@ -7404,9 +7403,9 @@ fn emit_call_code_probe(
     miss: usize,
 ) {
     use std::mem::offset_of;
-    let call_tag = layout.obj_from_rc + layout.obj_call;
+    let call_tag = layout.obj_from_cell + layout.obj_call;
     let call_payload = call_tag + 8;
-    let ic_plain = layout.obj_from_rc + layout.obj_ic_plain;
+    let ic_plain = layout.obj_from_cell + layout.obj_ic_plain;
     let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
     let ic_func = offset_of!(crate::bytecode::CallIc, func);
     let ic_realm = offset_of!(crate::bytecode::CallIc, realm);
@@ -7431,7 +7430,7 @@ fn emit_call_code_probe(
     a.b_cond(C_NE, miss);
     a.ldrb_imm(9, 10, ic_plain as u32);
     a.cbz(9, false, miss);
-    a.ldr_imm(9, 10, call_payload as u32); // stored Rc<UserCallable>
+    a.ldr_imm(9, 10, call_payload as u32); // the closure cell (a `UserFn`)
     a.ldr_imm(11, 9, layout.user_func as u32);
     a.add_imm(11, 11, layout.func_data_off as u32); // the closure's function identity
     a.ldr_imm(16, 9, layout.user_realm as u32);
@@ -7628,8 +7627,8 @@ pub(crate) enum DirectCallSite {
 fn emit_direct_call(
     a: &mut asm::Asm,
     ilayout: &crate::interpreter::InterpLayout,
-    // Stored-pointer → `Rc::as_ptr` header delta (`JitLayout::gc_data_off`): FnFrame.fn_ptr
-    // records the as_ptr identity (FnFrame::callee reconstructs an Rc from it).
+    // Stored handle word → `Gc::as_ptr` delta (`JitLayout::gc_data_off`, 0): FnFrame.fn_ptr
+    // records the as_ptr identity (FnFrame::callee reconstructs a `Gc` from it).
     layout: &crate::value::JitLayout,
     // Byte offset of `Chunk::inline_attempted` (computed by the caller from its own chunk —
     // same monomorphized layout as the callee's): the sequence requires the callee's one-shot
@@ -7676,11 +7675,11 @@ fn emit_direct_call(
     // The code-keyed probe is emitted only under these conditions (see `emit_call_code_probe`);
     // without it every hit is an identity hit and the way's recorded environment is the callee's.
     let call_env_from_callee = layout.call_probe_valid
-        && fits8(layout.obj_from_rc + layout.obj_call + 8)
+        && fits8(layout.obj_from_cell + layout.obj_call + 8)
         && fits8(layout.user_env)
         && layout.scope_data_off < 4096;
 
-    // ---- checks (entry state: x12 = ic0 ptr, x10 = callee stored Rc ptr; NO mutations) ----
+    // ---- checks (entry state: x12 = ic0 ptr, x10 = callee cell address; NO mutations) ----
     // direct bits 0 (no force resets) and 2 (recompile settled)
     a.ldurb(9, 12, IC_DIRECT);
     let field1b = asm::logical_imm_w(1).unwrap();
@@ -7748,7 +7747,7 @@ fn emit_direct_call(
     a.str_w_imm(6, 4, runs_off as u32);
     a.bind(retry_done);
 
-    // x13 = the callee's [[Environment]] (`Rc::as_ptr`), kept until the install below. An
+    // x13 = the callee's [[Environment]] (`Env::as_ptr`), kept until the install below. An
     // identity hit's way recorded exactly this closure's environment; a code-keyed hit
     // (CALL_CODE_HIT in x15) matched another closure of the same function, so read the LIVE
     // closure's (x10 is the stored callee pointer).
@@ -7761,7 +7760,7 @@ fn emit_direct_call(
         a.ldur(13, 12, IC_ENV);
         a.b(env_done);
         a.bind(code_env);
-        a.ldr_imm(13, 10, (layout.obj_from_rc + layout.obj_call + 8) as u32);
+        a.ldr_imm(13, 10, (layout.obj_from_cell + layout.obj_call + 8) as u32);
         a.ldr_imm(13, 13, layout.user_env as u32);
         a.add_imm(13, 13, layout.scope_data_off as u32);
         a.bind(env_done);
@@ -7954,7 +7953,7 @@ fn emit_direct_call(
     let popped = ((argc + 1 + with_this as usize) * 8) as u32;
     a.sub_imm(20, 20, popped);
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
-                               // Move the complete owned word; no decode/encode or reference-count change.
+                               // Move the complete word; no decode/encode.
     a.ldr_imm(4, 19, cx_ret);
     a.stur(4, 20, 0);
     a.mov_imm64(5, crate::value::PACK_UNDEFINED);
@@ -8071,7 +8070,7 @@ mod direct_call_tests {
                     _ => panic!("wrong computed value"),
                 }
                 drop(operands);
-                // gc-heap owners carry no count: the probe leaves the key's, the holder's and
+                // Owners carry no count: the probe leaves the key's, the holder's and
                 // the receiver's cells intact, which a collection (and, in debug builds, its
                 // heap verifier) confirms.
                 engine.interp.gc_collect();
@@ -8554,7 +8553,7 @@ fn emit_direct_finish_stub(
         // ---- commit ----
         emit_handler_clear(a, 10, handlers_len_off);
         // Move the completion into the caller: its `ret` is vacant while it runs, so the
-        // record's owned word transfers without a reference-count change.
+        // record's word moves as it is (it owns nothing).
         a.ldr_imm(4, 10, cx_ret);
         a.str_imm(4, 19, cx_ret);
         a.mov_imm64(5, crate::value::PACK_UNDEFINED);
@@ -8650,7 +8649,7 @@ fn emit_update_prop_inline(
     l_unwind: usize,
 ) {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
@@ -8672,7 +8671,7 @@ fn emit_update_prop_inline(
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
     a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
     // 3. ordinary receiver, shape match
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(9, 11, ex);
     guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
@@ -8773,7 +8772,7 @@ fn emit_update_elem_inline(
     l_unwind: usize,
 ) {
     debug_assert_eq!(layout.entry_accessor, layout.entry_value + 8);
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -8801,7 +8800,7 @@ fn emit_update_elem_inline(
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
     // 4. ordinary or Array exotic, not in any side table (proxy, typed array, host object)
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -8884,7 +8883,7 @@ fn emit_update_elem_inline(
 ))]
 fn eq_inlinable(layout: &crate::value::JitLayout) -> bool {
     layout.valid
-        && layout.obj_from_rc < 4096
+        && layout.obj_from_cell < 4096
         && layout.obj_ic_plain < 4096
         && crate::lstr::LEN_OFF.is_multiple_of(4)
         && crate::lstr::LEN_OFF / 4 < 4096
@@ -9014,7 +9013,7 @@ fn emit_local_eq_branch(
         // the helper; an ordinary object is definitively unequal to nullish.
         emit_exec_word_load(a, 12, 22, lhs_off as i32);
         emit_exec_payload(a, 12, 12);
-        a.add_imm(12, 12, layout.obj_from_rc as u32);
+        a.add_imm(12, 12, layout.obj_from_cell as u32);
         a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
         a.cbz(12, false, slow);
         a.b(unequal);
@@ -9032,7 +9031,7 @@ fn emit_local_eq_branch(
         a.bind(rhs_null_cmp);
         emit_exec_word_load(a, 12, 22, rhs_off as i32);
         emit_exec_payload(a, 12, 12);
-        a.add_imm(12, 12, layout.obj_from_rc as u32);
+        a.add_imm(12, 12, layout.obj_from_cell as u32);
         a.ldrb_imm(12, 12, layout.obj_ic_plain as u32);
         a.cbz(12, false, slow);
         a.b(unequal);
@@ -9085,7 +9084,7 @@ fn instanceof_inlinable(
     layout.valid
         && il.valid
         && layout.entry_accessor == layout.entry_value + 8
-        && layout.obj_from_rc < 4096
+        && layout.obj_from_cell < 4096
         && layout.obj_proto.is_multiple_of(8)
         && layout.obj_proto / 8 < 4096
         && layout.obj_exotic < 4096
@@ -9151,7 +9150,7 @@ fn emit_instanceof_inline(
     a.bind(refs_ok);
 
     // RHS: ordinary/plain constructor, canonical Function.prototype, and cached shape.
-    a.add_imm(12, 11, layout.obj_from_rc as u32);
+    a.add_imm(12, 11, layout.obj_from_cell as u32);
     a.ldrb_imm(9, 12, layout.obj_exotic as u32);
     a.cmp_imm_w(9, layout.exotic_none_tag as u32);
     a.b_cond(C_NE, slow);
@@ -9174,7 +9173,7 @@ fn emit_instanceof_inline(
     a.b_cond(C_NE, slow);
 
     // Resolve the cached own `.prototype` slot defensively, require a data property holding an
-    // object, and untag its stored Rc pointer from the packed heap value.
+    // object, and untag its cell address from the packed heap value.
     a.ldr_w_imm(13, 13, IC_OFF_SLOT);
     fields_len(a, layout, 14, 12);
     a.cmp_reg_x(13, 14);
@@ -9189,7 +9188,7 @@ fn emit_instanceof_inline(
     a.cmp_reg_x(16, 17);
     a.b_cond(C_NE, slow);
     a.lsl_imm(15, 15, 16);
-    a.lsr_imm(15, 15, 16); // x15 = target prototype stored Rc pointer
+    a.lsr_imm(15, 15, 16); // x15 = the target prototype's cell address
 
     // A scalar LHS is false. Otherwise walk lhs.[[Prototype]] until target or null. Cycles are
     // rejected by SetPrototypeOf, and the proxy latch above makes every hop a direct field read.
@@ -9197,7 +9196,7 @@ fn emit_instanceof_inline(
     a.b_cond(C_NE, no);
     a.mov(12, 10);
     a.bind(walk);
-    a.add_imm(12, 12, layout.obj_from_rc as u32);
+    a.add_imm(12, 12, layout.obj_from_cell as u32);
     a.ldr_imm(12, 12, layout.obj_proto as u32);
     a.cbz(12, true, no);
     a.cmp_reg_x(12, 15);
@@ -9355,7 +9354,8 @@ fn emit_prop_create_probe(
     a.mov_imm64(9, u32::MAX as u64);
     a.cmp_reg_w(16, 9);
     a.b_cond(C_EQ, miss);
-    // Cache stores Rc::as_ptr(proto); Object::proto stores the RcBox pointer.
+    // The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address,
+    // `gc_data_off` (0) bytes before it.
     a.ldr_w_imm(14, 12, IC_OFF_SLOT);
     a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
     a.lsl_imm(15, 15, 32);
@@ -9396,7 +9396,7 @@ fn emit_set_prop_inline(
         emit_op_helper(a, H_SET_PROP, pc, l_unwind);
         return;
     }
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
@@ -9433,10 +9433,10 @@ fn emit_set_prop_inline(
             emit_exec_payload(a, 9, 10);
         }
     }
-    // 2. object base; exotic ordinary (None, or a gc-heap Map/Set), and not a side-table exotic
+    // 2. object base; exotic ordinary (None, or a Map/Set), and not a side-table exotic
     //    (proxy/typed-array/namespace). Receiver-wide facts — validated once, shared by both
     //    ways.
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(9, 11, ex);
     guard_exotic_ordinary(a, layout, 9, 9, slow);
     a.ldrb_imm(9, 11, plain);
@@ -9713,7 +9713,7 @@ fn emit_eq_inline(
         a.cmp_imm_w(10, 8);
         a.b_cond(C_NE, la_drop);
         // nullish == Obj is only false for an ordinary object (ic_plain rules out IsHTMLDDA)
-        a.add_imm(11, 13, layout.obj_from_rc as u32);
+        a.add_imm(11, 13, layout.obj_from_cell as u32);
         a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
         a.cbz(11, false, slow);
         a.bind(la_drop);
@@ -9727,7 +9727,7 @@ fn emit_eq_inline(
         let lb_drop = a.new_label();
         a.cmp_imm_w(9, 8);
         a.b_cond(C_NE, lb_drop);
-        a.add_imm(11, 12, layout.obj_from_rc as u32);
+        a.add_imm(11, 12, layout.obj_from_cell as u32);
         a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
         a.cbz(11, false, slow);
         a.bind(lb_drop);
@@ -9917,7 +9917,7 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.cmp_imm_w(9, 8);
     a.b_cond(C_NE, os_drop);
     // an Obj is only reliably truthy when it is ordinary (ic_plain rules out IsHTMLDDA)
-    a.add_imm(11, 12, layout.obj_from_rc as u32);
+    a.add_imm(11, 12, layout.obj_from_cell as u32);
     a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
     a.cbz(11, false, slow);
     a.bind(os_drop);
@@ -10216,7 +10216,7 @@ fn emit_load_name_inline_marked(
 }
 
 /// `Op::LoadNameIn` / `Op::LoadNameForCallIn`: [`emit_load_name_inline`] resolving from a fixed
-/// inline target's [[Environment]] (`env`, an `Rc::as_ptr` scope address). Emitted at each site
+/// inline target's [[Environment]] (`env`, an `Env::as_ptr` scope address). Emitted at each site
 /// (in the chunk's shared fixed-environment name stub unless stubs are inlined).
 #[cfg(all(
     target_arch = "aarch64",
@@ -11094,7 +11094,7 @@ fn emit_name_ic_value_ptr_body(
 enum NameEnv {
     /// The running environment (`ctx.env_raw`).
     Running,
-    /// A fixed scope (`Rc::as_ptr`) the site already placed in x9 (`Op::LoadNameIn`).
+    /// A fixed scope (`Env::as_ptr`) the site already placed in x9 (`Op::LoadNameIn`).
     InX9,
 }
 
@@ -11246,7 +11246,7 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
     if env == NameEnv::InX9 {
-        // The fixed scope's live parent (stored Rc pointer → `Rc::as_ptr`).
+        // The fixed scope's live parent (stored handle word → `Env::as_ptr`).
         if layout.scope_parent_valid
             && layout.scope_parent.is_multiple_of(8)
             && layout.scope_parent / 8 < 4096
@@ -11402,7 +11402,7 @@ fn emit_get_elem_inline_marked(
     pc: u32,
     l_unwind: usize,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -11432,9 +11432,9 @@ fn emit_get_elem_inline_marked(
     // 3. x10 = the receiver's payload
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic must be ordinary (None, or a gc-heap Map/Set) or Array, and plain
+    // 4. object base; exotic must be ordinary (None, or a Map/Set) or Array, and plain
     //    (no side-table behavior)
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -11686,7 +11686,7 @@ fn emit_set_elem_inline_marked(
         emit_op_helper(a, H_SET_ELEM, pc, l_unwind);
         return;
     }
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -11712,8 +11712,8 @@ fn emit_set_elem_inline_marked(
     // 3. x10 = the receiver's payload
     emit_exec_word_load(a, 10, 20, -24);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain
-    a.add_imm(11, 10, rcv);
+    // 4. object base; exotic ordinary (None, or a Map/Set) or Array, and plain
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -11796,7 +11796,7 @@ fn emit_set_elem_inline_marked(
 /// and Array.[[DefineOwnProperty]] permit an existing writable data element to be overwritten
 /// without consulting prototypes or changing length. Holes, accessors, non-writable properties
 /// and reference-bearing old values retain the checked path. No guard follows the first write.
-/// Entry: x12 = DenseElems, x9 = index, x10 = receiver Rc, x11 = Object.
+/// Entry: x12 = DenseElems, x9 = index, x10 = the receiver's cell address, x11 = Object.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -11910,7 +11910,7 @@ fn emit_in_keyed(
     let _ = fast_event;
     let stack_receiver = receiver_slot.is_none();
     debug_assert!(stack_receiver == matches!(key, KeySrc::Stack));
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
@@ -11954,9 +11954,9 @@ fn emit_in_keyed(
         emit_exec_word_load(a, 10, 22, receiver_slot.unwrap() as i32);
         emit_exec_payload(a, 10, 10);
     }
-    // 3. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain (no
+    // 3. object base; exotic ordinary (None, or a Map/Set) or Array, and plain (no
     //    side-table internal methods).
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -12114,7 +12114,7 @@ fn emit_define_elem_inline(
     emit_exec_word_load(a, 10, 20, -24);
     emit_exec_payload(a, 10, 10);
     // 3. An extensible, plain Array (x11 = Object) ...
-    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.add_imm(11, 10, layout.obj_from_cell as u32);
     a.ldrb_imm(12, 11, layout.obj_exotic as u32);
     a.cmp_imm_w(12, layout.exotic_array_tag as u32);
     a.b_cond(C_NE, slow);
@@ -12372,7 +12372,7 @@ fn emit_elem_local_keyed(
         }
         return;
     }
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -12418,12 +12418,11 @@ fn emit_elem_local_keyed(
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
-    // 3. receiver rc ptr straight from the slot (no strong-count games — nothing drops)
-    // 3. receiver rc ptr straight from the slot (no strong-count games — nothing drops)
+    // 3. the receiver's cell address straight from the slot (nothing is counted or dropped)
     emit_exec_word_load(a, 10, 22, slot_off as i32);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic ordinary (None, or a gc-heap Map/Set) or Array, and plain
-    a.add_imm(11, 10, rcv);
+    // 4. object base; exotic ordinary (None, or a Map/Set) or Array, and plain
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(12, 11, plain);
@@ -12609,7 +12608,7 @@ fn emit_local_own_dense_data_guard(
     key: KeySrc,
     slow: usize,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
@@ -12644,7 +12643,7 @@ fn emit_local_own_dense_data_guard(
 
     emit_exec_word_load(a, 10, 22, receiver_off as i32);
     emit_exec_payload(a, 10, 10);
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     // `ic_plain` excludes proxies and all objects whose property lookup can invoke an
@@ -12711,7 +12710,7 @@ fn emit_local_assumed_dense_data_value(
     key: KeySrc,
     slow: usize,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
     let ev = layout.entry_value as i32;
@@ -12732,7 +12731,7 @@ fn emit_local_assumed_dense_data_value(
     a.fcvtzu_w_d(9, 0);
     emit_exec_word_load(a, 10, 22, receiver_off as i32);
     emit_exec_payload(a, 10, 10);
-    a.add_imm(11, 10, rcv);
+    a.add_imm(11, 10, obj_off);
     a.ldr_imm(12, 11, el);
 
     let classic_dense = a.new_label();
@@ -12820,7 +12819,7 @@ struct LinkedScanPlan {
 }
 
 /// Plan `while ((peek = next.link) != null) next = peek`.  The optimized region borrows linked
-/// objects through the still-rooted initial list, performs no per-node RC operations, then
+/// objects through the still-rooted initial list, does no per-node work on handles, then
 /// materializes the two locals exactly once at the exit or a guarded side exit.
 #[cfg(all(
     target_arch = "aarch64",
@@ -13518,7 +13517,7 @@ fn emit_chain_marked(
     let evl = (layout.dense_elems + layout.vec_len_off) as u32;
     let mvp = (layout.dense_mirror + layout.vec_ptr_off) as u32;
     let mvl = (layout.dense_mirror + layout.vec_len_off) as u32;
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
@@ -13614,7 +13613,7 @@ fn emit_chain_marked(
                     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
                     emit_exec_payload(a, 10, 10);
                 }
-                a.add_imm(11, 10, rcv);
+                a.add_imm(11, 10, obj_off);
                 a.ldrb_imm(14, 11, ex);
                 guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
@@ -13626,7 +13625,7 @@ fn emit_chain_marked(
                 if st.depth >= 1 {
                     a.ldr_imm(17, 11, pr);
                     a.cbz(17, true, guard!());
-                    a.add_imm(11, 17, rcv);
+                    a.add_imm(11, 17, obj_off);
                     a.ldrb_imm(14, 11, ex);
                     guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
@@ -13644,7 +13643,7 @@ fn emit_chain_marked(
                 if st.depth == 2 {
                     a.ldr_imm(17, 11, pr);
                     a.cbz(17, true, guard!());
-                    a.add_imm(11, 17, rcv);
+                    a.add_imm(11, 17, obj_off);
                     a.ldrb_imm(14, 11, ex);
                     guard_exotic_ordinary(a, layout, 14, 14, guard!());
                     a.ldrb_imm(14, 11, plain);
@@ -13704,7 +13703,7 @@ fn emit_chain_marked(
                     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
                     emit_exec_payload(a, 10, 10);
                 }
-                a.add_imm(11, 10, rcv);
+                a.add_imm(11, 10, obj_off);
                 a.ldrb_imm(14, 11, ex);
                 guard_exotic_ordinary(a, layout, 14, 14, guard!());
                 a.ldrb_imm(14, 11, plain);
@@ -13829,7 +13828,7 @@ fn emit_chain_marked(
                         a.ldr_imm(10, 22, xoff);
                         emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, guard!());
                         emit_exec_payload(a, 10, 10);
-                        a.add_imm(11, 10, rcv);
+                        a.add_imm(11, 10, obj_off);
                         a.ldrb_imm(12, 11, ex);
                         guard_exotic_ordinary_or_array(a, layout, 12, 13, guard!());
                         a.ldrb_imm(12, 11, plain); // no side-table behavior
@@ -14121,7 +14120,7 @@ fn emit_chain_marked(
                     a.bind(mirror_done);
                     free.push(dk);
                     if keep {
-                        vregs.push((dv, viv)); // v stays the virtual result (a Num — no refcounting)
+                        vregs.push((dv, viv)); // v stays the virtual result (a Num)
                     } else {
                         free.push(dv);
                     }
@@ -15727,11 +15726,11 @@ fn emit_region_own_entry(
     writable: bool,
     fail: usize,
 ) {
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let plain = layout.obj_ic_plain as u32;
     let shape = (layout.obj_props + layout.props_shape) as u32;
-    a.add_imm(body_reg, rc_reg, rcv);
+    a.add_imm(body_reg, rc_reg, obj_off);
     a.ldrb_imm(9, body_reg, ex);
     guard_exotic_ordinary(a, layout, 9, 9, fail);
     a.ldrb_imm(9, body_reg, plain);
@@ -15814,7 +15813,7 @@ fn emit_linked_scan_region(
         // null.  `ic_plain` is false for that object (and for other exotic receivers), so replay
         // the comparison in the baseline before committing `next = peek`.  Keep x0 unchanged
         // until after this guard so the materialized loop-head state remains exact.
-        a.add_imm(14, 15, layout.obj_from_rc as u32);
+        a.add_imm(14, 15, layout.obj_from_cell as u32);
         a.ldrb_imm(9, 14, layout.obj_ic_plain as u32);
         a.cbz(9, false, fail);
     }
@@ -15867,7 +15866,7 @@ fn emit_loop_chain(
     {
         return a.new_label();
     }
-    let rcv = layout.obj_from_rc as u32;
+    let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_exotic as u32;
     let el = (layout.obj_props + layout.props_elems) as u32;
     let evp = (layout.dense_elems + layout.vec_ptr_off) as u32;
@@ -16021,7 +16020,7 @@ fn emit_loop_chain(
         a.ldr_imm(10, 22, off);
         emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 12, pre_fail);
         emit_exec_payload(a, 10, 10);
-        a.add_imm(r, 10, rcv);
+        a.add_imm(r, 10, obj_off);
         a.ldrb_imm(12, r, ex);
         guard_exotic_ordinary_or_array(a, layout, 12, 13, pre_fail);
         a.ldrb_imm(12, r, plain);
@@ -16057,9 +16056,9 @@ fn emit_loop_chain(
                 for register in (2..18).step_by(2) {
                     a.stp_off(register, register + 1, register as i32 * 8);
                 }
-                a.sub_imm(0, r, rcv);
-                // Execution payloads contain Rc's allocation word, not Rc::as_ptr's data
-                // address. Rust's borrowed Rc view requires the probed data adjustment.
+                a.sub_imm(0, r, obj_off);
+                // The helper takes `Gc::as_ptr`, `gc_data_off` (0) bytes past the payload's
+                // cell address.
                 a.add_imm(0, 0, layout.gc_data_off as u32);
                 a.mov_imm64(16, jit_prepare_packed_numeric_mirror as *const () as u64);
                 a.blr(16);
@@ -17120,7 +17119,7 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     }
 }
 
-/// gc-heap: whether a call to helper `idx` ends in the explicit poll, in either backend: ARM64's
+/// Whether a call to helper `idx` ends in the explicit poll, in either backend: ARM64's
 /// `emit_op_helper` (see `emit_helper_end_poll`) and x64's `Asm::helper_spflag` (see
 /// `x64::Asm::helper_end_poll`). The census of helper families:
 /// - Polled after their call: the ones that can allocate cells without reaching a safepoint
@@ -17159,7 +17158,7 @@ fn helper_ends_in_poll(idx: usize) -> bool {
     )
 }
 
-/// gc-heap: the explicit poll that ends a call to an allocating helper in a chunk body's
+/// The explicit poll that ends a call to an allocating helper in a chunk body's
 /// baseline code (the recorded S5 deviation: allocation never collects, I9, and these polls
 /// take the place of "the allocation slow path may collect"). It runs once the helper has
 /// returned: the helper's results then sit in canonical places (operand words below the
@@ -17194,8 +17193,7 @@ fn emit_helper_end_poll(a: &mut asm::Asm, l_unwind: usize) {
 
 /// Try only primitive RHS strings. Miss preserves the canonical state and continues the
 /// original operation; success commits the entire region then takes its original continuation
-/// (gc-heap baseline code: after the helper-end poll; a throw from that poll goes to
-/// `l_unwind`).
+/// (in baseline code, after the helper-end poll; a throw from that poll goes to `l_unwind`).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17230,14 +17228,14 @@ fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool, l_unwind: u
 }
 
 /// `H_INTERRUPT`'s immediate: which poll calls it. A loop header's poll (where a region's poll
-/// bail lands too) passes `POLL_LOOP`; under gc-heap a function entry's passes `POLL_ENTRY` and
+/// bail lands too) passes `POLL_LOOP`; a function entry's passes `POLL_ENTRY` and
 /// the end of an allocating helper's call `POLL_HELPER_END`, so tests can count the collections
 /// each kind runs.
 pub(crate) const POLL_LOOP: u32 = 0;
 pub(crate) const POLL_ENTRY: u32 = 1;
 pub(crate) const POLL_HELPER_END: u32 = 2;
 
-/// Test-only (gc-heap): what generated code's `H_INTERRUPT` calls on this thread did, indexed by
+/// Test-only: what generated code's `H_INTERRUPT` calls on this thread did, indexed by
 /// the caller's `POLL_*` kind: the calls, the collections they ran, and the most bytes the heap
 /// had allocated past its trigger when a call collected.
 #[cfg(test)]
@@ -17305,11 +17303,11 @@ fn emit_live_count(a: &mut asm::Asm, slow: usize) {
 /// call-free loops can allocate cycles, and deferring optional task collection does not
 /// defer the live-object ceiling. The cold helper sees canonical owned frame roots.
 ///
-/// The fast path loads `ctx.interp` and the count, compares the count with `gc_next`, then
-/// bumps the shared interrupt divider (11 instructions); the slow path is `H_INTERRUPT`
-/// (`jit_interrupt`: the host interrupt, then `Interp::gc_check`), taken when the count passes
-/// `gc_next`, every 16384 ticks and, under gc-heap, while the heap's due word is set (see
-/// [`emit_live_count`]: 12 instructions). There `gc_check` collects, which clears the word,
+/// The fast path loads `ctx.interp`, the count and the heap's due word ([`emit_live_count`]),
+/// compares the count with `gc_next`, then bumps the shared interrupt divider (12
+/// instructions); the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt, then
+/// `Interp::gc_check`), taken when the count passes `gc_next`, every 16384 ticks and while the
+/// heap's due word is set. There `gc_check` collects, which clears the word,
 /// unless collections are suppressed or deferred (a no-GC region, an outstanding borrow, an
 /// interpreter that does not own its heap): then the word stays set and every poll calls the
 /// helper until one can collect. `kind` is `POLL_LOOP` or `POLL_ENTRY`.
@@ -17394,7 +17392,7 @@ fn emit_region_poll_finish(
 /// the tick: it performs the poll exactly once with all owned roots visible to helpers.
 ///
 /// A general region (`check_allocation`) also bails while the live-object count passes
-/// `gc_next` and, under gc-heap, while the heap's due word is set (+1 instruction, see
+/// `gc_next` and while the heap's due word is set (+1 instruction, see
 /// [`emit_live_count`]); its checked effects never poll themselves. The bail lands on the
 /// canonical header, whose poll collects. While collections are suppressed or deferred the
 /// word stays set and every backedge bails, but each bail follows a whole iteration run in the
@@ -17615,7 +17613,7 @@ fn emit_peek_cond_inline(
     a.bind(l_obj);
     emit_exec_word_load(a, 12, 20, -8);
     emit_exec_payload(a, 12, 12);
-    a.add_imm(11, 12, layout.obj_from_rc as u32);
+    a.add_imm(11, 12, layout.obj_from_cell as u32);
     a.ldrb_imm(11, 11, layout.obj_ic_plain as u32);
     a.cbz(11, false, slow); // includes the engine's possible HTMLDDA object
     a.bind(l_true);
@@ -17783,7 +17781,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         resume_step: None,
     };
     stack.set_len(0);
-    // gc-heap: the lent operand words leave the VM frame's traced length for the native run,
+    // The lent operand words leave the VM frame's traced length for the native run,
     // so they are this context's roots until it ends: the buffer's whole capacity, which covers
     // the entry depth and `max_stack` and is initialized (see `ValueStack`). The VM frame's
     // slots, environments and references stay registered by `drive_vm`.
@@ -17933,7 +17931,7 @@ pub fn run(
         ret: PackedValue::pack(Value::Undefined),
     };
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
-    // gc-heap: the pooled buffers are this context's roots for the native run (the stack scan
+    // The pooled buffers are this context's roots for the native run (the stack scan
     // sees the context itself): every slot, initialized above, and the operand words up to
     // `max_stack`, initialized because a ValueStack's whole capacity is (see `ValueStack`).
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
@@ -17994,7 +17992,7 @@ pub(crate) const FRAME_POOL_LIMIT: usize = 256;
 /// Generated code relies on these to skip the corresponding stores on entry: a receiver-less
 /// direct call leaves the callee's `this` as the pool left it.
 ///
-/// gc-heap rooting: the interpreter's `FramePool` registers every record, and the collector
+/// Rooting: the interpreter's `FramePool` registers every record, and the collector
 /// traces each one that is not pooled — from the pop that starts an activation (by a Rust entry
 /// or a direct call's machine code) to the push or free that ends it. It traces the context's
 /// values precisely (`GcTrace for JitCtx`) and all [`FRAME_BUF`] words conservatively, as packed
@@ -18011,7 +18009,7 @@ pub(crate) struct JitFrame {
 /// Byte offset of a record's slot storage from the record (and its context) base.
 pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
 
-/// gc-heap: an active record (see [`JitFrame`] and `GcTrace for FramePool`).
+/// An active record (see [`JitFrame`] and `GcTrace for FramePool`).
 impl crate::gc_trace::GcTrace for JitFrame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitFrame { ctx, words } = self;
@@ -18023,7 +18021,7 @@ impl crate::gc_trace::GcTrace for JitFrame {
 
 impl JitFrame {
     /// A new record owned by `i`'s pool, with its interpreter-constant fields initialized
-    /// (gc-heap: registered with the pool, its words zero-filled).
+    /// (registered with the pool, its words zero-filled).
     pub(crate) fn alloc(i: &mut Interp) -> std::ptr::NonNull<JitFrame> {
         let mut record = Box::<JitFrame>::new_uninit();
         let base = record.as_mut_ptr();
@@ -18418,7 +18416,7 @@ unsafe fn run_moved_oversized(
         ret: PackedValue::pack(Value::Undefined),
     };
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
-    // gc-heap: as in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
+    // As in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
     // above, are named here; the operand words are initialized up to `max_stack`.
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
         ctx: std::ptr::addr_of!(ctx),

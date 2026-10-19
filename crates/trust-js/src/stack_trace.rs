@@ -547,7 +547,7 @@ pub(crate) struct StackTrace {
 }
 
 impl StackTrace {
-    /// Each frame's name (engine strings: GC edges under gc-heap).
+    /// Each frame's name (engine strings: GC edges).
     pub(crate) fn for_each_name(&self, mut f: impl FnMut(&LStr)) {
         for frame in &self.frames {
             if let Some(name) = &frame.name {
@@ -614,7 +614,7 @@ pub(crate) struct ResumedFrame {
     name: Option<LStr>,
     source: Rc<ScriptSource>,
     start: u32,
-    /// `Rc::as_ptr` identity of the function object whose call created the body, if any: its
+    /// `Gc::as_ptr` identity of the function object whose call created the body, if any: its
     /// first step runs inside that call's frame (see [`Interp::in_resumed`]).
     function: usize,
 }
@@ -627,7 +627,7 @@ pub(crate) const DEFAULT_STACK_TRACE_LIMIT: f64 = 10.0;
 pub(crate) enum Skip {
     None,
     /// Every frame up to and including the innermost call of the function with this
-    /// `Rc::as_ptr` identity (V8's SKIP_UNTIL_SEEN); everything when it is not on the stack.
+    /// `Gc::as_ptr` identity (V8's SKIP_UNTIL_SEEN); everything when it is not on the stack.
     UntilSeen(usize),
 }
 
@@ -1042,7 +1042,7 @@ fn function_frame(
     }
 }
 
-// P1 S2 (gc-heap): frame names are engine strings, so frames are traced wherever they are held.
+// P1 S2: frame names are engine strings, so frames are traced wherever they are held.
 
 impl crate::gc_trace::GcTrace for Frame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn shared_inline_sites_keep_positions_live_until_the_last_chunk() {
         let mut engine = crate::Engine::new();
-        // gc-heap: the callee lives until the collection below finds it unreachable; no handle
+        // The callee lives until the collection below finds it unreachable; no handle
         // in this frame may retain it (the stack is scanned).
         let pin =
             crate::gc_test::in_frame(|| crate::value::Gc::downgrade(&engine.interp.new_object()));

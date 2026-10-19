@@ -1,13 +1,12 @@
 //! ARM64 storage accessors: where generated code finds an object's named-field values, a binding
 //! map's entries and a slot memo, in the build's layout (probed into the [`JitLayout`]).
 //!
-//! Named fields and binding-map entries are a `Vec` in the default build and, under gc-heap, an
-//! `InlineVec` whose first elements stay in the object or environment cell
-//! ([`JitVecLayout::Inline`]); a slot memo is 4 bytes wide in the default build and 2 under
-//! gc-heap. Templates never address these words themselves: they call the emitters below, which
-//! emit exactly the instructions the sites always emitted for the default build's layouts, and
-//! the gc-heap sequences for the others. Each site gates on the matching `*_fits` predicate,
-//! which holds wherever every offset the emitter bakes fits its instruction's immediate.
+//! Named fields and binding-map entries are an `InlineVec` whose first elements stay in the
+//! object or environment cell ([`JitVecLayout::Inline`]), and a slot memo is 2 bytes wide.
+//! Templates never address these words themselves: they call the emitters below, which also
+//! still handle an earlier layout's `Vec` and 4-byte memo. Each site gates on the matching
+//! `*_fits` predicate, which holds wherever every offset the emitter bakes fits its instruction's
+//! immediate.
 //!
 //! [`JitLayout`]: crate::value::JitLayout
 
@@ -122,7 +121,7 @@ pub(super) fn vec_data_fits(seq: JitVecLayout, off: usize) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // Named fields: the `Property` values of the Object at `obj` (the stored handle word plus
-// `obj_from_rc`), in key-layout order
+// `obj_from_cell`), in key-layout order
 // ---------------------------------------------------------------------------------------------
 
 /// The named-field storage within an Object.

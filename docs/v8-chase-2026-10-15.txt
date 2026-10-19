@@ -4477,3 +4477,48 @@ implementation agent's change, reviewed):
     its baseline (23 diagnostics); under Wine 2067 pass, 3 fail
     (step 1's snapshot codec tests) and 8 are ignored. Both test
     lists step 7b's.
+
+Step 8b, what still spoke of the flag, the counted build or Rc
+handles (an implementation agent's change, reviewed):
+- Comments and docs: 275 of the 278 engine lines that named gc-heap
+  now say what holds; 14 more spoke of "the default build" or of
+  both builds, and 56 called object or environment handles Rc
+  pointers, RcBoxes or Rc::as_ptr (now cell addresses, Gc::as_ptr
+  and Env::as_ptr). JitLayout's header, field and probe docs, the
+  JitCtx docs, NativeCallableRetained's public doc and the module
+  headers describe the GC heap alone. Genuine Rcs keep their wording
+  (PropertyLayout, Rc<str> keys, Rc<Chunk>, Rc<JitCode>,
+  Rc<Function>, BigInt data, GcHeap).
+- Kept: the three string literals that name gc-heap (the
+  TRUST_JS_GC_LOG prefix, LStr::strong_count's panic, step 8f's
+  H_DROP_PACKED_AT panic).
+- Renames: JitLayout's obj_from_rc is obj_from_cell (58 uses), the
+  locals bound to it obj_off (48), LStr's Header field strong
+  frontier (6). Three x86-64 test panic strings lost "gc-heap's". A
+  token comparison with comments stripped finds no other change.
+- Outside the engine: difftest's header gives its child processes'
+  real reasons (the memory and time budget, a crashing tier; a
+  dropped Engine frees its heap), and DIAGNOSTICS.md's GC stress
+  item lost its model qualifier. The Test262 runner said tests leak
+  by design between recycles. Measured over 4,331 tests (every 12th
+  of built-ins, language, annexB and intl402, one worker), its heap
+  counter stood at 0.7 MiB after the first and 1.4 MiB after the
+  last, far below the 256 MiB retirement cap; its comments now say
+  each test's Engine frees its heap.
+- Review: six comments that still described code in refcount terms
+  reworded (interpreter.rs's call-IC and env-borrow notes; jit.rs's
+  word moves, linked-scan plan and virtual result). Left: wording
+  about genuine Rcs, history notes, a test name.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2230/0/8, its test list step 8a's; clippy clean in
+    the five configurations; rustfmt clean; the workspace builds with
+    all targets without a diagnostic; rustdoc's 40 warnings are 8a's.
+  - The release engine's .text is byte-identical to step 8a's on
+    aarch64 and x86-64, and all three fixtures' code dumps are 8a's,
+    plain and with the shared stubs in both modes.
+  - x86-64 (zombie): clippy clean; lib 2074/0/8. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2067 pass, 3 fail
+    (step 1's snapshot codec tests) and 8 are ignored. Both test
+    lists step 8a's.
+  - Not run, the engine's code being 8a's: downstream suites,
+    fixtures, difftest, GC stress.

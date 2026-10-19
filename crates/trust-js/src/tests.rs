@@ -879,7 +879,7 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
             ),
             "ok"
         );
-        // The function's handle lives only in this helper frame (gc-heap scans the stack).
+        // The function's handle lives only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let global = crate::value::Value::Obj(engine.interp.global.clone());
             let value = engine
@@ -897,8 +897,8 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
             if mode == 1 { "17" } else { "sentinel" }
         );
         // The body removed both the global owner and the default prototype's constructor
-        // backlink. Only the caller operand remained; cleanup must drop that owner exactly once
-        // (gc-heap: leave no word that retains it, so the next collection finds it dead).
+        // backlink. Only the caller operand remained; cleanup must leave no word that retains
+        // it, so the next collection finds it dead.
         engine.interp.gc_collect();
         assert_eq!(
             weak.strong_count(),
@@ -1378,7 +1378,7 @@ fn embedder_indexed_property_side_table_does_not_pin_dead_objects() {
         .expect("getter parses")
         .unwrap_or_else(|_| panic!("getter evaluates"));
     let global = engine.ctx().global_this();
-    // The target lives only in this helper frame (gc-heap scans the stack).
+    // The target lives only in this helper frame (the collector scans the stack).
     let pointer = crate::gc_test::in_frame(|| {
         let target = Value::Obj(engine.ctx().new_object());
         let pointer = crate::gc_test::HiddenAddress::of(&target);
@@ -3600,7 +3600,7 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
         _ => panic!("child marker was retained"),
     };
 
-    // gc-heap: a ShadowRealm allocates in its parent's (its Agent's) heap, so both markers
+    // A ShadowRealm allocates in its parent's (its Agent's) heap, so both markers
     // live in the one heap; the caller's heap is still the active one afterwards.
     assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
     let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
@@ -3690,7 +3690,7 @@ fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
     );
 }
 
-/// P1 S4 (gc-heap): parsed code can serve several engines on one thread, one after another. A
+/// P1 S4: parsed code can serve several engines on one thread, one after another. A
 /// closure's `name` is a string of its own engine's heap, never one an AST-level template cached
 /// from the heap that first ran the code (here already dropped).
 #[test]
@@ -3729,7 +3729,7 @@ fn function_name_templates_serve_only_their_heap() {
     }
 }
 
-/// P1 S4 review (gc-heap): an AST-level template's name strings stay roots only while the
+/// P1 S4 review: an AST-level template's name strings stay roots only while the
 /// parsed code holding the template lives. Discarded code leaves nothing rooted in the heap.
 #[test]
 fn discarded_function_templates_release_their_name_strings() {
@@ -3756,14 +3756,14 @@ fn discarded_function_templates_release_their_name_strings() {
     );
 }
 
-/// P1 S5 (both builds): a property-creation cache (`IC_CREATE`) names its receiver's prototype by
+/// P1 S5: a property-creation cache (`IC_CREATE`) names its receiver's prototype by
 /// address. Once that prototype dies and its pin is pruned, a new object can take the address,
 /// and the cache must not stand for the new object's chain: here a setter of the created name.
 #[test]
 fn creation_caches_do_not_trust_a_reused_prototype_address() {
-    // The test needs the dead prototype's address back. The default build's objects come from
-    // the process allocator, which the suite's other test threads share and can take it from;
-    // a process that runs this test alone gets it back.
+    // The test needs the dead prototype's address back, so it reruns itself alone in a child
+    // process, where no other test thread can take that address first (added when objects came
+    // from the process allocator, which the suite's other test threads share).
     const CHILD: &str = "TRUST_JS_TEST_ADDRESS_REUSE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -3786,7 +3786,7 @@ fn creation_caches_do_not_trust_a_reused_prototype_address() {
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         // A tier's fresh heap can allocate at the previous tier's addresses, its prototype where
         // the previous new object was. Between stack scrubs, no handle the previous tier left in
-        // a frame survives to retain it (gc-heap).
+        // a frame survives to retain it.
         crate::scrubbed(|| creation_cache_after_address_reuse(tier));
     }
 }
@@ -3819,7 +3819,7 @@ fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
     });
     eval_to_string(&mut engine, "NT.prototype = null; 0");
     // The first collection finds the prototype dead and prunes its pin; the second frees
-    // its address (gc-heap keeps a pinned dead cell reserved until then).
+    // its address (the heap keeps a pinned dead cell reserved until then).
     engine.interp.gc_collect();
     engine.interp.gc_collect();
     let reused = crate::gc_test::in_frame(|| object_at(&mut engine, cached))
@@ -3859,7 +3859,7 @@ fn object_at(
     None
 }
 
-/// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
+/// P1 S4: a ShadowRealm's roots count only while its object is marked, so a realm
 /// kept only by its own wrapped function, stored inside it, is collected.
 #[test]
 fn shadow_realm_kept_only_through_itself_is_collected() {
@@ -3921,7 +3921,7 @@ fn ordinary_symbols_are_retained_only_by_live_values_and_property_keys() {
             false,
         )
         .expect("symbol-key setup parses");
-    // The strong handle stays in a helper frame (gc-heap scans the stack).
+    // The strong handle stays in a helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         let held = engine
             .interp
@@ -4852,7 +4852,8 @@ fn job_callback_source_realms_are_traced_and_collectable() {
             } else {
                 "globalThis.saved = new main.FinalizationRegistry(main.nothing); main.kept = saved;"
             };
-            // The child Realm handle lives only in this helper frame (gc-heap scans the stack).
+            // The child Realm handle lives only in this helper frame (the collector scans the
+            // stack).
             crate::gc_test::in_frame(|| {
                 let child = engine.ctx().create_embed_realm();
                 engine
@@ -4888,7 +4889,7 @@ fn job_callback_queued_source_is_a_temporary_root() {
     engine.set_job_callback_script_caller_capture(true);
     engine.define_global("nothing", 0, |_ctx, _, _| Ok(Value::Undefined));
     let main = engine.global_this();
-    // The child Realm handle lives only in this helper frame (gc-heap scans the stack).
+    // The child Realm handle lives only in this helper frame (the collector scans the stack).
     crate::gc_test::in_frame(|| {
         let child = engine.ctx().create_embed_realm();
         engine
@@ -5091,7 +5092,7 @@ fn suspended_context_realm_is_traced_but_not_permanently_rooted() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         crate::gc_test::in_frame(|| {
             let child = engine.ctx().create_embed_realm();
             engine.with_embed_realm(&child, |engine| {
@@ -18824,8 +18825,7 @@ fn finalization_registry_retention_and_cleanup_jobs() {
         )
         .expect("setup parses");
     engine.eval("$262.gc()", false).expect("collection parses");
-    // The cleanup job ran after that collection; a tracing heap (gc-heap) reclaims the held
-    // value at the next one, where reference counting freed it as the callback returned.
+    // The cleanup job ran after that collection; the next one reclaims the held value.
     engine.eval("$262.gc()", false).expect("collection parses");
     assert!(matches!(
         engine
@@ -20219,8 +20219,8 @@ fn destroyed_embedder_settings_context_releases_jobs_modules_and_global_state() 
         .modules
         .keys()
         .any(|key| crate::modules::module_map_context(key) == 61));
-    // Kept hidden: the conservative stack scan (gc-heap) would take the plain address for a
-    // reference to the namespace.
+    // Kept hidden: the conservative stack scan would take the plain address for a reference to
+    // the namespace.
     let retired_namespace = crate::gc_test::HiddenAddress::from_fn(|| {
         let ctx = engine.ctx();
         let namespace = ctx
@@ -20278,13 +20278,13 @@ fn retired_settings_request_boundary_collection_without_allocation_pressure() {
     // reachable. Retirement requests a scan; it must not forcibly destroy a
     // retained Realm or interrupt the synchronous job (ECMA-262 §9.9).
     let mut engine = Engine::new();
-    // Realm handles live only in helper frames (gc-heap scans the stack).
+    // Realm handles live only in helper frames (the collector scans the stack).
     let retained_ptr = crate::gc_test::in_frame(|| {
         let (abandoned_ptr, retained) = crate::gc_test::in_frame(|| {
             let abandoned = engine.ctx().create_embed_realm();
             let retained = engine.ctx().create_embed_realm();
-            // Addresses are kept hidden: the conservative stack scan (gc-heap) would take a plain
-            // address for a reference.
+            // Addresses are kept hidden: the conservative stack scan would take a plain address
+            // for a reference.
             let abandoned_ptr = crate::gc_test::HiddenAddress::of(&abandoned);
             for (realm, context) in [(&abandoned, 81), (&retained, 82)] {
                 assert!(engine
@@ -20335,11 +20335,11 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
     // switch must replace the bootstrap GlobalEnv rather than leave an
     // unreachable `(realm, 0)` HostSettingsState as a Rust GC root.
     let mut engine = Engine::new();
-    // The Realm handle lives only in this helper frame (gc-heap scans the stack).
+    // The Realm handle lives only in this helper frame (the collector scans the stack).
     let child_ptr = crate::gc_test::in_frame(|| {
         let child = engine.ctx().create_embed_realm();
-        // Kept hidden: the conservative stack scan (gc-heap) would take the plain address for
-        // a reference.
+        // Kept hidden: the conservative stack scan would take the plain address for a
+        // reference.
         let child_ptr = crate::gc_test::HiddenAddress::of(&child);
         assert!(engine
             .ctx()
@@ -20348,7 +20348,7 @@ fn first_window_context_does_not_retain_realm_bootstrap_state() {
         child_ptr
     });
     // The table is read in a helper frame too: its iterators left a word equal to a cell
-    // address in this frame on x86-64 (gc-heap), which the stack scan took for a root.
+    // address in this frame on x86-64, which the stack scan took for a root.
     let (bootstrap, window) = crate::gc_test::in_frame(|| {
         let states = &engine.ctx().host_settings_states;
         let has = |context| {
@@ -29816,7 +29816,7 @@ fn object_literal_methods_without_super_do_not_form_cycles() {
                     ),
                 );
                 let env = engine.interp.global_env.clone();
-                // The object lives only in this helper frame (gc-heap scans the stack).
+                // The object lives only in this helper frame (the collector scans the stack).
                 let weak = crate::gc_test::in_frame(|| {
                     let value = engine
                         .interp

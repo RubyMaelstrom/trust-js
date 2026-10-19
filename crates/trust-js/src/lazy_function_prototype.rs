@@ -53,7 +53,7 @@ impl LazyFunctionPrototype {
 
     pub(super) fn materialize(&self) -> Gc {
         // Held across one allocation, the prototype's cell. Allocation never collects, so no
-        // collection can trace this state while it is borrowed (gc-heap, I9; see `trace_cell`).
+        // collection can trace this state while it is borrowed (I9; see `trace_cell`).
         let mut state = self.state.borrow_mut();
         if let State::Materialized(prototype) = &*state {
             return prototype.clone();
@@ -95,7 +95,7 @@ impl LazyFunctionPrototype {
     }
 }
 
-/// The trace of a deferred-prototype cell (gc-heap): its function and the prototype's parent,
+/// The trace of a deferred-prototype cell: its function and the prototype's parent,
 /// or once materialized the prototype. Its finalizer (`gc_box::finalize`) drops the key layout.
 pub(super) fn trace_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: deferred-prototype cells are initialized by `gc_box::new` before any collection.
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// P1 S4 (gc-heap): a dead constructor's cell is freed by the collection that finds it
+    /// P1 S4: a dead constructor's cell is freed by the collection that finds it
     /// dead. Its deferred prototype holds no weak handle that would keep the cell reserved (a
     /// zombie) until the next collection.
     #[test]
@@ -303,14 +303,14 @@ mod tests {
         );
     }
 
-    /// The deferred-prototype cells `engine`'s heap holds (gc-heap).
+    /// The deferred-prototype cells `engine`'s heap holds.
     fn lazy_cells(engine: &Engine) -> usize {
         let heap = &engine.interp.gc_heap;
         heap.core.borrow().live_count(heap.lazy_proto_desc)
     }
 
     /// The tag of the global function `name`'s `prototype` word, read in a helper frame: the
-    /// conservative stack scan (gc-heap) would keep a handle left in the caller's frame.
+    /// conservative stack scan would keep a handle left in the caller's frame.
     fn prototype_tag(engine: &mut Engine, name: &str) -> u64 {
         crate::gc_test::in_frame(|| {
             object(engine, name)
@@ -323,7 +323,7 @@ mod tests {
         })
     }
 
-    /// P1 S5 (gc-heap): a function's deferred prototype is a cell that its function keeps
+    /// P1 S5: a function's deferred prototype is a cell that its function keeps
     /// alive. Across forced collections (in the stress child, also one at every safepoint) the
     /// heap keeps one such cell per live function, the words stay lazy and none is
     /// materialized, and a cell's first marker in a traced collection is its function's cell:
@@ -388,7 +388,7 @@ mod tests {
         );
     }
 
-    /// P1 S5 (gc-heap): the deferred-prototype descriptor's trace reports exactly the cell's
+    /// P1 S5: the deferred-prototype descriptor's trace reports exactly the cell's
     /// two edges, in order: the function, then the prototype's parent while it is deferred;
     /// the function, then the prototype once it is materialized (the promoted word no longer
     /// names the cell, which stays allocated until a collection).
@@ -433,7 +433,7 @@ mod tests {
         );
     }
 
-    /// P1 S5 (gc-heap): deferred prototypes that collections traced as cells materialize as
+    /// P1 S5: deferred prototypes that collections traced as cells materialize as
     /// they did before the cell. For an ordinary function of this realm, a function made by a
     /// `$262.createRealm()` realm's `Function` and a generator of that realm, after forced
     /// collections each word is still lazy; the first reads materialize each prototype once,
@@ -488,11 +488,11 @@ mod tests {
         );
     }
 
-    /// P1 S5 (gc-heap): `F.prototype = p` over unobserved deferred prototypes through Rust's
+    /// P1 S5: `F.prototype = p` over unobserved deferred prototypes through Rust's
     /// `Object.defineProperty` ([[DefineOwnProperty]]) and `Reflect.set` ([[Set]]): the new
     /// value reads back, and every old cell is gone after the next collection. Both operations
     /// first snapshot the current descriptor with `Property::clone`, which materializes the old
-    /// prototype (both builds, as before the cell): one materialization per function, and the
+    /// prototype (as before the cell): one materialization per function, and the
     /// materialized object is garbage once the store completes.
     #[test]
     fn rust_overwrites_of_deferred_prototypes_free_their_cells() {
@@ -648,8 +648,8 @@ mod tests {
         }
     }
 
-    /// P1 S5 (gc-heap, debug builds): copying a deferred prototype's word with `Clone`, a bit
-    /// copy under gc-heap, instead of `PackedValue::clone_materialized` trips a debug assertion
+    /// P1 S5 (debug builds): copying a deferred prototype's word with `Clone`, a bit copy,
+    /// instead of `PackedValue::clone_materialized` trips a debug assertion
     /// before the property-only word can leave its property.
     #[cfg(debug_assertions)]
     #[test]
@@ -668,8 +668,8 @@ mod tests {
     fn lazy_prototype_drops_without_a_cycle_and_materialized_escape_keeps_constructor() {
         let mut engine = Engine::new();
         eval(&mut engine, "var F=function(){}, G=function(){};");
-        // Strong handles live in helper frames: the conservative stack scan (gc-heap) would
-        // keep a handle in this frame alive after `drop`.
+        // Strong handles live in helper frames: the conservative stack scan would keep a
+        // handle in this frame alive after `drop`.
         let weak = crate::gc_test::in_frame(|| {
             let function = object(&mut engine, "F");
             assert_eq!(

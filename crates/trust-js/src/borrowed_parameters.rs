@@ -160,8 +160,8 @@ mod tests {
         let mut engine = crate::Engine::new();
         let environment = new_scope(None);
         let registry = Registry::default();
-        // The object's handles and the slots live only in this helper frame (gc-heap scans the
-        // stack).
+        // The object's handles and the slots live only in this helper frame (the collector
+        // scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let old = crate::value::Object::new(None);
             let weak = crate::value::Gc::downgrade(&old);

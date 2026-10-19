@@ -2611,7 +2611,7 @@ mod tests {
         let weak_layout = Rc::downgrade(&layout);
         let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>();
-        // The source lives only in this helper frame (gc-heap scans the stack).
+        // The source lives only in this helper frame (the collector scans the stack).
         let (weak_source, _keys) = crate::gc_test::in_frame(|| {
             let mut props = Props::with_layout(1, Some(layout.clone()));
             props.append_initialized_field(
@@ -2632,7 +2632,7 @@ mod tests {
             (weak_source, keys)
         });
         drop(layout);
-        // A tracing heap (gc-heap) reclaims the dropped source at a collection.
+        // A collection reclaims the dropped source.
         engine.interp.gc_collect();
         assert!(!crate::gc_test::alive(&weak_source));
         assert_eq!(
@@ -3257,12 +3257,12 @@ mod tests {
     }
 
     /// A function's deferred prototype counts once, in property storage, as its own
-    /// `LazyFunctionPrototype` payload: 48 requested bytes in both builds, as before the
-    /// payload became a gc-heap cell (no report counts gc-heap cells by bytes, so the cell is
-    /// not counted twice). Measuring does not materialize it. Of functions made by one
-    /// expression (their prototype template's key layout is counted with the template),
-    /// replacing one's `prototype`, after a warm-up replacement and with the garbage
-    /// collected, lowers property storage by exactly that payload.
+    /// `LazyFunctionPrototype` payload: 48 requested bytes, as before the payload became a
+    /// cell (no report counts cells by bytes, so the cell is not counted twice). Measuring
+    /// does not materialize it. Of functions made by one expression (their prototype
+    /// template's key layout is counted with the template), replacing one's `prototype`, after
+    /// a warm-up replacement and with the garbage collected, lowers property storage by exactly
+    /// that payload.
     #[test]
     fn deferred_prototype_payload_is_counted_once_in_property_storage() {
         let mut engine = crate::Engine::new();

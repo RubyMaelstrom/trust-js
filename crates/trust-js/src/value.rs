@@ -96,7 +96,7 @@ pub type NativeCaptureFn = fn(&mut Interp, Value, &[Value], &[Value]) -> Result<
 ///
 /// The reporter is stored separately so the established `Rc<NativeClosure>` call surface remains
 /// source-compatible. It must enumerate every allocation below its own inline payload and every
-/// captured JavaScript value: a tracing collector (`gc-heap`) keeps exactly those alive.
+/// captured JavaScript value: the collector keeps exactly those alive.
 pub trait NativeCallableRetained {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
 }
@@ -155,7 +155,7 @@ pub enum Value {
 }
 
 impl Value {
-    /// The cell this value holds, as a GC edge: an object or a payload cell (gc-heap).
+    /// The cell this value holds, as a GC edge: an object or a payload cell.
     #[inline]
     pub(crate) fn cell_word(&self) -> Option<u64> {
         match self {
@@ -219,8 +219,8 @@ use lazy_function_prototype::LazyFunctionPrototype;
 #[cfg(test)]
 pub(crate) const DEFERRED_PROTOTYPE_BYTES: usize = std::mem::size_of::<LazyFunctionPrototype>();
 
-/// The handle a PACK_LAZY_PROTO word holds: a function's deferred `prototype`. P1 S5
-/// (gc-heap): a payload cell that traces the function and the prototype's parent (or, once
+/// The handle a PACK_LAZY_PROTO word holds: a function's deferred `prototype`. P1 S5: a payload
+/// cell that traces the function and the prototype's parent (or, once
 /// materialized, the prototype), so the word owns nothing and dropping or overwriting it
 /// releases nothing; the cell dies at the first collection that finds no word naming it.
 type LazyProto = crate::gc_box::GcBox<LazyFunctionPrototype>;
@@ -411,7 +411,7 @@ impl PackedValue {
 
     /// Lend the object edge this word holds (an object, or a deferred prototype's single stored
     /// edge: the logical edge from its function) without copying a handle out of the word.
-    /// Never materializes a prototype. Under gc-heap a deferred prototype is a cell of its own,
+    /// Never materializes a prototype. A deferred prototype is a cell of its own,
     /// which marking reaches through `PackedValue::trace_gc_edges`, not through this edge.
     #[inline]
     fn with_object_edge(&self, f: impl FnOnce(&Gc)) {
@@ -470,7 +470,7 @@ impl PackedValue {
     }
 }
 
-/// gc-heap: a word owns nothing (its payload is a cell address or a scalar), so a clone copies
+/// A word owns nothing (its payload is a cell address or a scalar), so a clone copies
 /// its bits. A deferred prototype is a property-only word that must not be copied as is:
 /// property reads copy words with [`PackedValue::clone_materialized`]. Debug builds assert it.
 impl Clone for PackedValue {
@@ -485,7 +485,7 @@ impl Clone for PackedValue {
     }
 }
 
-// gc-heap: a word owns nothing, so it has no drop glue; dropping or overwriting one, and every
+// A word owns nothing, so it has no drop glue; dropping or overwriting one, and every
 // teardown loop over execution words, compiles to nothing.
 const _: () = assert!(!std::mem::needs_drop::<PackedValue>());
 
@@ -519,7 +519,7 @@ mod packed_value_tests {
             1.5
         );
         // The Obj payload is the stored handle word (the cell address); the Object sits
-        // `obj_from_rc` bytes in.
+        // `obj_from_cell` bytes in.
         let object = Object::new(None);
         let layout = jit_layout(&object);
         let value = Value::Obj(object.clone());
@@ -530,14 +530,14 @@ mod packed_value_tests {
                     .add(8)
                     .cast::<usize>()
                     .read()
-            } + layout.obj_from_rc,
+            } + layout.obj_from_cell,
             RefCell::as_ptr(&object) as usize
         );
     }
 
     /// Number and emptiness inspection reads a word's bits and nothing else: every word keeps
     /// its bits, a Number's (or NaN's) value comes back exactly, and an object's word still
-    /// names its object. A gc-heap word owns nothing, so its bits are all there is to keep.
+    /// names its object. A word owns nothing, so its bits are all there is to keep.
     #[test]
     fn packed_numeric_inspection_is_non_owning_and_preserves_number_bits() {
         for number in [
@@ -642,7 +642,7 @@ mod packed_value_tests {
     }
 
     /// Packing moves a handle into a word and `into_value` moves it back out, the same handle.
-    /// gc-heap: the word is the object tag over the cell's address, and the type has no drop
+    /// The word is the object tag over the cell's address, and the type has no drop
     /// glue, so a move needs no drop of its source.
     #[test]
     fn packed_value_moves_reference_ownership_without_a_bump() {
@@ -656,7 +656,7 @@ mod packed_value_tests {
     }
 
     /// A clone of a word has its exact bits, for every kind, and dropping clones leaves the
-    /// originals' values intact. gc-heap: a clone is a bit copy of a word over a cell's
+    /// originals' values intact. A clone is a bit copy of a word over a cell's
     /// address, which owns nothing, so there is nothing to retain or release.
     #[test]
     fn packed_value_direct_clones_preserve_bits_and_exact_owner_counts() {
@@ -753,7 +753,7 @@ mod packed_value_tests {
     }
 
     /// Raw frame-word reads, writes, an in-place `replace_value` and `drop_in_place` move an
-    /// object's word and leave the other words intact; gc-heap handles hold no count, so the
+    /// object's word and leave the other words intact; handles hold no count, so the
     /// test checks the words and identities alone.
     #[test]
     fn packed_raw_frame_moves_and_replacements_preserve_ownership() {
@@ -1088,31 +1088,30 @@ pub(crate) fn new_symbol_agent() -> SymbolAgent {
     }))
 }
 
-/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph,
-/// and how the build keeps values alive. Every field is *measured at runtime* against the real
-/// types of the build (never hardcoded); the layouts that aren't guaranteed — where a `Vec`'s or
-/// an `InlineVec`'s words sit, a handle's header size, the `Option<Gc>` niche — are located by
-/// probing and checked against live values, and reported in `valid`. If `valid` is false the
-/// JIT emits no inline caches and everything routes through the checked helper, so a future
-/// libstd layout change degrades performance, never correctness.
+/// Byte offsets the JIT's inline property-cache templates read directly out of the object graph.
+/// Every field is *measured at runtime* against the real types of the build (never hardcoded);
+/// the layouts that aren't guaranteed — where a `Vec`'s or an `InlineVec`'s words sit, a
+/// handle's header size, the `Option<Gc>` niche — are located by probing and checked against
+/// live values, and reported in `valid`. If `valid` is false the JIT emits no inline caches and
+/// everything routes through the checked helper, so a future libstd layout change degrades
+/// performance, never correctness.
 ///
 /// Object offsets are relative to the *stored* handle word — the value in a `Value::Obj` payload,
-/// a packed object word's payload and an `Option<Gc>` (proto) field. In the default build that
-/// word is the `Rc` pointer, which points at the `RcBox` header (`{strong, weak, value}`), NOT at
-/// [`Gc::as_ptr`] (the inner `RefCell<Object>`, `gc_data_off` bytes further on). Under gc-heap it
-/// is the cell address, where the `RefCell<Object>` starts (`gc_data_off` is 0). The inline
-/// templates only ever have the stored word, so measuring from it is what makes them correct.
+/// a packed object word's payload and an `Option<Gc>` (proto) field: the cell's address, which
+/// is [`Gc::as_ptr`], where the `RefCell<Object>` starts (`gc_data_off` is 0). The `Object` is
+/// `obj_from_cell` bytes on, past the `RefCell`'s borrow flag. The inline templates only ever
+/// have the stored word, so measuring from it is what makes them correct.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct JitLayout {
-    /// Stored handle word → the `Object` (through the RcBox header, if any, and the `RefCell`
-    /// wrapper, whose borrow flag is the first word of a gc-heap object cell).
-    pub obj_from_rc: usize,
-    /// Stored handle word → [`Gc::as_ptr`] (the RcBox header size; 0 under gc-heap): what the
+    /// Stored handle word → the `Object`, past the `RefCell` wrapper, whose borrow flag is the
+    /// first word of an object cell.
+    pub obj_from_cell: usize,
+    /// Stored handle word → [`Gc::as_ptr`] (0: the word is the cell address): what the
     /// call probes add to a payload before comparing it with a fill-time `Gc::as_ptr` identity.
     pub gc_data_off: usize,
-    /// The build's representation facts beyond these offsets ([`JitRepr`]): how values are
-    /// owned, how named fields and binding-map entries hold their elements, a slot memo's width
-    /// and the gc-heap Collection tag, probed once per process.
+    /// The build's representation facts beyond these offsets ([`JitRepr`]): where a key layout's
+    /// strong count sits, how named fields and binding-map entries hold their elements, a slot
+    /// memo's width and the Collection tag, probed once per process.
     pub(crate) repr: &'static JitRepr,
     pub obj_proto: usize,
     pub obj_props: usize,
@@ -1128,9 +1127,9 @@ pub struct JitLayout {
     /// canonical-index keys all live in element storage.
     pub props_elem_mode: usize,
     pub props_has_far: usize,
-    /// The contiguous instance-field storage within `Props` (a `Vec<Property>`, or under
-    /// gc-heap an `InlineVec` holding the first fields in the cell). Generated code reaches its
-    /// elements, length and capacity only as `JitRepr::props_fields` describes.
+    /// The contiguous instance-field storage within `Props` (an `InlineVec` holding the first
+    /// fields in the cell). Generated code reaches its elements, length and capacity only as
+    /// `JitRepr::props_fields` describes.
     pub props_entries: usize,
     /// Nullable stored Rc pointer to the shared key Vec; live keys are its fields-length prefix.
     pub props_layout: usize,
@@ -1204,8 +1203,7 @@ pub struct JitLayout {
     /// Parent `Option<Env>` within `Env::as_ptr(env)`: a stored environment handle word, or
     /// null (the handle's niche; checked live).
     pub scope_parent: usize,
-    /// Stored environment handle word → `Env::as_ptr` (the RcBox header size; 0 under gc-heap,
-    /// where the word is the cell address).
+    /// Stored environment handle word → `Env::as_ptr` (0: the word is the cell address).
     pub scope_data_off: usize,
     pub scope_parent_valid: bool,
     /// Guarded repr(Rust) small binding-map arm (its tag byte: Small 0, Large 1, Indexed 2) and
@@ -1239,14 +1237,13 @@ pub struct JitLayout {
     pub key_probe_ok: bool,
     /// `call` within `Object`: [`Callable`]'s discriminant byte at +0, its payload word at +8.
     pub obj_call: usize,
-    /// `Callable::User`'s payload word (a [`UserFn`]: the `Rc<UserCallable>` pointer, or under
-    /// gc-heap the closure cell's address) → the [`UserCallable`]'s `func`, `env` (a stored
-    /// environment handle word) and `realm` fields.
+    /// `Callable::User`'s payload word (a [`UserFn`]: the closure cell's address) → the
+    /// [`UserCallable`]'s `func`, `env` (a stored environment handle word) and `realm` fields.
     pub user_func: usize,
     pub user_env: usize,
     pub user_realm: usize,
     /// Stored `Rc<Function>` pointer → `Rc::as_ptr` (the AST identity a `CallIc` records; the
-    /// AST is reference-counted in every build).
+    /// AST is reference-counted).
     pub func_data_off: usize,
     /// `Env::as_ptr(env)` → `Scope::under_with` (through the `RefCell`).
     pub scope_under_with: usize,
@@ -1360,7 +1357,7 @@ fn probe_jit_repr() -> JitRepr {
     // place and spilled.
     let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
 
-    // gc-heap: a Map's or Set's data is `Exotic::Collection`, declared right after `None` so
+    // A Map's or Set's data is `Exotic::Collection`, declared right after `None` so
     // that `Exotic::is_ordinary` is one tag range. Its tag must be payload-independent and
     // distinct from every admitted tag, or no tag guard is sound: fail closed.
     let tag = |exotic: &Exotic| unsafe { *(exotic as *const Exotic as *const u8) };
@@ -1475,15 +1472,14 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         }
     };
     // The stored handle word — a `Value::Obj` payload, a packed object word's payload, an
-    // `Option<Gc>` (proto) field — is the RcBox pointer in the default build (`gc_data_off`
-    // bytes before `Gc::as_ptr`, with the strong count in that header) and the cell address
-    // under gc-heap (`Gc::as_ptr` itself: the cell starts with the RefCell<Object>). Every
-    // object offset is measured from it, through either header and the RefCell wrapper.
+    // `Option<Gc>` (proto) field — is the cell address (`Gc::as_ptr` itself: the cell starts
+    // with the RefCell<Object>). Every object offset is measured from it, through the RefCell
+    // wrapper.
     let stored = unsafe { *(sample as *const Gc as *const usize) };
     let as_ptr = Gc::as_ptr(sample) as usize; // the RefCell<Object>
     let obj_addr = &*sample.borrow() as *const Object as usize;
     let gc_data_off = as_ptr.wrapping_sub(stored);
-    let obj_from_rc = obj_addr.wrapping_sub(stored);
+    let obj_from_cell = obj_addr.wrapping_sub(stored);
     // An Option<Gc> (a proto field) holds exactly the stored word, and None is null (the
     // handle's non-null niche).
     let some_proto: Option<Gc> = Some(sample.clone());
@@ -1636,8 +1632,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 
     // Scope offsets for the inline LoadName template, relative to `Env::as_ptr` (the
     // RefCell<Scope>) → Scope.vars → VarMap generation. The RefCell value offset is probed on a
-    // live scope; a stored environment handle word is the RcBox pointer (default build) or the
-    // cell address (gc-heap), `scope_data_off` bytes before `Env::as_ptr`.
+    // live scope; a stored environment handle word is the cell address, `scope_data_off` (0)
+    // bytes before `Env::as_ptr`.
     let probe_env = crate::interpreter::new_scope(None);
     let scope_addr = {
         let b = probe_env.borrow();
@@ -1697,10 +1693,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 
     // Code-keyed call probe: `Callable` is repr(u8) (discriminant byte, then one payload word)
     // and `UserCallable` is repr(C). Verify both on live values: a native callable, and a
-    // closure of a parsed function, whose payload word (its `UserFn`: the Rc<UserCallable>
-    // pointer, or under gc-heap the closure cell's address) must lead through the measured
-    // offsets to the closure's func, env and realm, and whose func word plus `func_data_off`
-    // must be the AST identity a CallIc records.
+    // closure of a parsed function, whose payload word (its `UserFn`: the closure cell's
+    // address) must lead through the measured offsets to the closure's func, env and realm,
+    // and whose func word plus `func_data_off` must be the AST identity a CallIc records.
     fn call_layout_probe(_: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
         Ok(Value::Undefined)
     }
@@ -1761,7 +1756,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && layout_ok
         && heap_layouts_ok;
     JitLayout {
-        obj_from_rc,
+        obj_from_cell,
         gc_data_off,
         repr,
         obj_proto: offset_of!(Object, proto),
@@ -1993,7 +1988,7 @@ impl TypeofTest {
     }
 }
 
-/// A closure's [`UserCallable`], shared by handle. P1 S4 (gc-heap): a payload cell that traces
+/// A closure's [`UserCallable`], shared by handle. P1 S4: a payload cell that traces
 /// its environment, so creating a closure takes one 32-byte cell, and a call copies the handle
 /// without touching a count.
 pub type UserFn = crate::gc_box::GcBox<UserCallable>;
@@ -2162,7 +2157,7 @@ pub struct StringIteratorState {
 #[allow(dead_code)]
 pub enum Exotic {
     None,
-    /// P1 S4 (gc-heap): a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
+    /// P1 S4: a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
     /// `Interp::collection`). Declared next to `None` so that [`Exotic::is_ordinary`] tests one
     /// tag range.
     Collection(Box<crate::ordered_collection::OrderedCollection>),
@@ -2543,7 +2538,7 @@ pub(crate) struct GcState {
 
 pub(crate) type GcHeap = Rc<GcState>;
 
-/// gc-heap: the live-object count and, beside it, the cell heap's due word: 1 exactly while
+/// The live-object count and, beside it, the cell heap's due word: 1 exactly while
 /// `gc_core::Heap::collection_due` holds (the byte budget is spent, the stress interval reached
 /// or a request deferred), which the heap keeps current as their only writer (attached by
 /// [`new_gc_heap`]). None of these moves the count. `JitCtx::live_objects` holds the count's
@@ -2584,7 +2579,7 @@ const _: () = assert!(
         && std::mem::offset_of!(LiveCount, due) == LIVE_DUE_OFF as usize
 );
 
-/// Whether the cell heap has a collection due, as generated code reads it (gc-heap tests; see
+/// Whether the cell heap has a collection due, as generated code reads it (tests; see
 /// [`LiveCount`]).
 #[cfg(test)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -2592,7 +2587,7 @@ pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
     heap.live.due.get() != 0
 }
 
-/// Debug builds: the due word agrees with the core's `collection_due` (gc-heap; checked at
+/// Debug builds: the due word agrees with the core's `collection_due` (checked at
 /// `Interp::gc_check`).
 pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
     if cfg!(debug_assertions) {
@@ -2689,7 +2684,7 @@ pub(crate) fn alloc_string_cell(size: usize) -> *mut u8 {
     with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(heap.string_desc, size))
 }
 
-/// The active heap's interned string at `slot`, made by `make` on first use (gc-heap). Engine
+/// The active heap's interned string at `slot`, made by `make` on first use. Engine
 /// strings are immutable values; interning per heap keeps one heap's cells out of another's.
 pub(crate) fn interned_string(
     slot: usize,
@@ -2954,7 +2949,7 @@ fn finalize_object_cell(cell: *mut u8) {
     unsafe { std::ptr::drop_in_place(cell as *mut RefCell<Object>) };
 }
 
-/// The S3 layout census (`TRUST_JS_GC_CENSUS=1`, gc-heap; diagnostic only): how many named
+/// The S3 layout census (`TRUST_JS_GC_CENSUS=1`; diagnostic only): how many named
 /// properties objects hold, sampled over the live heap after every collection and over objects
 /// as they die, by family. It sizes inline property slots (Decision 3). S4 adds environment
 /// records: bindings per record and the binding storage beside the cell.
@@ -3359,7 +3354,7 @@ pub(crate) fn gc_performance_metrics_finish(
     GC_LAST_OBJECTS_AFTER.store(objects_after, Relaxed);
 }
 
-/// The S3 layout census as a JSON field, when it was requested (gc-heap).
+/// The S3 layout census as a JSON field, when it was requested.
 fn layout_census_field() -> String {
     if layout_census::enabled() {
         return format!(",\"gc_layout_census\":{}", layout_census::json());
@@ -3464,7 +3459,7 @@ pub(crate) fn active_heap_id() -> u64 {
     with_active_gc_heap(|heap| heap.heap_id)
 }
 
-/// The strings one AST-level template holds (gc-heap).
+/// The strings one AST-level template holds.
 pub(crate) type TemplateStrings = RefCell<Vec<crate::lstr::LStr>>;
 
 /// The roots of one AST-level template (`ast::FunctionMaps`): the strings it holds, cells of
@@ -3602,7 +3597,7 @@ pub(crate) fn active_agent_slow_switches() -> u64 {
 }
 
 thread_local! {
-    /// Where allocation goes outside any Agent (gc-heap): values made before an Engine exists,
+    /// Where allocation goes outside any Agent: values made before an Engine exists,
     /// or after its heap was deactivated. Never collected and released only when the thread
     /// exits, so such values stay valid wherever they end up. A heap made per activation gap
     /// instead freed them as soon as an Engine activated its own.
@@ -3662,7 +3657,7 @@ pub(crate) fn active_shape_transition_count() -> u64 {
 /// starts; reusable compiled chunks must not embed it because a chunk can be shared across Agents.
 /// Both native backends capture this pointer in the shared JIT entry paths. Those
 /// wrappers are also type-checked on fallback targets; obtaining this stable Cell
-/// address does not depend on native code generation or a platform ABI. Under gc-heap the
+/// address does not depend on native code generation or a platform ABI. The
 /// cell heap's due word follows the count ([`LiveCount`]).
 pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
@@ -3676,9 +3671,9 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
 mod jit_heap_tests {
     use super::*;
 
-    /// gc-heap: an allocation counts in the active Agent's heap, and a collection counts its
-    /// own heap's deaths in that heap's counter, whichever Agent is active (a tracing heap
-    /// frees at collections).
+    /// An allocation counts in the active Agent's heap, and a collection counts its own heap's
+    /// deaths in that heap's counter, whichever Agent is active (cells are freed at
+    /// collections).
     #[test]
     fn jit_live_object_counters_follow_their_heaps_across_agent_switches() {
         // ECMA-262, Agents (https://tc39.es/ecma262/#sec-agents): independent Agents may
@@ -4712,7 +4707,7 @@ pub(crate) const INLINE_NAMED_SLOTS: usize = 4;
 type Fields = crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS>;
 
 /// Bytes a map with room for `capacity` named values owns outside its object: none while they
-/// fit the inline slots (gc-heap).
+/// fit the inline slots.
 #[cfg(test)]
 pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
     if capacity <= INLINE_NAMED_SLOTS {

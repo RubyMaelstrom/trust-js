@@ -11,7 +11,7 @@
 //!
 //! Programs run at every tier with the same expected results (Node's, run as a classic script);
 //! at `Tier::Jit` the functions named ran as native code and, where a test counter records it,
-//! the native path ran. Under gc-heap the stress child (`jit::rooting_tests::
+//! the native path ran. The stress child (`jit::rooting_tests::
 //! rooting_holds_under_gc_stress`) also runs them at `TRUST_JS_GC_STRESS=1`.
 //!
 //! The counters of ARM64's direct calls, regions, numeric chains and property templates are

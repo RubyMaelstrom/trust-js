@@ -48,7 +48,7 @@ fn layout(engine: &crate::Engine) -> JitLayout {
 /// exactly while its elements are spilled.
 fn capacity_word(seq: JitVecLayout, base: usize, off: usize) -> u32 {
     let JitVecLayout::Inline { cap, .. } = seq else {
-        panic!("gc-heap's sequences are InlineVecs")
+        panic!("the sequences are InlineVecs")
     };
     // SAFETY: `base + off` is a live sequence of that layout.
     unsafe { ((base + off + cap) as *const u32).read() }
@@ -138,7 +138,7 @@ fn named_field_emitters_read_live_objects() {
         inline_capacity, ..
     } = layout.repr.props_fields
     else {
-        panic!("gc-heap's named fields are an InlineVec")
+        panic!("named fields are an InlineVec")
     };
     // In place up to four fields; spilled beyond.
     for count in [1usize, 2, 4, 5, 9] {
@@ -151,7 +151,7 @@ fn named_field_emitters_read_live_objects() {
         }
         // The Object, as a template finds it from the stored handle word.
         let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
-        let base = stored + layout.obj_from_rc;
+        let base = stored + layout.obj_from_cell;
         assert_eq!(base, &*object.borrow() as *const Object as usize);
         let fields = layout.obj_props + layout.props_entries;
         assert_eq!(
@@ -189,7 +189,7 @@ fn binding_entry_emitters_read_live_scopes() {
         inline_capacity, ..
     } = entries
     else {
-        panic!("gc-heap's binding entries are an InlineVec")
+        panic!("binding entries are an InlineVec")
     };
     // Entry `rsi`'s `Binding` in the scope at rdi, as the name templates find a fresh holder's.
     let (_code, binding) = assemble(|a| {
@@ -203,7 +203,7 @@ fn binding_entry_emitters_read_live_scopes() {
         a.nr_lea(AX, AX, layout.scope_binding_offset as i32);
         ret_none(a, miss);
     });
-    // One binding stays in a gc-heap environment cell; more spill. Indexed maps share the
+    // One binding stays in the environment cell; more spill. Indexed maps share the
     // Small arm's entries.
     for (count, indexed) in [(1usize, false), (2, false), (5, false), (3, true)] {
         let env = new_scope(None);

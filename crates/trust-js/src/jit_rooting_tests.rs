@@ -1,5 +1,5 @@
-//! The collector roots the native JIT's activations (P1 S5 step 7; gc-heap; ARM64, and x86-64
-//! from S6 step 7), with collections on and, in debug builds, the heap verifier after every
+//! The collector roots the native JIT's activations (P1 S5 step 7; ARM64, and x86-64 from S6
+//! step 7), with collections on and, in debug builds, the heap verifier after every
 //! marking.
 //!
 //! Each program keeps values in one kind of JIT storage and forces a collection from inside the
@@ -17,8 +17,8 @@
 //! test (its stack scrubbed, see `gc_test`) must find every object it tracked dead.
 //!
 //! From (10) on, and in two tests kept beside the paths they cover (a callback's long argument
-//! list, an OSR entry's operand prefix), these programs check under gc-heap the JIT paths whose
-//! default-build tests count references.
+//! list, an OSR entry's operand prefix), these programs check the JIT paths whose tests used to
+//! count references.
 
 use crate::bytecode::Tier;
 use crate::interpreter::Interp;
@@ -1113,8 +1113,8 @@ fn tail_call_arguments_are_roots_in_the_trampoline() {
     assert_tracked_collectable(&mut engine);
 }
 
-/// These programs, the rooting tests that use this harness beside the tests they stand in for
-/// under gc-heap (a callback's long argument list, an OSR entry's operand prefix), step 6's
+/// These programs, the rooting tests that use this harness beside the paths they cover (a
+/// callback's long argument list, an OSR entry's operand prefix), step 6's
 /// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, every kind of
 /// `this` through the sites of `jit::this_tests`, the string constants that generated code
 /// pushes as immediates (`jit::string_constant_tests`), the deferred

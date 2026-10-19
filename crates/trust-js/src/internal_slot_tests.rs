@@ -231,7 +231,7 @@ fn internal_slot_tests_gc_traces_live_slots_and_breaks_internal_slot_cycles() {
         "#,
         );
         let env = engine.interp.global_env.clone();
-        // Strong handles live only in helper frames (gc-heap scans the stack).
+        // Strong handles live only in helper frames (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let cycle = engine.interp.get_var("cycle", &env).ok().unwrap();
             crate::value::Gc::downgrade(cycle.as_obj().unwrap())

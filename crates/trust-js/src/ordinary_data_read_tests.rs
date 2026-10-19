@@ -227,7 +227,7 @@ fn ordinary_data_read_lazy_prototype_identity_and_returned_ownership() {
     for traced in [false, true] {
         let mut engine = Engine::new();
         run(&mut engine, "var F=function(){};");
-        // Strong handles live only in helper frames (gc-heap scans the stack): the outer one
+        // Strong handles live only in helper frames (the collector scans the stack): the outer one
         // keeps the returned prototype, the inner one the function.
         let weak_function = crate::gc_test::in_frame(|| {
             let (weak_function, first) = crate::gc_test::in_frame(|| {

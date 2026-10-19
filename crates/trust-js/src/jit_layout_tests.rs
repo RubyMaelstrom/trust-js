@@ -1,5 +1,5 @@
 //! P1 S5 step 4: [`JitLayout`] v2 describes the build truthfully. Every exported offset is read
-//! on a live structure through the raw offset and compared with the safe accessor: gc-heap's
+//! on a live structure through the raw offset and compared with the safe accessor: the
 //! traced handles, in-cell named fields (in place and spilled), narrow slot memos, in-cell first
 //! bindings and closure cells. Nothing here runs generated code.
 
@@ -24,7 +24,7 @@ fn env_stored(env: &Env) -> usize {
 
 /// The `Object` behind a handle, as generated code finds it.
 fn body(layout: &JitLayout, object: &Gc) -> usize {
-    stored(object) + layout.obj_from_rc
+    stored(object) + layout.obj_from_cell
 }
 
 fn probe(engine: &crate::Engine) -> JitLayout {
@@ -148,8 +148,8 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
         let wrapper = Object::new_with_parts(None, Props::new(), exotic);
         assert_eq!(tag(&wrapper), expected);
     }
-    // Maps and Sets: gc-heap keeps their data in the cell (`Exotic::Collection`, declared right
-    // after `None`); the default build keeps it in a side table, behind an ordinary tag.
+    // Maps and Sets keep their data in the cell (`Exotic::Collection`, declared right after
+    // `None`).
     let map = global(&mut engine, "var probeMap = new Map([[1, 2]]);", "probeMap");
     let set = global(&mut engine, "var probeSet = new Set([3]);", "probeSet");
     for collection in [&map, &set] {
@@ -281,7 +281,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         0,
         "a root scope's parent is the handle's niche"
     );
-    // One binding stays in a gc-heap environment cell; more spill; past eight the map is Large.
+    // One binding stays in the environment cell; more spill; past eight the map is Large.
     for count in [1usize, 2, 5, 9] {
         let env = new_scope(Some(parent.clone()));
         for slot in 0..count {

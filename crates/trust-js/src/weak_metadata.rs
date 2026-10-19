@@ -578,7 +578,7 @@ mod tests {
     fn weak_metadata_already_dead_subscription_counts_each_queue_once() {
         for symbol in [false, true] {
             let mut engine = Engine::new();
-            // The target's strong handles live only in this helper frame (gc-heap scans the
+            // The target's strong handles live only in this helper frame (the collector scans the
             // stack).
             let target = crate::gc_test::in_frame(|| {
                 let value = if symbol {
@@ -645,7 +645,8 @@ mod tests {
         }
         let mut engine = Engine::new();
         let calls = Rc::new(Cell::new(0));
-        // The target's strong handles live only in this helper frame (gc-heap scans the stack).
+        // The target's strong handles live only in this helper frame (the collector scans the
+        // stack).
         let (target, owner) = crate::gc_test::in_frame(|| {
             let value = Value::Obj(Object::new(None));
             let target = WeakTarget::of(&value).unwrap();
@@ -941,7 +942,8 @@ mod tests {
     #[test]
     fn weak_metadata_kept_target_and_owner_retirement_preserve_job_semantics() {
         let mut engine = Engine::new();
-        // The target's strong handles live only in this helper frame (gc-heap scans the stack).
+        // The target's strong handles live only in this helper frame (the collector scans the
+        // stack).
         let (weak, owner) = crate::gc_test::in_frame(|| {
             let target = Value::Obj(Object::new(None));
             let weak = WeakTarget::of(&target).unwrap();

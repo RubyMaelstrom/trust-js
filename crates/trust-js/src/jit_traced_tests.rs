@@ -1,4 +1,4 @@
-//! Generated code under gc-heap's traced ownership (P1 S5 step 6): the engine runs at
+//! Generated code under traced ownership (P1 S5 step 6): the engine runs at
 //! `Tier::Jit` (the ARM64 backend, and from S6 step 7 the x86-64 one) and collects as usual, its
 //! JIT activations being roots (whose rooting tests are `jit::rooting_tests`).
 //!
@@ -98,7 +98,7 @@ fn property_paths(run: impl FnOnce()) -> [u64; 3] {
 #[test]
 fn admission_collects() {
     let mut jit = engine(Tier::Jit);
-    // The victim's handle lives only in this helper frame (gc-heap scans the stack).
+    // The victim's handle lives only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         eval(&mut jit, "var victim = {v: 1}; 0;");
         let env = jit.interp.global_env.clone();
@@ -411,7 +411,7 @@ fn direct_calls_and_frame_teardown() {
     }
 }
 
-/// Maps and Sets (`Exotic::Collection` under gc-heap) through the ordinary-object guards: named
+/// Maps and Sets (`Exotic::Collection`) through the ordinary-object guards: named
 /// property loads (slot and operand-stack receivers, a Collection as a prototype hop, method
 /// loads through Map.prototype and Set.prototype), stores, updates and creations (a Map
 /// subclass's constructor), and element reads, writes, updates and `in`.

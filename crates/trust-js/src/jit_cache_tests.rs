@@ -483,10 +483,11 @@ fn recompiled_functions_keep_their_original_realm() {
     assert_eq!(lease.residency.active.get(), 0);
 }
 
-/// gc-heap: the same owner deaths and cache states, observed through collections with every
-/// strong handle and cell address the test uses kept in helper frames (gc-heap scans the
-/// stack, and a cached entry's raw callee address would retain its callee). A cache's object
-/// pin is a weak handle, so the dead callee's address stays reserved while the cache names it.
+/// Code owners' deaths and the cache states they leave, observed through collections with
+/// every strong handle and cell address the test uses kept in helper frames (the collector
+/// scans the stack, and a cached entry's raw callee address would retain its callee). A cache's
+/// object pin is a weak handle, so the dead callee's address stays reserved while the cache
+/// names it.
 #[test]
 fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() {
     // Epoch is process-global. Isolate this proof from other tests deliberately

@@ -1,4 +1,4 @@
-//! P1 S2: precise tracing of the engine's Rust-side GC edges (feature `gc-heap`).
+//! P1 S2: precise tracing of the engine's Rust-side GC edges.
 //!
 //! [`GcSink`] receives strong edges as cell words; [`GcTrace`] is implemented by every engine
 //! type that can hold a value, an object handle or an environment. Implementations for engine

@@ -375,7 +375,7 @@ fn prepared_reference_own_values_and_last_owner_survive_gc_without_reboxing_chan
         assert_eq!(paths()[2], 2);
         assert_eq!(paths()[3], 1);
     }
-    // Strong handles live only in helper frames (gc-heap scans the stack): the outer frame
+    // Strong handles live only in helper frames (the collector scans the stack): the outer frame
     // holds the returned value, the inner one the reference.
     let weak_child = crate::gc_test::in_frame(|| {
         let (weak_owner, weak_child, returned) = crate::gc_test::in_frame(|| {

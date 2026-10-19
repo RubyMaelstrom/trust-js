@@ -329,7 +329,7 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
         );
         let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get);
         assert_eq!(evaluate(&mut engine, "temporaryVoid()===undefined"), "true");
-        // gc-heap destroys the last owner when the next collection finds it dead.
+        // The next collection finds the last owner dead and destroys it.
         engine.interp.gc_collect();
         assert_eq!(drops.get(), 1, "last owner is destroyed at void, {tier:?}");
         if tier == Tier::Jit {

@@ -196,7 +196,7 @@ fn prepared_reference_object_record_get_and_set_repeat_has_not_unscopables() {
     );
 }
 
-/// gc-heap: a slot reports its Reference's environment to the collector, and replacing the
+/// A slot reports its Reference's environment to the collector, and replacing the
 /// Reference drops the old one in place: once its handles are gone a collection finds the old
 /// environment dead, while the slot keeps the new one alive.
 #[test]
@@ -210,7 +210,7 @@ fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
     let mut engine = Engine::new();
     let mut slot = PreparedReferenceSlot::default();
     assert!(slot.as_ref().is_none());
-    // Each environment's handles live only in a helper frame (gc-heap scans the stack).
+    // Each environment's handles live only in a helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         let scope = new_scope(None);
         scope

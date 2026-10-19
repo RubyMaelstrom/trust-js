@@ -1,4 +1,4 @@
-//! Observations of the production Rc heap, never a shadow ownership graph.
+//! Observations of the production heap, never a shadow ownership graph.
 //! ECMA-262 e28783d5 #sec-weakref-processing-model: records contain integers and
 //! static Rust allocation locations only. They cannot extend JavaScript liveness.
 //! Feature-gated out of ordinary builds. Lifetimes use allocation ordinals and GC

@@ -1450,7 +1450,7 @@ fn emit_borrowed_own_read(
         }
         PropRecv::Stack => unreachable!("a borrowed read requires a canonical receiver"),
     }
-    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.add_imm(11, 10, layout.obj_from_cell as u32);
     a.mov_imm64(12, cache as u64);
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
     a.cbnz(9, false, fail); // only depth zero is authoritative for own reads
@@ -1548,12 +1548,12 @@ fn emit_borrowed_method(
     guard_operand(a, stack, physical, depth - 1, fail);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, fail);
     emit_exec_payload(a, 9, 10);
-    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.add_imm(11, 10, layout.obj_from_cell as u32);
     for hop in 0..=state.depth {
         if hop != 0 {
             a.ldr_imm(17, 11, layout.obj_proto as u32);
             a.cbz(17, true, fail);
-            a.add_imm(11, 17, layout.obj_from_rc as u32);
+            a.add_imm(11, 17, layout.obj_from_cell as u32);
         }
         a.ldrb_imm(14, 11, layout.obj_exotic as u32);
         guard_exotic_ordinary(a, layout, 14, 14, fail);
@@ -2023,7 +2023,7 @@ pub(super) fn emit_name_element_body(
     a.ldur(10, 14, 8);
     a.bind(have);
     // An ordinary Object that is not exotic (a typed array is neither Array nor plain).
-    a.add_imm(11, 10, layout.obj_from_rc as u32);
+    a.add_imm(11, 10, layout.obj_from_cell as u32);
     a.ldrb_imm(12, 11, layout.obj_exotic as u32);
     a.cmp_imm_w(12, layout.exotic_none_tag as u32);
     a.b_cond(C_NE, value_miss);
@@ -2319,7 +2319,7 @@ pub(super) fn emit(
     let parameter_aliases =
         entry_kind == NativeEntryKind::BorrowedFrame && chunk.jit_borrowed_parameter_aliases();
     let emission_start = a.checkpoint();
-    // gc-heap: checked effects end in no poll (their virtual operands and private homes are
+    // Checked effects end in no poll (their virtual operands and private homes are
     // not materialized); the backedge guard bails to the canonical header to collect.
     let end_polls = a.set_end_polls(false);
 

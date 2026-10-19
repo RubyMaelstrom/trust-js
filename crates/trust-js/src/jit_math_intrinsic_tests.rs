@@ -47,8 +47,8 @@ fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) {
 
 /// Math methods ignore their receiver (ECMA-262 e28783d5, #sec-math.abs,
 /// #sec-math.min, #sec-math.max, #sec-math.sqrt). A callable may also be the
-/// receiver; both operand owners must still be released exactly once. gc-heap owners carry no
-/// count: the callable survives a collection after every run, intact.
+/// receiver, in both operand words at once. Owners carry no count: the callable survives a
+/// collection after every run, intact.
 #[test]
 fn math_intrinsics_release_aliased_and_distinct_operand_owners() {
     use crate::bytecode::{
@@ -122,7 +122,7 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
                  Object.defineProperty(builtin,'same',{{get:function(){{return this;}},configurable:true}});\n\
                  function invoke(clear){{return holder.value.same(clear?(delete holder.value,delete {expression},{argument}):{argument});}}"
             ));
-            // The strong handles live only in this helper frame (gc-heap scans the stack).
+            // The strong handles live only in this helper frame (the collector scans the stack).
             let (weak, sentinel_weak) = crate::gc_test::in_frame(|| {
                 let env = engine.interp.global_env.clone();
                 let value = engine.interp.get_var("builtin", &env).ok().unwrap();
@@ -140,7 +140,7 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
                 assert_native_intrinsic(&mut engine, "invoke", intrinsic);
             }
             assert_eq!(evaluate(&mut engine, "invoke(true)"), expected);
-            // gc-heap destroys the last owner when the next collection finds it dead.
+            // The next collection finds the last owner dead and destroys it.
             engine.interp.gc_collect();
             assert_eq!(weak.strong_count(), 0, "{tier:?} {expression} final owner");
             // A bare decrement to zero would make the callable Weak appear

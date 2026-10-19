@@ -730,7 +730,7 @@ pub(super) fn emit(
             a.blr(16);
             a.mov(20, 0);
             a.cbnz(1, false, unwind);
-            // gc-heap: a native constructor allocates after the call's last safepoint.
+            // A native constructor allocates after the call's last safepoint.
             emit_helper_end_poll(a, unwind);
         }
         Op::SetProp(..)

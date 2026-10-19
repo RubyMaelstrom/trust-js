@@ -403,7 +403,7 @@ fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
     (source, names)
 }
 
-/// gc-heap: owners carry no count and the finish stub releases nothing. Every slot shape runs
+/// Owners carry no count and the finish stub releases nothing. Every slot shape runs
 /// through the direct sequence, also with a collection due at every poll (stress 1), and keeps
 /// its results; once the program drops `token`, no finished callee's record retains it.
 #[cfg(target_arch = "aarch64")]

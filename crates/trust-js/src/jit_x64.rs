@@ -307,7 +307,7 @@ impl Asm {
             self.jcc(0x84, label);
         }
         let object_flag = layout
-            .obj_from_rc
+            .obj_from_cell
             .checked_add(layout.obj_ic_plain)
             .filter(|offset| *offset <= i32::MAX as usize);
         if peek && layout.valid {
@@ -372,8 +372,8 @@ impl Asm {
         self.add_sp(-8);
     }
     /// Call `helper` with the `(ctx, imm, sp)` contract: r13 takes the returned sp, and a set flag
-    /// (a throw) goes to `unwind`. Under gc-heap a call of an allocating helper then ends in the
-    /// explicit poll (see [`Asm::helper_end_poll`]).
+    /// (a throw) goes to `unwind`. A call of an allocating helper then ends in the explicit poll
+    /// (see [`Asm::helper_end_poll`]).
     fn helper_spflag(&mut self, helper: usize, imm: u32, unwind: usize) {
         self.call_helper_pair(helper, imm);
         self.bytes(&[0x49, 0x89, 0xc5]); // r13 = rax (new sp)
@@ -388,7 +388,7 @@ impl Asm {
         self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // mov rcx,[r12+live_objects]
         self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
     }
-    /// gc-heap: compare the cell heap's due word, which follows the live-object count at rcx
+    /// Compare the cell heap's due word, which follows the live-object count at rcx
     /// (`value::LiveCount`), with zero. The word is set exactly while a collection is due (the
     /// byte budget is spent, the stress interval reached or a request deferred), none of which
     /// moves the count.
@@ -397,7 +397,7 @@ impl Asm {
         // cmp qword [rcx+LIVE_DUE_OFF],0
         self.bytes(&[0x48, 0x83, 0x79, crate::value::LIVE_DUE_OFF as u8, 0x00]);
     }
-    /// gc-heap: the explicit poll that ends a call to an allocating helper (see
+    /// The explicit poll that ends a call to an allocating helper (see
     /// `jit::helper_ends_in_poll`), and the calls of `H_CALL` and `H_NEW` and string
     /// accumulation's committed exit: the recorded S5 deviation, in place of an allocation slow
     /// path that collects. It runs once the call has returned, with its results in canonical
@@ -417,8 +417,8 @@ impl Asm {
         self.helper_spflag(H_INTERRUPT, super::POLL_HELPER_END, unwind);
         self.bind(done);
     }
-    /// Generated code's entry and loop safepoint (`kind` is `POLL_ENTRY` or `POLL_LOOP`): under
-    /// gc-heap the heap's due word, the live-object count against `gc_next`, then the shared
+    /// Generated code's entry and loop safepoint (`kind` is `POLL_ENTRY` or `POLL_LOOP`): the
+    /// heap's due word, the live-object count against `gc_next`, then the shared
     /// interrupt divider; the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt,
     /// then `Interp::gc_check`). While collections are suppressed or deferred the word stays set
     /// and every poll calls the helper until one can collect.
@@ -611,7 +611,7 @@ fn emit_prop_own(
 ) -> bool {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
     let offsets = [
-        layout.obj_from_rc,
+        layout.obj_from_cell,
         layout.obj_exotic,
         layout.obj_ic_plain,
         layout.obj_props + layout.props_shape,
@@ -630,7 +630,7 @@ fn emit_prop_own(
     }
     receiver_cell(a, recv, slow);
     a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object
-    a.bytes(&(layout.obj_from_rc as i32).to_le_bytes());
+    a.bytes(&(layout.obj_from_cell as i32).to_le_bytes());
     a.guard_exotic_ordinary(layout, R11, AX, slow); // ordinary internal methods
     a.bytes(&[0x41, 0x80, 0xbb]);
     a.bytes(&(layout.obj_ic_plain as i32).to_le_bytes());
@@ -748,7 +748,7 @@ fn emit_prop_num(
     {
         return false;
     }
-    let Ok(rcv) = i32::try_from(layout.obj_from_rc) else {
+    let Ok(obj_off) = i32::try_from(layout.obj_from_cell) else {
         return false;
     };
     let Ok(plain) = i32::try_from(layout.obj_ic_plain) else {
@@ -775,7 +775,7 @@ fn emit_prop_num(
     let guard_object = |a: &mut Asm, expected: u32, slow: usize| {
         // r11 = the Object in the cell whose word is in r10.
         a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]);
-        a.bytes(&rcv.to_le_bytes());
+        a.bytes(&obj_off.to_le_bytes());
         a.guard_exotic_ordinary(layout, R11, AX, slow);
         a.bytes(&[0x41, 0x80, 0xbb]);
         a.bytes(&plain.to_le_bytes());
@@ -1019,7 +1019,7 @@ pub(super) fn compile_entry(
             a.bytes(&[0x49, 0x89, 0xc5]); // r13 = canonical sp
             a.bytes(&[0x48, 0x85, 0xd2]); // flag0 is complete success
             a.jcc(0x85, ordinary); // an unchanged miss
-            a.helper_end_poll(unwind); // gc-heap: the committed exit ends in the explicit poll
+            a.helper_end_poll(unwind); // the committed exit ends in the explicit poll
             a.jmp(pcs[plan.end]);
             a.bind(ordinary);
         }
@@ -1290,12 +1290,12 @@ pub(super) fn compile_entry(
             }
             Op::Call(..) | Op::CallWithThis(..) => {
                 a.helper_spflag(H_CALL, pc as u32, unwind);
-                // gc-heap: a native callee can allocate after the call's last safepoint.
+                // A native callee can allocate after the call's last safepoint.
                 a.helper_end_poll(unwind);
             }
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
-                // gc-heap: a native constructor allocates after the call's last safepoint.
+                // A native constructor allocates after the call's last safepoint.
                 a.helper_end_poll(unwind);
             }
             Op::GetPropThis(_, cache) => {

@@ -146,7 +146,7 @@ fn constructor_transfer_sole_object_owner_survives_gc_then_releases() {
                 &format!("var retained={maker}({{marker:71}}, Symbol('retained'));"),
             );
             let env = engine.interp.global_env.clone();
-            // Strong handles live only in this helper frame (gc-heap scans the stack).
+            // Strong handles live only in this helper frame (the collector scans the stack).
             let weak = crate::gc_test::in_frame(|| {
                 let retained = engine.interp.get_var("retained", &env).ok().unwrap();
                 let object = retained.as_obj().unwrap();

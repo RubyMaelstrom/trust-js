@@ -137,7 +137,7 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     }
 }
 
-/// gc-heap: the returned object survives the collection `enter` runs after the callee's
+/// The returned object survives the collection `enter` runs after the callee's
 /// teardown, and once the test drops the result a collection finds it dead: neither the
 /// occupied result slot nor the native frame keeps a hidden owner.
 #[test]
@@ -150,7 +150,7 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     ] {
         let (chunk, code) = compile_return(&mut engine, source);
         for occupied in [false, true] {
-            // The object's handles live only in this helper frame (gc-heap scans the stack).
+            // The object's handles live only in this helper frame (the collector scans the stack).
             let weak = crate::gc_test::in_frame(|| {
                 let object = crate::value::Object::new(None);
                 let weak = crate::value::Gc::downgrade(&object);
@@ -180,13 +180,13 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     }
 }
 
-/// gc-heap: a cyclic object whose only owner is the return word survives the collection `enter`
+/// A cyclic object whose only owner is the return word survives the collection `enter`
 /// runs after the callee's teardown, intact; once the test drops it, a collection finds it dead.
 #[test]
 fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let mut engine = Engine::new();
     let (chunk, code) = compile_return(&mut engine, "function pass(value){return value;}");
-    // The object's handles live only in this helper frame (gc-heap scans the stack).
+    // The object's handles live only in this helper frame (the collector scans the stack).
     let weak = crate::gc_test::in_frame(|| {
         let object = crate::value::Object::new(Some(engine.interp.object_proto.clone()));
         let weak = crate::value::Gc::downgrade(&object);

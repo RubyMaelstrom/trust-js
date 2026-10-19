@@ -275,7 +275,7 @@ fn hot_script_completion_owner_survives_gc_at_borrowed_entry_and_finalizer() {
         .ok()
         .expect("GC fixture parses");
         reset_counts();
-        // The completion lives only in this helper frame (gc-heap scans the stack).
+        // The completion lives only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let result = engine
                 .interp

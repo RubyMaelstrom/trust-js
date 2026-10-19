@@ -463,7 +463,7 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
         let mut addresses = Vec::new();
         for round in 0..3 {
             // The child Realm lives only in this helper frame and its address stays hidden
-            // (gc-heap scans the stack).
+            // (the collector scans the stack).
             addresses.push(crate::gc_test::in_frame(|| {
                 let child = it.create_realm();
                 let address = crate::gc_test::HiddenAddress::of(&child);
@@ -495,8 +495,8 @@ fn a_dropped_realm_that_ran_the_last_regexp_is_collected() {
         engine.set_tier(tier);
         let it = &mut *engine.interp;
         assert_eq!(eval_string(it, "/(b)c/.exec('abcd'); RegExp.$1"), "b");
-        // The child Realm lives only in this helper frame and its address stays hidden (gc-heap
-        // scans the stack).
+        // The child Realm lives only in this helper frame and its address stays hidden (the
+        // collector scans the stack).
         let address = crate::gc_test::in_frame(|| {
             let child = it.create_realm();
             let address = crate::gc_test::HiddenAddress::of(&child);

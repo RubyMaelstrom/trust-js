@@ -253,7 +253,7 @@ fn iterator_results_private_target_is_traced_and_collectable() {
         &mut engine,
         "var target=[{answer:42}];target.push(target);var iterator=target.values();target=null;",
     );
-    // Strong handles live only in this helper frame (gc-heap scans the stack).
+    // Strong handles live only in this helper frame (the collector scans the stack).
     let target = crate::gc_test::in_frame(|| {
         let iterator = global(&mut engine, "iterator");
         let object = iterator.as_obj().unwrap().borrow();

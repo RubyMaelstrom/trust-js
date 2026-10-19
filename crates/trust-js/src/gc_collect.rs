@@ -1,4 +1,4 @@
-//! P1 S2: the interpreter's half of a gc-heap collection (feature `gc-heap`).
+//! P1 S2: the interpreter's half of a collection.
 //!
 //! Collections run only at interpreter safepoints — [`Interp::gc_check`], task boundaries,
 //! buffer pressure and explicit requests — never on allocation. There the interpreter supplies

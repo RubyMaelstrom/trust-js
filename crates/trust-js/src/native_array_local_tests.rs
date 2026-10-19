@@ -142,7 +142,7 @@ fn tdz_tagged_write_releases_last_owner_before_collection() {
         assert_eq!(eval(&mut engine, source), "undefined", "{tier:?}");
         let before = super::test_tdz_effect_paths();
         eval(&mut engine, "releaseAtNextTdz();");
-        // gc-heap: the collection inside the loop can still find the witness through a stale
+        // The collection inside the loop can still find the witness through a stale
         // word in the live native frames above it (the stack is scanned conservatively, at
         // every tier); once the activation has finished, a collection finds it dead and runs
         // its destructor.

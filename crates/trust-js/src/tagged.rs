@@ -1,9 +1,8 @@
 //! Engine-owned tagged execution words.
 //!
 //! This is the Phase 2 ABI nucleus. It is intentionally not connected to the current `Value`
-//! enum or `PackedValue` storage yet: those still carry `Rc` ownership and need the central heap
-//! before a heap reference can be resolved safely. Keeping this module independent lets bit-level
-//! invariants and invalid-word handling be tested before any execution tier migrates.
+//! enum or `PackedValue` storage. Keeping this module independent lets bit-level invariants and
+//! invalid-word handling be tested before any execution tier migrates.
 
 #![allow(dead_code)]
 

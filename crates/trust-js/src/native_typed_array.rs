@@ -361,7 +361,8 @@ mod tests {
             &mut engine,
             "var buffer = new ArrayBuffer(64); var a = new Uint8Array(buffer); a.self = a;",
         );
-        // The buffer and its address live only in this helper frame (gc-heap scans the stack).
+        // The buffer and its address live only in this helper frame (the collector scans the
+        // stack).
         let (ptr, storage) = crate::gc_test::in_frame(|| {
             let buffer = engine
                 .eval_value("buffer")

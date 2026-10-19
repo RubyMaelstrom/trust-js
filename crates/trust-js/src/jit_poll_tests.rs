@@ -1,5 +1,5 @@
-//! The native JIT's polls see the cell heap's "collection due" (P1 S5 step 7b; gc-heap; ARM64,
-//! and x86-64 from S6 step 7): its byte budget, stress interval and deferred requests, none of
+//! The native JIT's polls see the cell heap's "collection due" (P1 S5 step 7b; ARM64, and
+//! x86-64 from S6 step 7): its byte budget, stress interval and deferred requests, none of
 //! which moves the live-object count, through the due word beside that count
 //! (`value::LiveCount`). Entry and loop polls take their slow path while the word is set, a
 //! general region's backedge guard bails to its canonical header (ARM64), and in baseline code

@@ -1,8 +1,7 @@
-//! P1 S5 step 5: the storage accessors read each build's layouts from machine code. Small
-//! ARM64 sequences built from the emitters run against live objects and scopes in both builds
-//! (the default build's `Vec`s and 4-byte memos; gc-heap's in-cell `InlineVec`s, in place and
-//! spilled, and 2-byte memos) and against synthetic sequences of either kind, so the gc-heap
-//! paths run here before any JIT code is admitted under gc-heap.
+//! P1 S5 step 5: the storage accessors read the engine's layouts from machine code. Small
+//! ARM64 sequences built from the emitters run against live objects and scopes (in-cell
+//! `InlineVec`s, in place and spilled, and 2-byte memos) and against synthetic sequences of
+//! either kind (an `InlineVec` and a `Vec`).
 
 use super::*;
 use crate::value::{JitLayout, JitVecLayout, Object, Property, Value};
@@ -138,7 +137,7 @@ fn named_field_emitters_read_live_objects() {
         ret_reg(a, 1);
     });
     let (_set_code, set_len) = assemble(|a| fields_set_len(a, &layout, 1, 0));
-    // In place under gc-heap up to four fields; spilled beyond.
+    // In place up to four fields; spilled beyond.
     for count in [1usize, 2, 4, 5, 9] {
         let object = Object::new(None);
         for slot in 0..count {
@@ -149,7 +148,7 @@ fn named_field_emitters_read_live_objects() {
         }
         // The Object, as a template finds it from the stored handle word.
         let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
-        let base = stored + layout.obj_from_rc;
+        let base = stored + layout.obj_from_cell;
         assert_eq!(base, &*object.borrow() as *const Object as usize);
         for slot in 0..=count {
             // A packed Number is its f64 bits; past the count the sequence answers all ones.
@@ -235,7 +234,7 @@ fn binding_entry_emitters_read_live_scopes() {
         a.add_imm(0, 3, layout.scope_binding_offset as u32);
         ret_none(a, miss);
     });
-    // One binding stays in a gc-heap environment cell; more spill. Indexed maps share the
+    // One binding stays in the environment cell; more spill. Indexed maps share the
     // Small arm's entries.
     for (count, indexed) in [(1usize, false), (2, false), (5, false), (3, true)] {
         let env = new_scope(None);

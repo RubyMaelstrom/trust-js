@@ -1,4 +1,4 @@
-//! P1 S2: payload cells (BigInt digits, Symbols, strings) under the gc-heap collector.
+//! P1 S2: payload cells (BigInt digits, Symbols, strings) under the collector.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};

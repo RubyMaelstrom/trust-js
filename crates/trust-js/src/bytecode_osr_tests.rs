@@ -74,7 +74,7 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
     assert!(crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0);
 }
 
-/// gc-heap (the rooting harness `jit::rooting_tests`): the operand prefix a hot Script loop
+/// Rooting harness (`jit::rooting_tests`): the operand prefix a hot Script loop
 /// lends its native code at OSR entry is a root for that native run. A fresh object the VM
 /// tracks below a loop entered at depth 1 waits in the borrowed frame's operand words, which the
 /// entry registers; when the native code calls `collect()` after the loop, they mark it. The
@@ -143,7 +143,7 @@ fn osr_entry_operand_prefix_is_a_root() {
     raw.has_tail_calls = false;
     let env = engine.interp.global_env.clone();
     crate::jit::TEST_OSR_ENTRIES.with(|count| count.set(0));
-    // The result's handle lives only in this helper frame (gc-heap scans the stack).
+    // The result's handle lives only in this helper frame (the collector scans the stack).
     let tag = crate::gc_test::in_frame(|| {
         let result = run_tiered_script(&mut engine.interp, &chunk, &env, Value::Undefined)
             .ok()

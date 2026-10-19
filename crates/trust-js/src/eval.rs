@@ -75,7 +75,8 @@ pub(crate) struct ForInKeys(Gc);
 
 impl ForInKeys {
     fn new(keys: Vec<String>) -> (Self, usize) {
-        // Include the Rc/RefCell header and conservatively charge string headers/index keys.
+        // Include the RefCell<Object> (plus two words) and conservatively charge string
+        // headers/index keys.
         // Unlike a normal Array, this backing cannot retain %Array.prototype% or its realm.
         let mut bytes =
             std::mem::size_of::<std::cell::RefCell<Object>>() + 2 * std::mem::size_of::<usize>();
@@ -212,7 +213,7 @@ impl Interp {
                         )
                     })
                 {
-                    // Rooted (gc-heap): binding one element may run code that empties the source.
+                    // Rooted: binding one element may run code that empties the source.
                     let mut values =
                         crate::rooting::RootedVec::from_vec(Vec::with_capacity(elems.len()));
                     if let Some(Ok(())) =
@@ -2545,8 +2546,9 @@ impl Interp {
     ) -> Result<(Value, Option<Value>), Abrupt> {
         // Walk the scope chain by raw pointer: every scope is transitively kept alive by `env`
         // (the caller holds it) via the `parent` links, and nothing mutates the chain during a
-        // lookup, so this avoids an `Rc` bump+drop per hop — the dominant cost when a free/global
-        // name misses every intermediate scope. `with`-object scopes take the owned slow path.
+        // lookup. (With counted handles the walk saved a bump and drop per hop, the dominant
+        // cost when a free/global name missed every intermediate scope.) `with`-object scopes
+        // take the owned slow path.
         type ScopeCell = std::cell::RefCell<crate::interpreter::Scope>;
         let mut cur: *const ScopeCell = Env::as_ptr(env);
         loop {

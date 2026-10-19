@@ -1240,7 +1240,7 @@ enum LegacyActivation {
 }
 
 impl Interp {
-    /// The youngest activation of the function with `Rc::as_ptr` identity `function`. Callees
+    /// The youngest activation of the function with `Gc::as_ptr` identity `function`. Callees
     /// the compiler spliced into their caller have no frame; those that made the call to a
     /// frame above them are named by that frame's call position.
     fn legacy_activation(&self, function: usize) -> Option<LegacyActivation> {
@@ -1337,7 +1337,7 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
 /// (`InterpLayout::frame_pool` is the address of `pool`). A pooled record's frame contents are
 /// already released. Teardown frees the pooled records.
 ///
-/// gc-heap: `records` knows every record allocated for this interpreter and not yet freed:
+/// `records` knows every record allocated for this interpreter and not yet freed:
 /// [`crate::jit::JitFrame::alloc`] inserts it, and freeing it (`JitFrame::release` past
 /// [`crate::jit::FRAME_POOL_LIMIT`], or teardown here) removes it. A record not in
 /// `pool[..len]` is active: a Rust entry (`run_moved_inner`) or a direct call popped it for an
@@ -1425,7 +1425,7 @@ impl crate::gc_trace::GcTrace for FramePool {
     }
 }
 
-/// Cached UTF-16 view of one string, keyed by `Rc<str>` identity (see `Interp::str_units`).
+/// Cached UTF-16 view of one string, keyed by string identity (see `Interp::str_units`).
 /// JS string semantics are code units but the engine stores UTF-8 `str`; without a cache every
 /// `charCodeAt`/`[i]`/`.length` is O(len) (a full `is_ascii` scan or unit walk), which turns a
 /// scanner loop — a JS parser reading a megabytes-long source one char at a time — into O(n²).
@@ -2076,7 +2076,7 @@ mod binding_layout_tests {
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
             let global = engine.interp.global_env.clone();
-            // Strong handles live only in helper frames (gc-heap scans the stack).
+            // Strong handles live only in helper frames (the collector scans the stack).
             let weak = crate::gc_test::in_frame(|| {
                 let exporter = new_scope(Some(global.clone()));
                 let object = engine.interp.new_object();
@@ -2981,7 +2981,7 @@ pub(crate) struct InterpLayout {
     pub fp_ptr_word: usize,
     pub fp_len_word: usize,
     pub fp_cap_word: usize,
-    /// `string_proto` (a `Gc` = one stored `Rc` pointer): the GetMethod template resolves
+    /// `string_proto` (a `Gc`: one stored cell address): the GetMethod template resolves
     /// string-primitive receivers against the ACTIVE realm's String.prototype through this.
     pub string_proto: usize,
     /// `number_proto` / `boolean_proto`: Number/Boolean-primitive receivers in the
@@ -3181,8 +3181,8 @@ pub struct Interp {
     pub(crate) property_key_strings: crate::cache::ByteLru<usize, (Rc<str>, crate::lstr::LStr)>,
     /// Freelist of the JIT's activation records ([`crate::jit::JitFrame`]: a context and
     /// [`crate::jit::FRAME_BUF`] slot and operand words each) — a pop and pointer math per call
-    /// instead of `Vec` bookkeeping. Records hold no live values while pooled. Under gc-heap it
-    /// also registers every record, so the collector finds the active ones (see [`FramePool`]).
+    /// instead of `Vec` bookkeeping. Records hold no live values while pooled. It also
+    /// registers every record, so the collector finds the active ones (see [`FramePool`]).
     pub(crate) frame_pool: FramePool,
     /// Prototype pins for property-*creation* inline caches (see
     /// [`crate::bytecode::IC_CREATE`]), keyed by prototype identity. Creation states rotate
@@ -3221,7 +3221,7 @@ pub struct Interp {
     /// Realm-wide proof that no Proxy has been created. Raw prototype-chain walks read it live;
     /// side-table exotics are guarded per receiver by `Object::ic_plain`.
     pub(crate) inline_ic_safe: std::cell::Cell<bool>,
-    /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `Rc` pins the
+    /// Recently indexed strings' UTF-16 views, keyed by string identity (the held `LStr` pins the
     /// pointer) — see [`StrUnits`]. Bounded by retained bytes as well as entry count, so one large
     /// source cannot escape the cache budget.
     pub(crate) str_units: crate::cache::ByteLru<
@@ -3259,7 +3259,7 @@ pub struct Interp {
     /// `MAX_PROXY_FORWARD_DEPTH`.
     pub(crate) proxy_forward_depth: u32,
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
-    /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
+    /// constructor object's pointer (`Gc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
     pub(crate) class_info: crate::fasthash::FastMap<usize, ClassInfo>,
     /// The global `eval` function object, so a *direct* eval call (`eval(src)` by that name) can be
@@ -3850,7 +3850,6 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    // gc-heap adds `heap_release`.
     assert_eq!(names.len(), 169);
     assert!(
         INTERP_MEMORY_INVENTORY
@@ -3868,7 +3867,7 @@ pub(crate) struct ShadowHome {
     pub(crate) owner: crate::value::WeakGc,
     /// The parent interpreter, recorded at each entry (see [`Interp::enter_shadow`]).
     pub(crate) parent: *mut Interp,
-    /// Entries in progress: code in this realm is running. gc-heap collections treat the
+    /// Entries in progress: code in this realm is running. Collections treat the
     /// realm's roots and its ShadowRealm object as roots meanwhile.
     pub(crate) entries: u32,
 }
@@ -7812,7 +7811,7 @@ impl Interp {
         // method's key (MethodDefinitionEvaluation). A function with its own name keeps it; the
         // template's `name` slot is entry 1 with the "" value.
         let named = name.filter(|_| func.name.is_none());
-        // gc-heap: the templates' name strings are cells of the heap that built them, which
+        // The templates' name strings are cells of the heap that built them, which
         // another engine's heap (or a later engine on this thread) must not reference.
         let foreign = maps.heap != crate::value::active_heap_id();
         let fn_map = match named {
@@ -9267,7 +9266,7 @@ impl Interp {
     /// proves the object is in none of those tables with one load instead of several hash
     /// probes. A clear byte (including an object currently borrowed mutably) is only a hint.
     ///
-    /// `ptr` must be the address of a live object (`Rc::as_ptr` of a held `Gc`).
+    /// `ptr` must be the address of a live object (`Gc::as_ptr` of a held `Gc`).
     #[inline(always)]
     fn object_ic_plain(ptr: usize) -> bool {
         let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
@@ -11226,7 +11225,7 @@ impl Interp {
     }
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
-        // gc-heap: the due word JIT polls read is the core's `collection_due` (debug builds).
+        // The due word JIT polls read is the core's `collection_due` (debug builds).
         crate::value::debug_assert_due_word(&self.gc_heap);
         if self.gc_suppressed != 0 {
             return Ok(());
@@ -11340,7 +11339,7 @@ impl Interp {
 
     /// A regex-ready view of `s`, cached by string identity: repeated exec/replace/split over the
     /// same subject (the common shape of both real code and the regexp benchmarks) skips the
-    /// O(len) element-vector rebuild. Strings are immutable, and each entry holds its `Rc` so the
+    /// O(len) element-vector rebuild. Strings are immutable, and each entry holds its `LStr` so the
     /// pointer can't be reused by a new allocation while cached.
     pub(crate) fn re_text(
         &mut self,
@@ -11675,8 +11674,8 @@ impl Interp {
     }
 
     /// Raw-address inline-cache maps carry weak allocation pins. Prune expired entries so the
-    /// pin itself does not retain allocator headers (gc-heap: reserved dead cells) forever; a
-    /// live cache identity remains ABA-safe because its pin still owns that allocation.
+    /// pin itself does not keep a dead cell reserved forever; a live cache identity remains
+    /// ABA-safe because its pin still keeps that cell reserved.
     pub(crate) fn gc_prune_dead_pins(&mut self) {
         let creation_pins = self.creation_pins.len();
         self.creation_pins.retain(|_, pin| pin.strong_count() != 0);
@@ -12769,7 +12768,7 @@ impl Interp {
         }
     }
 
-    /// gc-heap: OrdinaryCallBindThis on a moved operand word, for a compiled callee that a
+    /// OrdinaryCallBindThis on a moved operand word, for a compiled callee that a
     /// moved entry runs (`jit::run_moved` and its forms take `this` packed): Undefined when the
     /// body never reads `this` (`uses_this`), the word itself for a strict callee, and for a
     /// sloppy one the global object for undefined or null, an object word unchanged, and a
@@ -13070,7 +13069,7 @@ impl Interp {
     /// The identity-cached JIT→JIT call (see [`crate::bytecode::CallIc`]): on a per-site hit,
     /// the entire dispatch guard set collapses into two pointer compares (callee identity +
     /// active-realm global), and the frame's derived state (env, chunk, machine code, strict)
-    /// reads through the cached raw pointers with a single refcount bump for the env handle.
+    /// reads through the cached raw pointers.
     /// `None` = miss (empty cache / different callee / realm switched), with NO side effects —
     /// the caller falls into [`Interp::call_jit_fast`], which revalidates and refills.
     ///
@@ -13544,7 +13543,7 @@ impl Interp {
             construct: false,
             extra: None,
         });
-        // Borrow the env without touching its refcount: it stays alive for the whole call
+        // Borrow the env through its raw pointer: it stays alive for the whole call
         // because the callee object (held by the caller's operand stack) owns it through its
         // `call` field, which is never reassigned while live. ManuallyDrop = a non-owning
         // `&Env` fabricated from the raw pointer; nothing below moves it out.
@@ -14263,7 +14262,7 @@ impl Interp {
         } else {
             Value::Undefined
         };
-        // gc-heap: the moved entries take `this` packed.
+        // The moved entries take `this` packed.
         let tv = PackedValue::pack(tv);
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder

@@ -61,7 +61,7 @@ fn valid(l: &JitLayout) -> bool {
             l.entry_accessor,
             l.entry_writable,
             l.scope_data_off,
-            l.obj_from_rc,
+            l.obj_from_cell,
             l.str_ptr_word,
             l.str_len_word,
         ]
@@ -75,7 +75,7 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
 }
 
-/// R9=Object (a stored cell word plus `obj_from_rc`), AX=shape, DX=slot. Output CX=Property,
+/// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot. Output CX=Property,
 /// R11=1. No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
 /// (the VM checks `Exotic::None` there); a Reference's object base (`ordinary`) may be any object
 /// with ordinary internal methods, as ARM64's Reference template admits.
@@ -104,7 +104,7 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     a.nr_imm(R11, 1);
 }
 
-/// R8=live descriptor, R9=the current scope (`Env::as_ptr`: under gc-heap the environment cell's
+/// R8=live descriptor, R9=the current scope (`Env::as_ptr`: the environment cell's
 /// address). Output CX=Binding/Property, R11=0/1, R9=holder scope/Object. Preserve descriptor
 /// through commit.
 fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
@@ -573,7 +573,7 @@ fn reference_target(a: &mut Asm, l: &JitLayout, slot: u16, slow: usize) {
     a.jcc(NE, slow);
     a.nr_load(R9, R8, offset_of!(PreparedReference, object));
     a.nr_zero_guard(R9, slow);
-    a.nr_lea(R9, R9, l.obj_from_rc as i32);
+    a.nr_lea(R9, R9, l.obj_from_cell as i32);
     a.nr_load32(AX, R8, offset_of!(PreparedReference, shape));
     a.nr_load(DX, R8, offset_of!(PreparedReference, slot));
     global_target(a, l, true, slow);
@@ -634,7 +634,7 @@ fn capture(
     a.jcc(NE, slow);
     a.jmp(commit);
     a.bind(object);
-    a.nr_lea(AX, R9, -(l.obj_from_rc as i32));
+    a.nr_lea(AX, R9, -(l.obj_from_cell as i32));
     a.nr_load(DX, R10, offset_of!(PreparedReference, object));
     a.nr_cmp(AX, DX);
     a.jcc(NE, slow);

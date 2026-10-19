@@ -1,6 +1,6 @@
-//! Test support for observing collection under the conservative stack scan (feature
-//! `gc-heap`, Decision 0): a strong handle left in a test function's frame — even after `drop`,
-//! since handles are `Copy`, and even as an `upgrade()` temporary — keeps its object alive.
+//! Test support for observing collection under the conservative stack scan (Decision 0): a
+//! strong handle left in a test function's frame — even after `drop`, since handles are `Copy`,
+//! and even as an `upgrade()` temporary — keeps its object alive.
 //! Tests that expect an object to be reclaimed hold it only inside [`in_frame`] and ask
 //! [`alive`] instead of upgrading in their own frame.
 
@@ -74,7 +74,7 @@ impl<T> WeakCell for std::rc::Weak<T> {
     }
 }
 
-/// A Symbol cell (gc-heap).
+/// A Symbol cell.
 impl WeakCell for crate::value::WeakSymbol {
     fn live_address(&self) -> Option<usize> {
         self.upgrade()
@@ -184,7 +184,7 @@ pub(crate) fn install_crash_backtrace() {
     });
 }
 
-/// Zero this thread's stack when it exits (gc-heap test builds). libtest runs each test on a
+/// Zero this thread's stack when it exits (test builds). libtest runs each test on a
 /// new thread, and glibc gives a new thread a cached stack with its old contents: slots a test
 /// function has not written yet then hold addresses an earlier test's frames left there, and a
 /// heap whose pages land at that test's addresses takes them for roots.
@@ -239,7 +239,7 @@ impl HiddenAddress {
     }
 }
 
-/// Whether `TRUST_JS_GC_STRESS` is driving collections (gc-heap). Tests that assert when
+/// Whether `TRUST_JS_GC_STRESS` is driving collections. Tests that assert when
 /// collections or cleanup jobs happen skip their checks then: stress collects at every
 /// safepoint by design.
 pub(crate) fn stress_active() -> bool {

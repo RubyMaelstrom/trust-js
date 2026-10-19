@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn live_collections53_state_and_getters_are_traced_without_pinning_cycles() {
         let mut engine = setup(Tier::Jit);
-        // The target lives only in this helper frame (gc-heap scans the stack).
+        // The target lives only in this helper frame (the collector scans the stack).
         let pointer = crate::gc_test::in_frame(|| {
             let target = value(&mut engine, "liveCollection");
             crate::gc_test::HiddenAddress::of(&target)

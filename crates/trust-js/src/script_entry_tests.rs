@@ -278,7 +278,7 @@ fn compiled_script_completion_owners_survive_finalizer_gc_and_are_released() {
         let body = crate::parser::parse_script(
             "try {(function(){var result={n:42};result.self=result;return result;})();} finally {collect();}",
             false).ok().expect("GC script parses");
-        // The completion lives only in this helper frame (gc-heap scans the stack).
+        // The completion lives only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let result = engine
                 .interp

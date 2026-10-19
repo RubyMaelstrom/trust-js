@@ -30,7 +30,7 @@ mod tests {
     fn native_captures_collect_cycles_and_count_repeated_handles() {
         let mut interp = Interp::new();
         interp.gc_collect();
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let (weak_target, weak_callback) = crate::gc_test::in_frame(|| {
             let target = Object::new(None);
             let callback = interp.new_native_fn_with_captures(
@@ -60,7 +60,7 @@ mod tests {
     fn native_captures_shared_payload_is_counted_once_and_traced_from_every_owner() {
         for live_second in [false, true] {
             let mut interp = Interp::new();
-            // Strong handles live only in helper frames (gc-heap scans the stack).
+            // Strong handles live only in helper frames (the collector scans the stack).
             let weak_target = crate::gc_test::in_frame(|| {
                 let (live, weak_target) = crate::gc_test::in_frame(|| {
                     let target = Object::new(None);
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn native_captures_old_owner_preserves_a_shared_young_payload() {
         let mut interp = Interp::new();
-        // Strong handles live only in helper frames (gc-heap scans the stack).
+        // Strong handles live only in helper frames (the collector scans the stack).
         let weak_target = crate::gc_test::in_frame(|| {
             let old_owner = Object::new(None);
             interp.gc_collect();
@@ -170,7 +170,7 @@ mod tests {
         }
         for throws in [false, true] {
             let mut interp = Interp::new();
-            // Strong handles live only in helper frames (gc-heap scans the stack).
+            // Strong handles live only in helper frames (the collector scans the stack).
             let weak_target = crate::gc_test::in_frame(|| {
                 let (lease, weak_target) = crate::gc_test::in_frame(|| {
                     let target = Object::new(None);

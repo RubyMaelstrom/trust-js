@@ -87,7 +87,7 @@ fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Valu
 #[test]
 fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     let mut engine = Engine::new();
-    // Receivers live only in this helper frame (gc-heap scans the stack).
+    // Receivers live only in this helper frame (the collector scans the stack).
     let (weak_layout, weak_a, first, second) = crate::gc_test::in_frame(|| {
         let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
         let weak_layout = Rc::downgrade(&layout);
@@ -114,7 +114,7 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
         );
         (weak_layout, weak_a, first, second)
     });
-    // A tracing heap (gc-heap) reclaims the dropped receivers at a collection.
+    // A collection reclaims the dropped receivers.
     engine.interp.gc_collect();
     assert!(
         !crate::gc_test::alive(&weak_a),
@@ -194,7 +194,7 @@ fn key_at(backing: &Value, index: u32) -> String {
 fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
     let mut engine = Engine::new();
     engine.interp.activate_gc_heap();
-    // Sources live only in this helper frame (gc-heap scans the stack).
+    // Sources live only in this helper frame (the collector scans the stack).
     let (weak_object, weak_proto, keys) = crate::gc_test::in_frame(|| {
         let prototype = Object::new(None);
         prototype
@@ -230,7 +230,7 @@ fn for_in_backing_hits_share_identity_without_retaining_author_objects() {
         }
         (weak_object, weak_proto, keys)
     });
-    // A tracing heap (gc-heap) reclaims the dropped sources at a collection.
+    // A collection reclaims the dropped sources.
     engine.interp.gc_collect();
     assert!(!crate::gc_test::alive(&weak_object));
     assert!(!crate::gc_test::alive(&weak_proto));

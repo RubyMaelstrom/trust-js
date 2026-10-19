@@ -185,7 +185,7 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
     i.gc_collect();
 }
 
-/// gc-heap: the inline metadata names the planning environment only by address and by weak pin.
+/// The inline metadata names the planning environment only by address and by weak pin.
 /// The environment dies at the first collection after its last strong handle, its address
 /// stays reserved while a compiled guard pins it, and dropping the last such chunk lets the
 /// next collection free it.
@@ -217,8 +217,8 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
     for _ in 0..8 {
         assert_eq!(eval_string(i, "subject(5)"), "16");
     }
-    // The planning environment's handle and address stay in this helper frame (gc-heap scans
-    // the stack).
+    // The planning environment's handle and address stay in this helper frame (the collector
+    // scans the stack).
     let (chunk, weak, address) = crate::gc_test::in_frame(|| {
         let planning = crate::interpreter::new_scope(None);
         let address = Env::as_ptr(&planning) as usize;

@@ -17,18 +17,15 @@
 //! divergence, written to the regression corpus, and the process halts with a nonzero exit.
 //! On startup the whole corpus is replayed first — regressions stay fixed forever.
 //!
-//! The engine's Rc heap frees realms only via the in-interpreter cycle collector, so a dropped
-//! Engine leaks its realm (one big cycle). Like the test262 runner, the fuzzer therefore runs
-//! programs in short-lived child processes (batches), keeping the parent's memory flat.
-//!
 //! Usage:
 //!   trust-js-difftest [--seed N] [--count N] [--corpus DIR]
 //!
 //! Each candidate program runs in a short-lived child (`--check`) that the parent caps on memory
-//! and wall-clock: the Rc heap frees realms only via the cycle collector (a dropped Engine leaks
-//! its realm), and generated programs can be non-terminating or allocate without bound, so
-//! isolation + budget is what keeps the parent flat and turns pathological programs into skipped
-//! "inconclusive" results rather than false divergences or an OOM.
+//! and wall-clock: generated programs can be non-terminating or allocate without bound, and a
+//! tier can crash, so isolation + budget is what keeps the parent flat and turns pathological
+//! programs into skipped "inconclusive" results rather than false divergences or an OOM. (A
+//! dropped Engine frees its heap; the children are for the budget, not for memory a run leaves
+//! behind.)
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -410,7 +407,6 @@ fn main() {
 fn dispatch() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // Child: run a seed range in-process; leaked realms die with the process.
         Some("--one") => {
             // Debug: run a single seed in a single tier (which=interp|bytecode).
             let s: u64 = args[1].parse().unwrap();

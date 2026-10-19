@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn deep_names_reuse_fresh_layouts_but_read_live_cells_and_links() {
         let (mut engine, chunk, name, cache) = reader();
-        // Scopes live only in this helper frame (gc-heap scans the stack).
+        // Scopes live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let layouts = [
                 new_binding_layout_id(),
@@ -632,7 +632,7 @@ mod tests {
             ));
             Env::downgrade(&first)
         });
-        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        // A collection reclaims the scopes.
         engine.interp.gc_collect();
         assert!(
             !crate::gc_test::alive(&weak),
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn resolution_cache_captures_tdz_const_and_fresh_layouts_without_reading() {
         let (mut engine, chunk, name, _) = reader();
-        // Scopes live only in this helper frame (gc-heap scans the stack).
+        // Scopes live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let layout = new_binding_layout_id();
             let holder = scope(None, "outer", 5.0, layout);
@@ -765,7 +765,7 @@ mod tests {
                 .is_err());
             Env::downgrade(&holder)
         });
-        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        // A collection reclaims the scopes.
         engine.interp.gc_collect();
         assert!(
             !crate::gc_test::alive(&weak),

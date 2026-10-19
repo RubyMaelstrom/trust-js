@@ -238,7 +238,7 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
         assert_eq!(unsafe { probe(&reference) }, 0);
         assert_eq!(reference.shape, shape);
     }
-    // gc-heap owners carry no count: the probes leave both bases intact, which a collection
+    // Owners carry no count: the probes leave both bases intact, which a collection
     // (and, in debug builds, its heap verifier) confirms.
     let mut engine = engine;
     engine.interp.gc_collect();

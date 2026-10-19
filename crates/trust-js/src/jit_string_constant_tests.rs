@@ -9,7 +9,7 @@
 //! evaluates to its constant itself, the same string each time (the tree-walker makes a string
 //! at each evaluation), and a constant keeps its text across collections. A string a test checks
 //! is held only in a frame of its own, so a constant stays alive only if its chunk roots it.
-//! Under gc-heap the stress child (`jit::rooting_tests::rooting_holds_under_gc_stress`) also runs
+//! The stress child (`jit::rooting_tests::rooting_holds_under_gc_stress`) also runs
 //! them at `TRUST_JS_GC_STRESS=1`, which collects at every safepoint; debug builds poison a freed
 //! cell, so a constant freed while code embeds it no longer reads as its text.
 //!
@@ -144,7 +144,7 @@ fn holds_immediate(engine: &mut Engine, name: &str, index: usize) -> bool {
 
 /// Evaluate `call` and check from Rust that it returned a string reading `text`; at the tiers
 /// that run chunks, also that the string is the `index`th string constant of `name`'s chunk
-/// (`spliced`: its second stage) and, under gc-heap, that the constant's immediate is the word
+/// (`spliced`: its second stage) and that the constant's immediate is the word
 /// the bytecode VM pushes for it. Returns the string's address complemented, in a frame of its
 /// own: the caller holds no reference to the string (the conservative scan would take its plain
 /// address for one).
@@ -194,8 +194,8 @@ fn returned(
 /// it equals a string with the same text built at run time (`===`, `==`), across collections:
 /// `literal` returns its constant, `same` compares it at once, and `inLoop` pushes another
 /// constant with the same text in a loop that runs as a register region. At `Tier::Jit` the
-/// constants reach the operand stack through the string-constant templates, which under gc-heap
-/// embed the constant's word.
+/// constants reach the operand stack through the string-constant templates, which embed the
+/// constant's word.
 #[test]
 fn string_constants_keep_identity_and_equality_across_collections() {
     const SOURCE: &str = r#"
@@ -272,8 +272,8 @@ fn string_constants_keep_identity_and_equality_across_collections() {
 /// `s += x` with `s` initialized from a literal appends to a new string and leaves the literal
 /// as it was, for a local and for a binding a closure captures. The next evaluation of the
 /// literal reads the same text, and the grown string's buffer is not the constant's. A constant
-/// is allocated at exactly its length, so under gc-heap, whose appends write at a buffer's
-/// frontier, any append to one copies.
+/// is allocated at exactly its length and appends write at a buffer's frontier, so any append
+/// to one copies.
 #[test]
 fn appends_leave_string_constants_intact() {
     const SOURCE: &str = r#"

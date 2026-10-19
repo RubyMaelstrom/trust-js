@@ -65,7 +65,8 @@ const MEM_CAP: usize = 2560 * 1024 * 1024;
 
 /// Soft ceiling: after finishing (and recording) a test, a worker whose heap counter is still
 /// above this retires with exit 0 — the parent re-enqueues the rest of its chunk on a fresh
-/// process, no test blamed. Tests leak by design between recycles; this bounds the accumulation.
+/// process, no test blamed. Each test's Engine frees its heap when it drops; this bounds whatever
+/// accumulates anyway.
 const MEM_SOFT_CAP: usize = 256 * 1024 * 1024;
 
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
@@ -540,8 +541,9 @@ fn run_worker_inner(argv: &[String]) {
         // Flush per line so a stack overflow on the NEXT test still leaves this result on disk.
         let _ = writeln!(out, "{idx}\t{kind}\t{reason}");
         let _ = out.flush();
-        // Retire while still healthy once leaked heap accumulates — the parent respawns a fresh
-        // process for the rest of the chunk (this result is already on disk, so progress is made).
+        // Retire while still healthy if memory accumulates past the soft cap — the parent
+        // respawns a fresh process for the rest of the chunk (this result is already on disk, so
+        // progress is made).
         if HEAP_USED.load(Ordering::Relaxed) > MEM_SOFT_CAP {
             std::process::exit(0);
         }

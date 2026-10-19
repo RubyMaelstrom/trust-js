@@ -1,4 +1,4 @@
-//! P1 S2: handles to payload cells (feature `gc-heap`): a BigInt's digits, a Symbol's identity,
+//! P1 S2: handles to payload cells: a BigInt's digits, a Symbol's identity,
 //! (P1 S4) a closure's `UserCallable` and (P1 S5) a function's deferred `prototype`.
 //!
 //! A handle is its cell's address: `Copy`, with no reference count. The cell lives in the

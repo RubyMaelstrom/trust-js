@@ -101,10 +101,9 @@ comment/example in the same change.
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
 - `TRUST_JS_GC_LOG=1` logs collections.
-- In the GC heap (the default object model, P1): `TRUST_JS_GC_STRESS=N` collects at the
-  first safepoint after every N cell allocations and polls at every call (N=1 finds unrooted
-  values; run each test in its own process, since a use-after-free can take down the whole
-  run).
+- `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
+  polls at every call (N=1 finds unrooted values; run each test in its own process, since a
+  use-after-free can take down the whole run).
   `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
   each) and released pages kept for reuse (`spare`) after each collection.
   `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget, for

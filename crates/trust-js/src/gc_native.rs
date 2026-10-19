@@ -212,7 +212,7 @@ mod tests {
     fn mixed_native_heap_and_ephemerons_share_the_full_collector_fixed_point() {
         let mut engine = crate::Engine::new();
         engine.eval("var key={}, bridge={}, payload={n:42}, owner={}; var map = new WeakMap([[key,bridge]]);", false).unwrap();
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let weak: Vec<_> = crate::gc_test::in_frame(|| {
             let global = Value::Obj(engine.interp.global.clone());
             let mut values = Vec::new();

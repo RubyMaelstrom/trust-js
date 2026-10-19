@@ -19,9 +19,9 @@
 // on purpose: converting an object can run user `valueOf`/`toString`/getters, which mutate the
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
-// Under the P1 gc-heap object model handles are `Copy` (S2) and packed words have no drop glue
-// (S5): code written for reference-counted handles still clones, drops or forgets them where
-// such a handle was retained or released.
+// Handles are `Copy` (P1 S2) and packed words have no drop glue (S5): code written for
+// reference-counted handles still clones, drops or forgets them where such a handle was
+// retained or released.
 #![allow(
     dropping_copy_types,
     forgetting_copy_types,

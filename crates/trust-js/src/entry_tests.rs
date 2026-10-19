@@ -389,7 +389,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
             ),
             "true"
         );
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let env = engine.interp.global_env.clone();
             let value = engine
@@ -448,7 +448,7 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
             "var named=function unused(value){return value+1};[named.name,named.length,named(3)].join('|')"),
             "unused|1|4");
         let enabled = std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0");
-        // Strong handles live only in this helper frame (gc-heap scans the stack).
+        // Strong handles live only in this helper frame (the collector scans the stack).
         let weak = crate::gc_test::in_frame(|| {
             let env = engine.interp.global_env.clone();
             let value = engine

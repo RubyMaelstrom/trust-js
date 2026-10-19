@@ -461,7 +461,7 @@ mod tests {
         );
     }
 
-    /// gc-heap (the rooting harness `jit::rooting_tests`): a callback with more than four
+    /// Rooting harness (`jit::rooting_tests`): a callback with more than four
     /// arguments goes through `CallbackCache::call_values`'s list arm into the compiled callee,
     /// which receives the receiver as its record's `this` and the arguments in its record's
     /// slots. A collection from the callee finds the receiver and an object argument, both fresh

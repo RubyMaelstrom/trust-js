@@ -253,7 +253,7 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
         "#,
         );
         // The handles, and the cached entry's raw callee and environment addresses, live only
-        // in this helper frame (gc-heap scans the stack).
+        // in this helper frame (the collector scans the stack).
         let (victim_weak, token_weak) = crate::gc_test::in_frame(|| {
             let victim = object(&mut engine, "victim");
             let token = object(&mut engine, "token");

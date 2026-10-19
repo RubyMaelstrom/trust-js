@@ -94,7 +94,7 @@ impl<S: StoredValue> SlotAccess for [S] {
     }
 }
 
-/// An operand stack. gc-heap: its whole capacity is initialized memory — new capacity is
+/// An operand stack. Its whole capacity is initialized memory — new capacity is
 /// zero-filled where the buffer is created or grown, and nothing else changes it — so native
 /// code that borrows the buffer past its length (`jit::run`, `jit::run_borrowed_frame`) can
 /// have the collector scan words it has not written yet without reading uninitialized memory.
@@ -128,7 +128,7 @@ impl<S: StoredValue> ValueStack<S> {
             self.0.set_len(len + 1);
         }
     }
-    /// gc-heap: grow by at least `additional` and zero-fill the new spare capacity.
+    /// Grow by at least `additional` and zero-fill the new spare capacity.
     #[cold]
     #[inline(never)]
     fn grow(&mut self, additional: usize) {
@@ -313,7 +313,7 @@ mod tests {
     }
 
     /// An operand stack and shared slots keep scalar bits exactly (-0, infinities, NaN) and an
-    /// object's identity through pushes, pops, an argument decode and a split. gc-heap: the
+    /// object's identity through pushes, pops, an argument decode and a split. The
     /// stack's word is the object tag over the cell's address and stays so through the decode,
     /// and nothing is retained or released.
     #[test]
@@ -361,7 +361,7 @@ mod tests {
     }
 
     /// Decoding an argument list makes one Value per argument, on the Rust stack up to four,
-    /// each the argument's object, and leaves the words as they were. gc-heap: the words keep
+    /// each the argument's object, and leaves the words as they were. The words keep
     /// their bits through the decode, and neither the decode nor the words have anything to
     /// release.
     #[test]
@@ -422,7 +422,7 @@ mod tests {
 
     /// Slot-to-stack copies (LoadLocal, Dup) and stack-to-slot moves (StoreLocal) of an object's
     /// word, with no wide Value between them: every copy and move has the source word's bits.
-    /// gc-heap: copies are bit copies and drops and overwrites release nothing, so the object
+    /// Copies are bit copies and drops and overwrites release nothing, so the object
     /// outlives every word until a collection finds it dead.
     #[test]
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
@@ -447,7 +447,7 @@ mod tests {
     }
 
     /// A shared alias of a slot (a mapped parameter's) observes a replacement written through
-    /// the slice, and a replacement through the alias empties the slot. gc-heap: the alias's
+    /// the slice, and a replacement through the alias empties the slot. The alias's
     /// word is the replacement's bits, and replacements release nothing: both objects outlive
     /// their words until a collection.
     #[test]

@@ -228,7 +228,7 @@ impl IcState {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NameIc {
-    /// `Rc::as_ptr` of the scope at cache time (0 = empty). Low tag bits (scope allocations
+    /// `Env::as_ptr` of the scope at cache time (0 = empty). Low tag bits (scope allocations
     /// are ≥8-aligned): bit 0 = global-object mode; bit 1 = depth-1 mode, where the pointer
     /// is the current env's PARENT — the current env is this chunk's activation, whose fresh
     /// per-call pointer could never hit an exact compare (see `Chunk::name_ic_fill`).
@@ -322,7 +322,7 @@ mod binding_layout_cache_tests {
             env.borrow_mut().vars.publish_layout(layout);
             env
         };
-        // The first activation lives only in this helper frame (gc-heap scans the stack).
+        // The first activation lives only in this helper frame (the collector scans the stack).
         let (second, weak) = crate::gc_test::in_frame(|| {
             let first = make(17.);
             let second = make(29.);
@@ -336,7 +336,7 @@ mod binding_layout_cache_tests {
             assert!(chunk.name_pins.borrow()[cache as usize].is_none());
             (second, Env::downgrade(&first))
         });
-        // A tracing heap (gc-heap) reclaims the activation at a collection.
+        // A collection reclaims the activation.
         engine.interp.gc_collect();
         assert!(
             !crate::gc_test::alive(&weak),
@@ -406,7 +406,7 @@ mod binding_layout_cache_tests {
                 _ => None,
             })
             .unwrap();
-        // Activations live only in this helper frame (gc-heap scans the stack).
+        // Activations live only in this helper frame (the collector scans the stack).
         let weak_parent = crate::gc_test::in_frame(|| {
             let parent = new_scope(None);
             parent
@@ -505,7 +505,7 @@ mod binding_layout_cache_tests {
                 .unwrap_or_else(|_| panic!("layout cache refill threw"));
             Env::downgrade(&parent)
         });
-        // A tracing heap (gc-heap) reclaims the scopes at a collection.
+        // A collection reclaims the scopes.
         engine.interp.gc_collect();
         assert!(
             !crate::gc_test::alive(&weak_parent),
@@ -679,7 +679,7 @@ impl ComputedReadCache {
         storage.sets.len() * Self::SET_STRIDE + std::mem::size_of::<ComputedReadStorage>()
     }
 
-    /// The pinned key strings, roots while cached (gc-heap): a pin keeps its address from
+    /// The pinned key strings, roots while cached: a pin keeps its address from
     /// being reused by another string while an entry is keyed by it.
     pub(crate) fn trace_pins(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Some(storage) = &self.storage else {
@@ -782,15 +782,15 @@ mod computed_read_cache_tests {
 }
 
 /// Per-site call cache (`Op::Call` / `Op::CallWithThis`): the last callee that took the JIT→JIT
-/// fast call at this site, keyed by object identity. `callee` is the callee object's stored `Rc`
-/// pointer; a `Weak` pin in [`Chunk::call_pins`] keeps that ADDRESS from ever being recycled, so
-/// a live `Value::Obj` whose payload equals `callee` proves it is the *same, still-alive* object
-/// — and therefore that everything recorded at fill time still holds: its `call` field is the
-/// same `Callable::User` (a live function's `call` is never reassigned; the one upgrade site
-/// only converts `Callable::None`), which pins the `Function`, its env, its compiled chunk
-/// (`Function::code` is set once). Machine code is separately protected by the
-/// non-sentinel epoch and an owned lease acquired before reentrancy. A hit therefore
-/// skips the object borrow and dispatch checks. Rust dispatch leases the code;
+/// fast call at this site, keyed by object identity. `callee` is the callee object's stored
+/// handle word, its cell's address; a weak pin in [`Chunk::call_pins`] keeps that ADDRESS from
+/// ever being recycled, so a live `Value::Obj` whose payload equals `callee` proves it is the
+/// *same, still-alive* object — and therefore that everything recorded at fill time still
+/// holds: its `call` field is the same `Callable::User` (a live function's `call` is never
+/// reassigned; the one upgrade site only converts `Callable::None`), which pins the `Function`,
+/// its env, its compiled chunk (`Function::code` is set once). Machine code is separately
+/// protected by the non-sentinel epoch and an owned lease acquired before reentrancy. A hit
+/// therefore skips the object borrow and dispatch checks. Rust dispatch leases the code;
 /// direct native entry/exit marks protect mappings without a Rust frame.
 ///
 /// The fill happens only after [`crate::interpreter::Interp::call_jit_fast`] passed its full
@@ -809,16 +809,16 @@ mod computed_read_cache_tests {
 /// including the direct-call/native fields below, is compile-asserted in jit.rs.
 #[repr(C)]
 pub struct CallIc {
-    /// Stored `Rc` pointer of the callee function object; 0 = empty.
+    /// Stored handle word (the cell's address) of the callee function object; 0 = empty.
     pub callee: usize,
-    /// `Rc::as_ptr` of the callee's closure env (a hit reconstructs one owned handle from it).
+    /// `Env::as_ptr` of the callee's closure env (a hit reconstructs a handle from it).
     pub env: *const std::cell::RefCell<crate::interpreter::Scope>,
     /// Address of the `Rc<Chunk>` handle inside the callee's `Function::code` (set-once cell).
     pub chunk: *const Rc<Chunk>,
     /// `Rc::as_ptr` of the chunk's resident machine code. Valid only after the
     /// non-sentinel epoch guard; acquire a lease before any reentrant work.
     pub code: *const crate::jit::JitCode,
-    /// `Rc::as_ptr` of the active realm's global scope at fill time: the fill's same-realm proof
+    /// `Env::as_ptr` of the active realm's global scope at fill time: the fill's same-realm proof
     /// (the callee's env-chain root) is relative to it, so a hit requires the active global to be
     /// unchanged — a realm switch makes every site miss and revalidate through the full path.
     pub global_env: usize,
@@ -1010,7 +1010,7 @@ pub(crate) fn invalidate_call_caches() {
 pub(crate) struct PrivateSite {
     env: std::cell::Cell<usize>,
     pin: std::cell::RefCell<crate::interpreter::WeakEnv>,
-    /// Rooted (gc-heap): an unresolved name's key is a fresh string nothing else holds.
+    /// Rooted: an unresolved name's key is a fresh string nothing else holds.
     key: std::cell::RefCell<crate::rooting::Rooted<Option<crate::lstr::LStr>>>,
     slot: std::cell::Cell<u32>,
     /// The entry key last found for `key`. Instances that share a property layout share this
@@ -2265,7 +2265,7 @@ pub struct Chunk {
     jit_needs_activation_state: bool,
     /// Shared call/constructor eligibility also depends on this immutable body property.
     has_tail_calls: bool,
-    /// Literal values (strings, BigInts), roots for as long as the chunk lives (gc-heap).
+    /// Literal values (strings, BigInts), roots for as long as the chunk lives.
     consts: crate::rooting::RootedVec,
     names: Vec<Rc<str>>,
     n_slots: usize,
@@ -7111,8 +7111,8 @@ fn finish_chunk(
         }
     }
     // A speculative inline can allocate child call-cache seeds and then roll its op/cache
-    // vectors back. Keep only Weak pins referenced by the surviving fixed-size sites so failed
-    // speculation neither retains dead Rc allocation blocks nor consumes the runtime pin budget.
+    // vectors back. Keep only weak pins referenced by the surviving fixed-size sites so failed
+    // speculation neither keeps dead cells reserved nor consumes the runtime pin budget.
     c.call_pins.retain(|callee, _| {
         c.call_caches.iter().any(|site| {
             site.entries
@@ -20342,7 +20342,7 @@ impl Chunk {
     pub(crate) fn jit_const_packed_bits(&self, k: u32) -> Option<u64> {
         PackedValue::scalar_bits(&self.consts[k as usize])
     }
-    /// The execution word of string const `k` under gc-heap, `PACK_STR | cell`, which generated
+    /// The execution word of string const `k`, `PACK_STR | cell`, which generated
     /// code pushes as an immediate; `None` for any other const. The word owns nothing. It names
     /// a live cell for as long as code compiled from this chunk can run: the constant pool roots
     /// the cell while the chunk lives, the chunk owns that code, and cells never move. So only
@@ -20396,7 +20396,7 @@ impl Chunk {
 
     /// Seed captured owners directly from the still-live caller operand list. The ordinary
     /// frame subsequently consumes those words; the environment owns only its captured copies.
-    /// Under gc-heap `this` arrives packed and is widened only for an activation that binds it
+    /// `this` arrives packed and is widened only for an activation that binds it
     /// (an inner arrow chain reads it).
     pub(crate) fn jit_make_run_env_packed(
         &self,
@@ -25857,10 +25857,10 @@ unsafe fn jit_complete_target(
 }
 
 /// Full loop safepoint reached by the generated tier's interrupt divider or allocation
-/// pressure guard (under gc-heap also the heap's due word, at entry and loop polls and at the
-/// end of allocating helpers' calls; `_imm` names the caller, see `jit::POLL_LOOP`). KeptAlive
-/// roots remain intact until the host's job boundary; optional task collection deferral must
-/// not suppress allocation-limit/cycle-collection safepoints.
+/// pressure guard (also the heap's due word, at entry and loop polls and at the end of
+/// allocating helpers' calls; `_imm` names the caller, see `jit::POLL_LOOP`). KeptAlive roots
+/// remain intact until the host's job boundary; optional task collection deferral must not
+/// suppress allocation-limit/collection safepoints.
 pub(crate) unsafe extern "C" fn jit_interrupt(
     ctx: *mut crate::jit::JitCtx,
     _imm: u32,
@@ -25986,7 +25986,7 @@ mod return_slot_tests {
         }
     }
 
-    /// gc-heap: the same prefix offsets and sizes, with the packed `this` word itself at [48].
+    /// JitCtx's prefix offsets and sizes, with the packed `this` word itself at [48].
     /// No word owns anything, so no generated code calls `jit_drop_packed_at` (debug builds
     /// assert it). A function's deferred prototype, the one packed word that owned a box, names
     /// a cell in its function's heap: overwriting the word releases nothing (the cell still owns
@@ -26076,7 +26076,7 @@ mod return_slot_tests {
     }
 }
 
-/// The gc-heap walk of a suspended (or running, see `gc_trace::enter_coroutine`) continuation:
+/// The collector's walk of a suspended (or running, see `gc_trace::enter_coroutine`) continuation:
 /// [`VmCoro::trace_gc`]'s inventory, reading packed slots without unpacking them (unpacking can
 /// materialize a deferred prototype, which allocates).
 impl crate::gc_trace::GcTrace for VmCoro {

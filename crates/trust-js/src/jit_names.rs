@@ -20,8 +20,9 @@ thread_local! {
 #[path = "jit_names_tests.rs"]
 mod tests;
 
-/// x12: descriptor; x9: current Rc::as_ptr(Scope). On success x14 is Value/PackedValue address,
-/// x7 identifies packed property(1) or wide binding(0). Clobbers x7,x9..x17 and NZCV only.
+/// x12: descriptor; x9: the current scope's `Env::as_ptr`. On success x14 is Value/PackedValue
+/// address, x7 identifies packed property(1) or wide binding(0). Clobbers x7,x9..x17 and NZCV
+/// only.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -222,7 +223,7 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.b_cond(C_NE, slow);
     a.ldr_imm(9, 8, offset_of!(R, object) as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.obj_from_rc as u32);
+    a.add_imm(9, 9, layout.obj_from_cell as u32);
     a.ldrb_imm(10, 9, layout.obj_exotic as u32);
     guard_exotic_ordinary(a, layout, 10, 10, slow);
     a.ldrb_imm(10, 9, layout.obj_ic_plain as u32);
@@ -333,7 +334,7 @@ pub(super) fn emit_reference_op(
             a.bind(property);
             a.ldr_imm(13, 8, offset_of!(R, object) as u32);
             a.cbz(13, true, slow);
-            a.add_imm(13, 13, layout.obj_from_rc as u32);
+            a.add_imm(13, 13, layout.obj_from_cell as u32);
             a.ldr_imm(15, 19, offset_of!(JitCtx, global_body) as u32);
             a.cmp_reg_x(13, 15);
             a.b_cond(C_NE, slow);

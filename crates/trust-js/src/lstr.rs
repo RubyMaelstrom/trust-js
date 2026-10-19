@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 #[repr(C)]
 struct Header {
     /// A flat buffer's frontier (see the module docs); unused by a view.
-    strong: Cell<usize>,
+    frontier: Cell<usize>,
     len: Cell<u32>,
     cap: Cell<u32>,
     // `cap` bytes of UTF-8 follow.
@@ -76,7 +76,7 @@ const MIN_VIEW_BYTES: usize = 256;
 const VIEW_PIN_BYTES: usize = 1 << 20;
 const _: () = assert!(MIN_VIEW_BYTES > 10);
 
-/// The descriptor of string cells (gc-heap): a view's one edge is its flat owner.
+/// The descriptor of string cells: a view's one edge is its flat owner.
 pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
     fn trace(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
         // SAFETY: string cells are initialized before any collection can trace them; a view
@@ -115,8 +115,8 @@ impl LStr {
             // re-AND it with the extra bytes' ASCII-ness (see concat2/concat_grown).
             let hint = if ascii { ASCII_HINT } else { 0 };
             p.as_ptr().write(Header {
-                // The frontier: the content's end.
-                strong: Cell::new(content.len()),
+                // The content's end.
+                frontier: Cell::new(content.len()),
                 len: Cell::new(content.len() as u32),
                 cap: Cell::new(cap | hint),
             });
@@ -132,7 +132,7 @@ impl LStr {
     fn set_fresh_len(&self, len: usize) {
         let h = self.hdr();
         h.len.set(len as u32);
-        h.strong.set(len);
+        h.frontier.set(len);
     }
 
     /// Whether the content is KNOWN all-ASCII (see [`ASCII_HINT`]).
@@ -285,7 +285,7 @@ impl LStr {
         debug_assert!(owner.view().is_none(), "views own flat buffers");
         let view = View {
             header: Header {
-                strong: Cell::new(0),
+                frontier: Cell::new(0),
                 len: Cell::new(len as u32),
                 cap: Cell::new(VIEW_CAP),
             },
@@ -303,7 +303,7 @@ impl LStr {
         }
     }
 
-    /// The string's cell, as a GC edge (gc-heap).
+    /// The string's cell, as a GC edge.
     #[inline]
     pub(crate) fn cell_word(&self) -> u64 {
         self.p.as_ptr() as u64
@@ -324,7 +324,7 @@ impl LStr {
         self.view_owner().unwrap_or(self).as_ptr()
     }
 
-    /// Pointer identity (cache keys — same contract as `Rc::as_ptr`).
+    /// Pointer identity (cache keys): the string's cell address.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.p.as_ptr() as *const u8
@@ -379,7 +379,7 @@ impl LStr {
         };
         let len = self.len();
         let h = buffer.hdr();
-        let frontier = h.strong.get();
+        let frontier = h.frontier.get();
         if offset + len != frontier || frontier + x.len() > (h.cap.get() & !ASCII_HINT) as usize {
             return false;
         }
@@ -388,7 +388,7 @@ impl LStr {
             let data = (buffer.p.as_ptr() as *mut u8).add(HDR);
             std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(frontier), x.len());
         }
-        h.strong.set(frontier + x.len());
+        h.frontier.set(frontier + x.len());
         // The buffer's hint covers only the flat string's own bytes, so clearing it for a
         // non-ASCII suffix is conservative.
         buffer.and_ascii(ascii);
@@ -662,7 +662,7 @@ mod tests {
         s = s.concat_owned(&LStr::from("c"));
         assert_eq!(s.buffer_ptr(), p);
         assert_eq!(s.as_str(), "abc");
-        // A frontier append (gc-heap) returns a view, which carries no hint.
+        // A frontier append returns a view, which carries no hint.
         assert!(s.ascii_hint() || s.view_owner().is_some());
         let alias = s.clone();
         s = s.concat_owned(&LStr::from("d"));
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(s.len(), 80_000);
         assert!(s.as_str().starts_with("abcdefgh"));
         assert!(s.as_str().ends_with("abcdefgh"));
-        // The buffer the accumulated string reads (a view's owner under gc-heap).
+        // The buffer the accumulated string reads (a view's owner).
         let buffer = s.view_owner().unwrap_or(&s);
         let cap = (buffer.hdr().cap.get() & !ASCII_HINT) as usize;
         assert!(

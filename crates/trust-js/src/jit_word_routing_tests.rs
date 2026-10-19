@@ -1,6 +1,6 @@
-//! Execution words that own nothing (P1 S5 step 9a), checked in both builds. Under gc-heap's
-//! traced ownership generated code copies, overwrites and pops words without routing any tag to
-//! a checked path, so two kinds of word are driven through the paths that used to route them:
+//! Execution words that own nothing (P1 S5 step 9a). Under traced ownership generated code
+//! copies, overwrites and pops words without routing any tag to a checked path, so two kinds of
+//! word are driven through the paths that used to route them:
 //! - A function's deferred `prototype` is a property-only word and must never become an
 //!   execution word. Every native path that can read a property keyed `prototype` sends it to
 //!   its checked operation, which materializes it: the named read, the computed method read,
@@ -10,13 +10,13 @@
 //! - A BigInt used to leave the fast path wherever its owner needed the checked one. Each test
 //!   drives a BigInt through such a site and checks the results and the BigInt's value after
 //!   every store or compare.
-//! - Under gc-heap a deferred prototype's word names a cell and owns nothing either (step 9b):
-//!   the native property stores that used to send a lazy old value to the checked store or to a
-//!   drop helper overwrite it, materializing nothing, and the old cell dies at a collection.
+//! - A deferred prototype's word names a cell and owns nothing either (step 9b): the native
+//!   property stores that used to send a lazy old value to the checked store or to a drop helper
+//!   overwrite it, materializing nothing, and the old cell dies at a collection.
 //!
 //! Programs run at every tier with the same expected results; at `Tier::Jit` the functions named
 //! ran as native code and, where a test counter records it, the native path ran (or, for a
-//! deferred prototype, declined to the checked operation). Under gc-heap the stress child
+//! deferred prototype, declined to the checked operation). The stress child
 //! (`jit::rooting_tests::rooting_holds_under_gc_stress`) also runs them at `TRUST_JS_GC_STRESS=1`.
 
 use crate::bytecode::Tier;
@@ -327,15 +327,15 @@ fn deferred_prototype_region_method_reads_are_not_borrowed() {
     }
 }
 
-/// The deferred-prototype cells `engine`'s heap holds (gc-heap).
+/// The deferred-prototype cells `engine`'s heap holds.
 fn lazy_cells(engine: &Engine) -> usize {
     let heap = &engine.interp.gc_heap;
     heap.core.borrow().live_count(heap.lazy_proto_desc)
 }
 
-/// gc-heap: `F.prototype = p` over unobserved deferred prototypes through the generated SetProp
+/// `F.prototype = p` over unobserved deferred prototypes through the generated SetProp
 /// template (a warmed, compiled `setPrototype`): every store completes in the template, with no
-/// set-property helper call (so no checked store, and no drop helper, which gc-heap code never
+/// set-property helper call (so no checked store, and no drop helper, which generated code never
 /// calls), no old prototype is materialized (the probe), the new value reads back, and the old
 /// cells are gone after the next collection.
 #[test]
@@ -384,10 +384,10 @@ fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
     );
 }
 
-/// gc-heap: `prototype = p` inside `with (F)` over unobserved deferred prototypes (`StoreRef`
+/// `prototype = p` inside `with (F)` over unobserved deferred prototypes (`StoreRef`
 /// through the with object's Reference; a generator, whose resumable body compiles `with`):
 /// every store completes natively (the native Reference-store counter) and overwrites the lazy
-/// word with no drop helper (which gc-heap code never calls), no old prototype is materialized
+/// word with no drop helper (which generated code never calls), no old prototype is materialized
 /// (the probe), the new value reads back, and the old cells are gone after the next collection.
 #[test]
 fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
@@ -443,8 +443,7 @@ fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
 /// operand, a retained property store and a property store over a BigInt, loose `==` against
 /// null in both orders, strict `===` across different tags, and stores over a BigInt in a
 /// global property and in a closure binding. Results and the BigInt's value are checked after
-/// every store and compare. Under gc-heap the property stores run inline (no set-property
-/// helper call).
+/// every store and compare. The property stores run inline (no set-property helper call).
 #[test]
 fn bigints_take_the_baseline_fast_paths_with_their_values() {
     const SOURCE: &str = r#"
@@ -517,7 +516,7 @@ fn bigints_take_the_baseline_fast_paths_with_their_values() {
 /// a BigInt's owner: a borrowed own read of a BigInt property, a tagged-home read of a BigInt
 /// local, the self-hosted `map` loop's fused HasProperty/Get pair over BigInt elements, and a
 /// linked-list scan entered with a BigInt in its `peek` local. Results and the BigInts' values
-/// are checked; under gc-heap the borrowed reads and the fused pair hit natively for BigInts.
+/// are checked; the borrowed reads and the fused pair hit natively for BigInts.
 #[test]
 fn bigints_take_the_region_fast_paths_with_their_values() {
     const SOURCE: &str = r#"

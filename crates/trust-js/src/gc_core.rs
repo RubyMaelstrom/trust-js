@@ -1,6 +1,7 @@
 //! P1-S1 heap core: pointer-based mark-sweep heap for the GC-managed
 //! object model (docs/v8-chase-p1-plan-2026-10-15.txt, Decisions 0–4).
-//! Feature `gc-heap`: the object model's heap, the default since S6 step 2.
+//! The engine allocates its objects, environment records, strings and
+//! payload cells here.
 //!
 //! Design summary:
 //! - Cells live in 64 KiB pages segregated by (size class, descriptor);
@@ -3765,7 +3766,7 @@ mod tests {
     }
 
     // Timing probes behind the S1 review numbers, run with
-    // `cargo test --release -p trust-js --lib --features embed,gc-heap
+    // `cargo test --release -p trust-js --lib --features embed
     //  gc_core::tests::perf_ -- --ignored --nocapture --test-threads=1`.
 
     fn perf_heap() -> (Heap, DescId, DescId) {

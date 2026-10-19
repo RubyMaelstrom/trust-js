@@ -64,7 +64,7 @@ pub(super) fn install_map_methods(it: &mut Interp) {
 /// The receiver Set's values (deduped insertion order). Errors if `this` isn't a Set.
 fn set_values(i: &mut Interp, this: &Value) -> Result<crate::rooting::RootedVec, Value> {
     // Requires a real Set [[SetData]] slot — a Map (stored the same way) is rejected.
-    // Rooted (gc-heap): Set methods run the other set-like's methods between elements.
+    // Rooted: Set methods run the other set-like's methods between elements.
     let set = coll_obj_kind(i, this, Some("Set"))?;
     let mut values = crate::rooting::RootedVec::from_vec(Vec::with_capacity(coll_live_len(i, set)));
     values.extend(

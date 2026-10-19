@@ -2,7 +2,7 @@
 //! binding map's entries, in the build's layout (probed into the [`JitLayout`]), as the ARM64
 //! accessors (`jit_storage.rs`) do.
 //!
-//! Under gc-heap both sequences are an `InlineVec` ([`JitVecLayout::Inline`]): 4-byte length
+//! Both sequences are an `InlineVec` ([`JitVecLayout::Inline`]): 4-byte length
 //! and capacity words, with the first elements in the object or environment cell exactly while
 //! the capacity word is 0, else behind a heap pointer. A length is loaded as the 32-bit word it
 //! is: a 64-bit load would read `len | cap << 32`, which passes any bounds check of a spilled
@@ -80,7 +80,7 @@ pub(super) fn vec_data_fits(seq: JitVecLayout, off: usize) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // Named fields: the `Property` values of the Object at `obj` (a stored cell word plus
-// `obj_from_rc`), in key-layout order
+// `obj_from_cell`), in key-layout order
 // ---------------------------------------------------------------------------------------------
 
 /// The named-field storage within an Object.
@@ -111,7 +111,7 @@ pub(super) fn fields_data_fits(layout: &JitLayout) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // Binding-map entries: the ordered `(Rc<str>, Binding)` elements of a Small or Indexed map, in
-// the scope at `scope` (`Env::as_ptr`: under gc-heap the environment cell's address)
+// the scope at `scope` (`Env::as_ptr`: the environment cell's address)
 // ---------------------------------------------------------------------------------------------
 
 /// How the probed binding storage holds its entries (`JitRepr::scope_small`). Only sites that
