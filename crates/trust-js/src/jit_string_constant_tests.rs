@@ -12,6 +12,9 @@
 //! Under gc-heap the stress child (`jit::rooting_tests::rooting_holds_under_gc_stress`) also runs
 //! them at `TRUST_JS_GC_STRESS=1`, which collects at every safepoint; debug builds poison a freed
 //! cell, so a constant freed while code embeds it no longer reads as its text.
+//!
+//! x64 has no regions (that check is ARM64's); its baseline template moves the word into rax as
+//! an immediate, which its tests find in the native code of the constant's chunk.
 
 use crate::bytecode::{Chunk, Op, Tier};
 use crate::lstr::LStr;
@@ -112,6 +115,33 @@ fn constants(chunk: &Chunk) -> Vec<LStr> {
         .collect()
 }
 
+/// Whether the native code of `name`'s first-stage chunk holds the word of its `index`th string
+/// constant as an immediate: x64's string-constant template moves it into rax with `movabs`
+/// (`48 b8` and the word's eight bytes).
+#[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+fn holds_immediate(engine: &mut Engine, name: &str, index: usize) -> bool {
+    with_chunk(engine, name, false, |chunk| {
+        let k = chunk
+            .jit_ops()
+            .iter()
+            .filter_map(|op| match *op {
+                Op::Const(k) if chunk.jit_const_is_str(k) => Some(k),
+                _ => None,
+            })
+            .nth(index)
+            .expect("the constant's index");
+        let word = chunk
+            .jit_const_str_word(k)
+            .expect("a string constant's word");
+        let code = chunk.jit.get().flatten().expect("native code");
+        // SAFETY: the chunk keeps its code's executable buffer alive while it is lent.
+        let bytes = unsafe { std::slice::from_raw_parts(code.mem, code.len) };
+        let mut movabs = vec![0x48, 0xb8];
+        movabs.extend_from_slice(&word.to_le_bytes());
+        bytes.windows(movabs.len()).any(|window| window == movabs)
+    })
+}
+
 /// Evaluate `call` and check from Rust that it returned a string reading `text`; at the tiers
 /// that run chunks, also that the string is the `index`th string constant of `name`'s chunk
 /// (`spliced`: its second stage) and, under gc-heap, that the constant's immediate is the word
@@ -207,16 +237,27 @@ fn string_constants_keep_identity_and_equality_across_collections() {
         }
         let first = returned(&mut engine, tier, "literal()", ("literal", false, 0), TEXT);
         let looped = returned(&mut engine, tier, "inLoop(40)", ("inLoop", false, 0), TEXT);
+        #[cfg(target_arch = "aarch64")]
         let regions = super::regions::executed_regions();
         for _ in 0..3 {
             engine.interp.gc_collect();
             assert_eq!(eval(&mut engine, "round(40)"), EXPECTED, "{tier:?}");
         }
+        #[cfg(target_arch = "aarch64")]
         if tier == Tier::Jit {
             assert!(
                 super::regions::executed_regions() > regions,
                 "inLoop's loop runs as a register region"
             );
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+        if tier == Tier::Jit {
+            for name in ["literal", "inLoop"] {
+                assert!(
+                    holds_immediate(&mut engine, name, 0),
+                    "{name}'s string constant is an immediate"
+                );
+            }
         }
         engine.interp.gc_collect();
         let again = returned(&mut engine, tier, "literal()", ("literal", false, 0), TEXT);
@@ -260,6 +301,13 @@ fn appends_leave_string_constants_intact() {
         let names = ["literal", "grow", "growCaptured", "round"];
         if tier == Tier::Jit {
             assert_native(&mut engine, &names);
+            #[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+            for name in ["literal", "grow", "growCaptured"] {
+                assert!(
+                    holds_immediate(&mut engine, name, 0),
+                    "{name}'s literal is an immediate"
+                );
+            }
         }
         if tier != Tier::Interp {
             settle(&mut engine, &names);

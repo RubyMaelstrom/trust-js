@@ -8,9 +8,10 @@
 //! helper. Together they exercise the templates that copy, overwrite and pop execution words,
 //! property words and the direct call's frame (none of which emits a count), and the guards
 //! that admit a Map's or Set's `Exotic::Collection` as ordinary. The template counters and the
-//! direct call sequence these programs check are ARM64's (on x86-64 the programs run without
-//! those checks). The tests at the end check assembled ARM64 code: the finish stub's `this`
-//! reset, the property stores, the property-word guard and the string constants.
+//! direct call sequence these programs check are ARM64's; on x86-64 the programs run without
+//! them, except that the Map and Set program counts x64's own-data reads. The tests at the end
+//! check assembled ARM64 code: the finish stub's `this` reset, the property stores, the
+//! property-word guard and the string constants.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
@@ -477,8 +478,19 @@ fn maps_and_sets_take_the_ordinary_object_paths() {
         // readLabel, readInner (two loads), viaProto and two method loads per round.
         assert_eq!(paths, [50 * 6, 0, 0], "Collection receivers hit natively");
     }
+    // x64's own-data template reads from a local slot's receiver: readLabel's Map or Set and
+    // readInner's box per round (its inherited and operand-stack loads take the helper).
     #[cfg(target_arch = "x86_64")]
-    assert_eq!(eval(&mut jit, "labels(50);"), "0");
+    {
+        let reads = || super::x64::TEST_OWN_PROPERTY_READS.with(|counts| counts[0].get());
+        let before = reads();
+        assert_eq!(eval(&mut jit, "labels(50);"), "0");
+        assert_eq!(
+            reads() - before,
+            50 * 2,
+            "Collection receivers hit natively"
+        );
+    }
 }
 
 /// A finished direct callee's packed `this` (its [48]) is released by nothing: the finish stub

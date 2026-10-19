@@ -14,9 +14,28 @@ use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
 
 #[path = "jit_x64_names.rs"]
 mod names;
+#[path = "jit_x64_storage.rs"]
+mod storage;
 
 // JavaScript slots are owned PackedValues; C ABI stack alignment is independent.
 const SLOT_BYTES: i32 = 8;
+
+// Register numbers and condition codes of the register-generic forms (`Asm::nr_*`).
+const AX: u8 = 0;
+const CX: u8 = 1;
+const DX: u8 = 2;
+const R8: u8 = 8;
+const R9: u8 = 9;
+const R10: u8 = 10;
+const R11: u8 = 11;
+const CTX: u8 = 12;
+const SP: u8 = 13;
+const EQ: u8 = 0x84;
+const NE: u8 = 0x85;
+const BELOW: u8 = 0x82;
+const ABOVE: u8 = 0x87;
+const AE: u8 = 0x83;
+const BE: u8 = 0x86;
 
 #[derive(Clone, Copy)]
 enum PropRecv {
@@ -445,41 +464,150 @@ impl Asm {
     }
 }
 
+// Only ABI-volatile registers are scratch (also on Win64). No push/pop changes
+// the established helper-call alignment. Always use a full disp32 addressing form.
+impl Asm {
+    fn nr_rex(&mut self, wide: bool, reg: u8, base: u8) {
+        self.code
+            .push(0x40 | (u8::from(wide) << 3) | ((reg >> 3) << 2) | (base >> 3));
+    }
+    fn nr_mem(&mut self, wide: bool, opcode: &[u8], reg: u8, base: u8, off: i32) {
+        self.nr_rex(wide, reg, base);
+        self.bytes(opcode);
+        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
+        if base & 7 == 4 {
+            self.code.push(0x24);
+        }
+        self.bytes(&off.to_le_bytes());
+    }
+    fn nr_load(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(true, &[0x8b], reg, base, off as i32);
+    }
+    fn nr_load32(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(false, &[0x8b], reg, base, off as i32);
+    }
+    fn nr_load8(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(false, &[0x0f, 0xb6], reg, base, off as i32);
+    }
+    fn nr_store(&mut self, base: u8, off: usize, reg: u8) {
+        self.nr_mem(true, &[0x89], reg, base, off as i32);
+    }
+    fn nr_store32(&mut self, base: u8, off: usize, reg: u8) {
+        self.nr_mem(false, &[0x89], reg, base, off as i32);
+    }
+    fn nr_lea(&mut self, reg: u8, base: u8, off: i32) {
+        self.nr_mem(true, &[0x8d], reg, base, off);
+    }
+    fn nr_reg(&mut self, opcode: u8, dst: u8, src: u8) {
+        self.nr_rex(true, src, dst);
+        self.bytes(&[opcode, 0xc0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+    fn nr_mov(&mut self, dst: u8, src: u8) {
+        self.nr_reg(0x89, dst, src);
+    }
+    fn nr_cmp(&mut self, lhs: u8, rhs: u8) {
+        self.nr_reg(0x39, lhs, rhs);
+    }
+    fn nr_test(&mut self, reg: u8) {
+        self.nr_reg(0x85, reg, reg);
+    }
+    fn nr_imm(&mut self, reg: u8, value: u64) {
+        self.nr_rex(true, 0, reg);
+        self.code.push(0xb8 | (reg & 7));
+        self.bytes(&value.to_le_bytes());
+    }
+    fn nr_op_imm(&mut self, group: u8, reg: u8, value: i32) {
+        self.nr_rex(true, 0, reg);
+        self.bytes(&[0x81, 0xc0 | (group << 3) | (reg & 7)]);
+        self.bytes(&value.to_le_bytes());
+    }
+    fn nr_shift(&mut self, right: bool, reg: u8, count: u8) {
+        self.nr_rex(true, 0, reg);
+        self.bytes(&[
+            0xc1,
+            0xc0 | ((if right { 5 } else { 4 }) << 3) | (reg & 7),
+            count,
+        ]);
+    }
+    fn nr_mul_imm(&mut self, reg: u8, stride: usize) {
+        self.nr_rex(true, reg, reg);
+        self.bytes(&[0x69, 0xc0 | ((reg & 7) << 3) | (reg & 7)]);
+        self.bytes(&(stride as i32).to_le_bytes());
+    }
+    fn nr_zero_guard(&mut self, reg: u8, slow: usize) {
+        self.nr_test(reg);
+        self.jcc(EQ, slow);
+    }
+    fn nr_max_guard(&mut self, reg: u8, scratch: u8, slow: usize) {
+        self.nr_imm(scratch, u32::MAX as u64);
+        self.nr_cmp(reg, scratch);
+        self.jcc(EQ, slow);
+    }
+    /// Branch to `slow` unless the Object at `obj` has ordinary internal methods
+    /// ([`crate::value::Exotic::is_ordinary`]), as ARM64's `guard_exotic_ordinary`: its exotic
+    /// tag is None's, or, where `jit::exotic_collection_admitted` holds, a Map's or Set's
+    /// Collection's, which one unsigned range test from None's tag admits. Clobbers `scratch`
+    /// and the flags.
+    fn guard_exotic_ordinary(
+        &mut self,
+        layout: &crate::value::JitLayout,
+        obj: u8,
+        scratch: u8,
+        slow: usize,
+    ) {
+        self.nr_load8(scratch, obj, layout.obj_exotic);
+        if super::exotic_collection_admitted(layout) {
+            self.nr_op_imm(5, scratch, i32::from(layout.exotic_none_tag)); // sub
+            self.nr_op_imm(7, scratch, 1);
+            self.jcc(ABOVE, slow);
+        } else {
+            self.nr_op_imm(7, scratch, i32::from(layout.exotic_none_tag));
+            self.jcc(NE, slow);
+        }
+    }
+}
+
 fn a_jne_or_unordered(a: &mut Asm, slow: usize) {
     a.jcc(0x85, slow);
     a.jcc(0x8a, slow);
 }
 
 // ECMA-262 e28783d5, OrdinaryGet: an ordinary own data descriptor returns its live value.
-// No getter, prototype walk, conversion or JavaScript call occurs on this path.
+// No getter, prototype walk, conversion or JavaScript call occurs on this path. Test-only counts
+// of the reads `emit_prop_own` committed, by receiver form: [slot, `this`].
 #[cfg(test)]
 thread_local! {
-    static TEST_OWN_PROPERTY_READS: [std::cell::Cell<usize>; 2] = const {
+    pub(super) static TEST_OWN_PROPERTY_READS: [std::cell::Cell<usize>; 2] = const {
         [std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
 }
 
-/// The named-field count and data-pointer words of an Object, as displacements from it, when its
-/// fields are a `Vec`. This backend reads only that layout inline: gc-heap's `InlineVec` (see
-/// `JitVecLayout`) keeps the checked helpers until the x64 pass of S6 step 7b.
-fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
-    let fields = layout.obj_props + layout.props_entries;
-    match layout.repr.props_fields {
-        crate::value::JitVecLayout::Vec { ptr, len, .. } => Some((fields + len, fields + ptr)),
-        crate::value::JitVecLayout::Inline { .. } => None,
+/// r10 = the receiver's cell word, untagged, once its tag is Object's: other receivers (Empty, a
+/// primitive) keep the checked helper. Either form reads a packed word as a slot holds one: the
+/// local slot's, or the context's [r12+0x30] (`JitCtx::this_word`), the packed `this` itself.
+/// That slot or context keeps the receiver alive throughout the read.
+fn receiver_cell(a: &mut Asm, recv: PropRecv, slow: usize) {
+    match recv {
+        PropRecv::This => {
+            a.nr_mem(false, &[0x0f, 0xb7], AX, CTX, 0x30 + 6); // eax=ctx.this_word tag
+            a.cmp_eax((PACK_OBJ >> 48) as u32);
+            a.jcc(0x85, slow);
+            a.nr_load(R10, CTX, 0x30); // r10=ctx.this_word
+        }
+        PropRecv::Slot(slot) => {
+            let off = i32::from(slot) * SLOT_BYTES;
+            a.load_tag_r15(off);
+            a.cmp_eax((PACK_OBJ >> 48) as u32);
+            a.jcc(0x85, slow);
+            a.bytes(&[0x4d, 0x8b, 0x97]); // r10=[r15+off]
+            a.bytes(&off.to_le_bytes());
+        }
     }
-}
-
-/// Whether a property template can take `recv`: the `this` form reads [r12+0x30] as a pointer to
-/// a wide `this`, which gc-heap's packed word is not, so it keeps the checked helper until the
-/// x64 pass of S6 step 7b.
-fn this_form_ok(recv: PropRecv) -> bool {
-    !matches!(recv, PropRecv::This)
+    a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
 }
 
 /// Probe the live property IC, including fills made after this machine body was compiled.
-/// Receiver, cache, bounds, descriptor and owner checks precede the single clone/push commit.
-/// The canonical local/this owner keeps the receiver alive throughout the borrowed lookup.
+/// Receiver, cache, bounds, descriptor and value-tag checks precede the single push.
 fn emit_prop_own(
     a: &mut Asm,
     layout: &crate::value::JitLayout,
@@ -488,53 +616,28 @@ fn emit_prop_own(
     slow: usize,
 ) -> bool {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
-    let Some((fields_len, fields_ptr)) = vec_fields(layout) else {
-        return false;
-    };
-    if !this_form_ok(recv) {
-        return false;
-    }
     let offsets = [
         layout.obj_from_rc,
         layout.obj_exotic,
         layout.obj_ic_plain,
         layout.obj_props + layout.props_shape,
-        fields_len,
-        fields_ptr,
         layout.entry_size,
         layout.entry_value,
         layout.entry_accessor,
     ];
     if !layout.valid
+        || !storage::fields_len_fits(layout)
+        || !storage::fields_data_fits(layout)
         || layout.entry_accessor != layout.entry_value + 8
         || cache == 0
         || offsets.iter().any(|offset| *offset > i32::MAX as usize)
     {
         return false;
     }
-    match recv {
-        PropRecv::This => {
-            a.bytes(&[0x49, 0x8b, 0x84, 0x24, 0x30, 0, 0, 0]); // rax=ctx.this_raw
-            a.bytes(&[0x80, 0x38, 0x08]); // wide Value::Obj
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4c, 0x8b, 0x50, 0x08]); // r10=stored receiver owner
-        }
-        PropRecv::Slot(slot) => {
-            let off = i32::from(slot) * SLOT_BYTES;
-            a.load_tag_r15(off);
-            a.cmp_eax((PACK_OBJ >> 48) as u32); // Empty/primitive receivers retain the helper
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4d, 0x8b, 0x97]);
-            a.bytes(&off.to_le_bytes());
-            a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
-        }
-    }
-    a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object body
+    receiver_cell(a, recv, slow);
+    a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]); // r11=Object
     a.bytes(&(layout.obj_from_rc as i32).to_le_bytes());
-    a.bytes(&[0x41, 0x80, 0xbb]); // receiver must have ordinary internal methods
-    a.bytes(&(layout.obj_exotic as i32).to_le_bytes());
-    a.bytes(&[layout.exotic_none_tag]);
-    a.jcc(0x85, slow);
+    a.guard_exotic_ordinary(layout, R11, AX, slow); // ordinary internal methods
     a.bytes(&[0x41, 0x80, 0xbb]);
     a.bytes(&(layout.obj_ic_plain as i32).to_le_bytes());
     a.bytes(&[0]);
@@ -568,11 +671,10 @@ fn emit_prop_own(
     a.jcc(0x85, probe);
     a.jmp(slow);
     a.bind(found);
-    a.bytes(&[0x49, 0x3b, 0x93]); // cmp rdx,live entry count
-    a.bytes(&(fields_len as i32).to_le_bytes());
-    a.jcc(0x83, slow);
-    a.bytes(&[0x49, 0x8b, 0x83]); // rax=live entries buffer
-    a.bytes(&(fields_ptr as i32).to_le_bytes());
+    storage::fields_len(a, layout, CX, R11); // rcx=live entry count
+    a.nr_cmp(DX, CX);
+    a.jcc(AE, slow);
+    storage::fields_data(a, layout, AX, R11); // rax=live entries
     a.bytes(&[0x48, 0x69, 0xd2]); // imul rdx,rdx,entry_size
     a.bytes(&(layout.entry_size as i32).to_le_bytes());
     a.bytes(&[0x48, 0x01, 0xd0]); // rax=Property address
@@ -644,17 +746,15 @@ fn emit_prop_num(
     slow: usize,
 ) -> bool {
     if !layout.valid
+        || !storage::fields_data_fits(layout)
+        || layout.obj_exotic > i32::MAX as usize
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
         || layout.entry_size.checked_mul(st.slot as usize).is_none()
-        || !this_form_ok(recv)
     {
         return false;
     }
     let Ok(rcv) = i32::try_from(layout.obj_from_rc) else {
-        return false;
-    };
-    let Ok(exotic) = i32::try_from(layout.obj_exotic) else {
         return false;
     };
     let Ok(plain) = i32::try_from(layout.obj_ic_plain) else {
@@ -664,9 +764,6 @@ fn emit_prop_num(
         return false;
     };
     let Ok(proto) = i32::try_from(layout.obj_proto) else {
-        return false;
-    };
-    let Some(Ok(entries)) = vec_fields(layout).map(|(_, ptr)| i32::try_from(ptr)) else {
         return false;
     };
     let Some(entry_base) = layout.entry_size.checked_mul(st.slot as usize) else {
@@ -679,33 +776,13 @@ fn emit_prop_num(
         return false;
     };
 
-    match recv {
-        PropRecv::This => {
-            // rax=ctx.this_raw; receiver must be Value::Obj; r10=stored Rc pointer.
-            a.bytes(&[0x49, 0x8b, 0x84, 0x24, 0x30, 0, 0, 0]);
-            a.bytes(&[0x80, 0x38, 0x08]);
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4c, 0x8b, 0x50, 0x08]);
-        }
-        PropRecv::Slot(slot) => {
-            let off = i32::from(slot) * SLOT_BYTES;
-            a.load_tag_r15(off);
-            a.cmp_eax(0xfff9);
-            a.jcc(0x85, slow);
-            a.bytes(&[0x4d, 0x8b, 0x97]);
-            a.bytes(&off.to_le_bytes());
-            a.bytes(&[0x49, 0xc1, 0xe2, 0x10, 0x49, 0xc1, 0xea, 0x10]); // untag r10
-        }
-    }
+    receiver_cell(a, recv, slow);
 
     let guard_object = |a: &mut Asm, expected: u32, slow: usize| {
-        // r11 = Object body for the stored Rc in r10.
+        // r11 = the Object in the cell whose word is in r10.
         a.bytes(&[0x4d, 0x89, 0xd3, 0x49, 0x81, 0xc3]);
         a.bytes(&rcv.to_le_bytes());
-        a.bytes(&[0x41, 0x80, 0xbb]);
-        a.bytes(&exotic.to_le_bytes());
-        a.bytes(&[layout.exotic_none_tag]);
-        a.jcc(0x85, slow);
+        a.guard_exotic_ordinary(layout, R11, AX, slow);
         a.bytes(&[0x41, 0x80, 0xbb]);
         a.bytes(&plain.to_le_bytes());
         a.bytes(&[0]);
@@ -717,7 +794,7 @@ fn emit_prop_num(
     };
     guard_object(a, st.recv_shape, slow);
     if st.depth >= 1 {
-        a.bytes(&[0x4d, 0x8b, 0x93]); // r10=[r11+proto]
+        a.bytes(&[0x4d, 0x8b, 0x93]); // r10=[r11+proto], the prototype's cell word or null
         a.bytes(&proto.to_le_bytes());
         a.bytes(&[0x4d, 0x85, 0xd2]);
         a.jcc(0x84, slow);
@@ -739,9 +816,9 @@ fn emit_prop_num(
         guard_object(a, st.holder_shape, slow);
     }
 
-    // rax=entries data; reject a live accessor descriptor, then decode only packed Numbers.
-    a.bytes(&[0x49, 0x8b, 0x83]);
-    a.bytes(&entries.to_le_bytes());
+    // rax=the holder's entries; reject a live accessor descriptor, then decode only packed
+    // Numbers.
+    storage::fields_data(a, layout, AX, R11);
     a.bytes(&[0xf6, 0x80]);
     a.bytes(&accessor_off.to_le_bytes());
     a.bytes(&[crate::value::PROP_ACCESSOR as u8]);
@@ -959,6 +1036,14 @@ pub(super) fn compile_entry(
         match op {
             Op::Const(k) if chunk.jit_const_copyable(*k) => {
                 a.mov_word_imm(chunk.jit_const_packed_bits(*k)?);
+                a.store_word_r13(0);
+                a.add_sp(8);
+            }
+            // The constant's word owns nothing and names a cell the chunk's pool roots while
+            // this code, which the chunk owns, can run: an immediate (see `jit_const_str_word`).
+            #[cfg(feature = "gc-heap")]
+            Op::Const(k) if chunk.jit_const_is_str(*k) => {
+                a.mov_word_imm(chunk.jit_const_str_word(*k)?);
                 a.store_word_r13(0);
                 a.add_sp(8);
             }

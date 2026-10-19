@@ -8,24 +8,8 @@ use crate::bytecode::lexical_cache::{
 };
 use crate::bytecode::UpdKind;
 use crate::eval::{PreparedReference, PreparedReferenceSlot};
-use crate::value::{JitLayout, JitVecLayout, PACK_NULL, PACK_STR, PACK_SYM};
+use crate::value::{JitLayout, PACK_NULL, PACK_STR, PACK_SYM};
 use std::mem::{offset_of, size_of};
-
-const AX: u8 = 0;
-const CX: u8 = 1;
-const DX: u8 = 2;
-const R8: u8 = 8;
-const R9: u8 = 9;
-const R10: u8 = 10;
-const R11: u8 = 11;
-const CTX: u8 = 12;
-const SP: u8 = 13;
-const EQ: u8 = 0x84;
-const NE: u8 = 0x85;
-const BELOW: u8 = 0x82;
-const ABOVE: u8 = 0x87;
-const AE: u8 = 0x83;
-const BE: u8 = 0x86;
 
 #[cfg(test)]
 thread_local! {
@@ -48,106 +32,10 @@ fn record(a: &mut Asm, address: usize) {
     a.nr_mem(true, &[0xff], 0, AX, 0);
 }
 
-// Only ABI-volatile registers are scratch (also on Win64). No push/pop changes
-// the established helper-call alignment. Always use a full disp32 addressing form.
-impl Asm {
-    fn nr_rex(&mut self, wide: bool, reg: u8, base: u8) {
-        self.code
-            .push(0x40 | (u8::from(wide) << 3) | ((reg >> 3) << 2) | (base >> 3));
-    }
-    fn nr_mem(&mut self, wide: bool, opcode: &[u8], reg: u8, base: u8, off: i32) {
-        self.nr_rex(wide, reg, base);
-        self.bytes(opcode);
-        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
-        if base & 7 == 4 {
-            self.code.push(0x24);
-        }
-        self.bytes(&off.to_le_bytes());
-    }
-    fn nr_load(&mut self, reg: u8, base: u8, off: usize) {
-        self.nr_mem(true, &[0x8b], reg, base, off as i32);
-    }
-    fn nr_load32(&mut self, reg: u8, base: u8, off: usize) {
-        self.nr_mem(false, &[0x8b], reg, base, off as i32);
-    }
-    fn nr_load8(&mut self, reg: u8, base: u8, off: usize) {
-        self.nr_mem(false, &[0x0f, 0xb6], reg, base, off as i32);
-    }
-    fn nr_store(&mut self, base: u8, off: usize, reg: u8) {
-        self.nr_mem(true, &[0x89], reg, base, off as i32);
-    }
-    fn nr_store32(&mut self, base: u8, off: usize, reg: u8) {
-        self.nr_mem(false, &[0x89], reg, base, off as i32);
-    }
-    fn nr_lea(&mut self, reg: u8, base: u8, off: i32) {
-        self.nr_mem(true, &[0x8d], reg, base, off);
-    }
-    fn nr_reg(&mut self, opcode: u8, dst: u8, src: u8) {
-        self.nr_rex(true, src, dst);
-        self.bytes(&[opcode, 0xc0 | ((src & 7) << 3) | (dst & 7)]);
-    }
-    fn nr_mov(&mut self, dst: u8, src: u8) {
-        self.nr_reg(0x89, dst, src);
-    }
-    fn nr_cmp(&mut self, lhs: u8, rhs: u8) {
-        self.nr_reg(0x39, lhs, rhs);
-    }
-    fn nr_test(&mut self, reg: u8) {
-        self.nr_reg(0x85, reg, reg);
-    }
-    fn nr_imm(&mut self, reg: u8, value: u64) {
-        self.nr_rex(true, 0, reg);
-        self.code.push(0xb8 | (reg & 7));
-        self.bytes(&value.to_le_bytes());
-    }
-    fn nr_op_imm(&mut self, group: u8, reg: u8, value: i32) {
-        self.nr_rex(true, 0, reg);
-        self.bytes(&[0x81, 0xc0 | (group << 3) | (reg & 7)]);
-        self.bytes(&value.to_le_bytes());
-    }
-    fn nr_shift(&mut self, right: bool, reg: u8, count: u8) {
-        self.nr_rex(true, 0, reg);
-        self.bytes(&[
-            0xc1,
-            0xc0 | ((if right { 5 } else { 4 }) << 3) | (reg & 7),
-            count,
-        ]);
-    }
-    fn nr_mul_imm(&mut self, reg: u8, stride: usize) {
-        self.nr_rex(true, reg, reg);
-        self.bytes(&[0x69, 0xc0 | ((reg & 7) << 3) | (reg & 7)]);
-        self.bytes(&(stride as i32).to_le_bytes());
-    }
-    fn nr_zero_guard(&mut self, reg: u8, slow: usize) {
-        self.nr_test(reg);
-        self.jcc(EQ, slow);
-    }
-    fn nr_max_guard(&mut self, reg: u8, scratch: u8, slow: usize) {
-        self.nr_imm(scratch, u32::MAX as u64);
-        self.nr_cmp(reg, scratch);
-        self.jcc(EQ, slow);
-    }
-}
-
-/// The small binding map's entry count and data-pointer words, as displacements from the
-/// scope, when its entries are a `Vec` (see `vec_fields`).
-fn vec_scope_entries(l: &JitLayout) -> Option<(usize, usize)> {
-    match (
-        l.scope_small_valid,
-        l.repr.scope_small.map(|small| small.storage),
-    ) {
-        (true, Some(JitVecLayout::Vec { ptr, len, .. })) => {
-            Some((l.scope_small_vec + len, l.scope_small_vec + ptr))
-        }
-        _ => None,
-    }
-}
-
 fn valid(l: &JitLayout) -> bool {
-    let Some((fields_len, fields_ptr)) = vec_fields(l) else {
-        return false;
-    };
     l.valid
+        && storage::fields_len_fits(l)
+        && storage::fields_data_fits(l)
         && l.scope_parent_valid
         && l.scope_with_valid
         && l.key_probe_ok
@@ -165,8 +53,6 @@ fn valid(l: &JitLayout) -> bool {
             l.binding_init,
             l.binding_import,
             l.binding_mutable,
-            fields_len,
-            fields_ptr,
             l.obj_props + l.props_shape,
             l.obj_ic_plain,
             l.obj_exotic,
@@ -189,32 +75,38 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
 }
 
-/// R9=body, AX=shape, DX=slot. Output CX=Property, R11=1. No value flags yet. `valid` admitted
-/// the layout: the named fields are a `Vec`.
-fn global_target(a: &mut Asm, l: &JitLayout, slow: usize) {
-    let (fields_len, fields_ptr) = vec_fields(l).expect("valid() admits Vec fields only");
+/// R9=Object (a stored cell word plus `obj_from_rc`), AX=shape, DX=slot. Output CX=Property,
+/// R11=1. No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
+/// (the VM checks `Exotic::None` there); a Reference's object base (`ordinary`) may be any object
+/// with ordinary internal methods, as ARM64's Reference template admits.
+fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     a.nr_zero_guard(R9, slow);
     a.nr_zero_guard(AX, slow);
     a.nr_max_guard(AX, CX, slow);
     a.nr_load32(CX, R9, l.obj_props + l.props_shape);
     a.nr_cmp(CX, AX);
     a.jcc(NE, slow);
-    a.nr_load8(CX, R9, l.obj_exotic);
-    a.nr_op_imm(7, CX, l.exotic_none_tag as i32);
-    a.jcc(NE, slow);
+    if ordinary {
+        a.guard_exotic_ordinary(l, R9, CX, slow);
+    } else {
+        a.nr_load8(CX, R9, l.obj_exotic);
+        a.nr_op_imm(7, CX, l.exotic_none_tag as i32);
+        a.jcc(NE, slow);
+    }
     a.nr_load8(CX, R9, l.obj_ic_plain);
     a.nr_zero_guard(CX, slow);
-    a.nr_load(CX, R9, fields_len);
+    storage::fields_len(a, l, CX, R9);
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    a.nr_load(CX, R9, fields_ptr);
+    storage::fields_data(a, l, CX, R9);
     a.nr_mul_imm(DX, l.entry_size);
     a.nr_reg(0x01, CX, DX);
     a.nr_imm(R11, 1);
 }
 
-/// R8=live descriptor, R9=current Rc::as_ptr(Scope). Output CX=Binding/Property,
-/// R11=0/1, R9=holder Scope pointer/Object body. Preserve descriptor through commit.
+/// R8=live descriptor, R9=the current scope (`Env::as_ptr`: under gc-heap the environment cell's
+/// address). Output CX=Binding/Property, R11=0/1, R9=holder scope/Object. Preserve descriptor
+/// through commit.
 fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     let loop_head = a.label();
     let layout = a.label();
@@ -269,17 +161,17 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_load(CX, R8, offset_of!(NativeNameDescriptor, binding));
     a.jmp(binding);
     a.bind(fresh);
-    if let Some((entries_len, entries_ptr)) = vec_scope_entries(l) {
+    if storage::scope_entries_fit(l) {
         a.nr_load8(AX, R9, l.scope_small_tag);
         a.nr_imm(DX, 2);
         a.nr_reg(0x09, AX, DX); // tag | 2 == 2 accepts Small(0) and Indexed(2)
         a.nr_cmp(AX, DX);
         a.jcc(NE, slow);
         a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
-        a.nr_load(CX, R9, entries_len);
+        storage::scope_entries_len(a, l, CX, R9);
         a.nr_cmp(DX, CX);
         a.jcc(AE, slow);
-        a.nr_load(CX, R9, entries_ptr);
+        storage::scope_entries_data(a, l, CX, R9);
         a.nr_mul_imm(DX, l.scope_binding_stride);
         a.nr_reg(0x01, CX, DX);
         a.nr_lea(CX, CX, l.scope_binding_offset as i32);
@@ -299,7 +191,7 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, global_body));
     a.nr_load32(AX, R8, offset_of!(NativeNameDescriptor, shape));
     a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
-    global_target(a, l, slow);
+    global_target(a, l, false, slow);
     a.bind(done);
     #[cfg(test)]
     record(
@@ -346,7 +238,7 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.nr_shift(true, AX, 32);
     // A 32-bit self move zero-extends the compact slot without sign extension.
     a.bytes(&[0x89, 0xd2]);
-    global_target(a, l, slow);
+    global_target(a, l, false, slow);
     a.jmp(done);
     a.bind(direct);
     a.nr_load32(AX, R9, l.scope_gen);
@@ -684,7 +576,7 @@ fn reference_target(a: &mut Asm, l: &JitLayout, slot: u16, slow: usize) {
     a.nr_lea(R9, R9, l.obj_from_rc as i32);
     a.nr_load32(AX, R8, offset_of!(PreparedReference, shape));
     a.nr_load(DX, R8, offset_of!(PreparedReference, slot));
-    global_target(a, l, slow);
+    global_target(a, l, true, slow);
     a.bind(done);
 }
 

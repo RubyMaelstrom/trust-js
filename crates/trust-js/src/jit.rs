@@ -171,7 +171,7 @@ mod word_routing_tests;
 
 #[cfg(all(
     test,
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_this_tests.rs"]
@@ -179,7 +179,7 @@ mod this_tests;
 
 #[cfg(all(
     test,
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_string_constant_tests.rs"]
@@ -5294,10 +5294,13 @@ fn guard_prop_writable(a: &mut asm::Asm, reg: u32, base: u32, flags: u32, slow: 
 /// interpreter's caches treat its named fields and elements as ordinary. Its tag must directly
 /// follow None's (`JitRepr::exotic_ordinary_contiguous`) for one range test to admit both;
 /// otherwise, and in the default build (which has no such variant), a Collection takes the
-/// checked path.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
+/// checked path. Both backends' ordinary-object guards ask it.
+#[cfg(any(
+    test,
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
 ))]
 fn exotic_collection_admitted(layout: &crate::value::JitLayout) -> bool {
     layout.repr.exotic_collection_tag.is_some() && layout.repr.exotic_ordinary_contiguous

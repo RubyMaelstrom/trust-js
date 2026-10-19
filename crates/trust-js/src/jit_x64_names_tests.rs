@@ -56,7 +56,6 @@ fn check(source: &str, expected: &str) {
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
@@ -123,8 +122,59 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     );
 }
 
+/// A fresh holder's binding is found from its published layout in place and spilled: an
+/// environment cell keeps its first binding, and more spill (here the name is the third).
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
+fn native_deep_names_find_fresh_holder_bindings_in_place_and_spilled() {
+    for before in [0usize, 2] {
+        let mut engine = Engine::new();
+        let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
+        let layouts = [
+            new_binding_layout_id(),
+            new_binding_layout_id(),
+            new_binding_layout_id(),
+        ];
+        let chain = |value: f64| {
+            let holder = new_scope(None);
+            {
+                let mut holder_scope = holder.borrow_mut();
+                let vars = &mut holder_scope.vars;
+                for k in 0..before {
+                    vars.insert(format!("b{k}"), Binding::data(Value::Num(0.0), true, true));
+                }
+                vars.insert("outer", Binding::data(Value::Num(value), true, true));
+                vars.publish_layout(layouts[0]);
+            }
+            scope(
+                Some(scope(Some(holder), "middle", 0.0, layouts[1])),
+                "local",
+                0.0,
+                layouts[2],
+            )
+        };
+        let child = chain(11.0);
+        assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 11.0);
+        // Resolved targets, and reads that pushed their value natively.
+        let counts = || {
+            (
+                TEST_NATIVE_DEEP_NAMES.with(std::cell::Cell::get),
+                TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get),
+            )
+        };
+        let (targets, reads) = counts();
+        assert_eq!(number(run(&mut engine, &chunk, &code, &child)), 11.0);
+        let fresh = chain(29.0);
+        assert_eq!(number(run(&mut engine, &chunk, &code, &fresh)), 29.0);
+        assert_eq!(
+            counts(),
+            (targets + 2, reads + 2),
+            "{} bindings in the holder: the exact and the fresh holder are read natively",
+            before + 1
+        );
+    }
+}
+
+#[test]
 fn native_deep_globals_load_store_and_all_numeric_update_kinds() {
     let mut engine = Engine::new();
     engine.eval("var outer=0;", false).unwrap();
@@ -162,7 +212,6 @@ fn native_name_wide_and_packed_owner_transfers_and_last_owner_fallback() {
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_name_import_mutability_and_parent_changes_stay_live() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
@@ -191,7 +240,6 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_references_hot_fragment_reuses_capture_load_and_store() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);

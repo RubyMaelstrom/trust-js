@@ -49,7 +49,6 @@ fn run(
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
     for (this, source) in [
         (false, "function read(receiver){return receiver.value;}"),
@@ -97,8 +96,38 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
     }
 }
 
+/// The template finds a named field in place and spilled (an object's fifth field spills its
+/// fields from the cell to a heap buffer), from a local slot's receiver and from `this`, the
+/// packed word at [48].
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
+fn own_data_reads_find_fields_in_place_and_spilled() {
+    for (this, source) in [
+        (false, "function read(receiver){return receiver.value;}"),
+        (true, "function read(){'use strict';return this.value;}"),
+    ] {
+        // `value` is the last of `count` fields.
+        for count in [1usize, 4, 5, 9] {
+            let mut engine = Engine::new();
+            let (chunk, code) = compile(&mut engine, source);
+            let fields: String = (1..count).map(|k| format!("f{k}:{k},")).collect();
+            let receiver = eval(&mut engine, &format!("({{{fields}value:{count}}})"));
+            run(&mut engine, &chunk, &code, &receiver, this);
+            let before = reads(usize::from(this));
+            let result = run(&mut engine, &chunk, &code, &receiver, this);
+            assert!(
+                matches!(result, Value::Num(n) if n == count as f64),
+                "{count} fields (this: {this})"
+            );
+            assert_eq!(
+                reads(usize::from(this)) - before,
+                1,
+                "{count} fields (this: {this}): the read is native"
+            );
+        }
+    }
+}
+
+#[test]
 fn live_polymorphic_own_cache_ways_keep_each_receivers_storage() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(
@@ -138,7 +167,6 @@ fn live_polymorphic_own_cache_ways_keep_each_receivers_storage() {
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers() {
     let source = r#"
         function read(receiver){return receiver.value;}
@@ -186,7 +214,6 @@ fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers()
 }
 
 #[test]
-#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn one_native_chunk_reads_live_receivers_in_each_realm() {
     use crate::realm_inline_guard_tests::{eval_string, in_realm};
     let mut engine = Engine::new();

@@ -13,6 +13,11 @@
 //! at `Tier::Jit` the functions named ran as native code and, where a test counter records it,
 //! the native path ran. Under gc-heap the stress child (`jit::rooting_tests::
 //! rooting_holds_under_gc_stress`) also runs them at `TRUST_JS_GC_STRESS=1`.
+//!
+//! The counters of ARM64's direct calls, regions, numeric chains and property templates are
+//! checked on aarch64 only. On x86-64, which has none of those, x64's own-data template counts
+//! the reads of `this`'s properties it ran (`TEST_OWN_PROPERTY_READS`), the `this` form reading
+//! the packed word at [48] as a slot form reads its slot.
 
 use crate::bytecode::Tier;
 use crate::value::Value;
@@ -85,30 +90,42 @@ fn delta<const N: usize>(counter: impl Fn() -> [u64; N], run: impl FnOnce()) -> 
 }
 
 /// Returns through the direct call sequence on this thread.
+#[cfg(target_arch = "aarch64")]
 fn direct_returns() -> [u64; 1] {
     [super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) as u64]
 }
 
 /// Native data hits, native absence hits and checked fallbacks of the property template.
+#[cfg(target_arch = "aarch64")]
 fn property_paths() -> [u64; 3] {
     let paths = super::regions::property_paths();
     [paths[0], paths[1], paths[2]]
 }
 
 /// Calls of the property-store helper.
+#[cfg(target_arch = "aarch64")]
 fn set_prop_helpers() -> [u64; 1] {
     [crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get) as u64]
 }
 
 /// Borrowed own reads a loop region ran.
+#[cfg(target_arch = "aarch64")]
 fn borrowed_reads() -> [u64; 1] {
     [super::regions::borrowed_reads().0]
+}
+
+/// Own-data reads x64's property template ran on this thread: a local slot's receiver, and
+/// `this`.
+#[cfg(target_arch = "x86_64")]
+fn own_reads() -> [u64; 2] {
+    super::x64::TEST_OWN_PROPERTY_READS.with(|counts| counts.each_ref().map(|c| c.get() as u64))
 }
 
 /// Evaluate `source` until it takes at least `direct` direct returns: a site takes the direct
 /// sequence once its call cache is filled for compiled code, and a concurrent test can exhaust
 /// the process-wide call-cache epoch, which sends calls through the checked helper until their
 /// sites refill. Returns the last result.
+#[cfg(target_arch = "aarch64")]
 fn direct_eval(engine: &mut Engine, source: &str, direct: u64) -> String {
     let mut result = String::new();
     for _ in 0..100 {
@@ -194,7 +211,11 @@ fn load_this_pushes_every_kind_of_this() {
             // A round's 30 direct returns: its 7 calls, viaMethods' 4 methods (all but a
             // sloppy callee's primitive receivers) and 6 `kind`s, viaPlain's strict call and 2
             // `kind`s, and viaCall's 10 `kind`s (`call` is not a direct call).
+            #[cfg(target_arch = "aarch64")]
             assert_eq!(direct_eval(&mut engine, "round()", 30), EXPECTED);
+            // x64 has no direct call sequence: its calls take the checked helper.
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(eval(&mut engine, "round()"), EXPECTED);
         }
     }
 }
@@ -312,35 +333,56 @@ fn property_reads_and_writes_receive_every_kind_of_this() {
             ];
             assert_native(&mut engine, &names);
             settle(&mut engine, &names);
-            // A round's 41 direct returns: its 8 calls; reads' 5, writes' 2 and lengths' 4
-            // methods that bind `this` without boxing and return normally, and lengths' 2 and
-            // viaCall's 20 `attempt`s (whose `call` is not a direct call).
-            assert_eq!(direct_eval(&mut engine, "round()", 41), EXPECTED);
-            // Each iteration's method load is a data hit, and so is its callee's read of
-            // `this.x`, or of an object's `this.length`; a primitive's `length` is checked.
+            #[cfg(target_arch = "aarch64")]
+            {
+                // A round's 41 direct returns: its 8 calls; reads' 5, writes' 2 and lengths' 4
+                // methods that bind `this` without boxing and return normally, and lengths' 2
+                // and viaCall's 20 `attempt`s (whose `call` is not a direct call).
+                assert_eq!(direct_eval(&mut engine, "round()", 41), EXPECTED);
+                // Each iteration's method load is a data hit, and so is its callee's read of
+                // `this.x`, or of an object's `this.length`; a primitive's `length` is checked.
+                for (call, expected) in [
+                    ("readObject(20)", [40, 0, 0]),
+                    ("readNumber(20)", [40, 0, 0]),
+                    ("lengthObject(20)", [40, 0, 0]),
+                    ("lengthNumber(20)", [20, 0, 20]),
+                ] {
+                    let paths = delta(property_paths, || {
+                        eval(&mut engine, call);
+                    });
+                    assert_eq!(paths, expected, "{call}: property paths");
+                }
+                let helpers = delta(set_prop_helpers, || {
+                    assert_eq!(eval(&mut engine, "writeObject(20)"), "19");
+                });
+                assert_eq!(helpers, [0], "an object `this` is stored natively");
+                let helpers = delta(set_prop_helpers, || {
+                    assert_eq!(eval(&mut engine, "writeNumber(20)"), "20");
+                });
+                assert_eq!(
+                    helpers,
+                    [20],
+                    "a primitive `this` takes the throwing helper"
+                );
+            }
+            // x64 reads an object `this`'s own `x` or `length` (its spilled named fields) in its
+            // own-data template; a primitive `this`, whose `x` is its wrapper prototype's, and
+            // the method loads take the checked helper.
+            #[cfg(target_arch = "x86_64")]
             for (call, expected) in [
-                ("readObject(20)", [40, 0, 0]),
-                ("readNumber(20)", [40, 0, 0]),
-                ("lengthObject(20)", [40, 0, 0]),
-                ("lengthNumber(20)", [20, 0, 20]),
+                ("readObject(20)", [0, 20]),
+                ("readNumber(20)", [0, 0]),
+                ("lengthObject(20)", [0, 20]),
+                ("lengthNumber(20)", [0, 0]),
             ] {
-                let paths = delta(property_paths, || {
+                let reads = delta(own_reads, || {
                     eval(&mut engine, call);
                 });
-                assert_eq!(paths, expected, "{call}: property paths");
+                assert_eq!(
+                    reads, expected,
+                    "{call}: own-data reads of a slot, of `this`"
+                );
             }
-            let helpers = delta(set_prop_helpers, || {
-                assert_eq!(eval(&mut engine, "writeObject(20)"), "19");
-            });
-            assert_eq!(helpers, [0], "an object `this` is stored natively");
-            let helpers = delta(set_prop_helpers, || {
-                assert_eq!(eval(&mut engine, "writeNumber(20)"), "20");
-            });
-            assert_eq!(
-                helpers,
-                [20],
-                "a primitive `this` takes the throwing helper"
-            );
         }
     }
 }
@@ -410,6 +452,7 @@ fn numeric_chains_receive_every_kind_of_this() {
         });
         eval(&mut engine, &source);
         engine.set_tier(tier);
+        #[cfg(target_arch = "aarch64")]
         let chains = super::TEST_THIS_CHAIN_OPS.with(std::cell::Cell::get);
         for _ in 0..3 {
             assert_eq!(eval(&mut engine, "round()"), EXPECTED, "{tier:?}");
@@ -430,25 +473,43 @@ fn numeric_chains_receive_every_kind_of_this() {
                 "controls",
             ];
             assert_native(&mut engine, &names);
-            // The four chains' operations on `this`: two reads each, and the marks' stores.
-            let compiled = super::TEST_THIS_CHAIN_OPS.with(std::cell::Cell::get) - chains;
-            assert!(
-                compiled >= 10,
-                "{compiled} chain operations on `this` compiled"
-            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                // The four chains' operations on `this`: two reads each, and the marks' stores.
+                let compiled = super::TEST_THIS_CHAIN_OPS.with(std::cell::Cell::get) - chains;
+                assert!(
+                    compiled >= 10,
+                    "{compiled} chain operations on `this` compiled"
+                );
+            }
             settle(&mut engine, &names);
             // `orders` and `controls` load their methods alike; the chains' four reads of `this`
             // per iteration add no property template path (no data hit, absence or fallback).
-            let paths = delta(property_paths, || {
-                assert_eq!(eval(&mut engine, "orders(20)"), "ltlt");
-            });
-            let control = delta(property_paths, || {
-                assert_eq!(eval(&mut engine, "controls(20)"), "ltlt");
-            });
-            assert_eq!(
-                paths, control,
-                "the chains read `this` without the template"
-            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                let paths = delta(property_paths, || {
+                    assert_eq!(eval(&mut engine, "orders(20)"), "ltlt");
+                });
+                let control = delta(property_paths, || {
+                    assert_eq!(eval(&mut engine, "controls(20)"), "ltlt");
+                });
+                assert_eq!(
+                    paths, control,
+                    "the chains read `this` without the template"
+                );
+            }
+            // x64 has no numeric chains: its own-data template reads an object `this`'s `a` and
+            // `b`, in each of an iteration's two callees; `controls`' callees read none.
+            #[cfg(target_arch = "x86_64")]
+            for (call, expected) in [("orders(20)", [0, 80]), ("controls(20)", [0, 0])] {
+                let reads = delta(own_reads, || {
+                    assert_eq!(eval(&mut engine, call), "ltlt");
+                });
+                assert_eq!(
+                    reads, expected,
+                    "{call}: own-data reads of a slot, of `this`"
+                );
+            }
         }
     }
 }
@@ -503,6 +564,12 @@ fn region_own_reads_receive_every_kind_of_this() {
         });
         eval(&mut engine, &source);
         engine.set_tier(tier);
+        // ARM64: the loop region's borrowed reads. x64, which has no regions: its own-data
+        // template's reads of `this`.
+        #[cfg(target_arch = "aarch64")]
+        let native_reads = borrowed_reads;
+        #[cfg(target_arch = "x86_64")]
+        let native_reads = || [own_reads()[1]];
         let mut reads = Vec::new();
         for (call, result) in [
             ("o.sloppyScan(20)", "1o"),
@@ -510,7 +577,7 @@ fn region_own_reads_receive_every_kind_of_this() {
             ("(5).strictScan(20)", "1N"),
         ] {
             reads.push(
-                delta(borrowed_reads, || {
+                delta(native_reads, || {
                     assert_eq!(eval(&mut engine, call), result, "{tier:?} {call}");
                 })[0],
             );
@@ -523,7 +590,7 @@ fn region_own_reads_receive_every_kind_of_this() {
             assert_eq!(
                 reads,
                 [20, 20, 0],
-                "an object's reads are borrowed in the region, a primitive's are not"
+                "an object's reads are native, a primitive's are not"
             );
         }
     }
@@ -581,7 +648,12 @@ fn direct_calls_move_every_kind_of_receiver_and_reset_this() {
             // A round's 26 direct returns: its 2 calls; moved's 5 methods (all but the sloppy
             // callee's primitive receiver) and 4 `kind`s; afterReceiver's 4 methods, its 4
             // receiver-less `st()` and 1 `strictThis()`, and their 5 `kind`s.
+            #[cfg(target_arch = "aarch64")]
             assert_eq!(direct_eval(&mut engine, "round()", 26), EXPECTED);
+            // x64 has no direct call sequence: its calls take the checked helper, whose native
+            // callees run in pooled records too.
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(eval(&mut engine, "round()"), EXPECTED);
             assert!(!engine.interp.frame_pool.is_empty());
             for record in engine.interp.frame_pool.iter() {
                 // SAFETY: a pooled record is allocated and runs nothing.
