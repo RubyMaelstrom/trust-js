@@ -4377,3 +4377,55 @@ change, reviewed):
   - Fixtures at --tier=jit on x86-64 (no-LTO release): compiles
     56/10/160 with aarch64's masked md5s; difftest 138 agree, 12
     skipped, no crash.
+
+Step 8 plan (2026-10-19), from a read-only survey of the committed
+tree at ef2ffe1c:
+- The flag: gc-heap is named on 10 manifest lines in 8 crates
+  (trust-js's default list and feature; host, fs, timers, web, node,
+  runtime and difftest each have it as their only feature) and on
+  638 lines in 84 engine files: 323 cfg attributes and 9 cfg! folds
+  that become unconditional, 31 compound conditions that simplify,
+  the compile_error and POLL_ENTRY's else arm (the only dead code
+  left), 270 comment lines and 4 strings. Elsewhere only dated
+  records name it; heap-bridge survives only in dated records and
+  the djot fixture's input.
+- At step 8's base (4a0b83c5): 647 lines in 87 files, with 324
+  attributes (step 7b's string-constant arm) and 44 lines of other
+  conditions (7b's three x86-64 test gates); the manifests as at
+  ef2ffe1c.
+- Risk: once the manifests drop the feature, a missed cfg compiles
+  its item out with at most a warning, and several gated statements
+  are root guards and polls whose loss still compiles. So the cfgs
+  are unwrapped to zero before the manifests change, clippy runs
+  with -Dwarnings on aarch64, x86-64 and Windows, and each test list
+  must equal its parent's. Unwrapped, 14 gated tail returns need
+  rewriting for clippy, and 19 gated blocks flatten without changing
+  a drop order.
+- Users: TRust depends on trust-js with features = ["embed"] and
+  never names gc-heap. No public item is gated; one public doc
+  (NativeCallableRetained) names the feature. The small build
+  becomes --no-default-features.
+- Deferred items found: gc_core's registration surface (about 220
+  lines) has no engine user but roots gc_core's test fixture (41
+  Fixture::new() calls in its 51 tests). Interp's gc_task_major and
+  scope_gc_next and Object's gc_mark and gc_scratch move probed
+  offsets that generated code embeds (Object likely 184 to 176
+  bytes, the same size class). H_DROP_AT and H_DROP_PACKED_AT are
+  unused (N_HELPERS 33). gc_data_off and scope_data_off measure 0
+  yet emit 11 adds on ARM64 (two of them moves) and 4 leas on x64.
+  obj_from_rc is a real offset (8) under a counted-model name;
+  LStr's `strong` holds a frontier.
+- Method: 8a's code is checked as the release engine's .text, byte-
+  identical to the parent's when both builds enable the same
+  features. Cargo hashes a unit's enabled features into its symbol
+  names, and a changed feature list alone reorders the code:
+  ef2ffe1c built with a dummy default feature differs in 1,277,254
+  of its 5,230,488 .text bytes, every function's size the same. So
+  the child's comparison build re-declares gc-heap, as an empty
+  default feature, in a copy of the tree. Checked by deleting every
+  standalone gc-heap attribute line and rewording a manifest
+  comment: the .text stays identical (no-LTO; aarch64 at ef2ffe1c,
+  x86-64 at 4a0b83c5).
+- Stays, for later steps: the PropertyLayout count emitters and the
+  count-motivated guards (step 12), the host API's nursery-shaped
+  items (steps 10 and 11).
