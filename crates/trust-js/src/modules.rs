@@ -2374,7 +2374,6 @@ fn exported_decl_names(inner: &Stmt) -> Vec<String> {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for ModuleCoro {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self { body, key: _ } = self;
@@ -2382,7 +2381,6 @@ impl crate::gc_trace::GcTrace for ModuleCoro {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for ModuleRec {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {
@@ -2421,7 +2419,6 @@ impl crate::gc_trace::GcTrace for ModuleRec {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PendingDynamicImport {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {

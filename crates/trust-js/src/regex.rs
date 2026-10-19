@@ -1959,7 +1959,6 @@ fn elem_of_cp(cp: u32) -> char {
 
 /// The source string a prepared subject keeps (and its window's parent's), the GC edges of a
 /// cached subject (gc-heap).
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for ReText {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         crate::gc_trace::GcTrace::trace_gc(&self.ascii_src, sink);

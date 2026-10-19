@@ -487,7 +487,6 @@ fn recompiled_functions_keep_their_original_realm() {
 /// strong handle and cell address the test uses kept in helper frames (gc-heap scans the
 /// stack, and a cached entry's raw callee address would retain its callee). A cache's object
 /// pin is a weak handle, so the dead callee's address stays reserved while the cache names it.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() {
     // Epoch is process-global. Isolate this proof from other tests deliberately

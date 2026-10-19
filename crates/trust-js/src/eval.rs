@@ -27,7 +27,6 @@ pub(crate) struct CachedForInKeys {
 }
 
 /// The cached key backing is a cell the cache owns (layouts are Rust-heap shape data).
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for CachedForInKeys {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let CachedForInKeys {
@@ -10188,7 +10187,6 @@ enum TailEval {
     Val(Value),
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PreparedDecoratorValue {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let PreparedDecoratorValue {
@@ -10203,7 +10201,6 @@ impl crate::gc_trace::GcTrace for PreparedDecoratorValue {
 /// Every cell the suspended evaluation holds: objects and environments, and also the Symbols of
 /// computed keys and decorator receivers of any type (`@a.b` captures `a`, which may be a
 /// string).
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PreparedClassEvaluation {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {

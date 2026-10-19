@@ -283,10 +283,9 @@ pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
     if index >= INDEX_STRINGS {
         return crate::lstr::LStr::from(index.to_string().as_str());
     }
-    #[cfg(feature = "gc-heap")]
-    return crate::value::interned_string(128 + index as usize, || {
+    crate::value::interned_string(128 + index as usize, || {
         crate::lstr::LStr::from(index.to_string().as_str())
-    });
+    })
 }
 
 /// The engine string for one UTF-16 code unit, interned for ASCII.
@@ -294,8 +293,7 @@ pub fn unit_lstr(unit: u16) -> crate::lstr::LStr {
     if unit >= 128 {
         return unit_str(unit).into();
     }
-    #[cfg(feature = "gc-heap")]
-    return crate::value::interned_string(unit as usize, || unit_str(unit).into());
+    crate::value::interned_string(unit as usize, || unit_str(unit).into())
 }
 
 /// The spec's code-unit-wise string comparison (differs from `str` byte order for strings mixing

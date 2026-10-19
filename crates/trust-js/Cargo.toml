@@ -16,11 +16,11 @@ rust-version.workspace = true
 stacker = "0.1.25"
 
 [features]
-default = ["intl", "gc-heap"]
+default = ["intl"]
 # ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
-# binary size. Disable it for a small build (`--no-default-features`, plus `--features gc-heap`
-# until that flag goes in P1 S6 step 8): the `Intl` global is absent and the `toLocale*` methods
-# degrade to their locale-independent forms (like engines built without i18n support).
+# binary size. Disable it for a small build (`--no-default-features`): the `Intl` global is
+# absent and the `toLocale*` methods degrade to their locale-independent forms (like engines
+# built without i18n support).
 intl = []
 # The curated embedder surface (`trust_js::embed`: Ctx, host state, define_global, event-loop
 # hooks) used by the trust-js-host/trust-js-runtime crates. Off by default: everything under it is a
@@ -31,10 +31,6 @@ embed = []
 bench = []
 # Allocation/call-cache observations compiled out of ordinary engine builds.
 architecture-diagnostics = []
-# P1 (rearch/v8-chase) GC heap: the object model by default since S6 step 2. Building without it
-# is a compile error from S6 step 4; the flag goes in step 8. See
-# docs/v8-chase-p1-plan-2026-10-15.txt.
-gc-heap = []
 
 [lints]
 workspace = true

@@ -6,10 +6,8 @@
 //! associated functions — [`Env::as_ptr`], [`Env::ptr_eq`], [`Env::downgrade`]. Rust frames
 //! hold environments in locals everywhere, where the conservative stack scan finds them.
 
-#[cfg(feature = "gc-heap")]
 pub use cell::{Env, WeakEnv};
 
-#[cfg(feature = "gc-heap")]
 mod cell {
     use crate::gc_handle::WeakRef;
     use crate::interpreter::Scope;

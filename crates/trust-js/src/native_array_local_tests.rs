@@ -146,18 +146,15 @@ fn tdz_tagged_write_releases_last_owner_before_collection() {
         // word in the live native frames above it (the stack is scanned conservatively, at
         // every tier); once the activation has finished, a collection finds it dead and runs
         // its destructor.
-        #[cfg(feature = "gc-heap")]
-        {
-            engine.interp.gc_collect();
-            assert_eq!(
-                eval(
-                    &mut engine,
-                    "tdzWeak.deref() === undefined && nativeTdzDropCount() === 1"
-                ),
-                "true",
-                "{tier:?}"
-            );
-        }
+        engine.interp.gc_collect();
+        assert_eq!(
+            eval(
+                &mut engine,
+                "tdzWeak.deref() === undefined && nativeTdzDropCount() === 1"
+            ),
+            "true",
+            "{tier:?}"
+        );
         if tier == Tier::Jit {
             let after = super::test_tdz_effect_paths();
             assert!(

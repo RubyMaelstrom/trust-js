@@ -681,7 +681,6 @@ impl ComputedReadCache {
 
     /// The pinned key strings, roots while cached (gc-heap): a pin keeps its address from
     /// being reused by another string while an entry is keyed by it.
-    #[cfg(feature = "gc-heap")]
     pub(crate) fn trace_pins(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Some(storage) = &self.storage else {
             return;
@@ -15103,7 +15102,6 @@ fn drive_vm(
 ) -> Result<VmStep, Abrupt> {
     // I1: this activation's frame state lives on the Rust heap (or in a suspended coroutine);
     // the conservative stack scan sees only pointers to it, so register it for the call.
-    #[cfg(feature = "gc-heap")]
     let _frame = crate::gc_trace::enter_vm_frame(crate::gc_trace::VmFrameRoots {
         env: std::ptr::from_ref(&*env),
         cap_env: std::ptr::from_ref(cap_env),
@@ -20349,7 +20347,6 @@ impl Chunk {
     /// a live cell for as long as code compiled from this chunk can run: the constant pool roots
     /// the cell while the chunk lives, the chunk owns that code, and cells never move. So only
     /// code this chunk owns may embed it, never a process-wide shared stub.
-    #[cfg(feature = "gc-heap")]
     pub(crate) fn jit_const_str_word(&self, k: u32) -> Option<u64> {
         match &self.consts[k as usize] {
             Value::Str(string) => Some(crate::value::PACK_STR | string.cell_word()),
@@ -20408,7 +20405,6 @@ impl Chunk {
         this_val: &crate::jit::JitThis,
         args: &[PackedValue],
     ) -> Env {
-        #[cfg(feature = "gc-heap")]
         let this_val = &if self.env_this && !self.lexical_this {
             this_val.unpack()
         } else {
@@ -21415,7 +21411,7 @@ pub(crate) unsafe extern "C" fn jit_drop_packed_at(
     _imm: u32,
     word: *mut PackedValue,
 ) -> *mut PackedValue {
-    if cfg!(all(feature = "gc-heap", debug_assertions)) {
+    if cfg!(debug_assertions) {
         panic!("gc-heap generated code dropped a packed word");
     }
     unsafe { crate::value::PackedValue::drop_raw(word.cast::<u64>()) };
@@ -25872,13 +25868,13 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
-    #[cfg(all(test, feature = "gc-heap"))]
+    #[cfg(test)]
     let (collections, overshoot) = {
         let core = i.gc_heap.core.borrow();
         (core.collections(), core.budget_overshoot())
     };
     let result = i.interrupt_poll_force().and_then(|()| i.gc_check());
-    #[cfg(all(test, feature = "gc-heap"))]
+    #[cfg(test)]
     {
         let collected = i.gc_heap.core.borrow().collections() != collections;
         crate::jit::record_poll(_imm, collected, overshoot);
@@ -25927,7 +25923,6 @@ mod return_slot_tests {
             slots: std::ptr::null_mut(),
             inline_ic_safe: std::ptr::null(),
             env_raw: std::ptr::null(),
-            #[cfg(feature = "gc-heap")]
             this_word: PackedValue::pack(Value::Undefined),
             global_body: std::ptr::null(),
             genv: 0,
@@ -25997,7 +25992,6 @@ mod return_slot_tests {
     /// a cell in its function's heap: overwriting the word releases nothing (the cell still owns
     /// its key layout), and the next collection frees the cell, whose finalizer drops the layout.
     /// `jit_drop_at` returns the value it was given.
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
@@ -26085,7 +26079,6 @@ mod return_slot_tests {
 /// The gc-heap walk of a suspended (or running, see `gc_trace::enter_coroutine`) continuation:
 /// [`VmCoro::trace_gc`]'s inventory, reading packed slots without unpacking them (unpacking can
 /// materialize a deferred prototype, which allocates).
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for VmCoro {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {
@@ -26158,7 +26151,6 @@ impl crate::gc_trace::GcTrace for VmCoro {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for DisposeCompletion {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self {
@@ -26176,7 +26168,6 @@ impl crate::gc_trace::GcTrace for DisposeCompletion {
 }
 
 /// A native continuation's exit step, held in its context between the exit and the driver.
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for VmStep {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         match self {
@@ -26207,7 +26198,6 @@ impl crate::gc_trace::GcTrace for VmStep {
 
 /// A native activation's bridge state, reached from its context (see `GcTrace for JitCtx`).
 /// The operand words `jit_vm_operation` lends to one VM operation sit in `stack` meanwhile.
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for NativeActivation {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {
@@ -26228,7 +26218,7 @@ impl crate::gc_trace::GcTrace for NativeActivation {
     }
 }
 
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 impl NativeActivation {
     /// The running environment's cell (tests).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]

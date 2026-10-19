@@ -189,7 +189,6 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
 /// The environment dies at the first collection after its last strong handle, its address
 /// stays reserved while a compiled guard pins it, and dropping the last such chunk lets the
 /// next collection free it.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots() {
     use crate::gc_test::HiddenAddress;

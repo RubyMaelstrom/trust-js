@@ -72,7 +72,6 @@ fn invoke(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(&env).cast(),
-        #[cfg(feature = "gc-heap")]
         this_word: PackedValue::pack(Value::Undefined),
         global_body: std::ptr::null(),
         genv: Env::as_ptr(&env) as usize,

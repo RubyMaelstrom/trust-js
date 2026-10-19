@@ -282,13 +282,10 @@ fn call_epoch_native_primary_and_overflow_permanently_miss_at_max() {
     engine.interp.call_overflow.raw_sets = original_sets;
     // gc-heap owners carry no count: the probe leaves the callee's operand word and cell
     // intact, which a collection (and, in debug builds, its heap verifier) confirms.
-    #[cfg(feature = "gc-heap")]
-    {
-        assert!(
-            matches!(&operand[0].unpack(), Value::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
-            "the probe must not consume the callee operand"
-        );
-        engine.interp.gc_collect();
-        assert!(object.try_borrow_mut().is_ok(), "the callee cell is intact");
-    }
+    assert!(
+        matches!(&operand[0].unpack(), Value::Obj(o) if crate::value::Gc::ptr_eq(o, &object)),
+        "the probe must not consume the callee operand"
+    );
+    engine.interp.gc_collect();
+    assert!(object.try_borrow_mut().is_ok(), "the callee cell is intact");
 }

@@ -351,7 +351,7 @@ out.join('|');
     );
 }
 
-#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
+#[cfg(target_arch = "aarch64")]
 fn settle(engine: &mut Engine, name: &str) {
     let env = engine.interp.global_env.clone();
     let function = engine.interp.get_var(name, &env).ok().expect("function");
@@ -373,7 +373,7 @@ fn settle(engine: &mut Engine, name: &str) {
 /// Callees with every slot count from 1 to 13 holding the owner `a` at the first, middle and
 /// last slot, each with a driver that calls it `n` times: the program (after `prelude`, which
 /// binds `token` and `text`) and the (callee, driver) names.
-#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
+#[cfg(target_arch = "aarch64")]
 fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
     let mut source = String::from(prelude);
     let mut names = Vec::new();
@@ -406,7 +406,7 @@ fn slot_owner_program(prelude: &str) -> (String, Vec<(String, String)>) {
 /// gc-heap: owners carry no count and the finish stub releases nothing. Every slot shape runs
 /// through the direct sequence, also with a collection due at every poll (stress 1), and keeps
 /// its results; once the program drops `token`, no finished callee's record retains it.
-#[cfg(all(target_arch = "aarch64", feature = "gc-heap"))]
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn direct_calls_release_slot_owners_exactly_once() {
     use super::rooting_tests::{assert_tracked_collectable, jit_engine, run};

@@ -187,7 +187,6 @@ mod string_constant_tests;
 
 #[cfg(all(
     test,
-    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -196,7 +195,6 @@ mod traced_tests;
 
 #[cfg(all(
     test,
-    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -205,7 +203,6 @@ pub(crate) mod rooting_tests;
 
 #[cfg(all(
     test,
-    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -1761,7 +1758,6 @@ pub struct JitCtx {
     /// [48] The activation's `this` itself, as a packed word that owns nothing. Generated code
     /// chooses its LoadThis, receiver, direct-call and finish-stub forms for it; Rust reads and
     /// writes it through the `this` accessors below.
-    #[cfg(feature = "gc-heap")]
     pub(crate) this_word: PackedValue,
     /// [56] The current realm's global `Object` (through the Rc and RefCell): the LoadName
     /// templates' global-mode path validates the cached shape/slot against it.
@@ -1818,13 +1814,11 @@ pub struct JitCtx {
 
 /// `this` as the moved JIT entries (`run_moved` and its forms) take it and a [`JitCtx`] holds
 /// it: the packed word.
-#[cfg(feature = "gc-heap")]
 pub(crate) type JitThis = PackedValue;
 
 /// An activation's `this` lent to Rust code that takes a `&Value` (see [`JitCtx::this_view`]):
 /// the view holds the widened word.
 pub(crate) struct JitThisView {
-    #[cfg(feature = "gc-heap")]
     this: Value,
 }
 
@@ -1833,8 +1827,7 @@ impl std::ops::Deref for JitThisView {
 
     #[inline]
     fn deref(&self) -> &Value {
-        #[cfg(feature = "gc-heap")]
-        return &self.this;
+        &self.this
     }
 }
 
@@ -1843,8 +1836,7 @@ impl JitCtx {
     /// The activation's `this` as a wide Value: the word widened.
     #[inline]
     pub(crate) fn this_value(&self) -> Value {
-        #[cfg(feature = "gc-heap")]
-        return self.this_word.unpack();
+        self.this_word.unpack()
     }
 
     /// Lend the activation's `this` as a wide Value without borrowing the context, so the caller
@@ -1852,7 +1844,6 @@ impl JitCtx {
     #[inline]
     pub(crate) fn this_view(&self) -> JitThisView {
         JitThisView {
-            #[cfg(feature = "gc-heap")]
             this: self.this_word.unpack(),
         }
     }
@@ -1860,20 +1851,14 @@ impl JitCtx {
     /// Install the activation's `this`; the previous word owns nothing, so nothing is released.
     #[inline]
     pub(crate) fn set_this(&mut self, this: JitThis) {
-        #[cfg(feature = "gc-heap")]
-        {
-            self.this_word = this;
-        }
+        self.this_word = this;
     }
 
     /// Reset the activation's `this` to Undefined, a pooled record's invariant: one store of the
     /// complete Undefined word.
     #[inline]
     pub(crate) fn clear_this(&mut self) {
-        #[cfg(feature = "gc-heap")]
-        {
-            self.this_word = PackedValue::pack(Value::Undefined);
-        }
+        self.this_word = PackedValue::pack(Value::Undefined);
     }
 }
 
@@ -1895,7 +1880,6 @@ impl JitCtx {
 /// makes the context a root scans its slot and operand words: an active [`JitFrame`] record its
 /// whole word buffer, a Rust entry the ranges it registers (`gc_trace::JitFrameRoots`). The raw
 /// identities it caches are kept alive by their owners, as classified below.
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for JitCtx {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitCtx {
@@ -2571,7 +2555,6 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(JitCtx, inline_ic_safe) == 32);
     const _: () = assert!(std::mem::offset_of!(JitCtx, env_raw) == 40);
     // [48]: the 8-byte packed `this` word.
-    #[cfg(feature = "gc-heap")]
     const _: () = assert!(
         std::mem::offset_of!(JitCtx, this_word) == 48
             && std::mem::size_of::<crate::value::PackedValue>() == 8
@@ -2654,7 +2637,6 @@ mod asm {
         /// gc-heap: the code being emitted is a chunk body's baseline code, where a call to an
         /// allocating helper ends in the explicit poll (see `super::emit_helper_end_poll`).
         /// Clear in region code, shared stubs and loose test assemblies.
-        #[cfg(feature = "gc-heap")]
         end_polls: bool,
     }
 
@@ -2678,17 +2660,14 @@ mod asm {
                 marks: Vec::new(),
                 mark_stack: Vec::new(),
                 string_accumulations: Vec::new(),
-                #[cfg(feature = "gc-heap")]
                 end_polls: false,
             }
         }
         /// gc-heap: set whether helper calls emitted from here on end in the explicit poll (see
         /// the `end_polls` field); returns the previous setting.
-        #[cfg(feature = "gc-heap")]
         pub fn set_end_polls(&mut self, on: bool) -> bool {
             std::mem::replace(&mut self.end_polls, on)
         }
-        #[cfg(feature = "gc-heap")]
         pub fn end_polls(&self) -> bool {
             self.end_polls
         }
@@ -2932,7 +2911,6 @@ mod asm {
             self.emit(0xA900_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1);
         }
         /// ldp xt1, xt2, [xn, #imm] (signed offset, any base register; xn may be xt1 or xt2)
-        #[cfg(feature = "gc-heap")]
         pub fn ldp_base(&mut self, rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) {
             debug_assert!(
                 imm_bytes % 8 == 0 && (-512..=504).contains(&imm_bytes),
@@ -4167,7 +4145,6 @@ fn compile_entry(
     let in_loop = loop_body_mask(ops);
     // gc-heap: the body's baseline templates end each call to an allocating helper in the
     // explicit poll; region emission clears this for its own code.
-    #[cfg(feature = "gc-heap")]
     a.set_end_polls(true);
     for (pc, op) in ops.iter().enumerate() {
         a.bind(pc_labels[pc]);
@@ -4810,7 +4787,6 @@ fn compile_entry(
         }
     }
     a.set_hot(false);
-    #[cfg(feature = "gc-heap")]
     a.set_end_polls(false);
     // Fall off the end: return undefined (compile() always terminates with ReturnUndef, but be
     // safe about it).
@@ -6823,7 +6799,6 @@ fn emit_call_inline_marked(
     // gc-heap: every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
     // call) lands here with its result pushed. A native or intrinsic can allocate after the
     // call's last safepoint.
-    #[cfg(feature = "gc-heap")]
     emit_helper_end_poll(a, l_unwind);
 }
 /// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
@@ -8099,12 +8074,9 @@ mod direct_call_tests {
                 // gc-heap owners carry no count: the probe leaves the key's, the holder's and
                 // the receiver's cells intact, which a collection (and, in debug builds, its
                 // heap verifier) confirms.
-                #[cfg(feature = "gc-heap")]
-                {
-                    engine.interp.gc_collect();
-                    assert_eq!(key.as_str(), format!("method{depth}"));
-                    assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
-                }
+                engine.interp.gc_collect();
+                assert_eq!(key.as_str(), format!("method{depth}"));
+                assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
             }
             holder
                 .borrow_mut()
@@ -17131,7 +17103,6 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
         let stub = a.shared_stub(SharedStub::Helper { idx: idx as u8 }.key());
         a.bl_label(stub);
         a.cbnz(1, false, l_unwind);
-        #[cfg(feature = "gc-heap")]
         if helper_ends_in_poll(idx) {
             emit_helper_end_poll(a, l_unwind);
         }
@@ -17144,7 +17115,6 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     a.blr(16);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
-    #[cfg(feature = "gc-heap")]
     if helper_ends_in_poll(idx) {
         emit_helper_end_poll(a, l_unwind);
     }
@@ -17168,7 +17138,6 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
 ///   `direct_finish` runs inside a direct call, whose site polls at its end (a tail call goes
 ///   through `gc_check_amortized` first); `slice_op` ends the native slice, and the code that
 ///   resumes or receives it polls; `interrupt` is the poll.
-#[cfg(feature = "gc-heap")]
 fn helper_ends_in_poll(idx: usize) -> bool {
     matches!(
         idx,
@@ -17204,7 +17173,6 @@ fn helper_ends_in_poll(idx: usize) -> bool {
 /// and so clears it; a throw from there (the live-object limit's RangeError, a host interrupt)
 /// unwinds from here. The object count is left to the entry and loop polls.
 #[cfg(all(
-    feature = "gc-heap",
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -17250,7 +17218,6 @@ fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool, l_unwind: u
     a.cmp_reg_x(10, 11);
     a.b_cond(C_NE, ordinary);
     emit_helper(a, H_STRING_ACCUMULATION, pc);
-    #[cfg(feature = "gc-heap")]
     if a.end_polls() {
         a.cbnz(1, false, ordinary); // an unchanged miss
         emit_helper_end_poll(a, l_unwind);
@@ -17265,16 +17232,15 @@ fn emit_string_accumulation(a: &mut asm::Asm, pc: u32, replay: bool, l_unwind: u
 /// `H_INTERRUPT`'s immediate: which poll calls it. A loop header's poll (where a region's poll
 /// bail lands too) passes `POLL_LOOP`; under gc-heap a function entry's passes `POLL_ENTRY` and
 /// the end of an allocating helper's call `POLL_HELPER_END`, so tests can count the collections
-/// each kind runs. The default build passes 0 from every poll.
+/// each kind runs.
 pub(crate) const POLL_LOOP: u32 = 0;
-pub(crate) const POLL_ENTRY: u32 = if cfg!(feature = "gc-heap") { 1 } else { 0 };
-#[cfg(feature = "gc-heap")]
+pub(crate) const POLL_ENTRY: u32 = 1;
 pub(crate) const POLL_HELPER_END: u32 = 2;
 
 /// Test-only (gc-heap): what generated code's `H_INTERRUPT` calls on this thread did, indexed by
 /// the caller's `POLL_*` kind: the calls, the collections they ran, and the most bytes the heap
 /// had allocated past its trigger when a call collected.
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PollCensus {
     pub(crate) calls: [u64; 3],
@@ -17282,7 +17248,7 @@ pub(crate) struct PollCensus {
     pub(crate) max_overshoot: usize,
 }
 
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 thread_local! {
     static POLL_CENSUS: std::cell::Cell<PollCensus> = const {
         std::cell::Cell::new(PollCensus {
@@ -17299,14 +17265,14 @@ thread_local! {
 }
 
 /// The poll census so far on this thread, which then starts over (tests).
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 pub(crate) fn take_poll_census() -> PollCensus {
     POLL_CENSUS.with(|census| census.replace(PollCensus::default()))
 }
 
 /// `jit_interrupt`'s record of one call (tests): its caller, whether it collected, and the
 /// heap's allocated bytes past the trigger before it ran.
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize) {
     POLL_CENSUS.with(|census| {
         let mut current = census.get();
@@ -17330,12 +17296,9 @@ pub(crate) fn record_poll(kind: u32, collected: bool, overshoot: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_live_count(a: &mut asm::Asm, slow: usize) {
-    #[cfg(feature = "gc-heap")]
-    {
-        const _: () = assert!(crate::value::LIVE_DUE_OFF == 8);
-        a.ldp_base(9, 10, 9, 0);
-        a.cbnz(10, true, slow);
-    }
+    const _: () = assert!(crate::value::LIVE_DUE_OFF == 8);
+    a.ldp_base(9, 10, 9, 0);
+    a.cbnz(10, true, slow);
 }
 
 /// Generated-loop safepoint. Allocation pressure must not wait for the interrupt divider:
@@ -17793,7 +17756,6 @@ pub(crate) unsafe fn run_borrowed_frame(
         inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(env) as *const u8,
         // The VM frame's `this` stays wide; the native run reads it packed.
-        #[cfg(feature = "gc-heap")]
         this_word: PackedValue::pack(this_val.clone()),
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
@@ -17825,7 +17787,6 @@ pub(crate) unsafe fn run_borrowed_frame(
     // so they are this context's roots until it ends: the buffer's whole capacity, which covers
     // the entry depth and `max_stack` and is initialized (see `ValueStack`). The VM frame's
     // slots, environments and references stay registered by `drive_vm`.
-    #[cfg(feature = "gc-heap")]
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
         ctx: std::ptr::addr_of!(ctx),
         words: [
@@ -17880,7 +17841,6 @@ pub(crate) unsafe fn run_borrowed_frame(
         // A synchronous DisposeNormal can finish without suspension. Continue from its
         // settled bytecode successor using the same borrowed activation and no allocation.
     };
-    #[cfg(feature = "gc-heap")]
     drop(roots);
     i.strict = saved_strict;
     (*state.stack).set_len(ctx.final_sp.offset_from(stack_base) as usize);
@@ -17944,7 +17904,6 @@ pub fn run(
         stack_base,
         final_sp: stack_base,
         env_raw,
-        #[cfg(feature = "gc-heap")]
         this_word: PackedValue::pack(this_val),
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
@@ -17977,7 +17936,6 @@ pub fn run(
     // gc-heap: the pooled buffers are this context's roots for the native run (the stack scan
     // sees the context itself): every slot, initialized above, and the operand words up to
     // `max_stack`, initialized because a ValueStack's whole capacity is (see `ValueStack`).
-    #[cfg(feature = "gc-heap")]
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
         ctx: std::ptr::addr_of!(ctx),
         words: [
@@ -17986,7 +17944,6 @@ pub fn run(
         ],
     });
     let ok = entry(&mut ctx);
-    #[cfg(feature = "gc-heap")]
     drop(roots);
     drop(env); // the env handle must outlive the run (ctx.env_ref aliases it)
                // Drop any operands left on the raw stack (a throw can leave temporaries).
@@ -18055,7 +18012,6 @@ pub(crate) struct JitFrame {
 pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
 
 /// gc-heap: an active record (see [`JitFrame`] and `GcTrace for FramePool`).
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for JitFrame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitFrame { ctx, words } = self;
@@ -18074,7 +18030,6 @@ impl JitFrame {
         let record = unsafe {
             let words = std::ptr::addr_of_mut!((*base).words).cast::<PackedValue>();
             // The collector scans an active record's words whole (see `JitFrame`).
-            #[cfg(feature = "gc-heap")]
             words.write_bytes(0, FRAME_BUF);
             std::ptr::addr_of_mut!((*base).ctx).write(JitCtx {
                 helpers: i.jit_helpers.as_ptr(),
@@ -18083,7 +18038,6 @@ impl JitFrame {
                 slots: words,
                 inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
                 env_raw: std::ptr::null(),
-                #[cfg(feature = "gc-heap")]
                 this_word: PackedValue::pack(Value::Undefined),
                 global_body: std::ptr::null(),
                 genv: 0,
@@ -18112,7 +18066,6 @@ impl JitFrame {
             });
             std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
         };
-        #[cfg(feature = "gc-heap")]
         i.frame_pool.register(record);
         record
     }
@@ -18139,7 +18092,6 @@ impl JitFrame {
         if i.frame_pool.len() < FRAME_POOL_LIMIT {
             i.frame_pool.push(frame);
         } else {
-            #[cfg(feature = "gc-heap")]
             i.frame_pool.unregister(frame);
             drop(unsafe { Box::from_raw(frame.as_ptr()) });
         }
@@ -18437,7 +18389,6 @@ unsafe fn run_moved_oversized(
         stack_base,
         final_sp: stack_base,
         env_raw: Env::as_ptr(env) as *const u8,
-        #[cfg(feature = "gc-heap")]
         this_word: this_val,
         global_body: jit_global_body(i, code),
         genv: Env::as_ptr(&i.global_env) as usize,
@@ -18469,7 +18420,6 @@ unsafe fn run_moved_oversized(
     let entry: extern "C" fn(*mut JitCtx) -> u64 = unsafe { std::mem::transmute(code.mem) };
     // gc-heap: as in `run`. The slot Vec's length stays 0, so its `n_slots` words, all written
     // above, are named here; the operand words are initialized up to `max_stack`.
-    #[cfg(feature = "gc-heap")]
     let roots = crate::gc_trace::enter_jit_frame(crate::gc_trace::JitFrameRoots {
         ctx: std::ptr::addr_of!(ctx),
         words: [
@@ -18478,7 +18428,6 @@ unsafe fn run_moved_oversized(
         ],
     });
     let ok = entry(&mut ctx);
-    #[cfg(feature = "gc-heap")]
     drop(roots);
     unsafe {
         let mut p = ctx.stack_base;

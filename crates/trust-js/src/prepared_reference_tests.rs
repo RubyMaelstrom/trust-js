@@ -199,7 +199,6 @@ fn prepared_reference_object_record_get_and_set_repeat_has_not_unscopables() {
 /// gc-heap: a slot reports its Reference's environment to the collector, and replacing the
 /// Reference drops the old one in place: once its handles are gone a collection finds the old
 /// environment dead, while the slot keeps the new one alive.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn prepared_reference_slot_reports_its_reference_and_releases_a_replaced_one() {
     struct Words(Vec<u64>);

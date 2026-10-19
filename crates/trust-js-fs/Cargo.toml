@@ -13,9 +13,5 @@ publish = false
 [dependencies]
 trust-js-host = { path = "../trust-js-host" }
 
-[features]
-# P1 S4: run on the engine's tracing heap.
-gc-heap = ["trust-js-host/gc-heap"]
-
 [lints]
 workspace = true

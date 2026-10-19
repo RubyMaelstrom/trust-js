@@ -640,7 +640,6 @@ pub(super) fn emit(
         }
         // The constant's word owns nothing and names a cell the chunk's pool roots while this
         // code can run, so it is an immediate (see `jit_const_str_word`).
-        #[cfg(feature = "gc-heap")]
         Op::Const(k) if fast & 128 != 0 && chunk.jit_const_is_str(*k) => {
             let Some(word) = chunk.jit_const_str_word(*k) else {
                 return false;
@@ -732,7 +731,6 @@ pub(super) fn emit(
             a.mov(20, 0);
             a.cbnz(1, false, unwind);
             // gc-heap: a native constructor allocates after the call's last safepoint.
-            #[cfg(feature = "gc-heap")]
             emit_helper_end_poll(a, unwind);
         }
         Op::SetProp(..)

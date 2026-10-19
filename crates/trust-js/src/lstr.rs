@@ -77,7 +77,6 @@ const VIEW_PIN_BYTES: usize = 1 << 20;
 const _: () = assert!(MIN_VIEW_BYTES > 10);
 
 /// The descriptor of string cells (gc-heap): a view's one edge is its flat owner.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
     fn trace(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
         // SAFETY: string cells are initialized before any collection can trace them; a view
@@ -110,7 +109,6 @@ impl LStr {
         assert!(cap < VIEW_CAP, "capacity claims representation bits");
         debug_assert!(!ascii || content.is_ascii());
         unsafe {
-            #[cfg(feature = "gc-heap")]
             let p = crate::value::alloc_string_cell(HDR + cap as usize) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
             // The hint holds for `content`; constructors that append more bytes afterwards
@@ -134,7 +132,6 @@ impl LStr {
     fn set_fresh_len(&self, len: usize) {
         let h = self.hdr();
         h.len.set(len as u32);
-        #[cfg(feature = "gc-heap")]
         h.strong.set(len);
     }
 
@@ -295,7 +292,6 @@ impl LStr {
             owner,
             offset,
         };
-        #[cfg(feature = "gc-heap")]
         let p = {
             let cell = crate::value::alloc_string_cell(std::mem::size_of::<View>()).cast::<View>();
             // SAFETY: a fresh cell sized and aligned for a view.
@@ -308,7 +304,6 @@ impl LStr {
     }
 
     /// The string's cell, as a GC edge (gc-heap).
-    #[cfg(feature = "gc-heap")]
     #[inline]
     pub(crate) fn cell_word(&self) -> u64 {
         self.p.as_ptr() as u64
@@ -343,7 +338,6 @@ impl LStr {
     #[inline]
     #[track_caller]
     pub fn strong_count(&self) -> usize {
-        #[cfg(feature = "gc-heap")]
         panic!("LStr::strong_count: gc-heap strings have no reference counts");
     }
 
@@ -377,7 +371,6 @@ impl LStr {
         self.append_with_hint(x, x.is_ascii())
     }
 
-    #[cfg(feature = "gc-heap")]
     fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
         // Frontier append: only the string ending where its buffer's writes end may extend it.
         let (buffer, offset) = match self.view() {
@@ -560,7 +553,6 @@ impl Clone for LStr {
 /// Nothing to release: the collector frees unreachable cells. The empty impl keeps `LStr`, and
 /// so `Value`, a type with drop glue until S6's criterion closure decides how far values become
 /// `Copy`.
-#[cfg(feature = "gc-heap")]
 impl Drop for LStr {
     #[inline]
     fn drop(&mut self) {}

@@ -899,7 +899,6 @@ mod tests {
             );
             eval(&mut engine, &source, "0");
             // The collection finds the registered Symbols dead, with a dead registry's cells.
-            #[cfg(feature = "gc-heap")]
             engine.interp.gc_collect();
             if !stress {
                 assert_eq!(

@@ -240,14 +240,11 @@ fn native_reference_max_generation_and_shape_guards_keep_owned_bases_unchanged()
     }
     // gc-heap owners carry no count: the probes leave both bases intact, which a collection
     // (and, in debug builds, its heap verifier) confirms.
-    #[cfg(feature = "gc-heap")]
-    {
-        let mut engine = engine;
-        engine.interp.gc_collect();
-        assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
-        assert!(matches!(
-            object.borrow().props.get("outer").map(|p| p.value()),
-            Some(Value::Num(n)) if n == 13.0
-        ));
-    }
+    let mut engine = engine;
+    engine.interp.gc_collect();
+    assert!(holder.try_borrow_mut().is_ok() && object.try_borrow_mut().is_ok());
+    assert!(matches!(
+        object.borrow().props.get("outer").map(|p| p.value()),
+        Some(Value::Num(n)) if n == 13.0
+    ));
 }

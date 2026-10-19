@@ -87,21 +87,18 @@ fn math_intrinsics_release_aliased_and_distinct_operand_owners() {
                     evaluate(&mut engine, &format!("{name}(256)")),
                     (result * 256).to_string()
                 );
-                #[cfg(feature = "gc-heap")]
-                {
-                    engine.interp.gc_collect();
-                    assert_eq!(
-                        evaluate(
-                            &mut engine,
-                            &format!(
-                                "builtin.same===builtin&&receiver.same===builtin&&\
-                                 +builtin.same({arguments})==={result}"
-                            )
-                        ),
-                        "true",
-                        "{tier:?} {expression} {name}"
-                    );
-                }
+                engine.interp.gc_collect();
+                assert_eq!(
+                    evaluate(
+                        &mut engine,
+                        &format!(
+                            "builtin.same===builtin&&receiver.same===builtin&&\
+                             +builtin.same({arguments})==={result}"
+                        )
+                    ),
+                    "true",
+                    "{tier:?} {expression} {name}"
+                );
             }
         }
     }
@@ -144,9 +141,7 @@ fn math_intrinsics_destroy_the_final_aliased_operand_owner() {
             }
             assert_eq!(evaluate(&mut engine, "invoke(true)"), expected);
             // gc-heap destroys the last owner when the next collection finds it dead.
-            if cfg!(feature = "gc-heap") {
-                engine.interp.gc_collect();
-            }
+            engine.interp.gc_collect();
             assert_eq!(weak.strong_count(), 0, "{tier:?} {expression} final owner");
             // A bare decrement to zero would make the callable Weak appear
             // dead without running its destructor. Releasing its property is

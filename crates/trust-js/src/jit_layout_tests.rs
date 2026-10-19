@@ -88,29 +88,26 @@ fn layout_is_valid_with_the_build_ownership() {
         stored(&object) + layout.gc_data_off,
         Gc::as_ptr(&object) as usize
     );
-    #[cfg(feature = "gc-heap")]
-    {
-        assert_eq!(layout.gc_data_off, 0, "the stored word is the cell address");
-        assert!(matches!(
-            layout.repr.props_fields,
-            JitVecLayout::Inline {
-                inline_capacity: INLINE_NAMED_SLOTS,
-                ..
-            }
-        ));
-        assert!(matches!(
-            entries_of(&layout),
-            JitVecLayout::Inline {
-                inline_capacity: 1,
-                ..
-            }
-        ));
-        assert_eq!(
-            (layout.repr.slot_memo_width, layout.repr.slot_memo_none),
-            (2, u32::from(u16::MAX))
-        );
-        assert!(layout.repr.exotic_collection_tag.is_some());
-    }
+    assert_eq!(layout.gc_data_off, 0, "the stored word is the cell address");
+    assert!(matches!(
+        layout.repr.props_fields,
+        JitVecLayout::Inline {
+            inline_capacity: INLINE_NAMED_SLOTS,
+            ..
+        }
+    ));
+    assert!(matches!(
+        entries_of(&layout),
+        JitVecLayout::Inline {
+            inline_capacity: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        (layout.repr.slot_memo_width, layout.repr.slot_memo_none),
+        (2, u32::from(u16::MAX))
+    );
+    assert!(layout.repr.exotic_collection_tag.is_some());
 }
 
 #[test]
@@ -173,10 +170,7 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
             .exotic_collection_tag
             .unwrap_or(layout.exotic_none_tag);
         assert!((layout.exotic_none_tag..=last).contains(&found));
-        assert_eq!(
-            last - layout.exotic_none_tag,
-            u8::from(cfg!(feature = "gc-heap"))
-        );
+        assert_eq!(last - layout.exotic_none_tag, 1);
     }
 }
 
@@ -200,7 +194,6 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
         assert_eq!(len, values.len(), "{count} fields");
         assert_eq!(data, values.as_ptr() as usize, "{count} fields");
         assert_eq!(cap, props.entries.heap_capacity(), "{count} fields");
-        #[cfg(feature = "gc-heap")]
         assert_eq!(
             cap == 0,
             count <= INLINE_NAMED_SLOTS,

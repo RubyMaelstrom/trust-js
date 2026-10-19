@@ -899,9 +899,7 @@ fn jit_direct_call_releases_the_last_callee_reference_after_return_and_throw() {
         // The body removed both the global owner and the default prototype's constructor
         // backlink. Only the caller operand remained; cleanup must drop that owner exactly once
         // (gc-heap: leave no word that retains it, so the next collection finds it dead).
-        if cfg!(feature = "gc-heap") {
-            engine.interp.gc_collect();
-        }
+        engine.interp.gc_collect();
         assert_eq!(
             weak.strong_count(),
             0,
@@ -3604,19 +3602,17 @@ fn shadow_realm_heap_transitions_restore_the_caller_heap() {
 
     // gc-heap: a ShadowRealm allocates in its parent's (its Agent's) heap, so both markers
     // live in the one heap; the caller's heap is still the active one afterwards.
-    if cfg!(feature = "gc-heap") {
-        assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
-        let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
-        for marker in [&parent_object, &child_object] {
-            assert!(snapshot
-                .iter()
-                .any(|object| crate::value::Gc::ptr_eq(object, marker)));
-        }
-        assert!(std::rc::Rc::ptr_eq(
-            &crate::value::active_gc_heap(),
-            &engine.interp.gc_heap
-        ));
+    assert!(std::rc::Rc::ptr_eq(&engine.interp.gc_heap, &child.gc_heap));
+    let snapshot = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+    for marker in [&parent_object, &child_object] {
+        assert!(snapshot
+            .iter()
+            .any(|object| crate::value::Gc::ptr_eq(object, marker)));
     }
+    assert!(std::rc::Rc::ptr_eq(
+        &crate::value::active_gc_heap(),
+        &engine.interp.gc_heap
+    ));
 }
 
 /// The completion value of `source`, or a panic naming what it threw.
@@ -3697,7 +3693,6 @@ fn shadow_realm_stays_traced_while_its_function_is_wrapped() {
 /// P1 S4 (gc-heap): parsed code can serve several engines on one thread, one after another. A
 /// closure's `name` is a string of its own engine's heap, never one an AST-level template cached
 /// from the heap that first ran the code (here already dropped).
-#[cfg(feature = "gc-heap")]
 #[test]
 fn function_name_templates_serve_only_their_heap() {
     let body = crate::parser::parse_script(
@@ -3736,7 +3731,6 @@ fn function_name_templates_serve_only_their_heap() {
 
 /// P1 S4 review (gc-heap): an AST-level template's name strings stay roots only while the
 /// parsed code holding the template lives. Discarded code leaves nothing rooted in the heap.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn discarded_function_templates_release_their_name_strings() {
     const NAME_BYTES: usize = 64 * 1024;
@@ -3867,7 +3861,6 @@ fn object_at(
 
 /// P1 S4 (gc-heap): a ShadowRealm's roots count only while its object is marked, so a realm
 /// kept only by its own wrapped function, stored inside it, is collected.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn shadow_realm_kept_only_through_itself_is_collected() {
     let mut engine = Engine::new();

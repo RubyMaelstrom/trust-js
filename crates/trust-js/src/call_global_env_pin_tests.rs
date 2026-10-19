@@ -153,7 +153,6 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
     engine.interp.switch_host_job_context(42);
     let before = CALL_IC_EPOCH.load(Relaxed);
     engine.interp.gc_collect();
-    #[cfg(feature = "gc-heap")]
     assert!(
         !crate::gc_test::alive(&retired_env),
         "callee/code do not retain the old settings environment"

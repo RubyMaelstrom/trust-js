@@ -51,7 +51,6 @@ fn enter(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
         env_raw: Env::as_ptr(&env) as *const u8,
-        #[cfg(feature = "gc-heap")]
         this_word: PackedValue::pack(Value::Undefined),
         global_body: super::jit_global_body(i, code),
         genv: Env::as_ptr(&env) as usize,
@@ -141,7 +140,6 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
 /// gc-heap: the returned object survives the collection `enter` runs after the callee's
 /// teardown, and once the test drops the result a collection finds it dead: neither the
 /// occupied result slot nor the native frame keeps a hidden owner.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
     let mut engine = Engine::new();
@@ -184,7 +182,6 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
 
 /// gc-heap: a cyclic object whose only owner is the return word survives the collection `enter`
 /// runs after the callee's teardown, intact; once the test drops it, a collection finds it dead.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn packed_native_return_sole_cyclic_result_survives_teardown_collection() {
     let mut engine = Engine::new();

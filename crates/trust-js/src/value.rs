@@ -154,7 +154,6 @@ pub enum Value {
     Obj(Gc) = 8,
 }
 
-#[cfg(feature = "gc-heap")]
 impl Value {
     /// The cell this value holds, as a GC edge: an object or a payload cell (gc-heap).
     #[inline]
@@ -224,7 +223,6 @@ pub(crate) const DEFERRED_PROTOTYPE_BYTES: usize = std::mem::size_of::<LazyFunct
 /// (gc-heap): a payload cell that traces the function and the prototype's parent (or, once
 /// materialized, the prototype), so the word owns nothing and dropping or overwriting it
 /// releases nothing; the cell dies at the first collection that finds no word naming it.
-#[cfg(feature = "gc-heap")]
 type LazyProto = crate::gc_box::GcBox<LazyFunctionPrototype>;
 
 impl PackedValue {
@@ -438,7 +436,6 @@ impl PackedValue {
     /// into execution or under another key.
     #[inline]
     pub(crate) fn clone_materialized(&self) -> PackedValue {
-        #[cfg(feature = "gc-heap")]
         if self.tag() == PACK_LAZY_PROTO {
             return PackedValue::pack(self.unpack());
         }
@@ -476,7 +473,6 @@ impl PackedValue {
 /// gc-heap: a word owns nothing (its payload is a cell address or a scalar), so a clone copies
 /// its bits. A deferred prototype is a property-only word that must not be copied as is:
 /// property reads copy words with [`PackedValue::clone_materialized`]. Debug builds assert it.
-#[cfg(feature = "gc-heap")]
 impl Clone for PackedValue {
     #[inline]
     fn clone(&self) -> Self {
@@ -491,7 +487,6 @@ impl Clone for PackedValue {
 
 // gc-heap: a word owns nothing, so it has no drop glue; dropping or overwriting one, and every
 // teardown loop over execution words, compiles to nothing.
-#[cfg(feature = "gc-heap")]
 const _: () = assert!(!std::mem::needs_drop::<PackedValue>());
 
 #[cfg(test)]
@@ -653,11 +648,8 @@ mod packed_value_tests {
     fn packed_value_moves_reference_ownership_without_a_bump() {
         let obj = Object::new(None);
         let packed = PackedValue::pack(Value::Obj(obj.clone()));
-        #[cfg(feature = "gc-heap")]
-        {
-            assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
-            assert!(!std::mem::needs_drop::<PackedValue>());
-        }
+        assert_eq!(packed.bits(), PACK_OBJ | Gc::as_ptr(&obj) as u64);
+        assert!(!std::mem::needs_drop::<PackedValue>());
         let out = packed.into_value();
         assert!(matches!(&out, Value::Obj(actual) if Gc::ptr_eq(actual, &obj)));
         drop(out);
@@ -696,7 +688,6 @@ mod packed_value_tests {
             PackedValue::pack(Value::Str(string.clone())),
             PackedValue::pack(Value::Sym(symbol.clone())),
         ];
-        #[cfg(feature = "gc-heap")]
         assert_eq!(
             [original[0].bits(), original[2].bits()],
             [
@@ -784,7 +775,6 @@ mod packed_value_tests {
             assert_eq!((*base).bits(), 1.5f64.to_bits());
             assert!(matches!(moved.unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             (*base.add(3)).replace_value(moved.into_value());
-            #[cfg(feature = "gc-heap")]
             assert!(matches!((*base.add(3)).unpack(), Value::Obj(o) if Gc::ptr_eq(&o, &obj)));
             assert!(matches!((*base.add(1)).unpack(), Value::Undefined));
             assert!(matches!((*base.add(2)).unpack(), Value::Bool(true)));
@@ -868,16 +858,13 @@ impl Drop for SymbolData {
 
 /// A Symbol value's handle: a cell in the Agent heap that was active when the Symbol was minted
 /// (P1 S2). Identity is the handle's address ([`symbol_ptr_eq`]), equivalently the `id`.
-#[cfg(feature = "gc-heap")]
 pub type SymbolRef = crate::gc_box::GcBox<SymbolData>;
 
 /// A weak Symbol handle: it upgrades until a collection (or the heap's teardown) finds the
 /// Symbol dead and clears the shared weak cell.
-#[cfg(feature = "gc-heap")]
 #[derive(Clone, Default)]
 pub(crate) struct WeakSymbol(crate::gc_handle::WeakRef);
 
-#[cfg(feature = "gc-heap")]
 impl WeakSymbol {
     #[inline]
     pub(crate) fn upgrade(&self) -> Option<SymbolRef> {
@@ -896,31 +883,26 @@ impl WeakSymbol {
 
 /// Mint the handle of a new Symbol (in the active Agent's heap).
 pub(crate) fn new_symbol_ref(data: SymbolData) -> SymbolRef {
-    #[cfg(feature = "gc-heap")]
     crate::gc_box::new(data)
 }
 
 #[inline]
 pub(crate) fn symbol_ptr_eq(a: &SymbolRef, b: &SymbolRef) -> bool {
-    #[cfg(feature = "gc-heap")]
     crate::gc_box::GcBox::ptr_eq(a, b)
 }
 
 /// The Symbol's allocation address, for identity-keyed diagnostics.
 #[inline]
 pub(crate) fn symbol_identity(symbol: &SymbolRef) -> usize {
-    #[cfg(feature = "gc-heap")]
     let identity = crate::gc_box::GcBox::as_ptr(symbol);
     identity as usize
 }
 
 #[inline]
 pub(crate) fn symbol_downgrade(symbol: &SymbolRef) -> WeakSymbol {
-    #[cfg(feature = "gc-heap")]
     WeakSymbol(crate::gc_handle::WeakRef::to(symbol_identity(symbol)))
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_box::Payload for SymbolData {
     fn desc(heap: &GcState) -> crate::gc_core::DescId {
         heap.symbol_desc
@@ -928,7 +910,6 @@ impl crate::gc_box::Payload for SymbolData {
 }
 
 /// The descriptor of Symbol cells: no edges; the finalizer delivers death notifications.
-#[cfg(feature = "gc-heap")]
 fn symbol_cell_layout() -> crate::gc_core::LayoutDesc {
     crate::gc_core::LayoutDesc {
         name: "symbol",
@@ -1377,7 +1358,6 @@ fn probe_jit_repr() -> JitRepr {
 
     // Named fields: an InlineVec keeping the first INLINE_NAMED_SLOTS in the cell, probed in
     // place and spilled.
-    #[cfg(feature = "gc-heap")]
     let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
 
     // gc-heap: a Map's or Set's data is `Exotic::Collection`, declared right after `None` so
@@ -1385,7 +1365,6 @@ fn probe_jit_repr() -> JitRepr {
     // distinct from every admitted tag, or no tag guard is sound: fail closed.
     let tag = |exotic: &Exotic| unsafe { *(exotic as *const Exotic as *const u8) };
     let none_tag = tag(&Exotic::None);
-    #[cfg(feature = "gc-heap")]
     let (exotic_collection_tag, collection_ok) = {
         use crate::ordered_collection::{CollectionKind, OrderedCollection};
         let map = Exotic::Collection(Box::new(OrderedCollection::new(CollectionKind::Map)));
@@ -2017,13 +1996,11 @@ impl TypeofTest {
 /// A closure's [`UserCallable`], shared by handle. P1 S4 (gc-heap): a payload cell that traces
 /// its environment, so creating a closure takes one 32-byte cell, and a call copies the handle
 /// without touching a count.
-#[cfg(feature = "gc-heap")]
 pub type UserFn = crate::gc_box::GcBox<UserCallable>;
 
 /// The address of a closure's [`UserCallable`]: its identity.
 pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
-    #[cfg(feature = "gc-heap")]
-    return crate::gc_box::GcBox::as_ptr(user);
+    crate::gc_box::GcBox::as_ptr(user)
 }
 
 /// How an object can be called. Most objects are not callable (`None`).
@@ -2143,8 +2120,7 @@ impl Callable {
             realm,
             binding_getter_cache: Cell::new(None),
         };
-        #[cfg(feature = "gc-heap")]
-        return Callable::User(crate::gc_box::new(user));
+        Callable::User(crate::gc_box::new(user))
     }
 
     pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
@@ -2189,7 +2165,6 @@ pub enum Exotic {
     /// P1 S4 (gc-heap): a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
     /// `Interp::collection`). Declared next to `None` so that [`Exotic::is_ordinary`] tests one
     /// tag range.
-    #[cfg(feature = "gc-heap")]
     Collection(Box<crate::ordered_collection::OrderedCollection>),
     Array,
     BoolWrap(bool),
@@ -2216,15 +2191,13 @@ impl Exotic {
     /// plain objects ask this, so Maps and Sets keep them.
     #[inline]
     pub(crate) fn is_ordinary(&self) -> bool {
-        #[cfg(feature = "gc-heap")]
-        return matches!(self, Exotic::None | Exotic::Collection(_));
+        matches!(self, Exotic::None | Exotic::Collection(_))
     }
 
     /// A Map's or Set's in-cell data.
     #[inline]
     pub(crate) fn is_collection(&self) -> bool {
-        #[cfg(feature = "gc-heap")]
-        return matches!(self, Exotic::Collection(_));
+        matches!(self, Exotic::Collection(_))
     }
 
     pub(crate) fn str_wrap(value: crate::lstr::LStr) -> Exotic {
@@ -2515,7 +2488,6 @@ impl<T> SlotRegistry<T> {
     }
 
     /// Every live entry's address.
-    #[cfg(feature = "gc-heap")]
     fn entry_ptrs(&self) -> impl Iterator<Item = *const RefCell<T>> + '_ {
         self.entries
             .iter()
@@ -2547,35 +2519,25 @@ pub(crate) struct GcState {
     allocated: Cell<u64>,
     /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
     /// `new_object_heap`); collections run at interpreter safepoints, which supply the roots.
-    #[cfg(feature = "gc-heap")]
     pub(crate) core: RefCell<crate::gc_core::Heap>,
-    #[cfg(feature = "gc-heap")]
     pub(crate) object_desc: crate::gc_core::DescId,
-    #[cfg(feature = "gc-heap")]
     pub(crate) scope_desc: crate::gc_core::DescId,
     /// BigInt payload cells.
-    #[cfg(feature = "gc-heap")]
     pub(crate) bigint_desc: crate::gc_core::DescId,
     /// Symbol cells.
-    #[cfg(feature = "gc-heap")]
     pub(crate) symbol_desc: crate::gc_core::DescId,
     /// String cells (flat buffers and views).
-    #[cfg(feature = "gc-heap")]
     pub(crate) string_desc: crate::gc_core::DescId,
     /// Closure cells (each a [`UserCallable`]).
-    #[cfg(feature = "gc-heap")]
     pub(crate) user_fn_desc: crate::gc_core::DescId,
     /// Deferred-prototype cells (each a function's [`LazyFunctionPrototype`]).
-    #[cfg(feature = "gc-heap")]
     pub(crate) lazy_proto_desc: crate::gc_core::DescId,
     /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
     /// `jstr::index_lstr`), roots for the heap's lifetime.
-    #[cfg(feature = "gc-heap")]
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
     /// P1 S4: the roots of the AST-level templates built in this heap (see [`TemplateRoots`]),
     /// held weakly: a template's strings are roots while the template lives. Dead entries are
     /// dropped as they are traced.
-    #[cfg(feature = "gc-heap")]
     pub(crate) template_roots: RefCell<Vec<std::rc::Weak<TemplateStrings>>>,
 }
 
@@ -2587,14 +2549,12 @@ pub(crate) type GcHeap = Rc<GcState>;
 /// [`new_gc_heap`]). None of these moves the count. `JitCtx::live_objects` holds the count's
 /// address, so a JIT poll loads both words with one LDP: the count for its `gc_next` compare,
 /// the due word for its slow path (see `jit::emit_live_count`).
-#[cfg(feature = "gc-heap")]
 #[repr(C)]
 pub(crate) struct LiveCount {
     count: Cell<i64>,
     due: Cell<u64>,
 }
 
-#[cfg(feature = "gc-heap")]
 impl LiveCount {
     fn new(count: i64) -> Self {
         Self {
@@ -2617,10 +2577,8 @@ impl LiveCount {
 }
 
 /// Byte offset of the due word from the live-object count (see [`LiveCount`]).
-#[cfg(feature = "gc-heap")]
 pub(crate) const LIVE_DUE_OFF: u32 = 8;
 
-#[cfg(feature = "gc-heap")]
 const _: () = assert!(
     std::mem::offset_of!(LiveCount, count) == 0
         && std::mem::offset_of!(LiveCount, due) == LIVE_DUE_OFF as usize
@@ -2628,7 +2586,7 @@ const _: () = assert!(
 
 /// Whether the cell heap has a collection due, as generated code reads it (gc-heap tests; see
 /// [`LiveCount`]).
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
     heap.live.due.get() != 0
@@ -2636,7 +2594,6 @@ pub(crate) fn heap_collection_due(heap: &GcHeap) -> bool {
 
 /// Debug builds: the due word agrees with the core's `collection_due` (gc-heap; checked at
 /// `Interp::gc_check`).
-#[cfg(feature = "gc-heap")]
 pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
     if cfg!(debug_assertions) {
         if let Ok(core) = heap.core.try_borrow() {
@@ -2651,7 +2608,6 @@ pub(crate) fn debug_assert_due_word(heap: &GcHeap) {
 }
 
 /// The descriptors of a [`GcState`]'s cell kinds.
-#[cfg(feature = "gc-heap")]
 struct CellDescs {
     object: crate::gc_core::DescId,
     scope: crate::gc_core::DescId,
@@ -2663,7 +2619,6 @@ struct CellDescs {
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
-#[cfg(feature = "gc-heap")]
 fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
@@ -2710,14 +2665,12 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     )
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_box::Payload for UserCallable {
     fn desc(heap: &GcState) -> crate::gc_core::DescId {
         heap.user_fn_desc
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_box::Payload for LazyFunctionPrototype {
     fn desc(heap: &GcState) -> crate::gc_core::DescId {
         heap.lazy_proto_desc
@@ -2725,7 +2678,6 @@ impl crate::gc_box::Payload for LazyFunctionPrototype {
 }
 
 /// A closure cell's one edge: its environment.
-#[cfg(feature = "gc-heap")]
 fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: closure cells are initialized by `gc_box::new` before any collection.
     let user = unsafe { &*cell.cast::<UserCallable>() };
@@ -2733,14 +2685,12 @@ fn trace_user_fn_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 }
 
 /// A fresh string cell of `size` bytes in the active Agent's heap (see `LStr`).
-#[cfg(feature = "gc-heap")]
 pub(crate) fn alloc_string_cell(size: usize) -> *mut u8 {
     with_active_gc_heap(|heap| heap.core.borrow_mut().alloc(heap.string_desc, size))
 }
 
 /// The active heap's interned string at `slot`, made by `make` on first use (gc-heap). Engine
 /// strings are immutable values; interning per heap keeps one heap's cells out of another's.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn interned_string(
     slot: usize,
     make: impl FnOnce() -> crate::lstr::LStr,
@@ -2760,7 +2710,6 @@ pub(crate) fn interned_string(
 }
 
 /// Report a heap's interned strings, roots for its lifetime.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
@@ -2779,7 +2728,6 @@ pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_tr
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
-#[cfg(feature = "gc-heap")]
 pub(crate) fn alloc_payload_cell(
     desc: fn(&GcState) -> crate::gc_core::DescId,
     size: usize,
@@ -2789,7 +2737,6 @@ pub(crate) fn alloc_payload_cell(
 
 /// Strong edges an object holds itself. Edges kept for it in the interpreter's owner-keyed
 /// side tables are reported by the interpreter once the object is marked.
-#[cfg(feature = "gc-heap")]
 fn trace_object_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     use crate::gc_trace::GcTrace;
     // SAFETY: collections run at safepoints, where no object is mutably borrowed (I9);
@@ -2800,7 +2747,6 @@ fn trace_object_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 }
 
 /// Strong edges of an environment record.
-#[cfg(feature = "gc-heap")]
 fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     use crate::gc_trace::GcTrace;
     // SAFETY: as for objects (I9).
@@ -2811,7 +2757,6 @@ fn trace_scope_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
 }
 
 /// Release the record's Rust-heap payload when its cell dies.
-#[cfg(feature = "gc-heap")]
 fn finalize_scope_cell(cell: *mut u8) {
     if layout_census::enabled() {
         // SAFETY: a dying cell is initialized and borrowed by no one.
@@ -2826,7 +2771,6 @@ fn finalize_scope_cell(cell: *mut u8) {
 }
 
 /// A fresh cell for one environment record in the active heap (see `Env::new`).
-#[cfg(feature = "gc-heap")]
 pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
     with_active_gc_heap(|heap| {
         heap.core
@@ -2839,7 +2783,6 @@ pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
     })
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Object {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Object {
@@ -2906,7 +2849,6 @@ impl crate::gc_trace::GcTrace for Object {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         for property in self.values() {
@@ -2916,7 +2858,6 @@ impl crate::gc_trace::GcTrace for Props {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl Props {
     /// The Symbols of Symbol-valued keys, which the encoded keys only name by id.
     pub(crate) fn trace_symbol_keys(&self, sink: &mut dyn crate::gc_trace::GcSink) {
@@ -2928,7 +2869,6 @@ impl Props {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PropertyKey {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let PropertyKey {
@@ -2942,7 +2882,6 @@ impl crate::gc_trace::GcTrace for PropertyKey {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Property {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.packed.trace_gc_edges(sink);
@@ -2955,7 +2894,6 @@ impl crate::gc_trace::GcTrace for Property {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for NativeCallable {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         struct Retained<'a>(&'a mut dyn crate::gc_trace::GcSink);
@@ -2981,7 +2919,6 @@ impl crate::gc_trace::GcTrace for NativeCallable {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl PackedValue {
     /// Report this word's strong edge: a payload cell (a deferred prototype's included, which
     /// traces its function and its parent or prototype itself) or an object.
@@ -3006,7 +2943,6 @@ impl PackedValue {
 }
 
 /// Run `Object::drop` and release the object's Rust-heap payload when its cell dies.
-#[cfg(feature = "gc-heap")]
 fn finalize_object_cell(cell: *mut u8) {
     if layout_census::enabled() {
         // SAFETY: a dying cell is initialized and borrowed by no one.
@@ -3022,7 +2958,6 @@ fn finalize_object_cell(cell: *mut u8) {
 /// properties objects hold, sampled over the live heap after every collection and over objects
 /// as they die, by family. It sizes inline property slots (Decision 3). S4 adds environment
 /// records: bindings per record and the binding storage beside the cell.
-#[cfg(feature = "gc-heap")]
 pub(crate) mod layout_census {
     use super::{Callable, Exotic, GcHeap, Object};
     use std::cell::RefCell;
@@ -3189,11 +3124,9 @@ pub(crate) mod layout_census {
 
 // S3: the header and its inline named slots fill the 192 B size class (184 B since S4 narrowed
 // the slots' header); growing either past it moves every object into the 256 B class.
-#[cfg(feature = "gc-heap")]
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
-#[cfg(feature = "gc-heap")]
 pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
     heap.core
         .borrow_mut()
@@ -3204,10 +3137,8 @@ pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
 /// Ends an Agent's object heap: declared as the interpreter's LAST field, so it runs after every
 /// other field (anything that might still read an object) has dropped. Finalizes every remaining
 /// object, clears weak handles into the heap and frees its memory.
-#[cfg(feature = "gc-heap")]
 pub(crate) struct HeapRelease(Option<GcHeap>);
 
-#[cfg(feature = "gc-heap")]
 impl HeapRelease {
     /// The heap's owner: the interpreter that collects it and releases it when dropped.
     pub(crate) fn new(heap: &GcHeap) -> Self {
@@ -3224,7 +3155,6 @@ impl HeapRelease {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl Drop for HeapRelease {
     fn drop(&mut self) {
         let Some(heap) = &self.0 else {
@@ -3431,7 +3361,6 @@ pub(crate) fn gc_performance_metrics_finish(
 
 /// The S3 layout census as a JSON field, when it was requested (gc-heap).
 fn layout_census_field() -> String {
-    #[cfg(feature = "gc-heap")]
     if layout_census::enabled() {
         return format!(",\"gc_layout_census\":{}", layout_census::json());
     }
@@ -3495,7 +3424,6 @@ thread_local! {
 
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    #[cfg(feature = "gc-heap")]
     let (core, descs) = new_cell_heap();
     let heap = Rc::new(GcState {
         heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -3507,30 +3435,19 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         array_length_shape: Cell::new(SHAPE_EMPTY),
         live: LiveCount::new(0),
         allocated: Cell::new(0),
-        #[cfg(feature = "gc-heap")]
         core: RefCell::new(core),
-        #[cfg(feature = "gc-heap")]
         object_desc: descs.object,
-        #[cfg(feature = "gc-heap")]
         scope_desc: descs.scope,
-        #[cfg(feature = "gc-heap")]
         bigint_desc: descs.bigint,
-        #[cfg(feature = "gc-heap")]
         symbol_desc: descs.symbol,
-        #[cfg(feature = "gc-heap")]
         string_desc: descs.string,
-        #[cfg(feature = "gc-heap")]
         user_fn_desc: descs.user_fn,
-        #[cfg(feature = "gc-heap")]
         lazy_proto_desc: descs.lazy_proto,
-        #[cfg(feature = "gc-heap")]
         interned_strings: RefCell::default(),
-        #[cfg(feature = "gc-heap")]
         template_roots: RefCell::default(),
     });
     // SAFETY: the word lives in this heap's `GcState`, which the `Rc` keeps at one address for
     // as long as the core, one of its fields, lives; nothing but the core writes it.
-    #[cfg(feature = "gc-heap")]
     unsafe {
         let word = std::ptr::NonNull::from(&heap.live.due);
         heap.core.borrow_mut().attach_due_word(word);
@@ -3548,7 +3465,6 @@ pub(crate) fn active_heap_id() -> u64 {
 }
 
 /// The strings one AST-level template holds (gc-heap).
-#[cfg(feature = "gc-heap")]
 pub(crate) type TemplateStrings = RefCell<Vec<crate::lstr::LStr>>;
 
 /// The roots of one AST-level template (`ast::FunctionMaps`): the strings it holds, cells of
@@ -3557,28 +3473,23 @@ pub(crate) type TemplateStrings = RefCell<Vec<crate::lstr::LStr>>;
 /// share the roots.
 #[derive(Clone)]
 pub(crate) struct TemplateRoots {
-    #[cfg(feature = "gc-heap")]
     strings: Rc<TemplateStrings>,
 }
 
 impl TemplateRoots {
     /// Roots for a template the active heap builds.
     pub(crate) fn new() -> Self {
-        #[cfg(feature = "gc-heap")]
-        {
-            let strings = Rc::new(TemplateStrings::default());
-            with_active_gc_heap(|heap| {
-                heap.template_roots
-                    .borrow_mut()
-                    .push(Rc::downgrade(&strings))
-            });
-            TemplateRoots { strings }
-        }
+        let strings = Rc::new(TemplateStrings::default());
+        with_active_gc_heap(|heap| {
+            heap.template_roots
+                .borrow_mut()
+                .push(Rc::downgrade(&strings))
+        });
+        TemplateRoots { strings }
     }
 
     /// Keep `value`, a string the template holds, for the template's lifetime.
     pub(crate) fn pin(&self, value: &Value) {
-        #[cfg(feature = "gc-heap")]
         if let Value::Str(string) = value {
             self.strings.borrow_mut().push(string.clone());
         }
@@ -3586,17 +3497,15 @@ impl TemplateRoots {
 
     /// Bytes allocated beside the template (memory accounting).
     pub(crate) fn heap_bytes(&self) -> usize {
-        #[cfg(feature = "gc-heap")]
-        return std::mem::size_of::<TemplateStrings>()
+        std::mem::size_of::<TemplateStrings>()
             + 2 * std::mem::size_of::<usize>()
-            + self.strings.borrow().capacity() * std::mem::size_of::<crate::lstr::LStr>();
+            + self.strings.borrow().capacity() * std::mem::size_of::<crate::lstr::LStr>()
     }
 }
 
 impl std::fmt::Debug for TemplateRoots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut roots = f.debug_struct("TemplateRoots");
-        #[cfg(feature = "gc-heap")]
         roots.field("strings", &self.strings.borrow().len());
         roots.finish()
     }
@@ -3692,7 +3601,6 @@ pub(crate) fn active_agent_slow_switches() -> u64 {
     ACTIVE_AGENT_SLOW_SWITCHES.with(Cell::get)
 }
 
-#[cfg(feature = "gc-heap")]
 thread_local! {
     /// Where allocation goes outside any Agent (gc-heap): values made before an Engine exists,
     /// or after its heap was deactivated. Never collected and released only when the thread
@@ -3703,8 +3611,7 @@ thread_local! {
 
 /// The heap allocation uses while no Agent is active.
 fn unowned_gc_heap() -> GcHeap {
-    #[cfg(feature = "gc-heap")]
-    return DEFAULT_GC_HEAP.with(Rc::clone);
+    DEFAULT_GC_HEAP.with(Rc::clone)
 }
 
 pub(crate) fn active_gc_heap() -> GcHeap {
@@ -3763,7 +3670,6 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
 
 #[cfg(all(
     test,
-    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -3826,7 +3732,6 @@ pub(crate) fn bench_registry_cycle(heap: &GcHeap, entry: *const Object) {
     registry.remove(slot);
 }
 
-#[cfg(feature = "gc-heap")]
 pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
     // SAFETY: registry entries are live object cells (removed by `Object::drop`).
     heap.registry
@@ -3849,7 +3754,6 @@ pub(crate) fn gc_finish_generation(heap: &GcHeap) {
 }
 
 /// The environment cells of `heap` not yet swept.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn gc_scope_snapshot(heap: &GcHeap) -> Vec<Env> {
     let cells = heap.core.borrow().live_cells(heap.scope_desc);
     // SAFETY: an allocated cell of the environment descriptor holds an initialized record
@@ -4258,7 +4162,6 @@ impl Property {
     /// naming a new [`LazyProto`], a cell in the active heap (which is `owner`'s).
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
         let lazy = LazyFunctionPrototype::new(owner, parent, template);
-        #[cfg(feature = "gc-heap")]
         let lazy: LazyProto = crate::gc_box::new(lazy);
         self.packed = PackedValue(Cell::new(
             PACK_LAZY_PROTO | unsafe { PackedValue::into_word(lazy) },
@@ -4802,19 +4705,16 @@ pub(crate) fn new_shared_indexed_property_layout(keys: Vec<Rc<str>>) -> Property
 
 /// Named properties kept in the object cell (S3, Decision 3): the measured count that holds
 /// nearly every short-lived plain object in one allocation.
-#[cfg(feature = "gc-heap")]
 pub(crate) const INLINE_NAMED_SLOTS: usize = 4;
 
 /// Named-property values in key-layout order: in the cell up to [`INLINE_NAMED_SLOTS`], beyond
 /// that in one heap buffer (see `crate::inline_vec`), a layout the JIT reads.
-#[cfg(feature = "gc-heap")]
 type Fields = crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS>;
 
 /// Bytes a map with room for `capacity` named values owns outside its object: none while they
 /// fit the inline slots (gc-heap).
 #[cfg(test)]
 pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
-    #[cfg(feature = "gc-heap")]
     if capacity <= INLINE_NAMED_SLOTS {
         return 0;
     }
@@ -4836,7 +4736,6 @@ impl NamedEntries {
     }
     /// The capacity of a separate heap buffer for the values: none while they sit in the cell.
     fn heap_capacity(&self) -> usize {
-        #[cfg(feature = "gc-heap")]
         if !self.fields.spilled() {
             return 0;
         }
@@ -5045,7 +4944,6 @@ const NO_SLOT: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct SlotMemo(SlotMemoWord);
-#[cfg(feature = "gc-heap")]
 type SlotMemoWord = u16;
 
 impl SlotMemo {

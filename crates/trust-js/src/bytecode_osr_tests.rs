@@ -80,7 +80,6 @@ fn osr_preserves_nonempty_operand_prefix_and_rejects_wrong_initial_depth() {
 /// entry registers; when the native code calls `collect()` after the loop, they mark it. The
 /// run returns it intact, and once the run ends nothing keeps it.
 #[cfg(all(
-    feature = "gc-heap",
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]

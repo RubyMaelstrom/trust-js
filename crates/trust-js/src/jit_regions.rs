@@ -2321,7 +2321,6 @@ pub(super) fn emit(
     let emission_start = a.checkpoint();
     // gc-heap: checked effects end in no poll (their virtual operands and private homes are
     // not materialized); the backedge guard bails to the canonical header to collect.
-    #[cfg(feature = "gc-heap")]
     let end_polls = a.set_end_polls(false);
 
     let plain = a.new_label();
@@ -3676,7 +3675,6 @@ pub(super) fn emit(
     a.bind(private_unwind);
     plan.flush_locals(a);
     a.b(unwind);
-    #[cfg(feature = "gc-heap")]
     a.set_end_polls(end_polls);
     Emission {
         plain,
@@ -3757,7 +3755,6 @@ fn emit_effect(
             a.add_imm(20, 20, 8);
         }
         // As in the baseline template: the constant's word is an immediate that owns nothing.
-        #[cfg(feature = "gc-heap")]
         Op::Const(k) if fast & 128 != 0 && chunk.jit_const_is_str(k) => {
             a.mov_imm64(9, chunk.jit_const_str_word(k).unwrap());
             emit_exec_word_store(a, 9, 20, 0);

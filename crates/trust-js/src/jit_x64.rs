@@ -379,7 +379,6 @@ impl Asm {
         self.bytes(&[0x49, 0x89, 0xc5]); // r13 = rax (new sp)
         self.bytes(&[0x48, 0x85, 0xd2]); // test rdx, rdx (throw flag)
         self.jcc(0x85, unwind); // jne
-        #[cfg(feature = "gc-heap")]
         if super::helper_ends_in_poll(helper) {
             self.helper_end_poll(unwind);
         }
@@ -393,7 +392,6 @@ impl Asm {
     /// (`value::LiveCount`), with zero. The word is set exactly while a collection is due (the
     /// byte budget is spent, the stress interval reached or a request deferred), none of which
     /// moves the count.
-    #[cfg(feature = "gc-heap")]
     fn cmp_due_word_rcx(&mut self) {
         const _: () = assert!(crate::value::LIVE_DUE_OFF < 0x80);
         // cmp qword [rcx+LIVE_DUE_OFF],0
@@ -407,7 +405,6 @@ impl Asm {
     /// caller-saved register across a helper call, only the context, operand top, helper table
     /// and slot base in r12-r15. Three instructions while the due word is clear; a set word
     /// calls `H_INTERRUPT` (`POLL_HELPER_END`), whose throw unwinds from here.
-    #[cfg(feature = "gc-heap")]
     fn helper_end_poll(&mut self, unwind: usize) {
         #[cfg(test)]
         if super::TEST_NO_END_POLLS.with(std::cell::Cell::get) {
@@ -434,11 +431,8 @@ impl Asm {
         let slow = self.label();
         self.bytes(&[0x49, 0x8b, 0x44, 0x24, 0x48]); // rax = ctx.interp
         self.load_live_count_address();
-        #[cfg(feature = "gc-heap")]
-        {
-            self.cmp_due_word_rcx();
-            self.jcc(0x85, slow); // jne: a collection is due
-        }
+        self.cmp_due_word_rcx();
+        self.jcc(0x85, slow); // jne: a collection is due
         self.bytes(&[0x48, 0x8b, 0x09]); // rcx = current live object count
         self.bytes(&[0x48, 0x3b, 0x88]); // cmp rcx, [rax+gc_next]
         self.bytes(&gc_next.to_le_bytes());
@@ -1025,7 +1019,6 @@ pub(super) fn compile_entry(
             a.bytes(&[0x49, 0x89, 0xc5]); // r13 = canonical sp
             a.bytes(&[0x48, 0x85, 0xd2]); // flag0 is complete success
             a.jcc(0x85, ordinary); // an unchanged miss
-            #[cfg(feature = "gc-heap")]
             a.helper_end_poll(unwind); // gc-heap: the committed exit ends in the explicit poll
             a.jmp(pcs[plan.end]);
             a.bind(ordinary);
@@ -1041,7 +1034,6 @@ pub(super) fn compile_entry(
             }
             // The constant's word owns nothing and names a cell the chunk's pool roots while
             // this code, which the chunk owns, can run: an immediate (see `jit_const_str_word`).
-            #[cfg(feature = "gc-heap")]
             Op::Const(k) if chunk.jit_const_is_str(*k) => {
                 a.mov_word_imm(chunk.jit_const_str_word(*k)?);
                 a.store_word_r13(0);
@@ -1299,13 +1291,11 @@ pub(super) fn compile_entry(
             Op::Call(..) | Op::CallWithThis(..) => {
                 a.helper_spflag(H_CALL, pc as u32, unwind);
                 // gc-heap: a native callee can allocate after the call's last safepoint.
-                #[cfg(feature = "gc-heap")]
                 a.helper_end_poll(unwind);
             }
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
                 // gc-heap: a native constructor allocates after the call's last safepoint.
-                #[cfg(feature = "gc-heap")]
                 a.helper_end_poll(unwind);
             }
             Op::GetPropThis(_, cache) => {

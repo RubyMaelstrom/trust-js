@@ -12,10 +12,8 @@ use crate::value::Value;
 /// A `Vec<Value>` whose elements are GC roots while it lives.
 pub(crate) struct RootedVec {
     /// Boxed so the registered address stays put when the `RootedVec` moves.
-    #[cfg(feature = "gc-heap")]
     #[allow(clippy::box_collection)]
     values: Box<Vec<Value>>,
-    #[cfg(feature = "gc-heap")]
     slot: registry::Slot,
 }
 
@@ -27,12 +25,9 @@ impl RootedVec {
 
     #[inline]
     pub(crate) fn from_vec(values: Vec<Value>) -> Self {
-        #[cfg(feature = "gc-heap")]
-        {
-            let values = Box::new(values);
-            let slot = registry::register(registry::Entry::Vec(std::ptr::from_ref(&*values)));
-            RootedVec { values, slot }
-        }
+        let values = Box::new(values);
+        let slot = registry::register(registry::Entry::Vec(std::ptr::from_ref(&*values)));
+        RootedVec { values, slot }
     }
 
     /// The values, no longer rooted: the caller roots them again before the next safepoint
@@ -133,7 +128,6 @@ impl FromIterator<Value> for RootedVec {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl Drop for RootedVec {
     #[inline]
     fn drop(&mut self) {
@@ -142,29 +136,23 @@ impl Drop for RootedVec {
 }
 
 /// What [`Rooted`] can hold: everything traceable.
-#[cfg(feature = "gc-heap")]
 pub(crate) use crate::gc_trace::GcTrace as Traceable;
 
 /// A value whose GC edges are roots while it lives: engine state built up in a Rust structure
 /// across safepoints, such as a class evaluation's decorators.
 pub(crate) struct Rooted<T: Traceable + 'static> {
     /// Boxed so the registered address stays put.
-    #[cfg(feature = "gc-heap")]
     value: Box<T>,
-    #[cfg(feature = "gc-heap")]
     slot: registry::Slot,
 }
 
 impl<T: Traceable + 'static> Rooted<T> {
     #[inline]
     pub(crate) fn new(value: T) -> Self {
-        #[cfg(feature = "gc-heap")]
-        {
-            let value = Box::new(value);
-            let traced: &dyn crate::gc_trace::GcTrace = &*value;
-            let slot = registry::register(registry::Entry::Traced(std::ptr::from_ref(traced)));
-            Rooted { value, slot }
-        }
+        let value = Box::new(value);
+        let traced: &dyn crate::gc_trace::GcTrace = &*value;
+        let slot = registry::register(registry::Entry::Traced(std::ptr::from_ref(traced)));
+        Rooted { value, slot }
     }
 }
 
@@ -183,7 +171,6 @@ impl<T: Traceable + 'static> std::ops::DerefMut for Rooted<T> {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl<T: Traceable + 'static> Drop for Rooted<T> {
     #[inline]
     fn drop(&mut self) {
@@ -195,7 +182,6 @@ impl<T: Traceable + 'static> Drop for Rooted<T> {
 /// built-in's groups or worklist): `keep` each value as it enters the structure.
 #[derive(Default)]
 pub(crate) struct ValueRoots {
-    #[cfg(feature = "gc-heap")]
     values: RootedVec,
 }
 
@@ -207,7 +193,6 @@ impl ValueRoots {
 
     #[inline]
     pub(crate) fn keep(&mut self, value: &Value) {
-        #[cfg(feature = "gc-heap")]
         self.values.push(value.clone());
     }
 }
@@ -215,7 +200,6 @@ impl ValueRoots {
 /// Roots a borrowed slice of values while it lives; see [`root_slice`].
 #[must_use]
 pub(crate) struct SliceRoot<'a> {
-    #[cfg(feature = "gc-heap")]
     slot: registry::Slot,
     _values: std::marker::PhantomData<&'a [Value]>,
 }
@@ -225,13 +209,11 @@ pub(crate) struct SliceRoot<'a> {
 #[inline]
 pub(crate) fn root_slice(values: &[Value]) -> SliceRoot<'_> {
     SliceRoot {
-        #[cfg(feature = "gc-heap")]
         slot: registry::register(registry::Entry::Slice(std::ptr::from_ref(values))),
         _values: std::marker::PhantomData,
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl Drop for SliceRoot<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -240,12 +222,10 @@ impl Drop for SliceRoot<'_> {
 }
 
 /// Trace every value rooted on this thread.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn trace_rooted(sink: &mut dyn crate::gc_trace::GcSink) {
     registry::trace(sink);
 }
 
-#[cfg(feature = "gc-heap")]
 mod registry {
     use crate::gc_trace::GcTrace;
     use crate::value::Value;

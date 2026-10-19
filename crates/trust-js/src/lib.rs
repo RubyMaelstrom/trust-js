@@ -22,20 +22,12 @@
 // Under the P1 gc-heap object model handles are `Copy` (S2) and packed words have no drop glue
 // (S5): code written for reference-counted handles still clones, drops or forgets them where
 // such a handle was retained or released.
-#![cfg_attr(
-    feature = "gc-heap",
-    allow(
-        dropping_copy_types,
-        forgetting_copy_types,
-        clippy::clone_on_copy,
-        clippy::drop_non_drop
-    )
+#![allow(
+    dropping_copy_types,
+    forgetting_copy_types,
+    clippy::clone_on_copy,
+    clippy::drop_non_drop
 )]
-
-#[cfg(not(feature = "gc-heap"))]
-compile_error!(
-    "trust-js needs its default `gc-heap` feature: the reference-counted object model has no collector"
-);
 
 /// A process-lifetime diagnostic switch: whether environment variable `$name` is set. The first
 /// read is cached, because a libc environment lookup scans every variable under a lock and the
@@ -101,13 +93,11 @@ mod for_in_cache_tests;
 mod function_realm_identity_tests;
 #[cfg(test)]
 mod function_realm_lifetime_tests;
-#[cfg(feature = "gc-heap")]
 mod gc_box;
-#[cfg(feature = "gc-heap")]
 mod gc_core;
 #[cfg(test)]
 mod gc_test;
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 mod payload_cell_tests;
 mod rooting;
 
@@ -116,10 +106,10 @@ mod rooting;
 /// whatever the embedder calls next, such as an explicit collection.
 #[inline(never)]
 fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
-    #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
     let result = f();
-    #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
     result
 }
@@ -128,7 +118,6 @@ mod gc_native;
 #[cfg(test)]
 mod gc_scan_spike;
 mod gc_sweep;
-#[cfg(feature = "gc-heap")]
 mod gc_trace;
 #[cfg(test)]
 mod group_by_tests;
@@ -137,7 +126,6 @@ mod host_collections;
 mod host_memory;
 #[cfg(test)]
 mod host_string_tests;
-#[cfg(feature = "gc-heap")]
 mod inline_vec;
 #[cfg(test)]
 mod internal_slot_tests;
@@ -1495,7 +1483,7 @@ impl Engine {
         if !self.interp.gc_task_pending || self.interp.gc_task_deferred {
             return 0;
         }
-        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         gc_core::scrub_stack(gc_core::ENTRY_SCRUB_BYTES);
         self.interp.activate_gc_heap();
         self.interp.gc_task_boundary()

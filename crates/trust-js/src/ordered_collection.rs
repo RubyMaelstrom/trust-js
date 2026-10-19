@@ -400,10 +400,8 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
 }
 
 /// A held [[MapData]]/[[SetData]] (see [`Interp::collection`]).
-#[cfg(feature = "gc-heap")]
 pub(crate) type CollectionRef<'a> = std::cell::Ref<'a, OrderedCollection>;
 /// A held, writable [[MapData]]/[[SetData]] (see [`Interp::collection_mut`]).
-#[cfg(feature = "gc-heap")]
 pub(crate) type CollectionMut<'a> = std::cell::RefMut<'a, OrderedCollection>;
 
 impl crate::interpreter::Interp {
@@ -411,52 +409,40 @@ impl crate::interpreter::Interp {
     /// object's cell and is borrowed with the object, so hold it for one step and never across
     /// JavaScript.
     pub(crate) fn collection<'a>(&'a self, object: &'a Gc) -> Option<CollectionRef<'a>> {
-        #[cfg(feature = "gc-heap")]
-        return std::cell::Ref::filter_map(object.borrow(), |object| match &object.exotic {
+        std::cell::Ref::filter_map(object.borrow(), |object| match &object.exotic {
             crate::value::Exotic::Collection(data) => Some(&**data),
             _ => None,
         })
-        .ok();
+        .ok()
     }
 
     /// [`Interp::collection`], writable.
     pub(crate) fn collection_mut<'a>(&'a mut self, object: &'a Gc) -> Option<CollectionMut<'a>> {
-        #[cfg(feature = "gc-heap")]
-        return std::cell::RefMut::filter_map(object.borrow_mut(), |object| {
-            match &mut object.exotic {
-                crate::value::Exotic::Collection(data) => Some(&mut **data),
-                _ => None,
-            }
+        std::cell::RefMut::filter_map(object.borrow_mut(), |object| match &mut object.exotic {
+            crate::value::Exotic::Collection(data) => Some(&mut **data),
+            _ => None,
         })
-        .ok();
+        .ok()
     }
 
     /// Give a new Map or Set `object` its [[MapData]]/[[SetData]].
     pub(crate) fn set_collection(&mut self, object: &Gc, data: OrderedCollection) {
-        #[cfg(feature = "gc-heap")]
-        {
-            object.borrow_mut().exotic = crate::value::Exotic::Collection(Box::new(data));
-        }
+        object.borrow_mut().exotic = crate::value::Exotic::Collection(Box::new(data));
     }
 
     /// Move `from`'s [[MapData]]/[[SetData]], if it has one, to `to` (the subclass instance a
     /// `super()` call made). Whether one moved.
     pub(crate) fn move_collection(&mut self, from: &Gc, to: &Gc) -> bool {
-        #[cfg(feature = "gc-heap")]
-        {
-            let moved = match std::mem::replace(
-                &mut from.borrow_mut().exotic,
-                crate::value::Exotic::None,
-            ) {
+        let moved =
+            match std::mem::replace(&mut from.borrow_mut().exotic, crate::value::Exotic::None) {
                 crate::value::Exotic::Collection(data) => data,
                 other => {
                     from.borrow_mut().exotic = other;
                     return false;
                 }
             };
-            to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
-            true
-        }
+        to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
+        true
     }
 }
 
@@ -476,7 +462,6 @@ impl From<Vec<(Value, Value)>> for OrderedCollection {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for OrderedCollection {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {

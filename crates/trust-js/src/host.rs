@@ -168,10 +168,8 @@ pub trait HostGcVisitor {
 }
 
 /// A host value's [`HostTrace`], recorded when it is stored (gc-heap).
-#[cfg(feature = "gc-heap")]
 type HostTracer = fn(&dyn Any, &mut dyn HostGcVisitor);
 
-#[cfg(feature = "gc-heap")]
 fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisitor) {
     value
         .downcast_ref::<T>()
@@ -321,7 +319,6 @@ pub struct OpState {
     external_reporters: HashMap<TypeId, ExternalReporter>,
     gc_reporters: HashMap<TypeId, GcReporter>,
     /// Every slot's [`HostTrace`] (gc-heap: the host roots of a collection).
-    #[cfg(feature = "gc-heap")]
     tracers: crate::fasthash::FastMap<TypeId, HostTracer>,
     pub resources: ResourceTable,
 }
@@ -331,7 +328,6 @@ impl OpState {
     fn insert<T: Any + HostTrace>(&mut self, value: T) -> TypeId {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
-        #[cfg(feature = "gc-heap")]
         self.tracers.insert(type_id, host_tracer::<T>);
         type_id
     }
@@ -409,7 +405,6 @@ impl OpState {
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
-        #[cfg(feature = "gc-heap")]
         self.tracers.remove(&type_id);
         Some(*value.downcast().ok()?)
     }
@@ -438,15 +433,12 @@ impl OpState {
     /// Report the host's JavaScript values: every slot's and resource's [`HostTrace`], the
     /// host roots.
     pub(crate) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
-        #[cfg(feature = "gc-heap")]
-        {
-            for (key, tracer) in &self.tracers {
-                if let Some(value) = self.map.get(key) {
-                    tracer(value.as_ref(), visitor);
-                }
+        for (key, tracer) in &self.tracers {
+            if let Some(value) = self.map.get(key) {
+                tracer(value.as_ref(), visitor);
             }
-            self.resources.trace_gc(visitor);
         }
+        self.resources.trace_gc(visitor);
     }
 
     pub(crate) fn end_job(&mut self) {
@@ -562,7 +554,6 @@ pub struct ResourceTable {
     managed_reporters: HashMap<ResourceId, ManagedReporter>,
     external_reporters: HashMap<ResourceId, ExternalReporter>,
     /// Every resource's [`HostTrace`] (gc-heap).
-    #[cfg(feature = "gc-heap")]
     tracers: HashMap<ResourceId, HostTracer>,
 }
 
@@ -576,7 +567,6 @@ impl ResourceTable {
             .checked_add(1)
             .expect("ResourceTable id space exhausted; ids are never reused");
         self.map.insert(rid, Rc::new(resource));
-        #[cfg(feature = "gc-heap")]
         self.tracers.insert(rid, host_tracer::<T>);
         rid
     }
@@ -630,7 +620,6 @@ impl ResourceTable {
         rid
     }
     /// Report every open resource's JavaScript values (gc-heap).
-    #[cfg(feature = "gc-heap")]
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         for (rid, tracer) in &self.tracers {
             if let Some(resource) = self.map.get(rid) {
@@ -651,7 +640,6 @@ impl ResourceTable {
         self.retained_reporters.remove(&rid);
         self.managed_reporters.remove(&rid);
         self.external_reporters.remove(&rid);
-        #[cfg(feature = "gc-heap")]
         self.tracers.remove(&rid);
         value
     }
@@ -1025,7 +1013,7 @@ mod resource_id_tests {
 }
 
 /// P1 S2: under gc-heap a host's JavaScript values live exactly as its [`HostTrace`] reports.
-#[cfg(all(test, feature = "gc-heap"))]
+#[cfg(test)]
 mod host_trace_tests {
     use super::*;
     use crate::value::Object;

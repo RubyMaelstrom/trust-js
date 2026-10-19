@@ -81,16 +81,13 @@ struct BigIntData {
 
 /// The owner of a value's digits: a cell in the Agent heap that was active when the value was
 /// made (P1 S2).
-#[cfg(feature = "gc-heap")]
 type Payload = crate::gc_box::GcBox<BigIntData>;
 
 #[inline]
 fn payload(data: BigIntData) -> Payload {
-    #[cfg(feature = "gc-heap")]
     crate::gc_box::new(data)
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_box::Payload for BigIntData {
     fn desc(heap: &crate::value::GcState) -> crate::gc_core::DescId {
         heap.bigint_desc
@@ -98,7 +95,6 @@ impl crate::gc_box::Payload for BigIntData {
 }
 
 /// The descriptor of BigInt cells: no edges; the finalizer frees the digits.
-#[cfg(feature = "gc-heap")]
 pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
     crate::gc_core::LayoutDesc {
         name: "bigint",
@@ -127,7 +123,6 @@ impl BigIntLiteral {
     /// The literal's value.
     #[inline]
     pub fn value(&self) -> JsBigInt {
-        #[cfg(feature = "gc-heap")]
         JsBigInt(payload(BigIntData {
             neg: self.0.neg,
             mag: self.0.mag.clone(),
@@ -312,13 +307,11 @@ fn radix_chunk(radix: u32) -> (u64, usize) {
 
 impl JsBigInt {
     pub(crate) fn allocation_identity(&self) -> usize {
-        #[cfg(feature = "gc-heap")]
         let identity = crate::gc_box::GcBox::as_ptr(&self.0);
         identity as usize
     }
 
     /// The value's cell, as a GC edge.
-    #[cfg(feature = "gc-heap")]
     #[inline]
     pub(crate) fn cell_word(&self) -> u64 {
         crate::gc_box::GcBox::as_ptr(&self.0) as u64

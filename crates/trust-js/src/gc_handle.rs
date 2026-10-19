@@ -6,12 +6,9 @@
 //! [`Gc::downgrade`] — so `gc.as_ptr()` names `RefCell::as_ptr` through the deref. Copying a
 //! handle is free and dropping one releases nothing; the collector reclaims unreachable cells.
 
-#[cfg(feature = "gc-heap")]
 pub(crate) use cell::{clear_dead_weak_cells, WeakRef};
-#[cfg(feature = "gc-heap")]
 pub use cell::{Gc, WeakGc};
 
-#[cfg(feature = "gc-heap")]
 mod cell {
     use crate::value::Object;
     use std::cell::{Cell, RefCell};

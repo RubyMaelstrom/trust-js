@@ -328,7 +328,6 @@ fn deferred_prototype_region_method_reads_are_not_borrowed() {
 }
 
 /// The deferred-prototype cells `engine`'s heap holds (gc-heap).
-#[cfg(feature = "gc-heap")]
 fn lazy_cells(engine: &Engine) -> usize {
     let heap = &engine.interp.gc_heap;
     heap.core.borrow().live_count(heap.lazy_proto_desc)
@@ -339,7 +338,6 @@ fn lazy_cells(engine: &Engine) -> usize {
 /// set-property helper call (so no checked store, and no drop helper, which gc-heap code never
 /// calls), no old prototype is materialized (the probe), the new value reads back, and the old
 /// cells are gone after the next collection.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
     let source = format!(
@@ -391,7 +389,6 @@ fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
 /// every store completes natively (the native Reference-store counter) and overwrites the lazy
 /// word with no drop helper (which gc-heap code never calls), no old prototype is materialized
 /// (the probe), the new value reads back, and the old cells are gone after the next collection.
-#[cfg(feature = "gc-heap")]
 #[test]
 fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
     let source = format!(
@@ -511,9 +508,7 @@ fn bigints_take_the_baseline_fast_paths_with_their_values() {
                 ],
             );
             // The retained store of a BigInt and the store over one.
-            if cfg!(feature = "gc-heap") {
-                assert_eq!((helpers[2], helpers[3]), (0, 0));
-            }
+            assert_eq!((helpers[2], helpers[3]), (0, 0));
         }
     }
 }
@@ -599,10 +594,8 @@ fn bigints_take_the_region_fast_paths_with_their_values() {
         );
         if tier == Tier::Jit {
             assert_native(&mut engine, &["ownRead", "homeRead", "lastNode"]);
-            if cfg!(feature = "gc-heap") {
-                assert_eq!(borrowed, 20, "a BigInt property is borrowed in the region");
-                assert!(fused > 0, "the fused pair admits BigInt elements");
-            }
+            assert_eq!(borrowed, 20, "a BigInt property is borrowed in the region");
+            assert!(fused > 0, "the fused pair admits BigInt elements");
         }
     }
 }

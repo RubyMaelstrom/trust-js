@@ -371,7 +371,6 @@ where
     }
 
     /// The cached values, in no particular order.
-    #[cfg(feature = "gc-heap")]
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.values().map(|entry| &entry.value)
     }

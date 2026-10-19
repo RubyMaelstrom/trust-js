@@ -75,7 +75,6 @@ impl<T> WeakCell for std::rc::Weak<T> {
 }
 
 /// A Symbol cell (gc-heap).
-#[cfg(feature = "gc-heap")]
 impl WeakCell for crate::value::WeakSymbol {
     fn live_address(&self) -> Option<usize> {
         self.upgrade()
@@ -118,7 +117,6 @@ impl<T: WeakCell> WeakCell for &T {
 #[inline(never)]
 pub(crate) fn alive(weak: &impl WeakCell) -> bool {
     let alive = weak.live_address().is_some();
-    #[cfg(feature = "gc-heap")]
     if alive && std::env::var_os("TRUST_JS_GC_WHY").is_some() {
         eprintln!("[gc-why] alive:\n{}", why(weak));
     }
@@ -127,7 +125,6 @@ pub(crate) fn alive(weak: &impl WeakCell) -> bool {
 
 /// The retention path of `weak`'s referent in the last collection of its heap (run with
 /// `TRUST_JS_GC_WHY=1`).
-#[cfg(feature = "gc-heap")]
 #[inline(never)]
 pub(crate) fn why(weak: &impl WeakCell) -> String {
     let Some(address) = weak.live_address() else {
@@ -140,7 +137,6 @@ pub(crate) fn why(weak: &impl WeakCell) -> String {
 }
 
 /// The retention path of the cell at `address` in `heap`'s last collection.
-#[cfg(feature = "gc-heap")]
 #[inline(never)]
 pub(crate) fn why_address(heap: &crate::value::GcHeap, address: usize) -> String {
     let core = heap.core.borrow();
@@ -162,7 +158,7 @@ pub(crate) fn why_address(heap: &crate::value::GcHeap, address: usize) -> String
 
 /// `TRUST_JS_SEGV_BACKTRACE=1`: print a backtrace when a test crashes on a fault (debugging
 /// use-after-free under GC stress). Not async-signal-safe; good enough to locate a crash.
-#[cfg(all(feature = "gc-heap", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn install_crash_backtrace() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -192,7 +188,7 @@ pub(crate) fn install_crash_backtrace() {
 /// new thread, and glibc gives a new thread a cached stack with its old contents: slots a test
 /// function has not written yet then hold addresses an earlier test's frames left there, and a
 /// heap whose pages land at that test's addresses takes them for roots.
-#[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn scrub_stack_at_thread_exit() {
     struct Scrub;
     impl Drop for Scrub {
@@ -247,8 +243,7 @@ impl HiddenAddress {
 /// collections or cleanup jobs happen skip their checks then: stress collects at every
 /// safepoint by design.
 pub(crate) fn stress_active() -> bool {
-    #[cfg(feature = "gc-heap")]
-    return crate::interpreter::gc_collect::gc_stress() != 0;
+    crate::interpreter::gc_collect::gc_stress() != 0
 }
 
 /// The JavaScript values a test's native closure captures, reported for it

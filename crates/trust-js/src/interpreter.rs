@@ -1347,7 +1347,6 @@ fn trace_legacy_reflection(key: &str, frame: Option<&FnFrame>) {
 #[derive(Default)]
 pub(crate) struct FramePool {
     pub(crate) pool: Vec<std::ptr::NonNull<crate::jit::JitFrame>>,
-    #[cfg(feature = "gc-heap")]
     records: crate::fasthash::FastSet<std::ptr::NonNull<crate::jit::JitFrame>>,
 }
 
@@ -1365,7 +1364,6 @@ impl std::ops::DerefMut for FramePool {
 impl Drop for FramePool {
     fn drop(&mut self) {
         for p in self.pool.drain(..) {
-            #[cfg(feature = "gc-heap")]
             self.records.remove(&p);
             // SAFETY: pooled records come from `JitFrame::alloc` and are not executing.
             drop(unsafe { Box::from_raw(p.as_ptr()) });
@@ -1373,7 +1371,6 @@ impl Drop for FramePool {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl FramePool {
     /// Note a record [`crate::jit::JitFrame::alloc`] just created for this interpreter.
     pub(crate) fn register(&mut self, record: std::ptr::NonNull<crate::jit::JitFrame>) {
@@ -1418,7 +1415,6 @@ impl FramePool {
 /// Every active record: its context's values precisely and its words conservatively (see
 /// `GcTrace for JitFrame`). Pooled records own nothing and are not traced, so the stale words a
 /// finished activation leaves in its record retain nothing.
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for FramePool {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         for record in self.active_records() {
@@ -1571,12 +1567,10 @@ impl BindingLayout {
 /// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
 /// record with one binding (most block and many function records) allocates nothing beside it;
 /// more move the entries to one heap buffer.
-#[cfg(feature = "gc-heap")]
 pub(crate) type BindingEntries = crate::inline_vec::InlineVec<(Rc<str>, Binding), 1>;
 
 /// The bytes of `entries`' storage beside the environment cell.
 fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
-    #[cfg(feature = "gc-heap")]
     let capacity = entries.heap_capacity();
     capacity.saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>())
 }
@@ -2042,7 +2036,6 @@ impl VarMap {
     }
 
     /// The entries are an `InlineVec`, probed in place and spilled.
-    #[cfg(feature = "gc-heap")]
     fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
         BindingEntries::probe_jit_layout(|| {
             (
@@ -2390,7 +2383,6 @@ pub struct Scope {
 
 /// P1 S4: an environment cell, with its first binding in place, fills the heap's 128-byte size
 /// class.
-#[cfg(feature = "gc-heap")]
 const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
@@ -3644,7 +3636,6 @@ pub struct Interp {
         HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
     /// P1 S2: frees this Agent's object cells. Keep it the LAST field: fields drop in
     /// declaration order, and every earlier one may still read objects as it drops.
-    #[cfg(feature = "gc-heap")]
     #[allow(dead_code)] // held for its Drop
     heap_release: crate::value::HeapRelease,
 }
@@ -3837,7 +3828,6 @@ interp_memory_inventory! {
     pending_finalization_cleanup => "measured",
     async_gen_busy => "measured",
     async_gen_queue => "measured",
-    #[cfg(feature = "gc-heap")]
     heap_release => "non_owning",
 }
 
@@ -3948,7 +3938,6 @@ impl Drop for Interp {
         // Do not let a driver thread retain this Agent's heap and its object registry after its
         // interpreter dies. Objects already carry their own owner through the ensuing field drops.
         // A ShadowRealm sharing its parent's heap and symbols has the parent's Agent identity.
-        #[cfg(feature = "gc-heap")]
         if !self.gc_heap_root() {
             return;
         }
@@ -4069,7 +4058,6 @@ pub struct PromiseState {
 /// The pointer-keyed `Interp` tables whose values are strong internal-slot edges of their key
 /// object, traced once that object is marked (`Interp::trace_owner_slots`). Expands
 /// `$callback!(table, ...)`. A Map's or Set's [[MapData]]/[[SetData]] is in its cell.
-#[cfg(feature = "gc-heap")]
 macro_rules! gc_side_slot_tables {
     ($callback:ident) => {
         $callback!(
@@ -4088,7 +4076,6 @@ macro_rules! gc_side_slot_tables {
     };
 }
 
-#[cfg(feature = "gc-heap")]
 #[path = "gc_collect.rs"]
 pub(crate) mod gc_collect;
 
@@ -4287,8 +4274,7 @@ pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn grow_stack<R>(stack_size: usize, f: impl FnOnce() -> R) -> R {
-    #[cfg(feature = "gc-heap")]
-    return crate::gc_core::grow(stack_size, f);
+    crate::gc_core::grow(stack_size, f)
 }
 
 #[inline]
@@ -5285,7 +5271,6 @@ impl Interp {
     /// — one heap per Agent, so no edge between the two realms' objects ever crosses heaps (I6)
     /// — and the root of the ShadowRealm tree collects for all of it.
     pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> Interp {
-        #[cfg(feature = "gc-heap")]
         let mut realm =
             Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
         realm.shadow_home = Some(ShadowHome {
@@ -5328,9 +5313,8 @@ impl Interp {
         owns_heap: bool,
     ) -> Interp {
         // Decision 0: every engine frame on this thread lies below the scanned stack top.
-        #[cfg(feature = "gc-heap")]
         crate::gc_core::register_thread_native_stack();
-        #[cfg(all(test, feature = "gc-heap", target_os = "linux"))]
+        #[cfg(all(test, target_os = "linux"))]
         crate::gc_test::install_crash_backtrace();
         crate::value::activate_agent(&gc_heap, &symbol_agent);
         let object_proto = Object::new(None);
@@ -5526,7 +5510,6 @@ impl Interp {
             pending_finalization_cleanup: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
-            #[cfg(feature = "gc-heap")]
             heap_release: if owns_heap {
                 crate::value::HeapRelease::new(&gc_heap)
             } else {
@@ -6072,7 +6055,6 @@ impl Interp {
                     crate::value::Exotic::Array => ElementReceiverKind::Array,
                     crate::value::Exotic::StrWrap(_) => ElementReceiverKind::String,
                     crate::value::Exotic::None => ElementReceiverKind::Ordinary,
-                    #[cfg(feature = "gc-heap")]
                     crate::value::Exotic::Collection(_) => ElementReceiverKind::Ordinary,
                     _ => ElementReceiverKind::Exotic,
                 }
@@ -6487,7 +6469,7 @@ impl Interp {
     /// built (see `gc_collect`).
     #[inline(always)]
     pub fn collect_garbage_for_host(&mut self) -> i64 {
-        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
@@ -6505,7 +6487,7 @@ impl Interp {
     pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
@@ -7832,7 +7814,6 @@ impl Interp {
         let named = name.filter(|_| func.name.is_none());
         // gc-heap: the templates' name strings are cells of the heap that built them, which
         // another engine's heap (or a later engine on this thread) must not reference.
-        #[cfg(feature = "gc-heap")]
         let foreign = maps.heap != crate::value::active_heap_id();
         let fn_map = match named {
             _ if foreign => {
@@ -11234,7 +11215,6 @@ impl Interp {
     #[inline]
     pub(crate) fn gc_check_amortized(&mut self) -> Result<(), Abrupt> {
         self.gc_tick = self.gc_tick.wrapping_add(1);
-        #[cfg(feature = "gc-heap")]
         if gc_collect::gc_stress() != 0 {
             return self.gc_check();
         }
@@ -11247,7 +11227,6 @@ impl Interp {
 
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         // gc-heap: the due word JIT polls read is the core's `collection_due` (debug builds).
-        #[cfg(feature = "gc-heap")]
         crate::value::debug_assert_due_word(&self.gc_heap);
         if self.gc_suppressed != 0 {
             return Ok(());
@@ -11257,7 +11236,6 @@ impl Interp {
         // the cell heap's byte budget also collect here, and must not throw again inside the
         // handler the re-armed threshold below leaves room for.
         let threshold_due = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
-        #[cfg(feature = "gc-heap")]
         if !threshold_due && !self.gc_heap_due() {
             return Ok(());
         }
@@ -11652,8 +11630,7 @@ impl Interp {
             borrowed_parameters: _,
             module_source_objs: _,
             pending_finalization_cleanup: _,
-            #[cfg(feature = "gc-heap")]
-                heap_release: _,
+            heap_release: _,
         } = self;
         crate::gc_sweep::map(class_info, dead);
         crate::gc_sweep::set(eval_realm_fns, dead);
@@ -11745,7 +11722,6 @@ impl Interp {
     /// finished callee had used, which the scan took for a root.
     #[inline(always)]
     pub(crate) fn gc_collect(&mut self) {
-        #[cfg(feature = "gc-heap")]
         self.gc_heap_collect_explicit();
     }
 
@@ -11791,7 +11767,6 @@ impl Interp {
 
     pub(crate) fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
         self.buffer_gc.since_gc = 0;
-        #[cfg(feature = "gc-heap")]
         if matches!(cause, crate::value::GcCause::Explicit) {
             self.gc_heap_collect_explicit();
         } else {
@@ -12799,7 +12774,6 @@ impl Interp {
     /// body never reads `this` (`uses_this`), the word itself for a strict callee, and for a
     /// sloppy one the global object for undefined or null, an object word unchanged, and a
     /// primitive boxed. Boxing is the one case that widens the word.
-    #[cfg(feature = "gc-heap")]
     fn bind_this_word(&mut self, this: PackedValue, uses_this: bool, strict: bool) -> PackedValue {
         if !uses_this {
             PackedValue::pack(Value::Undefined)
@@ -13389,7 +13363,6 @@ impl Interp {
         // belongs to whichever closure instance filled the entry).
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(env_ptr) });
         let chunk = unsafe { &*ic.chunk };
-        #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved_env(
@@ -13579,7 +13552,6 @@ impl Interp {
         let chunk = unsafe { &*ic.chunk };
         // OrdinaryCallBindThis on the moved `this` word, over `ic.strict` and the fill-time
         // `uses_this`: `bind_this_word` binds it on its tag.
-        #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved(
@@ -14292,7 +14264,6 @@ impl Interp {
             Value::Undefined
         };
         // gc-heap: the moved entries take `this` packed.
-        #[cfg(feature = "gc-heap")]
         let tv = PackedValue::pack(tv);
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder
@@ -14651,7 +14622,6 @@ impl Interp {
             construct: false,
             extra: None,
         });
-        #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(
             unsafe { this_slot.read() },
             chunk.needs_frame_this(),

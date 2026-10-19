@@ -128,7 +128,6 @@ impl Drop for Scope<'_> {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Registry {
     /// Aliased homes' environments; the aliased slots belong to registered VM frames.
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {

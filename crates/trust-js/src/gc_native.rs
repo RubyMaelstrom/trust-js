@@ -75,7 +75,6 @@ impl NativeGcGraph {
 
     pub(crate) fn native_to_js(&mut self, from: NativeGcId, value: &Value) {
         // Every cell a value holds is an edge, primitive payload cells included.
-        #[cfg(feature = "gc-heap")]
         let target = value.cell_word().map(|word| word as usize);
         if let Some(target) = target {
             let from = self.index(from);

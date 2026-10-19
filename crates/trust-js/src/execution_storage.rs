@@ -109,7 +109,6 @@ impl<S: StoredValue> Default for ValueStack<S> {
 impl<S: StoredValue> ValueStack<S> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         let mut stack = Self(Vec::with_capacity(capacity));
-        #[cfg(feature = "gc-heap")]
         stack.zero_spare_capacity();
         stack
     }
@@ -119,28 +118,23 @@ impl<S: StoredValue> ValueStack<S> {
     }
     #[inline]
     pub(crate) fn push_stored(&mut self, value: S) {
-        #[cfg(feature = "gc-heap")]
-        {
-            let len = self.0.len();
-            if len == self.0.capacity() {
-                self.grow(1);
-            }
-            // SAFETY: the capacity exceeds the length; the slot past it becomes the top.
-            unsafe {
-                self.0.as_mut_ptr().add(len).write(value);
-                self.0.set_len(len + 1);
-            }
+        let len = self.0.len();
+        if len == self.0.capacity() {
+            self.grow(1);
+        }
+        // SAFETY: the capacity exceeds the length; the slot past it becomes the top.
+        unsafe {
+            self.0.as_mut_ptr().add(len).write(value);
+            self.0.set_len(len + 1);
         }
     }
     /// gc-heap: grow by at least `additional` and zero-fill the new spare capacity.
-    #[cfg(feature = "gc-heap")]
     #[cold]
     #[inline(never)]
     fn grow(&mut self, additional: usize) {
         self.0.reserve(additional);
         self.zero_spare_capacity();
     }
-    #[cfg(feature = "gc-heap")]
     fn zero_spare_capacity(&mut self) {
         let spare = self.0.spare_capacity_mut();
         // SAFETY: the spare capacity is this Vec's memory past its length; zero bytes are a
@@ -193,7 +187,6 @@ impl<S: StoredValue> ValueStack<S> {
     }
     #[inline]
     pub(crate) fn reserve(&mut self, additional: usize) {
-        #[cfg(feature = "gc-heap")]
         if self.0.capacity() - self.0.len() < additional {
             self.grow(additional);
         }
@@ -330,16 +323,13 @@ mod tests {
         let object = interp.new_object();
         let mut stack = ValueStack::<PackedValue>::default();
         stack.push(Value::Obj(object.clone()));
-        #[cfg(feature = "gc-heap")]
         let word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&object) as u64;
-        #[cfg(feature = "gc-heap")]
         assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.with_tail(0, |args| {
             assert!(
                 matches!(&args[0], Value::Obj(actual) if crate::value::Gc::ptr_eq(actual, &object))
             );
         });
-        #[cfg(feature = "gc-heap")]
         assert_eq!(stack.last_stored().unwrap().bits(), word);
         stack.push(Value::Num(-0.0));
         assert!(
@@ -437,7 +427,6 @@ mod tests {
     #[test]
     fn compact_storage_owner_moves_and_duplicates_do_not_cross_value_boundary() {
         let object = crate::value::Object::new(None);
-        #[cfg(feature = "gc-heap")]
         let weak = crate::value::Gc::downgrade(&object);
         let slots = [
             PackedValue::pack(Value::Obj(object)),
@@ -454,7 +443,6 @@ mod tests {
         drop(stack.pop_stored());
         slots[0].replace_stored(PackedValue::pack(Value::Undefined));
         drop(slots);
-        #[cfg(feature = "gc-heap")]
         assert!(crate::gc_test::alive(&weak), "a word released its object");
     }
 
@@ -465,17 +453,14 @@ mod tests {
     #[test]
     fn compact_storage_shared_alias_observes_replacement_and_exact_owner_release() {
         let first = crate::value::Object::new(None);
-        #[cfg(feature = "gc-heap")]
         let first_weak = crate::value::Gc::downgrade(&first);
         let second = crate::value::Object::new(None);
         let second_weak = crate::value::Gc::downgrade(&second);
-        #[cfg(feature = "gc-heap")]
         let second_word = crate::value::PACK_OBJ | crate::value::Gc::as_ptr(&second) as u64;
         let slots = [PackedValue::pack(Value::Obj(first))];
         let shared = &slots[..];
         let alias = &shared[0];
         shared.write_value(0, Value::Obj(second));
-        #[cfg(feature = "gc-heap")]
         assert_eq!(alias.bits(), second_word);
         let seen = alias.unpack();
         assert!(crate::value::Gc::ptr_eq(
@@ -485,7 +470,6 @@ mod tests {
         alias.replace_value(Value::Empty);
         assert!(shared[0].is_empty());
         drop(seen);
-        #[cfg(feature = "gc-heap")]
         assert!(
             crate::gc_test::alive(&first_weak) && crate::gc_test::alive(&second_weak),
             "a replacement released its object"
@@ -537,7 +521,6 @@ mod tests {
                 matches!(result.borrow().props.get("negativeZero").unwrap().value(),
                 Value::Num(number) if number.to_bits() == (-0.0f64).to_bits())
             );
-            #[cfg(feature = "gc-heap")]
             assert!(
                 matches!(result.borrow().props.get("held").unwrap().value(),
                 Value::Obj(actual) if crate::value::Gc::ptr_eq(&actual, &object)),

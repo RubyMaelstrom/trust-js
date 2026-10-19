@@ -4429,3 +4429,51 @@ tree at ef2ffe1c:
 - Stays, for later steps: the PropertyLayout count emitters and the
   count-motivated guards (step 12), the host API's nursery-shaped
   items (steps 10 and 11).
+
+Step 8a, the gc-heap feature gone, its cfgs unwrapped (an
+implementation agent's change, reviewed):
+- The feature: trust-js's default list is ["intl"] and its
+  gc-heap = [] is gone with its comment; host, fs, timers, web,
+  node, runtime and difftest lost the [features] tables that only
+  forwarded it. The intl comment gives the small build as
+  --no-default-features; --features gc-heap is now a cargo error.
+- The engine: 324 #[cfg(feature = "gc-heap")] attributes and 9 cfg!
+  folds gone; 34 compound conditions lost their feature term (the
+  survey's 31 and step 7b's three x86-64 test gates); the crate's
+  cfg_attr is a plain #![allow] of the same four lints. The
+  compile_error is gone, and POLL_ENTRY is 1.
+- Unwrapped, 14 gated tail returns became tail expressions, and 19
+  gated blocks and 7 `if cfg!` bodies were flattened: each binds
+  nothing or ends its function or closure, so no drop order, borrow
+  or root guard changed. Comments naming the flag or the counted
+  build stay for step 8b (278 lines in 74 files), except POLL_ENTRY's
+  doc, which spoke of the deleted arm.
+- The check (the plan's method): the no-LTO release engine's .text,
+  built with the parent's feature list, is byte-identical to step
+  7b's on aarch64 (5,230,488 bytes) and x86-64 (5,300,576 bytes).
+- Found, not changed: move_collection's non-Collection arm borrows
+  `from` mutably while the match's scrutinee still holds its first
+  mutable borrow, a panic if reached. Its only caller is the native
+  arm of eval.rs's run_constructor_on, when a native's construct
+  result is not `this`. Nothing tried reached it: subclasses of 18
+  built-ins at --tier=interp, and at every tier subclasses of bound
+  Error, Array, Map, Promise and 8 other natives, and
+  Reflect.construct of a bound Error. Open (binding the replaced
+  value before the match fixes it).
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2230/0/8, its test list step 7b's; clippy clean in
+    the five configurations (the small build now plain
+    --no-default-features); rustfmt clean; the workspace builds with
+    all targets without a diagnostic; --features gc-heap is refused.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0 (masked md5 65b1faf9, 05a89273, 9cad1fec);
+    difftest 138 agree, 12 skipped, no crash.
+  - Code dumps: all three fixtures' identical to step 7b's, plain and
+    with the shared stubs in both modes (vue's and react's are step
+    0's).
+  - x86-64 (zombie): clippy clean; lib 2074/0/8. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2067 pass, 3 fail
+    (step 1's snapshot codec tests) and 8 are ignored. Both test
+    lists step 7b's.

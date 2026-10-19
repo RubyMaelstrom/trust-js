@@ -1044,7 +1044,6 @@ fn function_frame(
 
 // P1 S2 (gc-heap): frame names are engine strings, so frames are traced wherever they are held.
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for Frame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Frame {
@@ -1059,7 +1058,6 @@ impl crate::gc_trace::GcTrace for Frame {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for StackTrace {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let StackTrace { frames, lines: _ } = self;
@@ -1067,7 +1065,6 @@ impl crate::gc_trace::GcTrace for StackTrace {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for CodeFrame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let CodeFrame {
@@ -1082,7 +1079,6 @@ impl crate::gc_trace::GcTrace for CodeFrame {
     }
 }
 
-#[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for ResumedFrame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let ResumedFrame {
@@ -1105,7 +1101,6 @@ mod tests {
         let mut engine = crate::Engine::new();
         // gc-heap: the callee lives until the collection below finds it unreachable; no handle
         // in this frame may retain it (the stack is scanned).
-        #[cfg(feature = "gc-heap")]
         let pin =
             crate::gc_test::in_frame(|| crate::value::Gc::downgrade(&engine.interp.new_object()));
         let (mut sites, positions) = InlineSites::register(vec![
@@ -1134,7 +1129,6 @@ mod tests {
         let inner = inline_site(positions[1]).expect("the clone owns both registered identities");
         assert_eq!(inner.outer, positions[0]);
         assert_eq!(inline_site(inner.outer).unwrap().outer, 37);
-        #[cfg(feature = "gc-heap")]
         engine.interp.gc_collect();
         assert!(
             !crate::gc_test::alive(&pin),

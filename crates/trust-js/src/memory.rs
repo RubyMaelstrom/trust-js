@@ -1045,7 +1045,6 @@ impl Visitor {
                     self.value(&Value::Str(string.clone()));
                 }
             }
-            #[cfg(feature = "gc-heap")]
             Exotic::Collection(entries) => {
                 internal_bytes += std::mem::size_of_val(&**entries)
                     .saturating_add(entries.storage_bytes_lower_bound());
@@ -1357,7 +1356,6 @@ fn scan_realm(
                     .saturating_mul(size_of::<crate::interpreter::WeakEnv>()),
             ),
     );
-    #[cfg(feature = "gc-heap")]
     totals.engine_caches.add(interp.frame_pool.registry_bytes());
     for (slots, stack) in &interp.vm_pool {
         totals.engine_caches.add(

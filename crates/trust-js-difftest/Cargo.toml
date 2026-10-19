@@ -11,9 +11,5 @@ publish = false
 [dependencies]
 trust-js = { path = "../trust-js" }
 
-[features]
-# The P1 GC heap (see trust-js); its jit tier runs only where the JIT is admitted.
-gc-heap = ["trust-js/gc-heap"]
-
 [lints]
 workspace = true

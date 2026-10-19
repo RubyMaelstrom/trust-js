@@ -118,7 +118,7 @@ fn constants(chunk: &Chunk) -> Vec<LStr> {
 /// Whether the native code of `name`'s first-stage chunk holds the word of its `index`th string
 /// constant as an immediate: x64's string-constant template moves it into rax with `movabs`
 /// (`48 b8` and the word's eight bytes).
-#[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+#[cfg(target_arch = "x86_64")]
 fn holds_immediate(engine: &mut Engine, name: &str, index: usize) -> bool {
     with_chunk(engine, name, false, |chunk| {
         let k = chunk
@@ -171,23 +171,20 @@ fn returned(
                 LStr::ptr_eq(string, constant),
                 "{tier:?} {call} returns {name}'s constant itself"
             );
-            #[cfg(feature = "gc-heap")]
-            {
-                let k = chunk
-                    .jit_ops()
-                    .iter()
-                    .filter_map(|op| match *op {
-                        Op::Const(k) if chunk.jit_const_is_str(k) => Some(k),
-                        _ => None,
-                    })
-                    .nth(index)
-                    .expect("the constant's index");
-                assert_eq!(
-                    chunk.jit_const_str_word(k),
-                    Some(crate::value::PackedValue::pack(value.clone()).bits()),
-                    "the immediate is the word the VM pushes"
-                );
-            }
+            let k = chunk
+                .jit_ops()
+                .iter()
+                .filter_map(|op| match *op {
+                    Op::Const(k) if chunk.jit_const_is_str(k) => Some(k),
+                    _ => None,
+                })
+                .nth(index)
+                .expect("the constant's index");
+            assert_eq!(
+                chunk.jit_const_str_word(k),
+                Some(crate::value::PackedValue::pack(value.clone()).bits()),
+                "the immediate is the word the VM pushes"
+            );
         });
     }
     !(string.as_ptr() as usize)
@@ -250,7 +247,7 @@ fn string_constants_keep_identity_and_equality_across_collections() {
                 "inLoop's loop runs as a register region"
             );
         }
-        #[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+        #[cfg(target_arch = "x86_64")]
         if tier == Tier::Jit {
             for name in ["literal", "inLoop"] {
                 assert!(
@@ -301,7 +298,7 @@ fn appends_leave_string_constants_intact() {
         let names = ["literal", "grow", "growCaptured", "round"];
         if tier == Tier::Jit {
             assert_native(&mut engine, &names);
-            #[cfg(all(target_arch = "x86_64", feature = "gc-heap"))]
+            #[cfg(target_arch = "x86_64")]
             for name in ["literal", "grow", "growCaptured"] {
                 assert!(
                     holds_immediate(&mut engine, name, 0),

@@ -20,7 +20,6 @@ pub(super) struct LazyFunctionPrototype {
     /// and its cell form a cycle that dies in one collection, and a stale stack word that
     /// conservatively keeps the cell keeps the function too. A weak handle would allocate a
     /// weak cell per constructor and keep a dead constructor's cell reserved for a collection.
-    #[cfg(feature = "gc-heap")]
     owner: Gc,
     state: RefCell<State>,
     // Reuse the creation Agent's exact key layout/shape, not whichever Agent first reads it.
@@ -44,7 +43,6 @@ impl LazyFunctionPrototype {
             "lazy prototype template with a non-writable or accessor field"
         );
         Self {
-            #[cfg(feature = "gc-heap")]
             owner: *owner,
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
@@ -69,7 +67,6 @@ impl LazyFunctionPrototype {
         if self.constructor {
             // A descriptor clone materializes before it can outlive the function. All other
             // value reads retain their receiver, including reads while its RefCell is borrowed.
-            #[cfg(feature = "gc-heap")]
             let owner = self.owner;
             props
                 .entries
@@ -100,7 +97,6 @@ impl LazyFunctionPrototype {
 
 /// The trace of a deferred-prototype cell (gc-heap): its function and the prototype's parent,
 /// or once materialized the prototype. Its finalizer (`gc_box::finalize`) drops the key layout.
-#[cfg(feature = "gc-heap")]
 pub(super) fn trace_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: deferred-prototype cells are initialized by `gc_box::new` before any collection.
     let lazy = unsafe { &*cell.cast::<LazyFunctionPrototype>() };
@@ -289,7 +285,6 @@ mod tests {
     /// P1 S4 (gc-heap): a dead constructor's cell is freed by the collection that finds it
     /// dead. Its deferred prototype holds no weak handle that would keep the cell reserved (a
     /// zombie) until the next collection.
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn dead_constructors_leave_no_reserved_cells() {
         let mut engine = Engine::new();
@@ -309,7 +304,6 @@ mod tests {
     }
 
     /// The deferred-prototype cells `engine`'s heap holds (gc-heap).
-    #[cfg(feature = "gc-heap")]
     fn lazy_cells(engine: &Engine) -> usize {
         let heap = &engine.interp.gc_heap;
         heap.core.borrow().live_count(heap.lazy_proto_desc)
@@ -317,7 +311,6 @@ mod tests {
 
     /// The tag of the global function `name`'s `prototype` word, read in a helper frame: the
     /// conservative stack scan (gc-heap) would keep a handle left in the caller's frame.
-    #[cfg(feature = "gc-heap")]
     fn prototype_tag(engine: &mut Engine, name: &str) -> u64 {
         crate::gc_test::in_frame(|| {
             object(engine, name)
@@ -337,7 +330,6 @@ mod tests {
     /// it is marked through the function's property word, not by a stack word. Once the
     /// functions are unreachable, the collection that frees them frees their cells: both
     /// counts return to their baselines (give or take a stale stack or pooled-frame word).
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn deferred_prototype_cells_live_and_die_with_their_functions() {
         const N: usize = 256;
@@ -400,7 +392,6 @@ mod tests {
     /// two edges, in order: the function, then the prototype's parent while it is deferred;
     /// the function, then the prototype once it is materialized (the promoted word no longer
     /// names the cell, which stays allocated until a collection).
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn deferred_prototype_cell_traces_its_function_and_state_edge() {
         let mut engine = Engine::new();
@@ -449,7 +440,6 @@ mod tests {
     /// and after more collections every read returns that object, whose `constructor` is its
     /// function (a generator's prototype has none) and whose prototype is the creation realm's
     /// intrinsic.
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn deferred_prototypes_materialize_after_collections_in_their_creation_realm() {
         let mut engine = Engine::new();
@@ -504,7 +494,6 @@ mod tests {
     /// first snapshot the current descriptor with `Property::clone`, which materializes the old
     /// prototype (both builds, as before the cell): one materialization per function, and the
     /// materialized object is garbage once the store completes.
-    #[cfg(feature = "gc-heap")]
     #[test]
     fn rust_overwrites_of_deferred_prototypes_free_their_cells() {
         const N: usize = 16;
@@ -662,7 +651,7 @@ mod tests {
     /// P1 S5 (gc-heap, debug builds): copying a deferred prototype's word with `Clone`, a bit
     /// copy under gc-heap, instead of `PackedValue::clone_materialized` trips a debug assertion
     /// before the property-only word can leave its property.
-    #[cfg(all(feature = "gc-heap", debug_assertions))]
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "a deferred prototype's word copied without materializing")]
     fn deferred_prototype_word_copied_as_bits_trips_the_debug_assertion() {
