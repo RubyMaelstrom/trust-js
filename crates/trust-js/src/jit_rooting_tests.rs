@@ -1,5 +1,6 @@
-//! The collector roots the native JIT's activations (P1 S5 step 7; gc-heap, ARM64), with
-//! collections on and, in debug builds, the heap verifier after every marking.
+//! The collector roots the native JIT's activations (P1 S5 step 7; gc-heap; ARM64, and x86-64
+//! from S6 step 7), with collections on and, in debug builds, the heap verifier after every
+//! marking.
 //!
 //! Each program keeps values in one kind of JIT storage and forces a collection from inside the
 //! activation: the test native `collect()`, called from generated code, runs the explicit
@@ -190,17 +191,27 @@ pub(crate) fn last_census() -> Census {
 
 /// Run `source` until a round returns through the direct call sequence at least `direct` times:
 /// a concurrent test can exhaust the process-wide call-cache epoch, which sends calls through
-/// the checked helper until their sites refill. Returns the last round's result.
+/// the checked helper until their sites refill. Returns the last round's result. x64 has no
+/// direct call sequence: its calls run through `jit_call`, whose committed paths run a compiled
+/// callee on a pooled record, so there one run is the round.
 pub(super) fn direct_round(engine: &mut Engine, source: &str, direct: usize) -> String {
-    let mut result = String::new();
-    for _ in 0..100 {
-        super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
-        result = run(engine, source);
-        if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) >= direct {
-            return result;
-        }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = direct;
+        run(engine, source)
     }
-    panic!("{source}: fewer than {direct} direct returns (last result {result})");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut result = String::new();
+        for _ in 0..100 {
+            super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+            result = run(engine, source);
+            if super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get()) >= direct {
+                return result;
+            }
+        }
+        panic!("{source}: fewer than {direct} direct returns (last result {result})");
+    }
 }
 
 /// Once its activations have finished, nothing a program tracked survives a collection: pooled

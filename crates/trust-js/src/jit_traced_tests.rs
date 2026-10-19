@@ -1,15 +1,16 @@
 //! Generated code under gc-heap's traced ownership (P1 S5 step 6): the engine runs at
-//! `Tier::Jit` (admitted under gc-heap on ARM64) and collects as usual, its JIT activations
-//! being roots (whose rooting tests are `jit::rooting_tests`).
+//! `Tier::Jit` (the ARM64 backend, and from S6 step 7 the x86-64 one) and collects as usual, its
+//! JIT activations being roots (whose rooting tests are `jit::rooting_tests`).
 //!
 //! Each program runs at `Tier::Jit` and at `Tier::Bytecode` (tier threshold 0) in the same build
 //! and must produce the same, pinned, result; the functions it names must have run as native
 //! code, and where a test counter records it, the inline template must have run rather than its
 //! helper. Together they exercise the templates that copy, overwrite and pop execution words,
 //! property words and the direct call's frame (none of which emits a count), and the guards
-//! that admit a Map's or Set's `Exotic::Collection` as ordinary. The tests at the end check
-//! assembled code: the finish stub's `this` reset, the property stores, the property-word guard
-//! and the string constants.
+//! that admit a Map's or Set's `Exotic::Collection` as ordinary. The template counters and the
+//! direct call sequence these programs check are ARM64's (on x86-64 the programs run without
+//! those checks). The tests at the end check assembled ARM64 code: the finish stub's `this`
+//! reset, the property stores, the property-word guard and the string constants.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
@@ -19,10 +20,7 @@ fn engine(tier: Tier) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
-    assert_eq!(
-        engine.interp.tier, tier,
-        "gc-heap admits every tier on ARM64"
-    );
+    assert_eq!(engine.interp.tier, tier);
     engine
 }
 
@@ -85,7 +83,8 @@ fn agree(source: &str, expected: &str, natives: &[&str]) -> Engine {
 }
 
 /// The property-load paths (native data hits, native absence hits, checked fallbacks; see
-/// `regions::property_paths`) `run` takes on this thread.
+/// `regions::property_paths`) `run` takes on this thread: ARM64's property templates.
+#[cfg(target_arch = "aarch64")]
 fn property_paths(run: impl FnOnce()) -> [u64; 3] {
     let before = super::regions::property_paths();
     run();
@@ -195,11 +194,16 @@ fn property_receivers_load_store_update_and_create() {
         "4100:p39b39:40:3:z39",
         &["props", "Point", "holder"],
     );
-    let paths = property_paths(|| {
-        assert_eq!(eval(&mut jit, "props(40);"), "4100:p39b39:40:3:z39");
-    });
-    assert!(paths[0] >= 40 * 8, "native property hits: {paths:?}");
-    assert_eq!(paths[2], 0, "checked property loads once warm: {paths:?}");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let paths = property_paths(|| {
+            assert_eq!(eval(&mut jit, "props(40);"), "4100:p39b39:40:3:z39");
+        });
+        assert!(paths[0] >= 40 * 8, "native property hits: {paths:?}");
+        assert_eq!(paths[2], 0, "checked property loads once warm: {paths:?}");
+    }
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(eval(&mut jit, "props(40);"), "4100:p39b39:40:3:z39");
 }
 
 /// Computed method reads with a string key (`o[name](x)`) and dense element methods with a
@@ -358,7 +362,23 @@ fn direct_calls_and_frame_teardown() {
     ] {
         settle(&mut jit, name);
     }
+    // x64 has no direct call sequence: its calls run through the checked helper.
+    #[cfg(target_arch = "x86_64")]
+    for (call, expected) in [
+        ("arity0(40)", "40"),
+        ("arity1(40)", "780"),
+        ("arity2(40)", "110"),
+        ("missing(40)", "missingc39"),
+        ("surplus(40)", "40"),
+        ("withThis(40)", "980"),
+        ("lastOwner(40)", "1560"),
+        ("depth(300)", "300"),
+    ] {
+        assert_eq!(eval(&mut jit, call), expected, "{call}");
+    }
+    #[cfg(target_arch = "aarch64")]
     let direct_returns = || super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.get());
+    #[cfg(target_arch = "aarch64")]
     for (call, expected, direct) in [
         ("arity0(40)", "40", 40),
         ("arity1(40)", "780", 40),
@@ -382,9 +402,12 @@ fn direct_calls_and_frame_teardown() {
         assert!(returns >= direct, "{call}: {returns} direct returns");
     }
     // Deeper than the frame pool: direct returns until the pool runs out, then the checked call.
-    super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
-    assert_eq!(eval(&mut jit, "depth(300);"), "300");
-    assert!(direct_returns() > 0, "depth recursion returns directly");
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
+        assert_eq!(eval(&mut jit, "depth(300);"), "300");
+        assert!(direct_returns() > 0, "depth recursion returns directly");
+    }
 }
 
 /// Maps and Sets (`Exotic::Collection` under gc-heap) through the ordinary-object guards: named
@@ -446,15 +469,21 @@ fn maps_and_sets_take_the_ordinary_object_paths() {
         ],
     );
     eval(&mut jit, "labels(2);");
-    let paths = property_paths(|| {
-        assert_eq!(eval(&mut jit, "labels(50);"), "0");
-    });
-    // readLabel, readInner (two loads), viaProto and two method loads per round.
-    assert_eq!(paths, [50 * 6, 0, 0], "Collection receivers hit natively");
+    #[cfg(target_arch = "aarch64")]
+    {
+        let paths = property_paths(|| {
+            assert_eq!(eval(&mut jit, "labels(50);"), "0");
+        });
+        // readLabel, readInner (two loads), viaProto and two method loads per round.
+        assert_eq!(paths, [50 * 6, 0, 0], "Collection receivers hit natively");
+    }
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(eval(&mut jit, "labels(50);"), "0");
 }
 
 /// A finished direct callee's packed `this` (its [48]) is released by nothing: the finish stub
 /// resets it with one store of the complete Undefined word it holds in x5, `str x5, [x10, #48]`.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn direct_finish_stub_resets_this_with_one_store() {
     use super::*;
@@ -478,6 +507,7 @@ fn direct_finish_stub_resets_this_with_one_store() {
 /// the SetProp template (each receiver kind, with and without a retained result) and the name
 /// and Reference store, load neither drop helper (`H_DROP_PACKED_AT`, `H_DROP_AT`): they
 /// overwrite the old word. No other generated code calls either helper.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn traced_property_stores_call_no_drop_helper() {
     use super::*;
@@ -530,6 +560,7 @@ fn traced_property_stores_call_no_drop_helper() {
 /// Object (PACK_LAZY_PROTO, a function's deferred `prototype`, and every other property-only or
 /// unknown tag) to the slow path, over all 65,536 tags, each with a null and a wild payload:
 /// no payload is read. The word is preserved on both paths.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn property_word_guard_routes_exactly_the_tags_above_object() {
     use super::*;
@@ -576,6 +607,7 @@ fn property_word_guard_routes_exactly_the_tags_above_object() {
 /// loop region's.
 /// `string_constant_region_copy_pushes_an_immediate` runs this again with the regions' own copy
 /// of the template.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn string_constant_sites_push_an_immediate() {
     use super::*;
@@ -640,6 +672,7 @@ fn string_constant_sites_push_an_immediate() {
 /// The regions' own copy of the string-constant template (the vocabulary of
 /// `regions::emit_effect` that `TRUST_JS_SHARED_NATIVE_OPERATIONS=0` selects; the setting is
 /// read once per process): `string_constant_sites_push_an_immediate` in a process of its own.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn string_constant_region_copy_pushes_an_immediate() {
     const CHILD: &str = "TRUST_JS_TEST_REGION_VOCABULARY_CHILD";
@@ -665,6 +698,7 @@ fn string_constant_region_copy_pushes_an_immediate() {
 
 /// The 64-bit values the move-wide sequences in `words` materialize: a MOVZ or MOVN, then the
 /// MOVKs that follow it into the same register.
+#[cfg(target_arch = "aarch64")]
 fn materialized(words: &[u32]) -> Vec<u64> {
     let mut values = Vec::new();
     let mut current: Option<(u32, u64)> = None;
@@ -696,6 +730,7 @@ fn materialized(words: &[u32]) -> Vec<u64> {
 /// `assemble_global_stub` assembles it (with the stubs it requests and a direct call's finish
 /// stub), materializes no string word (the string tag over a nonzero payload), and none of the
 /// words, cells or pool slots of the string constants of a chunk that requests shared stubs.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn shared_stubs_embed_no_string_constant() {
     use super::*;

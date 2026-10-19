@@ -288,9 +288,7 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
             ),
             "{tier:?}"
         );
-        if tier.admitted() == Tier::Jit
-            && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
-        {
+        if tier == Tier::Jit && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             let maker = object(&mut engine, "make");
             let maker = maker.borrow();
             let Callable::User(user) = &maker.call else {
@@ -314,10 +312,6 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
     let mut engine = Engine::new();

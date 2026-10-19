@@ -61,7 +61,7 @@ fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool
                 );
             }
             if native
-                && matches!(tier.admitted(), Tier::Jit)
+                && matches!(tier, Tier::Jit)
                 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
             {
                 assert!(

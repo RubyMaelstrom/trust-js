@@ -235,9 +235,7 @@ fn string_concat_helpers_reach_compiled_tiers() {
                     "captured string store pattern must actually execute"
                 );
             }
-            if tier.admitted() == Tier::Jit
-                && cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
-            {
+            if tier == Tier::Jit && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
                 assert!(
                     chunk.jit.get().is_some_and(|code| code.is_some()),
                     "{name} stayed in bytecode"

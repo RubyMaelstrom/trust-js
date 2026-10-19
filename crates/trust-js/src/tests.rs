@@ -987,10 +987,6 @@ fn megamorphic_direct_call_can_grow_the_secondary_cache_in_a_nested_call() {
     );
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn megamorphic_cache_does_not_keep_discarded_functions_alive() {
     let mut engine = Engine::new();
@@ -7304,6 +7300,9 @@ fn recursive_calls_cross_generator_continuations_without_an_artificial_budget() 
 fn execution_stack_resource_exhaustion_unwinds_and_recovers() {
     // Host stack exhaustion must be catchable, not unlimited native segment growth. Do not
     // assert an exact JS depth: the resource being bounded is native storage, not [[Call]].
+    // Every path that checks before it grows leaves the cap to its check: no growth checkpoint
+    // finds the red zone reached at the cap.
+    let capped = crate::interpreter::execution_stack_capped_checkpoints();
     for tier in [
         crate::bytecode::Tier::Interp,
         crate::bytecode::Tier::Bytecode,
@@ -7359,6 +7358,11 @@ fn execution_stack_resource_exhaustion_unwinds_and_recovers() {
             Completion::Value(value) => assert_eq!(value, "20000", "{tier:?}: tail calls"),
             Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),
         }
+        assert_eq!(
+            crate::interpreter::execution_stack_capped_checkpoints(),
+            capped,
+            "{tier:?}: a growth checkpoint found the red zone reached at the cap"
+        );
     }
 }
 
@@ -7377,6 +7381,68 @@ fn execution_stack_segment_budget_is_returned_on_rust_unwind() {
         assert!(result.is_err());
         assert_eq!(crate::interpreter::execution_stack_segments(), 0);
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn execution_stack_checkpoints_never_grow_past_the_segment_cap() {
+    // A call path checks for exhaustion, then reaches its growth checkpoint at the same depth a
+    // little deeper on the stack. At the segment cap a check inside the margin above the red zone
+    // reports exhaustion, and a checkpoint that finds the red zone reached runs the call on the
+    // current stack instead of adding a segment past the cap. The stack is positioned exactly,
+    // in a thread of its own, and the live segment count set without allocating the segments.
+    use crate::interpreter::{
+        execution_stack_capped_checkpoints, execution_stack_exhausted, execution_stack_segments,
+        with_execution_stack, with_execution_stack_segments, EXECUTION_STACK_CHECK_MARGIN,
+        EXECUTION_STACK_RED_ZONE, MAX_EXECUTION_STACK_SEGMENTS,
+    };
+    const CAP: usize = MAX_EXECUTION_STACK_SEGMENTS;
+    /// Run `f` deeper on this stack, in the first frame whose headroom is below `below`.
+    #[inline(never)]
+    fn below_headroom(below: usize, f: &mut dyn FnMut(usize)) {
+        let mut frame = [0u8; 1024];
+        std::hint::black_box(&mut frame);
+        let remaining = stacker::remaining_stack().expect("a thread stack of known bounds");
+        if remaining < below {
+            f(remaining);
+        } else {
+            below_headroom(below, f);
+        }
+        std::hint::black_box(&frame);
+    }
+    std::thread::Builder::new()
+        .name(String::from("trust-js-execution-stack-segment-cap"))
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            // Inside the margin, above the red zone: exhausted at the cap only.
+            let margin = EXECUTION_STACK_RED_ZONE + EXECUTION_STACK_CHECK_MARGIN / 2;
+            below_headroom(margin, &mut |remaining| {
+                assert!(remaining > EXECUTION_STACK_RED_ZONE + EXECUTION_STACK_CHECK_MARGIN / 4);
+                with_execution_stack_segments(CAP - 1, || {
+                    assert!(!execution_stack_exhausted(8), "below the cap");
+                });
+                with_execution_stack_segments(CAP, || {
+                    assert!(execution_stack_exhausted(8), "inside the margin at the cap");
+                });
+            });
+            // Inside the red zone: a checkpoint below the cap adds a segment, one at the cap
+            // runs the call where it is.
+            below_headroom(EXECUTION_STACK_RED_ZONE / 2, &mut |_| {
+                with_execution_stack_segments(CAP - 1, || {
+                    assert_eq!(with_execution_stack(8, execution_stack_segments), CAP);
+                    assert_eq!(execution_stack_segments(), CAP - 1);
+                });
+                with_execution_stack_segments(CAP, || {
+                    let capped = execution_stack_capped_checkpoints();
+                    assert_eq!(with_execution_stack(8, execution_stack_segments), CAP);
+                    assert_eq!(execution_stack_capped_checkpoints(), capped + 1);
+                });
+            });
+            assert_eq!(execution_stack_segments(), 0);
+        })
+        .expect("spawn segment-cap test")
+        .join()
+        .expect("segment-cap test completes");
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -9524,7 +9590,7 @@ fn jit_numeric_packed_overwrites_stay_in_native_code() {
 #[cfg(target_arch = "aarch64")]
 fn jit_small_packed_array_reads_and_writes_stay_native() {
     let mut engine = Engine::new();
-    engine.interp.tier = crate::bytecode::Tier::Jit.admitted();
+    engine.interp.tier = crate::bytecode::Tier::Jit;
     engine.interp.tier_threshold = 0;
     assert_eq!(
         run_in(
@@ -9562,7 +9628,7 @@ fn jit_small_packed_array_reads_and_writes_stay_native() {
 #[cfg(target_arch = "aarch64")]
 fn jit_packed_numeric_chains_do_not_replay_element_helpers() {
     let mut engine = Engine::new();
-    engine.interp.tier = crate::bytecode::Tier::Jit.admitted();
+    engine.interp.tier = crate::bytecode::Tier::Jit;
     engine.interp.tier_threshold = 0;
     assert_eq!(
         run_in(
@@ -10563,7 +10629,7 @@ fn bytecode_property_inline_cache() {
     // run the getter, not read a raw slot), own-shadows-proto + delete falling back to the proto,
     // and writes through the SetProp cache.
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
     e.interp.tier_threshold = 0; // compile on first call so the caches are exercised
     let src = r#"
       function readXY(o){ return o.x + "," + o.y; }
@@ -10603,7 +10669,7 @@ fn compiled_parameterless_arguments_object() {
     "#;
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10659,7 +10725,7 @@ fn compiled_strict_arguments_preserve_parameters_and_escaping_identity() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         let got = match e.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -10748,7 +10814,7 @@ fn jit_construct_arguments_apply_forwarder_preserves_live_guards() {
 fn compiled_typeof_unresolved_name() {
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         let got = match e
             .eval(
@@ -10783,7 +10849,7 @@ fn compiled_update_free_name() {
     "#;
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10882,7 +10948,7 @@ fn compiled_regexp_literal_is_fresh() {
     assert!(crate::bytecode::compile(&func).is_some());
     for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         let got = match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -10944,7 +11010,7 @@ fn compiled_comma_prefixes_preserve_getters_coercions_and_abrupt_completions() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         let result = match engine.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -11030,7 +11096,7 @@ fn bytecode_labelled_loops_match_interp() {
     // both tiers (threshold 0 forces immediate compilation) and require identical results.
     fn on_tier(src: &str, tier: crate::bytecode::Tier) -> String {
         let mut e = Engine::new();
-        e.interp.tier = tier.admitted();
+        e.interp.tier = tier;
         e.interp.tier_threshold = 0;
         match e.eval(src, false).expect("parse") {
             Completion::Value(v) => v,
@@ -11058,7 +11124,7 @@ fn bytecode_async_vm() {
     // coroutine. Checks the awaited value flows back, `await` in a loop accumulates, the return
     // value is delivered, and `await` still yields a microtask tick (ordering "123", not "132").
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
     e.interp.tier_threshold = 0; // compile every function so the VM async path is taken
     let src = r#"
       var out = "";
@@ -11087,7 +11153,7 @@ fn bytecode_try_catch() {
     // the outer catch, `return` inside try still returns, and — the reason Hono's async `compose`
     // now compiles — a rejected `await` inside a `try` lands in its `catch`.
     let mut e = Engine::new();
-    e.interp.tier = crate::bytecode::Tier::Bytecode.admitted();
+    e.interp.tier = crate::bytecode::Tier::Bytecode;
     e.interp.tier_threshold = 0;
     let src = r#"
       function f(x){ try { if (x<0) throw "neg"+x; return "ok"+x; } catch(e){ return "c:"+e; } }
@@ -12260,7 +12326,7 @@ fn projected_class_defaults_preserve_the_derived_constructor_this_environment() 
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12350,7 +12416,7 @@ fn for_of_returns_run_inner_finalizers_before_iterator_close() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12407,7 +12473,7 @@ fn arrow_super_properties_capture_the_enclosing_receiver_without_explicit_this()
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12466,7 +12532,7 @@ fn loop_fallback_fusions_preserve_mixed_values_and_getter_effects() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12499,7 +12565,7 @@ fn discarded_local_reads_preserve_every_value_kind_and_tdz() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12567,7 +12633,7 @@ fn compiled_lexical_assignments_check_tdz_after_rhs_and_close_iterators() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -12649,7 +12715,7 @@ fn direct_eval_from_with_keeps_lexical_scope_and_argument_order() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         match engine.eval(source, false).unwrap() {
             Completion::Value(value) => assert_eq!(value, "ok", "{tier:?}"),
@@ -14508,10 +14574,6 @@ fn for_head_no_in_function_boundaries_execute() {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn loop_free_functions_earn_native_code_through_vm_runs() {
     // A loop-free body runs `jit_admit_runs` times on the bytecode VM before it is compiled to
@@ -21613,7 +21675,7 @@ fn for_in_cached_shapes_preserve_live_enumeration() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         assert_eq!(run_in(&mut engine, source), "ok");
         let (entries, bytes) = engine.interp.enumeration_keys.stats();
@@ -26890,7 +26952,7 @@ fn host_snapshots_keep_source_policy_without_changing_execution_or_author_code()
     ] {
         for (snapshot, opaque) in [(&ordinary, false), (&host, true)] {
             let mut engine = Engine::new();
-            engine.interp.tier = tier.admitted();
+            engine.interp.tier = tier;
             engine.interp.tier_threshold = 0;
             assert!(matches!(
                 engine.eval_snapshot(snapshot, false).unwrap(),
@@ -28584,7 +28646,7 @@ fn jit_local_store_pairs_preserve_owned_values_and_throw_state() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         let result = match engine.eval(source, false).expect("parse") {
             Completion::Value(value) => value,
@@ -28623,7 +28685,7 @@ fn deep_property_caches_preserve_absence_accessors_and_prototype_swaps() {
         crate::bytecode::Tier::Jit,
     ] {
         let mut engine = Engine::new();
-        engine.interp.tier = tier.admitted();
+        engine.interp.tier = tier;
         engine.interp.tier_threshold = 0;
         assert_eq!(run_in(&mut engine, source), "ok");
     }
@@ -29474,10 +29536,6 @@ fn jit_function_call_intrinsic_preserves_target_and_receiver_guards() {
     );
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn interp_layout_probes() {
     // The asm call thunk's foundation: every probed Interp offset must resolve, and the Vec

@@ -23,10 +23,10 @@ fn assert_osr(tier: Tier) {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
-    if matches!(tier.admitted(), Tier::Jit) {
+    if matches!(tier, Tier::Jit) {
         assert!(entries > 0, "must enter actual borrowed native code");
     }
-    if !matches!(tier.admitted(), Tier::Jit) {
+    if !matches!(tier, Tier::Jit) {
         assert_eq!(entries, 0);
     }
 }

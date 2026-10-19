@@ -3892,10 +3892,6 @@ mod tests {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     #[test]
     fn borrowed_osr_cache_metadata_is_counted_once_and_released_with_chunk() {
         let mut engine = crate::Engine::new();

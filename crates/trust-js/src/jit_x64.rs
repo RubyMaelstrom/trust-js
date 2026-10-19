@@ -352,22 +352,74 @@ impl Asm {
         self.bytes(&(-2 * SLOT_BYTES).to_le_bytes());
         self.add_sp(-8);
     }
+    /// Call `helper` with the `(ctx, imm, sp)` contract: r13 takes the returned sp, and a set flag
+    /// (a throw) goes to `unwind`. Under gc-heap a call of an allocating helper then ends in the
+    /// explicit poll (see [`Asm::helper_end_poll`]).
     fn helper_spflag(&mut self, helper: usize, imm: u32, unwind: usize) {
         self.call_helper_pair(helper, imm);
         self.bytes(&[0x49, 0x89, 0xc5]); // r13 = rax (new sp)
         self.bytes(&[0x48, 0x85, 0xd2]); // test rdx, rdx (throw flag)
         self.jcc(0x85, unwind); // jne
+        #[cfg(feature = "gc-heap")]
+        if super::helper_ends_in_poll(helper) {
+            self.helper_end_poll(unwind);
+        }
     }
-    fn interrupt_poll(&mut self, interp_offsets: Option<(i32, i32)>, unwind: usize) {
+    /// rcx = `ctx.live_objects`, the address of the live-object count (`value::LiveCount`).
+    fn load_live_count_address(&mut self) {
+        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // mov rcx,[r12+live_objects]
+        self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
+    }
+    /// gc-heap: compare the cell heap's due word, which follows the live-object count at rcx
+    /// (`value::LiveCount`), with zero. The word is set exactly while a collection is due (the
+    /// byte budget is spent, the stress interval reached or a request deferred), none of which
+    /// moves the count.
+    #[cfg(feature = "gc-heap")]
+    fn cmp_due_word_rcx(&mut self) {
+        const _: () = assert!(crate::value::LIVE_DUE_OFF < 0x80);
+        // cmp qword [rcx+LIVE_DUE_OFF],0
+        self.bytes(&[0x48, 0x83, 0x79, crate::value::LIVE_DUE_OFF as u8, 0x00]);
+    }
+    /// gc-heap: the explicit poll that ends a call to an allocating helper (see
+    /// `jit::helper_ends_in_poll`), and the calls of `H_CALL` and `H_NEW` and string
+    /// accumulation's committed exit: the recorded S5 deviation, in place of an allocation slow
+    /// path that collects. It runs once the call has returned, with its results in canonical
+    /// places (operand words below r13, slots, context fields): this backend keeps no value in a
+    /// caller-saved register across a helper call, only the context, operand top, helper table
+    /// and slot base in r12-r15. Three instructions while the due word is clear; a set word
+    /// calls `H_INTERRUPT` (`POLL_HELPER_END`), whose throw unwinds from here.
+    #[cfg(feature = "gc-heap")]
+    fn helper_end_poll(&mut self, unwind: usize) {
+        #[cfg(test)]
+        if super::TEST_NO_END_POLLS.with(std::cell::Cell::get) {
+            return;
+        }
+        let done = self.label();
+        self.load_live_count_address();
+        self.cmp_due_word_rcx();
+        self.jcc(0x84, done); // je: no collection due
+        self.helper_spflag(H_INTERRUPT, super::POLL_HELPER_END, unwind);
+        self.bind(done);
+    }
+    /// Generated code's entry and loop safepoint (`kind` is `POLL_ENTRY` or `POLL_LOOP`): under
+    /// gc-heap the heap's due word, the live-object count against `gc_next`, then the shared
+    /// interrupt divider; the slow path is `H_INTERRUPT` (`jit_interrupt`: the host interrupt,
+    /// then `Interp::gc_check`). While collections are suppressed or deferred the word stays set
+    /// and every poll calls the helper until one can collect.
+    fn interrupt_poll(&mut self, interp_offsets: Option<(i32, i32)>, kind: u32, unwind: usize) {
         let Some((offset, gc_next)) = interp_offsets else {
-            self.helper_spflag(H_INTERRUPT, 0, unwind);
+            self.helper_spflag(H_INTERRUPT, kind, unwind);
             return;
         };
         let done = self.label();
         let slow = self.label();
         self.bytes(&[0x49, 0x8b, 0x44, 0x24, 0x48]); // rax = ctx.interp
-        self.bytes(&[0x49, 0x8b, 0x8c, 0x24]); // rcx = ctx.live_objects
-        self.bytes(&(std::mem::offset_of!(super::JitCtx, live_objects) as i32).to_le_bytes());
+        self.load_live_count_address();
+        #[cfg(feature = "gc-heap")]
+        {
+            self.cmp_due_word_rcx();
+            self.jcc(0x85, slow); // jne: a collection is due
+        }
         self.bytes(&[0x48, 0x8b, 0x09]); // rcx = current live object count
         self.bytes(&[0x48, 0x3b, 0x88]); // cmp rcx, [rax+gc_next]
         self.bytes(&gc_next.to_le_bytes());
@@ -379,7 +431,7 @@ impl Asm {
         self.bytes(&0x3fffu32.to_le_bytes());
         self.jcc(0x85, done); // nonzero: skip the shared-state helper
         self.bind(slow);
-        self.helper_spflag(H_INTERRUPT, 0, unwind);
+        self.helper_spflag(H_INTERRUPT, kind, unwind);
         self.bind(done);
     }
     fn finish(mut self) -> Vec<u8> {
@@ -409,7 +461,7 @@ thread_local! {
 
 /// The named-field count and data-pointer words of an Object, as displacements from it, when its
 /// fields are a `Vec`. This backend reads only that layout inline: gc-heap's `InlineVec` (see
-/// `JitVecLayout`) keeps the checked helpers until the x64 pass of S6 (step 7).
+/// `JitVecLayout`) keeps the checked helpers until the x64 pass of S6 step 7b.
 fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
     let fields = layout.obj_props + layout.props_entries;
     match layout.repr.props_fields {
@@ -420,7 +472,7 @@ fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
 
 /// Whether a property template can take `recv`: the `this` form reads [r12+0x30] as a pointer to
 /// a wide `this`, which gc-heap's packed word is not, so it keeps the checked helper until the
-/// x64 pass of S6 (step 7).
+/// x64 pass of S6 step 7b.
 fn this_form_ok(recv: PropRecv) -> bool {
     !matches!(recv, PropRecv::This)
 }
@@ -583,7 +635,7 @@ fn emit_prop_read(
 }
 
 /// Compact monomorphic property-number load. Every cached structural fact is rechecked against
-/// the live object graph; a miss reaches H_GET_PROP before stack or refcount state changes.
+/// the live object graph; a miss reaches H_GET_PROP before the operand stack changes.
 fn emit_prop_num(
     a: &mut Asm,
     layout: &crate::value::JitLayout,
@@ -856,7 +908,7 @@ pub(super) fn compile_entry(
     // a user agent may abort a running script at any time (HTML "Killing scripts"). The frame
     // is fully established and the operand stack empty, as at a back-edge target at pc 0.
     if !borrowed_entry {
-        a.interrupt_poll(interrupt_offset, unwind);
+        a.interrupt_poll(interrupt_offset, super::POLL_ENTRY, unwind);
     }
 
     if borrowed_entry {
@@ -878,7 +930,7 @@ pub(super) fn compile_entry(
         a.bind(pcs[pc]);
         pc_offsets.push(a.code.len() as u32);
         if interrupt_targets[pc] {
-            a.interrupt_poll(interrupt_offset, unwind);
+            a.interrupt_poll(interrupt_offset, super::POLL_LOOP, unwind);
         }
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) {
             a.helper_spflag(H_SLICE_OP, pc as u32, ret_throw);
@@ -895,7 +947,10 @@ pub(super) fn compile_entry(
             a.call_helper_pair(super::H_STRING_ACCUMULATION, pc as u32);
             a.bytes(&[0x49, 0x89, 0xc5]); // r13 = canonical sp
             a.bytes(&[0x48, 0x85, 0xd2]); // flag0 is complete success
-            a.jcc(0x84, pcs[plan.end]);
+            a.jcc(0x85, ordinary); // an unchanged miss
+            #[cfg(feature = "gc-heap")]
+            a.helper_end_poll(unwind); // gc-heap: the committed exit ends in the explicit poll
+            a.jmp(pcs[plan.end]);
             a.bind(ordinary);
         }
         if names::emit_op(&mut a, chunk, layout, ilayout, op, pc as u32, unwind) {
@@ -942,7 +997,7 @@ pub(super) fn compile_entry(
                 a.load_tag_r15(off);
                 a.reference_or_immediate(rc_ok, commit, slow);
                 a.bind(commit);
-                a.load_word_r13(-SLOT_BYTES); // transfer one owner, no retain
+                a.load_word_r13(-SLOT_BYTES); // move the word: it owns nothing
                 a.store_word_r15(off);
                 a.add_sp(-8);
                 a.jmp(exit);
@@ -1158,9 +1213,15 @@ pub(super) fn compile_entry(
             }
             Op::Call(..) | Op::CallWithThis(..) => {
                 a.helper_spflag(H_CALL, pc as u32, unwind);
+                // gc-heap: a native callee can allocate after the call's last safepoint.
+                #[cfg(feature = "gc-heap")]
+                a.helper_end_poll(unwind);
             }
             Op::New(argc, _) => {
                 a.helper_spflag(H_NEW, pc as u32 | ((*argc as u32) << 16), unwind);
+                // gc-heap: a native constructor allocates after the call's last safepoint.
+                #[cfg(feature = "gc-heap")]
+                a.helper_end_poll(unwind);
             }
             Op::GetPropThis(_, cache) => {
                 emit_prop_read(
@@ -1354,10 +1415,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     fn finally_completions_remain_native_and_preserve_abrupt_precedence() {
         // ECMA-262 e28783d5, sec-try-statement-runtime-semantics-evaluation:
         // normal finally completion preserves the body completion; abrupt finally replaces it.
@@ -1394,10 +1451,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     fn labelled_break_runs_finally_then_closes_iterators_inside_out() {
         // ECMA-262 e28783d5, sec-iteratorclose and TryStatement Evaluation: preserve
         // the pending break while running every intervening cleanup in nesting order.
@@ -1428,10 +1481,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     fn packed_numeric_and_boolean_operands_preserve_number_semantics() {
         let mut engine = engine();
         assert_eq!(evaluate(&mut engine,
@@ -1447,10 +1496,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     fn packed_heap_owners_survive_local_overwrites_calls_and_unwind() {
         let mut engine = engine();
         assert_eq!(

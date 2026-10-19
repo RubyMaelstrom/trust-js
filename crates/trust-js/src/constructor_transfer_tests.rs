@@ -50,7 +50,7 @@ fn setup(tier: Tier) -> Engine {
 }
 
 fn assert_native_hit(tier: Tier, forwarded: bool, before: usize) {
-    if tier.admitted() == Tier::Jit
+    if tier == Tier::Jit
         && cfg!(all(
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(

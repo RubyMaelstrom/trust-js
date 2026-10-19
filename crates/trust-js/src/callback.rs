@@ -470,7 +470,7 @@ mod tests {
     /// the callee, does not root it: once unnamed it dies, and pruning empties the site.
     #[cfg(all(
         feature = "gc-heap",
-        target_arch = "aarch64",
+        any(target_arch = "aarch64", target_arch = "x86_64"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     #[test]

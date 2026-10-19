@@ -248,7 +248,7 @@ mod tests {
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
-            if matches!(tier.admitted(), Tier::Jit) {
+            if matches!(tier, Tier::Jit) {
                 assert!(native > 0, "spread fixture must execute native Script");
             }
         }

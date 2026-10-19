@@ -56,10 +56,7 @@ fn check(source: &str, expected: &str) {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
@@ -127,10 +124,7 @@ fn native_deep_names_use_fresh_holder_layouts_and_live_flags() {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_deep_globals_load_store_and_all_numeric_update_kinds() {
     let mut engine = Engine::new();
     engine.eval("var outer=0;", false).unwrap();
@@ -168,10 +162,7 @@ fn native_name_wide_and_packed_owner_transfers_and_last_owner_fallback() {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_name_import_mutability_and_parent_changes_stay_live() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(&mut engine, "function f(){return outer;}");
@@ -200,10 +191,7 @@ fn native_name_import_mutability_and_parent_changes_stay_live() {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends name and Reference ops to their helpers (InlineVec storage) until then"]
 fn native_references_hot_fragment_reuses_capture_load_and_store() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);

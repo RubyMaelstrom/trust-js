@@ -22,7 +22,7 @@ fn check(source: &str, expected: &str) {
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if tier.admitted() == Tier::Jit {
+        if tier == Tier::Jit {
             assert!(native > 0, "binding Script must enter native code");
         }
     }

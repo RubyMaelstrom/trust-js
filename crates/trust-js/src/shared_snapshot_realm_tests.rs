@@ -350,7 +350,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
             ),
             "14000"
         );
-        if tier.admitted() == Tier::Jit {
+        if tier == Tier::Jit {
             let call = shared_method(it, "call");
             assert!(
                 call.code2.get().is_some_and(Option::is_some),

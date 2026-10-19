@@ -536,7 +536,8 @@ mod tests {
         let run: unsafe extern "C" fn(u64, *mut u64) -> u64 =
             unsafe { std::mem::transmute(code.as_ptr()) };
         // Payloads need not point at allocations: encoding/decoding must not dereference
-        // them or change a reference count. Include nonzero low payload bytes.
+        // them (no word owns its cell; the collector traces the words). Include nonzero low
+        // payload bytes.
         let mut words = vec![
             0.0f64.to_bits(),
             (-0.0f64).to_bits(),

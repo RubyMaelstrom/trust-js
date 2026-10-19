@@ -49,10 +49,7 @@ fn run(
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
     for (this, source) in [
         (false, "function read(receiver){return receiver.value;}"),
@@ -101,10 +98,7 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn live_polymorphic_own_cache_ways_keep_each_receivers_storage() {
     let mut engine = Engine::new();
     let (chunk, code) = compile(
@@ -144,10 +138,7 @@ fn live_polymorphic_own_cache_ways_keep_each_receivers_storage() {
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers() {
     let source = r#"
         function read(receiver){return receiver.value;}
@@ -195,10 +186,7 @@ fn descriptor_exotic_shape_and_value_changes_preserve_get_effects_across_tiers()
 }
 
 #[test]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
+#[ignore = "P1 S6 step 7b: under the GC heap x64 sends property reads to their helper (InlineVec fields, the packed `this`) until then"]
 fn one_native_chunk_reads_live_receivers_in_each_realm() {
     use crate::realm_inline_guard_tests::{eval_string, in_realm};
     let mut engine = Engine::new();

@@ -166,7 +166,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
             "{tier:?}"
         );
         let entries = property_read::TEST_RECORD_GETTERS.with(Cell::get) - before;
-        if tier.admitted() == Tier::Jit {
+        if tier == Tier::Jit {
             assert!(
                 entries > 100,
                 "warm closed getters execute their structural plan"
@@ -176,7 +176,7 @@ fn record_getter_specialization_returns_fresh_live_records() {
         }
         engine.interp.gc_collect();
         assert_eq!(evaluate(&mut engine, "read(source).index"), "7");
-        if tier.admitted() == Tier::Jit {
+        if tier == Tier::Jit {
             let env = engine.interp.global_env.clone();
             let source = engine
                 .interp
@@ -987,10 +987,6 @@ fn propstat_classify_buckets_match_template_guards_without_running_getters() {
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn propstat_diagnostic_tallies_helper_reasons_at_exit() {
     if std::env::var_os("TRUST_JS_PROPSTAT_CHILD").is_none() {
@@ -1053,10 +1049,6 @@ fn validated_accessor_reads_observe_live_mutations_in_every_tier() {
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn validated_accessor_landing_is_exercised_by_jit_reads() {
     let before = property_read::TEST_VALIDATED_ACCESSORS.with(Cell::get);

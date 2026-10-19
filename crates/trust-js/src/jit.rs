@@ -57,58 +57,49 @@ mod profiler;
 #[path = "jit_cache.rs"]
 pub(crate) mod cache;
 
-// The JIT's tests need native code, and several compile directly through the backend: a gc-heap
-// build compiles them out on x86-64, whose backend is not ported to the GC heap until S6 step 7
-// (see `Tier::admitted`).
 #[cfg(all(
     test,
-    any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", not(feature = "gc-heap"))
-    ),
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "jit_cache_tests.rs"]
 mod cache_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_coverage_tests.rs"]
 mod coverage_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_assignment_tests.rs"]
 mod assignment_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_update_elem_tests.rs"]
 mod update_elem_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_call_reference_tests.rs"]
 mod call_reference_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_call_closure_tests.rs"]
 mod call_closure_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_osr_entry_tests.rs"]
 mod osr_entry_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_continuation_tests.rs"]
 mod continuation_tests;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_inline_context_tests.rs"]
 mod inline_context_tests;
 
 #[cfg(all(
     test,
-    any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", not(feature = "gc-heap"))
-    ),
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "bytecode_inline_prepared_tests.rs"]
@@ -116,10 +107,7 @@ mod inline_prepared_tests;
 
 #[cfg(all(
     test,
-    any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", not(feature = "gc-heap"))
-    ),
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "jit_inline_realm_selection_tests.rs"]
@@ -127,10 +115,7 @@ mod inline_realm_selection_tests;
 
 #[cfg(all(
     test,
-    any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", not(feature = "gc-heap"))
-    ),
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 #[path = "call_global_env_pin_tests.rs"]
@@ -203,7 +188,7 @@ mod string_constant_tests;
 #[cfg(all(
     test,
     feature = "gc-heap",
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_traced_tests.rs"]
@@ -212,7 +197,7 @@ mod traced_tests;
 #[cfg(all(
     test,
     feature = "gc-heap",
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_rooting_tests.rs"]
@@ -221,7 +206,7 @@ pub(crate) mod rooting_tests;
 #[cfg(all(
     test,
     feature = "gc-heap",
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_poll_tests.rs"]
@@ -234,7 +219,7 @@ mod poll_tests;
 #[path = "jit_regions.rs"]
 mod regions;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -252,7 +237,7 @@ pub(crate) fn test_local_array_fusion_hits() -> [u64; 5] {
     }
 }
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 pub(crate) fn test_tdz_array_pair_hits() -> [u64; 2] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -270,7 +255,7 @@ pub(crate) fn test_tdz_array_pair_hits() -> [u64; 2] {
     }
 }
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
     #[cfg(all(
         target_arch = "aarch64",
@@ -1392,7 +1377,7 @@ impl Drop for ExecutableCodeReservation<'_> {
     }
 }
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 mod executable_code_budget_tests {
     use super::*;
     use std::sync::atomic::Ordering::Relaxed;
@@ -2350,7 +2335,7 @@ mod shared_stub_tests {
     }
 }
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 mod helper_identity_tests {
     use super::*;
 
@@ -2364,7 +2349,7 @@ mod helper_identity_tests {
     }
 }
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 mod native_op_tests {
     use super::*;
 
@@ -2571,44 +2556,59 @@ const _: () = assert!(std::mem::align_of::<Value>() == 8);
 // The offsets below bake 8-byte pointers into the emitted templates: JIT-platform only (on
 // wasm32 pointers are 4 bytes and none of this code exists).
 #[cfg(all(
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 mod layout_asserts {
     use super::JitCtx;
-    // The call template's inline way-1 probe reads these CallIc fields by fixed offset.
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, callee) == 0);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, global_env) == 32);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, epoch) == 56);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_params) == 42);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_slots) == 44);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, direct) == 46);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, chunk_raw) == 64);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, code_mem) == 72);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, pc_offs_ptr) == 80);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, native) == 88);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, intrinsic) == 96);
-    const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, realm) == 104);
-    const _: () = assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 112);
+    // Both backends read the context's leading words by fixed offset (x64: the helper table at
+    // [r12], the operand base or final top into r13 and back, the slots into r15, the
+    // environment, `this`, the global scope and the interpreter).
+    const _: () = assert!(std::mem::offset_of!(JitCtx, helpers) == 0);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, stack_base) == 8);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, final_sp) == 16);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, slots) == 24);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, inline_ic_safe) == 32);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, env_raw) == 40);
     // [48]: the 8-byte packed `this` word.
     #[cfg(feature = "gc-heap")]
     const _: () = assert!(
         std::mem::offset_of!(JitCtx, this_word) == 48
             && std::mem::size_of::<crate::value::PackedValue>() == 8
     );
+    const _: () = assert!(std::mem::offset_of!(JitCtx, global_body) == 56);
     const _: () = assert!(std::mem::offset_of!(JitCtx, genv) == 64);
     // 3b reads Interp state from machine code through ctx.interp.
     const _: () = assert!(std::mem::offset_of!(JitCtx, interp) == 72);
-    // The asm frame push writes FnFrame fields by fixed offset.
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, fn_ptr) == 0);
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, call_site) == 8);
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, strict) == 12);
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, construct) == 13);
-    const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, extra) == 16);
-    const _: () = assert!(std::mem::size_of::<crate::interpreter::FnFrame>() == 24);
-    // The direct-call sequence reads the callee's code/pc_offsets straight from its JitCode.
-    const _: () = assert!(std::mem::offset_of!(super::JitCode, mem) == 0);
-    const _: () = assert!(std::mem::offset_of!(super::JitCode, pc_offsets) == 16);
+    // ARM64's call, frame-push and direct-call sequences.
+    #[cfg(target_arch = "aarch64")]
+    mod arm64 {
+        // The call template's inline way-1 probe reads these CallIc fields by fixed offset.
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, callee) == 0);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, global_env) == 32);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, epoch) == 56);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_params) == 42);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_slots) == 44);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, direct) == 46);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, chunk_raw) == 64);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, code_mem) == 72);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, pc_offs_ptr) == 80);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, native) == 88);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, intrinsic) == 96);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, realm) == 104);
+        const _: () =
+            assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 112);
+        // The asm frame push writes FnFrame fields by fixed offset.
+        const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, fn_ptr) == 0);
+        const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, call_site) == 8);
+        const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, strict) == 12);
+        const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, construct) == 13);
+        const _: () = assert!(std::mem::offset_of!(crate::interpreter::FnFrame, extra) == 16);
+        const _: () = assert!(std::mem::size_of::<crate::interpreter::FnFrame>() == 24);
+        // The direct-call sequence reads the callee's code/pc_offsets straight from its JitCode.
+        const _: () = assert!(std::mem::offset_of!(crate::jit::JitCode, mem) == 0);
+        const _: () = assert!(std::mem::offset_of!(crate::jit::JitCode, pc_offsets) == 16);
+    }
 }
 
 /// Two-register return for helpers that produce (new sp, flag) — x0/x1 under the C ABI.
@@ -3579,7 +3579,7 @@ mod asm {
         None
     }
 
-    #[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+    #[cfg(test)]
     mod tests {
         #[test]
         fn optional_region_reference_inventory_ignores_unused_bailouts() {
@@ -4542,9 +4542,10 @@ fn compile_entry(
                 continue;
             }
         }
-        // An unused local read still checks the TDZ, but does not need a cloned
-        // Value or any refcount/BigInt traffic. In particular this is the guard
-        // before a plain lexical assignment. Keep independent Pop entries intact.
+        // An unused local read still checks the TDZ, but copies nothing: no word owns
+        // anything, and the slot keeps its word where the collector traces it. In particular
+        // this is the guard before a plain lexical assignment. Keep independent Pop entries
+        // intact.
         if fast & (8 | 64) == (8 | 64) {
             if let Some(slot) = local_read_discard_pair(ops, pc, &targeted) {
                 emit_discard_local_read(&mut a, slot as u32 * 8, pc as u32, l_unwind);
@@ -5077,7 +5078,7 @@ fn emit_residency_mark(a: &mut asm::Asm, residency: u64, enter: bool) {
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod x64;
 
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_exec_memory_tests.rs"]
 mod exec_memory_tests;
 
@@ -5091,13 +5092,13 @@ mod call_epoch_tests;
 ))]
 #[path = "native_array_local_tests.rs"]
 mod native_array_local_tests;
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_numeric_array_tests.rs"]
 mod numeric_array_tests;
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_property_store_tests.rs"]
 mod property_store_tests;
-#[cfg(all(test, not(all(feature = "gc-heap", target_arch = "x86_64"))))]
+#[cfg(test)]
 #[path = "jit_return_tests.rs"]
 mod return_tests;
 
@@ -12338,9 +12339,10 @@ fn emit_packed_stack_encode(a: &mut asm::Asm, off: i32, slow: usize) {
 /// Inline fused element access where the receiver lives in a *parameter* slot
 /// ([`crate::bytecode::Op::GetElemLocal`] and friends): like [`emit_get_elem_inline`] /
 /// [`emit_set_elem_inline`] but the receiver is read straight out of the slot — it never crosses
-/// the operand stack, so there is no receiver clone/drop refcounting at all (the slot's own
-/// reference keeps it alive; no user code runs inside the fast path). A non-Obj slot (including
-/// a defensive TDZ Empty) falls to the checked helper, which re-runs the op generically.
+/// the operand stack, so no receiver word is copied or dropped at all (the slot holds it, and
+/// the collector traces the slot; no user code runs inside the fast path). A non-Obj slot
+/// (including a defensive TDZ Empty) falls to the checked helper, which re-runs the op
+/// generically.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13621,8 +13623,9 @@ fn emit_chain_marked(
             }
             ChainOp::LoadProp(off, st) => {
                 // Receiver-direct compact property probe. Unlike the ordinary property
-                // template, a successful read never materializes a wide Value or adjusts a
-                // refcount: the numeric payload enters the chain's FP register stack directly.
+                // template, a successful read never materializes a wide Value or pushes the
+                // property's word: the numeric payload enters the chain's FP register stack
+                // directly.
                 #[cfg(all(test, target_arch = "aarch64"))]
                 if off == u32::MAX {
                     TEST_THIS_CHAIN_OPS.with(|ops| ops.set(ops.get() + 1));
@@ -17144,8 +17147,9 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     }
 }
 
-/// gc-heap: whether a call to helper `idx` through [`emit_op_helper`] ends in the explicit poll
-/// (see [`emit_helper_end_poll`]). The census of helper families:
+/// gc-heap: whether a call to helper `idx` ends in the explicit poll, in either backend: ARM64's
+/// `emit_op_helper` (see `emit_helper_end_poll`) and x64's `Asm::helper_spflag` (see
+/// `x64::Asm::helper_end_poll`). The census of helper families:
 /// - Polled after their call: the ones that can allocate cells without reaching a safepoint
 ///   (`gc_check`, `gc_check_amortized` or a call into JavaScript) before they return, or that
 ///   reach one only before allocating: `exec` (generic operations), `make_object`,
@@ -17161,11 +17165,7 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
 ///   `direct_finish` runs inside a direct call, whose site polls at its end (a tail call goes
 ///   through `gc_check_amortized` first); `slice_op` ends the native slice, and the code that
 ///   resumes or receives it polls; `interrupt` is the poll.
-#[cfg(all(
-    feature = "gc-heap",
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+#[cfg(feature = "gc-heap")]
 fn helper_ends_in_poll(idx: usize) -> bool {
     matches!(
         idx,
@@ -17568,8 +17568,9 @@ fn emit_cond_imm(a: &mut asm::Asm, mode: u32, l_unwind: usize) {
 }
 
 /// Non-owning conditional check for the short-circuit peek ops. ToBoolean cannot throw and the
-/// value stays on the operand stack, so common tags need neither refcount traffic nor a helper
-/// transition. BigInt and a possible HTMLDDA object retain the canonical helper path.
+/// value stays on the operand stack, where the collector traces it (the word owns nothing), so
+/// common tags need no helper transition. BigInt and a possible HTMLDDA object retain the
+/// canonical helper path.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")

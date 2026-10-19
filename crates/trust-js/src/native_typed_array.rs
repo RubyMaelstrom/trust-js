@@ -240,10 +240,6 @@ mod tests {
         }
     }
 
-    #[cfg_attr(
-        all(feature = "gc-heap", target_arch = "x86_64"),
-        ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-    )]
     #[test]
     fn native_typed_array_writes_publish_versions_ranges_and_survive_throws() {
         let mut engine = Engine::new();

@@ -60,10 +60,6 @@ fn check(source: &str, expected: &str) {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() {
@@ -132,10 +128,6 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn checked_calls_use_creation_realm_after_host_environment_replacement() {
@@ -229,10 +221,6 @@ fn checked_calls_use_creation_realm_after_host_environment_replacement() {
     engine.interp.gc_collect();
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
@@ -301,10 +289,6 @@ fn checked_calls_borrow_last_callee_owner_through_gc_return_and_throw() {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments() {
@@ -369,10 +353,6 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn proxies_do_not_disable_ordinary_call_and_construct_cache_fill() {
@@ -442,7 +422,7 @@ fn fresh_closure_call_cache_uses_the_live_function_identity() {
             var replacement = factory('replacementClosure');
         "#,
         );
-        if matches!(tier.admitted(), Tier::Jit) {
+        if matches!(tier, Tier::Jit) {
             let driver = chunk(&mut engine, "drive");
             let original = object(&mut engine, "original");
             let entry = driver

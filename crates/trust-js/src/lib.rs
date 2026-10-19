@@ -911,11 +911,9 @@ impl Engine {
     /// Select the execution tier (see [`bytecode::Tier`]). `Interp` never touches any codegen
     /// path; `Bytecode` compiles eligible functions after
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls; `Jit` is the default and lowers
-    /// eligible bytecode to native code where the backend supports the host architecture. The
-    /// engine runs [`bytecode::Tier::admitted`] for the request: a gc-heap build keeps x86-64 on
-    /// the bytecode VM.
+    /// eligible bytecode to native code where the backend supports the host architecture.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
-        self.interp.tier = tier.admitted();
+        self.interp.tier = tier;
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).

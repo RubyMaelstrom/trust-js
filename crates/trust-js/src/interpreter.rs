@@ -4187,14 +4187,22 @@ pub(crate) const WASM_EXECUTION_DEPTH_GUARD: u32 = 128;
 /// https://tc39.es/ecma262/multipage/executable-code-and-execution-contexts.html#sec-execution-contexts
 /// https://tc39.es/ecma262/multipage/ecmascript-language-functions-and-classes.html#sec-preparefortailcall
 #[cfg(not(target_arch = "wasm32"))]
-const EXECUTION_STACK_RED_ZONE: usize = 1024 * 1024;
+pub(crate) const EXECUTION_STACK_RED_ZONE: usize = 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const EXECUTION_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 // Host resource policy, not a language recursion-depth limit. The original thread stack is
 // owned by the embedder; TRust JS may add at most 512 MiB of simultaneously live native segments.
 // This also accommodates the existing 4096-call stress case with large unoptimized VM frames.
 #[cfg(not(target_arch = "wasm32"))]
-const MAX_EXECUTION_STACK_SEGMENTS: usize = 64;
+pub(crate) const MAX_EXECUTION_STACK_SEGMENTS: usize = 64;
+/// A call path checks for exhaustion ([`execution_stack_exhausted`]) and then reaches its growth
+/// checkpoint ([`with_execution_stack`]) at the same depth but a little deeper on the stack: in
+/// the frame that holds the call's continuation, inside the closures that move its arguments. At
+/// the segment cap the check keeps this margin above the red zone, which bounds those frames,
+/// so a path that passes the check still finds the red zone free at its checkpoint and needs no
+/// segment there.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const EXECUTION_STACK_CHECK_MARGIN: usize = 256 * 1024;
 /// The most trapless Proxy forwards that may nest. Each forwards natively, without a JavaScript
 /// frame, so the whole native stack budget would allow hundreds of thousands, and an unbounded
 /// chain (a Proxy on its own target's prototype chain, which fingerprinting scripts probe for
@@ -4217,6 +4225,10 @@ const EXECUTION_STACK_CHECK_MASK: u32 = 7;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
     static EXECUTION_STACK_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Checkpoints that found the red zone reached with the segment cap reached (see
+    /// [`with_execution_stack`]).
+    static EXECUTION_STACK_CAPPED_CHECKPOINTS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -4229,9 +4241,30 @@ pub(crate) fn execution_stack_segments() -> usize {
     EXECUTION_STACK_SEGMENTS.with(std::cell::Cell::get)
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn execution_stack_capped_checkpoints() -> u64 {
+    EXECUTION_STACK_CAPPED_CHECKPOINTS.with(std::cell::Cell::get)
+}
+
+/// Run `f` with this thread's live segment count set to `segments`, restored afterwards: the
+/// accounting at and below the cap, without allocating the segments.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn with_execution_stack_segments<R>(segments: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXECUTION_STACK_SEGMENTS.with(|live| live.set(self.0));
+        }
+    }
+    let _restore = Restore(EXECUTION_STACK_SEGMENTS.with(|live| live.replace(segments)));
+    f()
+}
+
 /// Check before entering a call (and before moving its owned JIT arguments). Leave the red
-/// zone available for error construction and unwinding. The caller must preserve normal
-/// argument/frame cleanup on failure, just as for any other abrupt completion.
+/// zone available for error construction and unwinding, and at the segment cap the margin above
+/// it for the frames between this check and the call's growth checkpoint
+/// ([`EXECUTION_STACK_CHECK_MARGIN`]). The caller must preserve normal argument/frame cleanup on
+/// failure, just as for any other abrupt completion.
 #[inline]
 pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
     #[cfg(target_arch = "wasm32")]
@@ -4241,8 +4274,9 @@ pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
         (depth == 1 || depth & EXECUTION_STACK_CHECK_MASK == 0)
             && EXECUTION_STACK_SEGMENTS.with(|segments| {
                 segments.get() >= MAX_EXECUTION_STACK_SEGMENTS
-                    && stacker::remaining_stack()
-                        .is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE)
+                    && stacker::remaining_stack().is_none_or(|remaining| {
+                        remaining < EXECUTION_STACK_RED_ZONE + EXECUTION_STACK_CHECK_MARGIN
+                    })
             })
     }
 }
@@ -4267,6 +4301,17 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
             if stacker::remaining_stack()
                 .is_none_or(|remaining| remaining < EXECUTION_STACK_RED_ZONE)
             {
+                if EXECUTION_STACK_SEGMENTS.with(std::cell::Cell::get)
+                    >= MAX_EXECUTION_STACK_SEGMENTS
+                {
+                    // At the cap no segment is added: the call runs on this stack, whose red
+                    // zone holds the contexts up to the next checkpoint, where the exhaustion
+                    // check reports the RangeError. The check's margin keeps a path that checks
+                    // first from getting here; tests count the checkpoints that do.
+                    #[cfg(test)]
+                    EXECUTION_STACK_CAPPED_CHECKPOINTS.with(|capped| capped.set(capped.get() + 1));
+                    return f();
+                }
                 // Pair native segment allocation with its lifetime, including Rust unwinding.
                 // All execution entry points check exhaustion before moving frame ownership.
                 struct SegmentGuard;
@@ -4275,10 +4320,7 @@ pub(crate) fn with_execution_stack<R>(depth: u32, f: impl FnOnce() -> R) -> R {
                         EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() - 1));
                     }
                 }
-                EXECUTION_STACK_SEGMENTS.with(|segments| {
-                    debug_assert!(segments.get() < MAX_EXECUTION_STACK_SEGMENTS);
-                    segments.set(segments.get() + 1);
-                });
+                EXECUTION_STACK_SEGMENTS.with(|segments| segments.set(segments.get() + 1));
                 let _guard = SegmentGuard;
                 return grow_stack(EXECUTION_STACK_SEGMENT, f);
             }
@@ -5359,8 +5401,7 @@ impl Interp {
                 Ok("interp") => crate::bytecode::Tier::Interp,
                 Ok("bytecode") => crate::bytecode::Tier::Bytecode,
                 _ => crate::bytecode::Tier::Jit,
-            }
-            .admitted(),
+            },
             tier_threshold: std::env::var("TRUST_JS_TIER_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())

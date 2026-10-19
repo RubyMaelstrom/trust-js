@@ -48,7 +48,7 @@ fn check(source: &str, expected: &str, whole_frame: bool) {
                 any(target_arch = "aarch64", target_arch = "x86_64"),
                 any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
-            if matches!(tier.admitted(), Tier::Jit) {
+            if matches!(tier, Tier::Jit) {
                 assert!(
                     crate::jit::TEST_OSR_ENTRIES.with(|count| count.get()) > 0,
                     "hot current invocation must enter native code"
@@ -238,10 +238,6 @@ fn install_native(engine: &mut Engine, name: &str, callback: crate::value::Nativ
     );
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn recursive_borrowed_parameter_scopes_keep_both_live_activations() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -253,21 +249,21 @@ fn recursive_borrowed_parameter_scopes_keep_both_live_activations() {
             "enableTier",
             match tier {
                 Tier::Interp => |i, _, _| {
-                    i.tier = Tier::Interp.admitted();
+                    i.tier = Tier::Interp;
                     Ok(crate::value::Value::Undefined)
                 },
                 Tier::Bytecode => |i, _, _| {
-                    i.tier = Tier::Bytecode.admitted();
+                    i.tier = Tier::Bytecode;
                     Ok(crate::value::Value::Undefined)
                 },
                 Tier::Jit => |i, _, _| {
-                    i.tier = Tier::Jit.admitted();
+                    i.tier = Tier::Jit;
                     Ok(crate::value::Value::Undefined)
                 },
             },
         );
         install_native(&mut engine, "enterInterpreter", |i, _, _| {
-            i.tier = Tier::Interp.admitted();
+            i.tier = Tier::Interp;
             Ok(crate::value::Value::Undefined)
         });
         reset_counts();
@@ -360,10 +356,6 @@ fn check_fragment(source: &str, expected: &str) {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn sloppy_fragments_publish_parameter_objects_before_parked_handlers() {
     check_fragment("var saved;var receiver={get value(){var before=Object.getOwnPropertyDescriptor(saved,'0').value;saved[0]={tag:before};return 0;}};function f(n){saved=arguments;try{for(var k=0;k<3000;k++){n++;if(k===1500){void receiver.value;if(n.tag!==1501)throw 'publication';n=n.tag;}}}finally{if(n!==3000||saved[0]!==3000)throw 'outer finally';}return n+':'+saved[0];}f(0);", "3000:3000");
@@ -373,10 +365,6 @@ fn sloppy_fragments_publish_parameter_objects_before_parked_handlers() {
     check_fragment("function change(){f.arguments[0]=7;return 0;}function f(n){try{for(var k=0;k<3000;k++){n++;if(k===1500){var C=class{[n+(change(),0)](){}};}}}finally{if(n!==1506)throw 'projection';}return n+':'+f.arguments[0];}f(0);", "1506:1506");
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn sloppy_fragments_keep_shadowed_and_captured_lexical_homes_distinct() {
     check_fragment("function change(){f.arguments[0]=7;}function f(n){var inside;try{let n=2;for(let k=0;k<3000;k++){n++;if(k===1500)change();}inside=n;}finally{if(n!==7)throw 'outer parameter';}return inside+':'+n+':'+f.arguments[0];}f(0);", "3002:7:7");
@@ -384,10 +372,6 @@ fn sloppy_fragments_keep_shadowed_and_captured_lexical_homes_distinct() {
     check_fragment("function f(n){var args=arguments,inside;try{let n=2;const read=()=>n;for(let k=0;k<3000;k++){n++;if(k===1500){args[0]=7;if(read()!==1503)throw 'captured shadow';}}inside=read();}finally{if(n!==7)throw 'outer parameter';}return inside+':'+n+':'+args[0];}f(0);", "3002:7:7");
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn sloppy_fragment_aliases_follow_nested_labels_and_finally_completions() {
     check_fragment("var outerCleanup=0;function f(n){var args=arguments,cleaned=0;try{outer:for(let k=0;k<3000;k++){n++;try{if(k===1500)args[0]=7;if(k%2===0)continue outer;if(k===2201)break outer;}finally{cleaned++;}}}finally{outerCleanup++;if(n!==708||args[0]!==708)throw 'parked finally';}return n+':'+args[0]+':'+cleaned+':'+outerCleanup;}f(0);", "708:708:2202:1");
@@ -396,10 +380,6 @@ fn sloppy_fragment_aliases_follow_nested_labels_and_finally_completions() {
     check_fragment("function f(n){var args=arguments,cleaned=0;block:{try{for(var k=0;k<3000;k++){n++;if(k===2200)break block;}}finally{cleaned++;args[0]++;if(n!==2202)throw 'external break';}}return n+':'+args[0]+':'+cleaned;}f(0);", "2202:2202:1");
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn constructor_migration_keeps_reflect_new_target_and_return_rules() {
     check("var saved;function change(){saved=F.arguments;saved[0]=7;}function F(n){for(let k=0;k<3000;k++){n++;if(k===1500)change();}this.value=n;this.target=new.target;return 17;}function Other(){}var result=Reflect.construct(F,[0],Other);[result.value,result.target===Other,Object.getPrototypeOf(result)===Other.prototype,saved[0]].join(':');", "1506:true:true:1506", true);
@@ -408,10 +388,6 @@ fn constructor_migration_keeps_reflect_new_target_and_return_rules() {
     check_fragment("var saved;function F(n){saved=F.arguments;try{for(let k=0;k<3000;k++){n++;if(k===2200){this.value=n;return 17;}}}finally{this.cleaned=n===2201;saved[0]=8;this.after=n;}}var result=new F(0);[result.value,result.cleaned,result.after,saved[0]].join(':');", "2201:true:8:8");
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn derived_constructor_loops_preserve_their_established_completion_path() {
     check_fragment("class Base{}class Derived extends Base{constructor(n){for(let k=0;k<3000;k++)n++;return {value:n,target:new.target};}}var result=new Derived(0);[result.value,result.target===Derived].join(':');", "3000:true");
@@ -475,10 +451,6 @@ fn sloppy_fragment_aliases_retire_on_collection_and_host_interruption() {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     let mut engine = Engine::new();
@@ -519,10 +491,6 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     }
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -633,10 +601,6 @@ thread_local! {
     };
 }
 
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn generic_native_promotion_uses_the_callees_running_realm() {
     use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global};

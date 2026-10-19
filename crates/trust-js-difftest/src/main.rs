@@ -153,8 +153,8 @@ fn run_tier(src: &str, tier: Tier) -> Outcome {
 fn diverges(src: &str) -> bool {
     let oracle = run_tier(src, Tier::Interp);
     // The tree-walker is the reference: both compiled tiers must match it (Jit exercises the
-    // machine-code templates + register chains on aarch64 and degrades to the bytecode VM
-    // elsewhere, or where the build does not admit it — still a valid, if redundant, comparison).
+    // machine-code templates on aarch64 and x86-64, with register chains on aarch64, and
+    // degrades to the bytecode VM elsewhere — still a valid, if redundant, comparison).
     oracle != run_tier(src, Tier::Bytecode) || oracle != run_tier(src, Tier::Jit)
 }
 
@@ -720,12 +720,6 @@ fn fuzz_parent(args: Vec<String>) {
     }
     let exe = std::env::current_exe().unwrap();
     let tmp = std::env::temp_dir().join(format!("difftest-{}.js", std::process::id()));
-    if Tier::Jit.admitted() != Tier::Jit {
-        println!(
-            "note: the jit tier is not available in this build and runs as {:?}",
-            Tier::Jit.admitted()
-        );
-    }
 
     // Replay the regression corpus first — old divergences must stay fixed forever.
     if corpus.is_dir() {

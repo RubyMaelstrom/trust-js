@@ -88,8 +88,8 @@ fn compiled_tail_mutual_recursion_retires_vm_and_native_frames() {
             ),
             "20007"
         );
-        assert_compiled(&mut engine, "even", matches!(tier.admitted(), Tier::Jit));
-        assert_compiled(&mut engine, "odd", matches!(tier.admitted(), Tier::Jit));
+        assert_compiled(&mut engine, "even", matches!(tier, Tier::Jit));
+        assert_compiled(&mut engine, "odd", matches!(tier, Tier::Jit));
         assert!(engine.interp.pending_tail.is_none());
     }
 }
@@ -165,7 +165,7 @@ fn compiled_tail_expression_forms_and_optional_receivers() {
                 "2048",
                 "{tier:?}: {expression}"
             );
-            assert_compiled(&mut engine, "next", matches!(tier.admitted(), Tier::Jit));
+            assert_compiled(&mut engine, "next", matches!(tier, Tier::Jit));
         }
         let mut engine = engine(tier);
         assert_eq!(
@@ -182,8 +182,8 @@ fn compiled_tail_expression_forms_and_optional_receivers() {
             ),
             "|||41|1"
         );
-        assert_compiled(&mut engine, "missing", matches!(tier.admitted(), Tier::Jit));
-        assert_compiled(&mut engine, "method", matches!(tier.admitted(), Tier::Jit));
+        assert_compiled(&mut engine, "missing", matches!(tier, Tier::Jit));
+        assert_compiled(&mut engine, "method", matches!(tier, Tier::Jit));
     }
 }
 
@@ -208,12 +208,8 @@ fn compiled_tail_call_order_and_throwing_callee() {
             ),
             "get,arg,TypeError|43|43"
         );
-        assert_compiled(&mut engine, "invoke", matches!(tier.admitted(), Tier::Jit));
-        assert_compiled(
-            &mut engine,
-            "transfer",
-            matches!(tier.admitted(), Tier::Jit),
-        );
+        assert_compiled(&mut engine, "invoke", matches!(tier, Tier::Jit));
+        assert_compiled(&mut engine, "transfer", matches!(tier, Tier::Jit));
         assert!(engine.interp.pending_tail.is_none());
     }
 }
@@ -264,11 +260,7 @@ fn compiled_tail_finalizers_catches_and_empty_disposal_boundaries_transfer() {
             ),
             "10"
         );
-        assert_compiled(
-            &mut engine,
-            "fromCatch",
-            matches!(tier.admitted(), Tier::Jit),
-        );
+        assert_compiled(&mut engine, "fromCatch", matches!(tier, Tier::Jit));
         assert_compiled(&mut engine, "fromFinally", false);
         assert_compiled(&mut engine, "beforeUsing", false);
     }
@@ -294,7 +286,7 @@ fn compiled_tail_constructor_results_do_not_escape_to_the_caller() {
             ),
             "true"
         );
-        assert_compiled(&mut engine, "C", matches!(tier.admitted(), Tier::Jit));
+        assert_compiled(&mut engine, "C", matches!(tier, Tier::Jit));
         assert!(engine.interp.pending_tail.is_none());
     }
 }
@@ -322,7 +314,7 @@ fn compiled_tail_spreads_templates_and_cross_tier_calls() {
         );
         assert_compiled(&mut engine, "spread", false);
         assert_compiled(&mut engine, "tagged", false);
-        assert_compiled(&mut engine, "rebound", matches!(tier.admitted(), Tier::Jit));
+        assert_compiled(&mut engine, "rebound", matches!(tier, Tier::Jit));
         assert!(engine.interp.pending_tail.is_none());
     }
 }
@@ -349,12 +341,8 @@ fn compiled_tail_general_entry_and_overridden_eval_retire_frames() {
             ),
             "8192"
         );
-        assert_compiled(&mut engine, "rest", matches!(tier.admitted(), Tier::Jit));
-        assert_compiled(
-            &mut engine,
-            "destructure",
-            matches!(tier.admitted(), Tier::Jit),
-        );
+        assert_compiled(&mut engine, "rest", matches!(tier, Tier::Jit));
+        assert_compiled(&mut engine, "destructure", matches!(tier, Tier::Jit));
         assert_compiled(&mut engine, "direct", false);
         assert!(engine.interp.pending_tail.is_none());
     }

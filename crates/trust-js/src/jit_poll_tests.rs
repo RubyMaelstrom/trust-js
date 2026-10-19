@@ -1,9 +1,11 @@
-//! The native JIT's polls see the cell heap's "collection due" (P1 S5 step 7b; gc-heap, ARM64):
-//! its byte budget, stress interval and deferred requests, none of which moves the live-object
-//! count, through the due word beside that count (`value::LiveCount`). Entry and loop polls take
-//! their slow path while the word is set, a general region's backedge guard bails to its
-//! canonical header, and in baseline code the calls of allocating helpers end in an explicit
-//! poll (`jit::emit_helper_end_poll`).
+//! The native JIT's polls see the cell heap's "collection due" (P1 S5 step 7b; gc-heap; ARM64,
+//! and x86-64 from S6 step 7): its byte budget, stress interval and deferred requests, none of
+//! which moves the live-object count, through the due word beside that count
+//! (`value::LiveCount`). Entry and loop polls take their slow path while the word is set, a
+//! general region's backedge guard bails to its canonical header (ARM64), and in baseline code
+//! the calls of allocating helpers end in an explicit poll (`jit::emit_helper_end_poll`,
+//! `x64::Asm::helper_end_poll`). x64 has no regions and no direct call sequence: its loops run
+//! in baseline code and its calls through the checked helper.
 //!
 //! The programs run at `Tier::Jit` with collections on and, in debug builds, the heap verifier
 //! after every marking. Each counts the
@@ -56,6 +58,18 @@ fn assert_due_word(i: &Interp) {
     );
 }
 
+/// Region entries so far on this thread (`regions::executed_regions`); x64 has no regions.
+fn executed_regions() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::regions::executed_regions()
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        0
+    }
+}
+
 /// Run `f` with helper-end polls off for every chunk this thread compiles meanwhile.
 fn without_end_polls<R>(f: impl FnOnce() -> R) -> R {
     struct Restore;
@@ -80,8 +94,8 @@ fn measured(engine: &mut Engine, source: &str) -> (String, PollCensus) {
 /// calls collects on (nearly) every iteration. `wide` runs in baseline code (its 16-element
 /// literal is deeper than a region's operand stack): with helper-end polls each allocation is
 /// collected where its helper returns, with them off at the loop header's poll, which now sees
-/// the due word. `narrow` runs as a general region, whose backedge bails to the canonical
-/// header's poll either way.
+/// the due word. On ARM64 `narrow` runs as a general region, whose backedge bails to the
+/// canonical header's poll either way; on x86-64 it runs in baseline code, as `wide` does.
 #[test]
 fn loop_only_code_collects_every_iteration_at_stress_1() {
     const SOURCE: &str = r#"
@@ -111,11 +125,11 @@ fn loop_only_code_collects_every_iteration_at_stress_1() {
             assert_native(&mut engine, &["wide", "narrow"]);
             stress(&engine.interp, 1);
             ["wide", "narrow"].map(|function| {
-                let entries = super::regions::executed_regions();
+                let entries = executed_regions();
                 let (result, census) = measured(&mut engine, &format!("{function}({N});"));
                 assert_eq!(result, (N * (N - 1) / 2).to_string());
                 assert_due_word(&engine.interp);
-                (census, super::regions::executed_regions() - entries)
+                (census, executed_regions() - entries)
             })
         };
         let [(wide, wide_regions), (narrow, narrow_regions)] = if end_polls {
@@ -125,27 +139,39 @@ fn loop_only_code_collects_every_iteration_at_stress_1() {
         };
         eprintln!("loop-only, end polls {end_polls}: wide {wide:?}, narrow {narrow:?}");
         assert_eq!(wide_regions, 0, "wide runs in baseline code");
-        assert!(narrow_regions >= N - 2, "narrow re-enters its region");
         for census in [wide, narrow] {
             assert!(
                 census.collections[LOOP] + census.collections[END] >= N - 2,
                 "a collection per iteration: {census:?}"
             );
         }
-        assert!(narrow.collections[LOOP] >= N - 2, "{narrow:?}");
-        if end_polls {
-            // The object's and the array's helpers: two collections per iteration.
-            assert!(wide.collections[END] >= 2 * N - 2, "{wide:?}");
-        } else {
-            assert_eq!(wide.calls[END], 0, "{wide:?}");
-            assert!(wide.collections[LOOP] >= N - 2, "{wide:?}");
+        #[cfg(target_arch = "aarch64")]
+        let baseline = {
+            assert!(narrow_regions >= N - 2, "narrow re-enters its region");
+            assert!(narrow.collections[LOOP] >= N - 2, "{narrow:?}");
+            [wide]
+        };
+        #[cfg(target_arch = "x86_64")]
+        let baseline = {
+            assert_eq!(narrow_regions, 0, "narrow runs in baseline code");
+            [wide, narrow]
+        };
+        for census in baseline {
+            if end_polls {
+                // The object's and the array's helpers: two collections per iteration.
+                assert!(census.collections[END] >= 2 * N - 2, "{census:?}");
+            } else {
+                assert_eq!(census.calls[END], 0, "{census:?}");
+                assert!(census.collections[LOOP] >= N - 2, "{census:?}");
+            }
         }
     }
 }
 
-/// (2) Call-only code at stress 1: loop-free recursion through direct calls. With helper-end
-/// polls off, the object each level allocates is collected at the next callee's entry poll,
-/// the direct call's safepoint; with them on, where the allocating helper returns.
+/// (2) Call-only code at stress 1: loop-free recursion through direct calls (on x86-64 through
+/// the checked call helper). With helper-end polls off, the object each level allocates is
+/// collected at the next callee's entry poll, the direct call's safepoint; with them on, where
+/// the allocating helper returns.
 #[test]
 fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
     const SOURCE: &str = r#"
@@ -166,9 +192,17 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
             settle(&mut engine, "make");
             settle(&mut engine, "down");
             stress(&engine.interp, 1);
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (result, census) = measured(&mut engine, &format!("down({N});"));
+                assert_eq!(result, (N * (N + 1) / 2).to_string());
+                assert_due_word(&engine.interp);
+                census
+            }
             // A concurrent test can exhaust the call-cache epoch, which sends calls through
             // the checked helper until their sites refill: measure a round that returned
             // through the direct sequence at every level.
+            #[cfg(target_arch = "aarch64")]
             for _ in 0..100 {
                 super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
                 let (result, census) = measured(&mut engine, &format!("down({N});"));
@@ -178,6 +212,7 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
                     return census;
                 }
             }
+            #[cfg(target_arch = "aarch64")]
             panic!("down({N}) never returned through direct calls");
         };
         let census = if end_polls {
@@ -190,7 +225,11 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
             assert!(census.collections[END] >= N - 2, "{census:?}");
         } else {
             assert_eq!(census.calls[END], 0, "{census:?}");
-            assert!(census.collections[ENTRY] >= N - 2, "{census:?}");
+            // x64's calls run through the call helper, whose amortized safepoint collects at
+            // every call under TRUST_JS_GC_STRESS, ahead of the callee's entry poll.
+            if cfg!(target_arch = "aarch64") || !crate::gc_test::stress_active() {
+                assert!(census.collections[ENTRY] >= N - 2, "{census:?}");
+            }
         }
     }
 }
@@ -267,8 +306,8 @@ fn a_spent_byte_budget_collects_within_one_poll() {
 /// in the native `deferred()`) is honoured at the next poll, of each kind: in baseline code the
 /// end of the native's call (`once`, `viaEntry`); with helper-end polls off the next callee's
 /// entry (`viaEntry`) or, when `once` returns with no poll after the request, the next
-/// activation's entry; in a region loop the header its backedge bails to (`honoured`).
-/// `count()` reads the collections run so far.
+/// activation's entry; in a loop (on ARM64 a region loop) the header its backedge reaches
+/// (`honoured`). `count()` reads the collections run so far.
 #[test]
 fn a_deferred_request_is_honoured_at_the_next_poll() {
     fn deferred(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
@@ -309,7 +348,7 @@ fn a_deferred_request_is_honoured_at_the_next_poll() {
             eval(&mut engine, SOURCE);
             assert_native(&mut engine, &["once", "next", "viaEntry", "honoured"]);
             settle(&mut engine, "next");
-            let regions = super::regions::executed_regions();
+            let regions = executed_regions();
             let calls = [
                 "viaEntry();",
                 &format!("honoured({N});"),
@@ -321,7 +360,7 @@ fn a_deferred_request_is_honoured_at_the_next_poll() {
                 assert_due_word(&engine.interp);
                 (result, census)
             });
-            (calls, super::regions::executed_regions() > regions)
+            (calls, executed_regions() > regions)
         };
         let ([via_entry, honoured, once, after], region) = if end_polls {
             measure()
@@ -414,7 +453,9 @@ fn operand_temporaries_survive_helper_end_polls() {
 /// With collections suppressed (`gc_suppressed`) or deferred (a no-GC region) the word stays
 /// set: every backedge bails and every header poll calls the helper, which collects nothing,
 /// yet each bail follows a whole iteration in the region and the loop completes. The request
-/// left pending is honoured at the next poll after the no-GC region ends.
+/// left pending is honoured at the next poll after the no-GC region ends. On x86-64 the loop
+/// runs in baseline code: at stress 1 its object's helper-end poll collects on every iteration,
+/// and while the word stays set its header and end polls call the helper on every iteration.
 #[test]
 fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     const SOURCE: &str = r#"
@@ -433,7 +474,15 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     let mut engine = engine();
     assert_eq!(eval(&mut engine, SOURCE), "3");
     assert_native(&mut engine, &["regionLoop"]);
-    let regions = super::regions::executed_regions;
+    let regions = executed_regions;
+    // The loop's region entries: one per bail on ARM64; none on x86-64.
+    let reentered = |entered: u64| {
+        if cfg!(target_arch = "aarch64") {
+            entered >= N - 2
+        } else {
+            entered == 0
+        }
+    };
 
     stress(&engine.interp, 1);
     let entries = regions();
@@ -441,8 +490,11 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     let entered = regions() - entries;
     eprintln!("region, stress 1: {entered} region entries, {census:?}");
     assert_eq!(result, expected);
-    assert!(entered >= N - 2, "re-entered after each bail: {entered}");
+    assert!(reentered(entered), "re-entered after each bail: {entered}");
+    #[cfg(target_arch = "aarch64")]
     assert!(census.collections[LOOP] >= N - 2, "{census:?}");
+    #[cfg(target_arch = "x86_64")]
+    assert!(census.collections[END] >= N - 2, "{census:?}");
     assert_due_word(&engine.interp);
 
     engine.interp.suspend_gc();
@@ -452,7 +504,7 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
     engine.interp.resume_gc();
     eprintln!("region, suppressed: {entered} region entries, {census:?}");
     assert_eq!(result, expected);
-    assert!(entered >= N - 2, "an iteration per bail: {entered}");
+    assert!(reentered(entered), "an iteration per bail: {entered}");
     assert!(census.calls[LOOP] >= N - 2, "{census:?}");
     assert_eq!(census.collections, [0; 3], "suppressed");
     assert!(crate::value::heap_collection_due(&engine.interp.gc_heap));
@@ -468,7 +520,7 @@ fn a_region_loop_completes_when_the_due_word_makes_it_bail() {
             "region, deferred: {entered} region entries, {:?}",
             outcome.1
         );
-        assert!(entered >= N - 2, "an iteration per bail: {entered}");
+        assert!(reentered(entered), "an iteration per bail: {entered}");
         outcome
     };
     assert_eq!(result, expected);

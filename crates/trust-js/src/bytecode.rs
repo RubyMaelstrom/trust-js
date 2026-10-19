@@ -61,24 +61,6 @@ pub enum Tier {
     Jit,
 }
 
-impl Tier {
-    /// The tier this build runs for a request. Under the P1 gc-heap object model the x86-64
-    /// backend is not ported to the GC heap until S6 step 7, so an x86-64 gc-heap build runs
-    /// `Jit` as `Bytecode`. The ARM64 backend runs it, and on a target without a native backend
-    /// `Jit` runs on the bytecode VM.
-    /// [`Engine::set_tier`] applies it; front ends compare it with the request to say when a
-    /// tier is not available.
-    ///
-    /// [`Engine::set_tier`]: crate::Engine::set_tier
-    pub const fn admitted(self) -> Tier {
-        if cfg!(all(feature = "gc-heap", target_arch = "x86_64")) && matches!(self, Tier::Jit) {
-            Tier::Bytecode
-        } else {
-            self
-        }
-    }
-}
-
 /// Per-site property inline-cache state. `depth == IC_EMPTY` means the site has not cached yet.
 /// Otherwise the property was last found as an own descriptor of the object
 /// `depth` prototype hops above the receiver, at `entries` slot `slot` — and every hop below the

@@ -455,10 +455,6 @@ fn resident_reads_do_not_enter_registry_or_allocate_and_epoch_precedes_retiremen
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-#[cfg_attr(
-    all(feature = "gc-heap", target_arch = "x86_64"),
-    ignore = "P1 S5: needs the JIT; gc-heap keeps x64 on bytecode until S6"
-)]
 #[test]
 fn admission_denial_precedes_actual_ordinary_continuation_and_osr_compilation() {
     const CHILD: &str = "TRUST_JS_TEST_METADATA_ADMISSION_CHILD";

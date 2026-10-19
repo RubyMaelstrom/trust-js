@@ -209,7 +209,7 @@ fn all_tiers(source: &str, expected: &str, required_shapes: &[usize], continuati
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
-        if tier.admitted() == Tier::Jit {
+        if tier == Tier::Jit {
             let counts = TEST_JIT_GET_ELEM_HELPERS.with(std::cell::Cell::get);
             for &shape in required_shapes {
                 assert!(

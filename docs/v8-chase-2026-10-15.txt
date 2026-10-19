@@ -4182,3 +4182,101 @@ Step 7 plan (2026-10-19), from a read-only survey of the x64 JIT at
 - Correction to S5 step 7's entry ("x64 uses no records"): x64's
   moved entries do pop FramePool records. The records are traced, so
   the conclusion stands.
+
+Step 7a, the x64 JIT's polls, the segment fix and the clamp lifted
+(an implementation agent's change, reviewed):
+- Polls (x64, gc-heap), as ARM64's: the entry and loop polls take
+  their slow path while the heap's due word is set, before the
+  count's comparison with gc_next, and the entry poll passes
+  POLL_ENTRY. Every call of an allocating helper ends in the explicit
+  poll (three instructions while the word is clear, else H_INTERRUPT
+  with POLL_HELPER_END): helper_ends_in_poll is now shared by both
+  backends, and H_CALL, H_NEW and string accumulation's committed
+  exit poll at their ends. x64 keeps no value in a caller-saved
+  register across a helper call (r12-r15 hold the context, operand
+  top, helper table and slot base; [rsp] the strict byte), so a
+  poll's collection finds every live word in place.
+- The segment fix (the recorded deviation): at the segment cap the
+  exhaustion check fires within EXECUTION_STACK_CHECK_MARGIN (256
+  KiB) above the red zone, and a growth checkpoint at the cap runs
+  the call on the current stack instead of adding a segment. The
+  debug assertion is gone; tests count the checkpoints that reach
+  the cap. A new test positions the stack exactly, in a thread of
+  its own, and sets the segment count without allocating segments;
+  the exhaustion test asserts that no checkpoint reached the cap, in
+  every tier.
+- The clamp lifted: Tier::admitted deleted with its callers (the
+  engine binary's and difftest's notes, Engine::set_tier and the
+  initial tier, now main's code, and 67 test sites), with the 44
+  ignores and 25 x86-64 compile-out gates.
+- Returning tests: 36 of the 44 ignored tests, the 115 tests of 19
+  compiled-out modules, the long-callback and OSR-prefix tests pass
+  unchanged. The poll, rooting and traced program tests now run on
+  x86-64 too. x64 has no regions and no direct call sequence, so
+  their region counts, direct-return counts and checks of ARM64
+  code stay aarch64-only, and on x86-64 the poll tests assert the
+  baseline forms (both of test 1's loops run in baseline code; under
+  TRUST_JS_GC_STRESS the call helper's own safepoint collects before
+  the callee's entry poll can). 8 tests are ignored until step 7b:
+  x64's names (4) and property (4) template tests, which need the
+  templates x64 still declines under the GC heap.
+- layout_asserts covers x86-64: the JitCtx offsets 0-72 that both
+  backends embed; CallIc, FnFrame and JitCode stay ARM64's.
+- Comments that step 6 left speaking of counts now say what holds:
+  no word owns anything, and the collector traces it.
+- Review: every census helper reaches its poll through helper_spflag.
+  x64's other direct helper calls are H_STRING_ACCUMULATION (it
+  polls explicitly) and, for the census's own reasons, H_COND,
+  H_RETURN, H_PUSH_HANDLER and H_POP_HANDLER (they allocate no cell)
+  and H_UNWIND and H_COMPLETE (they route a completion). A poll
+  clobbers rcx and the flags; through H_INTERRUPT it also sets rax to
+  the canonical sp, which r13 holds, and leaves rdx clear, as the
+  helper's own return did. The clamp's sites now equal main's.
+- Mutation checks on x86-64, each restored exactly: without the
+  due-word test 4 of the 6 poll tests fail, without the end polls 5;
+  with the segment fix undone the new test fails at the margin, and
+  with only the checkpoint's cap undone, at the old assertion.
+- Gates:
+  - aarch64: lib 2230/0/8, its test list step 6's plus the new test;
+    clippy clean in the five configurations; rustfmt clean; the
+    workspace builds with all targets without a diagnostic; without
+    gc-heap the build fails with the same errors as at step 6.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0. The runtime suite ran while the machine's
+    load average was 137 and failed two tests:
+    worker_terminate_aborts_current_synchronous_script (25.4 s
+    against its 5 s bound) and a Postgres adapter test (its client
+    did not connect). The Postgres binary passes on rerun. Of four
+    reruns of the worker test, two took 8.8 and 6.6 s and two 1.7 s.
+    Alternated with a fresh build of 8edc86a0, it passed 8 times in
+    each build (1.6-1.7 s): the bimodal timing step 5's A/B found
+    at step 4. A full rerun (load average 12) gave 182/0/1, as at
+    step 6.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0 (masked md5 65b1faf9, 05a89273, 9cad1fec);
+    difftest 138 agree, 12 skipped, no crash.
+  - Code dumps: vue and react identical to step 0's, plain and with
+    the shared stubs in both modes. djot's differ from step 0's (18,
+    18 and 8 lines) and are identical in all three forms to the
+    parent's (8edc86a0) built with 15 codegen units.
+  - Per-test GC stress with the verifier and poisoning:
+    - aarch64, the 630 tests whose names match the JIT's, the
+      stack's and the tiers' areas: 617 pass at interval 1, the slow
+      lists' 10 at 100 and 3 at 1000.
+    - x86-64 (zombie), the whole lib suite, 2067 tests: 2025 pass
+      and 16 are ignored at interval 1 (3,763 s, the x64 JIT now
+      running under stress); the slow lists' 22 pass at 100 and
+      their 4 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2051/0/16 (aarch64's 8
+    ignores and step 7b's 8), 151 tests more than at step 6.
+    Windows: clippy as its baseline (23 diagnostics); under Wine
+    2044 pass, 3 fail (step 1's snapshot codec tests) and 16 are
+    ignored; the exhaustion test passes with the x64 JIT.
+  - Test262 at --tier=jit on x86-64: 53575/53575, the summary
+    identical to step 1's x86-64 report and to the S5 exit gate's
+    aarch64 report.
+  - Fixtures at --tier=jit on x86-64 (no-LTO release): compiles
+    56/10/160 with aarch64's masked md5s; difftest 138 agree, 12
+    skipped, no crash.
+- Step 7b's scope gains Map and Set receivers in x64's ordinary-
+  object guards (the plan's recorded deviation, before 7b).
