@@ -17,8 +17,7 @@ pub(crate) fn in_frame<R>(f: impl FnOnce() -> R) -> R {
 pub(crate) trait WeakCell {
     /// The referent's address while it is alive.
     fn live_address(&self) -> Option<usize>;
-    /// The referent's heap while it is alive (retention paths: gc-heap only).
-    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+    /// The referent's heap while it is alive (retention paths).
     fn heap(&self) -> Option<crate::value::GcHeap>;
 }
 
@@ -63,7 +62,7 @@ impl WeakCell for crate::interpreter::WeakValue {
     }
 }
 
-/// Reference-counted Rust allocations (symbols, buffers): not cells, but asked the same way.
+/// Reference-counted Rust allocations (code, layouts, heaps): not cells, but asked the same way.
 impl<T> WeakCell for std::rc::Weak<T> {
     fn live_address(&self) -> Option<usize> {
         self.upgrade()
@@ -250,13 +249,10 @@ impl HiddenAddress {
 pub(crate) fn stress_active() -> bool {
     #[cfg(feature = "gc-heap")]
     return crate::interpreter::gc_collect::gc_stress() != 0;
-    #[cfg(not(feature = "gc-heap"))]
-    false
 }
 
 /// The JavaScript values a test's native closure captures, reported for it
-/// (`NativeCaptures::Reported`; its users are gc-heap tests).
-#[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
+/// (`NativeCaptures::Reported`).
 pub(crate) struct CapturedValues(pub(crate) Vec<crate::value::Value>);
 
 impl crate::value::NativeCallableRetained for CapturedValues {

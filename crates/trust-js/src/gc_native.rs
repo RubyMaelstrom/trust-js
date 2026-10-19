@@ -74,14 +74,9 @@ impl NativeGcGraph {
     }
 
     pub(crate) fn native_to_js(&mut self, from: NativeGcId, value: &Value) {
-        // Every cell a value holds is an edge under gc-heap; reference counts keep primitive
-        // payloads alive otherwise, so only objects are graph targets.
+        // Every cell a value holds is an edge, primitive payload cells included.
         #[cfg(feature = "gc-heap")]
         let target = value.cell_word().map(|word| word as usize);
-        #[cfg(not(feature = "gc-heap"))]
-        let target = value
-            .as_obj()
-            .map(|object| crate::value::Gc::as_ptr(object) as usize);
         if let Some(target) = target {
             let from = self.index(from);
             let next = self.heads[from];
@@ -181,7 +176,6 @@ mod tests {
         fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
             assert!(visitor.supports_native());
             for (id, value) in self.values.iter().enumerate() {
-                visitor.internal(value);
                 visitor.js_to_native(value, node(5, id));
                 visitor.native_to_js(node(5, id), value);
             }

@@ -345,8 +345,9 @@ impl Interp {
         }
     }
 
-    /// ECMA-262's atomic weak-clearing phase. Collector-proven cycles and acyclic destructor
-    /// notifications share this path. Never invoke author code here or while a queue is borrowed.
+    /// ECMA-262's atomic weak-clearing phase, for the objects a collection found dead and the
+    /// death notifications queued so far. Never invoke author code here or while a queue is
+    /// borrowed.
     pub(crate) fn gc_clear_weak_targets(&mut self, dead: &FastSet<usize>) {
         #[cfg(test)]
         {
@@ -358,8 +359,8 @@ impl Interp {
         self.gc_drain_weak_deaths();
     }
 
-    /// Also called after snapshots/strong edges are released: symbols and acyclic descendants
-    /// can die during that phase, so a single pre-sweep drain is insufficient.
+    /// Also called after the sweep: finalizers (an object's, a Symbol's) queue death
+    /// notifications as cells are freed, so a single pre-sweep drain is insufficient.
     #[inline(never)]
     pub(crate) fn gc_drain_weak_deaths(&mut self) {
         loop {
@@ -758,8 +759,7 @@ mod tests {
                     }
                 );
                 eval(&mut engine, &source, "true");
-                // Reference counting frees the acyclic target as the job ends; a tracing heap
-                // (gc-heap) reclaims it at a collection.
+                // The collection reclaims the target.
                 engine.interp.gc_collect();
                 assert!(
                     engine
@@ -898,8 +898,7 @@ mod tests {
                 if keep_owner { "registry=owner;" } else { "" }
             );
             eval(&mut engine, &source, "0");
-            // The registered Symbols die at once under reference counting; a tracing heap
-            // finds them, with a dead registry's cells, at a collection.
+            // The collection finds the registered Symbols dead, with a dead registry's cells.
             #[cfg(feature = "gc-heap")]
             engine.interp.gc_collect();
             if !stress {

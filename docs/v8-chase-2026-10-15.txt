@@ -3933,3 +3933,105 @@ agent's change, reviewed and amended):
     HostGcVisitor::internal.
   - trust-js-difftest's header still says a dropped Engine leaks its
     realm through the Rc heap; for step 8's documentation pass.
+
+Step 5, the counted handles, payloads and count observers (an
+implementation agent's change, reviewed):
+- Deleted, all cfg(not(gc-heap)) unless noted:
+  - the counted Gc and Env handles (both `mod rc`), and the GC heap's
+    stubs that served only counted code (compiled there): Gc's
+    outlives_release, clone_from_raw and release (a no-op; its five
+    JIT call-path callers now just pop the callee slot), and Env's
+    weak_count, outlives_release and clone_from_raw;
+  - the counted payloads: LStr's buffer and uniqueness-based append,
+    jstr's thread-local interned strings, BigInt's, Symbol's
+    (SymbolRef, WeakSymbol), UserFn, LazyProto, TemplateRoots and the
+    lazy prototype's weak owner;
+  - PackedValue's counted Clone, Drop, drop_word and clone_raw, and
+    replace_raw (compiled in the GC heap for one test);
+  - the VM's string-add retire (in Op::Add, two release helpers, and
+    jit_add_strings);
+  - map_data, and the scope registry with its counted snapshots and
+    teardown;
+  - count observers: the JitOwnership probe, the CALLSTAT "callee
+    refcount" gate, and array destructuring's old-slot checks, which
+    the GC heap compiled and which always passed there;
+  - the counted representations (Fields and BindingEntries as Vec, the
+    u32 slot memo, LiveCount's and rooting's and execution storage's
+    forms) and counted test code.
+- Kept: LStr::strong_count (public; it panics) and WeakGc::weak_count
+  (public; no caller), for step 11. LStr's empty Drop impl, which
+  keeps Value a type with drop glue; removing it changes codegen, and
+  step 12 decides how far values become Copy. The JIT's cfg(not)
+  group and Refcount ownership (step 6), and every positive cfg (step
+  8).
+- No test deleted; the suite's test list is unchanged.
+  packed_raw_frame_moves_and_replacements_preserve_ownership now calls
+  replace_value through the raw word, as replace_raw did.
+- Docs: about 40 sites described counted handles, payloads or cycle
+  collection as current (the module docs of gc_handle, env_handle,
+  lstr and bigint; Engine's collection docs; HostTrace, edge and
+  supports_native; the pins, the task trigger, string append). The
+  review checked them against the code, and also dropped HostTrace's
+  instruction to report handles with `internal` (no effect since step
+  4), with the two test hosts' calls.
+- The build without gc-heap now fails with the compile_error and 85
+  unresolved names from the deleted counted halves, until step 8.
+- Dump check, extended: the shared stubs (direct call, finish stub,
+  intrinsics, name and property ways) are assembled once per process
+  and appear in no per-chunk dump, so a change to them would pass
+  unseen. The dumps also run with TRUST_JS_JIT_CHUNK_STUBS=1 (each
+  chunk carries the stubs) and TRUST_JS_JIT_INLINE_STUBS=1 (stub code
+  at every site). Step 0's and step 4's binaries agree in both modes,
+  for all three fixtures.
+- Gates:
+  - aarch64: lib 2232/0/8, its test list identical to step 4's;
+    clippy clean for embed, embed with architecture-diagnostics,
+    default features, the small build and embed with bench; rustfmt
+    clean; the workspace builds with all targets without a
+    diagnostic.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0; the runtime's below.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0 (masked md5 65b1faf9, 05a89273, 9cad1fec);
+    difftest 138 agree, 12 skipped, no crash.
+  - Code dumps: vue, react and djot identical to step 0's, plain and
+    with the shared stubs in both modes.
+  - Per-test GC stress with the verifier and poisoning:
+    - aarch64, the 266 tests whose names match the changed areas
+      (array binding, string add and append, JIT calls, host GC and
+      the native graph, packed values, strings, symbols, BigInts,
+      lazy prototypes, templates, collections, rooting, stack
+      traces): 263 pass and 1 is ignored at interval 1; the 2 on
+      the slow lists pass at 100.
+    - x86-64 (zombie), the whole lib suite, 1916 tests: 1842 pass
+      and 49 are ignored at interval 1; the slow lists' 21 pass at
+      100 and their 4 at 1000. That is step 4's 1867/0/49.
+  - x86-64 Linux clippy clean. Windows: clippy as its baseline (23
+    diagnostics, none P1's); under Wine 1860 pass, 3 fail, 49
+    ignored, the 3 step 1's snapshot codec tests.
+  - trust-js-runtime (step 4: 182/0/1). The gate's run, on a machine
+    loaded by another session's build, failed worker_terminate_
+    aborts_current_synchronous_script (20.5 s against its 5 s
+    bound); a rerun gave 180/2/1, that test (12.5 s) and dropping_
+    runtime_with_live_listener_is_bounded (750 ms bound). An A/B
+    against a fresh build of step 4, alternating:
+    - Four full suites each. Step 4 failed the listener bound 3
+      times and a Postgres adapter test once. This step failed the
+      listener bound 3 times and the worker bound once, and one run
+      hung in tls_server_accepts_verified_client_and_exchanges_data
+      (killed at 3,600 s), redis_client_connects_over_tls's helper
+      timing out in the same run.
+    - The two bounded tests alone, 10 runs each: the listener test
+      passes in both builds. The worker test takes 4.4-4.9 s or
+      5.2-6.2 s in both, failing 3 times at step 4 and 5 times here
+      (this step's build ran it in 1.7 s three times earlier the
+      same night).
+    - The TLS and Redis test binaries, 5 runs each: Redis passes in
+      both; the TLS server test hung twice at step 4 (killed at
+      300 s), not here.
+    None of the failures is this step's.
+- Open (outside P1; step 4 has them too): the worker test's 5 s
+  bound and the listener test's 750 ms bound fail on a loaded
+  machine, the worker's also on a quiet one; the TLS server test
+  can hang (its server waits for one client, which the test starts
+  after a fixed 750 ms).

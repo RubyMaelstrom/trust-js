@@ -16,16 +16,12 @@ pub(super) struct LazyFunctionPrototype {
     /// The function whose `prototype` this is, for the materialized prototype's `constructor`.
     /// A lazy word lives only in that function's properties (copying one out of its property
     /// materializes it: `PackedValue::clone_materialized`), so the function is alive whenever
-    /// the prototype materializes. gc-heap: a traced edge of
-    /// this cell ([`trace_cell`]). The function and its cell form a cycle that dies in one
-    /// collection, and a stale stack word that conservatively keeps the cell keeps the
-    /// function too. A weak handle would allocate a weak cell per constructor and keep a dead
-    /// constructor's cell reserved for a collection. The default build holds it weakly, since a
-    /// strong `Rc` would be a cycle.
+    /// the prototype materializes. A traced edge of this cell ([`trace_cell`]): the function
+    /// and its cell form a cycle that dies in one collection, and a stale stack word that
+    /// conservatively keeps the cell keeps the function too. A weak handle would allocate a
+    /// weak cell per constructor and keep a dead constructor's cell reserved for a collection.
     #[cfg(feature = "gc-heap")]
     owner: Gc,
-    #[cfg(not(feature = "gc-heap"))]
-    owner: crate::value::WeakGc,
     state: RefCell<State>,
     // Reuse the creation Agent's exact key layout/shape, not whichever Agent first reads it.
     // Keys contain no ECMAScript object edges and do not keep the function/realm alive.
@@ -50,8 +46,6 @@ impl LazyFunctionPrototype {
         Self {
             #[cfg(feature = "gc-heap")]
             owner: *owner,
-            #[cfg(not(feature = "gc-heap"))]
-            owner: Gc::downgrade(owner),
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
             shape: template.shape(),
@@ -77,11 +71,6 @@ impl LazyFunctionPrototype {
             // value reads retain their receiver, including reads while its RefCell is borrowed.
             #[cfg(feature = "gc-heap")]
             let owner = self.owner;
-            #[cfg(not(feature = "gc-heap"))]
-            let owner = self
-                .owner
-                .upgrade()
-                .expect("live function owns deferred prototype");
             props
                 .entries
                 .fields

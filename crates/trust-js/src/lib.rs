@@ -20,8 +20,8 @@
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
 // Under the P1 gc-heap object model handles are `Copy` (S2) and packed words have no drop glue
-// (S5): code shared with the default build still clones, drops or forgets them where an `Rc`
-// handle must be retained or released.
+// (S5): code written for reference-counted handles still clones, drops or forgets them where
+// such a handle was retained or released.
 #![cfg_attr(
     feature = "gc-heap",
     allow(
@@ -85,9 +85,9 @@ mod dense_slot_tests;
 mod env_handle;
 mod eval;
 mod execution_storage;
-/// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
-/// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
-/// library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
+/// The engine's size-class caching allocator, for its many small Rust-heap blocks (spilled
+/// property and binding storage, keys, argument lists, boxed internal state). NOT registered
+/// here: a library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
 /// worker allocations with its own). Binaries opt in:
 /// `#[global_allocator] static A: trust_js::fastalloc::ClassAlloc = trust_js::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
@@ -111,9 +111,9 @@ mod gc_test;
 mod payload_cell_tests;
 mod rooting;
 
-/// Run an embedder entry (a script, a microtask checkpoint) between two stack scrubs (gc-heap):
-/// its frames start without stale cell addresses below the entry, and leave none behind for
-/// whatever the embedder calls next, such as an explicit collection. Free without gc-heap.
+/// Run an embedder entry (a script, a microtask checkpoint) between two stack scrubs: its
+/// frames start without stale cell addresses below the entry, and leave none behind for
+/// whatever the embedder calls next, such as an explicit collection.
 #[inline(never)]
 fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(all(feature = "gc-heap", not(target_arch = "wasm32")))]
@@ -1024,8 +1024,8 @@ pub mod embed {
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state, declaring its
     /// JavaScript captures ([`NativeCaptures`]). For JavaScript captures, prefer
-    /// [`Ctx::new_native_fn_with_captures`]: memory reporting alone does not make
-    /// opaque Rust captures collectable cycles.
+    /// [`Ctx::new_native_fn_with_captures`]: the engine owns those, while an opaque
+    /// closure's are traced only as its reporter enumerates them.
     pub use crate::value::{
         NativeCallableRetained, NativeCaptureFn, NativeCaptures, NativeClosure, NativeFn,
         NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value,
@@ -1465,16 +1465,16 @@ impl Engine {
         Ok(())
     }
 
-    /// Collect cycles when the host event loop is about to block for external input.
+    /// Collect garbage when the host event loop is about to block for external input.
     ///
-    /// This complements allocation-triggered task checks: cyclic garbage spread across many
+    /// This complements allocation-triggered task checks: garbage spread across many
     /// individually low-churn timer tasks is reclaimed once, at the natural idle boundary.
     #[inline(always)]
     pub fn collect_garbage_at_idle(&mut self) -> i64 {
         self.interp.collect_garbage_for_host()
     }
 
-    /// Defer optional task-boundary cycle scans during a short latency-sensitive
+    /// Defer optional task-boundary collections during a short latency-sensitive
     /// host interval. This does not suppress allocation-triggered collection,
     /// memory limits, microtasks, or ClearKeptObjects. The host must end the
     /// interval and service pending collection when its input queue quiets down.
@@ -1482,14 +1482,14 @@ impl Engine {
         self.interp.gc_task_deferred = deferred;
     }
 
-    /// Whether a checkpoint requested an optional cycle scan that is pending.
+    /// Whether a checkpoint requested an optional collection that is pending.
     pub fn has_pending_task_garbage_collection(&self) -> bool {
         self.interp.gc_task_pending
     }
 
     /// Service a deferred request between host tasks, after their microtask
     /// checkpoints. Returns zero while deferral remains enabled or no request
-    /// is pending. Unlike an explicit idle collection, this never forces a scan
+    /// is pending. Unlike an explicit idle collection, this never forces a collection
     /// of an otherwise quiet heap. Inlined: the stack below the host's frame is zeroed before
     /// the boundary's frames are built (see `Interp::gc_collect`).
     #[inline(always)]

@@ -500,14 +500,11 @@ fn collection_has(i: &Interp, object: &Gc, key: &Value) -> bool {
     i.collection(object).is_some_and(|data| data.has(key))
 }
 
-// A `RefMut` (gc-heap) needs a mutable binding to be written through; a `&mut` does not.
-#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
 fn collection_set(i: &mut Interp, object: &Gc, key: Value, value: Value) {
     let mut data = i.collection_mut(object).expect("collection internal slot");
     data.insert(key, value);
 }
 
-#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
 fn collection_delete(i: &mut Interp, object: &Gc, key: &Value) -> bool {
     match i.collection_mut(object) {
         Some(mut data) => data.delete(key),
@@ -515,7 +512,6 @@ fn collection_delete(i: &mut Interp, object: &Gc, key: &Value) -> bool {
     }
 }
 
-#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
 fn collection_clear(i: &mut Interp, object: &Gc) {
     if let Some(mut data) = i.collection_mut(object) {
         data.clear();
@@ -946,7 +942,6 @@ pub(crate) fn nf_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Val
         .unwrap_or(Value::Undefined))
 }
 
-#[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
 pub(crate) fn nf_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     // `map_set` with one [[MapData]] lookup (`insert` canonicalizes -0).
     let inserted = match this.as_obj() {

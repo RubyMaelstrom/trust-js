@@ -152,8 +152,6 @@ impl ActivationPlan {
         this_value: &Value,
         arguments: CallArgs<'_>,
     ) -> Env {
-        // A `Vec` (where `to_vec` would do) only in the default build; gc-heap fills an InlineVec.
-        #[allow(clippy::iter_cloned_collect)]
         let mut vars = VarMap::from_fixed_bindings(
             self.bindings.iter().cloned().collect(),
             self.layout.as_ref(),

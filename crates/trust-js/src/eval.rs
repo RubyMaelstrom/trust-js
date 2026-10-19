@@ -8323,8 +8323,8 @@ impl Interp {
                 _ => {}
             }
         }
-        // Primitive strings cannot invoke conversion hooks. Transfer the operand handles so
-        // all tiers can reuse unique temporary buffers, just like native string addition.
+        // Primitive strings cannot invoke conversion hooks. Append to the left operand's buffer
+        // at its frontier where it can, just like native string addition.
         if op == "+" && matches!((&l, &r), (Value::Str(_), Value::Str(_))) {
             let (Value::Str(left), Value::Str(right)) = (l, r) else {
                 unreachable!()
@@ -10200,9 +10200,9 @@ impl crate::gc_trace::GcTrace for PreparedDecoratorValue {
     }
 }
 
-/// Every cell the suspended evaluation holds. Unlike the counted build's walk, which sees only
-/// objects and environments, this includes the Symbols of computed keys and decorator receivers
-/// of any type (`@a.b` captures `a`, which may be a string).
+/// Every cell the suspended evaluation holds: objects and environments, and also the Symbols of
+/// computed keys and decorator receivers of any type (`@a.b` captures `a`, which may be a
+/// string).
 #[cfg(feature = "gc-heap")]
 impl crate::gc_trace::GcTrace for PreparedClassEvaluation {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {

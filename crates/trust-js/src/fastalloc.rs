@@ -1,9 +1,10 @@
 //! A thread-local size-class caching allocator (std-only).
 //!
 //! The engine's workloads are allocation-bound in exactly the way general-purpose system
-//! allocators are slowest: millions of short-lived, same-sized blocks (an `RcBox<RefCell<Object>>`
-//! per JS object, an `RcBox<RefCell<Scope>>` per activation, `Props` entry vectors, `LStr`
-//! buffers). On macOS in particular, `malloc`/`free` pairs dominate parser-shaped profiles.
+//! allocators are slowest: millions of short-lived, same-sized blocks (spilled `Props` and
+//! binding storage, property keys, argument lists, boxed internal state; objects, environments
+//! and strings are GC cells in pages of their own). On macOS in particular, `malloc`/`free`
+//! pairs dominate parser-shaped profiles.
 //!
 //! This allocator sits in front of [`std::alloc::System`]: small blocks (≤ [`MAX_CLASS`] bytes,
 //! alignment ≤ 16) are rounded up to a 16-byte size class and served from a per-thread

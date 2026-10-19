@@ -2094,7 +2094,7 @@ impl ReText {
                 unit_base: 0,
             };
         }
-        // Keep the engine string itself: `LStr::clone` is one refcount bump and its immutable
+        // Keep the engine string itself: `LStr::clone` copies a handle, and its immutable
         // bytes can be matched and sliced directly.
         Self::build(unicode, s, Some(s.clone()))
     }

@@ -2130,23 +2130,6 @@ fn scan_realm(
         );
     }
 
-    #[cfg(not(feature = "gc-heap"))]
-    totals
-        .interpreter_side_tables
-        .add(interp.map_data.len().saturating_mul(size_of::<(
-            usize,
-            crate::ordered_collection::OrderedCollection,
-        )>()));
-    #[cfg(not(feature = "gc-heap"))]
-    for entries in interp.map_data.values() {
-        totals
-            .interpreter_side_tables
-            .add(entries.storage_bytes_lower_bound());
-        for (key, value) in entries.iter() {
-            visitor.value(key);
-            visitor.value(value);
-        }
-    }
     totals
         .interpreter_side_tables
         .add(interp.collection_iterators.len().saturating_mul(size_of::<(
@@ -2190,12 +2173,7 @@ fn scan_realm(
                 .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
         );
     }
-    #[cfg(not(feature = "gc-heap"))]
-    let map_data = !interp.map_data.is_empty();
-    #[cfg(feature = "gc-heap")]
-    let map_data = false;
-    if map_data
-        || !interp.collection_iterators.is_empty()
+    if !interp.collection_iterators.is_empty()
         || !interp.weak_collection_data.is_empty()
         || !interp.weak_collection_index.is_empty()
     {

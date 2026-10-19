@@ -402,18 +402,14 @@ pub(crate) fn key_hash(value: &Value) -> u64 {
 /// A held [[MapData]]/[[SetData]] (see [`Interp::collection`]).
 #[cfg(feature = "gc-heap")]
 pub(crate) type CollectionRef<'a> = std::cell::Ref<'a, OrderedCollection>;
-#[cfg(not(feature = "gc-heap"))]
-pub(crate) type CollectionRef<'a> = &'a OrderedCollection;
 /// A held, writable [[MapData]]/[[SetData]] (see [`Interp::collection_mut`]).
 #[cfg(feature = "gc-heap")]
 pub(crate) type CollectionMut<'a> = std::cell::RefMut<'a, OrderedCollection>;
-#[cfg(not(feature = "gc-heap"))]
-pub(crate) type CollectionMut<'a> = &'a mut OrderedCollection;
 
 impl crate::interpreter::Interp {
-    /// The [[MapData]]/[[SetData]] of `object` if it is a Map or Set. P1 S4 (gc-heap): it lives
-    /// in the object's cell and is borrowed with the object, so hold it for one step and never
-    /// across JavaScript. The default build keys it by the object's address in `map_data`.
+    /// The [[MapData]]/[[SetData]] of `object` if it is a Map or Set. P1 S4: it lives in the
+    /// object's cell and is borrowed with the object, so hold it for one step and never across
+    /// JavaScript.
     pub(crate) fn collection<'a>(&'a self, object: &'a Gc) -> Option<CollectionRef<'a>> {
         #[cfg(feature = "gc-heap")]
         return std::cell::Ref::filter_map(object.borrow(), |object| match &object.exotic {
@@ -421,8 +417,6 @@ impl crate::interpreter::Interp {
             _ => None,
         })
         .ok();
-        #[cfg(not(feature = "gc-heap"))]
-        self.map_data.get(&(Gc::as_ptr(object) as usize))
     }
 
     /// [`Interp::collection`], writable.
@@ -435,8 +429,6 @@ impl crate::interpreter::Interp {
             }
         })
         .ok();
-        #[cfg(not(feature = "gc-heap"))]
-        self.map_data.get_mut(&(Gc::as_ptr(object) as usize))
     }
 
     /// Give a new Map or Set `object` its [[MapData]]/[[SetData]].
@@ -444,11 +436,6 @@ impl crate::interpreter::Interp {
         #[cfg(feature = "gc-heap")]
         {
             object.borrow_mut().exotic = crate::value::Exotic::Collection(Box::new(data));
-        }
-        #[cfg(not(feature = "gc-heap"))]
-        {
-            self.gc_pin(object);
-            self.map_data.insert(Gc::as_ptr(object) as usize, data);
         }
     }
 
@@ -469,14 +456,6 @@ impl crate::interpreter::Interp {
             };
             to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
             true
-        }
-        #[cfg(not(feature = "gc-heap"))]
-        match self.map_data.remove(&(Gc::as_ptr(from) as usize)) {
-            Some(data) => {
-                self.map_data.insert(Gc::as_ptr(to) as usize, data);
-                true
-            }
-            None => false,
         }
     }
 }

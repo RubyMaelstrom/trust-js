@@ -108,7 +108,6 @@ impl<S: StoredValue> Default for ValueStack<S> {
 
 impl<S: StoredValue> ValueStack<S> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        #[cfg_attr(not(feature = "gc-heap"), allow(unused_mut))]
         let mut stack = Self(Vec::with_capacity(capacity));
         #[cfg(feature = "gc-heap")]
         stack.zero_spare_capacity();
@@ -132,8 +131,6 @@ impl<S: StoredValue> ValueStack<S> {
                 self.0.set_len(len + 1);
             }
         }
-        #[cfg(not(feature = "gc-heap"))]
-        self.0.push(value);
     }
     /// gc-heap: grow by at least `additional` and zero-fill the new spare capacity.
     #[cfg(feature = "gc-heap")]
@@ -200,8 +197,6 @@ impl<S: StoredValue> ValueStack<S> {
         if self.0.capacity() - self.0.len() < additional {
             self.grow(additional);
         }
-        #[cfg(not(feature = "gc-heap"))]
-        self.0.reserve(additional);
     }
     #[cfg(test)]
     #[inline]

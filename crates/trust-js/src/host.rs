@@ -46,12 +46,10 @@ pub trait RetainedMemory {
 
 /// What every value an Agent keeps for its host declares (P1 S2, Decision 2): the JavaScript
 /// values it holds, so the type system, not review, enforces that host state is enumerated.
-/// [`OpState::put`] and [`ResourceTable::add`] require it. Report each strong handle once with
-/// `internal`, then each value that must stay alive with `root`, or with `edge` from the
-/// JavaScript owner that keeps it alive. A tracing collector (`gc-heap`) keeps alive exactly
-/// what this reports; reference counting also keeps unreported handles alive (the counted
-/// build's conservative fallback, which retires with it). A type that holds no JavaScript
-/// values declares so with [`value_free!`](crate::value_free). These callbacks must not execute
+/// [`OpState::put`] and [`ResourceTable::add`] require it. Report each value that must stay
+/// alive with `root`, or with `edge` from the JavaScript owner that keeps it alive: the
+/// collector keeps alive exactly what this reports. A type that holds no JavaScript values
+/// declares so with [`value_free!`](crate::value_free). These callbacks must not execute
 /// JavaScript, allocate JS objects, or re-enter collection.
 pub trait HostTrace {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
@@ -152,12 +150,14 @@ pub trait HostGcVisitor {
     /// Has no effect and keeps nothing alive. (Reference counting used it to discount a
     /// native-owned handle.)
     fn internal(&mut self, value: &Value);
-    /// A logical (non-Rc-owning) edge from a live owner to a retained value.
+    /// A logical edge from a live owner to a retained value: `value` stays alive while `owner`
+    /// does.
     fn edge(&mut self, owner: &Value, value: &Value);
     /// A value reachable from a native root not represented by a JS owner.
     fn root(&mut self, value: &Value);
-    /// Old/third-party visitors can conservatively retain their native graph. A host must not
-    /// discount the handles owned by that graph unless this visitor supports tracing it.
+    /// Whether this visitor traces a native graph (`native_edge`, `js_to_native`,
+    /// `native_to_js`, `native_root`). An old or third-party visitor may not: a host must then
+    /// report the values its native graph keeps alive with `root` or `edge` instead.
     fn supports_native(&self) -> bool {
         false
     }
@@ -746,9 +746,6 @@ mod tests {
 
     impl HostTrace for NativeCache {
         fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
-            for value in &self.values {
-                visitor.internal(value);
-            }
             for &(owner, target) in &self.edges {
                 visitor.edge(&self.values[owner], &self.values[target]);
             }

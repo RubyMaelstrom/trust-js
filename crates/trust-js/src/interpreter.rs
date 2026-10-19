@@ -1195,10 +1195,10 @@ impl ProxyTrapCaches {
 /// call_site@8, strict@12, construct@13, extra@16, size 24 (asserted in jit.rs).
 #[repr(C)]
 pub struct FnFrame {
-    /// `Rc::as_ptr` of the callee. No strong handle is kept: every frame is pushed while its
-    /// caller holds the callee alive (the callee `Value` sits on the caller's operand stack or in
-    /// the dispatch chain for the whole call), so the rare reflective reads reconstruct one via
-    /// [`FnFrame::callee`] instead of paying a refcount round-trip on every call.
+    /// [`Gc::as_ptr`] of the callee. The frame holds no handle: every frame is pushed while its
+    /// caller keeps the callee reachable (the callee `Value` sits on the caller's operand stack
+    /// or in the dispatch chain for the whole call), so the rare reflective reads reconstruct
+    /// one via [`FnFrame::callee`].
     pub fn_ptr: usize,
     /// Where the caller was: [`Interp::call_site`] when this frame was pushed, the byte
     /// position of the call in the caller's source (see `crate::stack_trace`). Popping the frame
@@ -1290,7 +1290,7 @@ impl FnFrame {
     /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
     pub fn callee(&self) -> Gc {
         let p = self.fn_ptr as *const RefCell<crate::value::Object>;
-        unsafe { Gc::clone_from_raw(p) }
+        unsafe { Gc::from_raw(p) }
     }
 }
 
@@ -1568,26 +1568,21 @@ impl BindingLayout {
     }
 }
 
-/// A binding map's ordered entries. P1 S4 (gc-heap): the first entry lives in the environment
-/// cell, so a record with one binding (most block and many function records) allocates nothing
-/// beside it; more move the entries to one heap buffer.
+/// A binding map's ordered entries. P1 S4: the first entry lives in the environment cell, so a
+/// record with one binding (most block and many function records) allocates nothing beside it;
+/// more move the entries to one heap buffer.
 #[cfg(feature = "gc-heap")]
 pub(crate) type BindingEntries = crate::inline_vec::InlineVec<(Rc<str>, Binding), 1>;
-#[cfg(not(feature = "gc-heap"))]
-pub(crate) type BindingEntries = Vec<(Rc<str>, Binding)>;
 
 /// The bytes of `entries`' storage beside the environment cell.
 fn binding_entries_heap_bytes(entries: &BindingEntries) -> usize {
     #[cfg(feature = "gc-heap")]
     let capacity = entries.heap_capacity();
-    #[cfg(not(feature = "gc-heap"))]
-    let capacity = entries.capacity();
     capacity.saturating_mul(std::mem::size_of::<(Rc<str>, Binding)>())
 }
 
-/// The entries are first so their native layout can share the Small storage path (in both
-/// builds). `VarMap::jit_small_storage_layout` verifies that fact against the actual Rust enum
-/// layout.
+/// The entries are first so their native layout can share the Small storage path.
+/// `VarMap::jit_small_storage_layout` verifies that fact against the actual Rust enum layout.
 #[repr(C)]
 struct IndexedBindings {
     entries: BindingEntries,
@@ -2004,11 +1999,10 @@ impl VarMap {
         std::mem::offset_of!(VarMap, layout_id)
     }
 
-    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout, in both
-    /// builds: the entries are a `Vec`, or under gc-heap an `InlineVec` whose first binding
-    /// stays in the environment cell. A native fresh-activation hit additionally requires the
-    /// same nonzero ordered layout identity. Unknown compiler layouts simply retain the checked
-    /// map path.
+    /// Probe the repr(Rust) small-map arm rather than baking an enum/vector layout: the entries
+    /// are an `InlineVec` whose first binding stays in the environment cell. A native
+    /// fresh-activation hit additionally requires the same nonzero ordered layout identity.
+    /// Unknown compiler layouts simply retain the checked map path.
     pub(crate) fn jit_small_storage_layout() -> Option<JitBindingStorage> {
         let mut small = Self::with_capacity(3);
         small.insert("probe", Binding::data(Value::Num(7.0), true, true));
@@ -2047,14 +2041,7 @@ impl VarMap {
         })
     }
 
-    /// The default build's entries are a `Vec`: its words, located on the probe's live one
-    /// (length 1, capacity 3).
-    #[cfg(not(feature = "gc-heap"))]
-    fn jit_entries_layout(entries: &BindingEntries) -> Option<crate::value::JitVecLayout> {
-        crate::value::probe_vec_layout(entries)
-    }
-
-    /// gc-heap's entries are an `InlineVec`, probed in place and spilled.
+    /// The entries are an `InlineVec`, probed in place and spilled.
     #[cfg(feature = "gc-heap")]
     fn jit_entries_layout(_: &BindingEntries) -> Option<crate::value::JitVecLayout> {
         BindingEntries::probe_jit_layout(|| {
@@ -2376,13 +2363,6 @@ mod binding_layout_tests {
 }
 
 pub struct Scope {
-    /// Slot in [`Scope::gc_heap`]'s environment registry (`u32::MAX` while unregistered).
-    /// gc-heap environments are cells, which their heap enumerates: no registry.
-    #[cfg(not(feature = "gc-heap"))]
-    pub(crate) gc_slot: std::cell::Cell<u32>,
-    /// The heap whose registry lists this record; `Scope::drop` unregisters it there.
-    #[cfg(not(feature = "gc-heap"))]
-    pub(crate) gc_heap: crate::value::GcHeap,
     pub vars: VarMap,
     pub parent: Option<Env>,
     /// For a `with (obj)` block: identifier resolution checks `obj`'s properties before the parent.
@@ -2409,19 +2389,9 @@ pub struct Scope {
 }
 
 /// P1 S4: an environment cell, with its first binding in place, fills the heap's 128-byte size
-/// class (it has no registry fields under gc-heap).
+/// class.
 #[cfg(feature = "gc-heap")]
 const _: () = assert!(std::mem::size_of::<std::cell::RefCell<Scope>>() <= 128);
-
-#[cfg(not(feature = "gc-heap"))]
-impl Drop for Scope {
-    fn drop(&mut self) {
-        let slot = self.gc_slot.get();
-        if slot != u32::MAX {
-            crate::value::gc_unregister_scope(&self.gc_heap, slot);
-        }
-    }
-}
 
 /// Lexical-name bookkeeping is only populated by direct eval, but every call allocates a scope.
 /// Keep the common empty case to one nullable pointer and materialize the Vec on first use.
@@ -2536,7 +2506,7 @@ impl Binding {
     }
 }
 
-/// A new environment record (registered with its heap in the default build).
+/// A new environment record.
 #[inline]
 fn new_env(
     vars: VarMap,
@@ -2546,11 +2516,7 @@ fn new_env(
     var_boundary: bool,
     catch_param: bool,
 ) -> Env {
-    let e = Env::new(Scope {
-        #[cfg(not(feature = "gc-heap"))]
-        gc_slot: std::cell::Cell::new(u32::MAX),
-        #[cfg(not(feature = "gc-heap"))]
-        gc_heap: crate::value::active_gc_heap(),
+    Env::new(Scope {
         vars,
         parent,
         with_obj,
@@ -2558,10 +2524,7 @@ fn new_env(
         var_boundary,
         catch_param,
         lexical_names: ScopeNames::default(),
-    });
-    #[cfg(not(feature = "gc-heap"))]
-    crate::value::gc_register_scope(&e);
-    e
+    })
 }
 
 pub fn new_scope(parent: Option<Env>) -> Env {
@@ -3409,11 +3372,6 @@ pub struct Interp {
         usize,
         crate::fasthash::FastMap<String, crate::modules::NsBinding>,
     >,
-    /// Ordered, indexed [[MapData]] / [[SetData]], including internal kind and live cursor tracking.
-    /// gc-heap keeps each in its Map's or Set's cell (`Exotic::Collection`).
-    #[cfg(not(feature = "gc-heap"))]
-    pub(crate) map_data:
-        crate::fasthash::FastMap<usize, crate::ordered_collection::OrderedCollection>,
     /// Unforgeable Map/Set iterator slots. Live targets are strong edges from the iterator owner;
     /// exhausted iterators keep their brand but release the target and cursor.
     pub(crate) collection_iterators:
@@ -3469,11 +3427,11 @@ pub struct Interp {
     /// GlobalDeclarationInstantiation's cross-script clash checks.
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
 
-    /// GC pins: one `Gc` clone per object that has an entry in a pointer-keyed side table
-    /// (typed_arrays, promises, array_buffers, …). The pin keeps the object from being freed by
-    /// plain refcounting — which would let a later allocation reuse its address and inherit the
-    /// stale side-table entry — so such objects die only in `gc_collect`'s sweep, which evicts
-    /// their table entries first. The collector discounts pins when finding roots.
+    /// GC pins: a `Gc` for each object that has an entry in a pointer-keyed side table
+    /// (typed_arrays, promises, array_buffers, …), keyed by its address. A pin keeps nothing
+    /// alive (the collector does not trace pins): such an object dies in a collection like any
+    /// other, whose sweep evicts its table entries and its pin before a later allocation can
+    /// reuse the address.
     pub(crate) gc_pins: crate::fasthash::FastMap<usize, Gc>,
     /// The backing ArrayBuffer *object* for each TypedArray (so the `buffer` getter can return it
     /// without storing it as an observable own property). Keyed by the TypedArray's pointer.
@@ -3636,7 +3594,7 @@ pub struct Interp {
     /// GetTemplateObject cache: one frozen strings array per tagged-template *site* (AST node)
     /// within its Realm, so the same site always passes the identical object. The Realm global's
     /// identity is part of the key because HTML/ECMA-262 give each Realm its own [[TemplateMap]];
-    /// this also lets cycle collection discard all entries when a browsing-context Realm dies.
+    /// this also lets a collection discard all entries when a browsing-context Realm dies.
     pub(crate) template_cache: std::collections::HashMap<(usize, u64), Value>,
     /// True while class field initializer code runs: a direct eval from there may not contain an
     /// `arguments` reference (arrows inherit the context; ordinary functions clear it).
@@ -3791,8 +3749,6 @@ interp_memory_inventory! {
     pending_dynamic_imports => "measured",
     next_dynamic_import_id => "non_owning",
     module_ns => "measured",
-    #[cfg(not(feature = "gc-heap"))]
-    map_data => "measured",
     collection_iterators => "measured",
     weak_collection_data => "measured",
     weak_collection_index => "measured",
@@ -3904,7 +3860,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    // gc-heap adds `heap_release` and keeps no `map_data`.
+    // gc-heap adds `heap_release`.
     assert_eq!(names.len(), 169);
     assert!(
         INTERP_MEMORY_INVENTORY
@@ -3986,14 +3942,10 @@ impl Drop for Interp {
         for wait in std::mem::take(&mut self.pending_async_waits) {
             futex_remove_async(wait.id, wait.index, wait.token);
         }
-        // The whole Agent is ending, not merely reaching a GC safepoint. Its global,
-        // intrinsics and environment roots are still live during Drop, so an ordinary
-        // collection here would preserve their cycles and then orphan the heap forever.
-        // (gc-heap: the heap's owner releases every cell once all other fields have dropped,
-        // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.)
-        #[cfg(not(feature = "gc-heap"))]
-        crate::value::destroy_gc_heap(&self.gc_heap);
-        // Do not let a driver thread retain this Agent's weak object/scope registries after its
+        // The whole Agent is ending, not merely reaching a GC safepoint: the heap's owner
+        // (`heap_release`) finalizes and frees every cell once all other fields have dropped,
+        // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.
+        // Do not let a driver thread retain this Agent's heap and its object registry after its
         // interpreter dies. Objects already carry their own owner through the ensuing field drops.
         // A ShadowRealm sharing its parent's heap and symbols has the parent's Agent identity.
         #[cfg(feature = "gc-heap")]
@@ -4114,11 +4066,9 @@ pub struct PromiseState {
     pub(crate) outstanding: Option<u64>,
 }
 
-/// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
 /// The pointer-keyed `Interp` tables whose values are strong internal-slot edges of their key
 /// object, traced once that object is marked (`Interp::trace_owner_slots`). Expands
-/// `$callback!(table, ...)`. A Map's or Set's [[MapData]]/[[SetData]] is in its cell, not in
-/// `map_data`.
+/// `$callback!(table, ...)`. A Map's or Set's [[MapData]]/[[SetData]] is in its cell.
 #[cfg(feature = "gc-heap")]
 macro_rules! gc_side_slot_tables {
     ($callback:ident) => {
@@ -4148,6 +4098,7 @@ pub(crate) mod gc_collect;
 /// copies only a table that another snapshot still shares.
 pub(crate) type IntrinsicMap = Rc<crate::fasthash::FastMap<&'static str, Gc>>;
 
+/// Engine-side metadata for a class constructor (see [`Interp::class_info`]).
 pub struct ClassInfo {
     /// Instance fields (and auto-accessor backing fields), in declaration order. Shared so each
     /// construction reads the list without copying keys, initializer ASTs or transforms.
@@ -4296,16 +4247,14 @@ pub(crate) fn execution_stack_exhausted(depth: u32) -> bool {
     }
 }
 
-/// `stacker::grow` for paths that run JavaScript. Under gc-heap the new segment is registered,
-/// with exact bounds, for conservative scanning (Decision 0, option (a)); a collection requested
-/// on an unregistered segment would defer instead.
+/// `stacker::grow` for paths that run JavaScript. The new segment is registered, with exact
+/// bounds, for conservative scanning (Decision 0, option (a)); a collection requested on an
+/// unregistered segment would defer instead.
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn grow_stack<R>(stack_size: usize, f: impl FnOnce() -> R) -> R {
     #[cfg(feature = "gc-heap")]
     return crate::gc_core::grow(stack_size, f);
-    #[cfg(not(feature = "gc-heap"))]
-    stacker::grow(stack_size, f)
 }
 
 #[inline]
@@ -4450,7 +4399,7 @@ pub(crate) fn with_data_stack<R>(f: impl FnOnce() -> R) -> Option<R> {
 /// Smallest automatically derived live-object ceiling (the former fixed limit). When a safe point
 /// sees more *live* objects than the engine's ceiling (see [`Interp::live_object_limit`]), a
 /// collection runs; if it can't get back under, a RangeError is thrown rather than exhausting
-/// RAM. This bounds genuine retention; transient cyclic garbage is reclaimed and doesn't count.
+/// RAM. This bounds genuine retention; transient garbage is reclaimed and doesn't count.
 pub const MIN_LIVE_OBJECT_LIMIT: i64 = 3_000_000;
 /// Largest automatically derived ceiling. An embedder may configure a larger explicit value.
 const MAX_DEFAULT_LIVE_OBJECT_LIMIT: i64 = 1 << 28;
@@ -4538,7 +4487,7 @@ fn buffer_gc_trigger_grows_with_retained_shared_data_blocks() {
     }
 }
 
-/// Minimum pressure that triggers an end-of-task cycle collection. Larger retained heaps scale
+/// Minimum pressure that triggers an end-of-task collection. Larger retained heaps scale
 /// this floor, so short-lived allocation churn alone does not force a full scan every frame.
 const GC_TASK_ALLOCATION_TRIGGER: u64 = 10_000;
 
@@ -5290,15 +5239,13 @@ impl Interp {
     }
 
     /// A ShadowRealm's implementation interpreter, owned by the ShadowRealm object `owner`:
-    /// same Agent (Symbols), isolated globals and intrinsics. Under gc-heap it allocates in its
-    /// parent's heap — one heap per Agent, so no edge between the two realms' objects ever
-    /// crosses heaps (I6) — and the root of the ShadowRealm tree collects for all of it.
+    /// same Agent (Symbols), isolated globals and intrinsics. It allocates in its parent's heap
+    /// — one heap per Agent, so no edge between the two realms' objects ever crosses heaps (I6)
+    /// — and the root of the ShadowRealm tree collects for all of it.
     pub(crate) fn new_shadow(parent: &Interp, owner: &Gc) -> Interp {
         #[cfg(feature = "gc-heap")]
         let mut realm =
             Self::new_in_heap(parent.symbol_agent.clone(), parent.gc_heap.clone(), false);
-        #[cfg(not(feature = "gc-heap"))]
-        let mut realm = Self::new_with_symbol_agent(parent.symbol_agent.clone());
         realm.shadow_home = Some(ShadowHome {
             owner: Gc::downgrade(owner),
             parent: std::ptr::null_mut(),
@@ -5327,7 +5274,6 @@ impl Interp {
     }
 
     /// Whether code in this (ShadowRealm) interpreter is running.
-    #[cfg_attr(not(feature = "gc-heap"), allow(dead_code))]
     pub(crate) fn shadow_entered(&self) -> bool {
         self.shadow_home
             .as_ref()
@@ -5339,8 +5285,6 @@ impl Interp {
         gc_heap: crate::value::GcHeap,
         owns_heap: bool,
     ) -> Interp {
-        #[cfg(not(feature = "gc-heap"))]
-        debug_assert!(owns_heap, "only gc-heap interpreters share a heap");
         // Decision 0: every engine frame on this thread lies below the scanned stack top.
         #[cfg(feature = "gc-heap")]
         crate::gc_core::register_thread_native_stack();
@@ -5453,8 +5397,6 @@ impl Interp {
             re_text_ascii_hot: None,
             regexp_dependency_cache: std::cell::Cell::new(RegexpDependencyCache::default()),
             regexp_last: None,
-            #[cfg(not(feature = "gc-heap"))]
-            map_data: Default::default(),
             collection_iterators: Default::default(),
             weak_collection_data: Default::default(),
             weak_collection_index: Default::default(),
@@ -7098,9 +7040,9 @@ impl Interp {
     /// Rust closure. Use `op_state` for independent native host state.
     ///
     /// Captures are immutable as a list; captured objects retain normal mutable
-    /// JavaScript behavior. A live function, active invocation, or Rust callable
-    /// lease keeps its captures alive (under gc-heap a lease alone does not: hold the
-    /// function). Unreachable captured cycles can be reclaimed.
+    /// JavaScript behavior. A live function or an active invocation keeps its captures
+    /// alive; a Rust callable lease alone does not: hold the function. Unreachable
+    /// captured cycles can be reclaimed.
     /// This does not change the ordinary function's receiver or argument list.
     pub fn new_native_fn_with_captures(
         &self,
@@ -7851,8 +7793,6 @@ impl Interp {
         // another engine's heap (or a later engine on this thread) must not reference.
         #[cfg(feature = "gc-heap")]
         let foreign = maps.heap != crate::value::active_heap_id();
-        #[cfg(not(feature = "gc-heap"))]
-        let foreign = false;
         let fn_map = match named {
             _ if foreign => {
                 let mut props = maps.function.clone();
@@ -8538,8 +8478,7 @@ impl Interp {
     ///
     /// The prototype chain is walked by raw pointer with no `Gc` clones: every object on it is
     /// transitively kept alive by `o` (which the caller holds) for the duration of this call, and
-    /// nothing mutates the chain here, so the pointers stay valid — this removes a refcount
-    /// bump+drop per hop on every property access.
+    /// nothing mutates the chain here, so the pointers stay valid.
     #[inline(always)]
     fn try_ic_get(
         &self,
@@ -9051,11 +8990,10 @@ impl Interp {
     /// The fused `obj.k += v` fast path (`bytecode::Op::AppendProp`): when the property still
     /// holds the exact string the compound read produced (`lval` — nothing replaced it while the
     /// RHS evaluated), both sides are strings, and the slot is an own writable data property on a
-    /// plain object, append **in place**: taking the value out of the slot and dropping the
-    /// stack copy makes it uniquely referenced, so `LStr::append_in_place` (or a capacity-doubled
-    /// rebuild) applies — the amortized-O(append) accumulator loop, instead of copying the whole
-    /// accumulation per step. `Err(lval)` = not applicable, nothing touched, caller runs the
-    /// generic Add + set.
+    /// plain object, append **in place**: an accumulated string ends at its buffer's frontier,
+    /// so `LStr::concat_owned` writes past it (or rebuilds once with doubled capacity) — the
+    /// amortized-O(append) accumulator loop, instead of copying the whole accumulation per step.
+    /// `Err(lval)` = not applicable, nothing touched, caller runs the generic Add + set.
     pub(crate) fn append_prop_fast(
         &mut self,
         o: &Gc,
@@ -9083,10 +9021,9 @@ impl Interp {
         if !same {
             return Err(lval);
         }
-        // Take the slot's handle and release the stack copy: unique unless shared elsewhere
-        // (then the grow-copy path runs once and the rebuilt handle is unique from here on).
-        // The object stays borrowed throughout, so the checked descriptor cannot change
-        // between the read above and the value-only take/store below.
+        // Take the slot's handle and append to it. The object stays borrowed throughout, so
+        // the checked descriptor cannot change between the read above and the value-only
+        // take/store below.
         let cur = match b.props.take_value(name) {
             Some(Value::Str(s)) => s,
             _ => unreachable!("checked above"),
@@ -11279,10 +11216,6 @@ impl Interp {
         // the cell heap's byte budget also collect here, and must not throw again inside the
         // handler the re-armed threshold below leaves room for.
         let threshold_due = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
-        #[cfg(not(feature = "gc-heap"))]
-        if !threshold_due {
-            return Ok(());
-        }
         #[cfg(feature = "gc-heap")]
         if !threshold_due && !self.gc_heap_due() {
             return Ok(());
@@ -11324,7 +11257,7 @@ impl Interp {
 
     /// Collect after a high-pressure host task, when temporary roots from that task have gone away.
     /// Allocation safepoints alone cannot see this transition: a graph may be reachable during
-    /// every in-task collection and become cyclic garbage only as the callback returns.
+    /// every in-task collection and become garbage only as the callback returns.
     pub(crate) fn gc_task_boundary(&mut self) -> i64 {
         if self.gc_suppressed != 0 {
             return 0;
@@ -11338,13 +11271,12 @@ impl Interp {
         self.gc_task_allocated = allocated;
         let before = crate::value::heap_live_objects(&self.gc_heap);
         let floor = GC_TASK_ALLOCATION_TRIGGER as i64;
-        // Most short-lived objects are already reclaimed by reference counting.
-        // Scanning an entire retained scene after every 10k transient allocations
-        // makes animation pauses proportional to the scene even with no garbage.
-        // Collect once retained growth reaches 1/8 of the last live set, or one
-        // task allocates half that set (covering graphs released after an in-task
-        // collection). The 10k floor preserves prompt collection on small heaps;
-        // growth also catches cycles accumulated across many smaller tasks.
+        // Marking an entire retained scene after every 10k transient allocations
+        // makes animation pauses proportional to the scene. Collect once growth
+        // reaches 1/8 of the last live set, or one task allocates half that set
+        // (covering graphs released after an in-task collection). The 10k floor
+        // preserves prompt collection on small heaps; growth also catches garbage
+        // accumulated across many smaller tasks.
         // ECMA-262 #sec-liveness permits this scheduling choice. ClearKeptObjects
         // above still runs at every job boundary, independently of collection.
         let growth = before.saturating_sub(self.gc_task_live);
@@ -11506,8 +11438,6 @@ impl Interp {
             eval_realm_fns,
             module_ns,
             realms,
-            #[cfg(not(feature = "gc-heap"))]
-            map_data,
             collection_iterators,
             typed_arrays,
             data_views,
@@ -11688,8 +11618,6 @@ impl Interp {
         crate::gc_sweep::set(eval_realm_fns, dead);
         crate::gc_sweep::map(module_ns, dead);
         crate::gc_sweep::map(realms, dead);
-        #[cfg(not(feature = "gc-heap"))]
-        crate::gc_sweep::map(map_data, dead);
         crate::gc_sweep::map(collection_iterators, dead);
         crate::gc_sweep::map(typed_arrays, dead);
         crate::gc_sweep::map(data_views, dead);

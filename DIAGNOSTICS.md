@@ -124,7 +124,7 @@ comment/example in the same change.
 ## Architecture diagnostics
 
 The `architecture-diagnostics` feature records allocation sites/lifetimes
-in the live Rc heap and call-cache epoch/refill traffic. It adds no object owners;
+in the live object heap and call-cache epoch/refill traffic. It adds no object owners;
 site and registry-slot limits report untracked allocations. Initial exotic family
 is recorded at allocation, before later function/exotic initialization. Lifetimes
 use heap allocation ordinals and completed collections, not elapsed time. Live

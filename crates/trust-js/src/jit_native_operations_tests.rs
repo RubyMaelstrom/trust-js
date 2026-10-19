@@ -335,8 +335,8 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
         }
         assert_eq!(drops.get(), 1, "last owner is destroyed at void, {tier:?}");
         if tier == Tier::Jit {
-            // The native template destroys a last owner through the packed drop helper (Rust
-            // destruction only), without the generic Void operation.
+            // The native template discards the value (traced ownership releases nothing),
+            // without the generic Void operation.
             assert_eq!(
                 crate::bytecode::TEST_JIT_VOID_HELPERS.with(Cell::get),
                 before,

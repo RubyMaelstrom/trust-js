@@ -973,7 +973,7 @@ impl CallIc {
 /// A speculative-inline site's guard data: the pinned expected callee plus how the call site's
 /// stack is shaped when the guard runs (`argc` arguments above the callee).
 pub struct InlineTarget {
-    /// Stored `Rc` pointer of the expected callee function object.
+    /// The stored handle word (the cell address) of the expected callee function object.
     pub expected: usize,
     /// Keeps `expected` from ever being recycled (same ABA argument as [`CallIc`]): a live
     /// `Value::Obj` whose payload equals it therefore IS the same, still-alive function.
@@ -981,7 +981,7 @@ pub struct InlineTarget {
     /// Exact shared closure environment required by a non-global free-name inline. Zero means
     /// the callee has no such dependency.
     pub expected_env: usize,
-    /// `Rc::as_ptr` of the global Environment Record of the Realm the plan was made in (the
+    /// `Env::as_ptr` of the global Environment Record of the Realm the plan was made in (the
     /// same-Realm proof call caches use). A splice evaluates the callee's literals, intrinsics
     /// and global references in the running Realm, so it is only the callee's own evaluation
     /// while that Realm is active. Code cached on a shared AST runs in other Realms too, where
@@ -1639,7 +1639,7 @@ pub enum Op {
     /// `Chunk::caches` (see `Interp::get_prop_ic`).
     GetProp(u32, u32),
     /// `this.name` — GetProp with the receiver read straight from the frame's `this` binding:
-    /// no operand-stack traffic and no receiver refcounting (the frame owns the binding).
+    /// no operand-stack traffic (the frame owns the binding).
     GetPropThis(u32, u32),
     /// `local.name` — receiver read straight from a slot (alive for the whole frame). A TDZ
     /// slot throws the same ReferenceError LoadLocal would.
@@ -1779,7 +1779,7 @@ pub enum Op {
     /// `obj[k] = v` in statement position: stores without leaving `v` on the stack.
     SetElemDrop,
     /// `x[k]` where `x` is a never-TDZ local slot (param or `var`): fused LoadLocal+GetElem —
-    /// the receiver never crosses the operand stack (no clone/drop refcount churn). Reads the
+    /// the receiver never crosses the operand stack (no push and pop). Reads the
     /// slot at exec time, which is only sound because the emitter proves the key expression
     /// cannot reassign the base local (see `Compiler::fused_elem_slot`) and the slot can never
     /// TDZ-throw.
@@ -13631,7 +13631,7 @@ impl Compiler {
                 ..
             } if !matches!(**obj, Expr::Super) && !prop.starts_with('#') => {
                 // Receiver-direct forms: `this.x` and `slotlocal.x` skip the operand-stack
-                // round trip (push + refcount bump + drop) entirely.
+                // round trip (push + drop) entirely.
                 match &**obj {
                     // Inside a splice `this` is the receiver slot; otherwise the frame binding.
                     Expr::This if self.inline_depth > 0 => {
@@ -16806,39 +16806,7 @@ fn run_vm_inner<S: StoredValue>(
                 stack.push(obj);
                 stack.push(m);
             }
-            Op::Add => {
-                // A following local store retires an owner of the old left string, so that a
-                // counted string can be unique and append in place. Both operands are already
-                // evaluated; only the non-coercing, non-throwing string case may release that
-                // owner before addition. The existing Add/Store ops and feedback remain intact,
-                // and real aliases still prevent in-place mutation. gc-heap appends at its
-                // buffer's frontier, which needs no uniqueness.
-                #[cfg(not(feature = "gc-heap"))]
-                {
-                    if let (Some(Value::Str(left)), Some(Value::Str(right))) =
-                        (stack.get(stack.len().saturating_sub(2)), stack.last())
-                    {
-                        if left.len().saturating_add(right.len()) <= crate::interpreter::MAX_STR_LEN
-                        {
-                            match chunk.ops.get(op_pc + 1) {
-                                Some(Op::StoreLocal(slot)) => {
-                                    if matches!(slots.read_value(*slot as usize), Value::Str(current)
-                                        if crate::lstr::LStr::ptr_eq(&current, &left))
-                                    {
-                                        slots.write_value(*slot as usize, Value::Undefined);
-                                    }
-                                }
-                                Some(Op::StoreCap(name)) => {
-                                    chunk
-                                        .release_overwritten_captured_string(cap_env, *name, &left);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                bin_num(i, stack, &chunk.feedback, op_pc, "+", |a, b| a + b)?;
-            }
+            Op::Add => bin_num(i, stack, &chunk.feedback, op_pc, "+", |a, b| a + b)?,
             Op::Sub => bin_num(i, stack, &chunk.feedback, op_pc, "-", |a, b| a - b)?,
             Op::Mul => bin_num(i, stack, &chunk.feedback, op_pc, "*", |a, b| a * b)?,
             Op::Div => bin_num(i, stack, &chunk.feedback, op_pc, "/", |a, b| a / b)?,
@@ -19303,19 +19271,6 @@ fn bin_num<S: StoredValue>(
     Ok(())
 }
 
-/// Retire only the local owner that the immediately following StoreLocal will overwrite.
-/// ECMA-262 assignment evaluation still reads the left value before the RHS, and conversion
-/// hooks must still see the binding: callers restrict this to already-primitive strings after
-/// the length guard. No JS, coercion, safepoint or recoverable error may occur before the store.
-/// Counted strings only: a gc-heap string appends without uniqueness.
-#[cfg(not(feature = "gc-heap"))]
-#[inline]
-fn release_overwritten_string_local(slot: &mut Value, left: &crate::lstr::LStr) {
-    if matches!(slot, Value::Str(current) if crate::lstr::LStr::ptr_eq(current, left)) {
-        *slot = Value::Undefined;
-    }
-}
-
 /// Attempt the immediate-only tagged ABI path. Returning `None` is a deliberate deoptimization:
 /// heap values, strings, BigInts, symbols, objects, and the internal Empty marker all continue
 /// through the complete interpreter helper, preserving ToPrimitive/ToNumeric ordering and
@@ -19935,17 +19890,6 @@ impl Chunk {
             binding.initialized = true;
         }
         Ok(())
-    }
-
-    /// The captured-cell equivalent of the adjacent Add/StoreLocal ownership handoff.
-    /// Only initialized mutable declarative cells qualify; name resolution, globals, imports,
-    /// TDZ and immutable stores retain their ordinary paths (ECMA-262 SetMutableBinding).
-    #[cfg(not(feature = "gc-heap"))]
-    fn release_overwritten_captured_string(&self, env: &Env, n: u32, left: &crate::lstr::LStr) {
-        let binding = unsafe { &mut *self.cap_binding_ptr(env, n) };
-        if binding.initialized && binding.mutable && binding.import_ref.is_none() {
-            release_overwritten_string_local(&mut binding.value, left);
-        }
     }
 
     /// Reject PutValue to a compiler-proven immutable captured binding without cloning its old
@@ -21564,10 +21508,10 @@ pub(crate) unsafe extern "C" fn jit_make_regexp(
     }
 }
 
-/// Fast `String + String` after the generated-code tag guards. Moving the left operand out of
-/// the stack lets a temporary concatenation grow in place; otherwise the replacement reserves
-/// spare capacity so a following concatenation can do so. This is the ordinary string-add
-/// operation, independent of source or benchmark identity.
+/// Fast `String + String` after the generated-code tag guards. A left operand that ends at its
+/// buffer's frontier grows in place; otherwise the replacement reserves spare capacity so a
+/// following concatenation can do so. This is the ordinary string-add operation, independent of
+/// source or benchmark identity.
 pub(crate) unsafe extern "C" fn jit_add_strings(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -21592,40 +21536,6 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
         let error = i.throw("RangeError", "Invalid string length");
         unsafe { ctx.throw_at(pc, error) };
         return crate::jit::SpFlag { sp: base, flag: 1 };
-    }
-
-    // Retire the owner of `left` that the next store overwrites, so that a counted string can be
-    // unique and append in place. gc-heap appends at its buffer's frontier, which needs no
-    // uniqueness.
-    #[cfg(not(feature = "gc-heap"))]
-    {
-        let ctx = unsafe { &mut *ctx };
-        let chunk = unsafe { &*ctx.chunk };
-        if let Some(Op::StoreLocal(slot)) = chunk.ops.get(pc as usize + 1) {
-            // Inspect/retire this one packed owner. The operand `left` keeps it alive here.
-            let word = unsafe { ctx.slots.cast::<u64>().add(*slot as usize) };
-            let current = unsafe { crate::value::PackedValue::clone_raw(word) };
-            let same = matches!(
-                &current,
-                Value::Str(current) if crate::lstr::LStr::ptr_eq(current, &left)
-            );
-            drop(current);
-            if same {
-                unsafe { crate::value::PackedValue::replace_raw(word, Value::Undefined) };
-            }
-        } else if let Some(Op::StoreCap(name)) = chunk.ops.get(pc as usize + 1) {
-            // As in jit_exec_inner, env_raw is the running environment swapped for this native
-            // frame, not a borrowed pointer to the caller's environment. Its existing owner
-            // outlives the call. The captured binding lives in the body's activation record,
-            // which env_raw leaves inside a block or `with` scope.
-            let env = std::mem::ManuallyDrop::new(unsafe {
-                crate::interpreter::Env::from_raw(
-                    ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
-                )
-            });
-            let cap_env = unsafe { jit_cap_env(ctx, &env) };
-            chunk.release_overwritten_captured_string(cap_env, *name, &left);
-        }
     }
 
     unsafe { base.write(PackedValue::pack(Value::Str(left.concat_owned(&right)))) };
@@ -22319,13 +22229,9 @@ unsafe fn jit_call_hit_inner(
         &raw mut *undef as *const PackedValue
     };
     let r = i.call_jit_committed(&ic, &code, this_slot, args_ptr, argc);
-    // Arguments and `this` were moved; pop them virtually and drop only the callee slot
-    // (same ownership story as jit_call_inner's Some arm).
+    // Arguments and `this` were moved; pop them and the callee slot virtually (same ownership
+    // story as jit_call_inner's Some arm).
     sp = args_ptr.sub(1);
-    match sp.read().into_value() {
-        Value::Obj(o) => crate::value::Gc::release(o),
-        other => drop(other),
-    }
     if with_this {
         sp = sp.sub(1); // `this` was consumed (moved) by the callee — skip, don't drop
     }
@@ -22402,12 +22308,8 @@ unsafe fn jit_call_hit_native(
         };
         i.call_native_committed(nf, this_slot, args_ptr, argc)
     };
-    // Arguments and `this` were moved; pop them virtually and drop only the callee slot.
+    // Arguments and `this` were moved; pop them and the callee slot virtually.
     sp = args_ptr.sub(1);
-    match sp.read().into_value() {
-        Value::Obj(o) => crate::value::Gc::release(o),
-        other => drop(other),
-    }
     if with_this {
         sp = sp.sub(1); // `this` was consumed (moved) by the callee — skip, don't drop
     }
@@ -22728,9 +22630,7 @@ fn open_array_binding<S: StoredValue>(
     next: u16,
     count: u16,
 ) -> Result<bool, Abrupt> {
-    let old_source = slots.read_value(iterator as usize);
-    let old_next = slots.read_value(next as usize);
-    let captured = i.try_array_binding(&source, count as usize, &old_source, &old_next)?;
+    let captured = i.try_array_binding(&source, count as usize)?;
     let matched = captured.is_some();
     if let Some(captured) = captured {
         slots.write_value(next as usize, captured);
@@ -23120,7 +23020,7 @@ unsafe fn jit_new_inner(
 ) -> Result<(), Abrupt> {
     let args_ptr = unsafe { sp.sub(argc) };
     // Identity-cached construct: on Some the arguments were MOVED into the callee's frame — pop
-    // them virtually and drop only the callee slot.
+    // them and the callee slot virtually.
     if let Some(r) = unsafe {
         i.construct_jit_fast(
             &(*sp.sub(argc + 1)).unpack(),
@@ -23131,10 +23031,6 @@ unsafe fn jit_new_inner(
         )
     } {
         *sp = unsafe { args_ptr.sub(1) };
-        match unsafe { sp.read().into_value() } {
-            Value::Obj(o) => crate::value::Gc::release(o),
-            other => drop(other),
-        }
         let v = r?;
         unsafe { sp.write(PackedValue::pack(v)) };
         *sp = unsafe { sp.add(1) };
@@ -23934,12 +23830,8 @@ unsafe fn jit_call_inner(
                         &raw mut *undef2 as *const PackedValue
                     };
                     let r = i.call_native_committed(nf, this_slot2, args_ptr, argc);
-                    // Arguments and `this` were consumed; drop only the callee slot.
+                    // Arguments and `this` were consumed; pop them and the callee slot.
                     *sp = args_ptr.sub(1);
-                    match sp.read().into_value() {
-                        Value::Obj(o) => crate::value::Gc::release(o),
-                        other => drop(other),
-                    }
                     if with_this {
                         *sp = sp.sub(1);
                     }
@@ -23960,14 +23852,8 @@ unsafe fn jit_call_inner(
         );
     }
     if let Some(r) = r {
+        // Pop the arguments and the callee/method slot.
         *sp = args_ptr.sub(1);
-        // Drop the callee/method slot. It is virtually always a function object with other
-        // live references, so peel that case into a bare refcount decrement instead of the
-        // outlined generic Value drop.
-        match sp.read().into_value() {
-            Value::Obj(o) => crate::value::Gc::release(o),
-            other => drop(other),
-        }
         if with_this {
             *sp = sp.sub(1); // `this` was consumed by the callee
         }
@@ -24174,13 +24060,6 @@ unsafe fn jit_callstat(
             }
             if !matches!((*sp.sub(argc + 2)).unpack(), Value::Obj(_)) {
                 break 'r "gate: sloppy this-user, non-object receiver";
-            }
-        }
-        // The direct sequence's shared-callee guard; traced ownership (gc-heap) has none.
-        #[cfg(not(feature = "gc-heap"))]
-        if let Value::Obj(o) = &(*sp.sub(argc + 1)).unpack() {
-            if crate::value::Gc::strong_count(o) <= 2 {
-                break 'r "gate: callee refcount <= 1";
             }
         }
         // No allocation-pressure or gc-tick gate: the callee's entry poll is the direct call's

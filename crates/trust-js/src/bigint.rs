@@ -1,5 +1,5 @@
-//! Arbitrary-precision BigInt, from scratch: sign + little-endian u64 magnitude behind an `Rc`,
-//! or in a GC cell with `gc-heap` (clones are cheap; every operation allocates a fresh value).
+//! Arbitrary-precision BigInt, from scratch: sign + little-endian u64 magnitude in a GC cell
+//! (clones are cheap; every operation allocates a fresh value).
 //! Conformance needs exactness far past 128 bits (e.g. comparing a 1024-bit literal with
 //! `Number.MAX_VALUE`), not speed.
 
@@ -79,17 +79,13 @@ struct BigIntData {
     mag: Vec<u64>,
 }
 
-/// The owner of a value's digits: reference-counted without `gc-heap`; with it, a cell in the
-/// Agent heap that was active when the value was made (P1 S2).
-#[cfg(not(feature = "gc-heap"))]
-type Payload = Rc<BigIntData>;
+/// The owner of a value's digits: a cell in the Agent heap that was active when the value was
+/// made (P1 S2).
 #[cfg(feature = "gc-heap")]
 type Payload = crate::gc_box::GcBox<BigIntData>;
 
 #[inline]
 fn payload(data: BigIntData) -> Payload {
-    #[cfg(not(feature = "gc-heap"))]
-    return Rc::new(data);
     #[cfg(feature = "gc-heap")]
     crate::gc_box::new(data)
 }
@@ -114,7 +110,7 @@ pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
 
 /// A BigInt literal as the lexer, the AST and snapshots hold it: digits in the Rust heap,
 /// outside any GC heap, shared by every evaluation of the literal. [`BigIntLiteral::value`]
-/// makes the runtime value (a reference-count bump without `gc-heap`, a fresh cell with it).
+/// makes the runtime value, a fresh cell.
 #[derive(Clone, Debug)]
 pub struct BigIntLiteral(Rc<BigIntData>);
 
@@ -131,8 +127,6 @@ impl BigIntLiteral {
     /// The literal's value.
     #[inline]
     pub fn value(&self) -> JsBigInt {
-        #[cfg(not(feature = "gc-heap"))]
-        return JsBigInt(self.0.clone());
         #[cfg(feature = "gc-heap")]
         JsBigInt(payload(BigIntData {
             neg: self.0.neg,
@@ -318,8 +312,6 @@ fn radix_chunk(radix: u32) -> (u64, usize) {
 
 impl JsBigInt {
     pub(crate) fn allocation_identity(&self) -> usize {
-        #[cfg(not(feature = "gc-heap"))]
-        let identity = Rc::as_ptr(&self.0);
         #[cfg(feature = "gc-heap")]
         let identity = crate::gc_box::GcBox::as_ptr(&self.0);
         identity as usize
@@ -332,7 +324,7 @@ impl JsBigInt {
         crate::gc_box::GcBox::as_ptr(&self.0) as u64
     }
 
-    /// Requested payload/capacity bytes, excluding the implementation-private `RcBox` header.
+    /// Requested payload/capacity bytes, excluding the cell's size-class rounding.
     pub(crate) fn retained_requested_bytes(&self) -> usize {
         self.0.retained_requested_bytes()
     }

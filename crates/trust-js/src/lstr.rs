@@ -1,40 +1,32 @@
-//! The engine string: a thin refcounted UTF-8 buffer with spare capacity.
+//! The engine string: a thin UTF-8 buffer with spare capacity, in a GC cell.
 //!
 //! `Value::Str` used to hold `Rc<str>` — immutable and exactly sized, which makes an append loop
 //! (`s += x`, astring's `this.output += e`) inherently O(n²): every step materializes a fresh
 //! allocation of the whole accumulated string. `LStr` is the classic engine fix (QuickJS's
-//! JSString): `{strong, len, cap}` header + bytes, one thin pointer. When a string is *uniquely
-//! referenced* an append writes in place (amortized by capacity doubling); shared strings copy
-//! first, exactly like `Rc::make_mut`.
+//! JSString): a `{frontier, len, cap}` header + bytes, one thin pointer.
 //!
-//! The payload is a single 8-byte pointer with the strong count at offset 0 — the same shape the
-//! JIT's inline templates already assume for refcounted payloads (`Rc`'s RcBox), so the machine
-//! code that bumps/decrements tag-6 values is unchanged. Logical content is always `len` bytes of
-//! valid UTF-8 (lone surrogates smuggled, as before — see [`crate::jstr`]); capacity beyond `len`
-//! is invisible to every reader because `Deref` slices to `len`. Large substrings may instead
-//! hold a bounded view of a flat buffer. Their header has the same count/length offsets, but
-//! no ASCII hint: native byte readers must take their checked path for a view.
+//! A string is a cell of the active Agent's heap (P1 S2): a handle is the cell's address,
+//! cloning copies it and nothing is counted. Word 0 of a flat buffer records its *frontier*, how
+//! many bytes have been written into it. An append to a string that ends at its buffer's
+//! frontier, with spare capacity, writes past the frontier and returns a view of the same
+//! buffer; bytes a string can read never change afterwards, so aliases keep their own length
+//! and no uniqueness is needed (Decision 4 as revised at step 4d). Any other append copies into
+//! a new buffer with geometric capacity.
 //!
-//! Like `Rc`, `LStr` is neither `Send` nor `Sync` (non-atomic count; the engine is one thread
-//! per realm).
+//! Logical content is always `len` bytes of valid UTF-8 (lone surrogates smuggled, as before —
+//! see [`crate::jstr`]); capacity beyond `len` is invisible to every reader because `Deref`
+//! slices to `len`. Large substrings may instead hold a bounded view of a flat buffer. Their
+//! header has the same length offset, but no ASCII hint: native byte readers must take their
+//! checked path for a view.
 //!
-//! With `gc-heap` (P1 S2) a string is a cell of the active Agent's heap: a handle is the cell's
-//! address, cloning copies it and nothing is counted. Word 0 of a flat buffer then records its
-//! *frontier*, how many bytes have been written into it. An append to a string that ends at its
-//! buffer's frontier, with spare capacity, writes past the frontier and returns a view of the
-//! same buffer; bytes a string can read never change afterwards, so aliases keep their own
-//! length and no uniqueness is needed (Decision 4 as revised at step 4d). Any other append
-//! copies into a new buffer with geometric capacity.
+//! `LStr` is neither `Send` nor `Sync`: the engine is one thread per realm.
 
-#[cfg(not(feature = "gc-heap"))]
-use std::alloc::{alloc, dealloc, Layout};
 use std::cell::Cell;
 use std::ptr::NonNull;
 
 #[repr(C)]
 struct Header {
-    /// Strong count — MUST stay the first field (the JIT bumps it at payload offset 0). With
-    /// `gc-heap`, a flat buffer's frontier (see the module docs); unused by a view.
+    /// A flat buffer's frontier (see the module docs); unused by a view.
     strong: Cell<usize>,
     len: Cell<u32>,
     cap: Cell<u32>,
@@ -56,7 +48,7 @@ pub struct LStr {
 const HDR: usize = std::mem::size_of::<Header>();
 
 /// Byte offset of the length within the header — the JIT's inline equality/truthiness templates
-/// read `len` from machine code through the stored pointer (the strong count stays at offset 0).
+/// read `len` from machine code through the stored pointer.
 pub(crate) const LEN_OFF: usize = std::mem::offset_of!(Header, len);
 /// Byte offset of `cap` (which carries [`ASCII_HINT`] in its top bit) — the JIT's charCodeAt
 /// intrinsic tests the hint from machine code.
@@ -83,12 +75,6 @@ const MIN_VIEW_BYTES: usize = 256;
 /// sticky RegExp exec) quadratic in both the copy and the matcher's text preparation.
 const VIEW_PIN_BYTES: usize = 1 << 20;
 const _: () = assert!(MIN_VIEW_BYTES > 10);
-
-#[cfg(not(feature = "gc-heap"))]
-fn layout(cap: u32) -> Layout {
-    Layout::from_size_align(HDR + cap as usize, std::mem::align_of::<Header>())
-        .expect("string too large")
-}
 
 /// The descriptor of string cells (gc-heap): a view's one edge is its flat owner.
 #[cfg(feature = "gc-heap")]
@@ -124,8 +110,6 @@ impl LStr {
         assert!(cap < VIEW_CAP, "capacity claims representation bits");
         debug_assert!(!ascii || content.is_ascii());
         unsafe {
-            #[cfg(not(feature = "gc-heap"))]
-            let p = alloc(layout(cap)) as *mut Header;
             #[cfg(feature = "gc-heap")]
             let p = crate::value::alloc_string_cell(HDR + cap as usize) as *mut Header;
             let p = NonNull::new(p).expect("allocation failed");
@@ -133,12 +117,8 @@ impl LStr {
             // re-AND it with the extra bytes' ASCII-ness (see concat2/concat_grown).
             let hint = if ascii { ASCII_HINT } else { 0 };
             p.as_ptr().write(Header {
-                // A count of one, or (gc-heap) the frontier: the content's end.
-                strong: Cell::new(if cfg!(feature = "gc-heap") {
-                    content.len()
-                } else {
-                    1
-                }),
+                // The frontier: the content's end.
+                strong: Cell::new(content.len()),
                 len: Cell::new(content.len() as u32),
                 cap: Cell::new(cap | hint),
             });
@@ -148,8 +128,8 @@ impl LStr {
         }
     }
 
-    /// Set a fresh, unpublished flat string's length after writing its bytes (and, with
-    /// `gc-heap`, its frontier to match).
+    /// Set a fresh, unpublished flat string's length after writing its bytes, and its frontier
+    /// to match.
     #[inline]
     fn set_fresh_len(&self, len: usize) {
         let h = self.hdr();
@@ -308,15 +288,13 @@ impl LStr {
         debug_assert!(owner.view().is_none(), "views own flat buffers");
         let view = View {
             header: Header {
-                strong: Cell::new(if cfg!(feature = "gc-heap") { 0 } else { 1 }),
+                strong: Cell::new(0),
                 len: Cell::new(len as u32),
                 cap: Cell::new(VIEW_CAP),
             },
             owner,
             offset,
         };
-        #[cfg(not(feature = "gc-heap"))]
-        let p = Box::into_raw(Box::new(view)).cast::<Header>();
         #[cfg(feature = "gc-heap")]
         let p = {
             let cell = crate::value::alloc_string_cell(std::mem::size_of::<View>()).cast::<View>();
@@ -345,7 +323,7 @@ impl LStr {
     }
 
     /// The flat buffer this string reads: a view's owner, else itself. An in-place append keeps
-    /// it (with `gc-heap` the result is a new view of the same buffer).
+    /// it (the result is a new view of the same buffer).
     #[cfg(test)]
     pub(crate) fn buffer_ptr(&self) -> *const u8 {
         self.view_owner().unwrap_or(self).as_ptr()
@@ -367,8 +345,6 @@ impl LStr {
     pub fn strong_count(&self) -> usize {
         #[cfg(feature = "gc-heap")]
         panic!("LStr::strong_count: gc-heap strings have no reference counts");
-        #[cfg(not(feature = "gc-heap"))]
-        self.hdr().strong.get()
     }
 
     /// Requested bytes retained by this allocation, excluding allocator rounding.
@@ -393,10 +369,10 @@ impl LStr {
         }
     }
 
-    /// Append in place when this is the ONLY reference and capacity suffices. Returns false
-    /// (without modifying anything) otherwise — the caller copies. The unique-owner requirement
-    /// is what makes the mutation invisible: no other handle can observe the content, and the
-    /// caller must not hold a `&str` borrow of `self` across the call (enforced by `&mut self`).
+    /// Append in place when this string ends at its buffer's frontier and the capacity
+    /// suffices: the bytes go past the frontier, where no string reads, and `self` becomes a
+    /// view of the longer content. Returns false (without modifying anything) otherwise — the
+    /// caller copies.
     pub fn append_in_place(&mut self, x: &str) -> bool {
         self.append_with_hint(x, x.is_ascii())
     }
@@ -427,25 +403,6 @@ impl LStr {
         true
     }
 
-    #[cfg(not(feature = "gc-heap"))]
-    fn append_with_hint(&mut self, x: &str, ascii: bool) -> bool {
-        let h = self.hdr();
-        if h.strong.get() != 1 || h.cap.get() == VIEW_CAP {
-            return false;
-        }
-        let len = h.len.get() as usize;
-        if len + x.len() > (h.cap.get() & !ASCII_HINT) as usize {
-            return false;
-        }
-        unsafe {
-            let data = (self.p.as_ptr() as *mut u8).add(HDR);
-            std::ptr::copy_nonoverlapping(x.as_ptr(), data.add(len), x.len());
-        }
-        h.len.set((len + x.len()) as u32);
-        self.and_ascii(ascii);
-        true
-    }
-
     /// `self + x` with growth capacity: used by the fused append ops when in-place didn't apply.
     /// Doubles (at least) so a rebuilt accumulator amortizes the next appends.
     pub fn concat_grown(&self, x: &str) -> LStr {
@@ -468,17 +425,17 @@ impl LStr {
 
     /// ECMAScript code-unit concatenation after the caller's coercions and length check.
     /// Shared by all execution tiers and String#concat. Cached ASCII hints eliminate prefix
-    /// rescans; moving the left handle also permits amortized appends to unique temporaries.
-    /// Aliases (including `s + s`) keep the strong count above one and force a separate buffer.
+    /// rescans; a left string that ends at its buffer's frontier appends there, amortized by
+    /// geometric capacity, whatever aliases it has (`s + s` included).
     pub(crate) fn concat_owned(mut self, right: &LStr) -> LStr {
         self.append_or_replace(right);
         self
     }
 
     /// Append without temporarily removing an owning binding. Build a replacement before
-    /// assigning it, so allocation failure cannot strand a cleared binding. Unique buffers
-    /// with capacity mutate only while this mutable borrow excludes every other observer;
-    /// shared strings and views retain the original contents and allocate a replacement.
+    /// assigning it, so allocation failure cannot strand a cleared binding. A string that ends
+    /// at its buffer's frontier, with spare capacity, writes past it (bytes no string reads) and
+    /// becomes a view of the longer content; any other keeps its contents and is replaced.
     pub(crate) fn append_or_replace(&mut self, right: &LStr) {
         if right.is_empty() {
             return;
@@ -596,42 +553,17 @@ impl LStr {
 impl Clone for LStr {
     #[inline]
     fn clone(&self) -> LStr {
-        #[cfg(not(feature = "gc-heap"))]
-        {
-            let h = self.hdr();
-            h.strong.set(h.strong.get() + 1);
-        }
         LStr { p: self.p }
     }
 }
 
-/// Nothing to release under gc-heap: the collector frees unreachable cells. Kept as a type
-/// with drop glue so code written for counted strings (an explicit `drop` that releases a
-/// buffer early, scoped temporaries) reads the same in both builds.
+/// Nothing to release: the collector frees unreachable cells. The empty impl keeps `LStr`, and
+/// so `Value`, a type with drop glue until S6's criterion closure decides how far values become
+/// `Copy`.
 #[cfg(feature = "gc-heap")]
 impl Drop for LStr {
     #[inline]
     fn drop(&mut self) {}
-}
-
-#[cfg(not(feature = "gc-heap"))]
-impl Drop for LStr {
-    #[inline]
-    fn drop(&mut self) {
-        let h = self.hdr();
-        let s = h.strong.get();
-        if s == 1 {
-            if h.cap.get() == VIEW_CAP {
-                // Drops the one flat owner, then releases the view allocation.
-                unsafe { drop(Box::from_raw(self.p.as_ptr().cast::<View>())) };
-            } else {
-                let cap = h.cap.get() & !ASCII_HINT;
-                unsafe { dealloc(self.p.as_ptr() as *mut u8, layout(cap)) };
-            }
-        } else {
-            h.strong.set(s - 1);
-        }
-    }
 }
 
 impl std::ops::Deref for LStr {

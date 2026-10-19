@@ -5,12 +5,11 @@
 //! safepoint — an argument list under evaluation, a spread's accumulated elements, a built-in's
 //! working copy — is a [`RootedVec`] (owned, growable), is registered for a scope with
 //! [`root_slice`] (borrowed, fixed), or lives in a [`Rooted`] (any traceable state); values
-//! entering a structure that cannot be traced are kept in [`ValueRoots`]. Without `gc-heap` all
-//! of these are plain buffers: reference counts keep the values alive.
+//! entering a structure that cannot be traced are kept in [`ValueRoots`].
 
 use crate::value::Value;
 
-/// A `Vec<Value>` whose elements are GC roots while it lives (feature `gc-heap`).
+/// A `Vec<Value>` whose elements are GC roots while it lives.
 pub(crate) struct RootedVec {
     /// Boxed so the registered address stays put when the `RootedVec` moves.
     #[cfg(feature = "gc-heap")]
@@ -18,8 +17,6 @@ pub(crate) struct RootedVec {
     values: Box<Vec<Value>>,
     #[cfg(feature = "gc-heap")]
     slot: registry::Slot,
-    #[cfg(not(feature = "gc-heap"))]
-    values: Vec<Value>,
 }
 
 impl RootedVec {
@@ -36,8 +33,6 @@ impl RootedVec {
             let slot = registry::register(registry::Entry::Vec(std::ptr::from_ref(&*values)));
             RootedVec { values, slot }
         }
-        #[cfg(not(feature = "gc-heap"))]
-        RootedVec { values }
     }
 
     /// The values, no longer rooted: the caller roots them again before the next safepoint
@@ -146,24 +141,18 @@ impl Drop for RootedVec {
     }
 }
 
-/// What [`Rooted`] can hold: everything traceable (gc-heap), anything otherwise.
+/// What [`Rooted`] can hold: everything traceable.
 #[cfg(feature = "gc-heap")]
 pub(crate) use crate::gc_trace::GcTrace as Traceable;
-#[cfg(not(feature = "gc-heap"))]
-pub(crate) trait Traceable {}
-#[cfg(not(feature = "gc-heap"))]
-impl<T: ?Sized> Traceable for T {}
 
-/// A value whose GC edges are roots while it lives (feature `gc-heap`): engine state built up
-/// in a Rust structure across safepoints, such as a class evaluation's decorators.
+/// A value whose GC edges are roots while it lives: engine state built up in a Rust structure
+/// across safepoints, such as a class evaluation's decorators.
 pub(crate) struct Rooted<T: Traceable + 'static> {
     /// Boxed so the registered address stays put.
     #[cfg(feature = "gc-heap")]
     value: Box<T>,
     #[cfg(feature = "gc-heap")]
     slot: registry::Slot,
-    #[cfg(not(feature = "gc-heap"))]
-    value: T,
 }
 
 impl<T: Traceable + 'static> Rooted<T> {
@@ -176,8 +165,6 @@ impl<T: Traceable + 'static> Rooted<T> {
             let slot = registry::register(registry::Entry::Traced(std::ptr::from_ref(traced)));
             Rooted { value, slot }
         }
-        #[cfg(not(feature = "gc-heap"))]
-        Rooted { value }
     }
 }
 
@@ -205,8 +192,7 @@ impl<T: Traceable + 'static> Drop for Rooted<T> {
 }
 
 /// Keeps values alive while it lives, beside a Rust-heap structure the scan cannot see (a
-/// built-in's groups or worklist): `keep` each value as it enters the structure. Without
-/// `gc-heap` it holds nothing and costs nothing.
+/// built-in's groups or worklist): `keep` each value as it enters the structure.
 #[derive(Default)]
 pub(crate) struct ValueRoots {
     #[cfg(feature = "gc-heap")]
@@ -223,8 +209,6 @@ impl ValueRoots {
     pub(crate) fn keep(&mut self, value: &Value) {
         #[cfg(feature = "gc-heap")]
         self.values.push(value.clone());
-        #[cfg(not(feature = "gc-heap"))]
-        let _ = value;
     }
 }
 
@@ -236,12 +220,10 @@ pub(crate) struct SliceRoot<'a> {
     _values: std::marker::PhantomData<&'a [Value]>,
 }
 
-/// Root `values` until the returned guard drops (feature `gc-heap`; free otherwise). The
-/// borrow keeps the slice from being changed or freed meanwhile.
+/// Root `values` until the returned guard drops. The borrow keeps the slice from being changed
+/// or freed meanwhile.
 #[inline]
 pub(crate) fn root_slice(values: &[Value]) -> SliceRoot<'_> {
-    #[cfg(not(feature = "gc-heap"))]
-    let _ = values;
     SliceRoot {
         #[cfg(feature = "gc-heap")]
         slot: registry::register(registry::Entry::Slice(std::ptr::from_ref(values))),
