@@ -433,14 +433,16 @@ impl crate::interpreter::Interp {
     /// Move `from`'s [[MapData]]/[[SetData]], if it has one, to `to` (the subclass instance a
     /// `super()` call made). Whether one moved.
     pub(crate) fn move_collection(&mut self, from: &Gc, to: &Gc) -> bool {
-        let moved =
-            match std::mem::replace(&mut from.borrow_mut().exotic, crate::value::Exotic::None) {
-                crate::value::Exotic::Collection(data) => data,
-                other => {
-                    from.borrow_mut().exotic = other;
-                    return false;
-                }
-            };
+        // Taken in a statement of its own: `from`'s borrow ends before the match puts back a
+        // state that is not a collection.
+        let taken = std::mem::replace(&mut from.borrow_mut().exotic, crate::value::Exotic::None);
+        let moved = match taken {
+            crate::value::Exotic::Collection(data) => data,
+            other => {
+                from.borrow_mut().exotic = other;
+                return false;
+            }
+        };
         to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
         true
     }

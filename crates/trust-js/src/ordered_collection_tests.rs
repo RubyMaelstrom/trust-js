@@ -278,3 +278,26 @@ fn ordered_collection_iterator_cycle_is_collectable() {
     assert!(!crate::gc_test::alive(&weak));
     assert!(engine.interp.collection_iterators.is_empty());
 }
+
+/// A super() call's native result hands its [[MapData]]/[[SetData]] to `this`. A result holding
+/// neither keeps its own exotic state, and nothing moves.
+#[test]
+fn move_collection_moves_only_map_and_set_data() {
+    use crate::ordered_collection::{CollectionKind, OrderedCollection};
+    use crate::value::{Exotic, Object};
+    let mut engine = Engine::new();
+    let interp = &mut engine.interp;
+    let array = Object::new(None);
+    array.borrow_mut().exotic = Exotic::Array;
+    let to = Object::new(None);
+    assert!(!interp.move_collection(&array, &to));
+    assert!(matches!(array.borrow().exotic, Exotic::Array));
+    assert!(matches!(to.borrow().exotic, Exotic::None));
+    let map = Object::new(None);
+    interp.set_collection(&map, OrderedCollection::new(CollectionKind::Map));
+    assert!(interp.move_collection(&map, &to));
+    assert!(matches!(map.borrow().exotic, Exotic::None));
+    assert!(interp
+        .collection(&to)
+        .is_some_and(|data| data.kind() == CollectionKind::Map));
+}

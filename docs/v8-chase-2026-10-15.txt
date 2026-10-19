@@ -4522,3 +4522,25 @@ handles (an implementation agent's change, reviewed):
     lists step 8a's.
   - Not run, the engine's code being 8a's: downstream suites,
     fixtures, difftest, GC stress.
+
+The move_collection fix (step 8's recorded deviation, after 8b):
+- move_collection took `from`'s exotic state in the scrutinee of the
+  match whose non-Collection arm put it back, so that arm borrowed
+  `from` mutably while the scrutinee's borrow was still live: a
+  "RefCell already borrowed" panic for any source that is not a Map
+  or Set. The state is now taken in a statement of its own.
+- A new unit test moves nothing out of an Array exotic and moves a
+  Map's data; without the fix it panics at the second borrow.
+- Gates:
+  - aarch64: lib 2231/0/8, its test list step 8b's plus the new
+    test; clippy clean in the five configurations; rustfmt clean;
+    the workspace builds with all targets without a diagnostic.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1 (load average up to 61).
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash; all
+    three fixtures' code dumps step 8b's, in every mode.
+  - x86-64 (zombie): clippy clean; lib 2075/0/8. Windows: clippy as
+    its baseline; under Wine 2068 pass, 3 fail (step 1's snapshot
+    codec tests) and 8 are ignored. Both lists step 8b's plus the
+    new test.
