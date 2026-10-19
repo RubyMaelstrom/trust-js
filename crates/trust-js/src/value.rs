@@ -1097,8 +1097,9 @@ pub(crate) fn new_symbol_agent() -> SymbolAgent {
 /// performance, never correctness.
 ///
 /// Object offsets are relative to the *stored* handle word — the value in a `Value::Obj` payload,
-/// a packed object word's payload and an `Option<Gc>` (proto) field: the cell's address, which
-/// is [`Gc::as_ptr`], where the `RefCell<Object>` starts (`gc_data_off` is 0). The `Object` is
+/// a packed object word's payload and an `Option<Gc>` (proto) field: the cell's address, where
+/// the `RefCell<Object>` starts. It is the handle's [`Gc::as_ptr`] identity itself (checked
+/// live), so generated code compares it with recorded identities as it is. The `Object` is
 /// `obj_from_cell` bytes on, past the `RefCell`'s borrow flag. The inline templates only ever
 /// have the stored word, so measuring from it is what makes them correct.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1106,9 +1107,6 @@ pub struct JitLayout {
     /// Stored handle word → the `Object`, past the `RefCell` wrapper, whose borrow flag is the
     /// first word of an object cell.
     pub obj_from_cell: usize,
-    /// Stored handle word → [`Gc::as_ptr`] (0: the word is the cell address): what the
-    /// call probes add to a payload before comparing it with a fill-time `Gc::as_ptr` identity.
-    pub gc_data_off: usize,
     /// The build's representation facts beyond these offsets ([`JitRepr`]): where a key layout's
     /// strong count sits, how named fields and binding-map entries hold their elements, a slot
     /// memo's width and the Collection tag, probed once per process.
@@ -1195,16 +1193,15 @@ pub struct JitLayout {
     /// Fail-closed probe for ordinary numeric typed-array backing storage.
     pub native_typed_array: Option<crate::native_typed_array::Layout>,
     /// Scope offsets are relative to [`Env::as_ptr`] (the `RefCell<Scope>`), what generated code
-    /// keeps for an environment. `Env::as_ptr(env)` → the scope's `VarMap` generation counter
-    /// (through the `RefCell`).
+    /// keeps for an environment and what a stored environment handle word (a parent field, a
+    /// closure's `env`) holds (checked live). `Env::as_ptr(env)` → the scope's `VarMap`
+    /// generation counter (through the `RefCell`).
     pub scope_gen: usize,
     /// The live fixed-binding-layout identity, zero after structural mutation.
     pub scope_layout: usize,
     /// Parent `Option<Env>` within `Env::as_ptr(env)`: a stored environment handle word, or
     /// null (the handle's niche; checked live).
     pub scope_parent: usize,
-    /// Stored environment handle word → `Env::as_ptr` (0: the word is the cell address).
-    pub scope_data_off: usize,
     pub scope_parent_valid: bool,
     /// Guarded repr(Rust) small binding-map arm (its tag byte: Small 0, Large 1, Indexed 2) and
     /// its ordered entries, which the Indexed arm shares, relative to `Env::as_ptr(env)`. The
@@ -1472,13 +1469,14 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         }
     };
     // The stored handle word — a `Value::Obj` payload, a packed object word's payload, an
-    // `Option<Gc>` (proto) field — is the cell address (`Gc::as_ptr` itself: the cell starts
-    // with the RefCell<Object>). Every object offset is measured from it, through the RefCell
-    // wrapper.
+    // `Option<Gc>` (proto) field — is the cell address, `Gc::as_ptr` itself (the cell starts
+    // with the RefCell<Object>): generated code compares it with recorded `Gc::as_ptr`
+    // identities as it is, and `object_identity_ok` checks that. Every object offset is
+    // measured from it, through the RefCell wrapper.
     let stored = unsafe { *(sample as *const Gc as *const usize) };
     let as_ptr = Gc::as_ptr(sample) as usize; // the RefCell<Object>
     let obj_addr = &*sample.borrow() as *const Object as usize;
-    let gc_data_off = as_ptr.wrapping_sub(stored);
+    let object_identity_ok = stored == as_ptr;
     let obj_from_cell = obj_addr.wrapping_sub(stored);
     // An Option<Gc> (a proto field) holds exactly the stored word, and None is null (the
     // handle's non-null niche).
@@ -1487,7 +1485,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let niche_ok = std::mem::size_of::<Option<Gc>>() == std::mem::size_of::<usize>()
         && unsafe { *(&some_proto as *const Option<Gc> as *const usize) } == stored
         && unsafe { *(&none_proto as *const Option<Gc> as *const usize) } == 0
-        && stored <= as_ptr
         && as_ptr <= obj_addr;
     let repr = jit_repr();
 
@@ -1632,8 +1629,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
 
     // Scope offsets for the inline LoadName template, relative to `Env::as_ptr` (the
     // RefCell<Scope>) → Scope.vars → VarMap generation. The RefCell value offset is probed on a
-    // live scope; a stored environment handle word is the cell address, `scope_data_off` (0)
-    // bytes before `Env::as_ptr`.
+    // live scope; a stored environment handle word is the cell address, `Env::as_ptr` itself,
+    // which generated code uses as it is (`scope_identity_ok` checks that).
     let probe_env = crate::interpreter::new_scope(None);
     let scope_addr = {
         let b = probe_env.borrow();
@@ -1641,7 +1638,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     };
     let scope_refcell = scope_addr - Env::as_ptr(&probe_env) as usize;
     let scope_stored = unsafe { *(&probe_env as *const Env as *const usize) };
-    let scope_data_off = (Env::as_ptr(&probe_env) as usize).wrapping_sub(scope_stored);
+    let scope_identity_ok = scope_stored == Env::as_ptr(&probe_env) as usize;
     let parent_some = Some(probe_env.clone());
     let parent_none: Option<Env> = None;
     let scope_parent = scope_refcell + offset_of!(crate::interpreter::Scope, parent);
@@ -1650,11 +1647,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let child_parent =
         unsafe { *((Env::as_ptr(&probe_child) as usize + scope_parent) as *const usize) };
     let scope_parent_valid = std::mem::size_of::<Option<Env>>() == std::mem::size_of::<usize>()
-        && scope_data_off < 256
+        && scope_identity_ok
         && unsafe { *(&parent_some as *const Option<Env> as *const usize) } == scope_stored
         && unsafe { *(&parent_none as *const Option<Env> as *const usize) } == 0
-        && child_parent == scope_stored
-        && child_parent.wrapping_add(scope_data_off) == Env::as_ptr(&probe_env) as usize;
+        && child_parent == scope_stored;
     let scope_gen = scope_refcell
         + offset_of!(crate::interpreter::Scope, vars)
         + crate::interpreter::VarMap::generation_offset();
@@ -1735,7 +1731,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
                 && func_data_off < 256
                 && read(user_func) == func_word
                 && read(user_func).wrapping_add(func_data_off) == Rc::as_ptr(&user.func) as usize
-                && read(user_env).wrapping_add(scope_data_off) == Env::as_ptr(&user.env) as usize
+                && read(user_env) == Env::as_ptr(&user.env) as usize
                 && read(user_realm) == realm;
             (user_func, user_env, user_realm, func_data_off, ok)
         }
@@ -1745,6 +1741,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let call_probe_valid = callable_ok && closure_ok;
 
     let valid = repr.valid
+        && object_identity_ok
+        && scope_identity_ok
         && niche_ok
         && vec_ptr_off.is_some()
         && vec_len_off.is_some()
@@ -1757,7 +1755,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && heap_layouts_ok;
     JitLayout {
         obj_from_cell,
-        gc_data_off,
         repr,
         obj_proto: offset_of!(Object, proto),
         obj_ic_plain: offset_of!(Object, ic_plain),
@@ -1814,7 +1811,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_gen,
         scope_layout,
         scope_parent,
-        scope_data_off,
         scope_parent_valid,
         scope_small_tag,
         scope_small_vec,

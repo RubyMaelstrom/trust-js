@@ -76,7 +76,6 @@ fn emit_deep_name_target_ptr(
     a.cbz(11, true, holder);
     a.ldr_imm(9, 9, layout.scope_parent as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.scope_data_off as u32);
     a.add_imm(10, 10, NAME_GUARD_SIZE as u32);
     a.b(loop_head);
     a.bind(holder);
@@ -208,7 +207,6 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cbnz(7, false, property);
     a.ldr_imm(9, 8, offset_of!(R, scope) as u32);
     a.cbz(9, true, slow);
-    a.add_imm(9, 9, layout.scope_data_off as u32);
     a.ldr_w_imm(10, 8, offset_of!(R, generation) as u32);
     a.cmn_imm_w(10, 1);
     a.b_cond(C_EQ, slow);
@@ -323,7 +321,6 @@ pub(super) fn emit_reference_op(
             a.cbnz(7, false, property);
             a.ldr_imm(13, 8, offset_of!(R, scope) as u32);
             a.cbz(13, true, slow);
-            a.add_imm(13, 13, layout.scope_data_off as u32);
             a.cmp_reg_x(13, 9);
             a.b_cond(C_NE, slow);
             // Commit only non-owning address hints; exact record/name owners stay unchanged.

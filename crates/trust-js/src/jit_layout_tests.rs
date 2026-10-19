@@ -85,10 +85,10 @@ fn layout_is_valid_with_the_build_ownership() {
         &*object.borrow() as *const Object as usize
     );
     assert_eq!(
-        stored(&object) + layout.gc_data_off,
-        Gc::as_ptr(&object) as usize
+        stored(&object),
+        Gc::as_ptr(&object) as usize,
+        "the stored word is the cell address, the `Gc::as_ptr` identity"
     );
-    assert_eq!(layout.gc_data_off, 0, "the stored word is the cell address");
     assert!(matches!(
         layout.repr.props_fields,
         JitVecLayout::Inline {
@@ -123,7 +123,7 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
     let base = body(&layout, &object);
     assert_eq!(read::<usize>(base, layout.obj_proto), stored(&proto));
     assert_eq!(
-        read::<usize>(base, layout.obj_proto) + layout.gc_data_off,
+        read::<usize>(base, layout.obj_proto),
         Gc::as_ptr(&proto) as usize
     );
     assert_eq!(
@@ -303,10 +303,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
         }
         let parent_word = read::<usize>(base, layout.scope_parent);
         assert_eq!(parent_word, env_stored(&parent));
-        assert_eq!(
-            parent_word + layout.scope_data_off,
-            Env::as_ptr(&parent) as usize
-        );
+        assert_eq!(parent_word, Env::as_ptr(&parent) as usize);
         let (tag, data, len) = entries(&env);
         if count > 8 {
             assert_eq!(tag, 1, "a Large map");
@@ -388,7 +385,7 @@ fn callable_fields_read_a_live_closure() {
         Rc::as_ptr(&user.func) as usize
     );
     assert_eq!(
-        read::<usize>(payload, layout.user_env) + layout.scope_data_off,
+        read::<usize>(payload, layout.user_env),
         Env::as_ptr(&user.env) as usize
     );
     assert_eq!(read::<usize>(payload, layout.user_realm), user.realm);

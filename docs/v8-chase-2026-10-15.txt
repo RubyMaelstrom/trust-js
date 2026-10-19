@@ -4692,3 +4692,84 @@ The scan-bound fix (step 8's recorded deviation, before 8d):
     (zombie), the whole lib suite, 2079 tests: 2046 pass and 7 are
     ignored at interval 1 (3,740 s); the slow lists' 22 pass at 100
     and their 4 at 1000.
+
+Step 8d, the always-zero data offsets gone (an implementation
+agent's change, reviewed):
+- Deleted: JitLayout's gc_data_off and scope_data_off, the offsets
+  from a stored object or environment handle word to its Gc::as_ptr
+  or Env::as_ptr identity, both 0 since a handle's word became its
+  cell's address. The probe now requires each stored word to be its
+  identity (object_identity_ok, scope_identity_ok, and a closure's
+  env word its Env::as_ptr); if one is not, the layout is not valid,
+  as for the probe's other checks.
+- Generated code: ARM64 loses nine no-op adds (`add xN, xN, #0`),
+  its two register moves spelled that way are `mov` (x13 from x10
+  in emit_call_inline_marked, x4 from x10 in emit_direct_call), and
+  the accessor landing subtracts obj_off alone. x64 loses three
+  no-op `lea r9, [r9+0]`, and its move spelled `lea rax, [r9-0]` is
+  `mov rax, r9`. Range checks, the x64 names module's `valid` and
+  the docs no longer name the fields; jit_layout_tests assert the
+  identities instead.
+- Review: two ARM64 null tests only skipped a deleted add, so each
+  branched to the next instruction (emit_direct_call's parent cache
+  and emit_prop_create_probe's proto); they went too, and the
+  comments say what the word is (an identity, or null).
+- Found on the way: the scan-bound fix's defect (the previous
+  entry). With 8d on 8c, five x86-64 tests that check that cells
+  die failed; on the fix they pass.
+- The dumps check is new, dumpcmp-8d.py: the brief's
+  dumpcmp-zero.py allows neither moved Interp offsets nor dropped
+  null tests. Interp holds its JitLayout inline (552 bytes, now
+  536), so the 60 members after it moved 16 bytes down (Interp 5832
+  bytes, now 5816). Per chunk, with the no-op adds dropped, then
+  each CBZ/CBNZ to the next kept instruction, and the moves' two
+  encodings one token: the parent's and the child's instruction
+  streams are equal but for load, store and add immediates that
+  address a member of Interp at its parent offset and its child
+  offset (the layouts read from both release engines' DWARF,
+  dwarf-layout.py); the child drops only no-op instructions that the
+  parent has at the same place (by kind and the number of kept
+  instructions before it); and the counts differ by what the child
+  lost.
+- Kept: two other offsets that are 0 in this build, a binding's
+  value (binding_value, at two sites) and a property entry's
+  (entry_value), still emit no-op adds; every one left in the
+  dumps is theirs, `add x14, x14, #0`. They are measured layout
+  offsets, not identities, and 8d leaves them.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2228/0/7, its test list the parent's; clippy clean
+    in the five configurations; rustfmt clean; the workspace builds
+    with all targets without a diagnostic; rustdoc's 40 warnings are
+    8c's.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1 (load average up to 62).
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash.
+  - The fixtures' code dumps against the fix's, plain and with the
+    shared stubs in both modes: every chunk of the three (56, 10 and
+    160) is equal as described, and none of djot's GC-timing-
+    sensitive chunks differs. Summed over the fixtures, the plain
+    dumps lost 1,471 no-op adds and 752 null tests and kept 894
+    no-op adds, and 2,571 Interp immediates were remapped (depth,
+    interrupt_poll_tick, gc_next, direct_call_depth, pending_tail).
+    With the stubs per chunk those four counts are 2,704, 1,129,
+    1,686 and 4,474; inline, 7,253, 1,969, 5,481 and 9,829, and
+    call_overflow's immediates move too.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64, the
+    1027 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas: 1003 pass at interval
+    1 (6 are ignored), the slow lists' 15 at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2072/0/7, the five tests that
+    failed before the fix among the passes. Windows: clippy as its
+    baseline (23 diagnostics); under Wine 2064 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's. Test262 at --tier=jit: 53575/53575, the report
+    identical to step 1's x86-64 one and the S5 exit gate's aarch64
+    one. Fixtures: compiles 56/10/160, outputs as on aarch64;
+    difftest 138 agree, 12 skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2079 tests: 2046 pass and 7 are
+    ignored at interval 1 (3,750 s); the slow lists' 22 pass at 100
+    and their 4 at 1000.

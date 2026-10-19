@@ -6201,10 +6201,9 @@ fn emit_prop_load_inline(
     // `jit_get_prop`'s validated accessor path, then take the ordinary helper call. No
     // JavaScript can run between the validation above and the helper consuming these.
     a.bind(accessor_hit);
-    // x11 is the Object base; the helper wants the `Gc::as_ptr` form (the RefCell),
-    // which sits `obj_from_cell - gc_data_off` (the RefCell value offset) before it.
-    debug_assert!(layout.gc_data_off <= obj_off as usize);
-    a.sub_imm(9, 11, obj_off - layout.gc_data_off as u32);
+    // x11 is the Object base; the helper wants the `Gc::as_ptr` form (the RefCell, at the
+    // cell address), which sits `obj_from_cell` (the RefCell value offset) before it.
+    a.sub_imm(9, 11, obj_off);
     a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
     a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
     a.bind(slow);
@@ -6544,10 +6543,10 @@ fn emit_call_inline_marked(
                 a.ldr_imm(9, 9, 0);
             }
             emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, slow);
-            // x10 = the callee's payload, its cell address; x13 = its `Gc::as_ptr` identity,
-            // which the ways record, `gc_data_off` (0) bytes on.
+            // x10 = the callee's payload, its cell address; x13 = the same word, its
+            // `Gc::as_ptr` identity, which the ways record.
             emit_exec_payload(a, 9, 10);
-            a.add_imm(13, 10, layout.gc_data_off as u32);
+            a.mov(13, 10);
             // Probe ALL 4 ways (a stable polymorphic site — e.g. one dispatch
             // loop over a handful of receiver classes — otherwise pays the full
             // helper on every call that isn't way 1): x12 = entry cursor,
@@ -7419,7 +7418,6 @@ fn emit_call_code_probe(
         && fits8(layout.user_env)
         && fits8(layout.user_realm)
         && layout.func_data_off < 4096
-        && layout.scope_data_off < 4096
         && layout.scope_under_with < 4096)
     {
         a.b(miss);
@@ -7459,8 +7457,7 @@ fn emit_call_code_probe(
     a.cbnz(14, false, probe);
     a.b(miss);
     a.bind(found);
-    a.ldr_imm(7, 9, layout.user_env as u32);
-    a.add_imm(7, 7, layout.scope_data_off as u32);
+    a.ldr_imm(7, 9, layout.user_env as u32); // the closure's environment, its `Env::as_ptr`
     a.ldrb_imm(7, 7, layout.scope_under_with as u32);
     a.cbnz(7, false, miss);
     a.movz(15, crate::bytecode::CALL_IC_WAYS as u32 + CALL_CODE_HIT, 0);
@@ -7565,11 +7562,9 @@ fn direct_call_supported(
     il.valid
         && FRAME_WORDS_OFF < 4096
         && argc <= 64
-        && layout.gc_data_off < 4096
         && layout.scope_parent_valid
         && layout.scope_parent.is_multiple_of(8)
         && layout.scope_parent / 8 < 4096
-        && layout.scope_data_off < 4096
         && fits4(il.depth)
         && fits4(il.direct_call_depth)
         && fits4(il.gc_tick)
@@ -7627,8 +7622,8 @@ pub(crate) enum DirectCallSite {
 fn emit_direct_call(
     a: &mut asm::Asm,
     ilayout: &crate::interpreter::InterpLayout,
-    // Stored handle word → `Gc::as_ptr` delta (`JitLayout::gc_data_off`, 0): FnFrame.fn_ptr
-    // records the as_ptr identity (FnFrame::callee reconstructs a `Gc` from it).
+    // A stored handle word is the cell's `Gc::as_ptr` identity: FnFrame.fn_ptr records the
+    // callee's as it is (FnFrame::callee reconstructs a `Gc` from it).
     layout: &crate::value::JitLayout,
     // Byte offset of `Chunk::inline_attempted` (computed by the caller from its own chunk —
     // same monomorphized layout as the callee's): the sequence requires the callee's one-shot
@@ -7653,7 +7648,6 @@ fn emit_direct_call(
         return false;
     }
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
-    let gc_data_off = layout.gc_data_off;
     let il = ilayout;
     const IC_ENV: i32 = 8;
     const IC_STRICT: u32 = 40;
@@ -7676,8 +7670,7 @@ fn emit_direct_call(
     // without it every hit is an identity hit and the way's recorded environment is the callee's.
     let call_env_from_callee = layout.call_probe_valid
         && fits8(layout.obj_from_cell + layout.obj_call + 8)
-        && fits8(layout.user_env)
-        && layout.scope_data_off < 4096;
+        && fits8(layout.user_env);
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee cell address; NO mutations) ----
     // direct bits 0 (no force resets) and 2 (recompile settled)
@@ -7762,7 +7755,6 @@ fn emit_direct_call(
         a.bind(code_env);
         a.ldr_imm(13, 10, (layout.obj_from_cell + layout.obj_call + 8) as u32);
         a.ldr_imm(13, 13, layout.user_env as u32);
-        a.add_imm(13, 13, layout.scope_data_off as u32);
         a.bind(env_done);
     } else {
         a.ldur(13, 12, IC_ENV);
@@ -7775,7 +7767,7 @@ fn emit_direct_call(
     a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
     a.movz(5, 24, 0);
     a.madd(6, 16, 5, 6);
-    a.add_imm(4, 10, gc_data_off as u32);
+    a.mov(4, 10);
     a.stur(4, 6, 0); // fn_ptr = the callee's as_ptr identity
     match call_site {
         DirectCallSite::Position(position) => {
@@ -7871,13 +7863,10 @@ fn emit_direct_call(
     a.movz(4, 8, 0);
     a.madd(3, 5, 4, 15);
     a.str_imm(3, 9, cx_stack_base);
-    // env_raw (selected into x13 above), and its parent cache from that environment
+    // env_raw (selected into x13 above), and its parent cache from that environment: the
+    // parent's stored word, its `Env::as_ptr`, or null.
     a.str_imm(13, 9, cx_env_raw);
     a.ldr_imm(6, 13, layout.scope_parent as u32);
-    let no_parent = a.new_label();
-    a.cbz(6, true, no_parent);
-    a.add_imm(6, 6, layout.scope_data_off as u32);
-    a.bind(no_parent);
     a.str_imm(6, 9, cx_env_parent_raw);
     a.ldur(4, 12, IC_CHUNK_RAW);
     a.str_imm(4, 9, cx_chunk);
@@ -8626,7 +8615,6 @@ fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && layout.props_elems.is_multiple_of(8)
         && layout.props_elems / 8 < 4096
         && fields_capacity_fits(layout)
-        && layout.gc_data_off < 4096
         && layout.str_ptr_word < 256
         && layout.str_len_word < 256
 }
@@ -9354,17 +9342,13 @@ fn emit_prop_create_probe(
     a.mov_imm64(9, u32::MAX as u64);
     a.cmp_reg_w(16, 9);
     a.b_cond(C_EQ, miss);
-    // The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address,
-    // `gc_data_off` (0) bytes before it.
+    // The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address, the same
+    // word (or null).
     a.ldr_w_imm(14, 12, IC_OFF_SLOT);
     a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
     a.lsl_imm(15, 15, 32);
     a.logic_x(1, 14, 14, 15);
     a.ldr_imm(16, 11, layout.obj_proto as u32);
-    let proto_ready = a.new_label();
-    a.cbz(16, true, proto_ready);
-    a.add_imm(16, 16, layout.gc_data_off as u32);
-    a.bind(proto_ready);
     a.cmp_reg_x(14, 16);
     a.b_cond(C_NE, miss);
     // Every execution word transfers unchanged.
@@ -11246,15 +11230,13 @@ fn emit_name_ic_value_ptr_in(
     a.cmp_reg_w(11, 15);
     a.b_cond(C_NE, slow);
     if env == NameEnv::InX9 {
-        // The fixed scope's live parent (stored handle word → `Env::as_ptr`).
+        // The fixed scope's live parent (a stored handle word: its `Env::as_ptr`).
         if layout.scope_parent_valid
             && layout.scope_parent.is_multiple_of(8)
             && layout.scope_parent / 8 < 4096
-            && layout.scope_data_off < 4096
         {
             a.ldr_imm(14, 9, layout.scope_parent as u32);
             a.cbz(14, true, slow);
-            a.add_imm(14, 14, layout.scope_data_off as u32);
         } else {
             a.b(slow);
         }
@@ -16056,10 +16038,9 @@ fn emit_loop_chain(
                 for register in (2..18).step_by(2) {
                     a.stp_off(register, register + 1, register as i32 * 8);
                 }
+                // The helper takes `Gc::as_ptr`: the cell address, `obj_off` bytes before the
+                // Object.
                 a.sub_imm(0, r, obj_off);
-                // The helper takes `Gc::as_ptr`, `gc_data_off` (0) bytes past the payload's
-                // cell address.
-                a.add_imm(0, 0, layout.gc_data_off as u32);
                 a.mov_imm64(16, jit_prepare_packed_numeric_mirror as *const () as u64);
                 a.blr(16);
                 for register in (2..18).step_by(2) {

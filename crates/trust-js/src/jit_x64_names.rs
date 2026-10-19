@@ -60,7 +60,6 @@ fn valid(l: &JitLayout) -> bool {
             l.entry_value,
             l.entry_accessor,
             l.entry_writable,
-            l.scope_data_off,
             l.obj_from_cell,
             l.str_ptr_word,
             l.str_len_word,
@@ -143,7 +142,6 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(EQ, holder);
     a.nr_load(R9, R9, l.scope_parent);
     a.nr_zero_guard(R9, slow);
-    a.nr_lea(R9, R9, l.scope_data_off as i32);
     a.nr_op_imm(0, R10, NAME_GUARD_SIZE as i32);
     a.jmp(loop_head);
     a.bind(holder);
@@ -264,7 +262,6 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, slow: usize) {
     a.bind(parent);
     a.nr_load(R9, R9, l.scope_parent);
     a.nr_zero_guard(R9, slow);
-    a.nr_lea(R9, R9, l.scope_data_off as i32);
     a.nr_op_imm(4, R10, -8);
     a.nr_cmp(R10, R9);
     a.jcc(NE, slow);
@@ -559,7 +556,6 @@ fn reference_target(a: &mut Asm, l: &JitLayout, slot: u16, slow: usize) {
     a.jcc(NE, object);
     a.nr_load(R9, R8, offset_of!(PreparedReference, scope));
     a.nr_zero_guard(R9, slow);
-    a.nr_lea(R9, R9, l.scope_data_off as i32);
     a.nr_load32(AX, R8, offset_of!(PreparedReference, generation));
     a.nr_max_guard(AX, DX, slow);
     a.nr_load32(DX, R9, l.scope_gen);
@@ -628,7 +624,7 @@ fn capture(
     let hints_done = a.label();
     a.nr_test(R11);
     a.jcc(NE, object);
-    a.nr_lea(AX, R9, -(l.scope_data_off as i32));
+    a.nr_mov(AX, R9);
     a.nr_load(DX, R10, offset_of!(PreparedReference, scope));
     a.nr_cmp(AX, DX);
     a.jcc(NE, slow);
