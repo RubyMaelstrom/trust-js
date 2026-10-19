@@ -352,7 +352,7 @@ pub(super) fn emit_reference_op(
             emit_reference_target_ptr(a, layout, slow);
             emit_target_value_ptr(a, layout, slow);
             let prototype_key = reference_may_name_prototype(chunk, pc as usize, reference);
-            emit_load_name_value(a, layout, None, slow, false, prototype_key);
+            emit_load_name_value(a, layout, slow, false, prototype_key);
             a.b(fast_done);
         }
         Op::StoreRef(_) => {

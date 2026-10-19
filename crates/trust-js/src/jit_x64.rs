@@ -5,9 +5,9 @@
 //! can then be ported without duplicating runtime semantics or compromising deoptimization.
 
 use super::{
-    ownership_traced, JitCode, JitOwnership, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE,
-    H_COND, H_EXEC, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER,
-    H_PUSH_HANDLER, H_RETURN, H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC, H_GET_ELEM,
+    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
+    H_SET_PROP, H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -174,8 +174,8 @@ impl Asm {
             0x48, 0xc1, 0xea, 0x10, // shr rdx,16 (unsigned low48)
         ]);
     }
-    /// EAX contains the high16 tag. Only exact String/Symbol/Object tags may
-    /// touch an Rc count. BigInt and reserved property tags remain checked.
+    /// EAX contains the high16 tag. Only exact String/Symbol/Object tags take
+    /// the reference path. BigInt and reserved property tags remain checked.
     fn reference_or_immediate(&mut self, rc_ok: bool, immediate: usize, slow: usize) {
         let reference = self.label();
         self.cmp_eax(0x7ffd);
@@ -198,46 +198,6 @@ impl Asm {
         self.cmp_eax(0xfff9);
         self.jcc(0x83, slow);
         self.bind(number);
-    }
-    // Ownership emitters (the x64 counterparts of `jit_ownership.rs`): every reference-count
-    // sequence of this backend. RDX holds the untagged String/Symbol/Object payload, which the
-    // caller's tag guard (`reference_or_immediate`, or the name templates' `owner_pointer`)
-    // proved reference-counted. Their `Traced` arms (gc-heap) are unreachable: x64 refuses
-    // gc-heap until S6.
-
-    /// Acquire one owner of the payload in RDX (`inc qword [rdx+strong]`). Flags clobbered.
-    fn rc_inc_rdx(&mut self, own: JitOwnership) {
-        let JitOwnership::Refcount { strong_off } = own else {
-            ownership_traced("rc_inc_rdx")
-        };
-        self.bytes(&[0x48, 0xff, 0x82]);
-        self.bytes(&strong_off.to_le_bytes());
-    }
-    /// Release one owner of the payload in RDX. A last owner branches to `slow` before any
-    /// change (the checked path runs the real destructor). Clobbers RAX and flags.
-    fn rc_dec_nonfinal_rdx(&mut self, own: JitOwnership, slow: usize) {
-        let JitOwnership::Refcount { strong_off } = own else {
-            ownership_traced("rc_dec_nonfinal_rdx")
-        };
-        self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
-        self.bytes(&strong_off.to_le_bytes());
-        self.bytes(&[0x48, 0x83, 0xf8, 0x01]);
-        self.jcc(0x86, slow); // last reference needs the real destructor
-        self.bytes(&[0x48, 0xff, 0x8a]);
-        self.bytes(&strong_off.to_le_bytes());
-    }
-    /// [`Self::rc_dec_nonfinal_rdx`] in the name templates' encoding (an imm32 compare).
-    fn rc_dec_nonfinal_rdx_imm32(&mut self, own: JitOwnership, slow: usize) {
-        let JitOwnership::Refcount { strong_off } = own else {
-            ownership_traced("rc_dec_nonfinal_rdx_imm32")
-        };
-        self.bytes(&[0x48, 0x8b, 0x82]); // rax=[payload+strong]
-        self.bytes(&strong_off.to_le_bytes());
-        self.bytes(&[0x48, 0x81, 0xf8]); // cmp rax,imm32 1
-        self.bytes(&1i32.to_le_bytes());
-        self.jcc(0x86, slow); // last reference needs the real destructor
-        self.bytes(&[0x48, 0xff, 0x8a]);
-        self.bytes(&strong_off.to_le_bytes());
     }
     fn numeric_compare(&mut self, setcc: u8, reject_unordered: bool) {
         // Packed Numbers are raw f64 bits; ucomisd supplies ordered scalar flags.
@@ -448,8 +408,8 @@ thread_local! {
 }
 
 /// The named-field count and data-pointer words of an Object, as displacements from it, when its
-/// fields are a `Vec` (the default build). This backend reads only that layout inline: gc-heap's
-/// `InlineVec` (see `JitVecLayout`) keeps the checked helpers until the x64 pass of S6.
+/// fields are a `Vec`. This backend reads only that layout inline: gc-heap's `InlineVec` (see
+/// `JitVecLayout`) keeps the checked helpers until the x64 pass of S6 (step 7).
 fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
     let fields = layout.obj_props + layout.props_entries;
     match layout.repr.props_fields {
@@ -458,12 +418,11 @@ fn vec_fields(layout: &crate::value::JitLayout) -> Option<(usize, usize)> {
     }
 }
 
-/// Whether a property template can take `recv`: the `this` form reads [r12+0x30] as the default
-/// build's pointer to a wide `this` (`JitThisRepr::Wide`); gc-heap's packed word keeps the
-/// checked helper until the x64 pass of S6.
-fn this_form_ok(layout: &crate::value::JitLayout, recv: PropRecv) -> bool {
+/// Whether a property template can take `recv`: the `this` form reads [r12+0x30] as a pointer to
+/// a wide `this`, which gc-heap's packed word is not, so it keeps the checked helper until the
+/// x64 pass of S6 (step 7).
+fn this_form_ok(recv: PropRecv) -> bool {
     !matches!(recv, PropRecv::This)
-        || matches!(layout.ctx_this(), crate::jit::JitThisRepr::Wide { .. })
 }
 
 /// Probe the live property IC, including fills made after this machine body was compiled.
@@ -480,7 +439,7 @@ fn emit_prop_own(
     let Some((fields_len, fields_ptr)) = vec_fields(layout) else {
         return false;
     };
-    if !this_form_ok(layout, recv) {
+    if !this_form_ok(recv) {
         return false;
     }
     let offsets = [
@@ -495,7 +454,6 @@ fn emit_prop_own(
         layout.entry_accessor,
     ];
     if !layout.valid
-        || !layout.ownership().fits_disp32()
         || layout.entry_accessor != layout.entry_value + 8
         || cache == 0
         || offsets.iter().any(|offset| *offset > i32::MAX as usize)
@@ -580,11 +538,9 @@ fn emit_prop_own(
     // BigInt and reserved/lazy-prototype words keep their checked materialization.
     a.reference_or_immediate(true, immediate, slow);
     a.bytes(&[0x4c, 0x89, 0xd0]);
-    a.payload_rax_to_rdx();
-    a.rc_inc_rdx(layout.ownership());
     a.jmp(copied);
     a.bind(immediate);
-    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word; no ownership traffic
+    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word
     a.bind(copied);
     a.store_word_r13(0);
     a.add_sp(8);
@@ -639,7 +595,7 @@ fn emit_prop_num(
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
         || layout.entry_size.checked_mul(st.slot as usize).is_none()
-        || !this_form_ok(layout, recv)
+        || !this_form_ok(recv)
     {
         return false;
     }
@@ -828,8 +784,7 @@ pub(super) fn compile_entry(
     let unwind = a.label();
     let ret_ok = a.label();
     let ret_throw = a.label();
-    let rc_ok = layout.valid && layout.ownership().fits_disp32();
-    let own = layout.ownership();
+    let rc_ok = layout.valid;
     let interrupt_offset = (ilayout.valid
         && ilayout.interrupt_poll_tick <= i32::MAX as usize
         && ilayout.gc_next <= i32::MAX as usize)
@@ -967,8 +922,6 @@ pub(super) fn compile_entry(
                 a.jcc(0x84, slow);
                 a.reference_or_immediate(rc_ok, copy, slow);
                 a.load_word_r15(off);
-                a.payload_rax_to_rdx();
-                a.rc_inc_rdx(own);
                 a.jmp(done);
                 a.bind(copy);
                 a.load_word_r15(off);
@@ -988,9 +941,6 @@ pub(super) fn compile_entry(
                 let off = i32::from(*slot) * SLOT_BYTES;
                 a.load_tag_r15(off);
                 a.reference_or_immediate(rc_ok, commit, slow);
-                a.load_word_r15(off);
-                a.payload_rax_to_rdx();
-                a.rc_dec_nonfinal_rdx(own, slow);
                 a.bind(commit);
                 a.load_word_r13(-SLOT_BYTES); // transfer one owner, no retain
                 a.store_word_r15(off);
@@ -1006,9 +956,6 @@ pub(super) fn compile_entry(
                 let exit = a.label();
                 a.load_tag_r13(-SLOT_BYTES);
                 a.reference_or_immediate(rc_ok, commit, slow);
-                a.load_word_r13(-SLOT_BYTES);
-                a.payload_rax_to_rdx();
-                a.rc_dec_nonfinal_rdx(own, slow);
                 a.bind(commit);
                 a.add_sp(-8);
                 a.jmp(exit);
@@ -1022,9 +969,6 @@ pub(super) fn compile_entry(
                 let exit = a.label();
                 a.load_tag_r13(-SLOT_BYTES);
                 a.reference_or_immediate(rc_ok, copy, slow);
-                a.load_word_r13(-SLOT_BYTES);
-                a.payload_rax_to_rdx();
-                a.rc_inc_rdx(own);
                 a.bind(copy);
                 a.load_word_r13(-SLOT_BYTES);
                 a.store_word_r13(0);

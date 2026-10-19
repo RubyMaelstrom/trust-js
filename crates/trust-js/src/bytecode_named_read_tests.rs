@@ -146,16 +146,12 @@ fn invoke(
         slots: slots.as_mut_ptr(),
         inline_ic_safe: &interp.inline_ic_safe as *const _ as *const u8,
         env_raw: Env::as_ptr(&env).cast(),
-        #[cfg(not(feature = "gc-heap"))]
-        this_raw: std::ptr::null(),
         #[cfg(feature = "gc-heap")]
         this_word: PackedValue::pack(this_value),
         global_body: std::ptr::null(),
         genv: Env::as_ptr(&env) as usize,
         interp,
         chunk: Rc::as_ptr(chunk),
-        #[cfg(not(feature = "gc-heap"))]
-        this_val: this_value,
         n_slots: slots.len(),
         handlers: Vec::new(),
         handler_floor: 0,
@@ -177,10 +173,6 @@ fn invoke(
         accessor_holder: 0,
         accessor_slot: 0,
     };
-    #[cfg(not(feature = "gc-heap"))]
-    {
-        ctx.this_raw = &ctx.this_val;
-    }
 
     let result = unsafe { jit_get_prop(&mut ctx, site.pc as u32, base.add(stack_len)) };
     assert_eq!(result.flag != 0, ctx.error.is_some());

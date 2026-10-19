@@ -5,10 +5,11 @@
 //! Each program runs at `Tier::Jit` and at `Tier::Bytecode` (tier threshold 0) in the same build
 //! and must produce the same, pinned, result; the functions it names must have run as native
 //! code, and where a test counter records it, the inline template must have run rather than its
-//! helper. Together they exercise every ownership-emitter family's `Traced` arm (clone, shared
-//! drop and word release; increments, non-final guards, commits and decrements; the direct-call
-//! teardown) and the guards that admit a Map's or Set's `Exotic::Collection` as ordinary. The
-//! emitter tests at the end check the `Traced` arms' contracts on assembled code.
+//! helper. Together they exercise the templates that copy, overwrite and pop execution words,
+//! property words and the direct call's frame (none of which emits a count), and the guards
+//! that admit a Map's or Set's `Exotic::Collection` as ordinary. The tests at the end check
+//! assembled code: the finish stub's `this` reset, the property stores, the property-word guard
+//! and the string constants.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
@@ -452,70 +453,46 @@ fn maps_and_sets_take_the_ordinary_object_paths() {
     assert_eq!(paths, [50 * 6, 0, 0], "Collection receivers hit natively");
 }
 
-/// The `Traced` arm of every ownership emitter that takes a [`super::JitOwnership`] emits
-/// nothing: the count emitters, the execution-word clone, shared drop and releases (whose
-/// owner guard is counted-only, so no tag reaches a checked path through them), and the frame
-/// teardown. A finished direct callee's packed `this` (gc-heap's [48]) is released by nothing:
-/// the finish stub's reset is one store of the complete Undefined word it holds in x5.
+/// A finished direct callee's packed `this` (its [48]) is released by nothing: the finish stub
+/// resets it with one store of the complete Undefined word it holds in x5, `str x5, [x10, #48]`.
 #[test]
-fn traced_ownership_emitters_emit_nothing() {
-    use super::JitOwnership::Traced;
+fn direct_finish_stub_resets_this_with_one_store() {
     use super::*;
-    let mut a = asm::Asm::new();
-    let label = a.new_label();
-    rc_inc(&mut a, Traced, 1, 2, 1);
-    rc_load_count(&mut a, Traced, 1, 2);
-    rc_check_nonfinal(&mut a, Traced, 2, 1, label);
-    rc_guard_nonfinal(&mut a, Traced, 1, 2, 2, label);
-    rc_commit_dec(&mut a, Traced, 1, 2, 1);
-    rc_dec_nonfinal(&mut a, Traced, 1, 2);
-    rc_dec_nonfinal_scaled(&mut a, Traced, 1, 2);
-    rc_release_shared(&mut a, Traced, 1, 2, label);
-    rc_release_unless_last(&mut a, Traced, 1, 2, label);
-    exec_clone(&mut a, Traced, 0, 2, 3, label);
-    exec_drop_shared(&mut a, Traced, 0, 2, 3, label);
-    exec_release_word(&mut a, Traced, 20, -8);
-    exec_release_word(&mut a, Traced, 22, 16);
-    exec_release_loaded(&mut a, Traced, 22, 16);
-    frame_surplus_release(&mut a, Traced);
-    frame_callee_release(&mut a, Traced, 3);
-    frame_this_release(&mut a, Traced, 64);
-    frame_slots_release(&mut a, Traced, 64, 72);
-    assert!(a.buf.is_empty(), "{} words emitted", a.buf.len());
-    assert!(!a.label_referenced(label), "a Traced arm branches");
-    let layout = crate::value::jit_layout(&crate::value::Object::new(None));
-    assert_eq!(layout.ctx_this(), JitThisRepr::Packed);
-    let mut reset = asm::Asm::new();
-    frame_this_reset(&mut reset, Traced, layout.ctx_this(), 5);
+    let mut engine = crate::Engine::new();
+    let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+    assert!(ilayout.valid);
+    let mut stub = asm::Asm::new();
+    emit_direct_finish_stub(&mut stub, &ilayout, true);
     let mut store = asm::Asm::new();
     store.str_imm(5, 10, 48);
-    assert_eq!(reset.finish(), store.finish(), "one store of x5 over [48]");
+    let reset = store.finish()[0];
+    let words = stub.finish();
+    assert_eq!(
+        words.iter().filter(|&&word| word == reset).count(),
+        1,
+        "one store of x5 over [48]"
+    );
 }
 
 /// The two property stores whose old word can be a function's deferred prototype (step 9b),
 /// the SetProp template (each receiver kind, with and without a retained result) and the name
-/// and Reference store, load neither drop helper (`H_DROP_PACKED_AT`, `H_DROP_AT`) under
-/// traced ownership: they overwrite the old word. Every other drop-helper call is in an
-/// emitter that is counted-only (`traced_ownership_emitters_emit_nothing`), so no traced code
-/// reaches either helper.
+/// and Reference store, load neither drop helper (`H_DROP_PACKED_AT`, `H_DROP_AT`): they
+/// overwrite the old word. No other generated code calls either helper.
 #[test]
 fn traced_property_stores_call_no_drop_helper() {
     use super::*;
     let layout = crate::value::jit_layout(&crate::value::Object::new(None));
-    assert!(!layout.ownership().counted(), "gc-heap layouts are traced");
-    // The helper-table load a drop-helper call begins with, as `drop_helper_call` emits it.
+    assert!(
+        layout.valid && set_prop_inlinable(&layout),
+        "the inline store templates"
+    );
+    // The helper-table load a helper call begins with, as `emit_op_helper` emits it.
     let helper_load = |helper: usize| {
         let mut a = asm::Asm::new();
         a.ldr_imm(16, 21, (helper * 8) as u32);
         a.finish()[0]
     };
     let drops = [helper_load(H_DROP_PACKED_AT), helper_load(H_DROP_AT)];
-    let mut a = asm::Asm::new();
-    drop_helper_call(&mut a, H_DROP_PACKED_AT, None, |_| {});
-    assert!(
-        a.finish().contains(&drops[0]),
-        "the scan sees a drop-helper call"
-    );
     let mut templates = Vec::new();
     for (recv, keep) in [
         (PropRecv::Stack, false),
@@ -527,7 +504,13 @@ fn traced_property_stores_call_no_drop_helper() {
         let unwind = a.new_label();
         emit_set_prop_inline(&mut a, &layout, 0x1000, "prototype", 0, unwind, recv, keep);
         a.bind(unwind);
-        templates.push(a.finish());
+        let words = a.finish();
+        // The scan sees the helper call the template does make: its checked fallback.
+        assert!(
+            words.contains(&helper_load(H_SET_PROP)),
+            "the scan sees a helper call"
+        );
+        templates.push(words);
     }
     let mut a = asm::Asm::new();
     let (slow, done) = (a.new_label(), a.new_label());
@@ -586,11 +569,11 @@ fn property_word_guard_routes_exactly_the_tags_above_object() {
     assert_eq!(unsafe { run(PACK_LAZY_PROTO | 8, &mut output) }, 0);
 }
 
-/// Under traced ownership every site of a string literal pushes the literal's word as an
-/// immediate: `mov_imm64 x9, word`, `str x9, [x20]` and `add x20, x20, #8`, where the word is
-/// the one the bytecode VM pushes for the constant (`PACK_STR | cell`). No site materializes the
-/// constant's pool slot, from which the counted template loads the payload. The literal before
-/// the loop has its baseline site; the one inside has the baseline's and the loop region's.
+/// Every site of a string literal pushes the literal's word as an immediate: `mov_imm64 x9,
+/// word`, `str x9, [x20]` and `add x20, x20, #8`, where the word is the one the bytecode VM
+/// pushes for the constant (`PACK_STR | cell`). No site materializes the constant's pool slot.
+/// The literal before the loop has its baseline site; the one inside has the baseline's and the
+/// loop region's.
 /// `string_constant_region_copy_pushes_an_immediate` runs this again with the regions' own copy
 /// of the template.
 #[test]
@@ -797,13 +780,7 @@ fn shared_stubs_embed_no_string_constant() {
             }
             a.bind(finish);
             if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
-                emit_direct_finish_stub(
-                    &mut a,
-                    &ilayout,
-                    layout.ownership(),
-                    layout.ctx_this(),
-                    layout.ownership().count_first(),
-                );
+                emit_direct_finish_stub(&mut a, &ilayout, layout.valid);
             }
             let words = a.finish();
             assert!(!words.is_empty(), "stub {key:#x}");

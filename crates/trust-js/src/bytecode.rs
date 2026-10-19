@@ -63,9 +63,9 @@ pub enum Tier {
 
 impl Tier {
     /// The tier this build runs for a request. Under the P1 gc-heap object model the x86-64
-    /// backend cannot emit traced ownership (`jit::JitOwnership::Traced`) until S6, so an x86-64
-    /// gc-heap build runs `Jit` as `Bytecode`. The ARM64 backend runs it in both builds, and on
-    /// a target without a native backend `Jit` runs on the bytecode VM in every build.
+    /// backend is not ported to the GC heap until S6 step 7, so an x86-64 gc-heap build runs
+    /// `Jit` as `Bytecode`. The ARM64 backend runs it, and on a target without a native backend
+    /// `Jit` runs on the bytecode VM.
     /// [`Engine::set_tier`] applies it; front ends compare it with the request to say when a
     /// tier is not available.
     ///
@@ -19567,13 +19567,6 @@ impl Chunk {
         self.cap_caches.as_ptr() as usize
             + idx as usize * std::mem::size_of::<std::cell::Cell<NameIc>>()
     }
-    /// Numeric value observed at this name site before second-stage compilation. Generated code
-    /// compares the live binding/property bits before taking the specialized decode path.
-    pub(crate) fn jit_name_number(&self, idx: u32) -> Option<u64> {
-        self.name_num_valid[idx as usize]
-            .get()
-            .then(|| self.name_num_bits[idx as usize].get())
-    }
     /// Name-cache hit check (see [`NameIc`] for the validation story): a pointer compare, a
     /// generation compare, and a value clone. `None` = miss (including TDZ — the slow path
     /// throws the proper error).
@@ -20381,15 +20374,15 @@ impl Chunk {
             _ => None,
         }
     }
-    /// Stable address of const `k` (the chunk is pinned by any code that runs it). Under counted
-    /// ownership the JIT's string-const template loads the payload from this Value and bumps its
-    /// count inline: a word pushed without its count would let a release free the constant while
-    /// the pool still holds it. Traced ownership pushes `jit_const_str_word` instead.
+    /// Stable address of const `k` (the chunk is pinned by any code that runs it). The tests use
+    /// it to check that no generated code loads a string constant from its pool slot: the
+    /// string-const templates push `jit_const_str_word` instead.
+    #[cfg(test)]
     pub(crate) fn jit_const_ptr(&self, k: u32) -> *const Value {
         &self.consts[k as usize] as *const Value
     }
-    /// Whether const `k` is a string: the string-const templates push it (the counted one bumps
-    /// the payload's strong count at offset 0).
+    /// Whether const `k` is a string: the string-const templates push it as an immediate
+    /// (`jit_const_str_word`).
     pub(crate) fn jit_const_is_str(&self, k: u32) -> bool {
         matches!(self.consts[k as usize], Value::Str(_))
     }
@@ -21421,8 +21414,8 @@ pub(crate) unsafe extern "C" fn jit_exec(
     }
 }
 
-/// Drop one wide boundary Value (`this`, return or hardware-saved state), never an execution
-/// word. Generated packed local/operand/property drops use `jit_drop_packed_at` explicitly.
+/// Drop one wide boundary Value, never an execution word. No generated code calls it (its slot
+/// is `jit::H_DROP_AT`).
 pub(crate) unsafe extern "C" fn jit_drop_at(
     _ctx: *mut crate::jit::JitCtx,
     _imm: u32,
@@ -21432,9 +21425,9 @@ pub(crate) unsafe extern "C" fn jit_drop_at(
     sp
 }
 
-/// Drop one NaN-boxed execution or property owner at `word`. Generated stores use this only
-/// after all observable guards pass; packed destruction cannot execute JavaScript. Counted
-/// ownership only: under gc-heap no word owns anything, so no generated code calls it.
+/// Drop one NaN-boxed execution or property word at `word`; packed destruction cannot execute
+/// JavaScript. No word owns anything, so no generated code calls it (its slot is
+/// `jit::H_DROP_PACKED_AT`).
 pub(crate) unsafe extern "C" fn jit_drop_packed_at(
     _ctx: *mut crate::jit::JitCtx,
     _imm: u32,
@@ -25952,16 +25945,12 @@ mod return_slot_tests {
             slots: std::ptr::null_mut(),
             inline_ic_safe: std::ptr::null(),
             env_raw: std::ptr::null(),
-            #[cfg(not(feature = "gc-heap"))]
-            this_raw: std::ptr::null(),
             #[cfg(feature = "gc-heap")]
             this_word: PackedValue::pack(Value::Undefined),
             global_body: std::ptr::null(),
             genv: 0,
             interp: std::ptr::null_mut(),
             chunk: std::ptr::null(),
-            #[cfg(not(feature = "gc-heap"))]
-            this_val: Value::Undefined,
             n_slots: 0,
             handlers: Vec::new(),
             activation: None,

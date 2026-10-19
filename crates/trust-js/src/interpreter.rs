@@ -13348,22 +13348,6 @@ impl Interp {
         // belongs to whichever closure instance filled the entry).
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(env_ptr) });
         let chunk = unsafe { &*ic.chunk };
-        #[cfg(not(feature = "gc-heap"))]
-        let this_val = {
-            let this_read = unsafe { this_slot.read() }.into_value();
-            if !ic.uses_this {
-                drop(this_read);
-                Value::Undefined
-            } else if ic.strict {
-                this_read
-            } else {
-                match this_read {
-                    Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-                    other @ Value::Obj(_) => other,
-                    prim => crate::builtins::box_primitive_pub(self, prim),
-                }
-            }
-        };
         #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
@@ -13552,24 +13536,8 @@ impl Interp {
         // `&Env` fabricated from the raw pointer; nothing below moves it out.
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(ic.env) });
         let chunk = unsafe { &*ic.chunk };
-        // OrdinaryCallBindThis on the moved `this` (bind_compiled_this, inlined over `ic.strict`
-        // and the fill-time `uses_this`); gc-heap binds the packed word on its tag.
-        #[cfg(not(feature = "gc-heap"))]
-        let this_val = {
-            let this_read = unsafe { this_slot.read() }.into_value();
-            if !ic.uses_this {
-                drop(this_read);
-                Value::Undefined
-            } else if ic.strict {
-                this_read
-            } else {
-                match this_read {
-                    Value::Undefined | Value::Null => Value::Obj(self.global.clone()),
-                    other @ Value::Obj(_) => other,
-                    prim => crate::builtins::box_primitive_pub(self, prim),
-                }
-            }
-        };
+        // OrdinaryCallBindThis on the moved `this` word, over `ic.strict` and the fill-time
+        // `uses_this`: `bind_this_word` binds it on its tag.
         #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
         let mut r = with_execution_stack(self.depth, || unsafe {
@@ -14642,13 +14610,6 @@ impl Interp {
             construct: false,
             extra: None,
         });
-        #[cfg(not(feature = "gc-heap"))]
-        let this_val = self.bind_compiled_this(
-            &func,
-            chunk,
-            unsafe { this_slot.read() }.into_value(),
-            false,
-        );
         #[cfg(feature = "gc-heap")]
         let this_val = self.bind_this_word(
             unsafe { this_slot.read() },

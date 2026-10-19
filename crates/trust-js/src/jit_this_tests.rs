@@ -1,15 +1,13 @@
-//! `this` through generated code (P1 S5 step 9d), checked in both builds. A JIT context holds
-//! the activation's `this` at [48]: under gc-heap the packed word itself, in the default build a
-//! pointer to the context's wide `this_val` ([`super::JitThisRepr`]). Each test drives every
-//! kind of `this` through one family of sites: an object; a primitive into a strict callee
-//! (as it is) and into a sloppy one (boxed); undefined and null into a sloppy callee (the global
-//! object) and into a strict one (as they are). The sites: LoadThis, GetPropThis, SetPropThis, a
-//! numeric chain, the region's own read, the direct call's move of the receiver and a
-//! constructor's. `this` arrives through direct calls, the checked call paths (which bind a
-//! sloppy callee's `this` on the word under gc-heap), `Function.prototype.call` (a Rust entry)
-//! and `new`. Another reads `this` from an environment (an arrow, a derived constructor after
-//! `super()`), and the direct-call test also checks a pooled record's `this` (the finish stub's
-//! reset), which a receiver-less direct call reads.
+//! `this` through generated code (P1 S5 step 9d). A JIT context holds the activation's `this`
+//! at [48] as the packed word itself. Each test drives every kind of `this` through one family
+//! of sites: an object; a primitive into a strict callee (as it is) and into a sloppy one
+//! (boxed); undefined and null into a sloppy callee (the global object) and into a strict one
+//! (as they are). The sites: LoadThis, GetPropThis, SetPropThis, a numeric chain, the region's
+//! own read, the direct call's move of the receiver and a constructor's. `this` arrives through
+//! direct calls, the checked call paths (which bind a sloppy callee's `this` on the word),
+//! `Function.prototype.call` (a Rust entry) and `new`. Another reads `this` from an environment
+//! (an arrow, a derived constructor after `super()`), and the direct-call test also checks a
+//! pooled record's `this` (the finish stub's reset), which a receiver-less direct call reads.
 //!
 //! Programs run at every tier with the same expected results (Node's, run as a classic script);
 //! at `Tier::Jit` the functions named ran as native code and, where a test counter records it,

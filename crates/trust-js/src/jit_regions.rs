@@ -1032,10 +1032,9 @@ struct ScalarState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operand {
     Canonical,
-    /// Non-owning view of a tagged home. LoadLocal rejects Empty (and, under counted
-    /// ownership, BigInt) before creating this view. Every effect or control-flow edge
-    /// clones it into a canonical owner before any source local can be replaced or observed
-    /// by GC.
+    /// Non-owning view of a tagged home. LoadLocal rejects Empty before creating this view.
+    /// Every effect or control-flow edge copies it into a canonical word before any source
+    /// local can be replaced or observed by GC.
     Borrowed(u32),
     /// A live data-property value, rooted by a canonical receiver and its data
     /// descriptor until the next effect. Unlike a home, this uses its own stack
@@ -1247,12 +1246,7 @@ fn propagate_checked_result(
     emit_property_event(a, 4);
 }
 
-fn materialize(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    stack: &[Operand],
-    physical: usize,
-) {
+fn materialize(a: &mut asm::Asm, stack: &[Operand], physical: usize) {
     for (index, value) in stack.iter().enumerate() {
         let offset = (index as i32 - physical as i32) * 8;
         let reg = 16 + index as u32;
@@ -1264,20 +1258,12 @@ fn materialize(
                     _ => reg,
                 };
                 a.fmov_x_d(9, source);
-                // This clone has no checked fallback: its slow label is the fall-through.
                 // The word is a tagged home's (a frame slot: execution storage, never a
                 // property-only word) or a borrowed data-property read's (an own read or a
-                // method read). Counted ownership: the originating read guard excludes
-                // BigInt, Empty and every tag above Object, so what remains is immediate or
-                // a shared Rc. Traced: the clone emits nothing, and a property-only word,
-                // which exists only as a function's deferred `prototype`, cannot arrive: the
-                // borrowed reads keyed "prototype" take the property-word guard, and no
-                // other key holds one.
-                // Clone cannot call author code, allocate, or invalidate another
-                // virtual register; the canonical local continues to own the source.
-                let cloned = a.new_label();
-                exec_clone(a, layout.ownership(), 9, 10, 11, cloned);
-                a.bind(cloned);
+                // method read), and is stored as it is. A property-only word, which exists
+                // only as a function's deferred `prototype`, cannot arrive: the borrowed reads
+                // keyed "prototype" take the property-word guard, and no other key holds one.
+                // The canonical local continues to hold the source.
                 emit_exec_word_store(a, 9, 20, offset);
             }
             Operand::Int { reg, unsigned } => {
@@ -1429,13 +1415,12 @@ impl OwnReadFacts {
     }
 }
 
-/// Borrow an ordinary own data value without touching its reference count. All
-/// guards fail at the original Get PC, before any observable operation commits.
-/// Accessors, exotics, inherited properties and lazy-prototype sentinels keep the
-/// complete existing checked templates, as do BigInts under counted ownership.
-/// Reload the *live* property even when a preceding read proved the receiver's
-/// type/shape. `prototype_key`: the site reads `prototype`, the one key whose value
-/// can be a function's deferred prototype (traced ownership guards only that key).
+/// Borrow an ordinary own data value. All guards fail at the original Get PC, before
+/// any observable operation commits. Accessors, exotics, inherited properties and
+/// lazy-prototype sentinels keep the complete existing checked templates. Reload the
+/// *live* property even when a preceding read proved the receiver's type/shape.
+/// `prototype_key`: the site reads `prototype`, the one key whose value can be a
+/// function's deferred prototype (only that key is guarded).
 fn emit_borrowed_own_read(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -1449,21 +1434,12 @@ fn emit_borrowed_own_read(
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
     let reused = previous_cache.is_some();
     match receiver {
-        PropRecv::This if layout.ctx_this() == JitThisRepr::Packed => {
+        PropRecv::This => {
             emit_exec_word_load(a, 9, 19, 48); // ctx.this_word, which this activation keeps
             if !reused {
                 emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, fail);
             }
             emit_exec_payload(a, 9, 10);
-        }
-        PropRecv::This => {
-            a.ldr_imm(14, 19, 48); // wide ctx.this_raw; owned by this activation
-            if !reused {
-                a.ldurb(9, 14, 0);
-                a.cmp_imm_w(9, 8);
-                a.b_cond(C_NE, fail);
-            }
-            a.ldur(10, 14, 8);
         }
         PropRecv::Slot(offset) => {
             emit_exec_word_load(a, 9, 22, offset as i32);
@@ -1512,7 +1488,7 @@ fn emit_borrowed_own_read(
     // encode (key, PropClass) per slot, so (shape, slot) proves this entry
     // is a data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
-    emit_borrowed_word_guard(a, layout, prototype_key, fail);
+    emit_borrowed_word_guard(a, prototype_key, fail);
     a.fmov_d_x(output, 12);
     #[cfg(test)]
     {
@@ -1609,45 +1585,25 @@ fn emit_borrowed_method(
     // shapes encode (key, PropClass) per slot, so (shape, slot) proves a
     // data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
-    emit_borrowed_word_guard(a, layout, prototype_key, fail);
+    emit_borrowed_word_guard(a, prototype_key, fail);
     a.fmov_d_x(16 + depth as u32, 12);
     #[cfg(test)]
     emit_guarded_event(a, 3);
 }
 
 /// Admit the data-property word a borrowed read loaded into x12 as a borrowed operand, or
-/// branch to `fail`. Empty (a deleted slot's marker, not a language value) always fails.
-/// Counted ownership: so do BigInt and every tag above Object, since [`materialize`] clones the
-/// operand without a checked fallback. Traced: nothing is cloned, so a BigInt passes; only a read
-/// keyed `prototype` (`prototype_key`) can see a property-only word (a function's deferred
-/// prototype), which [`property_word_guard`] sends to `fail`. Clobbers x9, x14 and NZCV.
-fn emit_borrowed_word_guard(
-    a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
-    prototype_key: bool,
-    fail: usize,
-) {
+/// branch to `fail`. Empty (a deleted slot's marker, not a language value) always fails; a
+/// BigInt passes. Only a read keyed `prototype` (`prototype_key`) can see a property-only word
+/// (a function's deferred prototype), which [`property_word_guard`] sends to `fail`. Clobbers
+/// x9, x14 and NZCV.
+fn emit_borrowed_word_guard(a: &mut asm::Asm, prototype_key: bool, fail: usize) {
     a.lsr_imm(9, 12, 48);
-    if !layout.ownership().counted() {
-        a.movz(14, (crate::value::PACK_EMPTY >> 48) as u32, 0);
-        a.cmp_reg_w(9, 14);
-        a.b_cond(C_EQ, fail);
-        if prototype_key {
-            property_word_guard(a, 12, 14, fail);
-        }
-        return;
-    }
-    for tag in [crate::value::PACK_BIGINT, crate::value::PACK_EMPTY] {
-        a.movz(14, (tag >> 48) as u32, 0);
-        a.cmp_reg_w(9, 14);
-        a.b_cond(C_EQ, fail);
-    }
-    // Negative tagged words above Obj are property-only internal values, not
-    // cloneable execution words. Ordinary numbers (including -NaN canonicalized
-    // on heap stores) and every public compact kind remain eligible.
-    a.movz(14, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.movz(14, (crate::value::PACK_EMPTY >> 48) as u32, 0);
     a.cmp_reg_w(9, 14);
-    a.b_cond(C_HI, fail);
+    a.b_cond(C_EQ, fail);
+    if prototype_key {
+        property_word_guard(a, 12, 14, fail);
+    }
 }
 
 /// ECMA-262 ToInt32/ToUint32 and NumberBitwiseOp (local snapshot e28783d5):
@@ -1703,25 +1659,6 @@ fn region_mark(op: &Op) -> &'static str {
     let interned: &'static str = Box::leak(format!("region:{name}").into_boxed_str());
     marks.push((name, interned));
     interned
-}
-
-/// Branch to `fail` unless the frame slot at `offset` owns nothing: its word is a Number or one
-/// of the immediate kinds (undefined, empty, null, Boolean), never a BigInt, String, Symbol or
-/// Object reference whose release a plain overwrite would skip. Traced: every frame word owns
-/// nothing (a plain overwrite is its release), so this emits nothing.
-fn emit_slot_owns_nothing(a: &mut asm::Asm, own: JitOwnership, offset: i32, fail: usize) {
-    if !own.counted() {
-        return;
-    }
-    emit_exec_word_load(a, 9, 22, offset);
-    a.lsr_imm(10, 9, 48);
-    a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-    a.sub_reg(11, 10, 11);
-    a.cmp_imm_x(11, 2);
-    a.b_cond(C_LS, fail); // BigInt, String, Symbol
-    a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
-    a.cmp_reg_x(10, 11);
-    a.b_cond(C_HS, fail); // Object, lazy prototype
 }
 
 /// The value domain in which two integer operands compare exactly (ECMA-262 Number::lessThan and
@@ -2130,7 +2067,6 @@ struct NameElementFallback {
     physical: usize,
     lazy: bool,
     cache_ptr: usize,
-    preferred: Option<u64>,
     name_pc: usize,
     elem_pc: usize,
     set: bool,
@@ -2231,7 +2167,6 @@ fn emit_name_element(
         physical,
         lazy,
         cache_ptr,
-        preferred: chunk.jit_name_number(cache),
         name_pc,
         elem_pc: plan.elem_pc,
         set: plan.set,
@@ -2255,7 +2190,7 @@ fn emit_name_element_fallback(
     // set the key (and value) in their slots above the name's.
     let prefix = |a: &mut asm::Asm| {
         if f.lazy {
-            materialize(a, layout, &f.pre, f.physical);
+            materialize(a, &f.pre, f.physical);
         }
         stash_operand(a, f.key, pre_len, 8);
         if let Some(value) = f.value {
@@ -2265,19 +2200,11 @@ fn emit_name_element_fallback(
     a.bind(f.name_miss);
     prefix(a);
     a.bind(full);
-    emit_load_name_inline(
-        a,
-        layout,
-        f.cache_ptr,
-        f.preferred,
-        f.name_pc as u32,
-        unwind,
-        false,
-    );
+    emit_load_name_inline(a, layout, f.cache_ptr, f.name_pc as u32, unwind, false);
     a.b(common);
     a.bind(f.value_miss);
     prefix(a);
-    emit_load_name_value(a, layout, f.preferred, full, false, false);
+    emit_load_name_value(a, layout, full, false, false);
     a.bind(common);
     a.add_imm(20, 20, 8 * (1 + u32::from(f.set)));
     if f.set {
@@ -2563,27 +2490,11 @@ pub(super) fn emit(
                     key_src,
                     candidate.pre_fail,
                 );
-                emit_tdz_objects_nonfinal(
-                    a,
-                    layout,
-                    pattern.value as u32 * 8,
-                    pattern.mapped as u32 * 8,
-                    candidate.pre_fail,
-                );
 
-                // The helper on a last-owner packed drop may clobber every caller-saved
-                // register. No borrowed descriptor or object pointer may survive either
-                // ordered release; the rooted receiver and preserved numeric key are
-                // reloaded only after both TDZ stores below. Traced ownership releases
-                // nothing (the stores alone clear the slots), so no helper runs here.
-                if layout.ownership().counted() {
-                    for register in 9..=17 {
-                        a.movz(register, 0, 0);
-                    }
-                }
+                // The stores alone clear the slots. The rooted receiver and preserved numeric
+                // key are reloaded only after both TDZ stores below.
                 for slot in [pattern.value, pattern.mapped] {
                     let offset = slot as i32 * 8;
-                    exec_release_word(a, layout.ownership(), 22, offset);
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     emit_exec_word_store(a, 9, 22, offset);
                     if let Some(home) = plan.tagged_reg(slot) {
@@ -2598,9 +2509,8 @@ pub(super) fn emit(
                     key_src,
                     candidate.post_fail,
                 );
-                exec_clone(a, layout.ownership(), 12, 13, 16, candidate.post_fail);
-                // The first Tdz made this destination Empty, so the cloned result can be
-                // transferred directly into its canonical owner slot.
+                // The first Tdz made this destination Empty, so the result can be stored
+                // directly into its canonical slot.
                 emit_exec_word_store(a, 12, 22, pattern.value as i32 * 8);
                 if let Some(home) = plan.tagged_reg(pattern.value) {
                     a.ldr_d_imm(home, 22, pattern.value as u32 * 8);
@@ -2630,7 +2540,7 @@ pub(super) fn emit(
                 {
                     if *lhs as u32 * 8 + 8 < 4096 && *rhs as u32 * 8 + 8 < 4096 {
                         own_facts.clear();
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         physical = stack.len();
                         stack.fill(Operand::Canonical);
                         plan.flush_local(a, *lhs);
@@ -2659,7 +2569,7 @@ pub(super) fn emit(
                     if let Some(slot) = local_read_discard_pair(ops, pc, source_targets) {
                         // No produced owner, no heap effect. Numeric homes cannot be Empty.
                         if plan.reg(slot).is_none() {
-                            materialize(a, layout, &stack, physical);
+                            materialize(a, &stack, physical);
                             physical = stack.len();
                             stack.fill(Operand::Canonical);
                             emit_discard_local_read(a, slot as u32 * 8, pc as u32, private_unwind);
@@ -2676,12 +2586,11 @@ pub(super) fn emit(
                         let numeric = stack.last().is_some_and(|value| value.numeric());
                         let before = stack.clone();
                         // Materialize aliases before replacing their canonical source owner.
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         physical = stack.len();
                         stack.fill(Operand::Canonical);
                         emit_store_local(
                             a,
-                            layout,
                             slot as u32 * 8,
                             &[pc as u32, pc as u32 + 1],
                             private_unwind,
@@ -2721,7 +2630,7 @@ pub(super) fn emit(
                             own_facts.clear();
                             numeric_locals.clear();
                             let before = stack.clone();
-                            materialize(a, layout, &stack, physical);
+                            materialize(a, &stack, physical);
                             physical = stack.len();
                             stack.fill(Operand::Canonical);
                             let slow_reload_fail = a.new_label();
@@ -2783,7 +2692,7 @@ pub(super) fn emit(
                             own_facts.clear();
                             numeric_locals.clear();
                             let before = stack.clone();
-                            materialize(a, layout, &stack, physical);
+                            materialize(a, &stack, physical);
                             physical = stack.len();
                             stack.fill(Operand::Canonical);
                             let slow_reload_fail = a.new_label();
@@ -2828,7 +2737,7 @@ pub(super) fn emit(
                             own_facts.clear();
                             numeric_locals.clear();
                             let before = stack.clone();
-                            materialize(a, layout, &stack, physical);
+                            materialize(a, &stack, physical);
                             physical = stack.len();
                             stack.fill(Operand::Canonical);
                             let slow_reload_fail = a.new_label();
@@ -2882,7 +2791,7 @@ pub(super) fn emit(
                 {
                     own_facts.clear();
                     numeric_locals.clear(); // checked chain suffixes may replace any written slot
-                    materialize(a, layout, &stack, physical);
+                    materialize(a, &stack, physical);
                     #[cfg(test)]
                     emit_lowering_event(a, record_reused_chain as *const () as u64);
                     emit_chain(a, layout, &chain, pc_labels, private_unwind);
@@ -2952,7 +2861,7 @@ pub(super) fn emit(
                         stack.clone()
                     } else {
                         let before = stack.clone();
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         physical = stack.len();
                         stack = vec![Operand::Canonical; physical];
                         preserve_scalar_prefix(a, &before, &mut stack, physical);
@@ -3218,26 +3127,17 @@ pub(super) fn emit(
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(10, 9);
                     a.b_cond(C_EQ, bailout);
-                    // Counted ownership: `materialize` has no checked clone for a BigInt.
-                    if layout.ownership().counted() {
-                        a.lsr_imm(9, 10, 48);
-                        a.movz(11, (crate::value::PACK_BIGINT >> 48) as u32, 0);
-                        a.cmp_reg_x(9, 11);
-                        a.b_cond(C_EQ, bailout);
-                    }
                     stack.push(Operand::Borrowed(home));
                 }
                 Op::LoadLocal(slot) if slot < 256 => {
-                    // Make the local's one canonical stack owner without a helper. No author
-                    // code executes, so numeric homes need no spill/reload. TDZ errors (and,
-                    // under counted ownership, BigInt cloning) retain the exact original-op
-                    // fallback.
+                    // Copy the local's word to the stack without a helper. No author code
+                    // executes, so numeric homes need no spill/reload. TDZ errors retain the
+                    // exact original-op fallback.
                     let off = slot as i32 * 8;
                     emit_exec_word_load(a, 10, 22, off);
                     a.mov_imm64(9, crate::value::PACK_EMPTY);
                     a.cmp_reg_x(10, 9);
                     a.b_cond(C_EQ, bailout);
-                    exec_clone(a, layout.ownership(), 10, 11, 12, bailout);
                     let dest = (depth as i32 - physical as i32) * 8;
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);
@@ -3269,13 +3169,11 @@ pub(super) fn emit(
                         && stack[depth - 1].numeric() =>
                 {
                     // A Number into a frame slot that is not a numeric home. The old word owns
-                    // nothing (counted ownership: a slot holding a reference leaves the region
-                    // instead), so the store is a plain overwrite; no author code runs, and the
+                    // nothing, so the store is a plain overwrite; no author code runs, and the
                     // slot's own-read facts end here.
                     saved_work += 3;
                     own_facts.clear();
                     number(a, &mut stack, physical, depth - 1, bailout);
-                    emit_slot_owns_nothing(a, layout.ownership(), slot as i32 * 8, bailout);
                     emit_exec_number_store(a, 15 + depth as u32, 22, slot as i32 * 8, 9);
                     stack.pop();
                     numeric_locals.insert(slot);
@@ -3319,7 +3217,7 @@ pub(super) fn emit(
                     // operand owners are canonical before entering that fallback.
                     own_facts.clear();
                     let before = stack.clone();
-                    materialize(a, layout, &stack, physical);
+                    materialize(a, &stack, physical);
                     let branch = if pc + 1 < end {
                         match ops[pc + 1] {
                             Op::JumpIfFalse(target) => {
@@ -3418,7 +3316,7 @@ pub(super) fn emit(
                             // Materialization canonicalizes NaN/clobbers NZCV, so compare LAST.
                             #[cfg(test)]
                             emit_predicate_event(a);
-                            materialize(a, layout, &stack, physical);
+                            materialize(a, &stack, physical);
                             match integers {
                                 Some(domain) => emit_int_compare(a, domain, operands),
                                 None => a.fcmp(left, right),
@@ -3503,7 +3401,7 @@ pub(super) fn emit(
                 }
                 Op::Jump(target) => {
                     own_facts.clear();
-                    materialize(a, layout, &stack, physical);
+                    materialize(a, &stack, physical);
                     edges.transfer(a, pc, target as usize, physical_next);
                 }
                 Op::JumpIfFalse(target) => {
@@ -3511,7 +3409,7 @@ pub(super) fn emit(
                     if stack[depth - 1].kind() == Some(ScalarKind::Boolean) {
                         scalar_register(a, &mut stack, physical, depth - 1);
                         stack.pop();
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         a.fmov_x_d(9, 15 + depth as u32);
                         a.logic_imm_w(0, 9, 9, asm::logical_imm_w(1).unwrap());
                         let edge = edges.target(a, pc, target as usize);
@@ -3519,13 +3417,13 @@ pub(super) fn emit(
                     } else if let Operand::Int { reg, .. } = stack[depth - 1] {
                         // ToBoolean of an integral Number: false only for zero.
                         stack.pop();
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         let edge = edges.target(a, pc, target as usize);
                         a.cbz(u32::from(reg), false, edge);
                     } else if stack[depth - 1].numeric() {
                         scalar_register(a, &mut stack, physical, depth - 1);
                         stack.pop();
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         // Numeric stores canonicalize NaNs and clobber NZCV. The condition's
                         // virtual register remains live until this comparison after spilling.
                         a.fcmp_zero(15 + depth as u32);
@@ -3533,7 +3431,7 @@ pub(super) fn emit(
                         a.b_cond(C_EQ, edge);
                         a.b_cond(C_VS, edge);
                     } else {
-                        materialize(a, layout, &stack, physical);
+                        materialize(a, &stack, physical);
                         emit_pop_cond(a, layout, private_unwind);
                         let edge = edges.target(a, pc, target as usize);
                         a.cbz(1, false, edge);
@@ -3551,7 +3449,7 @@ pub(super) fn emit(
                     if value.scalar() && !nullish {
                         scalar_register(a, &mut stack, physical, depth - 1);
                     }
-                    materialize(a, layout, &stack, physical);
+                    materialize(a, &stack, physical);
                     // Preserve the ordinary native truthiness/nullish template. ToBoolean
                     // has no author effects, so private homes need no spill or reload.
                     let edge = edges.target(a, pc, target as usize);
@@ -3592,7 +3490,7 @@ pub(super) fn emit(
                 _ => {
                     own_facts.clear();
                     let before = stack.clone();
-                    materialize(a, layout, &stack, physical);
+                    materialize(a, &stack, physical);
                     // Unlike an ordinary free-name read, the complete accumulation also
                     // reads a local RHS and can leave this region after its store. Publish all
                     // private homes before the helper, retaining exact canonical exit state.
@@ -3722,7 +3620,7 @@ pub(super) fn emit(
             ops[end - 1],
             Op::Jump(_) | Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
         ) {
-            materialize(a, layout, &stack, physical);
+            materialize(a, &stack, physical);
             // ECMA-262 If/Logical/Conditional Evaluation: same selected value,
             // owners and completion, with no extra control-flow-only trampoline.
             edges.transfer(a, end - 1, end, physical_next);
@@ -3765,7 +3663,7 @@ pub(super) fn emit(
             emit_property_event(a, 5);
         }
         if flush {
-            materialize(a, layout, &stack, physical);
+            materialize(a, &stack, physical);
             plan.flush_locals(a);
         }
         targets.push(pc);
@@ -3796,27 +3694,11 @@ pub(super) fn emit(
     }
 }
 
-/// ToBoolean followed by consuming the canonical owner. The peek emitter preserves w1;
-/// shared-owner dropping only uses x9..x11/NZCV. The rare last-owner/BigInt fallback
-/// repeats only ToBoolean (never author code), before any ownership mutation commits.
-/// Traced ownership drops by popping, so it has no fallback.
+/// ToBoolean followed by consuming the canonical operand: the peek emitter preserves w1, and
+/// popping the word is its release, so there is no fallback.
 fn emit_pop_cond(a: &mut asm::Asm, layout: &crate::value::JitLayout, unwind: usize) {
-    let own = layout.ownership();
-    let slow = a.new_label();
-    let done = a.new_label();
     emit_peek_cond_inline(a, layout, false, unwind);
-    // Traced: popping the word is its release; only the owner guard reached the fallback.
-    if own.counted() {
-        emit_exec_word_load(a, 9, 20, -8);
-        exec_drop_shared(a, own, 9, 10, 11, slow);
-    }
     a.sub_imm(20, 20, 8);
-    if own.counted() {
-        a.b(done);
-        a.bind(slow);
-        emit_cond(a, COND_POP_TRUTHY, unwind);
-    }
-    a.bind(done);
 }
 
 fn emit_effect(
@@ -3858,26 +3740,11 @@ fn emit_effect(
         return;
     }
     match *op {
-        Op::LoadThis if fast & 32768 != 0 && layout.ctx_this() == JitThisRepr::Packed => {
+        Op::LoadThis if fast & 32768 != 0 => {
             // As in the baseline template: [48] is the packed word, which owns nothing.
             a.ldr_imm(12, 19, 48); // ctx.this_word
             emit_exec_word_store(a, 12, 20, 0);
             a.add_imm(20, 20, 8);
-        }
-        Op::LoadThis if fast & 32768 != 0 => {
-            let slow = a.new_label();
-            let done = a.new_label();
-            a.ldr_imm(9, 19, 48); // wide ctx.this_raw, as in the baseline template
-            a.ldr_imm(10, 9, 0);
-            a.ldr_imm(11, 9, 8);
-            emit_exec_encode_wide(a, 10, 11, 12, 13, 14, 0, slow);
-            exec_clone(a, layout.ownership(), 12, 13, 14, slow);
-            emit_exec_word_store(a, 12, 20, 0);
-            a.add_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc_u32, unwind);
-            a.bind(done);
         }
         Op::Undef if fast & 128 != 0 => {
             a.mov_imm64(9, crate::value::PACK_UNDEFINED);
@@ -3889,25 +3756,11 @@ fn emit_effect(
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
         }
-        // As in the baseline template: under traced ownership the constant's word is an
-        // immediate that owns nothing.
+        // As in the baseline template: the constant's word is an immediate that owns nothing.
         #[cfg(feature = "gc-heap")]
-        Op::Const(k)
-            if fast & 128 != 0 && !layout.ownership().counted() && chunk.jit_const_is_str(k) =>
-        {
+        Op::Const(k) if fast & 128 != 0 && chunk.jit_const_is_str(k) => {
             a.mov_imm64(9, chunk.jit_const_str_word(k).unwrap());
             emit_exec_word_store(a, 9, 20, 0);
-            a.add_imm(20, 20, 8);
-        }
-        Op::Const(k)
-            if fast & 128 != 0 && layout.ownership().count_first() && chunk.jit_const_is_str(k) =>
-        {
-            a.mov_imm64(9, chunk.jit_const_ptr(k) as u64);
-            a.ldr_imm(11, 9, 8);
-            a.mov_imm64(10, crate::value::PACK_STR);
-            a.logic_x(1, 10, 10, 11);
-            emit_exec_word_store(a, 10, 20, 0);
-            rc_inc(a, layout.ownership(), 11, 13, 1);
             a.add_imm(20, 20, 8);
         }
         Op::GetProp(name, cache)
@@ -4040,7 +3893,6 @@ fn emit_effect(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(cache),
-                chunk.jit_name_number(cache),
                 pc_u32,
                 unwind,
                 matches!(op, Op::LoadNameForCall(..)),
@@ -4070,7 +3922,6 @@ fn emit_effect(
                 a,
                 layout,
                 chunk.jit_cap_cache_ptr(name),
-                None,
                 pc_u32,
                 unwind,
                 false,
@@ -4084,38 +3935,23 @@ fn emit_effect(
             emit_store_name_inline(a, layout, chunk.jit_cap_cache_ptr(name), pc_u32, unwind);
         }
         Op::StoreLocal(slot) if fast & 16 != 0 && slot as u32 * 8 + 8 < 4096 => {
-            emit_store_local(a, layout, slot as u32 * 8, &[pc_u32], unwind, false, true);
+            emit_store_local(a, slot as u32 * 8, &[pc_u32], unwind, false, true);
         }
         Op::UpdateLocal(slot, kind) if fast & 32 != 0 && slot as u32 * 8 + 8 < 4096 => {
             emit_update_local(a, slot, kind, pc_u32, unwind);
         }
-        Op::Pop if fast & 64 != 0 && layout.valid && layout.ownership().fits_unscaled() => {
-            exec_release_word(a, layout.ownership(), 20, -8);
+        Op::Pop if fast & 64 != 0 && layout.valid => {
             a.sub_imm(20, 20, 8);
         }
         Op::Pop | Op::Dup if fast & 64 != 0 => {
-            // Traced: the words are popped or copied as they are; only the owner guard reached
-            // the checked operation.
-            let counted = layout.ownership().counted();
-            let slow = a.new_label();
-            let done = a.new_label();
-            if counted || matches!(op, Op::Dup) {
+            // The words are popped or copied as they are.
+            if matches!(op, Op::Dup) {
                 emit_exec_word_load(a, 9, 20, -8);
-            }
-            if matches!(op, Op::Pop) {
-                exec_drop_shared(a, layout.ownership(), 9, 10, 11, slow);
-                a.sub_imm(20, 20, 8);
-            } else {
-                exec_clone(a, layout.ownership(), 9, 10, 11, slow);
                 emit_exec_word_store(a, 9, 20, 0);
                 a.add_imm(20, 20, 8);
+            } else {
+                a.sub_imm(20, 20, 8);
             }
-            if counted {
-                a.b(done);
-                a.bind(slow);
-                emit_exec(a, pc_u32, unwind);
-            }
-            a.bind(done);
         }
         Op::Not if fast & 131072 != 0 && eq_inlinable(layout) => {
             emit_not_inline(a, layout, pc_u32, unwind);

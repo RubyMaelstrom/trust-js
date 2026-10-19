@@ -1,8 +1,7 @@
-//! P1 S5 step 4: [`JitLayout`] v2 describes each build truthfully. Every exported offset is read
-//! on a live structure through the raw offset and compared with the safe accessor, in both
-//! builds: the default build's reference counts and `Vec`s, and gc-heap's traced handles,
-//! in-cell named fields (in place and spilled), narrow slot memos, in-cell first bindings and
-//! closure cells. Nothing here runs generated code.
+//! P1 S5 step 4: [`JitLayout`] v2 describes the build truthfully. Every exported offset is read
+//! on a live structure through the raw offset and compared with the safe accessor: gc-heap's
+//! traced handles, in-cell named fields (in place and spilled), narrow slot memos, in-cell first
+//! bindings and closure cells. Nothing here runs generated code.
 
 use super::*;
 use crate::interpreter::{new_scope, Binding};
@@ -91,7 +90,6 @@ fn layout_is_valid_with_the_build_ownership() {
     );
     #[cfg(feature = "gc-heap")]
     {
-        assert_eq!(layout.ownership(), crate::jit::JitOwnership::Traced);
         assert_eq!(layout.gc_data_off, 0, "the stored word is the cell address");
         assert!(matches!(
             layout.repr.props_fields,

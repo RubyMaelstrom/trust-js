@@ -130,7 +130,7 @@ impl Asm {
 }
 
 /// The small binding map's entry count and data-pointer words, as displacements from the
-/// scope, when its entries are a `Vec` (the default build; see `vec_fields`).
+/// scope, when its entries are a `Vec` (see `vec_fields`).
 fn vec_scope_entries(l: &JitLayout) -> Option<(usize, usize)> {
     match (
         l.scope_small_valid,
@@ -148,7 +148,6 @@ fn valid(l: &JitLayout) -> bool {
         return false;
     };
     l.valid
-        && l.ownership().fits_disp32()
         && l.scope_parent_valid
         && l.scope_with_valid
         && l.key_probe_ok
@@ -511,14 +510,9 @@ fn owner_pointer(a: &mut Asm, slow: usize) {
     a.bind(done);
 }
 
-fn load_value(a: &mut Asm, l: &JitLayout, for_call: bool, slow: usize) {
+fn load_value(a: &mut Asm, for_call: bool, slow: usize) {
     read_word(a, slow);
     owner_pointer(a, slow);
-    let copied = a.label();
-    a.nr_test(DX);
-    a.jcc(EQ, copied);
-    a.rc_inc_rdx(l.ownership());
-    a.bind(copied);
     if for_call {
         a.nr_imm(DX, PACK_UNDEFINED);
         a.nr_store(SP, 0, DX);
@@ -585,18 +579,13 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
     a.bind(done);
 }
 
-/// All semantic and ownership guards precede the sole refcount decrement/store commit.
-fn store_value(a: &mut Asm, l: &JitLayout, slow: usize) {
+/// All semantic guards precede the store commit.
+fn store_value(a: &mut Asm, slow: usize) {
     a.nr_mem(true, &[0x8b], R10, SP, -8);
     decode_rhs(a, slow);
     read_word(a, slow);
     owner_pointer(a, slow);
-    let commit = a.label();
-    a.nr_test(DX);
-    a.jcc(EQ, commit);
-    // No further guard/helper after this decrement. R8/R9/R10 hold the transferred new owner.
-    a.rc_dec_nonfinal_rdx_imm32(l.ownership(), slow);
-    a.bind(commit);
+    // R8/R9/R10 hold the transferred new word.
     let packed = a.label();
     let done = a.label();
     a.nr_test(R11);
@@ -826,9 +815,9 @@ pub(super) fn emit_op(
                 if let Op::UpdateNameCached(_, _, kind) = *op {
                     update_value(a, kind, slow);
                 } else if store {
-                    store_value(a, l, slow);
+                    store_value(a, slow);
                 } else {
-                    load_value(a, l, for_call, slow);
+                    load_value(a, for_call, slow);
                 }
             }
         }

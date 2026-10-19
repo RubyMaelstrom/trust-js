@@ -228,8 +228,7 @@ pub(crate) const DEFERRED_PROTOTYPE_BYTES: usize = std::mem::size_of::<LazyFunct
 type LazyProto = crate::gc_box::GcBox<LazyFunctionPrototype>;
 
 impl PackedValue {
-    /// Borrow the encoded bits without transferring their reference ownership. Generated code
-    /// may copy this word only after applying the matching clone/move ownership operation.
+    /// The encoded bits. A word owns nothing: generated code copies it as it is.
     #[cfg(test)]
     #[inline]
     pub(crate) fn bits(&self) -> u64 {
@@ -1332,13 +1331,8 @@ pub(crate) fn probe_vec_layout<T>(vec: &Vec<T>) -> Option<JitVecLayout> {
 /// interpreter's fields at probed offsets.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct JitRepr {
-    /// How generated code keeps a String/Symbol/Object payload alive: default build, one strong
-    /// count per owner at an offset of the stored word (located and verified on a live object);
-    /// gc-heap, traced (no count). Read through [`JitLayout::ownership`].
-    pub(crate) ownership: crate::jit::JitOwnership,
     /// Stored PropertyLayout Rc pointer → its strong count. Key layouts are
-    /// `Rc<PropertyLayoutData>` in every build: located and verified on a live layout,
-    /// independently of how values are owned.
+    /// `Rc<PropertyLayoutData>`: located and verified on a live layout.
     pub(crate) layout_rc_strong_off: usize,
     /// How the instance-field storage at `JitLayout::props_entries` holds its `Property` values.
     pub(crate) props_fields: JitVecLayout,
@@ -1358,12 +1352,8 @@ pub(crate) struct JitRepr {
     /// alone), so one unsigned range test can admit them. Probed: Collection's tag must directly
     /// follow None's.
     pub(crate) exotic_ordinary_contiguous: bool,
-    /// How a `JitCtx` holds the activation's `this` at [48]: a pointer to its wide `this_val`
-    /// in the default build, the packed word itself under gc-heap. Derived from the build's
-    /// cfg'd context layout, which the prefix assertions pin (not probed).
-    pub(crate) ctx_this: crate::jit::JitThisRepr,
-    /// The ownership, PropertyLayout count, named-field and Collection-tag probes held: a
-    /// `JitLayout` is valid only if they did.
+    /// The PropertyLayout count, named-field and Collection-tag probes held: a `JitLayout` is
+    /// valid only if they did.
     pub(crate) valid: bool,
 }
 
@@ -1375,10 +1365,6 @@ pub(crate) fn jit_repr() -> &'static JitRepr {
 
 fn probe_jit_repr() -> JitRepr {
     use std::mem::offset_of;
-    // The collector traces values: there is no count to locate.
-    #[cfg(feature = "gc-heap")]
-    let (ownership, ownership_ok) = (crate::jit::JitOwnership::Traced, true);
-
     // Key layouts are `Rc<PropertyLayoutData>` (never a value owner): locate their strong count
     // on a live one.
     let key_layout = Rc::new(PropertyLayoutData::new(vec![Rc::<str>::from("key")]));
@@ -1441,7 +1427,6 @@ fn probe_jit_repr() -> JitRepr {
         && u64::from(slot_memo_none) + 1 == 1u64 << (8 * slot_memo_width);
 
     JitRepr {
-        ownership,
         layout_rc_strong_off: layout_rc_strong_off.unwrap_or(0),
         props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
             ptr: 0,
@@ -1453,11 +1438,7 @@ fn probe_jit_repr() -> JitRepr {
         slot_memo_none,
         exotic_collection_tag,
         exotic_ordinary_contiguous,
-        ctx_this: crate::jit::JitThisRepr::BUILD,
-        valid: ownership_ok
-            && layout_rc_strong_off.is_some()
-            && props_fields.is_some()
-            && collection_ok,
+        valid: layout_rc_strong_off.is_some() && props_fields.is_some() && collection_ok,
     }
 }
 

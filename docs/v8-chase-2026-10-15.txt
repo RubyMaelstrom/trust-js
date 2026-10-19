@@ -4058,3 +4058,93 @@ Refcount ownership at ebc4f537:
   owners go; two Traced tests lose their counted calibrations.
 - Check: the fixtures' code dumps identical to step 0's, plain and
   with the shared stubs, as from step 5's review.
+
+Step 6, the JIT's counted arms (an implementation agent's change,
+reviewed):
+- Deleted:
+  - the JIT's cfg(not(gc-heap)) group: JitCtx's wide `this` fields
+    and their initializers, the default build's polls, three
+    run_moved sites in interpreter.rs, the JitCtx test helpers;
+  - JitOwnership, JitThisRepr, ownership_traced, and JitRepr's
+    ownership and ctx_this;
+  - on ARM64, every Refcount arm, counted() block, Wide `this` arm
+    and ownership emitter call, none of which emitted anything under
+    Traced; the counted-only emitters (emit_tdz_objects_nonfinal,
+    emit_slot_owns_nothing, the frame release emitters,
+    DIRECT_SAVE_SURPLUS); the gates Traced made always true
+    (fits_unscaled, count_first); Asm's ldp_post_base and
+    ccmp_reg_x, left without a user; and Chunk::jit_name_number, a
+    name site's observed number, which only counted arms read;
+  - on x64, its three count emitters, their seven sites and its
+    fits_disp32 gates.
+- rc_ok became layout.valid, not true: compile does not refuse an
+  invalid layout, and emit_store_local guards when it is false.
+  frame_this_reset became its one store, `str x5,[x10,#48]`, in the
+  direct finish stub. jit_ownership.rs keeps only the PropertyLayout
+  key buffer's count emitters (layout_rc_*, step 12): 636 lines to
+  80.
+- Kept, emitted as before: the property-word guard at every site,
+  the TDZ and Empty checks, the [PACK_EMPTY] loop, the string-
+  constant immediates, and semantic routing (the ordinary-object
+  and Map/Set guards, BigInt in equality and `!`, HTMLDDA). Kept
+  though the counts that motivated them are gone (step 12): the
+  Math, isNaN and sqrt receiver guards,
+  emit_packed_number_drop_guard and the payload loads in the
+  equality and `!` drop paths. For step 8: the helper table's two
+  drop slots (H_DROP_AT and H_DROP_PACKED_AT, now unused), every
+  embedded offset, gc_data_off and scope_data_off. For step 7: x64's
+  reference routing, its Vec-only field reads, its wide-`this`
+  decline and the tier clamp, which alone keeps x64 off under the
+  GC heap now.
+- Chunk's name_num_valid and name_num_bits still record each name
+  site's number, which now only seeds recompiles (step 12).
+- Tests (the list loses three and renames one):
+  - deleted last_callee_drop_owns_the_final_decrement_and_preserves_
+    completion, which built a Refcount layout and ran counted code;
+  - deleted native_owner_classifier_exhausts_high_lanes_and_random_
+    payloads and native_owner_classifier_instruction_paths_preserve_
+    object_cost, with the counted owner classifier they tested;
+  - traced_ownership_emitters_emit_nothing became
+    direct_finish_stub_resets_this_with_one_store: the stub holds
+    exactly one `str x5,[x10,#48]`;
+  - traced_property_stores_call_no_drop_helper calibrates its scan on
+    the SetProp templates' own helper call (H_SET_PROP) instead of
+    the deleted drop_helper_call; the layout test no longer asserts
+    the ownership; three scalar tests pass materialize no layout.
+- Docs: jit_ownership.rs's module doc states the traced contract (no
+  value kept alive by counting; the property-word guard is a
+  materialization boundary, not ownership); comments in the JIT,
+  value.rs, bytecode.rs (Tier::admitted among them) and four test
+  files no longer describe counted ownership as current.
+- Review: each deleted emitter call checked against its HEAD emitter
+  (whose Traced arm emitted nothing), each collapsed select against
+  its Traced side, and x64's seven sites lose only count
+  instructions. Mutation check: with the property-word guard
+  emitting nothing, 6 of the 23 traced and word-routing tests fail
+  (5 assertions, 1 abort).
+- Gates:
+  - aarch64: lib 2229/0/8, its test list step 5's less the three
+    deleted tests and with the one renamed; clippy clean for embed,
+    embed with architecture-diagnostics, default features, the small
+    build and embed with bench; rustfmt clean; the workspace builds
+    with all targets without a diagnostic. Without gc-heap the build
+    fails with the compile_error and 94 unresolved names.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0 (masked md5 65b1faf9, 05a89273, 9cad1fec);
+    difftest 138 agree, 12 skipped, no crash.
+  - Code dumps: vue and react identical to step 0's, plain and with
+    the shared stubs in both modes. djot's differ from step 0's (18,
+    18 and 8 lines) and are identical, in all three forms, to the
+    parent's (e930404a) built with 15 codegen units: the same code
+    under other stack contents.
+  - Per-test GC stress with the verifier and poisoning:
+    - aarch64, the 520 tests whose names match the JIT's areas: 512
+      pass at interval 1, the slow lists' 7 at 100 and 1 at 1000.
+    - x86-64 (zombie), the whole lib suite, 1916 tests: 1842 pass
+      and 49 are ignored at interval 1; the slow lists' 21 pass at
+      100 and their 4 at 1000, as at step 5.
+  - x86-64 Linux clippy clean. Windows: clippy as its baseline (23
+    diagnostics, none P1's); under Wine 1860 pass, 3 fail, 49
+    ignored, the 3 step 1's snapshot codec tests.

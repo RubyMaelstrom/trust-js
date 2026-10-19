@@ -1,8 +1,7 @@
-//! String constants through generated code (P1 S5 step 9e), checked in both builds. Under
-//! gc-heap the string-constant templates, the baseline's and the region copy's, push the
-//! constant's word (`PACK_STR | cell`) as an immediate that owns nothing: the chunk's constant
-//! pool roots the cell for as long as code compiled from the chunk can run. The default build
-//! keeps its template, which loads the payload from the constant's pool slot and takes a count.
+//! String constants through generated code (P1 S5 step 9e). The string-constant templates, the
+//! baseline's and the region copy's, push the constant's word (`PACK_STR | cell`) as an
+//! immediate that owns nothing: the chunk's constant pool roots the cell for as long as code
+//! compiled from the chunk can run.
 //!
 //! Programs run at every tier with the same expected results; at `Tier::Jit` the functions
 //! named ran as native code. From Rust each test checks the strings that literals evaluate to
@@ -233,12 +232,10 @@ fn string_constants_keep_identity_and_equality_across_collections() {
 }
 
 /// `s += x` with `s` initialized from a literal appends to a new string and leaves the literal
-/// as it was, for a local and for a binding a closure captures (the bytecode VM's Add retires
-/// the store's old string in the default build, so that a counted string can append in place;
-/// the native string addition does the same). The next evaluation of the literal reads the same
-/// text, and the grown string's buffer is not the constant's. A constant is allocated at exactly
-/// its length, so under gc-heap, whose appends write at a buffer's frontier, any append to one
-/// copies.
+/// as it was, for a local and for a binding a closure captures. The next evaluation of the
+/// literal reads the same text, and the grown string's buffer is not the constant's. A constant
+/// is allocated at exactly its length, so under gc-heap, whose appends write at a buffer's
+/// frontier, any append to one copies.
 #[test]
 fn appends_leave_string_constants_intact() {
     const SOURCE: &str = r#"

@@ -1,6 +1,6 @@
-//! ARM64 compact execution-word primitives. Canonical local/operand owners and a context's return
-//! slot (`ret`) are one PackedValue, as is its `this` under gc-heap; the default build's `this`
-//! and lexical Binding cells are wide Values, separate ABIs.
+//! ARM64 compact execution-word primitives. Canonical local/operand words and a context's return
+//! slot (`ret`) are one PackedValue, as is its `this`; lexical Binding cells are wide Values, a
+//! separate ABI.
 //! ECMA-262 §6.1.6.1 (snapshot e28783d5): preserve signed zero/infinities; NaN payload
 //! canonicalization is allowed and prevents numeric bits from aliasing internal tags.
 
@@ -136,8 +136,8 @@ pub(super) fn emit_exec_tag_guard(a: &mut asm::Asm, raw: u32, tag: u64, scratch:
 /// property-only word (a function's deferred `prototype`, PACK_LAZY_PROTO), which must not
 /// become an execution word. The site's checked operation reads the property in Rust, which
 /// materializes the prototype and leaves an ordinary Object word in the property. This is a
-/// materialization boundary, not ownership: a site emits it where traced ownership clones no
-/// owner (and so routes no tag) and the property read can be keyed "prototype". Every other
+/// materialization boundary, not ownership: a site emits it where the property read can be
+/// keyed "prototype" (no other routing sends the word to the checked path). Every other
 /// word (scalars, BigInt, String, Symbol, Object) falls through with its payload unread. Raw
 /// is preserved; scratch and NZCV are clobbered.
 pub(super) fn property_word_guard(a: &mut asm::Asm, raw: u32, scratch: u32, slow: usize) {
@@ -447,132 +447,6 @@ mod tests {
             random ^= random << 13;
             random ^= random >> 7;
             random ^= random << 17;
-        }
-    }
-
-    fn owner_classifier() -> (asm::Asm, [(usize, u64); 3]) {
-        let mut a = asm::Asm::new();
-        let scalar = a.new_label();
-        let heap = a.new_label();
-        let slow = a.new_label();
-        exec_owner_guard(&mut a, 0, 3, 4, heap, scalar, slow);
-        assert_eq!(a.buf.len(), 13, "classifier code-size regression");
-        let mut destinations = [(0, 0); 3];
-        for (kind, label) in [scalar, heap, slow].into_iter().enumerate() {
-            destinations[kind] = (a.buf.len(), kind as u64);
-            a.bind(label);
-            a.str_imm(0, 1, 0); // raw must survive classification unchanged.
-            a.str_imm(2, 1, 8); // unrelated caller-saved register must survive too.
-            a.movz(0, kind as u32, 0);
-            a.ret();
-        }
-        (a, destinations)
-    }
-
-    #[test]
-    fn native_owner_classifier_exhausts_high_lanes_and_random_payloads() {
-        let (a, _) = owner_classifier();
-        let code = executable(a);
-        let run: unsafe extern "C" fn(u64, *mut u64, u64) -> u64 =
-            unsafe { std::mem::transmute(code.as_ptr()) };
-        let mut random = 0x243f_6a88_85a3_08d3u64;
-        for high in 0..=u16::MAX as u64 {
-            // Independent exact-tag oracle, including noncanonical Numbers and every
-            // invalid/property-only high lane. No payload is dereferenced by this stub.
-            let tag = high << 48;
-            let expected = if [PACK_OBJ, PACK_STR, PACK_SYM].contains(&tag) {
-                1
-            } else if tag == PACK_BIGINT || tag > PACK_OBJ {
-                2
-            } else {
-                0
-            };
-            for payload in [0, 1, 0x0000_ffff_ffff_ffff, random] {
-                let raw = tag | (payload & 0x0000_ffff_ffff_ffff);
-                let sentinel = raw.rotate_left(17) ^ 0xdead_beef_badc_0ffe;
-                let mut output = [!raw, !sentinel];
-                assert_eq!(
-                    unsafe { run(raw, output.as_mut_ptr(), sentinel) },
-                    expected,
-                    "classification for {raw:016x}"
-                );
-                assert_eq!(
-                    output,
-                    [raw, sentinel],
-                    "register preservation for {raw:016x}"
-                );
-            }
-            random ^= random << 13;
-            random ^= random >> 7;
-            random ^= random << 17;
-        }
-    }
-
-    #[test]
-    fn native_owner_classifier_instruction_paths_preserve_object_cost() {
-        let (a, destinations) = owner_classifier();
-        let words = a.finish();
-        // Decode the actual emitted instructions, not a second copy of the classifier.
-        // Only x3/x4 writes and comparisons are accepted before a terminal destination.
-        let count_path = |raw: u64| {
-            let (mut pc, mut steps, mut high, mut constant) = (0, 0, 0, 0);
-            let (mut equal, mut lower) = (false, false);
-            loop {
-                if let Some((_, kind)) = destinations.iter().find(|(target, _)| *target == pc) {
-                    break (*kind, steps);
-                }
-                assert!(steps < 20, "classifier must terminate");
-                steps += 1;
-                let word = words[pc];
-                if word == 0xd370_fc03 {
-                    // LSR x3, x0, #48
-                    high = raw >> 48;
-                } else if word & 0xffe0_001f == 0xd280_0004 {
-                    // MOVZ x4, imm16
-                    constant = ((word >> 5) & 0xffff) as u64;
-                } else if word == 0xeb04_007f {
-                    // CMP x3, x4
-                    equal = high == constant;
-                    lower = high < constant;
-                } else if word & 0xff00_0010 == 0x5400_0000 {
-                    // B.cond
-                    let take = match word & 15 {
-                        C_EQ => equal,
-                        C_LO => lower,
-                        C_LS => lower || equal,
-                        C_HI => !lower && !equal,
-                        condition => panic!("unexpected branch condition {condition}"),
-                    };
-                    if take {
-                        let offset = ((((word >> 5) & 0x7ffff) as i32) << 13) >> 13;
-                        pc = (pc as i32 + offset) as usize;
-                        continue;
-                    }
-                } else if word & 0xfc00_0000 == 0x1400_0000 {
-                    // B
-                    let offset = (((word & 0x03ff_ffff) as i32) << 6) >> 6;
-                    pc = (pc as i32 + offset) as usize;
-                    continue;
-                } else {
-                    panic!("unexpected classifier instruction {word:08x}");
-                }
-                pc += 1;
-            }
-        };
-        for (raw, kind, count) in [
-            (PACK_OBJ, 1, 4),
-            (crate::value::PACK_LAZY_PROTO, 2, 5),
-            (0, 0, 8),
-            (PACK_CANON_NAN, 0, 8),
-            (PACK_UNDEFINED, 0, 8),
-            (PACK_BOOL | 1, 0, 8),
-            (PACK_BIGINT, 2, 9),
-            (PACK_STR, 1, 12),
-            (PACK_SYM, 1, 12),
-            ((-0.0f64).to_bits(), 0, 13),
-            (f64::NEG_INFINITY.to_bits(), 0, 13),
-        ] {
-            assert_eq!(count_path(raw), (kind, count), "path {raw:016x}");
         }
     }
 
