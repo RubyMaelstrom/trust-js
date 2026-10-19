@@ -1649,10 +1649,12 @@ impl Drop for NativeStackScope {
     }
 }
 
-/// Register this thread's whole native stack, from the current frame up to the top of its
-/// mapping, as a permanent entry region (idempotent). Interpreters call this at creation so
-/// every engine frame on the thread lies below the scanned top. Returns false where the
-/// stack bounds cannot be read; conservative collection then defers on this thread.
+/// Register this thread's whole native stack, from the current frame up to its outermost frame,
+/// as a permanent entry region (idempotent). Interpreters call this at creation so every engine
+/// frame on the thread lies below the scanned top. The top is the stack mapping's, or on a
+/// spawned Linux thread the start of the thread descriptor and static TLS that glibc and musl
+/// put at the top of the mapping: thread-locals are not roots. Returns false where the stack
+/// bounds cannot be read; conservative collection then defers on this thread.
 pub(crate) fn register_thread_native_stack() -> bool {
     native::enter_thread()
 }
@@ -1973,7 +1975,13 @@ mod native {
         });
     }
 
-    /// Permanently register the current thread's stack up to its mapping's top.
+    /// The entry region's exclusive top, when one is registered.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn entry_top() -> Option<usize> {
+        REGIONS.with(|regions| regions.borrow().first().map(|region| region.hi))
+    }
+
+    /// Permanently register the current thread's stack up to its outermost frame.
     pub(super) fn enter_thread() -> bool {
         if REGIONS.with(|regions| !regions.borrow().is_empty()) {
             return true;
@@ -1986,12 +1994,17 @@ mod native {
     }
 
     #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn pthread_self() -> usize;
+    }
+
+    /// The top of the stack mapping, lowered to [`tls_floor`].
+    #[cfg(target_os = "linux")]
     fn thread_stack_top() -> Option<usize> {
         // Opaque pthread_attr_t: 56 bytes (glibc x86_64) / 64 bytes (aarch64); 128 covers both.
         #[repr(C, align(16))]
         struct Attr([u8; 128]);
         unsafe extern "C" {
-            fn pthread_self() -> usize;
             fn pthread_getattr_np(thread: usize, attr: *mut Attr) -> std::ffi::c_int;
             fn pthread_attr_getstack(
                 attr: *const Attr,
@@ -2004,14 +2017,72 @@ mod native {
         let mut addr = std::ptr::null_mut();
         let mut size = 0usize;
         // SAFETY: `attr` outlives every call; getattr initializes it and destroy releases it.
-        unsafe {
+        let status = unsafe {
             if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
                 return None;
             }
             let status = pthread_attr_getstack(&attr, &mut addr, &mut size);
             pthread_attr_destroy(&mut attr);
-            (status == 0 && size != 0).then(|| addr as usize + size)
+            status
+        };
+        (status == 0 && size != 0).then(|| tls_floor(current_sp(), addr as usize + size))
+    }
+
+    /// The lowest of `top` and, between `sp` and `top`, this thread's descriptor (`pthread_self`
+    /// is its address on glibc and musl) and its instances of the loaded modules' TLS blocks
+    /// (`dlpi_tls_data`). A spawned thread has both at the top of its stack mapping, above its
+    /// outermost frame, where pthread_getattr_np's bounds include them; the main thread's lie
+    /// elsewhere. A lazily built thread-local can hold a stale cell address in bytes it never
+    /// wrote (an enum's unused payload), which would otherwise be a root.
+    #[cfg(target_os = "linux")]
+    fn tls_floor(sp: usize, top: usize) -> usize {
+        /// `struct dl_phdr_info`, glibc's and musl's layout.
+        #[repr(C)]
+        struct PhdrInfo {
+            addr: usize,
+            name: *const std::ffi::c_char,
+            phdr: *const std::ffi::c_void,
+            phnum: u16,
+            adds: u64,
+            subs: u64,
+            tls_modid: usize,
+            tls_data: *mut std::ffi::c_void,
         }
+        type Visit =
+            unsafe extern "C" fn(*mut PhdrInfo, usize, *mut std::ffi::c_void) -> std::ffi::c_int;
+        unsafe extern "C" {
+            fn dl_iterate_phdr(visit: Visit, data: *mut std::ffi::c_void) -> std::ffi::c_int;
+        }
+        struct Window {
+            sp: usize,
+            floor: usize,
+        }
+        unsafe extern "C" fn lower_to_block(
+            info: *mut PhdrInfo,
+            size: usize,
+            data: *mut std::ffi::c_void,
+        ) -> std::ffi::c_int {
+            // SAFETY: dl_iterate_phdr passes an `info` of `size` bytes and our `data`.
+            let (info, window) = unsafe { (&*info, &mut *data.cast::<Window>()) };
+            let block = if size >= size_of::<PhdrInfo>() {
+                info.tls_data as usize
+            } else {
+                0
+            };
+            if window.sp < block && block < window.floor {
+                window.floor = block;
+            }
+            0
+        }
+        let mut window = Window { sp, floor: top };
+        // SAFETY: no preconditions.
+        let descriptor = unsafe { pthread_self() };
+        if sp < descriptor && descriptor < top {
+            window.floor = descriptor;
+        }
+        // SAFETY: the visitor reads only `info` and writes only `window`, which outlives the call.
+        unsafe { dl_iterate_phdr(lower_to_block, (&raw mut window).cast()) };
+        window.floor
     }
 
     #[cfg(target_os = "macos")]
@@ -2161,6 +2232,11 @@ mod native {
 
     #[cfg(test)]
     pub(super) fn exit() {}
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn entry_top() -> Option<usize> {
+        None
+    }
 
     pub(super) fn enter_thread() -> bool {
         false
@@ -3067,6 +3143,48 @@ mod tests {
             assert!(deep_collect(&mut fx.heap, a));
             assert!(fx.heap.is_allocated_word(a as u64));
             assert_eq!(fx.val(a), 9);
+        })
+        .join()
+        .expect("collector thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static HELD: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Store a hidden pointer, unhidden, in this thread's `HELD`.
+    #[cfg(target_os = "linux")]
+    #[inline(never)]
+    fn hold_in_thread_local(hidden: u64) {
+        HELD.with(|held| unsafe { std::ptr::write_volatile(held.as_ptr(), !hidden) });
+    }
+
+    /// A spawned thread's descriptor and static TLS sit at the top of its stack mapping (glibc,
+    /// musl), above its outermost frame: the registered stack ends below them, so a cell that
+    /// only a thread-local holds dies at a conservative collection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_local_is_not_a_root() {
+        std::thread::spawn(|| {
+            let outer = 0u64;
+            assert!(register_thread_native_stack());
+            let top = native::entry_top().expect("registered");
+            let held = HELD.with(|held| held.as_ptr() as usize);
+            assert!(
+                (&raw const outer as usize) < top && top <= held,
+                "the stack ends between the thread's frames and its thread-locals"
+            );
+            let mut fx = Fixture::new();
+            let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+            hold_in_thread_local(hidden);
+            scrub_stack();
+            assert!(fx.heap.collect());
+            assert!(
+                !fx.heap.is_allocated_word(HELD.with(Cell::get)),
+                "a thread-local retained its cell"
+            );
+            black_box(&outer);
         })
         .join()
         .expect("collector thread");
