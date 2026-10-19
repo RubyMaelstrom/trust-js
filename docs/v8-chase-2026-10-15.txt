@@ -4148,3 +4148,37 @@ reviewed):
   - x86-64 Linux clippy clean. Windows: clippy as its baseline (23
     diagnostics, none P1's); under Wine 1860 pass, 3 fail, 49
     ignored, the 3 step 1's snapshot codec tests.
+
+Step 7 plan (2026-10-19), from a read-only survey of the x64 JIT at
+492d88ad, a survey of Windows unwinding at e930404a and one Wine run:
+- After step 6 the x64 JIT emits no count, and the tier clamp alone
+  keeps it off under the GC heap: Tier::admitted runs Jit as Bytecode
+  on x86-64, 44 tests are ignored there with the clamp's reason, and
+  16 test files and 4 inline test modules compile out.
+- Missing on x64, by the plan's list:
+  - polls: the entry and loop polls compare only the live count with
+    gc_next, so x64 loops miss the byte budget, the stress interval
+    and deferred requests (the heap's due word); entry polls pass 0,
+    not POLL_ENTRY; no call to an allocating helper ends in a poll;
+  - InlineVec: x64 reads named fields and scope entries only from a
+    Vec, so under the GC heap every property, name and Reference
+    template declines to its helper. Ported, a length is a 32-bit
+    load: a 64-bit one reads len | cap << 32, which passes a spilled
+    object's bounds check;
+  - the packed `this` at [r12+0x30], which x64's property templates
+    decline (they read it as a pointer to a wide `this`);
+  - string constants, which x64 sends to the helper in every build.
+- Windows: no unwind information is registered for JIT code and
+  every helper is extern "C", so a panic under a helper aborts there,
+  on any platform; errors leave JIT code as return values. One panic
+  does reach a helper under Wine: the segment assertion (the plan's
+  recorded deviation), seen in step 1's run of the counted build and
+  reproduced with --nocapture.
+- References: no counted x64 build is left. Step 1's x86-64 Test262
+  reports (the counted build's jit tier ran the x64 JIT, byte-
+  identical to aarch64's) and the aarch64 suite are the comparison.
+- JitCtx's offsets are asserted on aarch64 only, while x64 hard-codes
+  0x30 and 0x48: the asserts extend to x86-64.
+- Correction to S5 step 7's entry ("x64 uses no records"): x64's
+  moved entries do pop FramePool records. The records are traced, so
+  the conclusion stands.
