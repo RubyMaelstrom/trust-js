@@ -4997,3 +4997,88 @@ profiles of its fat-LTO engine:
   fixtures collect, so their dumps must be the reference's (dumps-
   vs-ref.sh), djot's GC-timing-sensitive chunks excepted under step
   4's rule.
+
+Step 9a, the byte budget the only allocation trigger (an
+implementation agent's change, reviewed):
+- Interp::gc_next is no longer a growth trigger but the live-object
+  ceiling: the live-object limit, or after the limit's RangeError
+  the live count plus LIMIT_ERROR_HANDLER_ROOM (100,000) for the
+  handler. Every writer sets it so: the initializer, the collector,
+  gc_check, gc_task_boundary, collect_garbage_for_host and
+  Engine::set_live_object_limit, whose floor stays 100,000
+  (MIN_CONFIGURED_LIVE_OBJECT_LIMIT). next_threshold and GC_TRIGGER
+  are gone. gc_next's readers are unchanged, generated code among
+  them.
+- The performance record reports GC pause time by cause as well
+  (gc_pause_seconds_by_cause, keyed like gc_causes), and
+  DIAGNOSTICS.md says that its counts and pauses include the shell's
+  exit collection.
+- Test object_count_alone_does_not_collect: with the heap's budget
+  floor out of reach, 300,000 objects, half of them kept, allocate
+  without a collection at each tier; with the engine's floor back,
+  the next safepoint collects once. The tests that set gc_next to
+  force a collection are unchanged.
+- Collections (TRUST_JS_PERF_METRICS, --tier=jit, the exit
+  collection included): vue, react and djot 7, 3 and 6, as at 8f;
+  the sustained workload 15 (13 when the budget is spent, one at
+  the end-of-eval task boundary, the exit collection), against 8f's
+  20 (18, 1 and 1).
+- Gates (the review's, on the agent's tree):
+  - aarch64: lib 2228/0/7, its test list the parent's plus the new
+    test; clippy clean in the five configurations; rustfmt clean;
+    the workspace builds with all targets without a diagnostic;
+    rustdoc's 40 warnings are 8f's.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash.
+  - The fixtures' code dumps: against the reference made at 8f,
+    every chunk of the three (56, 10 and 160) is identical in the
+    plain dumps and with the stubs per chunk and inline. vue's plain
+    dumps total one word more than the reference's: a heap address
+    one chunk embeds differs, and its mov sequence, which the check
+    counts as one token, is one instruction longer.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64:
+    the 1026 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas: 1002 pass at interval
+    1 (6 are ignored), the slow lists' 15 at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2073/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2065 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's plus the new test. Test262 at --tier=jit: 53575/53575,
+    the report identical to step 1's x86-64 one and the S5 exit
+    gate's aarch64 one. Fixtures: compiles 56/10/160 and 7, 3 and 6
+    collections, outputs as on aarch64; difftest 138 agree, 12
+    skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2080 tests: 2047 pass and 7 are
+    ignored at interval 1 (about 3,750 s; the new test returns early
+    under stress); the slow lists' 22 pass at 100 and their 4 at
+    1000.
+- Measured (gcmeasure.py; fat-LTO engines, each from a fresh export
+  in a fresh target dir: 8f d95cd4a8e052, 9a cb0c10ea9cc2 from the
+  gated tree, main e3310993 311ae9ae5658; copies made together; CPU
+  5, 15 interleaved rounds, medians; the other cores 1.5 busy on
+  average, 3.2 at most; outputs equal everywhere):
+  - The sustained workload against 8f: at --tier=jit cycles -11.3%
+    (wall -11.2%, instructions -10.4%), GC pause 511 to 391 ms; at
+    bytecode cycles -7.9% (wall -8.1%), GC pause 508 to 390 ms. Peak
+    RSS within 0.4% (181 MB).
+  - vue, react and djot at --tier=jit: cycles within 0.3% of 8f's,
+    instructions equal, GC pause and peak RSS within 2%.
+  - Against main, 9a's cycles: vue -10.8%, react -12.6%, djot -6.4%,
+    the sustained workload -32.0% (jit) and -26.2% (bytecode).
+  - S0's thresholds are not met yet, as they were not at 8f. Peak
+    RSS against main (at most +25%): vue +36%, react +132%, djot +7%,
+    the sustained workload +21% (jit) and +20% (bytecode). GC pause
+    over wall time (at most 5%), the exit collection left out: vue
+    5.3%, react 5.8%, djot 9.7%, the sustained workload 37.8% (jit)
+    and 28.8% (bytecode); main's, its exit collection included:
+    0.9%, 0.4%, 2.9%, 35.1% and 28.5%.
+- /tmp, which is RAM-backed on this machine, was cleared on
+  2026-10-20. What the record and plan cite there moved to target/:
+  S0's /tmp/spec-pilot to target/s0-spec-pilot, and the fixture
+  copies in /tmp/trust-js-review-controls-wnym0ybo to
+  target/s0-review-controls.

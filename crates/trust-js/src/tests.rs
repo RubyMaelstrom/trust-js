@@ -2397,6 +2397,64 @@ fn live_object_limit_error_handler_can_allocate() {
     }
 }
 
+/// Allocation makes a collection due through the heap's byte budget alone: the live-object
+/// count, which also collected once it grew by 100,000 objects (or an eighth) until P1 S6 step
+/// 9a, only enforces the live-object limit. With this heap's budget floor out of reach, 300,000
+/// objects, half of them kept, are allocated without a collection at every tier; with the
+/// engine's floor back, which they have long spent, the next safepoint collects.
+#[test]
+fn object_count_alone_does_not_collect() {
+    use crate::bytecode::Tier;
+    // GC stress collects at every safepoint after an allocation.
+    if crate::gc_test::stress_active() {
+        return;
+    }
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        // The end-of-eval task boundary would collect after this much growth: defer it, as the
+        // embed API's `defer_task_garbage_collection` does.
+        engine.interp.gc_task_deferred = true;
+        let heap = engine.interp.gc_heap.clone();
+        // This heap's budget floor, which TRUST_JS_GC_MIN_HEAP_BYTES sets for every heap in the
+        // process, at the engine's growth (`gc_collect::configure_heap`).
+        let set_floor = |bytes: usize| heap.core.borrow_mut().set_heap_growth(bytes, 100);
+        let collections = || heap.core.borrow().collections();
+        let live = || crate::value::heap_live_objects(&heap);
+        set_floor(1 << 40);
+        let before = collections();
+        let allocated = crate::value::heap_allocated_objects(&heap);
+        let source = "var kept = [];
+            function fill(n) { for (var i = 0; i < n; i++) { kept.push({ i: i }); var dead = { i: i }; } }
+            fill(150000); kept.length";
+        assert_eq!(run_in(&mut engine, source), "150000", "{tier:?}");
+        assert_eq!(collections(), before, "{tier:?}: no collection was due");
+        assert!(
+            crate::value::heap_allocated_objects(&heap) - allocated >= 300_000,
+            "{tier:?}"
+        );
+        // Unswept, the dead count as live.
+        let unswept = live();
+        assert!(unswept >= 300_000, "{tier:?}: {unswept} live objects");
+        // The engine's floor, 8 MiB, which those objects' cells have spent.
+        set_floor(8 << 20);
+        assert!(heap.core.borrow().collection_due(), "{tier:?}");
+        // The next safepoint, this loop's at the latest, collects.
+        assert_eq!(
+            run_in(&mut engine, "for (var j = 0; j < 2; j++); j"),
+            "2",
+            "{tier:?}"
+        );
+        assert_eq!(collections(), before + 1, "{tier:?}");
+        assert!(
+            live() <= unswept - 100_000,
+            "{tier:?}: {} live objects",
+            live()
+        );
+    }
+}
+
 /// Deeply nested source either runs or is a catchable SyntaxError, on every tier and on a 1 MiB
 /// thread stack: the parser bounds the nesting of statements, expressions and patterns
 /// (`MAX_PARSE_DEPTH`), and the parser, the AST passes, the compiler and the tree-walking

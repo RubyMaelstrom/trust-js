@@ -84,8 +84,10 @@ comment/example in the same change.
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
 - `TRUST_JS_PERF_METRICS=1` prints one JSON JIT/collector performance summary at normal
   exit (compile attempts/seconds/bytes, inline attempts, lex/parse/bytecode-compile time,
-  native-call time, GC pauses and post-GC managed memory). Diagnostic only; excluded from
-  acceptance timing.
+  native-call time, GC pauses and post-GC managed memory). The shell collects once more at
+  exit, before printing it, so the GC counts and pauses include that collection (cause
+  `explicit`); pauses are also reported by cause (`gc_pause_seconds_by_cause`, keyed like
+  `gc_causes`). Diagnostic only; excluded from acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
@@ -106,9 +108,11 @@ comment/example in the same change.
   use-after-free can take down the whole run).
   `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
   each) and released pages kept for reuse (`spare`) after each collection.
-  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget, for
-  collector tuning. `TRUST_JS_GC_CENSUS=1` adds a
-  `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
+  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
+  the live bytes after a collection, at least the floor), for collector tuning: outside GC
+  stress, cell allocation makes a collection due through this budget alone, and the
+  live-object count only enforces the engine's live-object limit. `TRUST_JS_GC_CENSUS=1`
+  adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
   heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records
   why each cell was marked (tests print the path with `gc_test::why`/`why_address`; a

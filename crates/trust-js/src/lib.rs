@@ -909,13 +909,15 @@ impl Engine {
         self.interp.tier_threshold = threshold;
     }
 
-    /// Set the ceiling on simultaneously live objects. An allocation safe point that still
-    /// exceeds it after a full collection throws a `RangeError` instead of exhausting memory.
-    /// The default scales with the memory available to the process (at least three million).
+    /// Set the ceiling on simultaneously live objects; values below 100,000 count as 100,000.
+    /// An allocation safe point that finds more live objects collects, and if more than the
+    /// ceiling survive, throws a `RangeError` instead of exhausting memory. The default scales
+    /// with the memory available to the process (at least three million).
     pub fn set_live_object_limit(&mut self, limit: u64) {
-        let limit = limit.clamp(interpreter::GC_TRIGGER as u64, i64::MAX as u64) as i64;
+        let floor = interpreter::MIN_CONFIGURED_LIVE_OBJECT_LIMIT as u64;
+        let limit = limit.clamp(floor, i64::MAX as u64) as i64;
         self.interp.live_object_limit = limit;
-        self.interp.gc_next = self.interp.gc_next.min(limit);
+        self.interp.gc_next = limit;
     }
 
     /// The engine's current live-object ceiling (see [`Engine::set_live_object_limit`]).

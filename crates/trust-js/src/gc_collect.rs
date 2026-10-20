@@ -22,10 +22,11 @@ use crate::gc_trace::{GcSink, GcTrace};
 use crate::host::{HostGcVisitor, NativeGcId};
 
 /// The byte budget's floor: below half of it live, a collection is due once this much has been
-/// allocated. Object counts also drive collection (see `gc_check`), but environment records
-/// are cells, not objects, so this budget alone bounds scope churn. On the gate fixtures, S2's
-/// tripwire measured peak RSS up to 6x higher at 64 MiB than at 8 MiB, with bytecode-tier time
-/// unchanged (docs/v8-chase-2026-10-15.txt, S2 exit gate).
+/// allocated. Cell allocation makes a collection due through this budget alone (GC stress
+/// aside): it counts every cell, environment records and strings as well as objects, and the
+/// live-object count only enforces the engine's live-object limit (see `Interp::gc_next`). On
+/// the gate fixtures, S2's tripwire measured peak RSS up to 6x higher at 64 MiB than at 8 MiB,
+/// with bytecode-tier time unchanged (docs/v8-chase-2026-10-15.txt, S2 exit gate).
 const GC_MIN_HEAP_BYTES: usize = 8 << 20;
 
 /// Native stack zeroed below a collection's entry before marking (see `gc_core::scrub_stack`).
@@ -337,8 +338,8 @@ impl Interp {
         self.heap_release.owns_heap()
     }
 
-    /// Whether a collection should run at this safepoint: object pressure (the old policy's
-    /// threshold, `gc_next`), the heap's byte budget or stress interval, or a deferred request.
+    /// Whether a collection should run at this safepoint: the live-object count above its
+    /// ceiling (`gc_next`), the heap's byte budget or stress interval, or a deferred request.
     pub(crate) fn gc_heap_due(&self) -> bool {
         crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
             || self.gc_heap.core.borrow().collection_due()
@@ -384,13 +385,13 @@ impl Interp {
         }
         crate::value::gc_finish_generation(&heap);
         let live = crate::value::heap_live_objects(&heap);
-        let next = next_threshold(live, self.live_object_limit);
-        // Over the live-object limit, keep the room gc_check re-armed for the handler of the
-        // limit's RangeError: a stress or byte-budget collection must not take it away.
+        // The ceiling is the live-object limit. Over the limit, keep the room gc_check left the
+        // handler of the limit's RangeError: a stress or byte-budget collection must not take
+        // it away.
         self.gc_next = if live > self.live_object_limit {
-            self.gc_next.max(next)
+            self.gc_next.max(self.live_object_limit)
         } else {
-            next
+            self.live_object_limit
         };
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             let stats = heap.core.borrow().stats();

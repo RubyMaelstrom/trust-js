@@ -3525,10 +3525,17 @@ pub struct Interp {
     /// Live generator coroutines, keyed by the generator object's pointer. Each owns an explicit
     /// heap VM continuation that parks at `yield`/`await` without reserving an OS thread stack.
     pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
-    /// Live-object count above which the next allocation safe point runs a collection.
+    /// The live-object ceiling: a safepoint (`gc_check`, the JIT's entry and loop polls) that
+    /// finds the live count above it collects, and throws the limit's RangeError if more than
+    /// `live_object_limit` objects stay alive; the record-getter fast path then leaves the call
+    /// to the ordinary path. It is `live_object_limit`, or, after that RangeError, the live
+    /// count at the throw plus [`LIMIT_ERROR_HANDLER_ROOM`]. It is not a growth trigger:
+    /// allocation makes a collection due through the heap's byte budget (see
+    /// `gc_collect::GC_MIN_HEAP_BYTES`).
     pub(crate) gc_next: i64,
     /// Live-object ceiling for this engine; see [`MIN_LIVE_OBJECT_LIMIT`]. Defaults to
-    /// [`default_live_object_limit`] and is configurable by the embedder.
+    /// [`default_live_object_limit`] and is configurable by the embedder. Safepoints see it
+    /// through `gc_next`.
     pub(crate) live_object_limit: i64,
     /// Nonzero while an embedder performs an atomic bootstrap operation whose
     /// temporary VM values are still being published into a rooted object
@@ -4443,17 +4450,15 @@ pub(crate) fn default_live_object_limit() -> i64 {
     })
 }
 
-/// Live-object count at which the collector first runs; the threshold then floats (see `gc_check`).
-pub const GC_TRIGGER: i64 = 100_000;
+/// Smallest live-object limit an embedder can set: [`crate::Engine::set_live_object_limit`]
+/// raises smaller values to it.
+pub(crate) const MIN_CONFIGURED_LIVE_OBJECT_LIMIT: i64 = 100_000;
+/// Objects the handler of the live-object limit's RangeError may allocate before a safepoint
+/// collects again: the throwing safepoint sets `Interp::gc_next` this far above the live count
+/// (see `gc_check`).
+pub(crate) const LIMIT_ERROR_HANDLER_ROOM: i64 = 100_000;
 /// Layered calls check allocation counters once per 256 calls (see `gc_check_amortized`).
 pub(crate) const GC_CALL_POLL_MASK: u32 = 255;
-
-/// The live-object threshold after a collection that left `live` objects: an eighth more, and at
-/// least [`GC_TRIGGER`] more, clamped to `[GC_TRIGGER, limit]`.
-pub(crate) fn next_threshold(live: i64, limit: i64) -> i64 {
-    live.saturating_add((live / 8).max(GC_TRIGGER))
-        .clamp(GC_TRIGGER, limit.max(GC_TRIGGER))
-}
 
 /// ArrayBuffer data allocated since the last collection that triggers another, at least. A
 /// backing store is freed only when the collector finds its buffer unreachable, and a buffer is
@@ -5322,6 +5327,7 @@ impl Interp {
         let symbol_proto = Object::new(Some(object_proto.clone()));
         let global = Object::new(Some(object_proto.clone()));
         let global_env = new_var_scope(None);
+        let live_object_limit = default_live_object_limit();
         let mut interp = Interp {
             gc_heap: gc_heap.clone(),
             symbol_agent,
@@ -5463,8 +5469,8 @@ impl Interp {
             kept_alive: Vec::new(),
             host_state: Default::default(),
             generators: Default::default(),
-            gc_next: GC_TRIGGER,
-            live_object_limit: default_live_object_limit(),
+            gc_next: live_object_limit,
+            live_object_limit,
             gc_suppressed: 0,
             buffer_gc: BufferPressure::default(),
             gc_tick: 0,
@@ -6464,7 +6470,7 @@ impl Interp {
         let before = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_collect_with_cause(crate::value::GcCause::Explicit);
         let live = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_next = next_threshold(live, self.live_object_limit);
+        self.gc_next = self.live_object_limit;
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
     }
@@ -11019,9 +11025,6 @@ impl Interp {
 
     // ----- garbage collection -----------------------------------------------------------------
 
-    /// Allocation safe point. When live objects pass the floating threshold, run the cycle
-    /// collector; if genuine retention still exceeds the engine's live-object ceiling, throw
-    /// rather than exhaust RAM.
     /// The cached UTF-16 view of `s` (see [`StrUnits`]): first access per string is O(len),
     /// every later one O(1) — pointer-compared against a small LRU. Short strings skip the
     /// cache entirely (the O(len) walk is trivial; caching them would just churn the LRU under
@@ -11214,6 +11217,10 @@ impl Interp {
         }
     }
 
+    /// Allocation safe point. Collects when the heap's byte budget is spent, its stress interval
+    /// reached or a deferred request waits (`gc_heap_due`), or when the live-object count is
+    /// above its ceiling (`gc_next`); if a collection the ceiling made due leaves more than the
+    /// engine's live-object limit alive, throws a RangeError rather than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         // The due word JIT polls read is the core's `collection_due` (debug builds).
         crate::value::debug_assert_due_word(&self.gc_heap);
@@ -11221,11 +11228,11 @@ impl Interp {
             return Ok(());
         }
         self.gc_weak_metadata_safepoint(false);
-        // Only a collection the live-object threshold makes due enforces the limit: GC stress and
-        // the cell heap's byte budget also collect here, and must not throw again inside the
-        // handler the re-armed threshold below leaves room for.
-        let threshold_due = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
-        if !threshold_due && !self.gc_heap_due() {
+        // Only a collection the ceiling makes due enforces the limit: GC stress and the cell
+        // heap's byte budget also collect here, and must not throw again inside the handler
+        // that the room set below lets allocate.
+        let over_ceiling = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
+        if !over_ceiling && !self.gc_heap_due() {
             return Ok(());
         }
         self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
@@ -11240,18 +11247,19 @@ impl Interp {
                 self.generators.len()
             );
         }
-        if threshold_due && live > self.live_object_limit {
+        if over_ceiling && live > self.live_object_limit {
             // Leave the handler that catches this error room to allocate (its error object,
-            // messages, cleanup) before the next safepoint collects again. Without re-arming,
+            // messages, cleanup) before the next safepoint collects again. Without the room,
             // the very first allocation in the `catch` block would rerun the full collection
             // and throw again, so the error could never be handled in practice.
-            self.gc_next = live.saturating_add(GC_TRIGGER);
+            self.gc_next = live.saturating_add(LIMIT_ERROR_HANDLER_ROOM);
             return Err(self.throw("RangeError", "allocation limit exceeded"));
         }
-        // Re-arm: collect again once live grows, clamped to [GC_TRIGGER, live_object_limit]. A
-        // collection the threshold did not trigger keeps the threshold the collector left.
-        if threshold_due {
-            self.gc_next = next_threshold(live, self.live_object_limit);
+        // Under the limit again, the ceiling is the limit. The collector sets it so too, unless
+        // it deferred or this is a ShadowRealm's interpreter, which leaves collecting to the
+        // root. A collection the ceiling did not make due keeps the ceiling the collector left.
+        if over_ceiling {
+            self.gc_next = self.live_object_limit;
         }
         Ok(())
     }
@@ -11310,7 +11318,7 @@ impl Interp {
                 self.generators.len()
             );
         }
-        self.gc_next = next_threshold(live, self.live_object_limit);
+        self.gc_next = self.live_object_limit;
         before.saturating_sub(live)
     }
 

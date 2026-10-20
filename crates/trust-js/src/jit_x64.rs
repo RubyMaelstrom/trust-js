@@ -436,7 +436,7 @@ impl Asm {
         self.bytes(&[0x48, 0x8b, 0x09]); // rcx = current live object count
         self.bytes(&[0x48, 0x3b, 0x88]); // cmp rcx, [rax+gc_next]
         self.bytes(&gc_next.to_le_bytes());
-        self.jcc(0x8f, slow); // signed greater: allocation pressure
+        self.jcc(0x8f, slow); // signed greater: over the live-object ceiling
         self.bytes(&[0xff, 0x80]); // inc dword ptr [rax+offset]
         self.bytes(&offset.to_le_bytes());
         self.bytes(&[0xf7, 0x80]); // test dword ptr [rax+offset], 0x3fff
