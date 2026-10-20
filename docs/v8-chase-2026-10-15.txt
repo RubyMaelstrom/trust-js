@@ -5174,3 +5174,32 @@ implementation agent's change, reviewed):
     collection: vue 5.0%, react 5.7%, djot 9.4%, the sustained
     workload 36.2% (jit) and 27.3% (bytecode); main's, its exit
     collection included: 0.8%, 0.3%, 2.8%, 34.8% and 28.2%.
+
+Step 9c's plan, amended before the step (2026-10-20), from a
+read-only survey of b0d97ce1 with counters (an export with counters
+added, nothing timed; vue, react and djot and the sustained workload
+at --tier=jit, their 31 collections):
+- The set of weakly pinned cells is never empty: it held 1 to 614
+  cells in every collection (dead objects that inline-cache, name-
+  lookup and call pins still name), so skipping the probes when it
+  is empty would skip none. Instead the pinned cells are marked in
+  their pages' metadata (a bit per small cell, a flag on a large
+  one) before the sweep, which tests the bit where it called the
+  probe. The probe hashed once per dead cell and zombie: up to
+  283,000 times in a collection, 262,000 in the sustained
+  workload's steady state.
+- The dead set goes as planned. Between the phases, an object is
+  dead when its cell, found by its exact start through 9b's table,
+  is allocated, unmarked and not a zombie. That answers the engine's
+  membership tests (912 to about 6,500 per collection, against
+  26,000 to 156,000 inserts into the set). Walks use the list that
+  dead_cells returns, or the table when it is the smaller: the weak
+  targets (at most 155 entries) are no longer probed once per dead
+  object.
+- FinalizationRegistry cleanup callbacks may run in another order:
+  they followed the hash set's order, and the specification leaves
+  the order to the implementation.
+- Chunk::call_pins keeps every callee it ever cached until the chunk
+  recompiles, so dead callees stay reserved as zombies (djot's grow
+  from 0 to 585 objects over its six collections). An open item, not
+  9c's.
