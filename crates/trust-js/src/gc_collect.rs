@@ -673,8 +673,6 @@ impl Interp {
             gc_task_live: _,
             gc_task_deferred: _,
             gc_task_pending: _,
-            gc_task_major: _,
-            scope_gc_next: _,
             constructing: _,
             super_call_ok: _,
             fn_frames,

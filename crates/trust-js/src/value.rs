@@ -2221,18 +2221,15 @@ pub struct Object {
     /// object in the program (the old global `inline_ic_safe` latch).
     pub(crate) ic_plain: Cell<bool>,
     pub(crate) native_typed_array: Option<Box<crate::native_typed_array::NativeTypedArray>>,
-    /// The construct-time prototype handed to instances (`F.prototype`), cached for `new`.
+    /// IsConstructor, recorded when the object gets its [[Call]]: set for user functions other
+    /// than arrows, methods, generators and async functions, for natives marked as constructors,
+    /// and for bound functions and callable proxies whose target was one. A native with an own
+    /// data `prototype` is a constructor too (`Interp::value_is_constructor`).
     pub(crate) is_constructor: bool,
-    /// Unused: kept until P1 S6 step 8, since generated code embeds Object's field offsets.
-    #[allow(dead_code)]
-    pub(crate) gc_mark: Cell<bool>,
     gc_weak_observed: Cell<bool>,
     /// The object's slot in its heap's registry, fixed for its lifetime (`Object::drop` and
     /// weak-target watches key on it).
     pub(crate) gc_internal: Cell<u32>,
-    /// Unused: kept until P1 S6 step 8, since generated code embeds Object's field offsets.
-    #[allow(dead_code)]
-    pub(crate) gc_scratch: Cell<u32>,
 }
 
 impl Object {
@@ -2324,10 +2321,8 @@ impl Object {
                     ic_plain: Cell::new(true),
                     native_typed_array: None,
                     is_constructor: false,
-                    gc_mark: Cell::new(false),
                     gc_weak_observed: Cell::new(false),
                     gc_internal: Cell::new(slot_u32),
-                    gc_scratch: Cell::new(0),
                 }),
             );
             reg.publish(slot, Gc::as_ptr(&obj));
@@ -2786,10 +2781,8 @@ impl crate::gc_trace::GcTrace for Object {
             ic_plain: _,
             native_typed_array: _, // byte storage only
             is_constructor: _,
-            gc_mark: _,
             gc_weak_observed: _,
             gc_internal: _,
-            gc_scratch: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);
@@ -3113,8 +3106,9 @@ pub(crate) mod layout_census {
     }
 }
 
-// S3: the header and its inline named slots fill the 192 B size class (184 B since S4 narrowed
-// the slots' header); growing either past it moves every object into the 256 B class.
+// S3: the header and its inline named slots fit in the 192 B size class (184 B after S4 narrowed
+// the slots' header, 176 B after S6 dropped two unused fields); growing either past it moves
+// every object into the 256 B class.
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).

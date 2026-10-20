@@ -3549,12 +3549,6 @@ pub struct Interp {
     /// Allocation safepoints and their existing limits remain enabled.
     pub(crate) gc_task_deferred: bool,
     pub(crate) gc_task_pending: bool,
-    /// Unused: kept until P1 S6 step 8, since generated code embeds Interp's field offsets.
-    #[allow(dead_code)]
-    pub(crate) gc_task_major: bool,
-    /// Unused: kept until P1 S6 step 8, since generated code embeds Interp's field offsets.
-    #[allow(dead_code)]
-    pub(crate) scope_gc_next: usize,
     /// True while a native constructor is being invoked via `new` (lets e.g. `Number`/`String`
     /// build a wrapper object instead of returning a primitive).
     pub(crate) constructing: bool,
@@ -3799,8 +3793,6 @@ interp_memory_inventory! {
     gc_task_live => "non_owning",
     gc_task_deferred => "non_owning",
     gc_task_pending => "non_owning",
-    gc_task_major => "non_owning",
-    scope_gc_next => "non_owning",
     constructing => "non_owning",
     super_call_ok => "non_owning",
     fn_frames => "measured",
@@ -3850,7 +3842,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 169);
+    assert_eq!(names.len(), 167);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5480,8 +5472,6 @@ impl Interp {
             gc_task_live: crate::value::heap_live_objects(&gc_heap),
             gc_task_deferred: false,
             gc_task_pending: false,
-            gc_task_major: false,
-            scope_gc_next: 0,
             constructing: false,
             super_call_ok: false,
             fn_frames: Vec::new(),
@@ -11609,8 +11599,6 @@ impl Interp {
             gc_task_live: _,
             gc_task_deferred: _,
             gc_task_pending: _,
-            gc_task_major: _,
-            scope_gc_next: _,
             constructing: _,
             super_call_ok: _,
             fn_frames: _,
