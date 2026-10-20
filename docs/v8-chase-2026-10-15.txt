@@ -5346,3 +5346,62 @@ agent's change, reviewed):
     MB for main (-7%), where by default they are 182 and 150 MB (5
     runs each, medians). vue's is 37.7 against 29.9 MB (+26%, +33%
     by default); react's and djot's do not change.
+
+Step 9 closed (2026-10-20): 9a b0d97ce1, 9b d498e826, the amended
+9c plan 61ee2a4e, 9c b72987ab.
+- Measured, 8f against 9c (9c's run): the sustained workload at
+  --tier=jit makes 15 collections instead of 20, cycles -21.0% (wall
+  -20.7%, instructions -19.1%), GC pause 506 to 281 ms (-44%); at
+  bytecode cycles -15.4% (wall -15.5%), GC pause 504 to 281 ms
+  (-44%). vue, react and djot at --tier=jit: cycles -1.3%, -1.8% and
+  -3.9%, GC pause -34%, -22% and -35%. Peak RSS -0.2% to -2.3% on
+  the fixtures, +1.8% (jit) and +1.6% (bytecode) on the sustained
+  workload.
+- S0's bounds on the fixtures against main, at 9c: GC time at most
+  5% of elapsed holds for vue (3.4%) and react (4.6%) without the
+  shell's exit collection (3.5% and 5.1% with it), not for djot
+  (6.3%); at 8f the three were 5.3%, 6.4% and 9.9% with it. Peak RSS
+  at most +25% holds for djot (+7%), not for vue (+36%) or react
+  (+125%). The longest pauses are 4.5, 3.6 and 4.5 ms. The
+  sustained workload, not a fixture: GC time 30.3% (jit) and 22.5%
+  (bytecode), main's 34.7% and 28.0%; peak RSS +22%.
+- Open items carried past step 9, each recorded where it arose:
+  - Peak RSS and GC time over S0's bounds (above); the byte budget's
+    8 MiB floor sets the fixtures' heap. Step 10, the nursery, is the
+    next lever. A lead (9c): the heap's pages and large cells come
+    from glibc's malloc, whose dynamic mmap threshold holds about 49
+    MB of the sustained workload's 182 MB peak and 4 MB of vue's.
+  - The task boundary's end-of-eval collection marks the whole heap
+    (on the sustained workload it reclaims nothing); step 10.
+  - Chunk::call_pins keeps every callee it cached until the chunk
+    recompiles, so dead callees stay reserved as zombies (9c's
+    amended plan).
+  - Heap::dead_cells tests three bits for each cell where it could
+    test a word of each bitmap at a time (9c).
+  - The in-cell weak callbacks have no engine user; the nursery's
+    plan decides whether they stay (8c).
+  - For step 11: the public items the agent found removable at step
+    4 (is_minor, native_old_generation,
+    unstable_collect_young_for_host_tests, HostGcVisitor::internal)
+    and the host API's nursery-shaped items (step 8's plan).
+  - For step 12: the PropertyLayout count emitters and the
+    count-motivated guards (step 8's plan).
+  - TRUST_JS_PERF_METRICS' managed-memory record has said
+    "unavailable" since S2 (step 4).
+  - For the owner: whether an interrupted script's queued jobs
+    should survive it (step 1's follow-up).
+  - ClearKeptObjects clears only the root interpreter's kept list, so
+    a WeakRef target kept inside a ShadowRealm may live as long as
+    the realm; untested (step 3).
+  - Memory snapshots (memory.rs) count 176 bytes an object, the
+    RefCell's size; the cell is 192 (8e).
+  - Two layout offsets that are 0 in this build, binding_value and
+    entry_value, still emit `add x14, x14, #0` (8d).
+  - Downstream bounds outside P1: the worker test's 5 s and the
+    listener test's 750 ms fail on a loaded machine, and the TLS
+    server test can hang (step 5).
+  - Windows under Wine: step 1's three snapshot codec tests fail.
+  - Lib test runs leave trust_js_ffi_fixture_* directories in /tmp.
+  - The dumps check counts a mov sequence as one token, so it does
+    not see an offset or address change inside one; the layout steps
+    checked those separately (8e, 8f).
