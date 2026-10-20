@@ -4918,3 +4918,82 @@ agent's change, reviewed):
     (zombie), the whole lib suite, 2079 tests: 2046 pass and 7 are
     ignored at interval 1 (about 3,700 s); the slow lists' 22 pass
     at 100 and their 4 at 1000.
+
+The dump reference for steps 9-12 (02d7f81d; ref-8f.sh):
+- A no-LTO release engine of 8f's commit, built in a fresh target
+  dir, is byte-identical to the 8f review gate's. Its fixture code
+  dumps, plain and with the shared stubs per chunk and inline, each
+  made twice, are identical run to run once normalized
+  (codedump_norm2) and identical to the review gate's: vue 56
+  chunks, react 10, djot 160. They are kept in target/s6-ref, and
+  dumps-vs-ref.sh compares a tree's dumps with them chunk by chunk.
+- Correction to 8f's entry: the raw word totals vary from run to run
+  with one binary (vue with the stubs inline: 447,516 and 447,513
+  words in the reference's two runs; with the stubs per chunk,
+  250,499 in both, against the review gate's 250,498). The one- and
+  three-word differences from 8e's totals are embedded heap
+  addresses that vary between runs, not the smaller binary.
+
+Step 9 plan (2026-10-20), from a read-only survey of 02d7f81d and
+profiles of its fat-LTO engine:
+- Triggers. A collection is due when:
+  - the live object count passes Interp::gc_next: 100,000 at first,
+    then the live count plus an eighth or plus 100,000, whichever is
+    more, clamped to the live-object limit;
+  - the heap's byte budget is spent: after a sweep, twice the live
+    bytes, at least 8 MiB (TRUST_JS_GC_MIN_HEAP_BYTES);
+  - GC stress asks, or a deferred request waits.
+  ArrayBuffer data (64 MiB), task boundaries (object growth and
+  churn since the last one) and explicit and idle requests collect
+  too. The byte budget reaches generated code through the heap's due
+  word; the JIT's polls (ARM64 and x64, at function entry and loop
+  headers) also compare the live count with gc_next.
+- Which fires (TRUST_JS_GC_LOG, and reruns with the byte budget
+  raised out of reach): on vue, react and djot every collection that
+  allocation triggers comes from the 8 MiB floor, and none reaches
+  100,000 objects. On benchmarks/sustained-allocation.js the object
+  count fires the 12 steady-state collections of 18 (38.6 MB and
+  201k objects live after each).
+- Marking resolves every traced edge in Heap::locate: an FxHash map
+  from address >> 16 to the page's slot, then a divide. Small cells
+  sit in 64 KiB-aligned pages without a header; cells over 4 KiB
+  (long strings) are separate allocations, kept in a BTreeMap.
+- The sweep collects every dead object's address into a hash set,
+  which the engine's table sweeps and weak processing consult, and
+  probes the set of weakly pinned cells for every dead cell.
+- Profiles (perf record, CPU 5, --tier=jit, self time as a share of
+  the process's cycles):
+  - sustained allocation: locate 9.2%, the dead set's inserts 6.9%,
+    trace_object_cell 7.7%, mark_word 4.1%, mark 2.7%, sweep_phase
+    2.5%;
+  - djot: the pinned probes 2.2%, the dead set's inserts 1.8%,
+    locate 0.9%, the rest of marking 1.1%.
+- Step 9 runs as three commits, each gated like 8a-8f and measured
+  against its parent:
+  - 9a: the byte budget replaces the object-count trigger. gc_next
+    becomes the live-object ceiling: the limit, or after the limit's
+    RangeError the room its handler gets. The JIT's polls keep
+    reading it, so generated code does not change. The performance
+    record also splits GC pause time by cause, so that measurements
+    can leave out the shell's exit collection.
+  - 9b: locate finds a small cell's page through a two-level table
+    indexed by address bits (the 48-bit payload >> 16) instead of
+    the hash map, for every word it resolves, conservative ones
+    included. Large cells keep their map.
+  - 9c: the sweep tells dead objects from live ones without a hash
+    set of every dead object, and skips the pinned probes when no
+    cell is pinned.
+- The task-boundary trigger stays. It serves embedders' quiet points
+  and FinalizationRegistry cleanup; its end-of-eval collection
+  re-marks the whole heap (on the sustained workload it reclaims
+  nothing). The nursery (step 10) revisits it.
+- Measurement (gcmeasure.py): fat-LTO binaries of each commit and of
+  main (e3310993), each from a fresh export in a fresh target dir,
+  run as fresh copies made together; vue, react and djot at
+  --tier=jit and the sustained workload at --tier=jit and bytecode,
+  with TRUST_JS_PERF_METRICS; perf stat on CPU 5; 15 rounds in
+  rotating order; medians. GC share is pause time over wall time.
+- Dumps: none of the three changes emitted code or when the
+  fixtures collect, so their dumps must be the reference's (dumps-
+  vs-ref.sh), djot's GC-timing-sensitive chunks excepted under step
+  4's rule.
