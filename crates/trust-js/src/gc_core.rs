@@ -4,10 +4,11 @@
 //! payload cells here.
 //!
 //! Design summary:
-//! - Cells live in 64 KiB pages segregated by (size class, descriptor);
-//!   page metadata is a side table found by page number through a directly
-//!   indexed page table, so interior pointers resolve by masking to the page
-//!   base. Large cells (> 4 KiB) get dedicated allocations, found by address
+//! - Cells live in 64 KiB pages segregated by (size class, descriptor),
+//!   memory mapped from the OS (see `page_source`); page metadata is a side
+//!   table found by page number through a directly indexed page table, so
+//!   interior pointers resolve by masking to the page base. Large cells
+//!   (> 4 KiB) get dedicated allocations from the allocator, found by address
 //!   range.
 //! - References are direct pointers (never handle-table indices); a
 //!   tagged execution word masks to the same pointer (payload mask).
@@ -62,10 +63,6 @@ fn set_bit(bits: &mut [u64], index: usize, on: bool) {
     } else {
         bits[index / 64] &= !mask;
     }
-}
-
-fn page_layout() -> Layout {
-    Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("GC page layout")
 }
 
 fn large_layout(size: usize) -> Layout {
@@ -223,7 +220,7 @@ impl<T: ZeroValid> Drop for TableLevel<T> {
     }
 }
 
-/// Zeroed memory mapped from the OS (see [`TableLevel`]).
+/// Zeroed memory mapped from the OS (see [`TableLevel`] and `page_source`).
 #[cfg(all(
     any(target_os = "linux", target_os = "macos"),
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -232,12 +229,18 @@ mod os_pages {
     unsafe extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
+        #[cfg(target_os = "linux")]
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
     const PROT_READ_WRITE: i32 = 0x1 | 0x2;
     #[cfg(target_os = "linux")]
     const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
     #[cfg(target_os = "macos")]
     const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x1000;
+    #[cfg(target_os = "linux")]
+    const MADV_DONTNEED: i32 = 4;
+    #[cfg(target_os = "linux")]
+    const MADV_HUGEPAGE: i32 = 14;
 
     /// `len` zeroed bytes at a page boundary; null when the system refuses.
     pub(super) fn map(len: usize) -> *mut u8 {
@@ -259,15 +262,55 @@ mod os_pages {
         }
     }
 
+    /// `len` zeroed bytes at an `align` boundary, `align` a power of two and both multiples of the
+    /// system's page size: `len + align` bytes mapped, and the ends outside the range unmapped.
+    /// Null when the system refuses.
+    pub(super) fn map_aligned(len: usize, align: usize) -> *mut u8 {
+        let raw = map(len + align);
+        if raw.is_null() {
+            return raw;
+        }
+        let head = (raw as usize).next_multiple_of(align) - raw as usize;
+        // SAFETY: both ends lie in the fresh mapping, at page boundaries, outside the range kept
+        // (the tail is `align - head` bytes, never empty).
+        unsafe {
+            if head > 0 {
+                munmap(raw, head);
+            }
+            munmap(raw.add(head + len), align - head);
+            raw.add(head)
+        }
+    }
+
     /// # Safety
-    /// `ptr` and `len` are a `map` call's, and nothing uses the memory again.
+    /// `ptr` and `len` are a `map` or `map_aligned` call's, and nothing uses the memory again.
     pub(super) unsafe fn unmap(ptr: *mut u8, len: usize) {
         // SAFETY: the caller's contract.
         unsafe { munmap(ptr, len) };
     }
+
+    /// Ask the system to back `ptr..ptr + len`, mapped here, with transparent huge pages. A system
+    /// without them refuses, which changes nothing.
+    #[cfg(target_os = "linux")]
+    pub(super) fn advise_huge_pages(ptr: *mut u8, len: usize) {
+        // SAFETY: advice only: no contents change.
+        unsafe { madvise(ptr, len, MADV_HUGEPAGE) };
+    }
+
+    /// Free the memory behind `ptr..ptr + len`, mapped here, at page boundaries, and leave the
+    /// range mapped: it reads as zero when next touched. False when the system refuses (a locked
+    /// mapping), which leaves the contents as they were.
+    ///
+    /// # Safety
+    /// Nothing holds a reference into the range or needs its contents.
+    #[cfg(target_os = "linux")]
+    pub(super) unsafe fn discard(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { madvise(ptr, len, MADV_DONTNEED) == 0 }
+    }
 }
 
-/// Zeroed memory mapped from the OS (see [`TableLevel`]).
+/// Zeroed memory mapped from the OS (see [`TableLevel`] and `page_source`).
 #[cfg(all(
     target_os = "windows",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -326,6 +369,271 @@ mod os_pages {
     pub(super) unsafe fn unmap(ptr: *mut u8, len: usize) {
         // SAFETY: the caller's contract.
         unsafe { dealloc(ptr, layout(len)) };
+    }
+}
+
+/// Where the heap's pages come from, and where they go back: memory mapped from the OS, outside
+/// the allocator. (glibc served each page as a 64 KiB-aligned block of its arena: the alignment
+/// slack beside it went to its free lists, where other allocations spread into it, and freed pages
+/// stayed in the arena.) `PageSource::take` gives a zeroed page at a `PAGE_SIZE` boundary. The
+/// heap keeps the pages it releases in its spare pool and gives back those the pool trims; its
+/// release returns every page.
+///
+/// On Linux the source maps chunks of 2 MiB at 2 MiB boundaries, advised for transparent huge
+/// pages, and carves its pages from them. A page given back is discarded (its memory freed, the
+/// range left mapped to read as zero) and taken again once the current chunk is carved, before a
+/// new chunk is mapped. Chunks are unmapped only with the heap.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod page_source {
+    use super::{os_pages, PAGE_SIZE};
+
+    /// The size and alignment of a chunk: one transparent huge page, where base pages are 4 KiB.
+    pub(super) const CHUNK_SIZE: usize = 2 << 20;
+    const PAGES_PER_CHUNK: usize = CHUNK_SIZE / PAGE_SIZE;
+
+    pub(super) struct PageSource {
+        /// The chunks mapped, by address.
+        chunks: Vec<usize>,
+        /// The pages of the last chunk not taken yet: `next..end`.
+        next: usize,
+        end: usize,
+        /// The pages given back, discarded, to be taken again before a new chunk is mapped.
+        free: Vec<usize>,
+    }
+
+    impl PageSource {
+        pub(super) fn new() -> Self {
+            Self {
+                chunks: Vec::new(),
+                next: 0,
+                end: 0,
+                free: Vec::new(),
+            }
+        }
+
+        /// A zeroed page at a `PAGE_SIZE` boundary: the current chunk's next page, else the page
+        /// given back last, else a new chunk's first. (A chunk a huge page backs is resident
+        /// whole, so its pages not taken yet cost no memory, where a page given back would.)
+        pub(super) fn take(&mut self) -> *mut u8 {
+            if self.next == self.end {
+                if let Some(base) = self.free.pop() {
+                    return base as *mut u8;
+                }
+                self.map_chunk();
+            }
+            let base = self.next;
+            self.next += PAGE_SIZE;
+            base as *mut u8
+        }
+
+        #[cold]
+        fn map_chunk(&mut self) {
+            let base = os_pages::map_aligned(CHUNK_SIZE, CHUNK_SIZE);
+            assert!(!base.is_null(), "GC page allocation failed");
+            os_pages::advise_huge_pages(base, CHUNK_SIZE);
+            self.chunks.push(base as usize);
+            (self.next, self.end) = (base as usize, base as usize + CHUNK_SIZE);
+        }
+
+        /// Return the memory of the page at `base` to the OS. The page stays in its chunk, to be
+        /// taken again.
+        ///
+        /// # Safety
+        /// `base` is a page `take` gave and not given back since, which nothing uses any more.
+        pub(super) unsafe fn give_back(&mut self, base: *mut u8) {
+            // SAFETY: the caller's contract.
+            if !unsafe { os_pages::discard(base, PAGE_SIZE) } {
+                // The system keeps the memory (a locked mapping), so the page is zeroed here.
+                // SAFETY: as above.
+                unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
+            }
+            self.free.push(base as usize);
+        }
+
+        /// Return every page to the OS, as the heap is released: `pages` are those `take` gave
+        /// and `give_back` did not take back (debug builds count them). A page taken afterwards
+        /// comes from a new chunk.
+        ///
+        /// # Safety
+        /// Nothing uses a page the source gave any more.
+        pub(super) unsafe fn release(&mut self, pages: impl IntoIterator<Item = usize>) {
+            if cfg!(debug_assertions) {
+                let untaken = (self.end - self.next) / PAGE_SIZE;
+                assert_eq!(
+                    pages.into_iter().count() + self.free.len() + untaken,
+                    self.chunks.len() * PAGES_PER_CHUNK,
+                    "GC page source: pages unaccounted for at the heap's release"
+                );
+            }
+            self.unmap_chunks();
+        }
+
+        fn unmap_chunks(&mut self) {
+            for base in self.chunks.drain(..) {
+                // SAFETY: mapped by `map_chunk` with this size; no page of it is used any more
+                // (`release`'s contract, or the heap is gone).
+                unsafe { os_pages::unmap(base as *mut u8, CHUNK_SIZE) };
+            }
+            self.free.clear();
+            (self.next, self.end) = (0, 0);
+        }
+
+        /// The chunks mapped.
+        #[cfg(test)]
+        pub(super) fn chunks(&self) -> usize {
+            self.chunks.len()
+        }
+
+        /// The pages given back and not taken again.
+        #[cfg(test)]
+        pub(super) fn free_pages(&self) -> usize {
+            self.free.len()
+        }
+
+        /// The bytes mapped for pages.
+        #[cfg(test)]
+        pub(super) fn mapped_bytes(&self) -> usize {
+            self.chunks.len() * CHUNK_SIZE
+        }
+    }
+
+    impl Drop for PageSource {
+        /// The heap's release has unmapped the chunks, unless a finalizer panicked during it.
+        fn drop(&mut self) {
+            self.unmap_chunks();
+        }
+    }
+}
+
+/// Where the heap's pages come from (see the Linux `page_source`), elsewhere a page at a time,
+/// returned when given back: on macOS a mapping (twice a page mapped, the ends unmapped); on
+/// Windows a VirtualAlloc region, which starts at the 64 KiB allocation granularity; on other
+/// targets the allocator's zeroed 64 KiB-aligned block.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+mod page_source {
+    use super::PAGE_SIZE;
+
+    pub(super) struct PageSource {
+        /// The bytes mapped for pages.
+        #[cfg(test)]
+        mapped: usize,
+    }
+
+    impl PageSource {
+        pub(super) fn new() -> Self {
+            Self {
+                #[cfg(test)]
+                mapped: 0,
+            }
+        }
+
+        /// A zeroed page at a `PAGE_SIZE` boundary.
+        pub(super) fn take(&mut self) -> *mut u8 {
+            let base = map_page();
+            assert!(!base.is_null(), "GC page allocation failed");
+            #[cfg(test)]
+            {
+                self.mapped += PAGE_SIZE;
+            }
+            base
+        }
+
+        /// Return the page at `base` to the OS.
+        ///
+        /// # Safety
+        /// `base` is a page `take` gave and not given back since, which nothing uses any more.
+        pub(super) unsafe fn give_back(&mut self, base: *mut u8) {
+            // SAFETY: the caller's contract.
+            unsafe { unmap_page(base) };
+            #[cfg(test)]
+            {
+                self.mapped -= PAGE_SIZE;
+            }
+        }
+
+        /// Return every page to the OS, as the heap is released: `pages` are those `take` gave
+        /// and `give_back` did not take back.
+        ///
+        /// # Safety
+        /// Nothing uses a page the source gave any more.
+        pub(super) unsafe fn release(&mut self, pages: impl IntoIterator<Item = usize>) {
+            for base in pages {
+                // SAFETY: the caller's contract.
+                unsafe { self.give_back(base as *mut u8) };
+            }
+        }
+
+        /// The bytes mapped for pages.
+        #[cfg(test)]
+        pub(super) fn mapped_bytes(&self) -> usize {
+            self.mapped
+        }
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn map_page() -> *mut u8 {
+        super::os_pages::map_aligned(PAGE_SIZE, PAGE_SIZE)
+    }
+
+    #[cfg(all(
+        target_os = "windows",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn map_page() -> *mut u8 {
+        let base = super::os_pages::map(PAGE_SIZE);
+        assert!(
+            (base as usize).is_multiple_of(PAGE_SIZE),
+            "VirtualAlloc placed a GC page off its 64 KiB allocation granularity"
+        );
+        base
+    }
+
+    /// # Safety
+    /// `base` is a `map_page` page, which nothing uses any more.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "windows"),
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    unsafe fn unmap_page(base: *mut u8) {
+        // SAFETY: the caller's contract.
+        unsafe { super::os_pages::unmap(base, PAGE_SIZE) };
+    }
+
+    #[cfg(not(all(
+        any(target_os = "macos", target_os = "windows"),
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("GC page layout")
+    }
+
+    #[cfg(not(all(
+        any(target_os = "macos", target_os = "windows"),
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    fn map_page() -> *mut u8 {
+        // SAFETY: a nonzero size.
+        unsafe { std::alloc::alloc_zeroed(layout()) }
+    }
+
+    /// # Safety
+    /// `base` is a `map_page` page, which nothing uses any more.
+    #[cfg(not(all(
+        any(target_os = "macos", target_os = "windows"),
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    unsafe fn unmap_page(base: *mut u8) {
+        // SAFETY: the caller's contract.
+        unsafe { std::alloc::dealloc(base, layout()) };
     }
 }
 
@@ -616,11 +924,12 @@ pub(crate) struct Heap {
     /// Slots are reused after release, so page indices stay stable.
     pages: Vec<Option<PageMeta>>,
     free_page_slots: Vec<u32>,
-    /// P1 S4: the memory of released pages, kept for reuse. Freeing each empty page to the
-    /// allocator and taking a fresh 64 KiB-aligned block for the next fragments the allocator's
-    /// arena; peak memory grew where pages empty out every cycle. Trimmed to `spare_page_cap`
-    /// at the end of each sweep.
+    /// P1 S4: the memory of released pages, kept (resident) for reuse, so that pages that empty
+    /// out every cycle do not go back to the page source and come again, faulting anew. Trimmed
+    /// to `spare_page_cap` at the end of each sweep; the pages trimmed go back to the source.
     spare_pages: Vec<usize>,
+    /// Where the pages come from (see `page_source`).
+    page_source: page_source::PageSource,
     /// Page number (address >> PAGE_SHIFT) to index in `pages`, for the live pages: where every
     /// word the collector resolves finds its page.
     page_table: PageTable,
@@ -676,6 +985,7 @@ impl Heap {
             pages: Vec::new(),
             free_page_slots: Vec::new(),
             spare_pages: Vec::new(),
+            page_source: page_source::PageSource::new(),
             page_table: PageTable::new(),
             larges: BTreeMap::new(),
             large_span: (usize::MAX, 0),
@@ -981,18 +1291,17 @@ impl Heap {
         let base = match self.spare_pages.pop() {
             Some(base) => {
                 let base = base as *mut u8;
-                // SAFETY: a spare page is a `page_layout()` block no cell occupies; zeroed like a
+                // SAFETY: a spare page is a page of the source no cell occupies; zeroed like a
                 // fresh one.
                 unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
                 base
             }
-            None => {
-                // SAFETY: non-zero size; null is checked below.
-                let base = unsafe { alloc_zeroed(page_layout()) };
-                assert!(!base.is_null(), "GC page allocation failed");
-                base
-            }
+            None => self.page_source.take(),
         };
+        debug_assert!(
+            (base as usize).is_multiple_of(PAGE_SIZE),
+            "GC page off its alignment"
+        );
         let cells = PAGE_SIZE / cell_size;
         // Thread the free list: cell i -> i+1 (stored as i+2), last -> 0.
         for i in 0..cells {
@@ -1864,9 +2173,9 @@ impl Heap {
         budget.div_ceil(PAGE_SIZE).max(64)
     }
 
-    /// Free the spare pages beyond the cap, once the sweep has released its empty pages and set
-    /// the next budget. (A cap checked as each page went would shrink with the pages still to
-    /// go, and keep about half of a large heap that emptied at once.)
+    /// Give the spare pages beyond the cap back to the page source, once the sweep has released
+    /// its empty pages and set the next budget. (A cap checked as each page went would shrink
+    /// with the pages still to go, and keep about half of a large heap that emptied at once.)
     fn trim_spare_pages(&mut self) {
         let cap = self.spare_page_cap();
         while self.spare_pages.len() > cap {
@@ -1874,8 +2183,8 @@ impl Heap {
                 .spare_pages
                 .pop()
                 .expect("more spare pages than the cap");
-            // SAFETY: a spare page is a `page_layout()` block from new_page; no cell remains.
-            unsafe { dealloc(base as *mut u8, page_layout()) };
+            // SAFETY: a spare page is a page of the source, from new_page; no cell remains.
+            unsafe { self.page_source.give_back(base as *mut u8) };
         }
     }
 
@@ -1895,7 +2204,8 @@ impl Heap {
     /// leaving an empty heap. Finalizers run in no particular order (see
     /// FinalizeFn). Every handle into this heap dangles afterwards.
     pub(crate) fn release_all(&mut self) {
-        for page in std::mem::take(&mut self.pages).into_iter().flatten() {
+        let pages = std::mem::take(&mut self.pages);
+        for page in pages.iter().flatten() {
             if let Some(finalize) = self.descs[page.desc.0 as usize].finalize {
                 for i in 0..page.cells {
                     if bit(&page.allocated, i) && !bit(&page.zombies, i) {
@@ -1903,8 +2213,6 @@ impl Heap {
                     }
                 }
             }
-            // SAFETY: allocated in new_page with this layout.
-            unsafe { dealloc(page.base as *mut u8, page_layout()) };
         }
         for (start, large) in std::mem::take(&mut self.larges) {
             if let Some(finalize) = self.descs[large.desc.0 as usize].finalize {
@@ -1915,10 +2223,13 @@ impl Heap {
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
         }
-        for base in std::mem::take(&mut self.spare_pages) {
-            // SAFETY: a spare page is a `page_layout()` block from new_page.
-            unsafe { dealloc(base as *mut u8, page_layout()) };
-        }
+        let spare = std::mem::take(&mut self.spare_pages);
+        // SAFETY: the live pages and the spare ones are all the pages the source gave and has not
+        // taken back; their cells are finalized, and nothing uses them any more.
+        unsafe {
+            self.page_source
+                .release(pages.iter().flatten().map(|page| page.base).chain(spare))
+        };
         self.free_page_slots.clear();
         self.page_table.clear();
         for class in self.classes.iter_mut().flatten() {
@@ -2881,6 +3192,108 @@ mod tests {
         fx.roots[0] = 0;
         fx.collect();
         assert_eq!(pages(&fx), (0, 128));
+    }
+
+    /// S6 step 10a: pages come from the heap's page source 64 KiB-aligned and zeroed: new, reused
+    /// from the spare pool, and given back to the source when the pool is trimmed and taken again.
+    /// On Linux the pages given back are taken again before a new chunk is mapped (after the
+    /// current chunk's last pages), so they come from the same chunks. The heap's release returns
+    /// every page: live, spare and given back.
+    #[test]
+    fn pages_are_aligned_and_zeroed_when_new_reused_or_taken_again() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let per_page = PAGE_SIZE / 16;
+        // Fill `pages` new pages with nodes whose value words are all ones, checking each page as
+        // it gives its first cell: the cell starts the page, and no value word is set.
+        let fill = |fx: &mut Fixture, pages: usize| -> Vec<usize> {
+            (0..pages)
+                .map(|_| {
+                    let first = fx.heap.alloc(fx.node, 16);
+                    let base = first as usize;
+                    assert_eq!(base % PAGE_SIZE, 0, "a new page's first cell starts it");
+                    assert!(
+                        (0..per_page).all(|i| word((base + 16 * i) as *const u8, 1) == 0),
+                        "the page at {base:#x} is not zeroed"
+                    );
+                    set_word(first, 1, u64::MAX);
+                    for _ in 1..per_page {
+                        fx.alloc_node(0, u64::MAX);
+                    }
+                    base
+                })
+                .collect()
+        };
+        // On Linux, the source's chunks and the pages given back to it; elsewhere, the pages it
+        // has mapped are the heap's, live and spare.
+        let source = |fx: &Fixture, chunks: usize, free: usize| {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            ))]
+            assert_eq!(
+                (
+                    fx.heap.page_source.chunks(),
+                    fx.heap.page_source.free_pages()
+                ),
+                (chunks, free)
+            );
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            )))]
+            {
+                let _ = (chunks, free);
+                let stats = fx.heap.stats();
+                assert_eq!(
+                    fx.heap.page_source.mapped_bytes(),
+                    (stats.pages_live + stats.pages_spare) * PAGE_SIZE
+                );
+            }
+        };
+        // On Linux, 32 pages a chunk: 28 of the fourth chunk's are not taken yet.
+        let first = fill(&mut fx, 100);
+        source(&fx, 4, 0);
+        // Nothing is kept: the pool keeps 64 pages and gives the other 36 back.
+        fx.collect();
+        assert_eq!(fx.heap.stats().pages_live, 0);
+        assert_eq!(fx.heap.spare_pages.len(), 64);
+        source(&fx, 4, 36);
+        // The pool's 64 pages come first; on Linux then the fourth chunk's last 28 and 8 of the
+        // pages given back, then the other 28 of those, and only then a new chunk.
+        let mut taken = fill(&mut fx, 100);
+        assert!(taken[..64].iter().all(|base| first.contains(base)));
+        source(&fx, 4, 28);
+        taken.extend(fill(&mut fx, 28));
+        source(&fx, 4, 0);
+        let last = fill(&mut fx, 1)[0];
+        source(&fx, 5, 0);
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ))]
+        {
+            let chunks = |pages: &[usize]| -> std::collections::BTreeSet<usize> {
+                pages
+                    .iter()
+                    .map(|base| base & !(page_source::CHUNK_SIZE - 1))
+                    .collect()
+            };
+            let distinct: std::collections::HashSet<&usize> = taken.iter().collect();
+            assert_eq!(distinct.len(), 128);
+            assert_eq!(chunks(&taken), chunks(&first), "the same four chunks");
+            assert!(chunks(&first).is_disjoint(&chunks(&[last])));
+        }
+        // Two pages keep a cell; the pool keeps 64 of the other 127 and gives 63 back.
+        fx.roots[0] = tagged(taken[0] as *const u8);
+        fx.roots[1] = tagged(last as *const u8);
+        fx.collect();
+        assert_eq!(fx.heap.stats().pages_live, 2);
+        assert_eq!(fx.heap.spare_pages.len(), 64);
+        source(&fx, 5, 63);
+        fx.heap.release_all();
+        assert_eq!(fx.heap.page_source.mapped_bytes(), 0);
+        source(&fx, 0, 0);
     }
 
     #[test]

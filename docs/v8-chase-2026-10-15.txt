@@ -5548,3 +5548,111 @@ CPU 5, the other cores 1.8 busy at the median).
   10b's. Their dumps must be the parent's, djot's GC-timing-
   sensitive chunks excepted as at step 4. 10b's must be the
   parent's with exactly the barrier's instructions added.
+
+Step 10a, the heap maps its pages from the OS (an implementation
+agent's change, reviewed):
+- A page source owned by the heap (gc_core::page_source) gives the
+  heap its 64 KiB pages and takes back those the spare pool trims.
+  On Linux it maps 2 MiB chunks at 2 MiB boundaries (4 MiB mapped,
+  the ends unmapped), advises them for transparent huge pages and
+  carves its pages from them: the current chunk's next page, else
+  the page given back last, else a new chunk's first (a chunk a
+  huge page backs is resident whole from its first touch, so its
+  later pages take no fault). A page given back is discarded
+  (MADV_DONTNEED; by hand if the system refuses) and stays in its
+  chunk. Chunks are unmapped with the heap; debug builds check that
+  its release accounts for every page. On macOS a page is a mapping
+  of its own (128 KiB mapped, the ends unmapped), on Windows a
+  VirtualAlloc of 64 KiB, its alignment asserted; other targets
+  keep the allocator. The spare pool and large cells are unchanged.
+- Test pages_are_aligned_and_zeroed_when_new_reused_or_taken_again:
+  100 pages filled, emptied (the pool keeps 64 and gives 36 back)
+  and refilled, every page aligned and zeroed; on Linux four chunks
+  throughout, a fifth only once no page given back is left; nothing
+  mapped after the heap's release. Five mutations each made it
+  fail. The macOS and allocator paths, forced onto Linux in a
+  scratch export, pass gc_core's 46 tests.
+- Collections (TRUST_JS_PERF_METRICS, --tier=jit): 7, 3, 6 and 15,
+  outputs the same. TRUST_JS_GC_LOG shows retention moving by a few
+  objects, the same on every run of a binary (the sustained workload
+  keeps 201,027 or 201,029 objects where 9c kept 201,030 or 201,032;
+  djot up to 241 fewer cells): stale stack words now resolve against
+  other addresses.
+- Gates (the review's, on the agent's tree):
+  - aarch64: lib 2237/0/7, its test list the parent's plus the new
+    test; clippy clean in the five configurations; rustfmt clean;
+    the workspace builds with all targets without a diagnostic;
+    rustdoc's 40 warnings are 9c's. git grep finds no call of
+    page_layout left; the allocator serves pages only on other
+    targets, and large cells.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash. The
+    sustained workload at --tier=jit and bytecode: 15 collections
+    (13 by allocation, the task boundary's, the exit's), its output
+    9c's.
+  - The fixtures' code dumps: against the reference made at 8f,
+    vue's and react's chunks are identical in the plain dumps and
+    with the stubs per chunk and inline; djot's differ in the 9
+    chunks (4 inline) that differed at 9c, and in all three forms
+    its chunks are 9c's review dumps'.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64:
+    the 1035 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas, the new one among
+    them: 1011 pass at interval 1 (6 are ignored), the slow lists'
+    15 at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2082/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2074 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's plus the new test. Test262 at --tier=jit: 53575/53575,
+    the report identical to step 1's x86-64 one and the S5 exit
+    gate's aarch64 one. Fixtures: compiles 56/10/160 and 7, 3 and 6
+    collections, outputs as on aarch64; difftest 138 agree, 12
+    skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2089 tests: 2056 pass and 7 are
+    ignored at interval 1 (about 3,100 s); the slow lists' 22 pass
+    at 100 and their 4 at 1000.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 9c
+  16498e4df839, 10a a9efdaf98d41 from the gated tree, main
+  311ae9ae5658; copies made together; CPU 5, 15 interleaved rounds,
+  medians; the empty script as a control; started once a local
+  inference server had used under 1% of a core for a minute, the
+  other cores 0.48 busy (median), 2.59 at most; outputs equal
+  everywhere):
+  - Against 9c: peak RSS on the sustained workload 183.5 to 136.9
+    MB at --tier=jit (-25.4%) and 181.9 to 136.4 at bytecode
+    (-25.0%), vue 43.1 to 40.3 (-6.6%), djot 44.7 to 44.8 (+0.3%),
+    react 37.6 to 39.3 (+4.4%), the empty script 16.0 to 17.5
+    (+9.4%). Minor faults -31% and -35% on the sustained workload,
+    -12% to -22% on the fixtures. Cycles -0.1% to -0.9% (wall -0.3%
+    to -1.2%), GC pause 0.3% to 2.9% shorter.
+  - The small heaps' 1.5 MB: idle (a script that spins for 1.5 s,
+    smaps_rollup read at 0.8 s, 5 runs each) the engine holds 5.8
+    MB of anonymous memory against 9c's 4.3 and main's 4.0. The
+    heap's first chunk is backed by a huge page, so all 2 MiB of it
+    is resident from its first touch, whatever the heap uses.
+  - Against main, 10a's cycles: vue -13.0%, react -14.5%, djot
+    -10.9%, the sustained workload -38.8% (jit) and -32.0%
+    (bytecode). Peak RSS: vue +27%, react +141%, djot +9%, the
+    sustained workload -8.7% (jit) and -8.5% (bytecode), the empty
+    script +17%. GC pause over wall time without the exit
+    collection: vue 3.4%, react 4.6%, djot 6.4%, the sustained
+    workload 30.5% (jit) and 22.7% (bytecode); main's, its exit
+    collection included: 0.8%, 0.3%, 2.8%, 34.9% and 28.2%.
+- Open, for 10c: the huge page that backs the heap's newest chunk
+  holds the pages not taken yet, up to 2 MiB, which a small heap
+  pays in full. Whether a chunk is advised only once the heap holds
+  several is decided with 10c's measurement of the nursery, and
+  recorded before the work.
+- Plan amendment for 10b, before its work: a host reporter whose
+  values may change after its function's creation has the
+  function's card set when each collection starts, so the function
+  is rescanned at every collection, rather than being traced as a
+  side-slot owner: the same effect, without exempting it from the
+  barrier's check. The reporter trait's new provided method says
+  whether the values are fixed; its default, for embedders, says
+  they may change.
