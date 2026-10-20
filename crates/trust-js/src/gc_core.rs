@@ -5,9 +5,10 @@
 //!
 //! Design summary:
 //! - Cells live in 64 KiB pages segregated by (size class, descriptor);
-//!   page metadata is a side table found by page number, so interior
-//!   pointers resolve by masking to the page base. Large cells (> 4 KiB)
-//!   get dedicated allocations, found by address range.
+//!   page metadata is a side table found by page number through a directly
+//!   indexed page table, so interior pointers resolve by masking to the page
+//!   base. Large cells (> 4 KiB) get dedicated allocations, found by address
+//!   range.
 //! - References are direct pointers (never handle-table indices); a
 //!   tagged execution word masks to the same pointer (payload mask).
 //! - Tracing is precise inside the heap (per-descriptor trace functions)
@@ -67,6 +68,263 @@ fn page_layout() -> Layout {
 
 fn large_layout(size: usize) -> Layout {
     Layout::from_size_align(size, 16).expect("large GC cell layout")
+}
+
+/// The bits of a page number each level of the [`PageTable`] decodes: a 48-bit payload holds a
+/// 32-bit page number above `PAGE_SHIFT`.
+const LEAF_BITS: u32 = 16;
+const LEAF_LEN: usize = 1 << LEAF_BITS;
+const _: () = assert!(PAYLOAD_MASK.count_ones() == PAGE_SHIFT + 2 * LEAF_BITS);
+
+/// The slot in `Heap::pages` of the page at each page number (an address's 48-bit payload >>
+/// `PAGE_SHIFT`), directly indexed: the page number's high 16 bits select a leaf of 65,536
+/// entries (4 GiB of addresses), its low 16 bits the entry, which holds the slot plus one, or 0.
+/// Both levels are zeroed memory mapped from the OS ([`TableLevel`]), so only the OS pages
+/// holding entries in use are ever written: with 4 KiB pages, of the top level (512 KiB) those
+/// recording leaves, and of a leaf (256 KiB, mapped when a page first falls in its range) one
+/// per 64 MiB of addresses holding pages. Leaves are unmapped by [`PageTable::clear`] or with
+/// the table.
+struct PageTable {
+    /// Each leaf's entries, by the page number's high 16 bits (null: no leaf).
+    top: TableLevel<*mut u32>,
+    /// The leaves, which `top` points into, with their indices there.
+    leaves: Vec<(u16, TableLevel<u32>)>,
+    /// Entries in use.
+    len: usize,
+}
+
+impl PageTable {
+    fn new() -> Self {
+        Self {
+            top: TableLevel::new(),
+            leaves: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// The entry of the page at `page`, a page number, if its leaf is mapped.
+    #[inline]
+    fn entry(&self, page: usize) -> Option<*mut u32> {
+        let page = u32::try_from(page).ok()?;
+        let leaf = self.top[(page >> LEAF_BITS) as usize];
+        if leaf.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null pointer in `top` addresses the LEAF_LEN entries of a leaf in
+        // `leaves`.
+        Some(unsafe { leaf.add(page as usize & (LEAF_LEN - 1)) })
+    }
+
+    /// The slot of the page at `page`, a page number, if one is mapped there.
+    #[inline]
+    fn get(&self, page: usize) -> Option<u32> {
+        // SAFETY: an entry of a mapped leaf, which no reference covers.
+        unsafe { self.entry(page)?.read() }.checked_sub(1)
+    }
+
+    /// Map the page at `page` to `slot`. Returns the slot it replaces, if any.
+    fn insert(&mut self, page: usize, slot: u32) -> Option<u32> {
+        let index = u32::try_from(page).expect("a GC page above the 48-bit payload") >> LEAF_BITS;
+        if self.top[index as usize].is_null() {
+            let leaf = TableLevel::new();
+            self.top[index as usize] = leaf.as_ptr();
+            self.leaves.push((index as u16, leaf));
+        }
+        let entry = self.entry(page).expect("a mapped leaf");
+        let new = slot.checked_add(1).expect("a page slot below u32::MAX");
+        // SAFETY: as in `get`.
+        let old = unsafe { entry.replace(new) };
+        if old == 0 {
+            self.len += 1;
+        }
+        old.checked_sub(1)
+    }
+
+    /// Unmap the page at `page`. Returns its slot, if one was mapped.
+    fn remove(&mut self, page: usize) -> Option<u32> {
+        let entry = self.entry(page)?;
+        // SAFETY: as in `get`.
+        let slot = unsafe { entry.replace(0) }.checked_sub(1)?;
+        self.len -= 1;
+        Some(slot)
+    }
+
+    /// Unmap every page, and the leaves.
+    fn clear(&mut self) {
+        for &(index, _) in &self.leaves {
+            self.top[index as usize] = std::ptr::null_mut();
+        }
+        self.leaves.clear();
+        self.len = 0;
+    }
+
+    /// The pages mapped.
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// One level of a [`PageTable`]: LEAF_LEN `T`s, zeroed, in memory mapped from the OS for it and
+/// unmapped with it, whose pages cost no memory until written. (A zeroed allocation does not
+/// promise that: glibc serves a 512 KiB `calloc` from its heap, writing every page, once its
+/// dynamic mmap threshold has risen past that size, as freeing a larger mapped block makes it.)
+struct TableLevel<T: ZeroValid> {
+    entries: NonNull<[T; LEAF_LEN]>,
+}
+
+/// A table entry type, valid as all-zero bytes, without drop glue.
+///
+/// # Safety
+/// All-zero bytes must be a valid `Self`.
+unsafe trait ZeroValid: Copy {}
+
+// SAFETY: all-zero bytes are the u32 0.
+unsafe impl ZeroValid for u32 {}
+// SAFETY: all-zero bytes are the null pointer.
+unsafe impl ZeroValid for *mut u32 {}
+
+impl<T: ZeroValid> TableLevel<T> {
+    const BYTES: usize = std::mem::size_of::<[T; LEAF_LEN]>();
+
+    fn new() -> Self {
+        let entries = NonNull::new(os_pages::map(Self::BYTES).cast())
+            .expect("GC page table allocation failed");
+        Self { entries }
+    }
+
+    /// The first entry: the level's entries by address.
+    fn as_ptr(&self) -> *mut T {
+        self.entries.as_ptr().cast()
+    }
+}
+
+impl<T: ZeroValid> std::ops::Deref for TableLevel<T> {
+    type Target = [T; LEAF_LEN];
+
+    fn deref(&self) -> &[T; LEAF_LEN] {
+        // SAFETY: mapped zeroed, which is a valid [T; LEAF_LEN], and owned by the level.
+        unsafe { self.entries.as_ref() }
+    }
+}
+
+impl<T: ZeroValid> std::ops::DerefMut for TableLevel<T> {
+    fn deref_mut(&mut self) -> &mut [T; LEAF_LEN] {
+        // SAFETY: as in `deref`.
+        unsafe { self.entries.as_mut() }
+    }
+}
+
+impl<T: ZeroValid> Drop for TableLevel<T> {
+    fn drop(&mut self) {
+        // SAFETY: mapped in `new` with this size; the entries need no drop.
+        unsafe { os_pages::unmap(self.as_ptr().cast(), Self::BYTES) };
+    }
+}
+
+/// Zeroed memory mapped from the OS (see [`TableLevel`]).
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod os_pages {
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+    const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+    #[cfg(target_os = "linux")]
+    const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+    #[cfg(target_os = "macos")]
+    const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x1000;
+
+    /// `len` zeroed bytes at a page boundary; null when the system refuses.
+    pub(super) fn map(len: usize) -> *mut u8 {
+        // SAFETY: a new private anonymous mapping, where the system chooses.
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr as isize == -1 {
+            std::ptr::null_mut()
+        } else {
+            ptr
+        }
+    }
+
+    /// # Safety
+    /// `ptr` and `len` are a `map` call's, and nothing uses the memory again.
+    pub(super) unsafe fn unmap(ptr: *mut u8, len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { munmap(ptr, len) };
+    }
+}
+
+/// Zeroed memory mapped from the OS (see [`TableLevel`]).
+#[cfg(all(
+    target_os = "windows",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod os_pages {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualAlloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8;
+        fn VirtualFree(addr: *mut u8, len: usize, kind: u32) -> i32;
+    }
+    const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_READWRITE: u32 = 0x04;
+
+    /// `len` zeroed bytes at a page boundary; null when the system refuses.
+    pub(super) fn map(len: usize) -> *mut u8 {
+        // SAFETY: a new committed region, where the system chooses; its pages read as zero.
+        unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                len,
+                MEM_COMMIT_RESERVE,
+                PAGE_READWRITE,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `ptr` is a `map` call's, and nothing uses the memory again.
+    pub(super) unsafe fn unmap(ptr: *mut u8, _len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+    }
+}
+
+/// Elsewhere, a zeroed allocation, which may write its pages.
+#[cfg(not(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+mod os_pages {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(len, 4096).expect("GC page table layout")
+    }
+
+    /// `len` zeroed bytes at a page boundary; null when the allocator refuses.
+    pub(super) fn map(len: usize) -> *mut u8 {
+        // SAFETY: a nonzero size.
+        unsafe { alloc_zeroed(layout(len)) }
+    }
+
+    /// # Safety
+    /// `ptr` and `len` are a `map` call's, and nothing uses the memory again.
+    pub(super) unsafe fn unmap(ptr: *mut u8, len: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { dealloc(ptr, layout(len)) };
+    }
 }
 
 /// Trace callback: report every strong heap edge of the cell at `cell` by
@@ -355,9 +613,9 @@ pub(crate) struct Heap {
     /// arena; peak memory grew where pages empty out every cycle. Trimmed to `spare_page_cap`
     /// at the end of each sweep.
     spare_pages: Vec<usize>,
-    /// Page number (address >> PAGE_SHIFT; page addresses would leave
-    /// FxHash's low bits zero) to index in `pages`.
-    page_map: FastMap<usize, u32>,
+    /// Page number (address >> PAGE_SHIFT) to index in `pages`, for the live pages: where every
+    /// word the collector resolves finds its page.
+    page_table: PageTable,
     larges: BTreeMap<usize, LargeObj>,
     /// Address span of all large objects: cheap rejection of stack words.
     large_span: (usize, usize),
@@ -410,7 +668,7 @@ impl Heap {
             pages: Vec::new(),
             free_page_slots: Vec::new(),
             spare_pages: Vec::new(),
-            page_map: FastMap::default(),
+            page_table: PageTable::new(),
             larges: BTreeMap::new(),
             large_span: (usize::MAX, 0),
             control: Rc::default(),
@@ -525,6 +783,12 @@ impl Heap {
     #[cfg(test)]
     pub(crate) fn collections(&self) -> u64 {
         self.stats.collections
+    }
+
+    /// The large cells allocated: live, or dead and weakly pinned.
+    #[cfg(test)]
+    pub(crate) fn large_cells(&self) -> usize {
+        self.larges.len()
     }
 
     /// Bytes allocated past the trigger: how far allocation has run beyond the budget.
@@ -752,7 +1016,7 @@ impl Heap {
                 (self.pages.len() - 1) as u32
             }
         };
-        self.page_map.insert(base as usize >> PAGE_SHIFT, index);
+        self.page_table.insert(base as usize >> PAGE_SHIFT, index);
         index
     }
 
@@ -785,7 +1049,7 @@ impl Heap {
         if addr < 4096 {
             return None;
         }
-        if let Some(&index) = self.page_map.get(&(addr >> PAGE_SHIFT)) {
+        if let Some(index) = self.page_table.get(addr >> PAGE_SHIFT) {
             let page = self.pages[index as usize].as_ref()?;
             let cell = (addr - page.base) / page.cell_size;
             return (cell < page.cells).then(|| CellRef {
@@ -1478,12 +1742,38 @@ impl Heap {
             _ => (usize::MAX, 0),
         };
         self.stats.cells_swept += swept;
+        if cfg!(debug_assertions) {
+            self.check_page_table();
+        }
         live_bytes
+    }
+
+    /// Debug check, after the pages change in bulk: the page table maps every live page's
+    /// number to its slot and holds no other entry.
+    fn check_page_table(&self) {
+        let mut live = 0;
+        for (slot, page) in self.pages.iter().enumerate() {
+            let Some(page) = page else {
+                continue;
+            };
+            live += 1;
+            assert_eq!(
+                self.page_table.get(page.base >> PAGE_SHIFT),
+                Some(slot as u32),
+                "GC page table: the page at {:#x} does not map to its slot",
+                page.base
+            );
+        }
+        assert_eq!(
+            self.page_table.len(),
+            live,
+            "GC page table: entries for pages that are not live"
+        );
     }
 
     fn release_page(&mut self, index: usize) {
         let page = self.pages[index].take().expect("live page slot");
-        self.page_map.remove(&(page.base >> PAGE_SHIFT));
+        self.page_table.remove(page.base >> PAGE_SHIFT);
         let class = &mut self.classes[page.desc.0 as usize][page.class];
         if class.current == Some(index as u32) {
             class.current = None;
@@ -1558,13 +1848,16 @@ impl Heap {
             unsafe { dealloc(base as *mut u8, page_layout()) };
         }
         self.free_page_slots.clear();
-        self.page_map.clear();
+        self.page_table.clear();
         for class in self.classes.iter_mut().flatten() {
             *class = ClassPages::default();
         }
         self.large_span = (usize::MAX, 0);
         self.allocated_bytes = 0;
         self.refresh_due();
+        if cfg!(debug_assertions) {
+            self.check_page_table();
+        }
     }
 }
 
@@ -3078,6 +3371,32 @@ mod tests {
         assert!(!fx.heap.is_allocated_word(other as u64));
     }
 
+    /// A precise edge from a small cell to a large one (in the engine, an object property's long
+    /// string), which resolves outside the pages: the large cell, and the small cell it
+    /// references in turn, live while the edge does and die when it goes.
+    #[test]
+    fn a_large_cell_lives_and_dies_with_its_edge_from_a_small_cell() {
+        let mut fx = Fixture::new();
+        let small = fx.alloc_node(0, 1);
+        let large = fx.heap.alloc(fx.node, 8192);
+        let leaf = fx.heap.alloc(fx.leaf, 16);
+        set_word(large, 0, tagged(leaf));
+        set_word(large, 1, 42);
+        set_word(small, 0, tagged(large));
+        fx.roots[0] = tagged(small);
+        fx.collect();
+        assert_eq!(fx.live(), 3);
+        assert!(fx.heap.is_allocated_word(large as u64));
+        assert!(fx.heap.is_allocated_word(leaf as u64));
+        assert_eq!((word(large, 0), word(large, 1)), (tagged(leaf), 42));
+        set_word(small, 0, 0);
+        fx.collect();
+        assert_eq!(fx.live(), 1, "only the rooted small cell");
+        assert!(!fx.heap.is_allocated_word(large as u64));
+        assert!(!fx.heap.is_allocated_word(leaf as u64));
+        assert_eq!(fx.heap.stats().cells_swept, 2);
+    }
+
     #[test]
     fn stress_graph_survives_collect_every_alloc() {
         let mut fx = Fixture::new();
@@ -3203,6 +3522,74 @@ mod tests {
         fx.collect();
         assert_eq!(fx.live(), 0);
         black_box(&top);
+    }
+
+    /// Collect conservatively with `words` spilled to this frame.
+    #[inline(never)]
+    fn collect_with_words_in_frame(heap: &mut Heap, words: [u64; 4]) -> bool {
+        let mut spill = [0u64; 4];
+        for (slot, word) in spill.iter_mut().zip(words) {
+            unsafe { std::ptr::write_volatile(slot, word) };
+        }
+        black_box(&spill);
+        let ran = heap.collect();
+        black_box(&spill);
+        ran
+    }
+
+    /// Conservative words resolve through the page table as they did through the hash map: a
+    /// tagged interior address of a small cell finds the cell, while an address in a released
+    /// (spare) page, one between the heap's pages and one in a 4 GiB range holding no page
+    /// find nothing, whether held on the native stack or reported as roots. Only the cell is
+    /// marked, and the spare page stays spare.
+    #[test]
+    fn conservative_words_find_cells_in_live_pages_only() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let per_page = PAGE_SIZE / 16;
+        let cells: Vec<*mut u8> = (0..per_page * 2)
+            .map(|i| fx.alloc_node(0, i as u64))
+            .collect();
+        let (kept, released) = (cells[3], cells[per_page + 5]);
+        let page_of = |p: usize| p & !(PAGE_SIZE - 1);
+        let (live_base, spare_base) = (page_of(kept as usize), page_of(released as usize));
+        fx.roots[0] = tagged(kept);
+        fx.collect();
+        assert_eq!(fx.heap.spare_pages, [spare_base]);
+        // A 64 KiB range beside the live page that no page occupies, in the leaf holding it.
+        let between = [PAGE_SIZE, 2 * PAGE_SIZE]
+            .into_iter()
+            .flat_map(|offset| [live_base + offset, live_base.wrapping_sub(offset)])
+            .find(|&base| base != spare_base && base >> 32 == live_base >> 32)
+            .expect("a free range beside the live page");
+        let words = [
+            tagged(kept) + 8,
+            released as u64 + 8,
+            between as u64 + 0x88,
+            (live_base ^ (1 << 40)) as u64 + 0x88,
+        ];
+        assert_eq!(
+            words.map(|word| fx.heap.resolve(word)),
+            [Some(kept as *const u8), None, None, None]
+        );
+        let check = |fx: &Fixture, marked_before: u64| {
+            let stats = fx.heap.stats();
+            assert_eq!(
+                (stats.cells_marked - marked_before, stats.live_cells),
+                (1, 1)
+            );
+            assert_eq!(fx.heap.spare_pages, [spare_base]);
+            assert_eq!(fx.val(kept), 3);
+        };
+        let marked = fx.heap.stats().cells_marked;
+        assert!(collect_with_words_in_frame(&mut fx.heap, words));
+        check(&fx, marked);
+        fx.roots[..4].copy_from_slice(&words);
+        let marked = fx.heap.stats().cells_marked;
+        fx.collect();
+        check(&fx, marked);
+        black_box((&top, &cells));
     }
 
     struct Holder {
@@ -3648,6 +4035,121 @@ mod tests {
         assert_eq!(fx.heap.stats().pages_live, 0, "empty pages released");
         let p = fx.heap.alloc(fx.leaf, 4096);
         assert!(fx.heap.is_allocated_word(p as u64));
+    }
+
+    /// The page table maps page numbers in the first, a middle and the last leaf, at either end
+    /// of a leaf; a removed or cleared entry is gone, a page number can be mapped to another
+    /// slot (a spare page reused) and a slot to another page number (a slot reused).
+    #[test]
+    fn page_table_maps_inserts_until_removed_or_cleared() {
+        let mut table = PageTable::new();
+        // Leaves 0, 1, 0x1234 and 0xffff; slot i for pages[i].
+        let pages = [
+            0,
+            1,
+            0xffff,
+            0x1_0000,
+            0x1234_5678,
+            0xffff_0000,
+            0xffff_ffff,
+        ];
+        for page in pages {
+            assert_eq!(table.get(page), None, "{page:#x} before");
+        }
+        for (slot, &page) in pages.iter().enumerate() {
+            assert_eq!(table.insert(page, slot as u32), None, "{page:#x}");
+        }
+        assert_eq!((table.len(), table.leaves.len()), (pages.len(), 4));
+        for (slot, &page) in pages.iter().enumerate() {
+            assert_eq!(table.get(page), Some(slot as u32), "{page:#x}");
+        }
+        // Neighbors in allocated leaves, pages of unallocated leaves and page numbers above
+        // the payload's 32 bits map nothing.
+        for page in [
+            2,
+            0xfffe,
+            0x1_0001,
+            0x1234_5677,
+            0x1234_5679,
+            0x2_0000,
+            0x7fff_5678,
+            0xffff_0001,
+            0xffff_fffe,
+            1 << 32,
+            (1 << 32) | 0x1234_5678,
+            usize::MAX,
+        ] {
+            assert_eq!(table.get(page), None, "{page:#x}");
+        }
+        assert_eq!(table.insert(0xffff, 9), Some(2), "a page mapped again");
+        assert_eq!(table.get(0xffff), Some(9));
+        assert_eq!(table.len(), pages.len());
+        assert_eq!(table.remove(0x1234_5678), Some(4));
+        assert_eq!(table.remove(0x1234_5678), None, "removed already");
+        assert_eq!(table.remove(0x5555_5555), None, "an unallocated leaf");
+        assert_eq!(table.get(0x1234_5678), None);
+        assert_eq!(table.len(), pages.len() - 1);
+        // A released page's slot taken by another page, in the same leaf and in another.
+        assert_eq!(table.insert(0x1234_9abc, 4), None);
+        assert_eq!(table.remove(0), Some(0));
+        assert_eq!(table.insert(0x8000_0000, 0), None);
+        assert_eq!(
+            [0x1234_5678, 0x1234_9abc, 0, 0x8000_0000].map(|page| table.get(page)),
+            [None, Some(4), None, Some(0)]
+        );
+        assert_eq!((table.len(), table.leaves.len()), (pages.len(), 5));
+        table.clear();
+        assert_eq!((table.len(), table.leaves.len()), (0, 0));
+        assert!(
+            table.top.iter().all(|leaf| leaf.is_null()),
+            "leaves unmapped"
+        );
+        for page in pages.into_iter().chain([0x1234_9abc, 0x8000_0000]) {
+            assert_eq!(table.get(page), None, "{page:#x} after clear");
+        }
+        assert_eq!(table.insert(0xffff_ffff, 3), None, "usable after clear");
+        assert_eq!(table.get(0xffff_ffff), Some(3));
+        assert_eq!((table.len(), table.leaves.len()), (1, 1));
+    }
+
+    /// The heap's page table follows its pages: a new page is mapped to its slot, a released
+    /// one (kept as a spare) is not, a reused spare page is mapped to the slot it gets, and the
+    /// heap's release unmaps every page and frees the leaves.
+    #[test]
+    fn page_table_follows_pages_through_release_and_reuse() {
+        let mut fx = Fixture::new();
+        let per_page = PAGE_SIZE / 16;
+        let page_of = |p: *mut u8| p as usize & !(PAGE_SIZE - 1);
+        let cells: Vec<*mut u8> = (0..per_page * 3)
+            .map(|i| fx.alloc_node(0, i as u64))
+            .collect();
+        let bases: [usize; 3] = std::array::from_fn(|i| page_of(cells[i * per_page]));
+        let mapped = |fx: &Fixture| bases.map(|base| fx.heap.page_table.get(base >> PAGE_SHIFT));
+        assert_eq!(mapped(&fx), [Some(0), Some(1), Some(2)]);
+        fx.heap.check_page_table();
+        // The middle page keeps a cell; the others are released to the spare pool.
+        fx.roots[0] = tagged(cells[per_page]);
+        fx.collect();
+        fx.heap.check_page_table();
+        assert_eq!(fx.heap.page_table.len(), 1);
+        assert_eq!(fx.heap.spare_pages, [bases[0], bases[2]]);
+        assert_eq!(mapped(&fx), [None, Some(1), None]);
+        // A page of another descriptor and class takes the last released slot and spare page.
+        let reused = fx.heap.alloc(fx.leaf, 32);
+        assert_eq!(page_of(reused), bases[2]);
+        assert_eq!(mapped(&fx), [None, Some(1), Some(2)]);
+        assert_eq!(
+            fx.heap.resolve(reused as u64 + 24),
+            Some(reused as *const u8)
+        );
+        fx.heap.check_page_table();
+        fx.heap.release_all();
+        fx.heap.check_page_table();
+        assert_eq!(
+            (fx.heap.page_table.len(), fx.heap.page_table.leaves.len()),
+            (0, 0)
+        );
+        assert_eq!(mapped(&fx), [None, None, None]);
     }
 
     #[test]

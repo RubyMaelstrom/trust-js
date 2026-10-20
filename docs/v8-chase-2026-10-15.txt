@@ -5082,3 +5082,95 @@ implementation agent's change, reviewed):
   S0's /tmp/spec-pilot to target/s0-spec-pilot, and the fixture
   copies in /tmp/trust-js-review-controls-wnym0ybo to
   target/s0-review-controls.
+
+Step 9b, marking finds a cell's page without hashing (an
+implementation agent's change, reviewed):
+- Heap::page_map, an FxHash map from page number to the page's slot,
+  is now a PageTable indexed directly by the page number of the
+  48-bit payload: its high 16 bits select a leaf of 65,536 entries
+  (4 GiB of addresses), its low 16 bits the entry, which holds the
+  slot plus one, or 0. new_page inserts, release_page removes, the
+  heap's release clears it and unmaps the leaves, and locate reads
+  it for every word the collector resolves; the large-cell fallback
+  and the divide are unchanged.
+- Both levels are zeroed memory mapped from the OS (mmap on Linux
+  and macOS, VirtualAlloc on Windows, a zeroed allocation elsewhere):
+  512 KiB of addresses for the top level and 256 KiB per leaf, of
+  which only the pages holding entries in use are written. A probe
+  of /proc/self/pagemap found one or two leaves per run of the
+  fixtures and the sustained workload, and one or two pages written
+  in the top level and one to three in a leaf; pages that the
+  conservative scan only reads map the shared zero page. The brief
+  suggested a zeroed Vec for the top level, but glibc served it from
+  its heap and wrote every page in three of four runs, once its
+  dynamic mmap threshold had risen.
+- Debug builds check the table after each sweep and at the heap's
+  release: every live page maps to its slot, and the table holds as
+  many entries as there are live pages. A page above the 48-bit
+  payload panics at insertion (the map took it, but locate could
+  never find it).
+- Tests: the table's operations (pages in the first, a middle and
+  the last leaf and at a leaf's ends, pages and slots reused); the
+  heap's table through release, reuse and the heap's release; a
+  precise edge from a small cell to a large one and on to a small
+  one (gc_core) and a long string held only by a property (engine,
+  Interp and Bytecode tiers), which no test covered; conservative
+  words in a spare page, between pages and in a 4 GiB range without
+  pages, on the stack and as roots, find nothing (interior addresses
+  were covered already). The three tests that do not use the table
+  pass at b0d97ce1 too.
+- Collections (TRUST_JS_PERF_METRICS, --tier=jit): 7, 3, 6 and 15,
+  as at 9a, outputs the same.
+- Gates (the review's, on the agent's tree):
+  - aarch64: lib 2233/0/7, its test list the parent's plus the five
+    new tests; clippy clean in the five configurations; rustfmt
+    clean; the workspace builds with all targets without a
+    diagnostic; rustdoc's 40 warnings are 9a's.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash.
+  - The fixtures' code dumps: against the reference made at 8f,
+    every chunk of the three (56, 10 and 160) is identical in the
+    plain dumps and with the stubs per chunk and inline. The raw word
+    totals differ in three chunks (one more word in a vue chunk's
+    plain dump, one and two fewer in two djot chunks' with the stubs
+    per chunk), each a heap address whose mov sequence, which the
+    check counts as one token, has another length.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64:
+    the 1031 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas, the five new among
+    them: 1007 pass at interval 1 (6 are ignored), the slow lists' 15
+    at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2078/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2070 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's plus the five new tests. Test262 at --tier=jit:
+    53575/53575, the report identical to step 1's x86-64 one and the
+    S5 exit gate's aarch64 one. Fixtures: compiles 56/10/160 and 7, 3
+    and 6 collections, outputs as on aarch64; difftest 138 agree, 12
+    skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2085 tests: 2052 pass and 7 are
+    ignored at interval 1 (about 3,050 s); the slow lists' 22 pass
+    at 100 and their 4 at 1000.
+- Measured (gcmeasure.py, as at 9a: fat-LTO engines from fresh
+  exports, 9a cb0c10ea9cc2, 9b 71cf32ad4f59 from the gated tree,
+  main 311ae9ae5658; copies made together; CPU 5, 15 interleaved
+  rounds, medians; started once a local inference server had been
+  idle for a minute, the other cores 0.4 busy on average, 2.6 at
+  most; outputs equal everywhere):
+  - The sustained workload against 9a: at --tier=jit cycles -3.2%
+    (wall -3.0%, instructions -1.5%), GC pause 390 to 361 ms; at
+    bytecode cycles -2.5% (wall -2.4%), GC pause 387 to 359 ms.
+  - vue, react and djot at --tier=jit: cycles within 0.4% of 9a's,
+    GC pause 1% to 3% lower, peak RSS within 2%.
+  - Against main, 9b's cycles: vue -11.2%, react -12.9%, djot -7.0%,
+    the sustained workload -33.2% (jit) and -27.5% (bytecode). Peak
+    RSS: vue +36%, react +127%, djot +9%, the sustained workload +21%
+    (jit and bytecode). GC pause over wall time without the exit
+    collection: vue 5.0%, react 5.7%, djot 9.4%, the sustained
+    workload 36.2% (jit) and 27.3% (bytecode); main's, its exit
+    collection included: 0.8%, 0.3%, 2.8%, 34.8% and 28.2%.

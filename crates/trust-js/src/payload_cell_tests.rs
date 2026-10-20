@@ -398,6 +398,48 @@ fn dead_strings_are_reclaimed() {
     }
 }
 
+/// A string over 4 KiB is a large cell, allocated outside the heap's pages: one held only by an
+/// object's property (a precise edge from a small cell to a large one) keeps its contents across
+/// collections, and is reclaimed once the property lets it go.
+#[test]
+fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
+    fn large_cells(engine: &Engine) -> usize {
+        engine.interp.gc_heap.core.borrow().large_cells()
+    }
+    for tier in [Tier::Interp, Tier::Bytecode] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        eval(&mut engine, "true");
+        engine.interp.gc_collect();
+        let before = large_cells(&engine);
+        eval(
+            &mut engine,
+            "var holder = {}; (function () { holder.text = 'ab'.repeat(5000) + 'c'; })(); true",
+        );
+        engine.interp.gc_collect();
+        eval(&mut engine, "true");
+        engine.interp.gc_collect();
+        assert_eq!(large_cells(&engine), before + 1, "{tier:?}");
+        let result = eval(
+            &mut engine,
+            r#"
+            var text = holder.text;
+            [text.length, text.slice(0, 4), text.slice(9998), text.indexOf('c'),
+             text.charCodeAt(5001)].join()
+            "#,
+        );
+        assert_eq!(result, "10001,abab,abc,10000,98", "{tier:?}");
+        eval(&mut engine, "text = undefined; holder.text = 0; true");
+        engine.interp.gc_collect();
+        assert_eq!(
+            large_cells(&engine),
+            before,
+            "{tier:?}: the string is reclaimed"
+        );
+    }
+}
+
 /// The heap's interned one-unit and index strings stay valid while nothing references them:
 /// a later lookup returns the same interned cell.
 #[test]
