@@ -5405,3 +5405,146 @@ Step 9 closed (2026-10-20): 9a b0d97ce1, 9b d498e826, the amended
   - The dumps check counts a mov sequence as one token, so it does
     not see an offset or address change inside one; the layout steps
     checked those separately (8e, 8f).
+
+Step 10 plan (2026-10-20), from two read-only surveys of 443fc5d6
+(their reports and briefs in target/s6-step10/surveys, their files
+in target/s6-survey10a and s6-survey10b):
+the write paths a barrier must cover (compiler passes over scratch
+trees, DWARF layouts, the JITs' store emitters, the fixtures'
+dumps), and what a nursery would face (no-LTO exports with counters
+and phase timers, and memory experiments; 9 interleaved rounds on
+CPU 5, the other cores 1.8 busy at the median).
+- Where a collection's time goes (default floor, per run):
+  - vue 28.9 ms: finalizers and emptied pages 40%, fixed work 31%
+    (0.49-1.70 ms per collection), page bit work 15%, marking 12%;
+  - react 5.9 ms: 54%, 19%, 14%, 13%;
+  - djot 23.3 ms: 42%, 19%, 15%, 22%;
+  - the sustained workload 305 ms (jit): marking 61%, finalizers
+    25%, page bit work 12%, fixed work 2%.
+  Finalizers cost about 32 ns per dead cell (react 61-67 ns), and a
+  nursery does not avoid them. The fixed work includes the 912
+  builtins' [[Realm]] edges, re-registered at every collection
+  (0.13-0.22 ms).
+- The full collector at byte floors of 8, 4, 2 and 1 MiB: only vue
+  at 4 MiB meets both of S0's bounds. React meets the RSS bound
+  only at 1 MiB (19.7 MB against main's 16.2), where its GC share
+  is 10.3%; djot meets the RSS bound at every floor and the GC
+  bound at none. At 8 MiB react's 21.7 MB over main are 8.8 MB of
+  cell pages (120 of its 135 pages spare after the first
+  collection), about 12.4 MB of dead objects' Rust-heap payloads,
+  freed at that collection and kept by glibc, and 0.7 MB of fixed
+  structures (the empty script's peak). The first two scale with
+  the budget.
+- Survival: at 1 MiB a collection promotes about 30 KB (vue), 50-90
+  KB (react) or 150-300 KB (djot), and old cells die at about the
+  promotion rate. Old cells holding young cells that die with them
+  (nepotism) are negligible.
+- Memory: glibc serves each 64 KiB page by posix_memalign from its
+  arena, and the alignment slack beside it returns to its free
+  lists, which payload churn then spreads into. Pages mapped from
+  the OS (an export, one mapping per page) took peak RSS from 183.7
+  to 133.8 MB on the sustained workload (main 150.0), from 42.4 to
+  37.4 on vue (main 31.0) and from 44.3 to 42.8 on djot (main
+  41.8); react's barely moved (37.9 to 37.0). GC pause unchanged;
+  wall +4.9% on the sustained workload from 18,000 more page
+  faults: a fresh 64 KiB mapping faults 16 times, where glibc's
+  heap here faults in 2 MiB huge pages. Mapping large cells too
+  changed nothing measurable. A microbenchmark (CPU 5) writing
+  1,186 fresh 64 KiB pages, the sustained workload's count: a
+  mapping per page 43 ms of faults, 2 MiB chunks 35 ms, the chunks
+  advised for huge pages 8 ms and 2 MiB more RSS (transparent huge
+  pages are madvise-only here, always on zombie).
+- Barrier sites (survey A):
+  - 476 production borrow_mut and try_borrow_mut calls whose
+    receiver is a Gc or an Env; inherent methods on the handles
+    take every one (the downstream crates and TRust have none);
+  - three raw writes: the captured-binding store's cache hit
+    (store_cap_ic), and a deferred prototype's materialization,
+    which during a read writes its lazy cell's state and promotes
+    its function's prototype word;
+  - generated code: on ARM64 five stores in three emitters (a named
+    property's update and creation IC, the name store's global
+    property and wide binding, an element append), on x64 one
+    emitter (store_value); 916 sites in the fixtures' dumps;
+  - host reporters whose values change after creation (napi's
+    promise executor).
+  Survey B's census: every old cell that held an edge to a young
+  cell had been mutably borrowed through its handle since the
+  previous collection, at every tier; its probes reach the three
+  raw paths. Remembered sets are at most 111 objects and 5
+  environments per interval, and most edges sit in array elements.
+- What a minor collection traces in full whatever the nursery's
+  size: Interp roots, host graphs, interned strings and template
+  roots, thread roots, every side-slot owner and Realm member, the
+  ephemerons and [[Realm]] edges. An old owner is marked, so its
+  conditions fire at once: none of them needs a barrier.
+- Step 10 runs as four commits, each measured against its parent
+  and main (fat LTO, gcmeasure.py):
+  - 10a: the heap maps its pages from the OS. On Linux it maps 2
+    MiB-aligned chunks, advises them for huge pages and carves 64
+    KiB pages from them; a page trimmed from the spare pool returns
+    its memory with MADV_DONTNEED and stays in its chunk for reuse.
+    Elsewhere a page is a mapping of its own (Windows' allocation
+    granularity is 64 KiB; macOS maps twice the size and unmaps the
+    ends). Large cells stay with the allocator.
+  - 10b: marks persist and a write barrier records old cells as
+    they are written; every collection is still major, and clears
+    the marks before it marks. Pages of objects, environments and
+    deferred prototypes end in a 512-byte card table, a byte per
+    128 bytes of the page (338, 508 and 1354 cells a page instead
+    of 341, 512 and 1365); the barrier stores to the card of a
+    cell's start, computed from its address alone, with no load or
+    branch. Its sites: inherent Gc::borrow_mut, Gc::try_borrow_mut
+    and Env::borrow_mut, the three raw writes, the generated stores
+    (the owner reloaded where no register holds it), and a
+    reporter that declares changing values, whose function is then
+    traced at every collection as a side-slot owner. Debug builds
+    check when a collection starts, before the marks clear, that no
+    marked cell with a clean card holds an edge to an unmarked
+    cell; GC stress runs the check at every safepoint. Generated
+    code changes by the barrier's instructions alone.
+  - 10c: minor collections. A minor collection marks from the
+    roots, the side slots, the ephemerons, the native stack and the
+    marked cells whose cards are set, traces no other old cell,
+    sweeps only the pages that received cells since the last
+    collection, lists the dead objects from those pages, and leaves
+    its marks set: a cell is old once any collection has marked it.
+    A minor collection is due when the bytes allocated since the
+    last collection pass the nursery budget
+    (TRUST_JS_GC_NURSERY_BYTES; the default chosen by measuring 1,
+    2 and 4 MiB); a major one when old bytes (live after the last
+    major collection plus those promoted since) pass today's byte
+    budget, max(8 MiB, twice the live bytes after the last major
+    collection). Explicit, idle and host requests, ArrayBuffer
+    pressure and the live-object limit (before its RangeError)
+    collect majorly; the task boundary's collection becomes minor,
+    on its growth and churn conditions. GC stress makes every Nth
+    stress collection major. The spare pool keeps what the nursery
+    can fill, at least 16 pages (64 today). The performance record
+    and TRUST_JS_GC_LOG tell minor collections from major ones. The
+    in-cell weak callbacks (WeakFn, WeakSink) go: no engine
+    descriptor has one, and a minor collection would never visit
+    an old holder's weak slots (8c's open item).
+  - 10d: a minor collection's fixed work is restricted to what
+    changed since the last collection: the [[Realm]] edges of the
+    functions registered since then, and the [[Realm]] table swept
+    from the dead list. What else 10c's measurement shows is
+    recorded before the work.
+- Weak handles, weak_metadata, FinalizationRegistry cleanup and the
+  table sweeps keep their rule, unmarked is dead; in a minor
+  collection only young cells can be unmarked, so an old dead cell
+  waits for a major collection.
+- Not in step 10:
+  - Element-range dirtiness: a dirty old array is rescanned whole.
+    The sustained workload writes its 200,000-element array only
+    in each round's replacement loop, so about once per round.
+  - Cheaper finalization: step 12's replacement of Object's
+    Rc<GcState> and the slot registry, which every object's
+    finalizer updates.
+  - The host API: HostGcVisitor::is_minor stays false, since host
+    graphs are reported in full at every collection; step 11
+    decides (TRust traces only young state when it is true).
+- Dumps: 10a and 10d change no emitted code, and 10c none beyond
+  10b's. Their dumps must be the parent's, djot's GC-timing-
+  sensitive chunks excepted as at step 4. 10b's must be the
+  parent's with exactly the barrier's instructions added.
