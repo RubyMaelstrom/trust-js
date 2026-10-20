@@ -11396,25 +11396,25 @@ impl Interp {
     /// (ECMA-262 #sec-weakref-execution).
     pub(crate) fn gc_sweep_dead_objects(
         &mut self,
-        garbage_objects: &crate::fasthash::FastSet<usize>,
+        garbage_objects: &crate::gc_sweep::DeadObjects<'_>,
         native: &crate::gc_native::NativeGcGraph,
     ) {
         self.host_state.sweep_gc_with_native(
             &|value| match value {
-                Value::Obj(object) => !garbage_objects.contains(&(Gc::as_ptr(object) as usize)),
+                Value::Obj(object) => !garbage_objects.contains(Gc::as_ptr(object) as usize),
                 _ => true,
             },
             &|id| native.is_live(id),
         );
 
         // Drop template entries owned by a dead Realm before the sweep releases its global.
-        // Checking the Realm table as well as the garbage set handles stale pointer-keyed entries
+        // Checking the Realm table as well as the dead objects handles stale pointer-keyed entries
         // without allowing an address-reused global to inherit an old template object.
         self.template_cache.retain(|(realm_key, _), value| {
             self.realms.contains_key(realm_key)
-                && !garbage_objects.contains(realm_key)
+                && !garbage_objects.contains(*realm_key)
                 && match value {
-                    Value::Obj(object) => !garbage_objects.contains(&(Gc::as_ptr(object) as usize)),
+                    Value::Obj(object) => !garbage_objects.contains(Gc::as_ptr(object) as usize),
                     _ => true,
                 }
         });
@@ -11424,14 +11424,13 @@ impl Interp {
         self.gc_clear_weak_targets(garbage_objects);
         self.gc_forget_weak_owners(garbage_objects);
         self.gc_drain_weak_deaths();
-        self.gc_schedule_finalization_cleanup(garbage_objects);
+        self.gc_schedule_finalization_cleanup(Some(garbage_objects));
 
         // Evict the dead from pointer-keyed side tables, so that a future object reusing an
         // address can't inherit stale metadata.
         self.native_function_realms.get_mut().retain(|_, (pin, _)| {
-            pin.upgrade().is_some_and(|function| {
-                !garbage_objects.contains(&(Gc::as_ptr(&function) as usize))
-            })
+            pin.upgrade()
+                .is_some_and(|function| !garbage_objects.contains(Gc::as_ptr(&function) as usize))
         });
         // Evict the chosen dead set in batches. Probing all internal-slot tables for each
         // ordinary function/prototype makes closure churn pay for unrelated platform state.
@@ -11446,7 +11445,7 @@ impl Interp {
     /// address evicts a dead object's entries here: a later object at the same address must
     /// not inherit them. Every other field keeps its keys alive, pins them weakly, is swept by
     /// an earlier step, or is not keyed by object addresses.
-    fn gc_evict_dead_owners(&mut self, dead: &crate::fasthash::FastSet<usize>) {
+    fn gc_evict_dead_owners(&mut self, dead: &crate::gc_sweep::DeadObjects<'_>) {
         let _evicting = crate::gc_sweep::Evicting::enter();
         let Interp {
             // Keyed by an object's address: evicted below.
@@ -11647,7 +11646,7 @@ impl Interp {
         if !shadow_realms.is_empty() {
             let collected: Vec<usize> = shadow_realms
                 .keys()
-                .filter(|owner| dead.contains(owner))
+                .filter(|&&owner| dead.contains(owner))
                 .copied()
                 .collect();
             for owner in collected {

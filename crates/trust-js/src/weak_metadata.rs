@@ -5,6 +5,7 @@
 //! other heaps sharing the Agent. Queue and index storage shrink geometrically under churn.
 
 use crate::fasthash::{FastMap, FastSet};
+use crate::gc_sweep::DeadObjects;
 use crate::interpreter::Interp;
 use crate::interpreter::{WeakKey, WeakTarget};
 use crate::value::Value;
@@ -348,13 +349,30 @@ impl Interp {
     /// ECMA-262's atomic weak-clearing phase, for the objects a collection found dead and the
     /// death notifications queued so far. Never invoke author code here or while a queue is
     /// borrowed.
-    pub(crate) fn gc_clear_weak_targets(&mut self, dead: &FastSet<usize>) {
+    pub(crate) fn gc_clear_weak_targets(&mut self, dead: &DeadObjects<'_>) {
         #[cfg(test)]
         {
             self.weak_metadata.cleared_subscribers = 0;
         }
-        for &object in dead {
-            self.clear_weak_identity(WeakKey::Object(object));
+        // Walk the smaller side: the observed targets (a few hundred at most on the gate
+        // workloads), asking the view about each, or the dead (tens of thousands).
+        if self.weak_metadata.targets.len() < dead.len() {
+            let objects: Vec<usize> = self
+                .weak_metadata
+                .targets
+                .keys()
+                .filter_map(|&key| match key {
+                    WeakKey::Object(object) if dead.contains(object) => Some(object),
+                    _ => None,
+                })
+                .collect();
+            for object in objects {
+                self.clear_weak_identity(WeakKey::Object(object));
+            }
+        } else {
+            for object in dead.iter() {
+                self.clear_weak_identity(WeakKey::Object(object));
+            }
         }
         self.gc_drain_weak_deaths();
     }
@@ -378,10 +396,14 @@ impl Interp {
         }
     }
 
-    pub(crate) fn gc_schedule_finalization_cleanup(&mut self, dead: &FastSet<usize>) {
+    /// Schedule the cleanup of every ready registry that has ready cells. Between a
+    /// collection's phases `dead` names the objects it found dead, whose registries are
+    /// skipped; after its sweep, where no view can answer, it is `None` (see
+    /// `Interp::gc_heap_after_sweep` for why no ready registry is dead there).
+    pub(crate) fn gc_schedule_finalization_cleanup(&mut self, dead: Option<&DeadObjects<'_>>) {
         let ready: Vec<_> = self.weak_metadata.ready_registries.drain().collect();
         for owner in ready {
-            if dead.contains(&owner) {
+            if dead.is_some_and(|dead| dead.contains(owner)) {
                 continue;
             }
             let Some(registry) = self.finalization_registries.get_mut(&owner) else {
@@ -401,18 +423,17 @@ impl Interp {
         }
     }
 
-    pub(crate) fn gc_forget_weak_owners(&mut self, dead: &FastSet<usize>) {
-        fn owners<V>(table: &FastMap<usize, V>, dead: &FastSet<usize>) -> Vec<usize> {
+    pub(crate) fn gc_forget_weak_owners(&mut self, dead: &DeadObjects<'_>) {
+        fn owners<V>(table: &FastMap<usize, V>, dead: &DeadObjects<'_>) -> Vec<usize> {
             if table.len() < dead.len() {
                 table
                     .keys()
-                    .filter(|owner| dead.contains(owner))
+                    .filter(|&&owner| dead.contains(owner))
                     .copied()
                     .collect()
             } else {
                 dead.iter()
                     .filter(|owner| table.contains_key(owner))
-                    .copied()
                     .collect()
             }
         }
@@ -932,7 +953,9 @@ mod tests {
             "target retained its observer heap queue"
         );
         drop(target);
-        second.interp.gc_clear_weak_targets(&FastSet::default());
+        second
+            .interp
+            .gc_clear_weak_targets(&DeadObjects::from_list(Vec::new()));
         assert!(second.interp.weak_refs[&(Gc::as_ptr(&other_owner) as usize)].is_none());
     }
 

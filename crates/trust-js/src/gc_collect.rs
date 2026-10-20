@@ -445,13 +445,8 @@ impl Interp {
     ) -> usize {
         // Between the phases every cell is intact and new cells are allocated marked: the
         // engine evicts the dead from its tables while their identities are still stable.
-        let garbage: FastSet<usize> = heap
-            .core
-            .borrow()
-            .dead_cells(heap.object_desc)
-            .into_iter()
-            .collect();
-        self.gc_heap_sweep_tree(&garbage, &native);
+        let dead = crate::gc_sweep::DeadObjects::new(heap);
+        self.gc_heap_sweep_tree(&dead, &native);
         drop(native);
         // Weak handles to dead cells are cleared; a cell a weak handle still names stays
         // reserved (finalized, never reused) until its last weak handle is dropped, which keeps
@@ -460,41 +455,48 @@ impl Interp {
             let core = heap.core.borrow();
             crate::gc_handle::clear_dead_weak_cells(|addr| core.is_dead_target(addr))
         };
-        heap.core
-            .borrow_mut()
-            .finish_collection(&|addr| pinned.contains(&addr));
-        self.gc_heap_after_sweep(&garbage);
-        garbage.len()
+        heap.core.borrow_mut().finish_collection(&pinned);
+        // The heap's bits no longer say what died: from here on only the list's length counts.
+        let reclaimed = dead.len();
+        drop(dead);
+        self.gc_heap_after_sweep();
+        reclaimed
     }
 
     /// Evict the dead from every interpreter's tables in this ShadowRealm tree. A dead
     /// ShadowRealm's interpreter is dropped here, while the cells it names are still intact.
     fn gc_heap_sweep_tree(
         &mut self,
-        garbage: &FastSet<usize>,
+        dead: &crate::gc_sweep::DeadObjects<'_>,
         native: &FastMap<usize, NativeGcGraph>,
     ) {
         let empty = NativeGcGraph::default();
         let graph = native
             .get(&(std::ptr::from_ref(self) as usize))
             .unwrap_or(&empty);
-        self.gc_sweep_dead_objects(garbage, graph);
+        self.gc_sweep_dead_objects(dead, graph);
         for child in self.shadow_realms.values_mut() {
-            child.gc_heap_sweep_tree(garbage, native);
+            child.gc_heap_sweep_tree(dead, native);
         }
     }
 
     /// Post-sweep bookkeeping for every interpreter in the tree: drop expired inline-cache
     /// pins, deliver destruction notifications and schedule FinalizationRegistry cleanup.
-    fn gc_heap_after_sweep(&mut self, garbage: &FastSet<usize>) {
+    fn gc_heap_after_sweep(&mut self) {
         self.gc_prune_dead_pins();
         self.gc_drain_weak_deaths();
-        self.gc_schedule_finalization_cleanup(garbage);
+        // The finalizers' death notices, just drained, can ready more registries, and every
+        // registry ready here is live. Before the sweep, `gc_forget_weak_owners` removed each
+        // dead registry from both `finalization_registries` and `ready_registries`; since then
+        // only a registry still in `finalization_registries` can be readied
+        // (`clear_weak_identity`), and no script has run to register one. So no dead check is
+        // needed, and none could be made: the sweep has cleared the bits that said what died.
+        self.gc_schedule_finalization_cleanup(None);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_task_pending = false;
         self.buffer_gc.since_gc = 0;
         for child in self.shadow_realms.values_mut() {
-            child.gc_heap_after_sweep(garbage);
+            child.gc_heap_after_sweep();
         }
     }
 
@@ -887,6 +889,29 @@ mod tests {
         engine.interp.gc_collect();
         eval(&mut engine, "true", "true");
         eval(&mut engine, "[first.deref() === undefined, second.deref() === undefined, finalized.join(',')].join(':')", "true:true:91");
+    }
+
+    /// A dead-object view answers from the heap's bits between its collection's phases, and
+    /// debug builds assert that no query comes later: once the sweep has cleared the marks
+    /// and freed the dead, a query panics.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a dead-object view queried outside its collection's phases")]
+    fn dead_objects_view_queried_after_the_sweep_panics() {
+        let mut engine = Engine::new();
+        eval(
+            &mut engine,
+            "(() => { for (let i = 0; i < 100; i++) ({ i }); return 'done'; })()",
+            "done",
+        );
+        let heap = engine.interp.gc_heap.clone();
+        let native = engine.interp.gc_heap_mark(&heap).expect("not deferred");
+        let dead = crate::gc_sweep::DeadObjects::new(&heap);
+        for object in dead.iter() {
+            assert!(dead.contains(object));
+        }
+        engine.interp.gc_heap_sweep(&heap, native);
+        dead.contains(dead.iter().next().unwrap_or(0));
     }
 
     /// Owners of every internal-slot family keep their table edges across a collection, and

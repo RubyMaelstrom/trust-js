@@ -40,6 +40,8 @@ const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
 const SIZE_CLASSES: [usize; 16] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 ];
+/// The largest small cell, which lives in a page: a larger one is a large object.
+pub(crate) const LARGEST_SMALL_CELL: usize = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
 const DEFAULT_MIN_TRIGGER: usize = 1024 * 1024;
 const DEFAULT_GROWTH_PERCENT: usize = 100;
 #[cfg(debug_assertions)]
@@ -436,6 +438,10 @@ struct PageMeta {
     /// behind `std::rc::Weak`, the address is not reused while a weak handle may compare it.
     /// Never marked or traced; freed once no weak handle pins it.
     zombies: Vec<u64>,
+    /// Cells a weak handle still names, recorded by exact start for the sweep of the collection
+    /// being finished ([`Heap::finish_collection`]): the sweep keeps those it finds unmarked as
+    /// zombies, and clears every bit.
+    pins: Vec<u64>,
     /// Index of first free cell, or -1. Free cells thread their next
     /// index+1 through their first word (0 = end).
     free_head: i32,
@@ -480,6 +486,8 @@ struct LargeObj {
     waiters: bool,
     /// See `PageMeta::zombies`.
     zombie: bool,
+    /// See `PageMeta::pins`.
+    pinned: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1003,6 +1011,7 @@ impl Heap {
             allocated: vec![0; words],
             waiters: vec![0; words],
             zombies: vec![0; words],
+            pins: vec![0; words],
             free_head: 0,
             live: 0,
         };
@@ -1033,6 +1042,7 @@ impl Heap {
                 marked: false,
                 waiters: false,
                 zombie: false,
+                pinned: false,
             },
         );
         self.large_span = (
@@ -1153,7 +1163,7 @@ impl Heap {
             return self.defer(true);
         }
         self.mark_phase(true, &NoClient);
-        self.sweep_phase(&|_| false);
+        self.sweep_phase();
         true
     }
 
@@ -1168,7 +1178,7 @@ impl Heap {
             return self.defer(false);
         }
         self.mark_phase(false, &NoClient);
-        self.sweep_phase(&|_| false);
+        self.sweep_phase();
         true
     }
 
@@ -1176,8 +1186,8 @@ impl Heap {
     /// ephemerons and, when `native_roots`, this thread's native stack (deferred as for
     /// [`Heap::collect`] when it cannot be scanned soundly). Marks stay set until
     /// [`Heap::finish_collection`]; meanwhile the embedder sweeps its own tables using
-    /// [`Heap::dead_cells`] and [`Heap::is_dead_target`]. Returns false when deferred, in
-    /// which case `finish_collection` must not be called.
+    /// [`Heap::dead_cells`], [`Heap::is_dead_small_cell`] and [`Heap::is_dead_target`].
+    /// Returns false when deferred, in which case `finish_collection` must not be called.
     pub(crate) fn start_marking(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
         if self.blocked() {
             return self.defer(false);
@@ -1189,15 +1199,45 @@ impl Heap {
         true
     }
 
-    /// Phase 2: finalize the newly dead cells and free them, except those whose address
-    /// `pinned` reports still held by a weak handle (they become zombies until a later
-    /// collection finds them unpinned).
-    pub(crate) fn finish_collection(&mut self, pinned: &dyn Fn(usize) -> bool) {
+    /// Phase 2: finalize the newly dead cells and free them, except those that an address in
+    /// `pinned` starts, which a weak handle still names: they become zombies until a later
+    /// collection finds them unpinned. Each pin is recorded in its cell's page (a flag on a
+    /// large cell) for the sweep, which reads it where it meets the cell and clears it. An
+    /// address that does not start an allocated cell (one inside a cell, a free cell's, or one
+    /// outside the heap) records nothing.
+    pub(crate) fn finish_collection(&mut self, pinned: &[usize]) {
         assert!(
             self.control.collecting.get(),
             "finish_collection without start_marking"
         );
-        self.sweep_phase(pinned);
+        for &addr in pinned {
+            self.record_pin(addr);
+        }
+        self.sweep_phase();
+    }
+
+    /// Pin the allocated cell that starts at `addr`, if one does, for this collection's sweep
+    /// (see [`Heap::finish_collection`]).
+    fn record_pin(&mut self, addr: usize) {
+        let Some(cell) = self.locate(addr as u64).filter(|cell| cell.start == addr) else {
+            return;
+        };
+        match cell.loc {
+            Loc::Small { page, index } => {
+                let page = self.pages[page as usize]
+                    .as_mut()
+                    .expect("a located page is live");
+                if bit(&page.allocated, index as usize) {
+                    set_bit(&mut page.pins, index as usize, true);
+                }
+            }
+            Loc::Large => {
+                self.larges
+                    .get_mut(&addr)
+                    .expect("a located large cell is allocated")
+                    .pinned = true;
+            }
+        }
     }
 
     /// The allocated cells of `desc` the current marking left unmarked (between
@@ -1217,6 +1257,37 @@ impl Heap {
             }
         }
         dead
+    }
+
+    /// Whether `addr` is the start of a small cell of `desc` that the current marking left
+    /// unmarked, zombies apart: between [`Heap::start_marking`] and [`Heap::finish_collection`],
+    /// whether [`Heap::dead_cells`] lists `addr` for a descriptor whose cells are all small.
+    /// The page table and the page's bits answer, without hashing; large cells are not
+    /// consulted, so a dead large cell's start answers false.
+    pub(crate) fn is_dead_small_cell(&self, addr: usize, desc: DescId) -> bool {
+        let Some(slot) = self.page_table.get(addr >> PAGE_SHIFT) else {
+            return false;
+        };
+        let Some(page) = self.pages[slot as usize].as_ref() else {
+            return false;
+        };
+        let index = (addr - page.base) / page.cell_size;
+        page.desc == desc
+            && page.cell_ptr(index) == addr
+            && index < page.cells
+            && bit(&page.allocated, index)
+            && !bit(&page.marks, index)
+            && !bit(&page.zombies, index)
+    }
+
+    /// The number of the collection in progress (the first is 1), while one is: for an
+    /// embedder's, from [`Heap::start_marking`] until [`Heap::finish_collection`] has swept.
+    #[cfg(debug_assertions)]
+    pub(crate) fn collection_in_progress(&self) -> Option<u64> {
+        self.control
+            .collecting
+            .get()
+            .then_some(self.stats.collections)
     }
 
     /// The allocated, non-zombie cells of `desc`: after a collection, the live ones.
@@ -1339,8 +1410,8 @@ impl Heap {
         }
     }
 
-    fn sweep_phase(&mut self, pinned: &dyn Fn(usize) -> bool) {
-        let live_bytes = self.sweep(pinned);
+    fn sweep_phase(&mut self) {
+        let live_bytes = self.sweep();
         self.allocated_bytes = live_bytes;
         let budget =
             live_bytes.saturating_add(live_bytes.saturating_mul(self.growth_percent) / 100);
@@ -1641,9 +1712,9 @@ impl Heap {
     }
 
     /// Finalize, poison (debug) and free unmarked cells, release empty
-    /// pages, clear marks. Dead cells `pinned` by weak handles stay allocated
-    /// as zombies. Returns the live bytes that remain.
-    fn sweep(&mut self, pinned: &dyn Fn(usize) -> bool) -> usize {
+    /// pages, clear marks and pins. Dead cells pinned for weak handles (see
+    /// `PageMeta::pins`) stay allocated as zombies. Returns the live bytes that remain.
+    fn sweep(&mut self) -> usize {
         let mut live_bytes = 0usize;
         let mut swept = 0u64;
         for index in 0..self.pages.len() {
@@ -1660,7 +1731,6 @@ impl Heap {
                 }
                 let cell = page.cell_ptr(i) as *mut u64;
                 if bit(&page.allocated, i) {
-                    let pin = pinned(cell as usize);
                     if !bit(&page.zombies, i) {
                         swept += 1;
                         if let Some(finalize) = finalize {
@@ -1672,7 +1742,7 @@ impl Heap {
                             unsafe { std::ptr::write(cell.add(w), POISON) };
                         }
                     }
-                    if pin {
+                    if bit(&page.pins, i) {
                         // Finalized, but its address stays reserved for weak handles.
                         set_bit(&mut page.zombies, i, true);
                         live += 1;
@@ -1690,6 +1760,7 @@ impl Heap {
             page.live = live;
             page.marks.fill(0);
             page.waiters.fill(0);
+            page.pins.fill(0);
             let cell_size = page.cell_size;
             if live == 0 {
                 self.release_page(index);
@@ -1711,6 +1782,7 @@ impl Heap {
         }
         let descs = &self.descs;
         self.larges.retain(|&start, large| {
+            let pinned = std::mem::take(&mut large.pinned);
             if large.marked {
                 large.marked = false;
                 large.waiters = false;
@@ -1729,7 +1801,7 @@ impl Heap {
                     std::ptr::write_bytes(start as *mut u8, 0xdd, large.size)
                 };
             }
-            if pinned(start) {
+            if pinned {
                 large.zombie = true;
                 return true;
             }
@@ -2672,7 +2744,7 @@ mod tests {
         /// and ephemerons through `edges`.
         fn collect_with(&mut self, edges: &dyn Fn(&mut EdgeSink<'_>)) {
             assert!(self.start_marking(edges));
-            self.heap.finish_collection(&|_| false);
+            self.heap.finish_collection(&[]);
         }
 
         /// Phase 1 of [`Fixture::collect_with`], without native roots.
@@ -2941,7 +3013,7 @@ mod tests {
             table
                 .borrow_mut()
                 .retain(|&(owner, _)| !fx.heap.is_dead_target(owner));
-            fx.heap.finish_collection(&|_| false);
+            fx.heap.finish_collection(&[]);
         };
         let owner = fx.alloc_node(0, 1);
         // The value points back at its owner: a cycle through the table.
@@ -3054,7 +3126,7 @@ mod tests {
             "interior addresses resolve"
         );
         assert!(!fx.heap.is_dead_target(value));
-        fx.heap.finish_collection(&|_| false);
+        fx.heap.finish_collection(&[]);
         assert_eq!(fx.live(), 2);
     }
 
@@ -3071,7 +3143,7 @@ mod tests {
         let small = fx.heap.alloc(fx.leaf, 16) as usize;
         let large = fx.heap.alloc(fx.leaf, 8192) as usize;
         assert_eq!(fx.heap.dead_cells(fx.leaf), vec![dead]);
-        fx.heap.finish_collection(&|_| false);
+        fx.heap.finish_collection(&[]);
         assert!(!fx.heap.is_allocated_word(dead as u64));
         assert!(fx.heap.is_allocated_word(small as u64), "allocated black");
         assert!(fx.heap.is_allocated_word(large as u64), "allocated black");
@@ -3209,7 +3281,7 @@ mod tests {
         let pinned = fx.heap.alloc(fx.leaf, 4096) as usize;
         assert!(fx.start_marking(&no_edges));
         assert_eq!(fx.heap.dead_cells(fx.leaf), vec![pinned]);
-        fx.heap.finish_collection(&|addr| addr == pinned);
+        fx.heap.finish_collection(&[pinned]);
         assert_eq!(FIN_COUNT.with(|c| c.get()), 1, "finalized when it died");
         assert!(
             fx.heap.is_allocated_word(pinned as u64),
@@ -3229,7 +3301,7 @@ mod tests {
         );
         assert!(!fx.heap.dead_cells(fx.leaf).contains(&pinned));
         assert!(fx.heap.is_dead_target(pinned));
-        fx.heap.finish_collection(&|_| false);
+        fx.heap.finish_collection(&[]);
         assert!(
             !fx.heap.is_allocated_word(pinned as u64),
             "freed once unpinned"
@@ -3239,6 +3311,166 @@ mod tests {
             15,
             "a zombie is never finalized twice"
         );
+    }
+
+    /// Pins are recorded by exact start in the pinned cells' pages (a flag on a large cell)
+    /// and cleared by the sweep: a pinned dead small cell and a pinned dead large cell stay
+    /// reserved as zombies, finalized once, through every collection that pins them, and the
+    /// first collection after their pins go frees them. An address inside a dead cell, a dead
+    /// cell's tagged word, a free cell's start and a live cell's start pin nothing.
+    #[test]
+    fn pins_keep_small_and_large_cells_reserved_by_exact_start() {
+        FIN_COUNT.with(|c| c.set(0));
+        let mut fx = Fixture::new();
+        let live = fx.heap.alloc(fx.leaf, 16) as usize;
+        let small = fx.heap.alloc(fx.leaf, 16) as usize;
+        let inside_small = fx.heap.alloc(fx.leaf, 16) as usize;
+        let tagged_small = fx.heap.alloc(fx.leaf, 16) as usize;
+        let large = fx.heap.alloc(fx.leaf, 8192) as usize;
+        let inside_large = fx.heap.alloc(fx.leaf, 8192) as usize;
+        // A fresh page hands out its cells in order: one 64 cells on is free.
+        let free = small + 64 * 16;
+        assert!(!fx.heap.is_allocated_word(free as u64));
+        fx.roots[0] = tagged(live as *const u8);
+        let pins = [
+            small,
+            large,
+            inside_small + 8,
+            inside_large + 8,
+            tagged(tagged_small as *const u8) as usize,
+            free,
+            live,
+        ];
+        assert!(fx.start_marking(&no_edges));
+        fx.heap.finish_collection(&pins);
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 5, "every dead cell finalized");
+        assert!(fx.heap.is_allocated_word(small as u64), "pinned small cell");
+        assert!(fx.heap.is_allocated_word(large as u64), "pinned large cell");
+        for (addr, what) in [
+            (inside_small, "a small cell pinned inside"),
+            (inside_large, "a large cell pinned inside"),
+            (tagged_small, "a cell pinned by its tagged word"),
+            (free, "a free cell"),
+        ] {
+            assert!(!fx.heap.is_allocated_word(addr as u64), "{what} is freed");
+        }
+        assert_eq!(fx.heap.large_cells(), 1);
+        assert_eq!(fx.live(), 3, "the live cell and the two zombies");
+
+        // Pinned again, the zombies stay, and nothing is finalized twice.
+        assert!(fx.start_marking(&no_edges));
+        assert!(
+            fx.heap.dead_cells(fx.leaf).is_empty(),
+            "zombies are not newly dead"
+        );
+        fx.heap.finish_collection(&[small, large]);
+        assert!(fx.heap.is_allocated_word(small as u64));
+        assert!(fx.heap.is_allocated_word(large as u64));
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 5);
+
+        // Once their pins go, the next collection frees them; the live cell, unrooted, dies
+        // with no pin left over from the first collection.
+        fx.roots[0] = 0;
+        assert!(fx.start_marking(&no_edges));
+        fx.heap.finish_collection(&[]);
+        for addr in [small, large, live] {
+            assert!(!fx.heap.is_allocated_word(addr as u64), "{addr:#x} freed");
+        }
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 6, "only the live cell is new");
+        assert_eq!(fx.heap.large_cells(), 0);
+        assert_eq!(fx.live(), 0);
+    }
+
+    /// Between the phases, `is_dead_small_cell` answers for every address what `dead_cells`
+    /// lists, for a descriptor whose cells are all small: over every byte of the heap's pages
+    /// (live, dead, zombie, free and black-allocated cells of two size classes, one of which
+    /// leaves a tail in its page, and cells of another descriptor), every byte around a dead and
+    /// a live large cell of the other descriptor, the dead cells' tagged words and addresses
+    /// outside the heap.
+    #[test]
+    fn dead_small_cells_answer_as_the_dead_cells_list_for_every_address() {
+        let mut fx = Fixture::new();
+        // 16-byte cells, and 48-byte ones, whose page ends in a 16-byte tail.
+        let small: Vec<usize> = (0..12)
+            .map(|_| fx.heap.alloc(fx.leaf, 16) as usize)
+            .collect();
+        let mid: Vec<usize> = (0..12)
+            .map(|_| fx.heap.alloc(fx.leaf, 48) as usize)
+            .collect();
+        let others: Vec<usize> = (0..6).map(|i| fx.alloc_node(0, i) as usize).collect();
+        let large_dead = fx.heap.alloc(fx.node, 8192) as usize;
+        let large_live = fx.heap.alloc(fx.node, 8192) as usize;
+        let root = |fx: &mut Fixture, cells: &[usize]| {
+            fx.roots.fill(0);
+            for (slot, &cell) in cells.iter().enumerate() {
+                fx.roots[slot] = tagged(cell as *const u8);
+            }
+        };
+
+        // The first collection frees two cells and keeps a pinned one as a zombie.
+        let mut kept: Vec<usize> = small[..10].to_vec();
+        kept.extend(&mid[..11]);
+        kept.extend(&others);
+        kept.extend([large_dead, large_live]);
+        root(&mut fx, &kept);
+        assert!(fx.start_marking(&no_edges));
+        fx.heap.finish_collection(&[mid[11]]);
+        let (free, zombie) = ([small[10], small[11]], mid[11]);
+
+        // The second leaves half of each kind dead, and allocates a cell black meanwhile.
+        let mut kept: Vec<usize> = small[..5].to_vec();
+        kept.extend(&mid[..5]);
+        kept.extend(&others[..3]);
+        kept.push(large_live);
+        root(&mut fx, &kept);
+        assert!(fx.start_marking(&no_edges));
+        let black = fx.heap.alloc(fx.leaf, 16) as usize;
+        let listed: crate::fasthash::FastSet<usize> =
+            fx.heap.dead_cells(fx.leaf).into_iter().collect();
+        let mut expected: Vec<usize> = small[5..10].to_vec();
+        expected.extend(&mid[5..11]);
+        let expected: crate::fasthash::FastSet<usize> = expected.into_iter().collect();
+        assert_eq!(listed, expected);
+        let agrees = |addr: usize| {
+            assert_eq!(
+                fx.heap.is_dead_small_cell(addr, fx.leaf),
+                listed.contains(&addr),
+                "{addr:#x}"
+            );
+        };
+        let bases: Vec<usize> = fx.heap.pages.iter().flatten().map(|p| p.base).collect();
+        assert_eq!(bases.len(), 3, "a page of each kind of small cell");
+        for base in bases {
+            (base..base + PAGE_SIZE).for_each(&agrees);
+        }
+        for large in [large_dead, large_live] {
+            (large - 64..large + 8192 + 64).for_each(&agrees);
+        }
+        for &cell in listed.iter().chain(&[free[0], zombie, black, others[3]]) {
+            agrees(tagged(cell as *const u8) as usize);
+        }
+        let top = 0u64;
+        for addr in [0, 8, 4096, usize::MAX, std::ptr::from_ref(&top) as usize] {
+            agrees(addr);
+        }
+        // The answers above are not vacuous: each kind of cell answers as it should.
+        let dead = |addr: usize| fx.heap.is_dead_small_cell(addr, fx.leaf);
+        assert!(dead(small[5]) && dead(mid[10]), "dead");
+        assert!(!dead(small[0]) && !dead(mid[0]), "live");
+        assert!(!dead(free[0]) && !dead(free[1]), "free");
+        assert!(!dead(zombie), "a zombie");
+        assert!(!dead(black), "allocated black");
+        assert!(
+            !dead(small[5] + 8) && !dead(mid[5] + 16),
+            "inside a dead cell"
+        );
+        assert!(!dead(others[3]), "another descriptor's dead cell");
+        assert!(fx.heap.is_dead_small_cell(others[3], fx.node));
+        // A large cell is never consulted: a dead one's start answers false although its
+        // descriptor's list holds it.
+        assert!(fx.heap.dead_cells(fx.node).contains(&large_dead));
+        assert!(!fx.heap.is_dead_small_cell(large_dead, fx.node));
+        fx.heap.finish_collection(&[]);
     }
 
     #[test]
@@ -3330,7 +3562,7 @@ mod tests {
             let _scope = fx.heap.nogc();
             assert!(!fx.heap.start_marking(false, &NoClient));
         }
-        fx.heap.finish_collection(&|_| false);
+        fx.heap.finish_collection(&[]);
         assert!(due(&fx) && fx.heap.collection_pending());
         fx.collect();
         assert!(!due(&fx));
@@ -4225,7 +4457,7 @@ mod tests {
                 };
                 let mut collect = || {
                     assert!(heap.start_marking(false, &client));
-                    heap.finish_collection(&|_| false);
+                    heap.finish_collection(&[]);
                 };
                 collect();
                 let start = Instant::now();

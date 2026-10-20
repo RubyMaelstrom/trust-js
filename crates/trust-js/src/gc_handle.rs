@@ -184,13 +184,12 @@ mod cell {
     }
 
     /// Clear the weak cells whose target `is_dead` (as decided by the owning heap's collection
-    /// or teardown) and return those dead targets' addresses: while a weak handle exists, its
-    /// target's cell must stay reserved (the heap keeps it as a zombie), exactly as
-    /// `std::rc::Weak` keeps its allocation. Abandoned cells stop being tracked.
-    pub(crate) fn clear_dead_weak_cells(
-        mut is_dead: impl FnMut(usize) -> bool,
-    ) -> crate::fasthash::FastSet<usize> {
-        let mut pinned = crate::fasthash::FastSet::default();
+    /// or teardown) and return those dead targets' addresses, once for each cell (a target
+    /// that several cells name is listed as often): while a weak handle exists, its target's
+    /// cell must stay reserved (the heap keeps it as a zombie), exactly as `std::rc::Weak`
+    /// keeps its allocation. Abandoned cells stop being tracked.
+    pub(crate) fn clear_dead_weak_cells(mut is_dead: impl FnMut(usize) -> bool) -> Vec<usize> {
+        let mut pinned = Vec::new();
         WEAK_CELLS.with(|cells| {
             cells.borrow_mut().cells.retain(|cell| {
                 let Some(cell) = cell.upgrade() else {
@@ -198,7 +197,7 @@ mod cell {
                 };
                 if is_dead(cell.ptr) {
                     cell.alive.set(false);
-                    pinned.insert(cell.ptr);
+                    pinned.push(cell.ptr);
                 }
                 true
             });

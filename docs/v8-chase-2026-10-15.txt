@@ -5203,3 +5203,146 @@ at --tier=jit, their 31 collections):
   recompiles, so dead callees stay reserved as zombies (djot's grow
   from 0 to 585 objects over its six collections). An open item, not
   9c's.
+
+Step 9c, the sweep stops hashing every dead cell (an implementation
+agent's change, reviewed):
+- Between a collection's phases the engine's table sweeps asked a
+  hash set of every dead object, built from the list Heap::dead_cells
+  returns (26,000 to 156,000 inserts per collection on the gate
+  workloads). They now take gc_sweep::DeadObjects, which keeps the
+  list for walks and answers membership from the heap's bits:
+  Heap::is_dead_small_cell finds the page through 9b's table and
+  requires the exact start of a cell of the object descriptor that
+  is allocated, unmarked and not a zombie. The map of large cells is
+  not consulted: an object's cell is never large (a const assertion
+  beside the view). Debug builds assert on every query that the heap
+  is between the phases of the view's collection (the collecting
+  flag and the collection's number), and that the answer is the
+  list's.
+- The consumers: the host sweep, the template cache, the native
+  functions' realms, the ShadowRealm eviction and the finalization
+  scheduling before the sweep ask the view. gc_clear_weak_targets
+  walks the weak-target table, asking the view about each object
+  key, when the table has fewer entries than there are dead objects,
+  and otherwise the list (clearing a key the table does not hold
+  does nothing). gc_forget_weak_owners chooses its side by the table's
+  length, as before. gc_sweep::map and set keep their rule: each dead
+  key is removed unless the dead outnumber the table's capacity, and
+  then the table is scanned, each key asking the view. The brief had
+  asked them to compare the table's length instead, which would scan
+  a sparse, large table's buckets for a handful of dead objects; the
+  review restored the capacity.
+- The scheduling after the sweep drops its dead check, which the
+  bits can no longer answer and which was redundant: before the
+  sweep gc_forget_weak_owners removed every dead registry from both
+  of its tables, after which only a registry still in
+  finalization_registries can be readied and no script runs (the
+  comment says so). The reclaimed count is the list's length.
+- Pins: clear_dead_weak_cells returns the dead targets that weak
+  handles still name as a list (a target named by several cells is
+  listed as often), and finish_collection records each in its page's
+  metadata, a new bitmap PageMeta::pins by exact start (a flag on a
+  large cell). The sweep tests the bit where it called the probe,
+  keeping a pinned dead cell as a zombie, and clears the bits with
+  the marks. An address that does not start an allocated cell
+  records nothing: the probe, asked only about allocated cells'
+  starts, matched nothing for one either. The bitmap adds a bit per
+  cell to a page's metadata, at most 512 bytes (16-byte cells).
+- FinalizationRegistry cleanup callbacks may now run in another
+  order (they followed the hash set's). No test depends on it: the
+  registry tests count or sort their callbacks.
+- Left out, as the brief said: Heap::dead_cells still tests three
+  bits for each cell (about 356,000 cells in each of the sustained
+  workload's collections, the survey counted), where it could test a
+  word of each bitmap at a time.
+- Tests: between the phases, is_dead_small_cell answers as the list
+  for every byte of three pages (live, dead, zombie, free and black-
+  allocated cells of two size classes, a page's tail, another
+  descriptor's cells), around a dead and a live large cell, for the
+  dead cells' tagged words and for addresses outside the heap; pins
+  keep a dead small cell and a dead large cell reserved, finalized
+  once, through each collection that pins them, and the first one
+  after their pins go frees them, while an interior address, a
+  tagged word, a free cell's start and a live cell's pin nothing; in
+  debug builds a query after the sweep panics. gc_sweep's tests and
+  one weak_metadata test build views from lists (from_list, no
+  heap). weakly_pinned_dead_cells_stay_reserved_until_unpinned
+  passes with only its two finish_collection calls changed (a slice
+  of addresses for the closure), as do six other calls in gc_core's
+  tests. Nine mutations each made a target test fail.
+- Collections (TRUST_JS_PERF_METRICS, --tier=jit): 7, 3, 6 and 15,
+  as at 9b, outputs the same.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2236/0/7, its test list the parent's plus the three
+    new tests; clippy clean in the five configurations; rustfmt
+    clean; the workspace builds with all targets without a
+    diagnostic; rustdoc's 40 warnings are 9b's. git grep finds no
+    dead or pinned set left in gc_collect, gc_handle and
+    weak_metadata; gc_sweep's FastSets are the debug builds' copy of
+    the list and the test views'.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash.
+  - The fixtures' code dumps: against the reference made at 8f,
+    vue's and react's chunks are identical in the plain dumps and
+    with the stubs per chunk and inline. djot's differ in 9 of its
+    160 chunks (4 inline) and are identical in all three forms to
+    the parent's (61ee2a4e) built with 15 codegen units: djot's first
+    collection, at 33,785 objects, keeps 6,643 in both and 5,285 in
+    the parent's at 16, the two states step 4 recorded, and the last
+    keeps 1,305 in each.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64:
+    the 1034 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas, the three new among
+    them: 1010 pass at interval 1 (6 are ignored), the slow lists' 15
+    at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2081/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2073 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's plus the three new tests. Test262 at --tier=jit:
+    53575/53575, the report identical to step 1's x86-64 one and the
+    S5 exit gate's aarch64 one. Fixtures: compiles 56/10/160 and 7, 3
+    and 6 collections, outputs as on aarch64; difftest 138 agree, 12
+    skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2088 tests: 2055 pass and 7 are
+    ignored at interval 1 (about 3,100 s); the slow lists' 22 pass
+    at 100 and their 4 at 1000.
+- Measured (gcmeasure.py, as at 9b: fat-LTO engines from fresh
+  exports, 8f d95cd4a8e052, 9b 71cf32ad4f59, 9c 16498e4df839 from
+  the gated tree, main 311ae9ae5658; copies made together; CPU 5, 15
+  interleaved rounds, medians; started once a local inference server
+  had used under 1% of a core for a minute, the other cores 0.3 busy
+  on average, 1.25 at most; outputs equal everywhere). Idle, the
+  server still uses about 0.3% of a core, so the test used at 9b, no
+  CPU at all for a minute, never passed.
+  - Against 9b: the sustained workload at --tier=jit cycles -8.1%
+    (wall -8.1%, instructions -8.4%), GC pause 360 to 281 ms; at
+    bytecode cycles -5.8% (wall -5.9%), GC pause 358 to 281 ms. vue,
+    react and djot at --tier=jit: cycles -1.3%, -1.7% and -3.6%, GC
+    pause -32%, -21% and -34%.
+  - Peak RSS against 9b: -0.3% to -1.2% on the fixtures, +1.3% (jit)
+    and +1.1% (bytecode) on the sustained workload, 3.0 MB. With
+    glibc's mmap threshold fixed (MALLOC_MMAP_THRESHOLD_=131072, 7
+    runs each) the difference is 0.5 MB (134.0 against 134.5 MB),
+    about what the pin bitmaps take.
+  - Against main, 9c's cycles: vue -12.9%, react -14.2%, djot
+    -10.4%, the sustained workload -38.6% (jit) and -31.8%
+    (bytecode). Peak RSS: vue +36%, react +125%, djot +7%, the
+    sustained workload +22% (jit and bytecode). GC pause over wall
+    time without the exit collection: vue 3.4%, react 4.6%, djot
+    6.3%, the sustained workload 30.3% (jit) and 22.5% (bytecode);
+    main's, its exit collection included: 0.8%, 0.3%, 2.8%, 34.7%
+    and 28.0%.
+  - A lead for peak RSS: the heap takes its 64 KiB pages and its
+    large cells from the system allocator (the shell's fastalloc
+    passes blocks over 1 KiB through), here glibc's malloc. With its
+    mmap threshold fixed as above, which also keeps glibc from
+    raising the threshold as large blocks are freed, the sustained
+    workload's peak RSS at --tier=jit is 133 MB for 9c against 143
+    MB for main (-7%), where by default they are 182 and 150 MB (5
+    runs each, medians). vue's is 37.7 against 29.9 MB (+26%, +33%
+    by default); react's and djot's do not change.
