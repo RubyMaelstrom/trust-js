@@ -5,7 +5,7 @@
 //! cell of the Agent's heap, and the collector traces the cells reachable from the words
 //! generated code stores (frame slots, operand words, property words, the context's packed
 //! `this`), so copying, moving or dropping such a word emits no instruction, and an execution
-//! word owns nothing. No generated code calls a drop helper: a store overwrites its old word, a
+//! word owns nothing. The helper table has no drop helper: a store overwrites its old word, a
 //! function's deferred prototype included (a cell, which dies once no word names it). A property
 //! word that can be a function's deferred `prototype` is kept out of execution by
 //! [`property_word_guard`]: a materialization boundary, not ownership.

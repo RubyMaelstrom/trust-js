@@ -463,11 +463,6 @@ impl PackedValue {
             _ => Value::Num(f64::from_bits(this.0.get())),
         }
     }
-
-    /// Drop one owned packed word in raw frame storage without first widening the frame.
-    pub(crate) unsafe fn drop_raw(word: *mut u64) {
-        drop(unsafe { std::ptr::read(word as *const PackedValue) });
-    }
 }
 
 /// A word owns nothing (its payload is a cell address or a scalar), so a clone copies

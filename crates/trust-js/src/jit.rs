@@ -1999,7 +1999,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_call as *const () as usize,
         crate::bytecode::jit_call_hit as *const () as usize,
         crate::bytecode::jit_direct_finish as *const () as usize,
-        crate::bytecode::jit_drop_at as *const () as usize,
+        crate::bytecode::jit_iteration as *const () as usize,
         crate::bytecode::jit_make_object as *const () as usize,
         crate::bytecode::jit_set_prop as *const () as usize,
         crate::bytecode::jit_get_prop as *const () as usize,
@@ -2009,7 +2009,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_instanceof as *const () as usize,
         crate::bytecode::jit_make_array as *const () as usize,
         crate::bytecode::jit_set_elem as *const () as usize,
-        crate::bytecode::jit_drop_packed_at as *const () as usize,
+        crate::bytecode::string_accumulation::jit_try as *const () as usize,
         crate::bytecode::jit_strict_eq as *const () as usize,
         crate::bytecode::jit_make_regexp as *const () as usize,
         crate::bytecode::jit_interrupt as *const () as usize,
@@ -2021,8 +2021,6 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_make_closure as *const () as usize,
         crate::bytecode::jit_object_literal as *const () as usize,
         crate::bytecode::jit_abstract_operation as *const () as usize,
-        crate::bytecode::jit_iteration as *const () as usize,
-        crate::bytecode::string_accumulation::jit_try as *const () as usize,
     ]
 }
 
@@ -2038,10 +2036,8 @@ pub const H_CALL: usize = 6;
 pub const H_CALL_HIT: usize = 7;
 /// Teardown for a direct (shared-ctx) call: drops, frame-pool return, FnFrame pop, tail drain.
 pub const H_DIRECT_FINISH: usize = 8;
-/// Drop the single wide `Value` at `sp`. No generated code calls it; the slot stays until P1 S6
-/// step 8, since generated code embeds the later indices (`Interp::jit_helpers`).
-#[allow(dead_code)]
-pub const H_DROP_AT: usize = 9;
+/// Iterator-protocol operations (see `bytecode::jit_iteration`).
+pub const H_ITERATION: usize = 9;
 /// Dedicated `Op::MakeObject` entry: template clone + stack-direct value writes, no op decode.
 pub const H_MAKE_OBJECT: usize = 10;
 /// Dedicated property-store entry (`SetProp`/`SetPropDrop`/`SetPropThisDrop`/`SetPropLocalDrop`
@@ -2060,10 +2056,9 @@ pub const H_INSTANCEOF: usize = 16;
 pub const H_MAKE_ARRAY: usize = 17;
 /// Dedicated element-store entry for dense misses and fresh indexed writes.
 pub const H_SET_ELEM: usize = 18;
-/// Drop a NaN-boxed property value at a validated address. No generated code calls it; the slot
-/// stays until P1 S6 step 8, like [`H_DROP_AT`]'s.
-#[allow(dead_code)]
-pub const H_DROP_PACKED_AT: usize = 19;
+/// Complete primitive-string declarative accumulation. flag1 is an unchanged miss,
+/// not an exception; only its guarded region emitters may call this helper.
+pub const H_STRING_ACCUMULATION: usize = 19;
 /// Strict equality misses after the generated fast path: handles content comparison and BigInts
 /// without entering the generic bytecode decoder.
 pub const H_STRICT_EQ: usize = 20;
@@ -2106,12 +2101,7 @@ pub const H_MAKE_CLOSURE: usize = 28;
 pub const H_OBJECT_LITERAL: usize = 29;
 /// Self-hosted built-ins' abstract operations (see `bytecode::jit_abstract_operation`).
 pub const H_ABSTRACT: usize = 30;
-/// Iterator-protocol operations (see `bytecode::jit_iteration`).
-pub const H_ITERATION: usize = 31;
-/// Complete primitive-string declarative accumulation. flag1 is an unchanged miss,
-/// not an exception; only its guarded region emitters may call this helper.
-pub const H_STRING_ACCUMULATION: usize = 32;
-pub const N_HELPERS: usize = 33;
+pub const N_HELPERS: usize = 31;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2126,7 +2116,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "call",
     "call_hit",
     "direct_finish",
-    "drop_at",
+    "iteration",
     "make_object",
     "set_prop",
     "get_prop",
@@ -2136,7 +2126,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "instanceof",
     "make_array",
     "set_elem",
-    "drop_packed_at",
+    "string_accumulation",
     "strict_eq",
     "make_regexp",
     "interrupt",
@@ -2148,8 +2138,6 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "make_closure",
     "object_literal",
     "abstract_operation",
-    "iteration",
-    "string_accumulation",
 ];
 
 #[inline]
@@ -2329,6 +2317,8 @@ mod helper_identity_tests {
         assert_eq!(helper_name(H_EXEC), "exec");
         assert_eq!(helper_name(H_CALL_HIT), "call_hit");
         assert_eq!(helper_name(H_LOOP_BACKEDGE), "loop_backedge");
+        assert_eq!(helper_name(H_ITERATION), "iteration");
+        assert_eq!(helper_name(H_STRING_ACCUMULATION), "string_accumulation");
         assert_eq!(helper_name(N_HELPERS), "invalid");
     }
 }
@@ -17112,12 +17102,11 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
 ///   key and string conversions). Calls (`call`, `call_hit`, `intrinsic`, direct calls) poll
 ///   once at their site's end, `new` after its own sequence and `string_accumulation` on its
 ///   committed exit, outside this table.
-/// - Not polled: `cond`, `return`, `push_handler`, `pop_handler`, `drop_at`,
-///   `drop_packed_at`, `strict_eq` and `loop_backedge` allocate no cell; `unwind` and
-///   `complete` route a completion already made (their ABIs return a code address);
-///   `direct_finish` runs inside a direct call, whose site polls at its end (a tail call goes
-///   through `gc_check_amortized` first); `slice_op` ends the native slice, and the code that
-///   resumes or receives it polls; `interrupt` is the poll.
+/// - Not polled: `cond`, `return`, `push_handler`, `pop_handler`, `strict_eq` and
+///   `loop_backedge` allocate no cell; `unwind` and `complete` route a completion already made
+///   (their ABIs return a code address); `direct_finish` runs inside a direct call, whose site
+///   polls at its end (a tail call goes through `gc_check_amortized` first); `slice_op` ends the
+///   native slice, and the code that resumes or receives it polls; `interrupt` is the poll.
 fn helper_ends_in_poll(idx: usize) -> bool {
     matches!(
         idx,

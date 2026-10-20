@@ -10,8 +10,8 @@
 //! that admit a Map's or Set's `Exotic::Collection` as ordinary. The template counters and the
 //! direct call sequence these programs check are ARM64's; on x86-64 the programs run without
 //! them, except that the Map and Set program counts x64's own-data reads. The tests at the end
-//! check assembled ARM64 code: the finish stub's `this` reset, the property stores, the
-//! property-word guard and the string constants.
+//! check assembled ARM64 code: the finish stub's `this` reset, the property-word guard and the
+//! string constants.
 
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
@@ -513,59 +513,6 @@ fn direct_finish_stub_resets_this_with_one_store() {
         1,
         "one store of x5 over [48]"
     );
-}
-
-/// The two property stores whose old word can be a function's deferred prototype (step 9b),
-/// the SetProp template (each receiver kind, with and without a retained result) and the name
-/// and Reference store, load neither drop helper (`H_DROP_PACKED_AT`, `H_DROP_AT`): they
-/// overwrite the old word. No other generated code calls either helper.
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn traced_property_stores_call_no_drop_helper() {
-    use super::*;
-    let layout = crate::value::jit_layout(&crate::value::Object::new(None));
-    assert!(
-        layout.valid && set_prop_inlinable(&layout),
-        "the inline store templates"
-    );
-    // The helper-table load a helper call begins with, as `emit_op_helper` emits it.
-    let helper_load = |helper: usize| {
-        let mut a = asm::Asm::new();
-        a.ldr_imm(16, 21, (helper * 8) as u32);
-        a.finish()[0]
-    };
-    let drops = [helper_load(H_DROP_PACKED_AT), helper_load(H_DROP_AT)];
-    let mut templates = Vec::new();
-    for (recv, keep) in [
-        (PropRecv::Stack, false),
-        (PropRecv::Stack, true),
-        (PropRecv::This, false),
-        (PropRecv::Slot(16), false),
-    ] {
-        let mut a = asm::Asm::new();
-        let unwind = a.new_label();
-        emit_set_prop_inline(&mut a, &layout, 0x1000, "prototype", 0, unwind, recv, keep);
-        a.bind(unwind);
-        let words = a.finish();
-        // The scan sees the helper call the template does make: its checked fallback.
-        assert!(
-            words.contains(&helper_load(H_SET_PROP)),
-            "the scan sees a helper call"
-        );
-        templates.push(words);
-    }
-    let mut a = asm::Asm::new();
-    let (slow, done) = (a.new_label(), a.new_label());
-    emit_store_name_value(&mut a, &layout, slow, done);
-    a.bind(slow);
-    a.bind(done);
-    templates.push(a.finish());
-    for words in &templates {
-        assert!(!words.is_empty());
-        for drop in drops {
-            assert!(!words.contains(&drop), "a traced store loads a drop helper");
-        }
-    }
 }
 
 /// The property-word guard is three instructions and sends exactly the words whose tag is above

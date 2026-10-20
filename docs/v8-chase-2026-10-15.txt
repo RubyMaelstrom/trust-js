@@ -4845,3 +4845,76 @@ change, reviewed without changes):
   - Both gates were stopped for low memory on the aarch64 machine
     during their stress runs; the unfinished parts then ran with the
     same test binaries on the unchanged tree.
+
+
+Step 8f, the helper table's two drop slots gone (an implementation
+agent's change, reviewed):
+- Deleted: H_DROP_AT and H_DROP_PACKED_AT (slots 9 and 19, which no
+  generated code called: no word owns anything), their
+  helper_table() and HELPER_NAMES entries, jit_drop_at,
+  jit_drop_packed_at with its debug panic, and
+  PackedValue::drop_raw, whose only caller it was.
+- Renumbered: the last two helpers take the freed slots, H_ITERATION
+  31 to 9 and H_STRING_ACCUMULATION 32 to 19, so no other index
+  moves (H_INTERRUPT stays 22, H_GET_METHOD_ELEM 24). N_HELPERS 33,
+  now 31.
+- Interp holds the table inline (jit_helpers at 4112, 264 bytes, now
+  248), so the 59 members after it, jit_layout to inline_ic_safe,
+  moved 16 bytes down, in the same order: Interp 5808 bytes, now
+  5792. Object is unchanged (168).
+- Tests: traced_property_stores_call_no_drop_helper (ARM64 only),
+  which scanned the traced stores for loads of the two slots, is
+  gone, and the traced tests' header no longer lists it. The packed
+  native ABI test in bytecode.rs loses its jit_drop_at call and the
+  doc sentences about the drop helpers. Docs that said no generated
+  code calls a drop helper now say the table has none (jit_ownership's
+  header) or drop the clause (two word-routing tests), and the poll
+  table's "not polled" list no longer names the two.
+- Review: the helper identity test also checks the two renumbered
+  helpers' names.
+- The dumps check (layout-dumps.sh, with the helper map 31:9 and
+  32:19): every chunk is equal up to the two helpers' table loads
+  and immediates that a moved member of Interp explains. Plain dumps
+  renumber only djot's six string-accumulation calls (plain mode's
+  helper stubs are shared by the process, not in the dumps); with the
+  stubs per chunk or inline, iteration's calls renumber too. As at
+  8e, the moves of strict and constructing sit in mov sequences, and
+  the emitters only check gc_tick's and call_site's range.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2227/0/7, its test list the parent's less the
+    deleted test; clippy clean in the five configurations; rustfmt
+    clean; the workspace builds with all targets without a
+    diagnostic; rustdoc's 40 warnings are 8e's.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash.
+  - The fixtures' code dumps against 8e's: every chunk of the three
+    (56, 10 and 160) is equal as described, none identical, and none
+    of djot's GC-timing-sensitive chunks differs. The immediates that
+    moved address Interp's depth, direct_call_depth, gc_next,
+    interrupt_poll_tick and pending_tail, and with the stubs its
+    call_overflow. The raw word totals differ from 8e's by one in
+    vue's plain dumps and those with the stubs per chunk, and by
+    three in djot's with the stubs inline: heap addresses moved with
+    the smaller binary, and one that a vue chunk embeds, and one that
+    a djot chunk embeds three times, now have zero low 16 bits, so
+    their mov sequences are one instruction shorter. The check counts
+    a mov sequence as one token.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier and poisoning, aarch64:
+    the 1026 tests whose names match the JIT's, the stack's, the
+    collector's and the layout probe's areas: 1002 pass at interval
+    1 (6 are ignored), the slow lists' 15 at 100 and 3 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2072/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2064 pass, 3 fail (step
+    1's snapshot codec tests) and 7 are ignored. Both lists are the
+    parent's (the deleted test is ARM64 only). Test262 at --tier=jit:
+    53575/53575, the report identical to step 1's x86-64 one and the
+    S5 exit gate's aarch64 one. Fixtures: compiles 56/10/160, outputs
+    as on aarch64; difftest 138 agree, 12 skipped, no crash.
+  - Per-test GC stress with the verifier and poisoning, x86-64
+    (zombie), the whole lib suite, 2079 tests: 2046 pass and 7 are
+    ignored at interval 1 (about 3,700 s); the slow lists' 22 pass
+    at 100 and their 4 at 1000.

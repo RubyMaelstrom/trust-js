@@ -21392,32 +21392,6 @@ pub(crate) unsafe extern "C" fn jit_exec(
     }
 }
 
-/// Drop one wide boundary Value, never an execution word. No generated code calls it (its slot
-/// is `jit::H_DROP_AT`).
-pub(crate) unsafe extern "C" fn jit_drop_at(
-    _ctx: *mut crate::jit::JitCtx,
-    _imm: u32,
-    sp: *mut Value,
-) -> *mut Value {
-    std::ptr::drop_in_place(sp);
-    sp
-}
-
-/// Drop one NaN-boxed execution or property word at `word`; packed destruction cannot execute
-/// JavaScript. No word owns anything, so no generated code calls it (its slot is
-/// `jit::H_DROP_PACKED_AT`).
-pub(crate) unsafe extern "C" fn jit_drop_packed_at(
-    _ctx: *mut crate::jit::JitCtx,
-    _imm: u32,
-    word: *mut PackedValue,
-) -> *mut PackedValue {
-    if cfg!(debug_assertions) {
-        panic!("gc-heap generated code dropped a packed word");
-    }
-    unsafe { crate::value::PackedValue::drop_raw(word.cast::<u64>()) };
-    word
-}
-
 /// Strict equality fallback for cases intentionally left out of the generated fast path:
 /// equal-length string content, BigInts, and operands whose last owner must run a destructor.
 /// This operation cannot throw, so it can bypass the generic bytecode decoder and stack/slot
@@ -25987,11 +25961,9 @@ mod return_slot_tests {
     }
 
     /// JitCtx's prefix offsets and sizes, with the packed `this` word itself at [48].
-    /// No word owns anything, so no generated code calls `jit_drop_packed_at` (debug builds
-    /// assert it). A function's deferred prototype, the one packed word that owned a box, names
-    /// a cell in its function's heap: overwriting the word releases nothing (the cell still owns
-    /// its key layout), and the next collection frees the cell, whose finalizer drops the layout.
-    /// `jit_drop_at` returns the value it was given.
+    /// A function's deferred prototype, the one packed word that owned a box, names a cell in its
+    /// function's heap: overwriting the word releases nothing (the cell still owns its key
+    /// layout), and the next collection frees the cell, whose finalizer drops the layout.
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
@@ -26066,12 +26038,6 @@ mod return_slot_tests {
             Rc::strong_count(&keys),
             1,
             "its finalizer dropped the key layout"
-        );
-        let mut wide = ManuallyDrop::new(Value::Obj(crate::value::Object::new(None)));
-        let wide_ptr = &raw mut *wide;
-        assert_eq!(
-            unsafe { jit_drop_at(std::ptr::null_mut(), 0, wide_ptr) },
-            wide_ptr
         );
     }
 }

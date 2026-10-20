@@ -335,9 +335,8 @@ fn lazy_cells(engine: &Engine) -> usize {
 
 /// `F.prototype = p` over unobserved deferred prototypes through the generated SetProp
 /// template (a warmed, compiled `setPrototype`): every store completes in the template, with no
-/// set-property helper call (so no checked store, and no drop helper, which generated code never
-/// calls), no old prototype is materialized (the probe), the new value reads back, and the old
-/// cells are gone after the next collection.
+/// set-property helper call (so no checked store), no old prototype is materialized (the probe),
+/// the new value reads back, and the old cells are gone after the next collection.
 #[test]
 fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
     let source = format!(
@@ -387,8 +386,8 @@ fn deferred_prototype_set_prop_overwrites_are_native_and_free_the_old_cells() {
 /// `prototype = p` inside `with (F)` over unobserved deferred prototypes (`StoreRef`
 /// through the with object's Reference; a generator, whose resumable body compiles `with`):
 /// every store completes natively (the native Reference-store counter) and overwrites the lazy
-/// word with no drop helper (which generated code never calls), no old prototype is materialized
-/// (the probe), the new value reads back, and the old cells are gone after the next collection.
+/// word, no old prototype is materialized (the probe), the new value reads back, and the old
+/// cells are gone after the next collection.
 #[test]
 fn deferred_prototype_with_object_stores_are_native_and_free_the_old_cells() {
     let source = format!(
