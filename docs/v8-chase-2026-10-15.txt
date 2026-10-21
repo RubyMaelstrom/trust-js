@@ -5842,3 +5842,190 @@ review on (the plan's working agreements):
   tests shows at the next milestone, to be found among the step's
   commits, rather than before the commit. The debug builds' barrier
   check and verifier still run in every lib test's collections.
+
+Step 10c, minor collections (an implementation agent's change,
+reviewed):
+- A minor collection keeps the marks. As it starts (begin_marking),
+  after debug builds' checks of the barrier and of the young pages'
+  bookkeeping, it lists every marked, non-zombie cell that starts in
+  a set card (a card can hold the starts of three 48-byte cells) and
+  clears those cards; marking traces them first, then the roots,
+  side slots, ephemerons and native stack as a major collection
+  does, and no other old cell. It sweeps only the pages that
+  received cells since the last collection (a page's young flag and
+  the heap's list, set where a cell is taken from a free list or a
+  page is made) and the large cells, puts the young pages with free
+  cells back on their classes' lists, and leaves the marks set.
+  dead_cells walks the same pages; pins are recorded only where
+  the sweep goes. Every sweep clears the young flags, and the heap's
+  bytes after it are what was allocated less what it freed (checked
+  against a page walk in debug builds). A major collection works as
+  before and clears the flags too.
+- Triggers: a minor collection is due once the bytes allocated since
+  the last collection pass the nursery budget,
+  TRUST_JS_GC_NURSERY_BYTES (2 MiB by default; 0 turns minor
+  collections off); a major one once the heap holds more than the
+  byte budget after a minor collection (max(the 8 MiB floor, twice
+  what the last major collection left), its old cells counted live
+  or not), or when a major request was deferred. The due word stays
+  the one flag generated code polls; Heap::due_kind chooses at the
+  safepoint. Under GC stress every Mth collection is major
+  (TRUST_JS_GC_STRESS_MAJOR, 8 by default). gc_core's own heaps have
+  no nursery unless asked, so its earlier tests run as before.
+- By cause: allocation safepoints, the JIT's polls and the task
+  boundary collect minorly unless a major collection is due; explicit
+  requests (gc_collect, $262.gc, collect_garbage_for_host, the idle
+  and exit collections, unstable_collect_young_for_host_tests),
+  ArrayBuffer pressure and the live-object ceiling majorly. The
+  ArrayBuffer pressure counts data since the last major collection,
+  since minor ones leave old dead buffers. Interp::gc_collect_minor
+  exists for tests.
+- A review change: release_host_job_context, which asks for a
+  collection at the next task boundary to reclaim a destroyed
+  Document's graph without waiting for allocation pressure, now also
+  asks the heap for a major collection (Heap::request_major: the
+  next collection of any cause is major, none is made due). The
+  agent's tree collected minorly there, so the retired Realm, old,
+  stayed until a major collection, and had changed the test to
+  expect that; the test is back to its property, the boundary
+  reclaiming the Realm, and asserts the collection was major.
+- The spare pool keeps the nursery's pages (32 at 2 MiB), at least
+  16.
+- The in-cell weak callbacks are gone: WeakFn, WeakSink,
+  LayoutDesc::weak, CondEdge::slots, visit_weak, clear_dead_weak,
+  the marker's three fields, every descriptor's weak field and
+  gc_core's four tests of them. Weak handles, weak_metadata and the
+  table sweeps keep their rule (unmarked is dead); in a minor
+  collection only young cells can be unmarked.
+- The performance record adds gc_kinds and
+  gc_pause_seconds_by_kind; TRUST_JS_GC_LOG names the kind, and a
+  minor collection's line adds the young pages it swept, the cells
+  it traced from cards and the bytes it marked (promoted).
+  DIAGNOSTICS.md documents both variables and the floor's new
+  meaning.
+- HostGcVisitor::is_minor stays false; host graphs are reported in
+  full at every collection.
+- Tests: 11 in gc_core (minor collections free young garbage and
+  keep old cells they never trace, a card's old cell keeps a young
+  one and the check panics without the card, only young pages are
+  swept, only young cells are found dead, zombies on swept pages,
+  promotion, the due logic, the stress period, the spare cap, the
+  review's request_major), 7 engine tests in
+  minor_collection_tests.rs (allocation safepoints minor until a
+  major collection is due, young garbage freed and old objects
+  kept, weak targets dying young at minor collections and old at
+  major ones, the task boundary, explicit majors, the live-object
+  limit's major collection, GC stress's major period). Changed, the
+  property kept: five direct start_marking calls name the kind;
+  a_spent_byte_budget_collects_within_one_poll spends a nursery;
+  operand_temporaries_survive_helper_end_polls makes every stress
+  collection major (a minor one would not mark an operand that is
+  old already); object_count_alone_does_not_collect raises and
+  restores the nursery with the floor; two task-boundary tests use
+  a 16 MiB nursery so the task's objects are young at the boundary.
+  Ten mutations at the key sites (the card scan, the young pages,
+  promotion, the due logic) each made a target test fail.
+- The agent's measurement (no-LTO, on a machine an unrelated build
+  kept busy, 19 cores on average: counts and peak RSS hold, times
+  are inflated): at a 2 MiB nursery vue makes 20 minor and 1 major
+  collections, react 5 and 1, djot 15 and 1 (each fixture's major
+  is the exit collection), the sustained workload 190 and 4; peak
+  RSS against the parent's vue 38.0 to 30.4 MB, react 37.5 to 22.1,
+  djot 43.8 to 41.2, the sustained workload 135.5 to 83.3, while GC
+  pause grows on every workload (vue 28.5 to 38.2 ms, djot 22.8 to
+  35.7, the sustained workload 286 to 385); at 1 MiB pause grows
+  more, at 4 MiB it is near the parent's with peak RSS 34.0, 27.7,
+  42.5 and 84.0 MB. Each minor collection still pays the
+  collection's fixed work (10d) and its finalizers, and on the
+  sustained workload each steady-state minor collection rescans the
+  carded 200,000-element array (Heap::mark 8% of cycles, the card
+  scan 2.6%). djot never runs a major collection before its exit
+  collection: its old cells stay under the 8 MiB floor.
+- 10a's open item, answered: without the huge-page advice (a
+  scratch export) peak RSS stays within the runs' spread at the 2
+  MiB nursery (the empty script 15.6 against 16.1 MB), while minor
+  faults rise 24% on the empty script, 50-57% on the fixtures and
+  4.9 times on the sustained workload. The advice stays.
+- Dumps: vue's and react's are 10b's in all three forms; djot's
+  differ from 10b's in the 9 GC-timing-sensitive chunks (5 inline),
+  now in a third retention state: its first collection is a minor
+  one at 8,609 objects that keeps 2,877. With the nursery off
+  (TRUST_JS_GC_NURSERY_BYTES=0) the engine collects as 10b and all
+  of djot's 160 chunks are 10b's.
+- Gates (the review's, tiered, on the reviewed tree):
+  - aarch64, while the owner's build kept the machine at a load
+    near 50 (110 at times): lib 2276 passed, 3 failed, 7 ignored;
+    the three are bound by wall time (100 1 MiB scans in 24.5 s, an
+    interruption's deadline met early, a BigInt deadline) and pass
+    rerun at a load of 6. The test list is the parent's plus 18,
+    less the weak callbacks' four; clippy clean in the five
+    configurations; rustfmt clean; rustdoc's 40 warnings are 10b's;
+    git grep finds the weak callbacks gone (4 lines name the weak
+    handles' clear_dead_weak_cells, which stays); the workspace
+    builds with all targets without a diagnostic.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0, 21, 6 and 16 collections; difftest 138 agree,
+    12 skipped, no crash. The sustained workload at --tier=jit and
+    bytecode: 194 collections (192 by allocation), its output 10b's.
+  - Dumps: against 10b's, vue's and react's chunks are identical in
+    the three forms, djot's differ in the 9 GC-timing-sensitive
+    chunks (5 inline), a third retention state, so the 10b
+    comparison against 10a's finds the rest equal with the card
+    sequences dropped and those 9 neither state of before.
+  - Test262 at --tier=jit threshold 8: 53575/53575, the report
+    identical to the S5 review fixes'.
+  - Per-test GC stress at interval 1 of the targeted list (the new
+    tests, the tests of the 11 changed modules' paths, those named
+    for the collector: 1192 tests, the slow lists' 19 left for the
+    step's close): 1186 pass, 5 are ignored, and
+    high_churn_task_collects_after_temporary_roots_are_released
+    failed: under stress the task's own collections promote its
+    objects before the boundary's minor collection. The review
+    skips its assertion under stress, as the plan's rule has it for
+    assertions about when collections happen; it passes, and passes
+    under stress (370 s).
+  - x86-64 (zombie): clippy clean; lib 2113/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2105 pass, 3 fail
+    (step 1's snapshot codec tests) and 7 are ignored. Both lists
+    are the parent's plus the 18 new tests, less the four. Fixtures:
+    compiles 56/10/160 and 21, 6 and 16 collections, outputs as on
+    aarch64; difftest 138 agree, 12 skipped, no crash.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 10b's
+  tree as committed (737e4d31) 4a4c9bd4e084, 10c 2a4c5ed657a2 from
+  the gated tree at its 2 MiB and at a 4 MiB nursery
+  (TRUST_JS_GC_NURSERY_BYTES), main 311ae9ae5658; copies made
+  together; CPU 5, 15 interleaved rounds, medians; the empty script
+  as a control; started once a local inference server had used
+  under 1% of a core and all CPUs under one core for a minute, the
+  other cores 0.32 busy (median), 2.15 at most; outputs equal
+  everywhere):
+  - Against 10b, at the 2 MiB nursery: peak RSS vue 40.6 to 33.0
+    MB (-18.6%), react 39.3 to 24.0 (-38.9%), djot 45.1 to 42.8
+    (-5.2%), the sustained workload 136.7 to 85.6 at --tier=jit
+    (-37.4%) and 136.2 to 84.5 at bytecode (-38.0%); the longest
+    pause vue 4.8 to 1.9 ms, react 3.6 to 1.4, djot 4.4 to 3.0, the
+    sustained workload 26.7 to 18.9. GC pause in all +26% on vue,
+    +9% on react, +43% on djot, +31% on the sustained workload;
+    cycles vue +1.1%, react -0.8%, djot +3.2%, the sustained
+    workload +8.9% (jit) and +6.9% (bytecode).
+  - At a 4 MiB nursery: peak RSS vue -11.9%, react -25.3%, djot
+    -2.7%, the sustained workload -37.4% (jit and bytecode); GC
+    pause vue -1.4%, react +2.8%, djot +19.6%, the sustained
+    workload +15%; cycles within 1% on the fixtures, +3.7% (jit)
+    and +2.9% (bytecode) on the sustained workload.
+  - Against main, at 2 MiB (4 MiB): cycles vue -11.1% (-12.2%),
+    react -14.8% (-14.5%), djot -7.6% (-9.5%), the sustained
+    workload -32.3% (-35.6%) at jit and -25.9% (-28.7%) at
+    bytecode. Peak RSS: vue +4.9% (+13.6%), react +45% (+78%), djot
+    +1.8% (+4.4%), the sustained workload -43% (-43%). GC pause over
+    wall time without the exit collection: vue 4.1% (3.3%), react
+    5.0% (4.6%), djot 8.2% (6.9%), the sustained workload 36.4%
+    (33.5%) at jit and 27.5% (24.9%) at bytecode; main's, its exit
+    collection included, 0.8%, 0.3%, 2.8%, 34.8% and 28.1%.
+  - S0's bounds on the fixtures at 2 MiB: peak RSS holds for vue
+    and djot, not react; GC time for vue, at the bound for react,
+    not for djot. The nursery stays 2 MiB by default until 10d,
+    which takes the fixed work out of each minor collection, is
+    measured; the choice is recorded then.

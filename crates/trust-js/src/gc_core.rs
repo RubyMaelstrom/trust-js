@@ -17,9 +17,9 @@
 //!   owner-conditional for its side tables, and conservative only for the
 //!   native stack and registers, per the Decision 0 scanning contract (see
 //!   `native`).
-//! - Weak slots and ephemerons are rediscovered every collection from
-//!   reachable holders. Nothing weak is registered globally, so a reused
-//!   cell address can neither revive a dead entry nor be clobbered by one.
+//! - Ephemerons (and the other conditional edges of the embedder's side
+//!   tables) are reported afresh by the [`MarkClient`] at every collection;
+//!   cells hold no weak slots of their own.
 //! - Collection honors I9: it never runs inside a no-GC region or while a
 //!   GcCell borrow is outstanding (deferred via a pending flag; the borrow
 //!   case asserts in debug builds), and cells are allocated zeroed.
@@ -29,9 +29,16 @@
 //!   collections a marked cell is old and an allocated unmarked one young. The
 //!   pages of kinds whose cells gain references after initialization end in a
 //!   card table, where the write barrier records each written cell
-//!   ([`card_mark`]); a collection clears marks and cards when it starts.
+//!   ([`card_mark`]).
+//! - Collections are minor or major (S6 step 10c, [`CollectionKind`]). A major
+//!   collection clears every mark and card, marks everything reachable and
+//!   sweeps every page. A minor one keeps the marks: it traces from the roots
+//!   and from the old cells whose cards are set, and no other old cell, and
+//!   sweeps only the pages that received cells since the last collection, and
+//!   the large cells. A cell is old once any collection has marked it, so an
+//!   old cell that died waits for a major collection.
 //! - Debug builds poison freed cells, verify the marked graph and check the
-//!   write barrier as each collection starts.
+//!   write barrier and the young pages' bookkeeping as each collection starts.
 
 use crate::fasthash::FastMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -51,6 +58,13 @@ const SIZE_CLASSES: [usize; 16] = [
 pub(crate) const LARGEST_SMALL_CELL: usize = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
 const DEFAULT_MIN_TRIGGER: usize = 1024 * 1024;
 const DEFAULT_GROWTH_PERCENT: usize = 100;
+/// Under a stress interval with a nursery, every this many collections the stress makes one
+/// major (see [`Heap::set_stress_major_every`]).
+const DEFAULT_STRESS_MAJOR_EVERY: usize = 8;
+/// The fewest released pages the spare pool keeps with a nursery (see `Heap::spare_page_cap`).
+const MIN_SPARE_PAGES_WITH_NURSERY: usize = 16;
+/// The fewest released pages the spare pool keeps without a nursery.
+const MIN_SPARE_PAGES: usize = 64;
 #[cfg(debug_assertions)]
 const POISON: u64 = 0xdddd_dddd_dddd_dddd;
 
@@ -670,10 +684,6 @@ mod page_source {
 /// must finish before the next allocation or write fields in an order in
 /// which each intermediate state traces safely.
 pub(crate) type TraceFn = fn(*const u8, &mut dyn FnMut(*const u8));
-/// Weak callback: report the cell's weak slots and ephemeron entries
-/// through the [`WeakSink`]. Called once per collection for each reachable
-/// cell of the descriptor; same state tolerance as [`TraceFn`].
-pub(crate) type WeakFn = fn(*mut u8, &mut WeakSink);
 /// Finalize callback for a dead cell, run during sweep or heap teardown.
 /// Must not allocate from this heap, resurrect the cell, or read other
 /// cells (they may already be finalized); same state tolerance as
@@ -686,7 +696,6 @@ pub(crate) struct DescId(pub(crate) u32);
 pub(crate) struct LayoutDesc {
     pub(crate) name: &'static str,
     pub(crate) trace: TraceFn,
-    pub(crate) weak: Option<WeakFn>,
     pub(crate) finalize: Option<FinalizeFn>,
     /// The kind's cells gain references after their initialization (the engine's objects,
     /// environments and deferred prototypes), through writes the barrier records
@@ -696,30 +705,17 @@ pub(crate) struct LayoutDesc {
     pub(crate) carded: bool,
 }
 
-/// Receives one reachable cell's weak data during marking, into buffers the
-/// marker lends it and takes back. Only the tests' descriptors report any:
-/// the engine's have no [`WeakFn`].
-pub(crate) struct WeakSink {
-    weak_slots: Vec<*mut u64>,
-    ephemerons: Vec<(*mut u64, *mut u64)>,
-}
-
-impl WeakSink {
-    /// `slot`, a word inside the cell, holds a weak reference: it is zeroed
-    /// when its target does not survive the collection.
-    #[cfg(test)]
-    pub(crate) fn weak_slot(&mut self, slot: *mut u64) {
-        self.weak_slots.push(slot);
-    }
-
-    /// An ephemeron entry inside the cell: the value word is reachable only
-    /// while the key word's target is. When the key dies both words are
-    /// zeroed, so the holder reads the entry as empty. A zero key is an
-    /// empty entry; a key that is not a heap reference never dies.
-    #[cfg(test)]
-    pub(crate) fn ephemeron(&mut self, key: *mut u64, value: *mut u64) {
-        self.ephemerons.push((key, value));
-    }
+/// What a collection traces and sweeps (S6 step 10c).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CollectionKind {
+    /// Keeps the marks, so that every old cell (one an earlier collection marked) stays marked:
+    /// traces from the roots, side slots, ephemerons and native stack, and from the old cells
+    /// whose cards are set, and from no other old cell. Sweeps the pages that received cells
+    /// since the last collection, and the large cells. An old cell that died stays allocated
+    /// until a major collection.
+    Minor = 0,
+    /// Clears every mark and card, marks everything reachable and sweeps every page.
+    Major = 1,
 }
 
 /// Receives the edges a [`MarkClient`] keeps off-heap, in its side tables.
@@ -768,9 +764,14 @@ struct PageMeta {
     class: usize,
     /// The page ends in a card table ([`LayoutDesc::carded`]).
     carded: bool,
+    /// The page received a cell since the last collection (it was made, or a cell was taken
+    /// from its free list), and is listed in `Heap::young_pages`: only such a page can hold a
+    /// young cell, so only such pages are swept by a minor collection. Cleared by every sweep.
+    young: bool,
     /// Set by the marking that found a cell reachable, and kept by the sweep: between
-    /// collections a marked cell is old (it survived the last collection), an allocated unmarked
-    /// one young (allocated since). A collection clears them before it marks.
+    /// collections a marked cell is old (a collection kept it), an allocated unmarked one young
+    /// (allocated since). A major collection clears them before it marks; a minor one keeps
+    /// them.
     marks: Vec<u64>,
     /// Allocated (handed-out) cells. Conservative marking must ignore
     /// free cells: a stale stack word resolving into a free cell would
@@ -820,6 +821,44 @@ impl PageMeta {
                     CARD_TABLE_BYTES,
                 )
             };
+        }
+    }
+
+    /// For a minor collection as it starts: list in `cells` every marked (old) cell that starts
+    /// in a set card of this page, and clear the cards. A card covers `1 << CARD_SHIFT` bytes,
+    /// so one card can cover the starts of several small cells; each marked one is listed. An
+    /// unmarked cell is young (or free, or a zombie) and is traced, if at all, as it is reached.
+    fn take_card_cells(&mut self, cells: &mut Vec<(usize, DescId)>) {
+        if !self.carded {
+            return;
+        }
+        const WORDS: usize = CARD_TABLE_BYTES / 8;
+        let table = (self.base + CARD_TABLE_OFFSET) as *mut u64;
+        for word_index in 0..WORDS {
+            // SAFETY: a carded page ends in its card table, 8-aligned (the page is 64 KiB-aligned
+            // and CARD_TABLE_OFFSET a multiple of 8), which no cell overlaps; the page is live
+            // while its metadata is, and nothing else touches it during a collection.
+            let word = unsafe { table.add(word_index).read() };
+            if word == 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            unsafe { table.add(word_index).write(0) };
+            for (byte, &value) in word.to_ne_bytes().iter().enumerate() {
+                if value == 0 {
+                    continue;
+                }
+                let card = word_index * 8 + byte;
+                let first = (card << CARD_SHIFT).div_ceil(self.cell_size);
+                let end = ((card + 1) << CARD_SHIFT)
+                    .div_ceil(self.cell_size)
+                    .min(self.cells);
+                for index in first..end {
+                    if bit(&self.marks, index) && !bit(&self.zombies, index) {
+                        cells.push((self.cell_ptr(index), self.desc));
+                    }
+                }
+            }
         }
     }
 
@@ -881,8 +920,6 @@ struct CondEdge {
     key: Option<CellRef>,
     value: EdgeValue,
     fired: bool,
-    /// In-cell entry words to zero if the key dies (from a [`WeakFn`]).
-    slots: Option<(*mut u64, *mut u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -952,16 +989,23 @@ struct Marker {
     /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
     waiting: FastMap<usize, Vec<u32>>,
     ready: Vec<u32>,
-    weak_slots: Vec<*mut u64>,
     trace_scratch: Vec<*const u8>,
-    slot_scratch: Vec<*mut u64>,
-    pair_scratch: Vec<(*mut u64, *mut u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcStats {
     pub(crate) allocations: u64,
     pub(crate) collections: u64,
+    /// The minor collections among `collections`.
+    pub(crate) minor_collections: u64,
+    /// The pages the last collection swept: a minor collection's young pages, or every page.
+    pub(crate) last_pages_swept: usize,
+    /// The old cells the last collection traced because their cards were set (a minor
+    /// collection's; a major one traces every reachable cell anyway).
+    pub(crate) last_card_cells: usize,
+    /// The bytes of the cells the last collection marked. A minor collection marks young cells
+    /// only (old ones are marked already), so for one these are the bytes it promoted.
+    pub(crate) last_marked_bytes: usize,
     pub(crate) cells_marked: u64,
     pub(crate) cells_swept: u64,
     pub(crate) pages_live: usize,
@@ -974,9 +1018,10 @@ pub(crate) struct GcStats {
     /// request (not per allocation that found it still pending).
     pub(crate) deferred_collections: u64,
     /// Subset of `deferred_collections` postponed because the native stack
-    /// could not be scanned soundly (see [`Heap::collect`]).
+    /// could not be scanned soundly (see [`Heap::collect_kind`]).
     pub(crate) deferred_native_stack: u64,
-    /// Allocated bytes at which the next collection becomes due.
+    /// The byte budget: without a nursery, the allocated bytes past which a collection is due;
+    /// with one, the heap's bytes after a minor collection past which a major one is.
     pub(crate) trigger_bytes: usize,
 }
 
@@ -1002,12 +1047,43 @@ pub(crate) struct Heap {
     /// Shared with NoGcScope/BorrowScope guards so a guard can be alive
     /// while `alloc(&mut self)` runs.
     control: Rc<Control>,
+    /// The bytes of the allocated cells: those the last sweep left (`swept_bytes`) and those
+    /// allocated since.
     allocated_bytes: usize,
+    /// The bytes of the allocated cells the last sweep left: the live ones, zombies and, after a
+    /// minor collection, the old cells that died since a collection last marked them.
+    swept_bytes: usize,
+    /// The byte budget (see `GcStats::trigger_bytes`): max(`min_trigger_bytes`, the bytes left
+    /// by the last major collection's sweep grown by `growth_percent`).
     trigger_bytes: usize,
     min_trigger_bytes: usize,
     growth_percent: usize,
+    /// The nursery budget (S6 step 10c): a minor collection is due once more than this many
+    /// bytes have been allocated since the last collection. `None`, the default: every
+    /// collection is major, due once the allocated bytes pass the byte budget.
+    nursery_bytes: Option<usize>,
+    /// A major collection is due (with a nursery): the heap held more than the byte budget after
+    /// a minor collection's sweep, or a major collection was requested and deferred. Cleared as
+    /// a major collection starts.
+    major_due: bool,
+    /// The next collection is to be major, whatever asks for it, though none is due
+    /// ([`Heap::request_major`]). Cleared as a major collection starts.
+    major_requested: bool,
     stress_every: usize,
+    /// With a nursery and a stress interval, every this many collections one is major.
+    stress_major_every: usize,
+    /// Collections started under a stress interval.
+    stress_collections: u64,
     allocs_since_gc: usize,
+    /// The kind of the collection in progress, while one is (`Control::collecting`).
+    collecting_kind: CollectionKind,
+    /// The pages that received cells since the last collection ([`PageMeta::young`]), by slot.
+    young_pages: Vec<u32>,
+    /// A minor collection's old cells whose cards were set, gathered as it starts
+    /// (`Heap::begin_marking`) and traced as its marking starts.
+    card_cells: Vec<(usize, DescId)>,
+    /// The bytes of the cells marked by the collection in progress.
+    marked_bytes: usize,
     /// When false, allocation never collects: the embedder polls
     /// [`Heap::collection_due`] at its own safepoints, where it can supply
     /// roots the heap cannot see (the interpreter's state).
@@ -1054,11 +1130,21 @@ impl Heap {
             large_span: (usize::MAX, 0),
             control: Rc::default(),
             allocated_bytes: 0,
+            swept_bytes: 0,
             trigger_bytes: DEFAULT_MIN_TRIGGER,
             min_trigger_bytes: DEFAULT_MIN_TRIGGER,
             growth_percent: DEFAULT_GROWTH_PERCENT,
+            nursery_bytes: None,
+            major_due: false,
+            major_requested: false,
             stress_every: 0,
+            stress_major_every: DEFAULT_STRESS_MAJOR_EVERY,
+            stress_collections: 0,
             allocs_since_gc: 0,
+            collecting_kind: CollectionKind::Major,
+            young_pages: Vec::new(),
+            card_cells: Vec::new(),
+            marked_bytes: 0,
             collect_on_alloc: true,
             due_word: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
@@ -1131,26 +1217,70 @@ impl Heap {
         self.refresh_due();
     }
 
+    /// With a nursery and a stress interval, make every `collections`-th collection that the heap
+    /// asks for major ([`Heap::due_kind`]); 1 makes every one major.
+    pub(crate) fn set_stress_major_every(&mut self, collections: usize) {
+        self.stress_major_every = collections.max(1);
+    }
+
+    /// The nursery budget (see the `nursery_bytes` field); `None` makes every collection major.
+    pub(crate) fn set_nursery_bytes(&mut self, bytes: Option<usize>) {
+        self.nursery_bytes = bytes;
+        self.refresh_due();
+    }
+
+    /// Make the next collection major, whatever asks for it, without making one due: for an
+    /// embedder that released a graph the heap holds as old cells (a retired document's Realm),
+    /// which only a major collection reclaims, and that collects at a boundary of its own.
+    pub(crate) fn request_major(&mut self) {
+        self.major_requested = true;
+    }
+
     /// See the `collect_on_alloc` field.
     pub(crate) fn set_collect_on_alloc(&mut self, collect: bool) {
         self.collect_on_alloc = collect;
     }
 
-    /// Whether a collection is due: the allocation budget is spent, the
-    /// stress interval elapsed, or an earlier request was deferred.
+    /// Whether a collection is due: with a nursery, its budget is spent or a major collection is
+    /// due; without one, the byte budget is spent; or the stress interval elapsed, or an earlier
+    /// request was deferred. Which kind runs is the collector's choice ([`Heap::due_kind`]).
     pub(crate) fn collection_due(&self) -> bool {
         self.control.pending_collect.get()
-            || self.allocated_bytes > self.trigger_bytes
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
+            || self.bytes_due(0)
+    }
+
+    /// Whether the allocated bytes make a collection due, once `upcoming` more are allocated.
+    fn bytes_due(&self, upcoming: usize) -> bool {
+        let allocated = self.allocated_bytes.saturating_add(upcoming);
+        match self.nursery_bytes {
+            Some(nursery) => self.major_due || allocated.saturating_sub(self.swept_bytes) > nursery,
+            None => allocated > self.trigger_bytes,
+        }
+    }
+
+    /// The kind of collection the heap asks for when it collects for its own reasons (a budget,
+    /// the stress interval, a deferred request): major without a nursery, when a major
+    /// collection is due or requested, or for every `stress_major_every`-th collection under a
+    /// stress interval; minor otherwise.
+    pub(crate) fn due_kind(&self) -> CollectionKind {
+        let stress_major = self.stress_every > 0
+            && (self.stress_collections + 1).is_multiple_of(self.stress_major_every as u64);
+        if self.nursery_bytes.is_none() || self.major_due || self.major_requested || stress_major {
+            CollectionKind::Major
+        } else {
+            CollectionKind::Minor
+        }
     }
 
     /// Keep `word` equal to [`Heap::collection_due`] (1 or 0) from now on, for code that polls
     /// for a collection without calling into the heap (the native JIT's polls; see
-    /// `value::LiveCount`). The heap is the word's only writer. An allocation that spends the
-    /// byte budget or reaches the stress interval sets it ([`Heap::alloc`]), and so does a
-    /// deferred request; marking (which takes the pending request), the end of every sweep (a
-    /// new budget and interval, and any request that arrived meanwhile) and the settings
-    /// recompute it. Nothing else changes what `collection_due` reads.
+    /// `value::LiveCount`). The heap is the word's only writer. An allocation that spends a
+    /// budget or reaches the stress interval sets it ([`Heap::alloc`]), and so does a deferred
+    /// request; marking (which takes the pending request and a due major collection), the end
+    /// of every sweep (new budgets and interval, a major collection a minor one made due, and
+    /// any request that arrived meanwhile) and the settings recompute it. Nothing else changes
+    /// what `collection_due` reads.
     ///
     /// # Safety
     /// `word` must stay valid at its address, and written by no one else, for as long as the
@@ -1166,16 +1296,35 @@ impl Heap {
         self.stats.collections
     }
 
+    /// Minor collections run so far.
+    #[cfg(test)]
+    pub(crate) fn minor_collections(&self) -> u64 {
+        self.stats.minor_collections
+    }
+
+    /// The pages that received cells since the last collection.
+    #[cfg(test)]
+    pub(crate) fn young_page_count(&self) -> usize {
+        self.young_pages.len()
+    }
+
     /// The large cells allocated: live, or dead and weakly pinned.
     #[cfg(test)]
     pub(crate) fn large_cells(&self) -> usize {
         self.larges.len()
     }
 
-    /// Bytes allocated past the trigger: how far allocation has run beyond the budget.
+    /// Bytes allocated past the budget that makes a collection due: the nursery's with a
+    /// nursery (bytes allocated since the last collection), the byte budget without.
     #[cfg(test)]
     pub(crate) fn budget_overshoot(&self) -> usize {
-        self.allocated_bytes.saturating_sub(self.trigger_bytes)
+        match self.nursery_bytes {
+            Some(nursery) => self
+                .allocated_bytes
+                .saturating_sub(self.swept_bytes)
+                .saturating_sub(nursery),
+            None => self.allocated_bytes.saturating_sub(self.trigger_bytes),
+        }
     }
 
     /// Whether the attached due word (if any) agrees with [`Heap::collection_due`]: the
@@ -1196,7 +1345,10 @@ impl Heap {
         } else if self.stress_every > 0 {
             self.allocated_bytes
         } else {
-            self.trigger_bytes
+            match self.nursery_bytes {
+                Some(nursery) => self.swept_bytes.saturating_add(nursery),
+                None => self.trigger_bytes,
+            }
         };
         if let Some(word) = self.due_word {
             // SAFETY: `attach_due_word`'s contract.
@@ -1204,9 +1356,11 @@ impl Heap {
         }
     }
 
-    /// The next collection is due once allocated bytes exceed
-    /// max(`min_bytes`, live × (1 + `growth_percent`/100)), so marking work
-    /// per allocated byte stays bounded as the live heap grows.
+    /// The byte budget: max(`min_bytes`, the bytes a major collection's sweep leaves × (1 +
+    /// `growth_percent`/100)), so that marking work per allocated byte stays bounded as the
+    /// live heap grows. Without a nursery a collection is due once the allocated bytes pass it;
+    /// with one, a major collection is due once the heap's bytes after a minor collection do.
+    /// Until the next major collection, the budget is `min_bytes`.
     pub(crate) fn set_heap_growth(&mut self, min_bytes: usize, growth_percent: usize) {
         self.min_trigger_bytes = min_bytes;
         self.growth_percent = growth_percent;
@@ -1275,7 +1429,7 @@ impl Heap {
     }
 
     /// Allocate a zeroed cell for `desc`. May first collect, conservatively
-    /// (see [`Heap::collect`]). The caller initializes, then publishes (I9).
+    /// (see [`Heap::collect_kind`]). The caller initializes, then publishes (I9).
     ///
     /// Between [`Heap::start_marking`] and [`Heap::finish_collection`] the
     /// cell is allocated marked (black): marking is over, so the cell survives
@@ -1317,10 +1471,10 @@ impl Heap {
         // Stress collects *before* an allocation: collecting after handing
         // out the cell would free it before the caller can root it.
         let due = self.control.pending_collect.get()
-            || self.allocated_bytes.saturating_add(upcoming) > self.trigger_bytes
+            || self.bytes_due(upcoming)
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every);
         if due && self.collect_on_alloc {
-            self.collect();
+            self.collect_kind(self.due_kind());
         }
     }
 
@@ -1333,14 +1487,19 @@ impl Heap {
             let Some(index) = pages.current else {
                 break;
             };
-            if let Some(ptr) = self.pages[index as usize]
-                .as_mut()
-                .and_then(PageMeta::take_free)
-            {
-                return ptr;
+            if let Some(page) = self.pages[index as usize].as_mut() {
+                if let Some(ptr) = page.take_free() {
+                    // The page holds a young cell now: the next minor collection sweeps it.
+                    if !page.young {
+                        page.young = true;
+                        self.young_pages.push(index);
+                    }
+                    return ptr;
+                }
             }
             self.classes[desc.0 as usize][class].current = None;
         }
+        // A new page is young from the start (`new_page`).
         let index = self.new_page(desc, class);
         self.classes[desc.0 as usize][class].current = Some(index);
         self.pages[index as usize]
@@ -1387,6 +1546,7 @@ impl Heap {
             desc,
             class,
             carded,
+            young: true,
             marks: vec![0; words],
             allocated: vec![0; words],
             waiters: vec![0; words],
@@ -1406,6 +1566,8 @@ impl Heap {
             }
         };
         self.page_table.insert(base as usize >> PAGE_SHIFT, index);
+        // Made for a cell about to be allocated: young until the next sweep.
+        self.young_pages.push(index);
         index
     }
 
@@ -1493,6 +1655,7 @@ impl Heap {
                     return None;
                 }
                 set_bit(&mut page.marks, index, true);
+                self.marked_bytes += page.cell_size;
                 Some(bit(&page.waiters, index))
             }
             Loc::Large => {
@@ -1501,6 +1664,7 @@ impl Heap {
                     return None;
                 }
                 large.marked = true;
+                self.marked_bytes += large.size;
                 Some(large.waiters)
             }
         }
@@ -1528,7 +1692,13 @@ impl Heap {
         }
     }
 
-    /// Request a collection with conservative native roots (Decision 0):
+    /// Request a major collection, as [`Heap::collect_kind`] does.
+    #[cfg(test)]
+    pub(crate) fn collect(&mut self) -> bool {
+        self.collect_kind(CollectionKind::Major)
+    }
+
+    /// Request a collection of `kind` with conservative native roots (Decision 0):
     /// this thread's registered native stack chain and a register snapshot,
     /// its only roots. Returns false when the request is deferred
     /// (pending until the next allocation or request): inside a no-GC
@@ -1537,47 +1707,54 @@ impl Heap {
     /// registered on this thread (see [`register_thread_native_stack`]), SP
     /// outside every registered region (e.g. an unregistered `stacker::grow`
     /// segment), or no scanner for this target (wasm32).
-    pub(crate) fn collect(&mut self) -> bool {
+    fn collect_kind(&mut self, kind: CollectionKind) -> bool {
         if self.blocked() {
-            return self.defer(false);
+            return self.defer(false, kind);
         }
         if !native::scannable(native::current_sp()) {
-            return self.defer(true);
+            return self.defer(true, kind);
         }
-        self.mark_phase(true, &NoClient);
+        self.mark_phase(true, &NoClient, kind);
         self.sweep_phase();
         true
     }
 
     /// Collect with no roots at all (no native stack or registers, and no
     /// embedder to report any), so every cell dies: for tests of what a
-    /// collection does rather than what it keeps. Deferred like
-    /// [`Heap::collect`] inside no-GC regions and while borrows are
-    /// outstanding.
+    /// collection does rather than what it keeps. A major collection, deferred like
+    /// [`Heap::collect`] inside no-GC regions and while borrows are outstanding.
     #[cfg(test)]
     pub(crate) fn collect_at_safepoint(&mut self) -> bool {
         if self.blocked() {
-            return self.defer(false);
+            return self.defer(false, CollectionKind::Major);
         }
-        self.mark_phase(false, &NoClient);
+        self.mark_phase(false, &NoClient, CollectionKind::Major);
         self.sweep_phase();
         true
     }
 
-    /// Phase 1 of an embedder-driven collection: mark from `client`'s roots, side slots and
-    /// ephemerons and, when `native_roots`, this thread's native stack (deferred as for
-    /// [`Heap::collect`] when it cannot be scanned soundly). Marks stay set until
-    /// [`Heap::finish_collection`]; meanwhile the embedder sweeps its own tables using
-    /// [`Heap::dead_cells`], [`Heap::is_dead_small_cell`] and [`Heap::is_dead_target`].
-    /// Returns false when deferred, in which case `finish_collection` must not be called.
-    pub(crate) fn start_marking(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
+    /// Phase 1 of an embedder-driven collection of `kind`: mark from `client`'s roots, side
+    /// slots and ephemerons and, when `native_roots`, this thread's native stack (deferred as
+    /// for [`Heap::collect_kind`] when it cannot be scanned soundly), and in a minor collection
+    /// from the old cells whose cards are set. Marks stay set until [`Heap::finish_collection`];
+    /// meanwhile the embedder sweeps its own tables using [`Heap::dead_cells`],
+    /// [`Heap::is_dead_small_cell`] and [`Heap::is_dead_target`], which in a minor collection
+    /// find only young cells dead. Returns false when deferred, in which case
+    /// `finish_collection` must not be called; a deferred major request makes a major
+    /// collection due.
+    pub(crate) fn start_marking(
+        &mut self,
+        native_roots: bool,
+        client: &dyn MarkClient,
+        kind: CollectionKind,
+    ) -> bool {
         if self.blocked() {
-            return self.defer(false);
+            return self.defer(false, kind);
         }
         if native_roots && !native::scannable(native::current_sp()) {
-            return self.defer(true);
+            return self.defer(true, kind);
         }
-        self.mark_phase(native_roots, client);
+        self.mark_phase(native_roots, client, kind);
         true
     }
 
@@ -1599,17 +1776,20 @@ impl Heap {
     }
 
     /// Pin the allocated cell that starts at `addr`, if one does, for this collection's sweep
-    /// (see [`Heap::finish_collection`]).
+    /// (see [`Heap::finish_collection`]). A minor collection's sweep leaves the pages that
+    /// received no cell since the last collection alone, and their cells with them (a dead one
+    /// there is a zombie already), so it records no pin there: none would be cleared.
     fn record_pin(&mut self, addr: usize) {
         let Some(cell) = self.locate(addr as u64).filter(|cell| cell.start == addr) else {
             return;
         };
+        let minor = self.collecting_kind == CollectionKind::Minor;
         match cell.loc {
             Loc::Small { page, index } => {
                 let page = self.pages[page as usize]
                     .as_mut()
                     .expect("a located page is live");
-                if bit(&page.allocated, index as usize) {
+                if bit(&page.allocated, index as usize) && (page.young || !minor) {
                     set_bit(&mut page.pins, index as usize, true);
                 }
             }
@@ -1632,18 +1812,38 @@ impl Heap {
         );
     }
 
-    /// The allocated cells of `desc` the current marking left unmarked (between
-    /// [`Heap::start_marking`] and [`Heap::finish_collection`]).
+    /// Call `f` with each page the collection in progress sweeps: a minor collection's young
+    /// pages, or every page.
+    fn for_each_swept_page(&self, mut f: impl FnMut(&PageMeta)) {
+        match self.collecting_kind {
+            CollectionKind::Minor => {
+                for &index in &self.young_pages {
+                    if let Some(page) = self.pages[index as usize].as_ref() {
+                        f(page);
+                    }
+                }
+            }
+            CollectionKind::Major => self.pages.iter().flatten().for_each(f),
+        }
+    }
+
+    /// The allocated cells of `desc` the current marking left unmarked, zombies apart (between
+    /// [`Heap::start_marking`] and [`Heap::finish_collection`]). A minor collection lists the
+    /// young pages' only (and the large cells'): every other page's allocated cells are old,
+    /// marked, or zombies.
     pub(crate) fn dead_cells(&self, desc: DescId) -> Vec<usize> {
         self.debug_assert_marking_current("dead_cells");
         let mut dead = Vec::new();
-        for page in self.pages.iter().flatten().filter(|page| page.desc == desc) {
+        self.for_each_swept_page(|page| {
+            if page.desc != desc {
+                return;
+            }
             for i in 0..page.cells {
                 if bit(&page.allocated, i) && !bit(&page.marks, i) && !bit(&page.zombies, i) {
                     dead.push(page.cell_ptr(i));
                 }
             }
-        }
+        });
         for (&start, large) in &self.larges {
             if large.desc == desc && !large.marked && !large.zombie {
                 dead.push(start);
@@ -1765,7 +1965,11 @@ impl Heap {
         borrows > 0
     }
 
-    fn defer(&mut self, native_stack: bool) -> bool {
+    /// Defer a requested collection of `kind`: it is pending until the next safepoint, and a
+    /// major request makes a major collection due.
+    fn defer(&mut self, native_stack: bool, kind: CollectionKind) -> bool {
+        // With a request pending the due word is set already.
+        self.major_due |= kind == CollectionKind::Major;
         if !self.control.pending_collect.replace(true) {
             self.stats.deferred_collections += 1;
             if native_stack {
@@ -1776,15 +1980,26 @@ impl Heap {
         false
     }
 
-    fn mark_phase(&mut self, native_roots: bool, client: &dyn MarkClient) {
+    fn mark_phase(&mut self, native_roots: bool, client: &dyn MarkClient, kind: CollectionKind) {
         assert!(
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
         self.control.pending_collect.set(false);
+        self.collecting_kind = kind;
+        if kind == CollectionKind::Major {
+            self.major_due = false;
+            self.major_requested = false;
+        } else {
+            self.stats.minor_collections += 1;
+        }
+        if self.stress_every > 0 {
+            self.stress_collections += 1;
+        }
+        self.marked_bytes = 0;
         self.refresh_due();
         self.stats.collections += 1;
-        self.begin_marking();
+        self.begin_marking(kind);
         // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
         // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
         // before a collection.
@@ -1797,6 +2012,9 @@ impl Heap {
         {
             m.parents = self.retention_tracing.then(FastMap::default);
         }
+        // A minor collection traces the old cells whose cards were set, although they are
+        // marked: they may hold the only edges to young cells.
+        m.worklist.append(&mut self.card_cells);
         client.roots(&mut |word| self.mark_word(word, &mut m));
         if native_roots {
             self.mark_native_stack(&mut m);
@@ -1815,14 +2033,12 @@ impl Heap {
                     key: None,
                     value: EdgeValue::SideSlots(owner),
                     fired: false,
-                    slots: None,
                 },
                 &mut m,
                 client,
             );
         });
         self.drain(&mut m, client);
-        self.clear_dead_weak(&m);
         if cfg!(debug_assertions) {
             self.verify(&m);
         }
@@ -1832,32 +2048,91 @@ impl Heap {
         }
     }
 
-    /// As a collection starts (S6 step 10b): in debug builds, check the write barrier's
-    /// invariant against the last collection's marks and the cards set since
-    /// ([`Heap::check_write_barrier`]); then clear every mark and every card, so that marking
-    /// starts from nothing and the next collection's cards record only what is written from now
-    /// on. Out of line, so that `mark_phase` can zero the frames it used (see there).
+    /// As a collection starts: in debug builds, check the write barrier's invariant against the
+    /// last collection's marks and the cards set since ([`Heap::check_write_barrier`]), and the
+    /// young pages' bookkeeping ([`Heap::check_young_pages`]). Then a major collection clears
+    /// every mark and every card, so that marking starts from nothing; a minor one gathers the
+    /// old cells whose cards are set into `card_cells` (S6 step 10c) and clears those cards.
+    /// Either way the next collection's cards record only what is written from now on. Out of
+    /// line, so that `mark_phase` can zero the frames it used (see there).
     #[inline(never)]
-    fn begin_marking(&mut self) {
+    fn begin_marking(&mut self, kind: CollectionKind) {
         if cfg!(debug_assertions) {
             self.check_write_barrier();
+            self.check_young_pages();
         }
-        for page in self.pages.iter_mut().flatten() {
-            page.marks.fill(0);
-            page.clear_cards();
+        match kind {
+            CollectionKind::Major => {
+                for page in self.pages.iter_mut().flatten() {
+                    page.marks.fill(0);
+                    page.clear_cards();
+                }
+                for large in self.larges.values_mut() {
+                    large.marked = false;
+                }
+                self.stats.last_card_cells = 0;
+            }
+            CollectionKind::Minor => {
+                let mut cells = std::mem::take(&mut self.card_cells);
+                cells.clear();
+                for page in self.pages.iter_mut().flatten() {
+                    page.take_card_cells(&mut cells);
+                }
+                self.stats.last_card_cells = cells.len();
+                self.card_cells = cells;
+            }
         }
-        for large in self.larges.values_mut() {
-            large.marked = false;
+    }
+
+    /// The young pages' bookkeeping, checked in debug builds as each collection starts: the list
+    /// names exactly the pages flagged young, each once, and every other page's allocated cells
+    /// are old (marked) or zombies. A minor collection sweeps the young pages alone, and lists
+    /// the dead there, so it relies on the second.
+    fn check_young_pages(&self) {
+        let flagged = self
+            .pages
+            .iter()
+            .flatten()
+            .filter(|page| page.young)
+            .count();
+        let listed: crate::fasthash::FastSet<u32> = self.young_pages.iter().copied().collect();
+        assert!(
+            listed.len() == self.young_pages.len() && listed.len() == flagged,
+            "young pages: the list ({} entries, {} distinct) and the pages' flags ({flagged}) \
+             disagree",
+            self.young_pages.len(),
+            listed.len()
+        );
+        for &index in &self.young_pages {
+            assert!(
+                self.pages[index as usize]
+                    .as_ref()
+                    .is_some_and(|page| page.young),
+                "young pages: slot {index} is listed but not a young page"
+            );
+        }
+        for page in self.pages.iter().flatten().filter(|page| !page.young) {
+            let young = page
+                .allocated
+                .iter()
+                .zip(&page.marks)
+                .zip(&page.zombies)
+                .any(|((&allocated, &marks), &zombies)| allocated & !marks & !zombies != 0);
+            assert!(
+                !young,
+                "young pages: the page at {:#x} holds a young cell but is not listed",
+                page.base
+            );
         }
     }
 
     /// The write barrier's invariant, checked in debug builds as each collection starts, before
-    /// its marks and cards clear: an old cell (one the last collection marked) whose card is
-    /// clean holds no traced edge to an allocated, unmarked cell of this heap (one allocated
-    /// since). A cell of a kind without cards, or a large cell, has no card: it never holds such
-    /// an edge. Every collection runs it, so GC stress runs it at every safepoint. Minor
-    /// collections, which trace an old cell only through its set card, rely on it. Panics naming
-    /// the holder's descriptor and address and the target's.
+    /// it clears any mark or card: an old cell (one a collection marked) whose card is clean
+    /// holds no traced edge to an allocated, unmarked cell of this heap (one allocated since the
+    /// last collection). A cell of a kind without cards, or a large cell, has no card: it never
+    /// holds such an edge. Every collection runs it, minor and major, so GC stress runs it at
+    /// every safepoint. Minor collections, which trace an old cell only through its set card,
+    /// rely on it. Panics naming the holder's descriptor and address and the target's.
     fn check_write_barrier(&self) {
         let mut edges: Vec<*const u8> = Vec::new();
         let mut check = |holder: usize, desc: DescId| {
@@ -1899,16 +2174,42 @@ impl Heap {
     }
 
     fn sweep_phase(&mut self) {
-        let live_bytes = self.sweep();
-        self.allocated_bytes = live_bytes;
-        let budget =
-            live_bytes.saturating_add(live_bytes.saturating_mul(self.growth_percent) / 100);
-        self.trigger_bytes = self.min_trigger_bytes.max(budget);
+        let kind = self.collecting_kind;
+        let freed = self.sweep(kind);
+        // What the heap holds now: its live cells, zombies and, after a minor collection, the old
+        // cells that died since a collection last marked them.
+        let held = self.allocated_bytes.saturating_sub(freed);
+        if cfg!(debug_assertions) {
+            assert_eq!(held, self.held_bytes(), "GC byte accounting");
+        }
+        self.allocated_bytes = held;
+        self.swept_bytes = held;
+        self.stats.last_marked_bytes = self.marked_bytes;
+        match kind {
+            CollectionKind::Major => {
+                let budget = held.saturating_add(held.saturating_mul(self.growth_percent) / 100);
+                self.trigger_bytes = self.min_trigger_bytes.max(budget);
+            }
+            // The old cells, live or not, have passed the byte budget: a major collection is
+            // due, at the next safepoint.
+            CollectionKind::Minor => self.major_due |= held > self.trigger_bytes,
+        }
         self.trim_spare_pages();
         self.allocs_since_gc = 0;
         self.control.collecting.set(false);
-        // A new budget and interval; a request deferred meanwhile keeps the word set.
+        // New budgets and interval; a request deferred meanwhile keeps the word set.
         self.refresh_due();
+    }
+
+    /// The bytes of every allocated cell, live or dead, zombies included: what `allocated_bytes`
+    /// counts once a sweep has set it (debug builds check the accounting after every sweep).
+    fn held_bytes(&self) -> usize {
+        self.pages
+            .iter()
+            .flatten()
+            .map(|page| page.live * page.cell_size)
+            .sum::<usize>()
+            + self.larges.values().map(|large| large.size).sum::<usize>()
     }
 
     /// Decision 0 spill protocol. Never inlined: callee-saved registers are
@@ -1978,7 +2279,6 @@ impl Heap {
                     key,
                     value: EdgeValue::Word(edge.value),
                     fired: false,
-                    slots: None,
                 },
                 m,
                 client,
@@ -1993,8 +2293,7 @@ impl Heap {
                 {
                     m.source = MarkSource::Cell(cell);
                 }
-                let desc = &self.descs[desc.0 as usize];
-                let (trace, weak) = (desc.trace, desc.weak);
+                let trace = self.descs[desc.0 as usize].trace;
                 let mut edges = std::mem::take(&mut m.trace_scratch);
                 edges.clear();
                 trace(cell as *const u8, &mut |edge| edges.push(edge));
@@ -2002,58 +2301,12 @@ impl Heap {
                     self.mark_word(edge as u64, m);
                 }
                 m.trace_scratch = edges;
-                if let Some(weak) = weak {
-                    self.visit_weak(cell, weak, m, client);
-                }
             }
             let Some(edge) = m.ready.pop() else {
                 break;
             };
             self.try_fire(edge, m, client);
         }
-    }
-
-    fn visit_weak(&mut self, cell: usize, weak: WeakFn, m: &mut Marker, client: &dyn MarkClient) {
-        let mut sink = WeakSink {
-            weak_slots: std::mem::take(&mut m.slot_scratch),
-            ephemerons: std::mem::take(&mut m.pair_scratch),
-        };
-        sink.weak_slots.clear();
-        sink.ephemerons.clear();
-        weak(cell as *mut u8, &mut sink);
-        let WeakSink {
-            weak_slots: slots,
-            ephemerons: pairs,
-        } = sink;
-        debug_assert!(
-            slots
-                .iter()
-                .chain(pairs.iter().flat_map(|(key, value)| [key, value]))
-                .all(|&slot| self.locate(slot as u64).is_some_and(|c| c.start == cell)),
-            "WeakFn reported a slot outside its cell"
-        );
-        m.weak_slots.extend_from_slice(&slots);
-        for &(key_slot, value_slot) in &pairs {
-            // SAFETY: the descriptor reported words inside this marked cell.
-            let (key, value) = unsafe { (std::ptr::read(key_slot), std::ptr::read(value_slot)) };
-            if key == 0 {
-                continue;
-            }
-            let key = self.locate(key);
-            self.add_edge(
-                CondEdge {
-                    owner: None,
-                    key,
-                    value: EdgeValue::Word(value),
-                    fired: false,
-                    slots: Some((key_slot, value_slot)),
-                },
-                m,
-                client,
-            );
-        }
-        m.slot_scratch = slots;
-        m.pair_scratch = pairs;
     }
 
     fn add_edge(&mut self, edge: CondEdge, m: &mut Marker, client: &dyn MarkClient) {
@@ -2122,29 +2375,6 @@ impl Heap {
         m.waiting.entry(cell.start >> 4).or_default().push(edge);
     }
 
-    /// After marking: zero weak slots whose targets died and in-cell
-    /// ephemeron entries whose keys died. Holders are marked, so the words
-    /// written belong to surviving cells, reported this cycle.
-    fn clear_dead_weak(&self, m: &Marker) {
-        for &slot in &m.weak_slots {
-            // SAFETY: reported by the WeakFn of a marked cell.
-            let word = unsafe { std::ptr::read(slot) };
-            if self.locate(word).is_some_and(|cell| !self.is_marked(&cell)) {
-                // SAFETY: as above.
-                unsafe { std::ptr::write(slot, 0) };
-            }
-        }
-        for edge in &m.edges {
-            if let (false, Some((key, value))) = (edge.fired, edge.slots) {
-                // SAFETY: as above.
-                unsafe {
-                    std::ptr::write(key, 0);
-                    std::ptr::write(value, 0);
-                }
-            }
-        }
-    }
-
     /// Structural check: every strong edge of every marked cell, and the
     /// value of every fired conditional edge, resolves to a marked cell.
     /// Cannot detect descriptor *omissions* (that proof is the registry
@@ -2199,82 +2429,81 @@ impl Heap {
         }
     }
 
-    /// Finalize, poison (debug) and free unmarked cells, release empty
-    /// pages, clear waiters and pins. Dead cells pinned for weak handles (see
-    /// `PageMeta::pins`) stay allocated as zombies. The marks stay set: until the next
-    /// collection starts they tell old cells from young ones (see `PageMeta::marks`). Returns
-    /// the live bytes that remain.
-    fn sweep(&mut self) -> usize {
-        let mut live_bytes = 0usize;
-        let mut swept = 0u64;
-        for index in 0..self.pages.len() {
-            let Some(page) = self.pages[index].as_mut() else {
-                continue;
-            };
-            let finalize = self.descs[page.desc.0 as usize].finalize;
-            let mut head: i32 = -1;
-            let mut live = 0usize;
-            for i in 0..page.cells {
-                if bit(&page.marks, i) {
-                    live += 1;
-                    continue;
+    /// Finalize, poison (debug) and free the unmarked cells of the pages a collection of `kind`
+    /// sweeps (a minor collection's young pages, or every page) and of the large cells, release
+    /// emptied pages, clear waiters and pins, and clear the young pages' flags and list. Dead
+    /// cells pinned for weak handles (see `PageMeta::pins`) stay allocated as zombies. The marks
+    /// stay set: until the next collection starts they tell old cells from young ones (see
+    /// `PageMeta::marks`). Returns the bytes freed.
+    fn sweep(&mut self, kind: CollectionKind) -> usize {
+        let young = std::mem::take(&mut self.young_pages);
+        let mut freed = 0usize;
+        let mut swept_pages = 0usize;
+        let mut sweep = |heap: &mut Self, index: usize| {
+            if heap.pages[index].is_some() {
+                swept_pages += 1;
+                freed += heap.sweep_page(index);
+            }
+        };
+        match kind {
+            CollectionKind::Minor => {
+                for &index in &young {
+                    sweep(self, index as usize);
                 }
-                let cell = page.cell_ptr(i) as *mut u64;
-                if bit(&page.allocated, i) {
-                    if !bit(&page.zombies, i) {
-                        swept += 1;
-                        if let Some(finalize) = finalize {
-                            finalize(cell as *mut u8);
-                        }
-                        #[cfg(debug_assertions)]
-                        for w in 1..page.cell_size / 8 {
-                            // SAFETY: the dead cell lies inside this page.
-                            unsafe { std::ptr::write(cell.add(w), POISON) };
-                        }
-                    }
-                    if bit(&page.pins, i) {
-                        // Finalized, but its address stays reserved for weak handles.
-                        set_bit(&mut page.zombies, i, true);
-                        live += 1;
+            }
+            CollectionKind::Major => {
+                for index in 0..self.pages.len() {
+                    sweep(self, index);
+                }
+            }
+        }
+        self.stats.last_pages_swept = swept_pages;
+        // Every page is old until it receives a cell again (pages released above are gone).
+        for &index in &young {
+            if let Some(page) = self.pages[index as usize].as_mut() {
+                page.young = false;
+            }
+        }
+        match kind {
+            // The old pages were left alone: those with free cells are on their classes' lists
+            // still (or current). A young page was taken from its list (or made) since, so it
+            // is on none: put back those that have free cells now.
+            CollectionKind::Minor => {
+                for &index in &young {
+                    let Some(page) = self.pages[index as usize].as_ref() else {
                         continue;
+                    };
+                    let class = &mut self.classes[page.desc.0 as usize][page.class];
+                    if page.free_head >= 0 && class.current != Some(index) {
+                        debug_assert!(!class.avail.contains(&index), "a young page on its list");
+                        class.avail.push(index);
                     }
-                    set_bit(&mut page.zombies, i, false);
-                    set_bit(&mut page.allocated, i, false);
                 }
-                let link = if head < 0 { 0 } else { head as u64 + 1 };
-                // SAFETY: as above; word 0 of a free cell is its free-list link.
-                unsafe { std::ptr::write(cell, link) };
-                head = i as i32;
             }
-            page.free_head = head;
-            page.live = live;
-            page.waiters.fill(0);
-            page.pins.fill(0);
-            let cell_size = page.cell_size;
-            if live == 0 {
-                self.release_page(index);
-            } else {
-                live_bytes += live * cell_size;
-            }
-        }
-        for class in self.classes.iter_mut().flatten() {
-            class.avail.clear();
-        }
-        for (index, page) in self.pages.iter().enumerate() {
-            let Some(page) = page else {
-                continue;
-            };
-            let class = &mut self.classes[page.desc.0 as usize][page.class];
-            if page.free_head >= 0 && class.current != Some(index as u32) {
-                class.avail.push(index as u32);
+            CollectionKind::Major => {
+                for class in self.classes.iter_mut().flatten() {
+                    class.avail.clear();
+                }
+                for (index, page) in self.pages.iter().enumerate() {
+                    let Some(page) = page else {
+                        continue;
+                    };
+                    let class = &mut self.classes[page.desc.0 as usize][page.class];
+                    if page.free_head >= 0 && class.current != Some(index as u32) {
+                        class.avail.push(index as u32);
+                    }
+                }
             }
         }
+        // The list's buffer is kept for the next cycle's young pages.
+        self.young_pages = young;
+        self.young_pages.clear();
+        let mut swept = 0u64;
         let descs = &self.descs;
         self.larges.retain(|&start, large| {
             let pinned = std::mem::take(&mut large.pinned);
             if large.marked {
                 large.waiters = false;
-                live_bytes += large.size;
                 return true;
             }
             large.waiters = false;
@@ -2293,6 +2522,7 @@ impl Heap {
                 large.zombie = true;
                 return true;
             }
+            freed += large.size;
             // SAFETY: allocated in alloc_large with this layout.
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
             false
@@ -2305,7 +2535,62 @@ impl Heap {
         if cfg!(debug_assertions) {
             self.check_page_table();
         }
-        live_bytes
+        freed
+    }
+
+    /// Sweep the page in slot `index` (see [`Heap::sweep`]), releasing it if no cell is left.
+    /// Returns the bytes freed.
+    fn sweep_page(&mut self, index: usize) -> usize {
+        let Some(page) = self.pages[index].as_mut() else {
+            return 0;
+        };
+        let finalize = self.descs[page.desc.0 as usize].finalize;
+        let mut head: i32 = -1;
+        let mut live = 0usize;
+        let mut freed = 0usize;
+        let mut swept = 0u64;
+        for i in 0..page.cells {
+            if bit(&page.marks, i) {
+                live += 1;
+                continue;
+            }
+            let cell = page.cell_ptr(i) as *mut u64;
+            if bit(&page.allocated, i) {
+                if !bit(&page.zombies, i) {
+                    swept += 1;
+                    if let Some(finalize) = finalize {
+                        finalize(cell as *mut u8);
+                    }
+                    #[cfg(debug_assertions)]
+                    for w in 1..page.cell_size / 8 {
+                        // SAFETY: the dead cell lies inside this page.
+                        unsafe { std::ptr::write(cell.add(w), POISON) };
+                    }
+                }
+                if bit(&page.pins, i) {
+                    // Finalized, but its address stays reserved for weak handles.
+                    set_bit(&mut page.zombies, i, true);
+                    live += 1;
+                    continue;
+                }
+                set_bit(&mut page.zombies, i, false);
+                set_bit(&mut page.allocated, i, false);
+                freed += page.cell_size;
+            }
+            let link = if head < 0 { 0 } else { head as u64 + 1 };
+            // SAFETY: as above; word 0 of a free cell is its free-list link.
+            unsafe { std::ptr::write(cell, link) };
+            head = i as i32;
+        }
+        page.free_head = head;
+        page.live = live;
+        page.waiters.fill(0);
+        page.pins.fill(0);
+        self.stats.cells_swept += swept;
+        if live == 0 {
+            self.release_page(index);
+        }
+        freed
     }
 
     /// Debug check, after the pages change in bulk: the page table maps every live page's
@@ -2343,13 +2628,21 @@ impl Heap {
         self.spare_pages.push(page.base);
     }
 
-    /// How many released pages to keep: as many as the allocation budget until the next
-    /// collection can fill, and at least 64. A heap that empties and refills its pages each
-    /// cycle takes them back from the pool, and one that shrank returns what its smaller budget
-    /// will not use.
+    /// How many released pages to keep: as many as allocation until the next collection can
+    /// fill. With a nursery that is its budget, and at least 16 pages; without one, the byte
+    /// budget's room, and at least 64. A heap that empties and refills its pages each cycle
+    /// takes them back from the pool, and one that shrank returns what its smaller budget will
+    /// not use.
     fn spare_page_cap(&self) -> usize {
-        let budget = self.trigger_bytes.saturating_sub(self.allocated_bytes);
-        budget.div_ceil(PAGE_SIZE).max(64)
+        match self.nursery_bytes {
+            Some(nursery) => nursery
+                .div_ceil(PAGE_SIZE)
+                .max(MIN_SPARE_PAGES_WITH_NURSERY),
+            None => {
+                let budget = self.trigger_bytes.saturating_sub(self.allocated_bytes);
+                budget.div_ceil(PAGE_SIZE).max(MIN_SPARE_PAGES)
+            }
+        }
     }
 
     /// Give the spare pages beyond the cap back to the page source, once the sweep has released
@@ -2411,11 +2704,16 @@ impl Heap {
         };
         self.free_page_slots.clear();
         self.page_table.clear();
+        self.young_pages.clear();
+        self.card_cells.clear();
         for class in self.classes.iter_mut().flatten() {
             *class = ClassPages::default();
         }
         self.large_span = (usize::MAX, 0);
         self.allocated_bytes = 0;
+        self.swept_bytes = 0;
+        self.major_due = false;
+        self.major_requested = false;
         self.refresh_due();
         if cfg!(debug_assertions) {
             self.check_page_table();
@@ -3140,19 +3438,6 @@ mod tests {
 
     fn trace_none(_: *const u8, _: &mut dyn FnMut(*const u8)) {}
 
-    /// WeakRef-like cell: word 0 is a weak target slot.
-    fn weak_target(cell: *mut u8, sink: &mut WeakSink) {
-        sink.weak_slot(cell as *mut u64);
-    }
-
-    /// WeakMap-like cell: four (key, value) ephemeron entries.
-    fn weak_entries(cell: *mut u8, sink: &mut WeakSink) {
-        let words = cell as *mut u64;
-        for entry in 0..4 {
-            unsafe { sink.ephemeron(words.add(2 * entry), words.add(2 * entry + 1)) };
-        }
-    }
-
     thread_local! {
         static FIN_COUNT: Cell<usize> = const { Cell::new(0) };
     }
@@ -3165,8 +3450,6 @@ mod tests {
         heap: Heap,
         node: DescId,
         leaf: DescId,
-        weakref: DescId,
-        table: DescId,
         /// A node whose cells gain edges after initialization: its pages end in a card table.
         carded: DescId,
         /// The words the Fixture's client reports as roots. Boxed, off the native stack: a
@@ -3180,35 +3463,18 @@ mod tests {
             let node = heap.register_desc(LayoutDesc {
                 name: "node",
                 trace: trace_node,
-                weak: None,
                 finalize: None,
                 carded: false,
             });
             let leaf = heap.register_desc(LayoutDesc {
                 name: "leaf",
                 trace: trace_none,
-                weak: None,
                 finalize: Some(fin_count),
-                carded: false,
-            });
-            let weakref = heap.register_desc(LayoutDesc {
-                name: "weakref",
-                trace: trace_none,
-                weak: Some(weak_target),
-                finalize: None,
-                carded: false,
-            });
-            let table = heap.register_desc(LayoutDesc {
-                name: "table",
-                trace: trace_none,
-                weak: Some(weak_entries),
-                finalize: None,
                 carded: false,
             });
             let carded = heap.register_desc(LayoutDesc {
                 name: "carded node",
                 trace: trace_node,
-                weak: None,
                 finalize: None,
                 carded: true,
             });
@@ -3216,8 +3482,6 @@ mod tests {
                 heap,
                 node,
                 leaf,
-                weakref,
-                table,
                 carded,
                 roots: Box::new([0; 64]),
             }
@@ -3247,11 +3511,17 @@ mod tests {
             word(p, 1)
         }
 
-        /// Precise collection through the Fixture's client: native frames are
+        /// Precise major collection through the Fixture's client: native frames are
         /// not roots, so death assertions do not depend on what registers
         /// happen to retain.
         fn collect(&mut self) {
             self.collect_with(&no_edges);
+        }
+
+        /// [`Fixture::collect`], minor.
+        fn collect_minor(&mut self) {
+            assert!(self.start_marking_kind(&no_edges, CollectionKind::Minor));
+            self.heap.finish_collection(&[]);
         }
 
         /// [`Fixture::collect`] whose client also reports side-table edges
@@ -3263,11 +3533,20 @@ mod tests {
 
         /// Phase 1 of [`Fixture::collect_with`], without native roots.
         fn start_marking(&mut self, edges: &dyn Fn(&mut EdgeSink<'_>)) -> bool {
+            self.start_marking_kind(edges, CollectionKind::Major)
+        }
+
+        /// [`Fixture::start_marking`] of a collection of `kind`.
+        fn start_marking_kind(
+            &mut self,
+            edges: &dyn Fn(&mut EdgeSink<'_>),
+            kind: CollectionKind,
+        ) -> bool {
             let client = FixtureClient {
                 roots: &self.roots[..],
                 edges,
             };
-            self.heap.start_marking(false, &client)
+            self.heap.start_marking(false, &client, kind)
         }
 
         fn live(&self) -> usize {
@@ -3511,109 +3790,6 @@ mod tests {
     }
 
     #[test]
-    fn in_cell_ephemerons_reach_a_fixed_point_and_clear_dead_entries() {
-        let mut fx = Fixture::new();
-        let table = fx.heap.alloc(fx.table, 64);
-        let [k1, v1, v2, k3, v3] = [0; 5].map(|_| fx.heap.alloc(fx.leaf, 16));
-        // (k1 -> v1), (v1 -> v2): v1 is itself a key, so marking v2 needs
-        // the fixed point. (k3 -> v3) dies with k3.
-        for (entry, (key, value)) in [(k1, v1), (v1, v2), (k3, v3)].into_iter().enumerate() {
-            set_word(table, 2 * entry, tagged(key));
-            set_word(table, 2 * entry + 1, tagged(value));
-        }
-        fx.roots[0] = tagged(table);
-        fx.roots[1] = tagged(k1);
-        fx.collect();
-        assert_eq!(fx.live(), 4, "table, k1, v1, v2");
-        assert_eq!(word(table, 3), tagged(v2));
-        assert_eq!(
-            (word(table, 4), word(table, 5)),
-            (0, 0),
-            "dead-key entry cleared"
-        );
-    }
-
-    #[test]
-    fn unreachable_table_keeps_no_values_alive() {
-        let mut fx = Fixture::new();
-        let table = fx.heap.alloc(fx.table, 64);
-        let key = fx.heap.alloc(fx.leaf, 16);
-        let value = fx.heap.alloc(fx.leaf, 16);
-        set_word(table, 0, tagged(key));
-        set_word(table, 1, tagged(value));
-        fx.roots[0] = tagged(key);
-        fx.collect();
-        assert_eq!(fx.live(), 1, "only the rooted key survives a dead table");
-    }
-
-    #[test]
-    fn weak_slots_clear_dead_targets_and_keep_the_rest() {
-        let mut fx = Fixture::new();
-        let [dead_ref, live_ref, number_ref] = [0; 3].map(|_| fx.heap.alloc(fx.weakref, 16));
-        let dead = fx.heap.alloc(fx.leaf, 16);
-        let live = fx.heap.alloc(fx.leaf, 16);
-        let number = std::f64::consts::PI.to_bits();
-        set_word(dead_ref, 0, tagged(dead));
-        set_word(live_ref, 0, tagged(live));
-        set_word(number_ref, 0, number);
-        for (slot, cell) in [dead_ref, live_ref, number_ref, live]
-            .into_iter()
-            .enumerate()
-        {
-            fx.roots[slot] = tagged(cell);
-        }
-        fx.collect();
-        assert_eq!(word(dead_ref, 0), 0, "dead target cleared");
-        assert_eq!(word(live_ref, 0), tagged(live), "live target kept");
-        assert_eq!(word(number_ref, 0), number, "non-reference word untouched");
-    }
-
-    /// Fill the 4 KiB class (16 cells per page) until `target` is handed
-    /// out again; returns it rooted in `roots[slot]`.
-    fn reuse_cell(fx: &mut Fixture, desc: DescId, target: u64, slot: usize) -> *mut u8 {
-        for _ in 0..64 {
-            let p = fx.heap.alloc(desc, 4096);
-            if p as u64 == target {
-                fx.roots[slot] = tagged(p);
-                return p;
-            }
-        }
-        panic!("cell was not reused");
-    }
-
-    #[test]
-    fn reused_cells_are_unaffected_by_dead_weak_holders() {
-        // Formerly weak slots and ephemerons were registered globally and
-        // outlived their holders: a reused weak-holder cell had an ordinary
-        // word zeroed, and a reused key cell next to a free value cell made
-        // the ephemeron loop spin forever.
-        let mut fx = Fixture::new();
-        // Anchors keep both pages alive, so freed cells are reused in place.
-        let anchor = fx.heap.alloc(fx.leaf, 4096);
-        let anchor_ref = fx.heap.alloc(fx.weakref, 4096);
-        fx.roots[0] = tagged(anchor);
-        fx.roots[3] = tagged(anchor_ref);
-        let table = fx.heap.alloc(fx.table, 4096);
-        let value = fx.heap.alloc(fx.leaf, 4096);
-        let key = fx.heap.alloc(fx.leaf, 4096);
-        set_word(table, 0, tagged(key));
-        set_word(table, 1, tagged(value));
-        let holder = fx.heap.alloc(fx.weakref, 4096);
-        set_word(holder, 0, tagged(key));
-        let (key, holder) = (key as u64, holder as u64);
-        fx.collect();
-        assert_eq!(fx.live(), 2, "only the anchors survive");
-        let (leaf, weakref) = (fx.leaf, fx.weakref);
-        let new_key = reuse_cell(&mut fx, leaf, key, 1);
-        let new_holder = reuse_cell(&mut fx, weakref, holder, 2);
-        let number = std::f64::consts::PI.to_bits();
-        set_word(new_holder, 0, number);
-        fx.collect();
-        assert!(fx.heap.is_allocated_word(new_key as u64));
-        assert_eq!(word(new_holder, 0), number);
-    }
-
-    #[test]
     fn edge_sources_trace_side_tables_through_their_owners() {
         let mut fx = Fixture::new();
         // Map-like side table: (owner, value), reported through the client's
@@ -3733,7 +3909,7 @@ mod tests {
                 (dead_value, dead_owner as u64),
             ],
         };
-        assert!(fx.heap.start_marking(false, &client));
+        assert!(fx.heap.start_marking(false, &client, CollectionKind::Major));
         let dead = fx.heap.dead_cells(fx.leaf);
         assert_eq!(dead.len(), 2);
         assert!(dead.contains(&dead_owner) && dead.contains(&dead_value));
@@ -3755,7 +3931,7 @@ mod tests {
             roots: Vec::new(),
             side_slots: Vec::new(),
         };
-        assert!(fx.heap.start_marking(false, &client));
+        assert!(fx.heap.start_marking(false, &client, CollectionKind::Major));
         let small = fx.heap.alloc(fx.leaf, 16) as usize;
         let large = fx.heap.alloc(fx.leaf, 8192) as usize;
         assert_eq!(fx.heap.dead_cells(fx.leaf), vec![dead]);
@@ -4173,10 +4349,14 @@ mod tests {
         assert!(!due(&fx));
 
         // A request deferred while a collection runs survives its sweep.
-        assert!(fx.heap.start_marking(false, &NoClient));
+        assert!(fx
+            .heap
+            .start_marking(false, &NoClient, CollectionKind::Major));
         {
             let _scope = fx.heap.nogc();
-            assert!(!fx.heap.start_marking(false, &NoClient));
+            assert!(!fx
+                .heap
+                .start_marking(false, &NoClient, CollectionKind::Major));
         }
         fx.heap.finish_collection(&[]);
         assert!(due(&fx) && fx.heap.collection_pending());
@@ -5394,6 +5574,424 @@ mod tests {
         assert_eq!(fx.live(), 2 + 2 + 2);
     }
 
+    /// Whether the cell at `cell` is allocated (a word naming it, for the fixtures below).
+    fn allocated(fx: &Fixture, cell: usize) -> bool {
+        fx.heap.is_allocated_word(cell as u64)
+    }
+
+    /// S6 step 10c: a minor collection frees the young cells nothing reaches, small and large,
+    /// keeps the young cells the roots reach, and traces no old cell whose card is clean: an old
+    /// node whose only holder died, the holder and an old large cell, all unrooted, stay
+    /// allocated through it (only the kept young cell is marked) and die at the next major
+    /// collection. The old cells on the page that took the young ones are kept by its sweep.
+    #[test]
+    fn a_minor_collection_frees_young_garbage_and_keeps_old_cells_it_never_traces() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let held = fx.alloc_node(0, 1) as usize;
+        let holder = fx.alloc_node(tagged(held as *const u8), 2) as usize;
+        let old_large = fx.heap.alloc(fx.leaf, 8192) as usize;
+        fx.roots[0] = tagged(holder as *const u8);
+        fx.roots[1] = tagged(old_large as *const u8);
+        fx.collect();
+        fx.roots[0] = 0;
+        fx.roots[1] = 0;
+        let kept = fx.alloc_node(0, 3) as usize;
+        let garbage = fx.alloc_node(0, 4) as usize;
+        let young_large = fx.heap.alloc(fx.leaf, 8192) as usize;
+        fx.roots[2] = tagged(kept as *const u8);
+        assert_eq!(kept & !(PAGE_SIZE - 1), held & !(PAGE_SIZE - 1), "one page");
+        let marked = fx.heap.stats().cells_marked;
+        fx.collect_minor();
+        assert_eq!(
+            fx.heap.stats().cells_marked - marked,
+            1,
+            "only the young kept cell is marked"
+        );
+        for (cell, live, what) in [
+            (held, true, "the old held node"),
+            (holder, true, "its old holder"),
+            (old_large, true, "the old large cell"),
+            (kept, true, "the kept young node"),
+            (garbage, false, "the young garbage node"),
+            (young_large, false, "the young large cell"),
+        ] {
+            assert_eq!(allocated(&fx, cell), live, "{what}");
+        }
+        assert_eq!(fx.val(kept as *const u8), 3);
+        fx.collect();
+        for cell in [held, holder, old_large] {
+            assert!(
+                !allocated(&fx, cell),
+                "{cell:#x} died at the major collection"
+            );
+        }
+        assert!(allocated(&fx, kept));
+        assert_eq!(fx.heap.minor_collections(), 1);
+    }
+
+    /// A minor collection traces the old cells whose cards are set, though they are marked, and
+    /// every marked cell that starts in such a card (three 48-byte cells start in one): young
+    /// cells only they hold survive it, an unrooted old holder's included (it is traced all the
+    /// same, so its young cell lives until a major collection finds the holder dead). The cards
+    /// are clean afterwards, and the young cells are old.
+    #[test]
+    fn young_cells_held_by_old_cells_with_set_cards_survive_a_minor_collection() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let carded = fx.carded;
+        let cells = fill_page(&mut fx, carded, 48);
+        let (a, b, unrooted) = (cells[0], cells[2], cells[3]);
+        assert_eq!(
+            (a - cells[0]) >> CARD_SHIFT,
+            (b - cells[0]) >> CARD_SHIFT,
+            "one card"
+        );
+        for (slot, cell) in [a, b, unrooted].into_iter().enumerate() {
+            fx.roots[slot] = tagged(cell as *const u8);
+        }
+        fx.collect();
+        fx.roots[2] = 0;
+        let [ya, yb, yu] = [1, 2, 3].map(|val| fx.alloc_node(0, val) as usize);
+        // `a`'s write sets the card `b` starts in too; `unrooted`'s sets its own.
+        // SAFETY: live carded cells.
+        unsafe { card_mark(a as *const u8) };
+        set_word(a as *mut u8, 0, tagged(ya as *const u8));
+        set_word(b as *mut u8, 0, tagged(yb as *const u8));
+        // SAFETY: as above.
+        unsafe { card_mark(unrooted as *const u8) };
+        set_word(unrooted as *mut u8, 0, tagged(yu as *const u8));
+        fx.collect_minor();
+        assert_eq!(fx.heap.stats().last_card_cells, 3, "a, b and unrooted");
+        for cell in [ya, yb, yu] {
+            assert!(
+                allocated(&fx, cell) && is_marked_at(&fx.heap, cell),
+                "{cell:#x}"
+            );
+        }
+        assert!(
+            page_bytes(cells[0])[CARD_TABLE_OFFSET..]
+                .iter()
+                .all(|&card| card == 0),
+            "the cards are clean"
+        );
+        fx.collect();
+        assert!(!allocated(&fx, unrooted) && !allocated(&fx, yu));
+        assert!([a, b, ya, yb].iter().all(|&cell| allocated(&fx, cell)));
+    }
+
+    /// The barrier's check runs as a minor collection starts (debug builds): an old cell
+    /// written with a young cell's address and no card set panics there, before the minor
+    /// collection, which would not trace the old cell, frees the young one.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "(carded node) with a clean card holds an edge to unmarked cell")]
+    fn a_minor_collection_checks_the_barrier_before_it_trusts_the_cards() {
+        let mut fx = Fixture::new();
+        let old = fx.heap.alloc(fx.carded, 16);
+        fx.roots[0] = tagged(old);
+        fx.collect();
+        let young = fx.alloc_node(0, 7);
+        set_word(old, 0, tagged(young));
+        fx.collect_minor();
+    }
+
+    /// A minor collection sweeps the pages that received cells since the last collection and
+    /// no other: four full pages of old cells are left alone while two new pages, and an old
+    /// page that gives a freed cell again, are swept. A major collection sweeps every page.
+    #[test]
+    fn a_minor_collection_sweeps_only_the_young_pages() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let per_page = PAGE_SIZE / 16;
+        // Four full pages of a live chain, and a fifth whose cells but one die.
+        fx.build_chain((per_page * 4) as u64);
+        let survivor = fx.heap.alloc(fx.leaf, 16);
+        for _ in 1..per_page {
+            fx.heap.alloc(fx.leaf, 16);
+        }
+        fx.roots[1] = tagged(survivor);
+        fx.collect();
+        assert_eq!(fx.heap.stats().last_pages_swept, 5);
+        assert_eq!(fx.heap.young_page_count(), 0);
+        // Young leaves on the fifth page (it has free cells), a young node on a new page and a
+        // young large cell (swept with every collection, but not a page).
+        let young: Vec<*mut u8> = (0..10).map(|_| fx.heap.alloc(fx.leaf, 16)).collect();
+        assert!(young
+            .iter()
+            .all(|&leaf| leaf as usize & !(PAGE_SIZE - 1) == survivor as usize & !(PAGE_SIZE - 1)));
+        fx.alloc_node(0, 1);
+        fx.heap.alloc(fx.leaf, 8192);
+        assert_eq!(fx.heap.young_page_count(), 2);
+        let swept = fx.heap.stats().cells_swept;
+        fx.collect_minor();
+        let stats = fx.heap.stats();
+        assert_eq!(stats.last_pages_swept, 2);
+        assert_eq!(
+            stats.cells_swept - swept,
+            12,
+            "ten leaves, a node, a large cell"
+        );
+        assert_eq!(fx.heap.young_page_count(), 0);
+        assert_eq!(stats.pages_live, 5, "the node's page emptied");
+        fx.collect();
+        assert_eq!(fx.heap.stats().last_pages_swept, 5);
+    }
+
+    /// Between a minor collection's phases the dead are the young cells nothing reached: an old
+    /// cell that died since the last collection is marked, so `dead_cells`, `is_dead_small_cell`
+    /// and `is_dead_target` call it live, and a cell allocated meanwhile (black) is live too. The
+    /// next major collection lists the old one.
+    #[test]
+    fn a_minor_collection_finds_only_young_cells_dead() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let old_dead = fx.alloc_node(0, 1) as usize;
+        let old_live = fx.alloc_node(0, 2) as usize;
+        fx.roots[0] = tagged(old_dead as *const u8);
+        fx.roots[1] = tagged(old_live as *const u8);
+        fx.collect();
+        fx.roots[0] = 0;
+        let young_dead = fx.alloc_node(0, 3) as usize;
+        let young_live = fx.alloc_node(0, 4) as usize;
+        fx.roots[2] = tagged(young_live as *const u8);
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        let black = fx.alloc_node(0, 5) as usize;
+        assert_eq!(fx.heap.dead_cells(fx.node), vec![young_dead]);
+        for (cell, dead) in [
+            (old_dead, false),
+            (old_live, false),
+            (young_dead, true),
+            (young_live, false),
+            (black, false),
+        ] {
+            assert_eq!(fx.heap.is_dead_small_cell(cell, fx.node), dead, "{cell:#x}");
+            assert_eq!(fx.heap.is_dead_target(cell), dead, "{cell:#x}");
+        }
+        fx.heap.finish_collection(&[]);
+        assert!(!allocated(&fx, young_dead));
+        assert!(allocated(&fx, old_dead) && allocated(&fx, black));
+        assert!(fx.start_marking(&no_edges));
+        let mut dead = fx.heap.dead_cells(fx.node);
+        dead.sort_unstable();
+        let mut expected = vec![old_dead, black];
+        expected.sort_unstable();
+        assert_eq!(dead, expected);
+        fx.heap.finish_collection(&[]);
+    }
+
+    /// Promotion at first survival: a cell a minor collection keeps is old for the next, and
+    /// the bytes it marked are its promoted bytes. Written with a young cell's address and its
+    /// card set, the promoted cell keeps that cell through the next minor collection; unrooted,
+    /// it stays through a minor collection and dies at a major one.
+    #[test]
+    fn a_cell_that_survives_a_minor_collection_is_old_for_the_next() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let cell = fx.heap.alloc(fx.carded, 16);
+        fx.roots[0] = tagged(cell);
+        fx.collect_minor();
+        assert!(is_marked_at(&fx.heap, cell as usize), "promoted");
+        assert_eq!(fx.heap.stats().last_marked_bytes, 16);
+        let young = fx.alloc_node(0, 9);
+        // SAFETY: a live carded cell.
+        unsafe { card_mark(cell) };
+        set_word(cell, 0, tagged(young));
+        fx.collect_minor();
+        assert!(allocated(&fx, young as usize) && is_marked_at(&fx.heap, young as usize));
+        assert_eq!(fx.heap.stats().last_marked_bytes, 16, "the young node");
+        fx.roots[0] = 0;
+        fx.collect_minor();
+        assert!(allocated(&fx, cell as usize) && allocated(&fx, young as usize));
+        assert_eq!(fx.heap.stats().last_marked_bytes, 0);
+        fx.collect();
+        assert!(!allocated(&fx, cell as usize) && !allocated(&fx, young as usize));
+        assert_eq!(fx.heap.minor_collections(), 3);
+    }
+
+    /// The due logic with a nursery, and the due word with it: a minor collection is due once
+    /// the bytes allocated since the last collection pass the nursery budget; a major one once
+    /// a minor collection leaves the heap holding more than the byte budget (live or not), at
+    /// once and until a major collection runs, which sets the next budget; and a major request
+    /// that is deferred makes one due. Without a nursery the heap asks for major collections.
+    #[test]
+    fn minor_and_major_collections_fall_due_by_their_budgets() {
+        // Declared before the fixture: the word outlives the heap.
+        let word = Box::new(Cell::new(7u64));
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        // SAFETY: `word` outlives the heap and nothing else writes it.
+        unsafe { fx.heap.attach_due_word(NonNull::from(&*word)) };
+        let due = |fx: &Fixture| {
+            assert!(fx.heap.due_word_agrees());
+            word.get() == 1
+        };
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Major, "no nursery");
+        // A nursery of 256 16-byte cells, and a byte budget of 16 KiB.
+        fx.heap.set_heap_growth(16 << 10, 100);
+        fx.heap.set_nursery_bytes(Some(4 << 10));
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        let mut head: *mut u8 = std::ptr::null_mut();
+        // Grow a live chain until a collection is due: the 257th cell passes the nursery.
+        let mut grow = |fx: &mut Fixture| {
+            let mut cells = 0;
+            while !fx.heap.collection_due() {
+                let next = if head.is_null() { 0 } else { tagged(head) };
+                head = fx.alloc_node(next, cells);
+                fx.roots[0] = tagged(head);
+                cells += 1;
+            }
+            cells
+        };
+        for round in 1..=4u64 {
+            assert!(!due(&fx));
+            assert_eq!(grow(&mut fx), 257, "round {round}");
+            assert!(due(&fx));
+            assert_eq!(fx.heap.due_kind(), CollectionKind::Minor, "round {round}");
+            fx.collect_minor();
+            // The heap holds round × 4,112 bytes: past 16 KiB after the fourth round.
+            assert_eq!(
+                (due(&fx), fx.heap.due_kind() == CollectionKind::Major),
+                (round == 4, round == 4),
+                "round {round}"
+            );
+        }
+        fx.collect();
+        assert!(
+            !due(&fx),
+            "a major collection sets the next budget, 2 × 16,448 bytes"
+        );
+        assert_eq!(fx.heap.stats().trigger_bytes, 2 * 4 * 257 * 16);
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        assert_eq!(grow(&mut fx), 257, "the nursery after a major collection");
+        fx.collect_minor();
+        assert!(!due(&fx));
+        // A major request deferred in a no-GC region makes a major collection due.
+        {
+            let _scope = fx.heap.nogc();
+            assert!(!fx.heap.collect_at_safepoint());
+        }
+        assert!(due(&fx));
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Major);
+        fx.collect();
+        assert!(!due(&fx));
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        fx.heap.set_nursery_bytes(None);
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Major, "no nursery");
+    }
+
+    /// A requested major collection makes none due, and makes the next collection the heap asks
+    /// for major, whatever its reason: a minor collection keeps the request, a major one clears
+    /// it.
+    #[test]
+    fn a_requested_major_makes_the_next_collection_major_without_making_one_due() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_nursery_bytes(Some(4 << 10));
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        fx.heap.request_major();
+        assert!(!fx.heap.collection_due());
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Major);
+        fx.collect_minor();
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Major, "kept by a minor");
+        fx.collect();
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        assert!(!fx.heap.collection_due());
+    }
+
+    /// Under a stress interval with a nursery, the collections the heap runs itself are minor
+    /// but for every Mth, which is major; with M = 1 every one is major.
+    #[test]
+    fn stress_collections_are_minor_but_every_mth_is_major() {
+        let mut fx = Fixture::new();
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        fx.heap.set_nursery_bytes(Some(1 << 20));
+        fx.heap.set_stress_every(1);
+        // The kinds of the collections `allocations` allocations run: m minor, M major.
+        let kinds = |fx: &mut Fixture, allocations: usize| {
+            let mut seen = String::new();
+            for _ in 0..allocations {
+                let (all, minor) = (fx.heap.collections(), fx.heap.minor_collections());
+                black_box(fx.heap.alloc(fx.leaf, 16));
+                if fx.heap.collections() > all {
+                    seen.push(if fx.heap.minor_collections() > minor {
+                        'm'
+                    } else {
+                        'M'
+                    });
+                }
+            }
+            seen
+        };
+        fx.heap.set_stress_major_every(3);
+        assert_eq!(kinds(&mut fx, 10), "mmMmmMmmM");
+        fx.heap.set_stress_major_every(1);
+        assert_eq!(kinds(&mut fx, 4), "MMMM");
+        black_box(&top);
+    }
+
+    /// With a nursery the spare pool keeps what the nursery can fill (its budget's pages, at
+    /// least 16), whatever the byte budget.
+    #[test]
+    fn spare_pages_follow_the_nursery_budget() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_heap_growth(8 << 20, 100);
+        fx.heap.set_nursery_bytes(Some(2 << 20));
+        let per_page = PAGE_SIZE / 16;
+        let pages = |fx: &Fixture| {
+            let stats = fx.heap.stats();
+            (stats.pages_live, stats.pages_spare)
+        };
+        for i in 0..per_page * 100 {
+            fx.alloc_node(0, i as u64);
+        }
+        fx.collect_minor();
+        assert_eq!(pages(&fx), (0, 32), "2 MiB: 32 pages");
+        fx.heap.set_nursery_bytes(Some(64 << 10));
+        fx.collect();
+        assert_eq!(pages(&fx), (0, 16), "the floor");
+    }
+
+    /// Pins in minor collections: a pinned young cell that dies becomes a zombie; once its page
+    /// receives no cell, minor collections leave it alone, pinned or not (a pin recorded there
+    /// would outlast the collection); a minor collection that sweeps its page again frees it
+    /// once unpinned, without finalizing it twice.
+    #[test]
+    fn a_minor_collection_keeps_and_frees_zombies_on_the_pages_it_sweeps() {
+        FIN_COUNT.with(|c| c.set(0));
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let anchor = fx.heap.alloc(fx.leaf, 4096);
+        fx.roots[0] = tagged(anchor);
+        fx.collect();
+        let pinned = fx.heap.alloc(fx.leaf, 4096) as usize;
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        assert_eq!(fx.heap.dead_cells(fx.leaf), vec![pinned]);
+        fx.heap.finish_collection(&[pinned]);
+        assert!(allocated(&fx, pinned), "a zombie");
+        assert_eq!(FIN_COUNT.with(|c| c.get()), 1);
+        // Its page received no cell since: pinned again, the pin is not recorded there.
+        assert_eq!(fx.heap.young_page_count(), 0);
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        assert!(fx.heap.dead_cells(fx.leaf).is_empty());
+        fx.heap.finish_collection(&[pinned]);
+        assert!(allocated(&fx, pinned));
+        // A cell taken from the page makes it young: the next minor collection sweeps it, and
+        // frees the zombie, unpinned now (no pin left over from the last collection keeps it).
+        let other = fx.heap.alloc(fx.leaf, 4096) as usize;
+        assert_eq!(other & !(PAGE_SIZE - 1), pinned & !(PAGE_SIZE - 1));
+        fx.collect_minor();
+        assert!(!allocated(&fx, pinned) && !allocated(&fx, other));
+        assert_eq!(
+            FIN_COUNT.with(|c| c.get()),
+            2,
+            "the zombie is not finalized twice"
+        );
+        assert!(allocated(&fx, anchor as usize));
+    }
+
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "heap verifier")]
@@ -5413,14 +6011,12 @@ mod tests {
         let node = heap.register_desc(LayoutDesc {
             name: "node",
             trace: trace_node,
-            weak: None,
             finalize: None,
             carded: false,
         });
         let blob = heap.register_desc(LayoutDesc {
             name: "blob",
             trace: trace_none,
-            weak: None,
             finalize: None,
             carded: false,
         });
@@ -5468,7 +6064,7 @@ mod tests {
                     edges: &no_edges,
                 };
                 let mut collect = || {
-                    assert!(heap.start_marking(false, &client));
+                    assert!(heap.start_marking(false, &client, CollectionKind::Major));
                     heap.finish_collection(&[]);
                 };
                 collect();

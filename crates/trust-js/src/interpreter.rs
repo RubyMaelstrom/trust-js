@@ -4843,7 +4843,14 @@ impl Interp {
         // ECMA-262 #sec-liveness / #sec-weakref-invariants still protect retained
         // objects and the current job: this only coalesces a collection request,
         // honoring the host's existing task deferral and ClearKeptObjects order.
+        // The released graph is mostly old, which a minor collection keeps (S6 step
+        // 10c): the boundary's collection is major. A collection in progress (a host
+        // sweep retiring a context) leaves the request to the boundary's minor one
+        // and the graph to the next major.
         self.gc_task_pending = true;
+        if let Ok(mut core) = self.gc_heap.core.try_borrow_mut() {
+            core.request_major();
+        }
         true
     }
 
@@ -6459,7 +6466,7 @@ impl Interp {
             .is_some_and(|ptr| self.proxies.contains_key(&ptr))
     }
 
-    /// Run a full collection and return the number of reclaimed heap objects.
+    /// Run a full (major) collection and return the number of reclaimed heap objects.
     /// Inlined: the stack below the host's frame is zeroed before the collection's frames are
     /// built (see `gc_collect`).
     #[inline(always)]
@@ -6468,23 +6475,30 @@ impl Interp {
         crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
-        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
+        self.gc_collect_with_cause(
+            crate::value::GcCause::Explicit,
+            Some(crate::gc_core::CollectionKind::Major),
+        );
         let live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_next = self.live_object_limit;
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
     }
 
-    /// Diagnostic collection for embedder graph/barrier conformance tests. There is no nursery:
-    /// this runs a full collection, as [`Interp::collect_garbage_for_host`] does. It is not a
-    /// supported scheduling API.
+    /// Diagnostic collection for embedder graph/barrier conformance tests: a full (major)
+    /// collection, as [`Interp::collect_garbage_for_host`] runs. Host graphs are reported in
+    /// full at every collection, minor or major (`HostGcVisitor::is_minor` is false). It is not
+    /// a supported scheduling API.
     #[doc(hidden)]
     pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
         self.activate_gc_heap();
         let before = crate::value::heap_live_objects(&self.gc_heap);
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
-        self.gc_collect_with_cause(crate::value::GcCause::Explicit);
+        self.gc_collect_with_cause(
+            crate::value::GcCause::Explicit,
+            Some(crate::gc_core::CollectionKind::Major),
+        );
         before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
     }
 
@@ -11232,10 +11246,12 @@ impl Interp {
         }
     }
 
-    /// Allocation safe point. Collects when the heap's byte budget is spent, its stress interval
-    /// reached or a deferred request waits (`gc_heap_due`), or when the live-object count is
-    /// above its ceiling (`gc_next`); if a collection the ceiling made due leaves more than the
-    /// engine's live-object limit alive, throws a RangeError rather than exhaust RAM.
+    /// Allocation safe point. Collects when the heap's nursery or byte budget is spent, its
+    /// stress interval reached or a deferred request waits (`gc_heap_due`): minorly, unless a
+    /// major collection is due. Collects majorly when the live-object count is above its
+    /// ceiling (`gc_next`), counting old objects that died since a collection last marked them;
+    /// if that leaves more than the engine's live-object limit alive, throws a RangeError rather
+    /// than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         // The due word JIT polls read is the core's `collection_due` (debug builds).
         crate::value::debug_assert_due_word(&self.gc_heap);
@@ -11244,13 +11260,16 @@ impl Interp {
         }
         self.gc_weak_metadata_safepoint(false);
         // Only a collection the ceiling makes due enforces the limit: GC stress and the cell
-        // heap's byte budget also collect here, and must not throw again inside the handler
-        // that the room set below lets allocate.
+        // heap's budgets also collect here, and must not throw again inside the handler that
+        // the room set below lets allocate.
         let over_ceiling = crate::value::heap_live_objects(&self.gc_heap) > self.gc_next;
         if !over_ceiling && !self.gc_heap_due() {
             return Ok(());
         }
-        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
+        // A minor collection would leave the old dead counted: the limit is enforced after a
+        // major one.
+        let kind = over_ceiling.then_some(crate::gc_core::CollectionKind::Major);
+        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold, kind);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             eprintln!(
@@ -11320,7 +11339,8 @@ impl Interp {
         if !self.gc_task_pending || self.gc_task_deferred {
             return 0;
         }
-        self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary);
+        // Minor, unless a major collection is due: what a task leaves is mostly young garbage.
+        self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary, None);
         let live = crate::value::heap_live_objects(&self.gc_heap);
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             eprintln!(
@@ -11731,19 +11751,30 @@ impl Interp {
     /// finished callee had used, which the scan took for a root.
     #[inline(always)]
     pub(crate) fn gc_collect(&mut self) {
-        self.gc_heap_collect_explicit();
+        self.gc_heap_collect_explicit(crate::gc_core::CollectionKind::Major);
     }
 
-    /// Account for `len` bytes of new ArrayBuffer data, first collecting once enough has been
-    /// allocated since the last collection that discarded buffers may be holding as much again.
-    /// Called before the data block is allocated, where a collection is a safepoint like any
-    /// allocation of the buffer object itself.
+    /// A minor collection, explicitly: for tests of what one keeps and frees (explicit requests
+    /// are otherwise major). Inlined like `gc_collect`.
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn gc_collect_minor(&mut self) {
+        self.gc_heap_collect_explicit(crate::gc_core::CollectionKind::Minor);
+    }
+
+    /// Account for `len` bytes of new ArrayBuffer data, first collecting (majorly) once enough
+    /// has been allocated since the last major collection that discarded buffers may be holding
+    /// as much again. Called before the data block is allocated, where a collection is a
+    /// safepoint like any allocation of the buffer object itself.
     pub(crate) fn note_buffer_allocation(&mut self, len: usize) {
         self.buffer_gc.since_gc = self.buffer_gc.since_gc.saturating_add(len);
         if self.buffer_gc.since_gc <= self.buffer_gc.trigger || self.gc_suppressed != 0 {
             return;
         }
-        self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold);
+        self.gc_collect_with_cause(
+            crate::value::GcCause::AllocationThreshold,
+            Some(crate::gc_core::CollectionKind::Major),
+        );
         let mut local = 0usize;
         let mut blocks = crate::fasthash::FastSet::default();
         for data in self.array_buffers.values() {
@@ -11774,12 +11805,20 @@ impl Interp {
         }
     }
 
-    pub(crate) fn gc_collect_with_cause(&mut self, cause: crate::value::GcCause) {
-        self.buffer_gc.since_gc = 0;
-        if matches!(cause, crate::value::GcCause::Explicit) {
-            self.gc_heap_collect_explicit();
-        } else {
-            self.gc_heap_collect(cause);
+    /// Collect for `cause`: a collection of `kind`, or with `None` of the kind the heap asks for
+    /// (minor unless a major collection is due; see `Interp::gc_heap_collect`).
+    pub(crate) fn gc_collect_with_cause(
+        &mut self,
+        cause: crate::value::GcCause,
+        kind: Option<crate::gc_core::CollectionKind>,
+    ) {
+        // ArrayBuffer data counts from the last major collection (see `gc_heap_after_sweep`).
+        if kind == Some(crate::gc_core::CollectionKind::Major) {
+            self.buffer_gc.since_gc = 0;
+        }
+        match (cause, kind) {
+            (crate::value::GcCause::Explicit, Some(kind)) => self.gc_heap_collect_explicit(kind),
+            _ => self.gc_heap_collect(cause, kind),
         }
     }
 

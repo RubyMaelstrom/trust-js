@@ -147,6 +147,8 @@ mod loop_completion_tests;
 mod loop_fragment_tests;
 mod lstr;
 mod memory;
+#[cfg(test)]
+mod minor_collection_tests;
 mod modules;
 #[cfg(test)]
 mod native_captures;

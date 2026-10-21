@@ -2397,11 +2397,13 @@ fn live_object_limit_error_handler_can_allocate() {
     }
 }
 
-/// Allocation makes a collection due through the heap's byte budget alone: the live-object
-/// count, which also collected once it grew by 100,000 objects (or an eighth) until P1 S6 step
-/// 9a, only enforces the live-object limit. With this heap's budget floor out of reach, 300,000
-/// objects, half of them kept, are allocated without a collection at every tier; with the
-/// engine's floor back, which they have long spent, the next safepoint collects.
+/// Allocation makes a collection due through the heap's budgets alone: the live-object count,
+/// which also collected once it grew by 100,000 objects (or an eighth) until P1 S6 step 9a,
+/// only enforces the live-object limit. With this heap's nursery budget and byte budget floor
+/// out of reach, 300,000 objects, half of them kept, are allocated without a collection at every
+/// tier; with the engine's nursery budget back, which they have long spent, the next safepoint
+/// collects (minorly: the byte budget's floor stays out of reach, so that no major collection
+/// follows).
 #[test]
 fn object_count_alone_does_not_collect() {
     use crate::bytecode::Tier;
@@ -2417,12 +2419,14 @@ fn object_count_alone_does_not_collect() {
         // embed API's `defer_task_garbage_collection` does.
         engine.interp.gc_task_deferred = true;
         let heap = engine.interp.gc_heap.clone();
-        // This heap's budget floor, which TRUST_JS_GC_MIN_HEAP_BYTES sets for every heap in the
-        // process, at the engine's growth (`gc_collect::configure_heap`).
-        let set_floor = |bytes: usize| heap.core.borrow_mut().set_heap_growth(bytes, 100);
+        // This heap's nursery budget, which TRUST_JS_GC_NURSERY_BYTES sets for every heap in the
+        // process (`gc_collect::configure_heap`).
+        let set_nursery = |bytes: usize| heap.core.borrow_mut().set_nursery_bytes(Some(bytes));
         let collections = || heap.core.borrow().collections();
         let live = || crate::value::heap_live_objects(&heap);
-        set_floor(1 << 40);
+        // The byte budget's floor, which TRUST_JS_GC_MIN_HEAP_BYTES sets, at the engine's growth.
+        heap.core.borrow_mut().set_heap_growth(1 << 40, 100);
+        set_nursery(1 << 40);
         let before = collections();
         let allocated = crate::value::heap_allocated_objects(&heap);
         let source = "var kept = [];
@@ -2437,8 +2441,8 @@ fn object_count_alone_does_not_collect() {
         // Unswept, the dead count as live.
         let unswept = live();
         assert!(unswept >= 300_000, "{tier:?}: {unswept} live objects");
-        // The engine's floor, 8 MiB, which those objects' cells have spent.
-        set_floor(8 << 20);
+        // The engine's nursery budget, 2 MiB, which those objects' cells have spent.
+        set_nursery(2 << 20);
         assert!(heap.core.borrow().collection_due(), "{tier:?}");
         // The next safepoint, this loop's at the latest, collects.
         assert_eq!(
@@ -6265,6 +6269,14 @@ fn deferred_task_gc_preserves_jobs_kept_objects_and_pending_pressure() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         engine.defer_task_garbage_collection(true);
+        // The boundary's collection is minor (S6 step 10c): a nursery larger than the task keeps
+        // the task's objects young for it (as in the high-churn task test).
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_nursery_bytes(Some(16 << 20));
         engine
             .eval_value_interruptible(
                 "var done=false;Promise.resolve().then(()=>done=true);\n\
@@ -6481,6 +6493,15 @@ fn compiled_allocation_guard_accepts_maximum_signed_threshold() {
 #[test]
 fn high_churn_task_collects_after_temporary_roots_are_released() {
     let mut engine = Engine::new();
+    // The boundary's collection is minor (S6 step 10c), so it reclaims the garbage that is
+    // young: a nursery larger than the task keeps the task's objects young until then, where a
+    // minor collection during the task would have made the ones it found reachable old.
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_nursery_bytes(Some(16 << 20));
     let before = engine.ctx().live_object_count();
     let result = engine
         .eval_value_interruptible(
@@ -6495,8 +6516,9 @@ fn high_churn_task_collects_after_temporary_roots_are_released() {
         .run_microtasks_interruptible()
         .expect("task-boundary checkpoint");
     let after_boundary = engine.ctx().live_object_count();
+    // Under GC stress the task's own collections promote its objects before the boundary.
     assert!(
-        after_boundary + 10_000 < before_boundary,
+        crate::gc_test::stress_active() || after_boundary + 10_000 < before_boundary,
         "task boundary retained cyclic garbage: {before_boundary} -> {after_boundary}"
     );
 }
@@ -20370,7 +20392,13 @@ fn retired_settings_request_boundary_collection_without_allocation_pressure() {
         assert_eq!(engine.collect_pending_task_garbage(), 0);
 
         engine.defer_task_garbage_collection(false);
+        // The requested boundary collection is major (S6 step 10c): both Realms are old, having
+        // survived the idle collection above, and a minor collection would keep the abandoned
+        // one.
+        let heap = engine.interp.gc_heap.clone();
+        let minors = heap.core.borrow().minor_collections();
         assert!(engine.collect_pending_task_garbage() > 0);
+        assert_eq!(heap.core.borrow().minor_collections(), minors);
         assert!(!abandoned_ptr.in_map(&engine.ctx().realms));
         assert!(retained_ptr.in_map(&engine.ctx().realms));
         assert!(!engine.has_pending_task_garbage_collection());

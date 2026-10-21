@@ -130,15 +130,15 @@ pub struct NativeGcId {
 
 pub trait HostGcVisitor {
     /// Whether this is a minor (nursery) collection, for which a host could enumerate only its
-    /// young and remembered state. There is no nursery: every collection visits the whole
-    /// graph, so this is false. A future nursery may use it.
+    /// young and remembered state. The collector asks every host for its whole graph at every
+    /// collection, minor or major, so this is false.
     fn is_minor(&self) -> bool {
         false
     }
     /// Declare the old prefix of a host's monotonic native identity domain (every ID below
     /// `first_young_id`) for a minor collection. False means the collection needs the host's
-    /// full native graph; there is no nursery, so every collector returns false. A future
-    /// nursery may use it.
+    /// full native graph; the collector traces host graphs in full at every collection, minor
+    /// or major, so every collector returns false.
     fn native_old_generation(
         &mut self,
         _domain: &'static str,

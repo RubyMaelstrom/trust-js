@@ -234,10 +234,11 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
     }
 }
 
-/// (3) The byte budget, no stress: a loop allocating only strings, which move no live-object
+/// (3) The nursery budget, no stress: a loop allocating only strings, which move no live-object
 /// count, collects within one poll of spending its budget, not at the interrupt divider: the
 /// loop takes fewer polls than the divider's 16384, and the most bytes a collecting poll found
-/// allocated past the trigger stays within one iteration's allocations.
+/// allocated past the budget stays within one iteration's allocations. (Until S6 step 10c the
+/// byte budget made allocation's collections due; the nursery budget does now.)
 #[test]
 fn a_spent_byte_budget_collects_within_one_poll() {
     const SOURCE: &str = r#"
@@ -256,16 +257,16 @@ fn a_spent_byte_budget_collects_within_one_poll() {
     stress(&engine.interp, 0);
     assert_eq!(eval(&mut engine, SOURCE), "6");
     assert_native(&mut engine, &["strings"]);
-    // A budget of a twentieth of the live heap, from a collection now.
+    // A nursery budget of a twentieth of the live heap, from a collection now.
+    engine.interp.gc_collect();
+    let stats = engine.interp.gc_heap.core.borrow().stats();
+    let budget = stats.live_bytes / 20;
     engine
         .interp
         .gc_heap
         .core
         .borrow_mut()
-        .set_heap_growth(16 * 1024, 5);
-    engine.interp.gc_collect();
-    let stats = engine.interp.gc_heap.core.borrow().stats();
-    let budget = stats.trigger_bytes - stats.live_bytes;
+        .set_nursery_bytes(Some(budget));
     let objects = engine.interp.live_object_count();
     let allocations = stats.allocations;
     let before = collections(&engine.interp);
@@ -277,7 +278,7 @@ fn a_spent_byte_budget_collects_within_one_poll() {
     let collected = collections(&engine.interp) - before;
     let cells = engine.interp.gc_heap.core.borrow().stats().allocations - allocations;
     eprintln!(
-        "byte budget: {budget} bytes, {cells} cells over {N} iterations, {collected} \
+        "nursery budget: {budget} bytes, {cells} cells over {N} iterations, {collected} \
          collections, {census:?}"
     );
     assert!(
@@ -421,12 +422,20 @@ fn a_deferred_request_is_honoured_at_the_next_poll() {
 /// [marks()])`, a collection runs where `{x: n}`'s helper returns while the callee and `a`, a
 /// fresh object nothing else holds, wait on the caller's operand stack, and again where the
 /// array's does. `marks()` reports what marked `a` first in the collection at `{x: n}`'s
-/// poll: a root (the activation's operand words), not a stale stack copy. Everything reads
-/// back, and nothing tracked outlives the calls.
+/// poll: a root (the activation's operand words), not a stale stack copy. Every stress
+/// collection is major here: a minor one would not mark `a`, old since the collection at the
+/// poll after `make`'s allocation. Everything reads back, and nothing tracked outlives the
+/// calls.
 #[test]
 fn operand_temporaries_survive_helper_end_polls() {
     let mut engine = jit_engine(0);
     stress(&engine.interp, 1);
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_stress_major_every(1);
     let source = r#"
         function make(tag) { return {tag: tag}; }
         function f(a, o, arr) { return arr[0] + ':' + a.tag + ':' + o.x; }

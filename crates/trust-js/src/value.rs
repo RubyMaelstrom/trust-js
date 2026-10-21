@@ -927,7 +927,6 @@ fn symbol_cell_layout() -> crate::gc_core::LayoutDesc {
     crate::gc_core::LayoutDesc {
         name: "symbol",
         trace: crate::gc_box::trace_none,
-        weak: None,
         finalize: Some(crate::gc_box::finalize::<SymbolData>),
         carded: false,
     }
@@ -2638,14 +2637,12 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let object = core.register_desc(crate::gc_core::LayoutDesc {
         name: "object",
         trace: trace_object_cell,
-        weak: None,
         finalize: Some(finalize_object_cell),
         carded: true,
     });
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
-        weak: None,
         finalize: Some(finalize_scope_cell),
         carded: true,
     });
@@ -2655,7 +2652,6 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let user_fn = core.register_desc(crate::gc_core::LayoutDesc {
         name: "closure",
         trace: trace_user_fn_cell,
-        weak: None,
         finalize: Some(crate::gc_box::finalize::<UserCallable>),
         // A closure's environment is set when the closure is made.
         carded: false,
@@ -2664,7 +2660,6 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
         name: "lazy prototype",
         trace: lazy_function_prototype::trace_cell,
-        weak: None,
         finalize: Some(crate::gc_box::finalize::<LazyFunctionPrototype>),
         // Materialization writes the cell's state (`LazyFunctionPrototype::materialize`).
         carded: true,
@@ -3329,6 +3324,11 @@ static GC_CAUSE_COUNTS: [std::sync::atomic::AtomicU64; 3] =
 /// shell's exit collection is `Explicit`).
 static GC_CAUSE_PAUSE_NANOS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Collections by kind (`gc_core::CollectionKind`: minor, major), and their pause time.
+static GC_KIND_COUNTS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static GC_KIND_PAUSE_NANOS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static GC_OBJECTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_OBJECTS_RECLAIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PEAK_OBJECTS_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3361,6 +3361,7 @@ pub(crate) fn gc_performance_metrics_finish(
     objects_before: usize,
     objects_after: i64,
     cause: GcCause,
+    kind: crate::gc_core::CollectionKind,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -3371,8 +3372,10 @@ pub(crate) fn gc_performance_metrics_finish(
 
     GC_COLLECTIONS.fetch_add(1, Relaxed);
     GC_CAUSE_COUNTS[cause as usize].fetch_add(1, Relaxed);
+    GC_KIND_COUNTS[kind as usize].fetch_add(1, Relaxed);
     GC_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
     GC_CAUSE_PAUSE_NANOS[cause as usize].fetch_add(elapsed, Relaxed);
+    GC_KIND_PAUSE_NANOS[kind as usize].fetch_add(elapsed, Relaxed);
     GC_MAX_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
     GC_PAUSE_BUCKET_COUNTS[bucket].fetch_add(1, Relaxed);
     GC_OBJECTS_SEEN.fetch_add(objects_before, Relaxed);
@@ -3411,16 +3414,24 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
     let cause_pause_seconds = |cause: GcCause| {
         GC_CAUSE_PAUSE_NANOS[cause as usize].load(Relaxed) as f64 / 1_000_000_000.0
     };
+    use crate::gc_core::CollectionKind::{Major, Minor};
+    let kind_pause_seconds = |kind: crate::gc_core::CollectionKind| {
+        GC_KIND_PAUSE_NANOS[kind as usize].load(Relaxed) as f64 / 1_000_000_000.0
+    };
     format!(
-        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_pause_seconds\":{:.9},\"gc_pause_seconds_by_cause\":{{\"allocation_threshold\":{:.9},\"task_boundary\":{:.9},\"explicit\":{:.9}}},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{}{}",
+        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_kinds\":{{\"minor\":{},\"major\":{}}},\"gc_pause_seconds\":{:.9},\"gc_pause_seconds_by_cause\":{{\"allocation_threshold\":{:.9},\"task_boundary\":{:.9},\"explicit\":{:.9}}},\"gc_pause_seconds_by_kind\":{{\"minor\":{:.9},\"major\":{:.9}}},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{}{}",
         GC_COLLECTIONS.load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::AllocationThreshold as usize].load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::TaskBoundary as usize].load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::Explicit as usize].load(Relaxed),
+        GC_KIND_COUNTS[Minor as usize].load(Relaxed),
+        GC_KIND_COUNTS[Major as usize].load(Relaxed),
         pause_nanos as f64 / 1_000_000_000.0,
         cause_pause_seconds(GcCause::AllocationThreshold),
         cause_pause_seconds(GcCause::TaskBoundary),
         cause_pause_seconds(GcCause::Explicit),
+        kind_pause_seconds(Minor),
+        kind_pause_seconds(Major),
         max_pause_nanos as f64 / 1_000_000_000.0,
         GC_OBJECTS_SEEN.load(Relaxed),
         GC_OBJECTS_RECLAIMED.load(Relaxed),

@@ -86,8 +86,10 @@ comment/example in the same change.
   exit (compile attempts/seconds/bytes, inline attempts, lex/parse/bytecode-compile time,
   native-call time, GC pauses and post-GC managed memory). The shell collects once more at
   exit, before printing it, so the GC counts and pauses include that collection (cause
-  `explicit`); pauses are also reported by cause (`gc_pause_seconds_by_cause`, keyed like
-  `gc_causes`). Diagnostic only; excluded from acceptance timing.
+  `explicit`, a major collection). Collections are counted by cause (`gc_causes`) and by kind
+  (`gc_kinds`: `minor`, `major`), and their pauses are also reported by cause
+  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). Diagnostic only;
+  excluded from acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
@@ -103,18 +105,33 @@ comment/example in the same change.
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
 - `TRUST_JS_GC_LOG=1` logs collections.
+- Collections are minor or major. A minor collection traces from the roots and from the old
+  cells (cells an earlier collection kept) whose cards the write barrier set since the last
+  collection, and sweeps only the pages that received cells since then, so an old object that
+  died stays allocated until a major collection, which marks and sweeps everything.
+  Allocation safepoints and task boundaries collect minorly unless a major collection is due;
+  explicit and idle collections, the shell's exit collection, ArrayBuffer pressure and the
+  live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
+  replaces the 2 MiB nursery budget: a minor collection is due once N bytes of cells have
+  been allocated since the last collection (0 turns minor collections off: every collection
+  is then major, due once the allocated bytes pass the byte budget).
+  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
+  the bytes a major collection leaves, at least the floor): a major collection is due once
+  the heap holds more than the budget after a minor collection, its old cells counted whether
+  they live or not. Outside GC stress, cell allocation makes collections due through these
+  budgets alone, and the live-object count only enforces the engine's live-object limit.
 - `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
-  use-after-free can take down the whole run). Debug builds also check the write barrier as
-  every collection starts, so stress checks it at every safepoint: an old cell (one the last
-  collection kept) that holds a cell allocated since must have had its card set when it was
-  written, and a panic `write barrier: old cell …` names both cells.
-  `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
-  each) and released pages kept for reuse (`spare`) after each collection.
-  `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice
-  the live bytes after a collection, at least the floor), for collector tuning: outside GC
-  stress, cell allocation makes a collection due through this budget alone, and the
-  live-object count only enforces the engine's live-object limit. `TRUST_JS_GC_CENSUS=1`
+  use-after-free can take down the whole run). Its collections are minor but for every Mth,
+  which is major (`TRUST_JS_GC_STRESS_MAJOR=M`, 8 by default; 1 makes every one major). Debug
+  builds also check the write barrier as every collection starts, minor or major, so stress
+  checks it at every safepoint: an old cell (one a collection kept) that holds a cell
+  allocated since the last collection must have had its card set when it was written, and a
+  panic `write barrier: old cell …` names both cells.
+  `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
+  small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it; a
+  minor collection's line adds the young pages it swept, the old cells it traced because
+  their cards were set (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
   heap at each collection; diagnostic only). In test builds, `TRUST_JS_GC_WHY=1` records

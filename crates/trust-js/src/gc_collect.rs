@@ -14,20 +14,36 @@
 //! roots belong to its ShadowRealm object, traced once that object is marked, so a realm kept
 //! only by cycles through itself is collected; while code in a realm runs, its roots and its
 //! ShadowRealm object are roots.
+//!
+//! Collections are minor or major (S6 step 10c, `gc_core::CollectionKind`). Allocation
+//! safepoints and task boundaries collect minorly unless a major collection is due; explicit
+//! requests (a host's, a test's, `$262.gc`, the idle and exit collections), ArrayBuffer
+//! pressure and the live-object ceiling collect majorly. Either way the interpreter reports
+//! everything above in full: a minor collection differs in what the heap traces of its old
+//! cells and which pages it sweeps, and the engine's tables lose only the young dead.
 
 use super::*;
 use crate::fasthash::{FastMap, FastSet};
+use crate::gc_core::CollectionKind;
 use crate::gc_native::NativeGcGraph;
 use crate::gc_trace::{GcSink, GcTrace};
 use crate::host::{HostGcVisitor, NativeGcId};
 
-/// The byte budget's floor: below half of it live, a collection is due once this much has been
-/// allocated. Cell allocation makes a collection due through this budget alone (GC stress
-/// aside): it counts every cell, environment records and strings as well as objects, and the
-/// live-object count only enforces the engine's live-object limit (see `Interp::gc_next`). On
-/// the gate fixtures, S2's tripwire measured peak RSS up to 6x higher at 64 MiB than at 8 MiB,
-/// with bytecode-tier time unchanged (docs/v8-chase-2026-10-15.txt, S2 exit gate).
+/// The byte budget's floor. A major collection is due once the heap holds more than the budget
+/// after a minor collection: its old cells, live or not, since minor collections free only young
+/// ones. The budget is max(this floor, twice the bytes the last major collection left). It counts
+/// every cell, environment records and strings as well as objects, and the live-object count
+/// only enforces the engine's live-object limit (see `Interp::gc_next`). On the gate fixtures,
+/// S2's tripwire measured peak RSS up to 6x higher at 64 MiB than at 8 MiB, with bytecode-tier
+/// time unchanged (docs/v8-chase-2026-10-15.txt, S2 exit gate).
 const GC_MIN_HEAP_BYTES: usize = 8 << 20;
+
+/// The nursery budget: a minor collection is due once this many bytes of cells have been
+/// allocated since the last collection (S6 step 10c).
+const GC_NURSERY_BYTES: usize = 2 << 20;
+
+/// Under GC stress, every this many collections the stress makes one major.
+const GC_STRESS_MAJOR_EVERY: usize = 8;
 
 /// Native stack zeroed below a collection's entry before marking (see `gc_core::scrub_stack`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -49,6 +65,19 @@ pub(crate) fn gc_stress() -> usize {
     })
 }
 
+/// `TRUST_JS_GC_STRESS_MAJOR=M`: under GC stress, every Mth collection is major
+/// ([`GC_STRESS_MAJOR_EVERY`] by default; 1 makes every collection major).
+fn gc_stress_major() -> usize {
+    static MAJOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        std::env::var("TRUST_JS_GC_STRESS_MAJOR")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&every| every > 0)
+            .unwrap_or(GC_STRESS_MAJOR_EVERY)
+    })
+}
+
 /// `TRUST_JS_GC_MIN_HEAP_BYTES=N` (diagnostic): the byte-budget floor instead of
 /// [`GC_MIN_HEAP_BYTES`], for collector tuning.
 fn gc_min_heap_bytes() -> usize {
@@ -61,10 +90,26 @@ fn gc_min_heap_bytes() -> usize {
     })
 }
 
+/// `TRUST_JS_GC_NURSERY_BYTES=N` (diagnostic): the nursery budget instead of
+/// [`GC_NURSERY_BYTES`], for collector tuning; 0 turns minor collections off, so that every
+/// collection is major and due once the allocated bytes pass the byte budget.
+fn gc_nursery_bytes() -> Option<usize> {
+    static NURSERY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *NURSERY.get_or_init(|| {
+        let bytes = std::env::var("TRUST_JS_GC_NURSERY_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(GC_NURSERY_BYTES);
+        (bytes > 0).then_some(bytes)
+    })
+}
+
 /// Collection settings for a new Agent heap.
 pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_heap_growth(gc_min_heap_bytes(), 100);
+    core.set_nursery_bytes(gc_nursery_bytes());
     core.set_stress_every(gc_stress());
+    core.set_stress_major_every(gc_stress_major());
     // `TRUST_JS_GC_WHY=1`: record retention paths, which only tests read (see `gc_test::why`).
     #[cfg(test)]
     if std::env::var_os("TRUST_JS_GC_WHY").is_some() {
@@ -358,35 +403,43 @@ impl Interp {
     }
 
     /// Whether a collection should run at this safepoint: the live-object count above its
-    /// ceiling (`gc_next`), the heap's byte budget or stress interval, or a deferred request.
+    /// ceiling (`gc_next`), the heap's nursery or byte budget or stress interval, or a deferred
+    /// request.
     pub(crate) fn gc_heap_due(&self) -> bool {
         crate::value::heap_live_objects(&self.gc_heap) > self.gc_next
             || self.gc_heap.core.borrow().collection_due()
     }
 
-    /// An explicit collection (a host or test request). It usually comes from just above a
-    /// finished job, whose frames left stale cell addresses in the stack the collection's own
-    /// frames are about to reuse. Zero that region first, from the caller's frame (inlined,
-    /// see `Interp::gc_collect`).
+    /// An explicit collection of `kind` (a host or test request). It usually comes from just
+    /// above a finished job, whose frames left stale cell addresses in the stack the
+    /// collection's own frames are about to reuse. Zero that region first, from the caller's
+    /// frame (inlined, see `Interp::gc_collect`).
     #[inline(always)]
-    pub(crate) fn gc_heap_collect_explicit(&mut self) {
+    pub(crate) fn gc_heap_collect_explicit(&mut self, kind: CollectionKind) {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(EXPLICIT_SCRUB_BYTES);
-        self.gc_heap_collect(crate::value::GcCause::Explicit);
+        self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind));
     }
 
-    /// Collect the Agent heap (a no-op in a ShadowRealm's interpreter). Defers, leaving the
-    /// request pending for the next safepoint, inside a no-GC region, while a cell borrow is
-    /// outstanding or on a native stack segment the scanner cannot see.
-    pub(crate) fn gc_heap_collect(&mut self, cause: crate::value::GcCause) {
+    /// Collect the Agent heap (a no-op in a ShadowRealm's interpreter): a collection of `kind`,
+    /// or with `None` of the kind the heap asks for (`gc_core::Heap::due_kind`: minor unless a
+    /// major collection is due). Defers, leaving the request pending for the next safepoint,
+    /// inside a no-GC region, while a cell borrow is outstanding or on a native stack segment
+    /// the scanner cannot see; a deferred major request makes a major collection due.
+    pub(crate) fn gc_heap_collect(
+        &mut self,
+        cause: crate::value::GcCause,
+        kind: Option<CollectionKind>,
+    ) {
         if !self.gc_heap_root() {
             return;
         }
         let heap = self.gc_heap.clone();
-        if heap.core.try_borrow_mut().is_err() {
+        let kind = match heap.core.try_borrow_mut() {
+            Ok(core) => kind.unwrap_or_else(|| core.due_kind()),
             // Requested from inside this collection (a host sweep or Drop): it is running.
-            return;
-        }
+            Err(_) => return,
+        };
         let performance_started = crate::value::gc_performance_metrics_start();
         let objects_before = crate::value::heap_live_objects(&heap);
         // Frames that are live while the native stack is scanned — this one and those of
@@ -395,10 +448,10 @@ impl Interp {
         // address, runs in a sibling call, and the region both calls use is zeroed first.
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
-        let Some(native) = self.gc_heap_mark(&heap) else {
+        let Some(native) = self.gc_heap_mark(&heap, kind) else {
             return;
         };
-        let reclaimed = self.gc_heap_sweep(&heap, native);
+        let reclaimed = self.gc_heap_sweep(&heap, native, kind);
         if crate::value::layout_census::enabled() {
             crate::value::layout_census::sample_live(&heap);
         }
@@ -414,8 +467,19 @@ impl Interp {
         };
         if std::env::var_os("TRUST_JS_GC_LOG").is_some() {
             let stats = heap.core.borrow().stats();
+            let minor = match kind {
+                CollectionKind::Minor => format!(
+                    " young_pages={} card_cells={} promoted={}",
+                    stats.last_pages_swept, stats.last_card_cells, stats.last_marked_bytes
+                ),
+                CollectionKind::Major => String::new(),
+            };
             eprintln!(
-                "[gc-heap] cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor}",
+                match kind {
+                    CollectionKind::Minor => "minor",
+                    CollectionKind::Major => "major",
+                },
                 stats.live_cells,
                 stats.live_bytes,
                 stats.pages_live,
@@ -434,33 +498,38 @@ impl Interp {
                 objects_before.max(0) as usize,
                 live,
                 cause,
+                kind,
             );
         }
     }
 
-    /// Phase 1: mark from this tree's roots, side slots, ephemerons and the native stack.
-    /// `None` when the heap deferred the collection.
+    /// Phase 1: mark from this tree's roots, side slots, ephemerons and the native stack (and,
+    /// in a minor collection, from the heap's old cells whose cards are set). `None` when the
+    /// heap deferred the collection.
     #[inline(never)]
     fn gc_heap_mark(
         &mut self,
         heap: &crate::value::GcHeap,
+        kind: CollectionKind,
     ) -> Option<FastMap<usize, NativeGcGraph>> {
         let marking = Marking::new(self);
         // Building the client just enumerated every Realm member and host value, dead or
         // alive, in frames below this one; the marker's frames reuse that region.
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
-        let started = heap.core.borrow_mut().start_marking(true, &marking);
+        let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
         started.then(|| marking.into_native_graphs())
     }
 
     /// Phase 2: evict the dead from the engine's tables, clear weak handles and free the dead
-    /// cells. Returns how many objects died.
+    /// cells (in a minor collection, the young ones only: the old are marked). Returns how many
+    /// objects died.
     #[inline(never)]
     fn gc_heap_sweep(
         &mut self,
         heap: &crate::value::GcHeap,
         native: FastMap<usize, NativeGcGraph>,
+        kind: CollectionKind,
     ) -> usize {
         // Between the phases every cell is intact and new cells are allocated marked: the
         // engine evicts the dead from its tables while their identities are still stable.
@@ -479,7 +548,7 @@ impl Interp {
         // The heap's bits no longer say what died: from here on only the list's length counts.
         let reclaimed = dead.len();
         drop(dead);
-        self.gc_heap_after_sweep();
+        self.gc_heap_after_sweep(kind);
         reclaimed
     }
 
@@ -502,7 +571,7 @@ impl Interp {
 
     /// Post-sweep bookkeeping for every interpreter in the tree: drop expired inline-cache
     /// pins, deliver destruction notifications and schedule FinalizationRegistry cleanup.
-    fn gc_heap_after_sweep(&mut self) {
+    fn gc_heap_after_sweep(&mut self, kind: CollectionKind) {
         self.gc_prune_dead_pins();
         self.gc_drain_weak_deaths();
         // The finalizers' death notices, just drained, can ready more registries, and every
@@ -514,9 +583,13 @@ impl Interp {
         self.gc_schedule_finalization_cleanup(None);
         self.gc_task_live = crate::value::heap_live_objects(&self.gc_heap);
         self.gc_task_pending = false;
-        self.buffer_gc.since_gc = 0;
+        // ArrayBuffer data counts from the last major collection: a minor one leaves the old
+        // buffers that died, and their data, for a major collection to free.
+        if kind == CollectionKind::Major {
+            self.buffer_gc.since_gc = 0;
+        }
         for child in self.shadow_realms.values_mut() {
-            child.gc_heap_after_sweep();
+            child.gc_heap_after_sweep(kind);
         }
     }
 
@@ -925,12 +998,16 @@ mod tests {
             "done",
         );
         let heap = engine.interp.gc_heap.clone();
-        let native = engine.interp.gc_heap_mark(&heap).expect("not deferred");
+        let major = crate::gc_core::CollectionKind::Major;
+        let native = engine
+            .interp
+            .gc_heap_mark(&heap, major)
+            .expect("not deferred");
         let dead = crate::gc_sweep::DeadObjects::new(&heap);
         for object in dead.iter() {
             assert!(dead.contains(object));
         }
-        engine.interp.gc_heap_sweep(&heap, native);
+        engine.interp.gc_heap_sweep(&heap, native, major);
         dead.contains(dead.iter().next().unwrap_or(0));
     }
 
