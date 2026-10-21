@@ -6226,3 +6226,54 @@ b67238bf, the Windows pages 737e4d31, the tiered gates 873b96d3, 10c
   - Step 9's other open items stand; step 10 closed two of them: the
     task boundary's collection is minor, and the in-cell weak
     callbacks are gone.
+
+Step 11 plan (2026-10-21), from a read-only survey of 5a4a1560
+(target/s6-survey11/report.md) and the owner's decisions:
+- The owner: step 11 replaces the embed API's storable Value outright,
+  with no deprecated compatibility layer, and migrates this
+  repository's users. TRust builds from an old trust-js commit
+  (e3310993 plus a patch, written against the pre-S2 host API) and
+  is ported after the merge review; it constrains nothing here.
+- What the survey found: the embed API hands out raw cell handles.
+  Value is a public Clone enum whose cell variants carry Gc, which is
+  pub, Copy and derefs to RefCell<Object>; a Value kept past its
+  Engine crashes, another Engine accepts it unchecked, and one kept
+  in a Vec across a major collection names another object at the
+  reused address. Rust storage is kept alive only through HostTrace
+  reports (OpState::put and ResourceTable::add require it), reporters
+  and the stack scan. This repository's 13 HostTrace impls only root
+  values; N-API's references (a weak-strong flip), its wraps (weak
+  identity) and wasm's host functions need weak handles. Six Vec
+  builders in node and web hold values across [[Set]], which can
+  collect; N-API references at count 0 stay strong, so wrapped
+  objects never die, and N-API finalizers never run.
+- Step 11 runs as two commits:
+  - 11a, rooted handles: a handle table in each heap's GcState
+    (shared by a ShadowRealm tree): counted strong and weak slots,
+    a free list, the heap's id, never reused, and a flag the heap's
+    release clears, after which every handle is inert. Handle and
+    WeakHandle hold the table and a slot, !Send and !Sync; using
+    one with another Engine is an error. A major collection traces
+    every strong slot; a minor one only the slots written since the
+    last collection, recorded as 10d's tables are, checked in debug
+    builds; weak slots are cleared between a collection's phases.
+    Every value this repository stores moves to handles (the 13
+    HostTrace impls, the runtime's duplicate and batch rooting,
+    N-API's references and wraps with Node-API's count semantics),
+    OpState and ResourceTable stop requiring HostTrace, and the six
+    builders root their values. Value itself does not change yet.
+  - 11b, the scoped call API: values in the embed API carry a
+    generative lifetime (Value<'s>, Ctx<'s>, engine.scope(|cx| ...),
+    natives over for<'s>), so none can be stored or cross a scope or
+    an Engine; strings and BigInts are made through the scope; Gc,
+    WeakGc, Object and Abrupt leave the public API. The host traits
+    lose what nothing uses (internal, supports_native, is_minor,
+    native_old_generation, unstable_collect_young_for_host_tests,
+    HostGc::sweep_gc); HostTrace's endpoints take weak handles;
+    NativeCallableRetained no longer reports values (closures keep
+    them as engine captures), which retires 10b's rescanned
+    natives; RealmEntry becomes a token. About 420 signatures in
+    this repository's crates move with it.
+- Not in step 11: TRust's port; minor-aware host tracing (hosts
+  report in full at every collection); a Vec<Value<'s>> held across
+  a safepoint stays a hole that rooted lists and GC stress guard.
