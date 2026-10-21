@@ -6029,3 +6029,43 @@ reviewed):
     not for djot. The nursery stays 2 MiB by default until 10d,
     which takes the fixed work out of each minor collection, is
     measured; the choice is recorded then.
+
+Step 10d plan (2026-10-21), from 10c's measurement:
+- Where minor collections cost time. 10c's added GC pause per added
+  collection, against 10b (fat LTO): vue about 0.4 ms (14 more
+  collections, +6.0 ms), djot about 0.8 ms (10 more, +7.7 ms),
+  react about 0.1 ms; survey B2 had put a collection's fixed work
+  at 0.3 to 1.7 ms (vue's side-slot owners up to 0.8 ms for 2,883
+  owners, the 912 builtins' [[Realm]] ephemerons 0.13 to 0.22 ms,
+  client roots, table sweeps). A flat profile of 10c (no-LTO,
+  user cycles, call graphs not permitted here) puts the fixtures'
+  GC-named functions at 2.5 to 5% of cycles, the client's own
+  functions at 0.1 to 0.2%: the fixed work is spread through
+  marking, edge registration and hash lookups. On the sustained
+  workload marking is 16% of cycles, tracing 4% and the card scan
+  2%: each minor collection rescans the carded 200,000-element
+  array, every one, not about once per round as the step 10 plan
+  had it.
+- 10d restricts a minor collection's fixed work to what changed
+  since the last collection, each restriction checked in debug
+  builds as each collection starts, as the barrier is:
+  - the [[Realm]] ephemerons of the native functions: in a minor
+    collection only those registered since the last collection;
+    the [[Realm]] table swept from the dead list;
+  - side-slot owners (the 11 tables of gc_side_slot_tables! and
+    the generators): in a minor collection only owners that are
+    young or whose entries were written since the last collection,
+    which the tables record as they are written (an old, clean
+    owner's values are old: the last collection traced them);
+  - WeakMap and WeakSet entries (weak_collection_data): in a minor
+    collection only entries written since the last collection or
+    whose keys are young;
+  - the nursery's default, chosen by 10d's measurement at 1, 2 and
+    4 MiB.
+- Not in 10d: element-range dirtiness (an open item now, its
+  premise corrected: the sustained workload's minor collections
+  each rescan the array; its elements live outside the cell, so a
+  card cannot name a range of them); a per-page summary of the
+  cards (the scan reads every carded page's 512-byte table, 2% of
+  the sustained workload's cycles); cheaper finalization (step
+  12); the client's roots, which every collection reports.
