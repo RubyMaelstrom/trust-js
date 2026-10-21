@@ -5802,3 +5802,18 @@ they are written (an implementation agent's change, reviewed):
     6.5%, the sustained workload 30.2% (jit) and 22.4% (bytecode);
     main's, its exit collection included: 0.9%, 0.4%, 2.8%, 35.0%
     and 28.5%.
+
+Step 10a on Windows, amended after 10b (the review's change): Windows
+takes its GC pages from the allocator again, as before 10a, instead
+of a VirtualAlloc of each page.
+- Why: the dropped-Realm retention flake under Wine (10b's entry)
+  became frequent with 10a's VirtualAlloc of each page, and nothing
+  measured on Windows asked for pages from the OS: 10a's lever was
+  glibc's alignment slack. macOS keeps its mapping of each page
+  (no macOS test host).
+- Gates: zombie-check.sh: x86-64 clippy clean, Windows clippy
+  as its baseline (23 diagnostics); lib suites: x86-64 2099/0/7;
+  Windows under Wine 2091 pass, 3 fail (step 1's snapshot codec
+  tests) and 7 are ignored; the realm tests' module under Wine
+  passes in 15 runs of 15 (10b: 9). Linux builds do not compile
+  the change; rustfmt clean.

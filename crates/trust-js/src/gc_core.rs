@@ -547,8 +547,9 @@ mod page_source {
 
 /// Where the heap's pages come from (see the Linux `page_source`), elsewhere a page at a time,
 /// returned when given back: on macOS a mapping (twice a page mapped, the ends unmapped); on
-/// Windows a VirtualAlloc region, which starts at the 64 KiB allocation granularity; on other
-/// targets the allocator's zeroed 64 KiB-aligned block.
+/// Windows and other targets the allocator's zeroed 64 KiB-aligned block. (Windows mapped each
+/// page with VirtualAlloc from S6 step 10a: a released heap's addresses then went to the next
+/// heap in the same order, and under Wine stale stack words kept dead Realms alive in tests.)
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -621,23 +622,10 @@ mod page_source {
         super::os_pages::map_aligned(PAGE_SIZE, PAGE_SIZE)
     }
 
-    #[cfg(all(
-        target_os = "windows",
-        any(target_arch = "aarch64", target_arch = "x86_64")
-    ))]
-    fn map_page() -> *mut u8 {
-        let base = super::os_pages::map(PAGE_SIZE);
-        assert!(
-            (base as usize).is_multiple_of(PAGE_SIZE),
-            "VirtualAlloc placed a GC page off its 64 KiB allocation granularity"
-        );
-        base
-    }
-
     /// # Safety
     /// `base` is a `map_page` page, which nothing uses any more.
     #[cfg(all(
-        any(target_os = "macos", target_os = "windows"),
+        target_os = "macos",
         any(target_arch = "aarch64", target_arch = "x86_64")
     ))]
     unsafe fn unmap_page(base: *mut u8) {
@@ -646,7 +634,7 @@ mod page_source {
     }
 
     #[cfg(not(all(
-        any(target_os = "macos", target_os = "windows"),
+        target_os = "macos",
         any(target_arch = "aarch64", target_arch = "x86_64")
     )))]
     fn layout() -> std::alloc::Layout {
@@ -654,7 +642,7 @@ mod page_source {
     }
 
     #[cfg(not(all(
-        any(target_os = "macos", target_os = "windows"),
+        target_os = "macos",
         any(target_arch = "aarch64", target_arch = "x86_64")
     )))]
     fn map_page() -> *mut u8 {
@@ -665,7 +653,7 @@ mod page_source {
     /// # Safety
     /// `base` is a `map_page` page, which nothing uses any more.
     #[cfg(not(all(
-        any(target_os = "macos", target_os = "windows"),
+        target_os = "macos",
         any(target_arch = "aarch64", target_arch = "x86_64")
     )))]
     unsafe fn unmap_page(base: *mut u8) {
