@@ -5817,3 +5817,28 @@ of a VirtualAlloc of each page.
   tests) and 7 are ignored; the realm tests' module under Wine
   passes in 15 runs of 15 (10b: 9). Linux builds do not compile
   the change; rustfmt clean.
+
+Gates tiered (2026-10-21, the owner's decision, for the rest of the
+program): a commit's full gates took about two and a half hours,
+four fifths of it per-test GC stress (10b: aarch64 2 h 18 min, 113
+of them stress, 38 of those for the 30 tests of the slow lists;
+zombie about 1 h 50 min, 75 of them stress), and 10b's agent 8.2
+hours, mostly its own stress runs and mutation rebuilds. From 10c's
+review on (the plan's working agreements):
+- Each commit's gate, about half an hour with the two machines in
+  parallel: aarch64 as before, but Test262 at threshold 8 only and
+  per-test GC stress at interval 1 only for a targeted list: the
+  commit's new tests, the tests of the modules it changes and the
+  tests named for the collector (gc_, weak, finaliz, rooting: 178
+  at 10b); zombie its compile checks, its x86-64 and Windows lib
+  suites, its test lists and its release checks (fixtures and
+  difftest).
+- At each step's close and the stage's exit gate: the whole lib
+  suite under GC stress on both machines, the slow lists at their
+  intervals, Test262 at threshold 0 and Test262 on x86-64.
+- Implementation agents run targeted stress only and mutation-check
+  only the key sites; the review's gate covers the rest.
+- The risk accepted: a rooting bug outside a commit's targeted
+  tests shows at the next milestone, to be found among the step's
+  commits, rather than before the commit. The debug builds' barrier
+  check and verifier still run in every lib test's collections.
