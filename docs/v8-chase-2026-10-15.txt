@@ -6069,3 +6069,160 @@ Step 10d plan (2026-10-21), from 10c's measurement:
   cards (the scan reads every carded page's 512-byte table, 2% of
   the sustained workload's cycles); cheaper finalization (step
   12); the client's roots, which every collection reports.
+
+Step 10d, a minor collection's fixed work restricted (an
+implementation agent's change, reviewed):
+- The records: ClientRecords in the heap's GcState (one per
+  ShadowRealm tree) holds what the tables wrote since the last
+  collection: side-slot owners, WeakMap and WeakSet entries by
+  (collection, key), and the native functions registered in the
+  [[Realm]] table. The tables are #[repr(transparent)] newtypes
+  over their maps, so Interp's layout, whose field offsets
+  generated code embeds, is unchanged (the dumps are 10c's): reads
+  go through Deref; every insert or mutable access takes the heap
+  and records, and with no DerefMut an unrecorded write does not
+  compile; removals record nothing. A collection consumes the
+  records once its marking has run, so writes between the phases
+  and after the sweep are kept for the next one; a deferred
+  collection consumes nothing.
+- A minor collection reports only what was recorded: the side-slot
+  owners of the 11 tables and the generators (Realm members,
+  ShadowRealm owners and host owners as before), the recorded
+  WeakMap and WeakSet entries as ephemerons, and the [[Realm]]
+  edges of the functions registered since the last collection;
+  its [[Realm]] table sweep asks the dead list about those
+  functions, or walks the dead list when that is shorter. A major
+  collection reports everything, as before.
+- A deviation from the brief, kept: the brief said "young or
+  recorded"; a young owner, key or built-in was necessarily written
+  after it was allocated, so it is recorded, and finding young ones
+  otherwise would walk the tables, the cost removed. The debug
+  check is the stronger for it: MarkClient::check_records runs in
+  begin_marking after the barrier's and the young pages' checks,
+  reads the last collection's marks (Heap::cell_age), and asserts
+  that every young owner, key and built-in is recorded, that an
+  unrecorded old owner's side slots hold only marked cells, that an
+  unrecorded entry under an old key has a marked value, and that an
+  old built-in not registered since has a marked [[Realm]]; a panic
+  names the table, the owner and the value. A write through a
+  table value's interior mutability would escape the types; the
+  review found none (the values are plain data, Values and handles
+  whose cells have their own cards), and generators leave their
+  table while they run and are inserted, recorded, as they
+  suspend.
+- Tests: 12 in table_record_tests.rs: the client's report (a
+  test-only ClientReport) names the written and young entries and
+  none of the old, clean ones, for each restriction; young values
+  survive minor collections through old entries alone (an old
+  promise's reaction, an old generator's sent value, an old
+  registry's held value, at every tier; each of the 12 tables
+  written from Rust; an old WeakMap key's value; a young built-in's
+  [[Realm]]); dead young built-ins' [[Realm]] entries leave at a
+  minor collection, dead old ones at the next major; five
+  should_panic tests bypass a record. Five call sites pass the heap
+  (memory.rs, prepared_reference_own_tests.rs), their assertions
+  unchanged. Eight mutations (each record removed, each check
+  disabled, the record never consumed, the minor [[Realm]] sweep
+  removed) each made a target test fail.
+- The agent's measurement (no-LTO, 5 rounds, the other cores 0.46
+  busy at the median): collections and outputs the parent's; GC
+  pause at the 2 MiB nursery vue 31.6 to 28.9 ms, react 5.7 to 5.4,
+  djot 27.4 to 26.2, while the sustained workload, which writes no
+  side table, took 6% more GC pause in that build: code generation
+  in the 16-unit no-LTO build (a property lookup's closure no longer
+  inlined, the trace callbacks dearer per call, the same cells
+  traced). Built with fat LTO the tree ran fewer instructions on
+  every workload.
+- Gates (the review's: step 10's close, the tiered gates'
+  milestone, on the reviewed tree):
+  - aarch64: lib 2291/0/7, its test list the parent's plus the 12
+    new tests; clippy clean in the five configurations; rustfmt
+    clean; rustdoc's 40 warnings are 10c's; the workspace builds
+    with all targets without a diagnostic.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0, 21, 6 and 16 collections; difftest 138 agree,
+    12 skipped, no crash. The sustained workload at --tier=jit and
+    bytecode: 194 collections, its output 10c's.
+  - Dumps: identical to 10c's in all three forms, djot's included.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier, poisoning and the
+    barrier's and the records' checks, aarch64, the whole lib suite
+    (2298 tests): 2261 pass at interval 1 (7 are ignored), the slow
+    lists' 25 at 100 and 5 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2125/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2117 pass, 3 fail
+    (step 1's snapshot codec tests) and 7 are ignored. Both lists
+    are the parent's plus the 12 new tests. Test262 at --tier=jit:
+    53575/53575, the report identical to step 1's x86-64 one and the
+    S5 exit gate's aarch64 one. Fixtures: compiles 56/10/160 and 21,
+    6 and 16 collections, outputs as on aarch64; difftest 138 agree,
+    12 skipped, no crash.
+  - Per-test GC stress, x86-64 (zombie), the whole lib suite, 2132
+    tests: 2099 pass and 7 are ignored at interval 1 (2,352 s; 3,792
+    at 10b, when every collection was major); the slow lists' 22
+    pass at 100 and their 4 at 1000.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 10c
+  2a4c5ed657a2, 10d 878d81371e7e from the gated tree at 1, 2 and 4 MiB
+  nurseries, main 311ae9ae5658; copies made together; CPU 5, 15
+  interleaved rounds, medians; the empty script as a control;
+  started once a local inference server had used under 1% of a core
+  and all CPUs under one core for a minute, the other cores 0.37
+  busy (median), 3.84 at most; outputs equal everywhere):
+  - Against 10c at the 2 MiB nursery: GC pause vue -9.3%, react
+    -6.9%, djot -5.5%, the sustained workload -3.5% (jit and
+    bytecode); cycles -0.6% to -1.7% (react +0.3%); peak RSS within
+    1%.
+  - The nursery's size, against 10c at 2 MiB: at 1 MiB peak RSS
+    falls 2% to 7% (vue 32.2, react 22.7, djot 40.6, the sustained
+    workload 82.5 MB) while GC pause rises 6% to 26% and the
+    sustained workload's cycles 7% to 9%; at 4 MiB GC pause falls 9%
+    to 25% and the sustained workload's cycles 4.7% to 5.6%, while
+    peak RSS rises 9% on vue and 20% on react (36.0 and 29.1 MB).
+    The default stays 2 MiB: the nursery's gain is peak RSS, and
+    neither size meets S0's bounds for react's peak RSS or djot's GC
+    time.
+  - Against main, at 2 MiB: cycles vue -12.1%, react -14.6%, djot
+    -8.3%, the sustained workload -33.3% (jit) and -27.4%
+    (bytecode); peak RSS vue +3.8%, react +48%, djot +3.4%, the
+    sustained workload -43%; GC pause over wall time without the
+    exit collection vue 3.8%, react 4.6%, djot 7.8%, the sustained
+    workload 35.6% (jit) and 27.0% (bytecode); main's, its exit
+    collection included, 0.8%, 0.3%, 2.9%, 34.8% and 28.3%.
+
+Step 10 closed (2026-10-21): the plan ac74e0d4, 10a bbf9691b, 10b
+b67238bf, the Windows pages 737e4d31, the tiered gates 873b96d3, 10c
+05defab6, 10d's plan 9546d31b, 10d (this commit).
+- Against 9c (fat LTO; 9c from 10a's run, 10d from its own, main's
+  engine in both with medians within 0.3%): peak RSS vue 43.1 to
+  32.7 MB (-24%), react 37.6 to 24.2 (-36%), djot 44.7 to 42.8
+  (-4%), the sustained workload 183.5 to 85.1 (-54%); the longest
+  pause vue 4.8 to 1.9 ms, react 3.9 to 1.3, djot 4.8 to 3.0, the
+  sustained workload 27.3 to 19.0; GC pause in all vue +13%, react
+  0%, djot +34%, the sustained workload +25%; cycles vue +0.4%,
+  react -0.4%, djot +2.0%, the sustained workload +8.4% (jit) and
+  +5.4% (bytecode), its minor collections each rescanning its
+  200,000-element array.
+- S0's bounds on the fixtures against main: peak RSS at most +25%
+  now holds for vue (+3.8%, +36% at 9c) and djot (+3.4%), not react
+  (+48%, +125% at 9c); GC time at most 5% of elapsed holds for vue
+  (3.8%) and react (4.6%), not djot (7.8%, 6.3% at 9c). The longest
+  pauses are 1.9, 1.3 and 3.0 ms.
+- Open items carried past step 10, each recorded where it arose:
+  - react's peak RSS and djot's GC time over S0's bounds; survey B2
+    put 40-54% of the fixtures' collection time in finalizers, step
+    12's cheaper finalization.
+  - Element-range dirtiness: the sustained workload's minor
+    collections each rescan its array, whose elements live outside
+    the cell (10d's plan).
+  - A per-page summary of the cards: the scan reads every carded
+    page's table, 2% of the sustained workload's cycles (10d's
+    plan).
+  - The nursery's size is fixed at 2 MiB; nothing adapts it.
+  - Windows takes its pages from the allocator, and macOS's mapping
+    of each page has no test host (10a and the Windows pages).
+  - Step 9's other open items stand; step 10 closed two of them: the
+    task boundary's collection is minor, and the in-cell weak
+    callbacks are gone.

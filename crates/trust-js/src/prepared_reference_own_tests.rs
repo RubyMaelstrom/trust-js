@@ -296,6 +296,7 @@ fn prepared_reference_own_exotic_host_and_exhausted_shapes_withdraw_hints() {
     // Registration marks the object as side-table exotic, as install_indexed_properties does.
     owner.borrow().ic_plain.set(false);
     engine.interp.host_indexed.insert(
+        &engine.interp.gc_heap,
         pointer,
         crate::interpreter::HostIndexedProperties {
             length: 0,

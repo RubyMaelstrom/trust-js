@@ -297,21 +297,14 @@ impl Interp {
         else {
             return false;
         };
-        let entries = self
-            .weak_collection_data
-            .get_mut(&owner)
-            .expect("weak collection backing data");
-        let removed = entries.swap_remove(index);
+        let removed = self.weak_collection_data.swap_remove(owner, index);
         let lookup = &mut self
             .weak_collection_index
             .get_mut(&owner)
             .expect("weak collection index")
             .entries;
-        if let Some((moved, _)) = entries.get(index) {
+        if let Some((moved, _)) = self.weak_collection_data[&owner].get(index) {
             lookup.insert(moved.key(), index);
-        }
-        if entries.capacity() > entries.len().saturating_mul(4).max(32) {
-            entries.shrink_to(entries.len().saturating_mul(2).max(16));
         }
         shrink_map(lookup);
         self.weak_metadata
@@ -336,7 +329,9 @@ impl Interp {
                     self.weak_collection_remove(owner, key);
                 }
                 Subscriber::Registry(owner) => {
-                    if let Some(registry) = self.finalization_registries.get_mut(&owner) {
+                    if let Some(registry) =
+                        self.finalization_registries.get_mut(&self.gc_heap, &owner)
+                    {
                         if registry.cells.clear_target(key) != 0 {
                             self.weak_metadata.ready_registries.insert(owner);
                         }
@@ -406,7 +401,7 @@ impl Interp {
             if dead.is_some_and(|dead| dead.contains(owner)) {
                 continue;
             }
-            let Some(registry) = self.finalization_registries.get_mut(&owner) else {
+            let Some(registry) = self.finalization_registries.get_mut(&self.gc_heap, &owner) else {
                 continue;
             };
             if !registry.cleanup_scheduled && registry.cells.has_ready() {
@@ -462,9 +457,9 @@ impl Interp {
             drop(registry);
         }
         shrink_map(&mut self.weak_refs);
-        shrink_map(&mut self.weak_collection_data);
+        self.weak_collection_data.shrink();
         shrink_map(&mut self.weak_collection_index);
-        shrink_map(&mut self.finalization_registries);
+        self.finalization_registries.shrink();
     }
 
     /// Native base constructors graft their internal slots onto a derived instance. Subscription
@@ -488,7 +483,8 @@ impl Interp {
                 self.weak_metadata
                     .unsubscribe(target.key(), Subscriber::Collection(source));
             }
-            self.weak_collection_data.insert(destination, entries);
+            self.weak_collection_data
+                .insert(&self.gc_heap, destination, entries);
             if let Some(index) = self.weak_collection_index.remove(&source) {
                 self.weak_collection_index.insert(destination, index);
             }
@@ -501,7 +497,8 @@ impl Interp {
                 self.weak_metadata
                     .unsubscribe(target.key(), Subscriber::Registry(source));
             }
-            self.finalization_registries.insert(destination, registry);
+            self.finalization_registries
+                .insert(&self.gc_heap, destination, registry);
             if self.weak_metadata.ready_registries.remove(&source) {
                 self.weak_metadata.ready_registries.insert(destination);
             }

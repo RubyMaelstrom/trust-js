@@ -90,7 +90,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         );
         let state = i
             .finalization_registries
-            .get_mut(&ptr)
+            .get_mut(&i.gc_heap, &ptr)
             .expect("brand check found FinalizationRegistry state");
         state.cells.push(crate::interpreter::FinalizationCell {
             target: Some(weak_target),
@@ -115,7 +115,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         }
         let cells = &mut i
             .finalization_registries
-            .get_mut(&ptr)
+            .get_mut(&i.gc_heap, &ptr)
             .expect("brand check found FinalizationRegistry state")
             .cells;
         let mut removed_targets = Vec::new();
@@ -142,6 +142,7 @@ pub(super) fn install_weak_refs(it: &mut Interp) {
         i.gc_pin(&obj);
         let cleanup_callback = i.make_job_callback(arg(a, 0));
         i.finalization_registries.insert(
+            &i.gc_heap,
             ptr,
             crate::interpreter::FinalizationState {
                 cleanup_callback,

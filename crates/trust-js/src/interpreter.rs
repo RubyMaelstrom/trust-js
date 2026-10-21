@@ -3261,7 +3261,7 @@ pub struct Interp {
     /// Per-class metadata (instance fields + whether the class extends another), keyed by the
     /// constructor object's pointer (`Gc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
-    pub(crate) class_info: crate::fasthash::FastMap<usize, ClassInfo>,
+    pub(crate) class_info: gc_collect::SideSlotTable<ClassInfo>,
     /// The global `eval` function object, so a *direct* eval call (`eval(src)` by that name) can be
     /// distinguished from an indirect one and run in the caller's scope.
     pub(crate) eval_fn: Option<Gc>,
@@ -3271,8 +3271,7 @@ pub struct Interp {
     /// Builtin functions' immutable [[Realm]] slots (ECMA-262 CreateBuiltinFunction).
     /// Weak identity pins prevent address reuse without rooting either functions or realms.
     /// The collector activates the owning realm when a registered function is reachable.
-    pub(crate) native_function_realms:
-        RefCell<crate::fasthash::FastMap<usize, (crate::value::WeakGc, usize)>>,
+    pub(crate) native_function_realms: RefCell<gc_collect::NativeFunctionRealms>,
     /// The "no-elements-on-array-protos" protector: `(epoch, clean)` — while `epoch` matches the
     /// live [`crate::value::proto_epoch`], `clean` says the canonical `Array.prototype` →
     /// `Object.prototype` chain has no canonical-index own keys, no exotic hops, and terminates
@@ -3360,17 +3359,15 @@ pub struct Interp {
     /// Live module-namespace state keyed by the namespace object's pointer: for each exported name,
     /// how to read its current value (a live binding in some module scope, or a static value for a
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
-    pub(crate) module_ns: crate::fasthash::FastMap<
-        usize,
-        crate::fasthash::FastMap<String, crate::modules::NsBinding>,
-    >,
+    pub(crate) module_ns:
+        gc_collect::SideSlotTable<crate::fasthash::FastMap<String, crate::modules::NsBinding>>,
     /// Unforgeable Map/Set iterator slots. Live targets are strong edges from the iterator owner;
     /// exhausted iterators keep their brand but release the target and cursor.
     pub(crate) collection_iterators:
-        crate::fasthash::FastMap<usize, crate::ordered_collection::CollectionIterator>,
+        gc_collect::SideSlotTable<crate::ordered_collection::CollectionIterator>,
     /// WeakMap/WeakSet cells. Keys are real weak handles; only WeakMap values are strong, and then
     /// only ephemerally while both the collection and key are live.
-    pub(crate) weak_collection_data: crate::fasthash::FastMap<usize, Vec<(WeakTarget, Value)>>,
+    pub(crate) weak_collection_data: gc_collect::WeakCollectionData,
     /// Object/symbol identity to entry offset for WeakMap/WeakSet. Their order is unobservable, and
     /// ECMA-262 requires average access time sublinear in the collection size; the parallel index
     /// makes get/set/has/delete average O(1) while `weak_collection_data` retains the payload.
@@ -3427,7 +3424,7 @@ pub struct Interp {
     pub(crate) gc_pins: crate::fasthash::FastMap<usize, Gc>,
     /// The backing ArrayBuffer *object* for each TypedArray (so the `buffer` getter can return it
     /// without storing it as an observable own property). Keyed by the TypedArray's pointer.
-    pub(crate) ta_buffer: crate::fasthash::FastMap<usize, Value>,
+    pub(crate) ta_buffer: gc_collect::SideSlotTable<Value>,
     /// Each `ShadowRealm` instance owns an isolated realm (a full sub-interpreter), keyed by the
     /// ShadowRealm object's pointer. Only primitive completion values cross the boundary.
     pub(crate) shadow_realms: crate::fasthash::FastMap<usize, Box<Interp>>,
@@ -3445,10 +3442,10 @@ pub struct Interp {
     /// constructs unbounded dynamic patterns cannot retain them forever.
     pub(crate) regexp_programs: crate::cache::RegexpProgramCache,
     /// Proxy `(target, handler)` pairs, keyed by the proxy object's pointer.
-    pub(crate) proxies: crate::fasthash::FastMap<usize, (Value, Value)>,
+    pub(crate) proxies: gc_collect::SideSlotTable<(Value, Value)>,
     /// Embedder-installed Web IDL indexed properties, keyed by the platform object's pointer.
     /// The object is pinned in `gc_pins`; `getter` is an internal GC edge owned by that object.
-    pub(crate) host_indexed: crate::fasthash::FastMap<usize, HostIndexedProperties>,
+    pub(crate) host_indexed: gc_collect::SideSlotTable<HostIndexedProperties>,
     /// The active `new.target` for the function currently executing (Undefined outside a `new`).
     pub(crate) new_target: Value,
     /// The `new.target` to install for the next constructor invocation (set by `construct`).
@@ -3466,7 +3463,7 @@ pub struct Interp {
     /// symbols are common, so objects cross realm boundaries freely.
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
     /// Promise state keyed by the promise object's pointer.
-    pub(crate) promises: crate::fasthash::FastMap<usize, PromiseState>,
+    pub(crate) promises: gc_collect::SideSlotTable<PromiseState>,
     /// Rejected promises with no handler attached at rejection time (ptr -> reason). Removed when a
     /// handler is later attached; whatever remains after a microtask checkpoint is a genuine
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
@@ -3524,7 +3521,7 @@ pub struct Interp {
     pub(crate) host_state: crate::host::OpState,
     /// Live generator coroutines, keyed by the generator object's pointer. Each owns an explicit
     /// heap VM continuation that parks at `yield`/`await` without reserving an OS thread stack.
-    pub(crate) generators: crate::fasthash::FastMap<usize, crate::coroutine::Coroutine>,
+    pub(crate) generators: gc_collect::SideSlotTable<crate::coroutine::Coroutine>,
     /// The live-object ceiling: a safepoint (`gc_check`, the JIT's entry and loop polls) that
     /// finds the live count above it collects, and throws the limit's RangeError if more than
     /// `live_object_limit` objects stay alive; the record-getter fast path then leaves the call
@@ -3613,11 +3610,11 @@ pub struct Interp {
     pub(crate) deferred_ns_objs: crate::fasthash::FastMap<String, Value>,
     /// Promise-state forwarding: when a native super() grafts a fresh promise's state onto the
     /// subclass `this`, the original object's resolvers redirect here.
-    pub(crate) promise_forward: crate::fasthash::FastMap<usize, Value>,
+    pub(crate) promise_forward: gc_collect::SideSlotTable<Value>,
     /// Mapped `arguments` objects: object ptr → (function scope, per-index parameter name — None
     /// once unmapped by delete/defineProperty). Reads/writes of still-mapped indices alias the
     /// parameter bindings.
-    pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
+    pub(crate) mapped_arguments: gc_collect::SideSlotTable<(Env, Vec<Option<String>>)>,
     /// Live AST-to-VM formal aliases. Allocated only while a sloppy activation needs them.
     pub(crate) borrowed_parameters: Option<borrowed_parameters::Registry>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
@@ -3627,14 +3624,16 @@ pub struct Interp {
     /// Weak-target reverse subscriptions and pinned acyclic-death notifications; no strong edges.
     pub(crate) weak_metadata: crate::weak_metadata::WeakMetadata,
     /// FinalizationRegistry internal slots, keyed by the registry instance.
-    pub(crate) finalization_registries: crate::fasthash::FastMap<usize, FinalizationState>,
+    pub(crate) finalization_registries: gc_collect::SideSlotTable<FinalizationState>,
     /// HostEnqueueFinalizationRegistryCleanupJob captures registries strongly until a later job.
     pub(crate) pending_finalization_cleanup: std::collections::VecDeque<Value>,
     /// Async generators mid-step (running or parked at an `await`): further next/return/throw
     /// requests queue here (the spec's AsyncGeneratorRequest queue) until the step completes.
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
-    pub(crate) async_gen_queue:
-        HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
+    pub(crate) async_gen_queue: gc_collect::SideSlotTable<
+        std::collections::VecDeque<(Value, crate::coroutine::Resume)>,
+        std::collections::hash_map::RandomState,
+    >,
     /// P1 S2: frees this Agent's object cells. Keep it the LAST field: fields drop in
     /// declaration order, and every earlier one may still read objects as it drops.
     #[allow(dead_code)] // held for its Drop
@@ -3922,7 +3921,7 @@ impl Drop for Interp {
         // pointer back to this interpreter. Wake and unwind every such body while `self` is still
         // valid, waiting for acknowledgement before normal field destruction begins.
         let mut coroutines = std::mem::take(&mut self.generators);
-        for coroutine in coroutines.values_mut() {
+        for coroutine in coroutines.values_mut(&self.gc_heap) {
             coroutine.terminate(self);
         }
         // A terminated agent cannot resolve its pending waitAsync promises. Remove its waiter
@@ -4820,7 +4819,7 @@ impl Interp {
         self.host_settings_states
             .retain(|(_, candidate), _| *candidate != context);
         self.microtasks.retain(|job| job.host_context != context);
-        for promise in self.promises.values_mut() {
+        for promise in self.promises.values_mut(&self.gc_heap) {
             promise
                 .reactions
                 .retain(|(fulfilled, rejected, _, candidate)| {
@@ -5085,7 +5084,8 @@ impl Interp {
         let Value::Obj(object) = value else {
             return None;
         };
-        self.promises.get_mut(&(Gc::as_ptr(object) as usize))
+        self.promises
+            .get_mut(&self.gc_heap, &(Gc::as_ptr(object) as usize))
     }
 
     /// A promise's [[PromiseIsHandled]] (None when `promise` is not a promise): whether a
@@ -6721,6 +6721,7 @@ impl Interp {
         self.gc_pin(&object);
         object.borrow().ic_plain.set(false);
         self.host_indexed.insert(
+            &self.gc_heap,
             ptr,
             HostIndexedProperties {
                 length,
@@ -6758,7 +6759,10 @@ impl Interp {
             None => (None, None),
         };
         self.host_indexed
-            .get_mut(&(Gc::as_ptr(target.as_obj().unwrap()) as usize))
+            .get_mut(
+                &self.gc_heap,
+                &(Gc::as_ptr(target.as_obj().unwrap()) as usize),
+            )
             .unwrap()
             .live = Some(Rc::new(HostIndexedLive {
             state,
@@ -7175,9 +7179,10 @@ impl Interp {
     }
 
     pub(crate) fn register_native_realm(&self, function: &Gc) {
-        self.native_function_realms.borrow_mut().insert(
-            Gc::as_ptr(function) as usize,
-            (Gc::downgrade(function), Gc::as_ptr(&self.global) as usize),
+        self.native_function_realms.borrow_mut().register(
+            &self.gc_heap,
+            function,
+            Gc::as_ptr(&self.global) as usize,
         );
     }
 
@@ -7269,6 +7274,7 @@ impl Interp {
         object.borrow().ic_plain.set(false);
         self.gc_pin(&object);
         self.host_indexed.insert(
+            &self.gc_heap,
             ptr,
             HostIndexedProperties {
                 length: 0,
@@ -10065,7 +10071,7 @@ impl Interp {
 
     /// Unmap an `arguments` index (delete / defineProperty severs the parameter alias).
     pub(crate) fn unmap_argument(&mut self, ptr: usize, key: &str) {
-        if let Some((_, names)) = self.mapped_arguments.get_mut(&ptr) {
+        if let Some((_, names)) = self.mapped_arguments.get_mut(&self.gc_heap, &ptr) {
             if let Some(idx) = crate::value::canonical_index(key) {
                 if let Some(slot) = names.get_mut(idx as usize) {
                     *slot = None;
@@ -11433,6 +11439,7 @@ impl Interp {
         &mut self,
         garbage_objects: &crate::gc_sweep::DeadObjects<'_>,
         native: &crate::gc_native::NativeGcGraph,
+        kind: crate::gc_core::CollectionKind,
     ) {
         self.host_state.sweep_gc_with_native(
             &|value| match value {
@@ -11463,10 +11470,7 @@ impl Interp {
 
         // Evict the dead from pointer-keyed side tables, so that a future object reusing an
         // address can't inherit stale metadata.
-        self.native_function_realms.get_mut().retain(|_, (pin, _)| {
-            pin.upgrade()
-                .is_some_and(|function| !garbage_objects.contains(Gc::as_ptr(&function) as usize))
-        });
+        self.gc_sweep_native_realms(garbage_objects, kind);
         // Evict the chosen dead set in batches. Probing all internal-slot tables for each
         // ordinary function/prototype makes closure churn pay for unrelated platform state.
         // Small dead sets keep directed removal; dense churn scans each table only once.
@@ -11661,23 +11665,23 @@ impl Interp {
             pending_finalization_cleanup: _,
             heap_release: _,
         } = self;
-        crate::gc_sweep::map(class_info, dead);
+        class_info.evict_dead(dead);
         crate::gc_sweep::set(eval_realm_fns, dead);
-        crate::gc_sweep::map(module_ns, dead);
+        module_ns.evict_dead(dead);
         crate::gc_sweep::map(realms, dead);
-        crate::gc_sweep::map(collection_iterators, dead);
+        collection_iterators.evict_dead(dead);
         crate::gc_sweep::map(typed_arrays, dead);
         crate::gc_sweep::map(data_views, dead);
         crate::gc_sweep::map(regexps, dead);
-        crate::gc_sweep::map(proxies, dead);
-        crate::gc_sweep::map(host_indexed, dead);
-        crate::gc_sweep::map(promises, dead);
+        proxies.evict_dead(dead);
+        host_indexed.evict_dead(dead);
+        promises.evict_dead(dead);
         crate::gc_sweep::map(temporal, dead);
         crate::gc_sweep::map(array_buffers, dead);
         crate::gc_sweep::map(native_buffers, dead);
         crate::gc_sweep::map(array_buffer_versions, dead);
         crate::gc_sweep::map(array_buffer_dirty_ranges, dead);
-        crate::gc_sweep::map(ta_buffer, dead);
+        ta_buffer.evict_dead(dead);
         if !shadow_realms.is_empty() {
             let collected: Vec<usize> = shadow_realms
                 .keys()
@@ -11692,13 +11696,13 @@ impl Interp {
         }
         crate::gc_sweep::set(immutable_buffers, dead);
         crate::gc_sweep::set(host_keyed_buffers, dead);
-        crate::gc_sweep::map(generators, dead);
+        generators.evict_dead(dead);
         crate::gc_sweep::set(async_gens, dead);
         crate::gc_sweep::set(async_gen_busy, dead);
-        crate::gc_sweep::map(async_gen_queue, dead);
-        crate::gc_sweep::map(mapped_arguments, dead);
+        async_gen_queue.evict_dead(dead);
+        mapped_arguments.evict_dead(dead);
         crate::gc_sweep::map(deferred_ns, dead);
-        crate::gc_sweep::map(promise_forward, dead);
+        promise_forward.evict_dead(dead);
         crate::gc_sweep::map(temporal_cal, dead);
         crate::gc_sweep::map(gc_pins, dead);
     }
@@ -12725,8 +12729,11 @@ impl Interp {
             }
             if names.iter().any(Option::is_some) {
                 self.gc_pin(&ao);
-                self.mapped_arguments
-                    .insert(Gc::as_ptr(&ao) as usize, (scope.clone(), names));
+                self.mapped_arguments.insert(
+                    &self.gc_heap,
+                    Gc::as_ptr(&ao) as usize,
+                    (scope.clone(), names),
+                );
             }
         }
         ao
@@ -15247,7 +15254,7 @@ impl Interp {
         if let Value::Obj(value) = &object {
             self.gc_pin(value);
             self.generators
-                .insert(Gc::as_ptr(value) as usize, continuation);
+                .insert(&self.gc_heap, Gc::as_ptr(value) as usize, continuation);
             if func.is_async {
                 self.async_gens.insert(Gc::as_ptr(value) as usize);
             }
@@ -15324,7 +15331,8 @@ impl Interp {
         let promise = self.new_promise();
         if let Value::Obj(o) = &promise {
             self.gc_pin(o);
-            self.generators.insert(Gc::as_ptr(o) as usize, coro);
+            self.generators
+                .insert(&self.gc_heap, Gc::as_ptr(o) as usize, coro);
         }
         let key = match &promise {
             Value::Obj(o) => Gc::as_ptr(o) as usize,
@@ -15354,9 +15362,9 @@ impl Interp {
         let suspend = coro.resume(self, signal);
         match suspend {
             Suspend::Await(awaited) => {
-                self.generators.insert(key, coro); // still running
-                                                   // Await → PromiseResolve(%Promise%, value); its abrupt (a poisoned `constructor`
-                                                   // getter) throws at the `await` itself.
+                self.generators.insert(&self.gc_heap, key, coro); // still running
+                                                                  // Await → PromiseResolve(%Promise%, value); its abrupt (a poisoned `constructor`
+                                                                  // getter) throws at the `await` itself.
                 let px = match self.promise_resolve_checked(awaited) {
                     Ok(p) => p,
                     Err(e) => {
@@ -15383,7 +15391,7 @@ impl Interp {
         // A request while a step is in progress (running or awaiting) queues behind it.
         if self.async_gen_busy.contains(&key) {
             self.async_gen_queue
-                .entry(key)
+                .entry(&self.gc_heap, key)
                 .or_default()
                 .push_back((r, signal));
             return;
@@ -15397,7 +15405,7 @@ impl Interp {
     pub(crate) fn finish_async_gen_step(&mut self, key: usize) {
         match self
             .async_gen_queue
-            .get_mut(&key)
+            .get_mut(&self.gc_heap, &key)
             .and_then(|q| q.pop_front())
         {
             Some((r, signal)) => self.drive_async_gen_inner(key, r, signal),
@@ -15423,7 +15431,7 @@ impl Interp {
             }
         };
         if coro.done() {
-            self.generators.insert(key, coro);
+            self.generators.insert(&self.gc_heap, key, coro);
             match signal {
                 Resume::Throw(e) => {
                     self.reject_promise(&r, e);
@@ -15449,12 +15457,12 @@ impl Interp {
         // running the body.
         if !coro.started() {
             if let Resume::Return(v) = signal {
-                self.generators.insert(key, coro);
+                self.generators.insert(&self.gc_heap, key, coro);
                 return self.async_gen_await_return(key, r, v);
             }
         }
         let suspend = coro.resume(self, signal);
-        self.generators.insert(key, coro);
+        self.generators.insert(&self.gc_heap, key, coro);
         match suspend {
             Suspend::Yield(v) => {
                 let res = self.iter_result_obj(v, false);

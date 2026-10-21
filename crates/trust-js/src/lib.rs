@@ -200,6 +200,8 @@ mod string_concat_tests;
 mod string_replace_split_tests;
 #[cfg(test)]
 mod string_slice_tests;
+#[cfg(test)]
+mod table_record_tests;
 mod tagged;
 mod temporal;
 mod tiering;

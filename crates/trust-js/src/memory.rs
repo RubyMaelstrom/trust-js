@@ -3469,7 +3469,7 @@ mod tests {
         engine
             .interp
             .async_gen_queue
-            .entry(request_key)
+            .entry(&engine.interp.gc_heap, request_key)
             .or_default()
             .push_back((
                 Value::lstr("queued request promise"),
@@ -3603,10 +3603,12 @@ mod tests {
 
         engine.interp.gc_pins.insert(identity, object.clone());
         engine.interp.proxies.insert(
+            &engine.interp.gc_heap,
             identity,
             (Value::Obj(object.clone()), Value::Obj(object.clone())),
         );
         engine.interp.host_indexed.insert(
+            &engine.interp.gc_heap,
             identity,
             crate::interpreter::HostIndexedProperties {
                 length: 1,
@@ -3628,10 +3630,11 @@ mod tests {
         );
         let mut mapped_names = Vec::with_capacity(5);
         mapped_names.push(Some("mappedParameterWithCapacity".to_string()));
-        engine
-            .interp
-            .mapped_arguments
-            .insert(identity, (engine.interp.global_env.clone(), mapped_names));
+        engine.interp.mapped_arguments.insert(
+            &engine.interp.gc_heap,
+            identity,
+            (engine.interp.global_env.clone(), mapped_names),
+        );
         engine.interp.module_source_objs.insert(
             "source/module.js".to_string(),
             Value::lstr("module source payload"),

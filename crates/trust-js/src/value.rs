@@ -2547,6 +2547,13 @@ pub(crate) struct GcState {
     /// finds its function dead (`Interp::gc_heap_sweep`), like the interpreters' owner tables
     /// (I8).
     pub(crate) rescanned_natives: RefCell<crate::fasthash::FastSet<usize>>,
+    /// S6 step 10d: what the tables of this heap's interpreters wrote since the last
+    /// collection's marking consumed it, which a minor collection reports instead of the tables
+    /// (see `gc_collect::ClientRecords`).
+    pub(crate) records: RefCell<crate::interpreter::gc_collect::ClientRecords>,
+    /// What the client of this heap's last collection reported (test builds).
+    #[cfg(test)]
+    pub(crate) client_report: RefCell<crate::interpreter::gc_collect::ClientReport>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -3485,6 +3492,9 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         interned_strings: RefCell::default(),
         template_roots: RefCell::default(),
         rescanned_natives: RefCell::default(),
+        records: RefCell::default(),
+        #[cfg(test)]
+        client_report: RefCell::default(),
     });
     // SAFETY: the word lives in this heap's `GcState`, which the `Rc` keeps at one address for
     // as long as the core, one of its fields, lives; nothing but the core writes it.

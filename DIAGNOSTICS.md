@@ -107,8 +107,10 @@ comment/example in the same change.
 - `TRUST_JS_GC_LOG=1` logs collections.
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
-  collection, and sweeps only the pages that received cells since then, so an old object that
-  died stays allocated until a major collection, which marks and sweeps everything.
+  collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
+  WeakSet entries, built-ins' [[Realm]]) only the entries written since then, and sweeps only
+  the pages that received cells since then, so an old object that died stays allocated until a
+  major collection, which marks and sweeps everything.
   Allocation safepoints and task boundaries collect minorly unless a major collection is due;
   explicit and idle collections, the shell's exit collection, ArrayBuffer pressure and the
   live-object limit collect majorly. For collector tuning, `TRUST_JS_GC_NURSERY_BYTES=N`
@@ -127,7 +129,11 @@ comment/example in the same change.
   builds also check the write barrier as every collection starts, minor or major, so stress
   checks it at every safepoint: an old cell (one a collection kept) that holds a cell
   allocated since the last collection must have had its card set when it was written, and a
-  panic `write barrier: old cell …` names both cells.
+  panic `write barrier: old cell …` names both cells. The side tables' records are checked
+  the same way: a side-table entry that holds such a cell, or belongs to such a cell, must
+  have been recorded when it was written, and a panic `side-slot table …`,
+  `weak_collection_data: …` or `native_function_realms: …` names the table, the owner and
+  the value.
   `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
   small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it; a
   minor collection's line adds the young pages it swept, the old cells it traced because

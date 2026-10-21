@@ -943,6 +943,25 @@ pub(crate) trait MarkClient {
     fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64));
     /// Ephemeron entries kept in side tables (WeakMap/WeakSet data).
     fn ephemerons(&self, sink: &mut EdgeSink<'_>);
+    /// Debug builds, as each collection starts (beside the write barrier's check, before any
+    /// mark is cleared): check what the embedder recorded since the last collection against
+    /// that collection's marks, read with [`Heap::cell_age`], and panic on a violation. A minor
+    /// collection's client may report only what changed since the last collection (S6 step
+    /// 10d): an old owner whose entries were not written holds old values, which the last
+    /// collection traced.
+    fn check_records(&self, _heap: &Heap) {}
+}
+
+/// What the marks say of an allocated cell between collections, and as one starts before its
+/// marks are cleared: the last collection's verdict ([`Heap::cell_age`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CellAge {
+    /// A collection marked it: it survived the last collection, or was allocated during one.
+    Old,
+    /// Allocated since the last collection, and unmarked.
+    Young,
+    /// Dead and finalized, its address kept for weak handles (a zombie): no edge may name it.
+    Dead,
 }
 
 /// The client of a collection driven by the heap itself. It reports nothing: such a collection
@@ -1631,6 +1650,36 @@ impl Heap {
         self.locate(word).map(|cell| cell.start as *const u8)
     }
 
+    /// The age of the allocated cell that `word` resolves to, as marking resolves it (interior
+    /// and packed words included); `None` when it names no allocated cell of this heap. Between
+    /// collections, and as one starts before its marks are cleared
+    /// ([`MarkClient::check_records`]), the marks are the last collection's.
+    pub(crate) fn cell_age(&self, word: u64) -> Option<CellAge> {
+        let cell = self.locate(word)?;
+        let (allocated, zombie, marked) = match cell.loc {
+            Loc::Small { page, index } => {
+                let page = self.pages[page as usize].as_ref()?;
+                let index = index as usize;
+                (
+                    bit(&page.allocated, index),
+                    bit(&page.zombies, index),
+                    bit(&page.marks, index),
+                )
+            }
+            Loc::Large => {
+                let large = self.larges.get(&cell.start)?;
+                (true, large.zombie, large.marked)
+            }
+        };
+        allocated.then_some(if zombie {
+            CellAge::Dead
+        } else if marked {
+            CellAge::Old
+        } else {
+            CellAge::Young
+        })
+    }
+
     fn is_marked(&self, cell: &CellRef) -> bool {
         match cell.loc {
             Loc::Small { page, index } => self.pages[page as usize]
@@ -1999,7 +2048,7 @@ impl Heap {
         self.marked_bytes = 0;
         self.refresh_due();
         self.stats.collections += 1;
-        self.begin_marking(kind);
+        self.begin_marking(kind, client);
         // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
         // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
         // before a collection.
@@ -2049,17 +2098,19 @@ impl Heap {
     }
 
     /// As a collection starts: in debug builds, check the write barrier's invariant against the
-    /// last collection's marks and the cards set since ([`Heap::check_write_barrier`]), and the
-    /// young pages' bookkeeping ([`Heap::check_young_pages`]). Then a major collection clears
-    /// every mark and every card, so that marking starts from nothing; a minor one gathers the
-    /// old cells whose cards are set into `card_cells` (S6 step 10c) and clears those cards.
-    /// Either way the next collection's cards record only what is written from now on. Out of
-    /// line, so that `mark_phase` can zero the frames it used (see there).
+    /// last collection's marks and the cards set since ([`Heap::check_write_barrier`]), the
+    /// young pages' bookkeeping ([`Heap::check_young_pages`]) and the client's records of what
+    /// changed since ([`MarkClient::check_records`]). Then a major collection clears every mark
+    /// and every card, so that marking starts from nothing; a minor one gathers the old cells
+    /// whose cards are set into `card_cells` (S6 step 10c) and clears those cards. Either way
+    /// the next collection's cards record only what is written from now on. Out of line, so
+    /// that `mark_phase` can zero the frames it used (see there).
     #[inline(never)]
-    fn begin_marking(&mut self, kind: CollectionKind) {
+    fn begin_marking(&mut self, kind: CollectionKind, client: &dyn MarkClient) {
         if cfg!(debug_assertions) {
             self.check_write_barrier();
             self.check_young_pages();
+            client.check_records(self);
         }
         match kind {
             CollectionKind::Major => {

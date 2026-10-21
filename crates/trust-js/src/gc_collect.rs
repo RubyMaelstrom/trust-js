@@ -18,16 +18,21 @@
 //! Collections are minor or major (S6 step 10c, `gc_core::CollectionKind`). Allocation
 //! safepoints and task boundaries collect minorly unless a major collection is due; explicit
 //! requests (a host's, a test's, `$262.gc`, the idle and exit collections), ArrayBuffer
-//! pressure and the live-object ceiling collect majorly. Either way the interpreter reports
-//! everything above in full: a minor collection differs in what the heap traces of its old
-//! cells and which pages it sweeps, and the engine's tables lose only the young dead.
+//! pressure and the live-object ceiling collect majorly. A minor collection differs in what the
+//! heap traces of its old cells and which pages it sweeps, and the engine's tables lose only the
+//! young dead. A major collection's client reports everything above in full; a minor one's
+//! reports the roots, Realm groups and host graphs in full, but of the side-slot tables, the
+//! WeakMap and WeakSet entries and the native functions' [[Realm]] edges only what was written
+//! since the last collection (S6 step 10d, [`ClientRecords`]): an old entry that has not been
+//! written since holds old values, which the last collection traced.
 
 use super::*;
 use crate::fasthash::{FastMap, FastSet};
-use crate::gc_core::CollectionKind;
+use crate::gc_core::{CellAge, CollectionKind};
 use crate::gc_native::NativeGcGraph;
 use crate::gc_trace::{GcSink, GcTrace};
 use crate::host::{HostGcVisitor, NativeGcId};
+use crate::value::GcState;
 
 /// The byte budget's floor. A major collection is due once the heap holds more than the budget
 /// after a minor collection: its old cells, live or not, since minor collections free only young
@@ -130,6 +135,304 @@ fn value_word(value: &Value) -> Option<u64> {
     value.cell_word()
 }
 
+/// S6 step 10d: what the interpreters sharing a heap (a ShadowRealm tree) wrote since the last
+/// collection's marking consumed it: the side-slot owners, WeakMap and WeakSet entries and
+/// native functions' [[Realm]] registrations that a minor collection reports instead of whole
+/// tables. The tables record into it as they are written ([`SideSlotTable`],
+/// [`WeakCollectionData`], [`NativeFunctionRealms`]), each through the only methods that write
+/// them. It lives in the heap's `GcState`, not beside each table, so that the tables keep the
+/// size of the maps they wrap: generated code embeds `Interp`'s field offsets.
+///
+/// Each collection's marking consumes it once marked ([`ClientRecords::consume`]): what is
+/// written from then on, between the phases and after the sweep included, is recorded for the
+/// next collection. A deferred collection consumes nothing.
+#[derive(Default)]
+pub(crate) struct ClientRecords {
+    /// The owners whose entries in a side-slot table were inserted or handed out mutably.
+    side_slot_owners: FastSet<usize>,
+    /// The WeakMap and WeakSet entries written, by (collection, key).
+    weak_entries: FastSet<(usize, WeakKey)>,
+    /// The native functions registered in `native_function_realms`, in order.
+    native_functions: Vec<usize>,
+    /// What `native_functions` held when the collection in progress consumed it: the functions
+    /// its [[Realm]] sweep looks at in a minor collection (`Interp::gc_sweep_native_realms`).
+    native_functions_swept: Vec<usize>,
+}
+
+impl ClientRecords {
+    /// The collection in progress has marked: start recording for the next one, keeping the
+    /// functions registered since the last collection for this one's [[Realm]] sweep.
+    fn consume(&mut self) {
+        fn clear<T: Eq + std::hash::Hash>(set: &mut FastSet<T>) {
+            set.clear();
+            if set.capacity() > 1024 {
+                set.shrink_to(64);
+            }
+        }
+        clear(&mut self.side_slot_owners);
+        clear(&mut self.weak_entries);
+        self.native_functions_swept.clear();
+        std::mem::swap(&mut self.native_functions, &mut self.native_functions_swept);
+    }
+
+    /// Forget that `owner`'s side-slot entries were written (tests: a write the record missed).
+    #[cfg(test)]
+    pub(crate) fn forget_side_slot_owner(&mut self, owner: usize) {
+        self.side_slot_owners.remove(&owner);
+    }
+
+    /// Forget that `owner`'s entry under `key` was written (tests).
+    #[cfg(test)]
+    pub(crate) fn forget_weak_entry(&mut self, owner: usize, key: WeakKey) {
+        self.weak_entries.remove(&(owner, key));
+    }
+
+    /// Forget that `function` was registered since the last collection (tests).
+    #[cfg(test)]
+    pub(crate) fn forget_native_function(&mut self, function: usize) {
+        self.native_functions
+            .retain(|&registered| registered != function);
+    }
+}
+
+/// An owner-keyed side-slot table (`gc_side_slot_tables!`, `Interp::generators`): an object's
+/// address mapped to the strong edges it holds outside its cell, traced once the owner is
+/// marked. Reads go through `Deref` to the map. Each method that inserts an entry or hands one
+/// out mutably records its owner in the heap's [`ClientRecords`] (S6 step 10d), and nothing else
+/// can write one; removing an entry adds no edge and records nothing. A minor collection
+/// reports the recorded owners only: an old owner whose entries were not written holds old
+/// values, which the last collection traced, and a young owner's entries were all inserted
+/// since it was allocated. Debug builds check both as each collection starts
+/// (`Interp::check_side_slot_records`), which also catches a write through a value's interior
+/// mutability, out of the methods' sight.
+#[repr(transparent)]
+pub(crate) struct SideSlotTable<V, S = std::hash::BuildHasherDefault<crate::fasthash::FxHasher>>(
+    std::collections::HashMap<usize, V, S>,
+);
+
+impl<V, S: Default> Default for SideSlotTable<V, S> {
+    fn default() -> Self {
+        Self(std::collections::HashMap::default())
+    }
+}
+
+impl<V, S> std::ops::Deref for SideSlotTable<V, S> {
+    type Target = std::collections::HashMap<usize, V, S>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V, S: std::hash::BuildHasher> SideSlotTable<V, S> {
+    #[inline]
+    pub(crate) fn insert(&mut self, heap: &GcState, owner: usize, value: V) -> Option<V> {
+        heap.records.borrow_mut().side_slot_owners.insert(owner);
+        self.0.insert(owner, value)
+    }
+
+    #[inline]
+    pub(crate) fn get_mut(&mut self, heap: &GcState, owner: &usize) -> Option<&mut V> {
+        let value = self.0.get_mut(owner)?;
+        heap.records.borrow_mut().side_slot_owners.insert(*owner);
+        Some(value)
+    }
+
+    #[inline]
+    pub(crate) fn entry(
+        &mut self,
+        heap: &GcState,
+        owner: usize,
+    ) -> std::collections::hash_map::Entry<'_, usize, V> {
+        heap.records.borrow_mut().side_slot_owners.insert(owner);
+        self.0.entry(owner)
+    }
+
+    /// Every entry, mutably: every owner is recorded.
+    pub(crate) fn values_mut(
+        &mut self,
+        heap: &GcState,
+    ) -> std::collections::hash_map::ValuesMut<'_, usize, V> {
+        heap.records
+            .borrow_mut()
+            .side_slot_owners
+            .extend(self.0.keys().copied());
+        self.0.values_mut()
+    }
+
+    #[inline]
+    pub(crate) fn remove(&mut self, owner: &usize) -> Option<V> {
+        self.0.remove(owner)
+    }
+
+    /// Evict the dead objects' entries (see [`crate::gc_sweep::map`]).
+    pub(crate) fn evict_dead(&mut self, dead: &crate::gc_sweep::DeadObjects<'_>) {
+        crate::gc_sweep::map(&mut self.0, dead);
+    }
+
+    /// Give back spare capacity (see [`crate::weak_metadata::shrink_map`]).
+    pub(crate) fn shrink(&mut self) {
+        crate::weak_metadata::shrink_map(&mut self.0);
+    }
+}
+
+/// `Interp::weak_collection_data`: each WeakMap's and WeakSet's entries, (weakly held key,
+/// value), by the collection's address. Reads go through `Deref` to the map. Each method that
+/// writes an entry records it, by (collection, key), in the heap's [`ClientRecords`] (S6 step
+/// 10d), and nothing else can write one; removing an entry records nothing. A minor collection
+/// registers the recorded entries only as ephemerons: an entry not written since the last
+/// collection whose key is old holds an old value (the last collection marked it, or found its
+/// key or its collection dead and evicted the entry), and an entry whose key is young was
+/// written since the key was allocated. Debug builds check both as each collection starts
+/// (`Interp::check_weak_entry_records`).
+#[repr(transparent)]
+#[derive(Default)]
+pub(crate) struct WeakCollectionData(FastMap<usize, Vec<(WeakTarget, Value)>>);
+
+impl std::ops::Deref for WeakCollectionData {
+    type Target = FastMap<usize, Vec<(WeakTarget, Value)>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl WeakCollectionData {
+    /// A collection's entries: a new collection's, or those moved to the instance a native base
+    /// constructor grafts its slots onto. Each entry is recorded.
+    pub(crate) fn insert(
+        &mut self,
+        heap: &GcState,
+        owner: usize,
+        entries: Vec<(WeakTarget, Value)>,
+    ) -> Option<Vec<(WeakTarget, Value)>> {
+        heap.records
+            .borrow_mut()
+            .weak_entries
+            .extend(entries.iter().map(|(key, _)| (owner, key.key())));
+        self.0.insert(owner, entries)
+    }
+
+    /// Replace the value of `owner`'s entry at `index`.
+    pub(crate) fn set_value(&mut self, heap: &GcState, owner: usize, index: usize, value: Value) {
+        let entry = &mut self
+            .0
+            .get_mut(&owner)
+            .expect("a weak collection has backing data")[index];
+        heap.records
+            .borrow_mut()
+            .weak_entries
+            .insert((owner, entry.0.key()));
+        entry.1 = value;
+    }
+
+    /// Append an entry to `owner`'s; returns its index.
+    pub(crate) fn push(
+        &mut self,
+        heap: &GcState,
+        owner: usize,
+        key: WeakTarget,
+        value: Value,
+    ) -> usize {
+        let entries = self
+            .0
+            .get_mut(&owner)
+            .expect("a weak collection has backing data");
+        heap.records
+            .borrow_mut()
+            .weak_entries
+            .insert((owner, key.key()));
+        entries.push((key, value));
+        entries.len() - 1
+    }
+
+    /// Remove `owner`'s entry at `index`, the last entry taking its place (with its edges
+    /// unchanged), and give back spare capacity.
+    pub(crate) fn swap_remove(&mut self, owner: usize, index: usize) -> (WeakTarget, Value) {
+        let entries = self
+            .0
+            .get_mut(&owner)
+            .expect("weak collection backing data");
+        let removed = entries.swap_remove(index);
+        if entries.capacity() > entries.len().saturating_mul(4).max(32) {
+            entries.shrink_to(entries.len().saturating_mul(2).max(16));
+        }
+        removed
+    }
+
+    pub(crate) fn remove(&mut self, owner: &usize) -> Option<Vec<(WeakTarget, Value)>> {
+        self.0.remove(owner)
+    }
+
+    /// Give back spare capacity (see [`crate::weak_metadata::shrink_map`]).
+    pub(crate) fn shrink(&mut self) {
+        crate::weak_metadata::shrink_map(&mut self.0);
+    }
+}
+
+/// `Interp::native_function_realms`: each built-in function's [[Realm]] (ECMA-262
+/// CreateBuiltinFunction), by the function's address: a weak pin of the function and the address
+/// of its Realm's global object. An entry never changes once registered
+/// ([`NativeFunctionRealms::register`], which records the function in the heap's
+/// [`ClientRecords`]; S6 step 10d). A minor collection reports the [[Realm]] edges of the
+/// functions registered since the last collection only (an old function's Realm was marked
+/// when the function was), and sweeps the table from them, the only functions it can find dead.
+/// Debug builds check the first as each collection starts (`Interp::check_native_realm_records`).
+#[repr(transparent)]
+#[derive(Default)]
+pub(crate) struct NativeFunctionRealms(FastMap<usize, (crate::value::WeakGc, usize)>);
+
+impl std::ops::Deref for NativeFunctionRealms {
+    type Target = FastMap<usize, (crate::value::WeakGc, usize)>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl NativeFunctionRealms {
+    /// `function`'s [[Realm]] is the Realm whose global object is at `realm`.
+    pub(crate) fn register(&mut self, heap: &GcState, function: &Gc, realm: usize) {
+        let address = Gc::as_ptr(function) as usize;
+        heap.records.borrow_mut().native_functions.push(address);
+        self.0.insert(address, (Gc::downgrade(function), realm));
+    }
+
+    /// Keep the entries `keep` accepts (a major collection's sweep).
+    fn retain(&mut self, mut keep: impl FnMut(&(crate::value::WeakGc, usize)) -> bool) {
+        self.0.retain(|_, entry| keep(entry));
+    }
+
+    fn remove(&mut self, function: &usize) {
+        self.0.remove(function);
+    }
+
+    /// Point `function`'s entry at another Realm without recording it (tests: a write the
+    /// record missed).
+    #[cfg(test)]
+    pub(crate) fn set_realm_unrecorded(&mut self, function: usize, realm: usize) {
+        if let Some(entry) = self.0.get_mut(&function) {
+            entry.1 = realm;
+        }
+    }
+}
+
+/// What the client of a heap's last collection reported (test builds): the side-slot table
+/// owners (`gc_side_slot_tables!` and `generators`; Realm members, ShadowRealm owners and host
+/// owners apart), the WeakMap and WeakSet entries it registered as ephemerons, by (collection,
+/// key's cell word), and the native functions whose [[Realm]] edges it reported.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ClientReport {
+    pub(crate) kind: Option<CollectionKind>,
+    pub(crate) side_slot_owners: Vec<usize>,
+    pub(crate) weak_entries: Vec<(usize, u64)>,
+    pub(crate) realm_edges: Vec<usize>,
+}
+
 /// One interpreter's host graph for this collection: what its `HostGc` slots report.
 #[derive(Default)]
 struct HostGraph {
@@ -179,6 +482,9 @@ impl HostGcVisitor for HostGraph {
 
 /// The [`crate::gc_core::MarkClient`] of one collection over a ShadowRealm tree.
 struct Marking<'a> {
+    /// A minor collection's client reports what the tables recorded instead of the tables (see
+    /// [`ClientRecords`]).
+    kind: CollectionKind,
     /// The root interpreter, then its ShadowRealm descendants breadth-first.
     interps: Vec<&'a Interp>,
     /// Parallel to `interps`.
@@ -197,7 +503,7 @@ struct Marking<'a> {
 impl<'a> Marking<'a> {
     /// Out of line: its frames must be dead (and scrubbed) before the native stack is scanned.
     #[inline(never)]
-    fn new(root: &'a Interp) -> Self {
+    fn new(root: &'a Interp, kind: CollectionKind) -> Self {
         let mut interps = vec![root];
         let mut shadow_owners = FastMap::default();
         let mut next = 0;
@@ -250,6 +556,7 @@ impl<'a> Marking<'a> {
             }
         }
         Marking {
+            kind,
             interps,
             hosts,
             shadow_owners,
@@ -257,6 +564,19 @@ impl<'a> Marking<'a> {
             templates,
             activated_realms: RefCell::default(),
         }
+    }
+
+    /// What the tree's tables recorded since the last collection (they share the root's heap).
+    fn records(&self) -> std::cell::Ref<'_, ClientRecords> {
+        self.interps[0].gc_heap.records.borrow()
+    }
+
+    /// Record part of what this collection's client reported (test builds).
+    #[cfg(test)]
+    fn report(&self, update: impl FnOnce(&mut ClientReport)) {
+        let mut report = self.interps[0].gc_heap.client_report.borrow_mut();
+        report.kind = Some(self.kind);
+        update(&mut report);
     }
 
     /// Each interpreter's native graph, by interpreter address, for the host sweeps.
@@ -271,6 +591,44 @@ impl<'a> Marking<'a> {
                 )
             })
             .collect()
+    }
+}
+
+/// Reports a collection's ephemerons and side-table edges to the heap ([`Marking::ephemerons`]),
+/// noting in test builds what it reported.
+struct EdgeReporter<'s, 'e> {
+    sink: &'s mut crate::gc_core::EdgeSink<'e>,
+    #[cfg(test)]
+    report: ClientReport,
+}
+
+impl EdgeReporter<'_, '_> {
+    /// A WeakMap or WeakSet entry of `owner`: with an object or Symbol key, its value lives while
+    /// both the collection and the key do.
+    fn weak_entry(&mut self, owner: usize, key: &WeakTarget, value: &Value) {
+        let Some(value) = value_word(value) else {
+            return;
+        };
+        if let Some(key) = key.upgrade().as_ref().and_then(Value::cell_word) {
+            self.sink.ephemeron(owner as *const u8, key, value);
+            #[cfg(test)]
+            self.report.weak_entries.push((owner, key));
+        }
+    }
+
+    /// [[Realm]] is a logical edge: a live built-in keeps its Realm (keyed by the Realm's global
+    /// object) alive, however its prototype has been rewired.
+    fn realm(&mut self, function: usize, realm: usize) {
+        self.sink.edge(function as *const u8, realm as u64);
+        #[cfg(test)]
+        self.report.realm_edges.push(function);
+    }
+
+    /// The logical edges a host graph reported.
+    fn host(&mut self, host: &RefCell<HostGraph>) {
+        for &(owner, value) in &host.borrow().edges {
+            self.sink.edge(owner as *const u8, value);
+        }
     }
 }
 
@@ -312,28 +670,47 @@ impl crate::gc_core::MarkClient for Marking<'_> {
     fn side_slot_owners(&self, owners: &mut dyn FnMut(usize)) {
         // Collected first: the heap may trace an already-marked owner's slots at once, which
         // re-enters this client.
-        let mut seen = FastSet::default();
-        let mut list = Vec::new();
-        let mut note = |owner: usize| {
-            if seen.insert(owner) {
-                list.push(owner);
-            }
-        };
-        for interp in &self.interps {
-            interp.for_each_side_slot_owner(&mut note);
+        #[derive(Default)]
+        struct Noted {
+            seen: FastSet<usize>,
+            list: Vec<usize>,
         }
+        impl Noted {
+            fn note(&mut self, owner: usize) {
+                if self.seen.insert(owner) {
+                    self.list.push(owner);
+                }
+            }
+        }
+        let mut noted = Noted::default();
+        match self.kind {
+            CollectionKind::Major => {
+                for interp in &self.interps {
+                    interp.for_each_side_slot_owner(&mut |owner| noted.note(owner));
+                }
+            }
+            // The owners whose entries were written since the last collection, the young ones
+            // among them (see `SideSlotTable`).
+            CollectionKind::Minor => {
+                for &owner in &self.records().side_slot_owners {
+                    noted.note(owner);
+                }
+            }
+        }
+        #[cfg(test)]
+        self.report(|report| report.side_slot_owners = noted.list.clone());
         for &owner in self.shadow_owners.keys() {
-            note(owner);
+            noted.note(owner);
         }
         for &member in self.realm_members.keys() {
-            note(member);
+            noted.note(member);
         }
         for host in &self.hosts {
             for owner in host.borrow().native.js_owners() {
-                note(owner);
+                noted.note(owner);
             }
         }
-        for owner in list {
+        for owner in noted.list {
             owners(owner);
         }
     }
@@ -370,27 +747,69 @@ impl crate::gc_core::MarkClient for Marking<'_> {
     }
 
     fn ephemerons(&self, sink: &mut crate::gc_core::EdgeSink<'_>) {
-        for (interp, host) in self.interps.iter().zip(&self.hosts) {
-            for (&owner, entries) in &interp.weak_collection_data {
-                for (key, value) in entries {
-                    let Some(value) = value_word(value) else {
-                        continue;
-                    };
-                    // An object or Symbol key: the value lives while both the collection and
-                    // the key do.
-                    if let Some(key) = key.upgrade().as_ref().and_then(Value::cell_word) {
-                        sink.ephemeron(owner as *const u8, key, value);
+        let mut edges = EdgeReporter {
+            sink,
+            #[cfg(test)]
+            report: ClientReport::default(),
+        };
+        match self.kind {
+            CollectionKind::Major => {
+                for (interp, host) in self.interps.iter().zip(&self.hosts) {
+                    for (&owner, entries) in interp.weak_collection_data.iter() {
+                        for (key, value) in entries {
+                            edges.weak_entry(owner, key, value);
+                        }
                     }
+                    for (&function, &(_, realm)) in interp.native_function_realms.borrow().iter() {
+                        edges.realm(function, realm);
+                    }
+                    edges.host(host);
                 }
             }
-            // [[Realm]] is a logical edge: a live built-in keeps its Realm (keyed by the
-            // Realm's global object) alive, however its prototype has been rewired.
-            for (&function, &(_, realm)) in interp.native_function_realms.borrow().iter() {
-                sink.edge(function as *const u8, realm as u64);
+            CollectionKind::Minor => {
+                let records = self.records();
+                // The entries written since the last collection, those of young keys among them
+                // (see `WeakCollectionData`), each found in its collection's interpreter.
+                for &(owner, key) in &records.weak_entries {
+                    let entry = self.interps.iter().find_map(|interp| {
+                        let entries = interp.weak_collection_data.get(&owner)?;
+                        let index = interp.weak_collection_index.get(&owner)?.entries.get(&key);
+                        Some(index.and_then(|&index| entries.get(index)))
+                    });
+                    if let Some((target, value)) = entry.flatten() {
+                        edges.weak_entry(owner, target, value);
+                    }
+                }
+                // The functions registered since the last collection: an old function's Realm
+                // was marked when the function was (see `NativeFunctionRealms`).
+                for &function in &records.native_functions {
+                    let realm = self.interps.iter().find_map(|interp| {
+                        let realms = interp.native_function_realms.borrow();
+                        realms.get(&function).map(|&(_, realm)| realm)
+                    });
+                    if let Some(realm) = realm {
+                        edges.realm(function, realm);
+                    }
+                }
+                for host in &self.hosts {
+                    edges.host(host);
+                }
             }
-            for &(owner, value) in &host.borrow().edges {
-                sink.edge(owner as *const u8, value);
-            }
+        }
+        #[cfg(test)]
+        self.report(|report| {
+            report.weak_entries = edges.report.weak_entries;
+            report.realm_edges = edges.report.realm_edges;
+        });
+    }
+
+    fn check_records(&self, heap: &crate::gc_core::Heap) {
+        let records = self.records();
+        let registered: FastSet<usize> = records.native_functions.iter().copied().collect();
+        for interp in &self.interps {
+            interp.check_side_slot_records(&records, heap);
+            interp.check_weak_entry_records(&records, heap);
+            interp.check_native_realm_records(&registered, heap);
         }
     }
 }
@@ -512,13 +931,19 @@ impl Interp {
         heap: &crate::value::GcHeap,
         kind: CollectionKind,
     ) -> Option<FastMap<usize, NativeGcGraph>> {
-        let marking = Marking::new(self);
+        let marking = Marking::new(self, kind);
         // Building the client just enumerated every Realm member and host value, dead or
         // alive, in frames below this one; the marker's frames reuse that region.
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
         let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
-        started.then(|| marking.into_native_graphs())
+        started.then(|| {
+            // This marking consumed what the tables recorded since the last collection: what is
+            // written from now on, between the phases and after the sweep included, is recorded
+            // for the next one.
+            heap.records.borrow_mut().consume();
+            marking.into_native_graphs()
+        })
     }
 
     /// Phase 2: evict the dead from the engine's tables, clear weak handles and free the dead
@@ -535,7 +960,8 @@ impl Interp {
         // engine evicts the dead from its tables while their identities are still stable.
         let dead = crate::gc_sweep::DeadObjects::new(heap);
         crate::gc_sweep::set(&mut heap.rescanned_natives.borrow_mut(), &dead);
-        self.gc_heap_sweep_tree(&dead, &native);
+        self.gc_heap_sweep_tree(&dead, &native, kind);
+        heap.records.borrow_mut().native_functions_swept.clear();
         drop(native);
         // Weak handles to dead cells are cleared; a cell a weak handle still names stays
         // reserved (finalized, never reused) until its last weak handle is dropped, which keeps
@@ -558,14 +984,49 @@ impl Interp {
         &mut self,
         dead: &crate::gc_sweep::DeadObjects<'_>,
         native: &FastMap<usize, NativeGcGraph>,
+        kind: CollectionKind,
     ) {
         let empty = NativeGcGraph::default();
         let graph = native
             .get(&(std::ptr::from_ref(self) as usize))
             .unwrap_or(&empty);
-        self.gc_sweep_dead_objects(dead, graph);
+        self.gc_sweep_dead_objects(dead, graph, kind);
         for child in self.shadow_realms.values_mut() {
-            child.gc_heap_sweep_tree(dead, native);
+            child.gc_heap_sweep_tree(dead, native, kind);
+        }
+    }
+
+    /// Evict the dead built-ins' [[Realm]] entries. A major collection walks the table. A minor
+    /// collection finds only young objects dead, and every young built-in was registered since
+    /// the last collection (S6 step 10d, see `NativeFunctionRealms`): it asks the dead list about
+    /// the functions registered since, which its marking kept from the heap's records, or, when
+    /// the dead list is the shorter, evicts each dead object's entry.
+    pub(crate) fn gc_sweep_native_realms(
+        &mut self,
+        dead: &crate::gc_sweep::DeadObjects<'_>,
+        kind: CollectionKind,
+    ) {
+        let realms = self.native_function_realms.get_mut();
+        match kind {
+            CollectionKind::Major => realms.retain(|(pin, _)| {
+                pin.upgrade()
+                    .is_some_and(|function| !dead.contains(Gc::as_ptr(&function) as usize))
+            }),
+            CollectionKind::Minor => {
+                let records = self.gc_heap.records.borrow();
+                let registered = &records.native_functions_swept;
+                if registered.len() <= dead.len() {
+                    for &function in registered {
+                        if dead.contains(function) {
+                            realms.remove(&function);
+                        }
+                    }
+                } else {
+                    for object in dead.iter() {
+                        realms.remove(&object);
+                    }
+                }
+            }
         }
     }
 
@@ -622,6 +1083,111 @@ impl Interp {
         gc_side_slot_tables!(slots);
         if let Some(coroutine) = self.generators.get(&owner) {
             GcTrace::trace_gc(coroutine, sink);
+        }
+    }
+
+    /// S6 step 10d, debug builds, as each collection starts (`Marking::check_records`): a
+    /// side-slot owner whose entries were not written since the last collection is old, and its
+    /// side slots hold only cells the last collection marked, since a minor collection does not
+    /// report it. Panics naming the table, the owner and the value.
+    fn check_side_slot_records(&self, records: &ClientRecords, heap: &crate::gc_core::Heap) {
+        let check = |table: &str, owner: usize, slots: &dyn GcTrace| {
+            if records.side_slot_owners.contains(&owner) {
+                return;
+            }
+            match heap.cell_age(owner as u64) {
+                Some(CellAge::Young) => panic!(
+                    "side-slot table {table}: young owner {owner:#x} was not recorded since the \
+                     last collection"
+                ),
+                Some(CellAge::Old) => slots.trace_gc(&mut WordSink(&mut |value| {
+                    if let Some(age @ (CellAge::Young | CellAge::Dead)) = heap.cell_age(value) {
+                        panic!(
+                            "side-slot table {table}: old owner {owner:#x}, not recorded since \
+                             the last collection, holds an unmarked ({age:?}) value {value:#x}"
+                        );
+                    }
+                })),
+                // A zombie owner's entries were evicted as it died; an address that names no
+                // allocated cell is not this heap's.
+                _ => {}
+            }
+        };
+        macro_rules! tables {
+            ($($table:ident),+ $(,)?) => {
+                $(for (&owner, slots) in self.$table.iter() {
+                    check(stringify!($table), owner, slots);
+                })+
+            };
+        }
+        gc_side_slot_tables!(tables);
+        for (&owner, coroutine) in self.generators.iter() {
+            check("generators", owner, coroutine);
+        }
+    }
+
+    /// S6 step 10d, debug builds, as each collection starts: a WeakMap or WeakSet entry not
+    /// written since the last collection has an old key (or a dead one), and with an old key an
+    /// old value, since a minor collection does not register it. Panics naming the collection,
+    /// the key and the value.
+    fn check_weak_entry_records(&self, records: &ClientRecords, heap: &crate::gc_core::Heap) {
+        for (&owner, entries) in self.weak_collection_data.iter() {
+            for (target, value) in entries {
+                if records.weak_entries.contains(&(owner, target.key())) {
+                    continue;
+                }
+                let Some(key) = target.upgrade().as_ref().and_then(Value::cell_word) else {
+                    continue;
+                };
+                match heap.cell_age(key) {
+                    Some(CellAge::Young) => panic!(
+                        "weak_collection_data: the entry of {owner:#x} under young key {key:#x} \
+                         was not recorded since the last collection"
+                    ),
+                    Some(CellAge::Old) => {
+                        let age = value_word(value)
+                            .and_then(|value| Some((value, heap.cell_age(value)?)));
+                        if let Some((value, age @ (CellAge::Young | CellAge::Dead))) = age {
+                            panic!(
+                                "weak_collection_data: the entry of {owner:#x} under old key \
+                                 {key:#x}, not recorded since the last collection, holds an \
+                                 unmarked ({age:?}) value {value:#x}"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// S6 step 10d, debug builds, as each collection starts: a built-in registered before the
+    /// last collection (not in `registered`) is old, and its [[Realm]], the Realm's global
+    /// object, was marked when it was, since a minor collection does not report the edge.
+    /// Panics naming the function and the Realm.
+    fn check_native_realm_records(&self, registered: &FastSet<usize>, heap: &crate::gc_core::Heap) {
+        for (&function, &(_, realm)) in self.native_function_realms.borrow().iter() {
+            if registered.contains(&function) {
+                continue;
+            }
+            match heap.cell_age(function as u64) {
+                Some(CellAge::Young) => panic!(
+                    "native_function_realms: young function {function:#x} was not registered \
+                     since the last collection"
+                ),
+                Some(CellAge::Old) => {
+                    if let Some(age @ (CellAge::Young | CellAge::Dead)) =
+                        heap.cell_age(realm as u64)
+                    {
+                        panic!(
+                            "native_function_realms: old function {function:#x}, registered \
+                             before the last collection, has an unmarked ({age:?}) [[Realm]] \
+                             {realm:#x}"
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

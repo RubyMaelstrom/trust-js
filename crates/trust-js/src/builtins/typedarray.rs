@@ -905,7 +905,7 @@ fn typed_array_over(
         track: false,
     };
     i.typed_arrays.insert(p, info);
-    i.ta_buffer.insert(p, buf_val);
+    i.ta_buffer.insert(&i.gc_heap, p, buf_val);
     i.register_native_typed_array(&obj, info);
     (Value::Obj(obj), info)
 }
@@ -1980,7 +1980,7 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
     // not own properties: length/byteLength/byteOffset are computed in get_member, the buffer object
     // is kept in a side table, and BYTES_PER_ELEMENT lives on the prototype.
     let _ = es;
-    i.ta_buffer.insert(p, buf_val);
+    i.ta_buffer.insert(&i.gc_heap, p, buf_val);
     i.register_native_typed_array(&obj, i.typed_arrays[&p]);
     Ok(Value::Obj(obj))
 }

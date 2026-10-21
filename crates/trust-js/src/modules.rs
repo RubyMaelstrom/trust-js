@@ -310,7 +310,7 @@ impl Interp {
         if let Value::Obj(object) = &promise {
             if let Some(state) = self
                 .promises
-                .get_mut(&(crate::value::Gc::as_ptr(object) as usize))
+                .get_mut(&self.gc_heap, &(crate::value::Gc::as_ptr(object) as usize))
             {
                 state.handled = true;
             }
@@ -1072,7 +1072,7 @@ impl Interp {
         // namespace handle and let an unrelated allocation reuse its address.
         self.gc_pin(ns);
         self.module_ns
-            .insert(crate::value::Gc::as_ptr(ns) as usize, live);
+            .insert(&self.gc_heap, crate::value::Gc::as_ptr(ns) as usize, live);
         Ok(())
     }
 
@@ -1115,7 +1115,7 @@ impl Interp {
             dns.borrow().ic_plain.set(false);
             self.gc_pin(&dns);
             self.module_ns
-                .insert(crate::value::Gc::as_ptr(&dns) as usize, live);
+                .insert(&self.gc_heap, crate::value::Gc::as_ptr(&dns) as usize, live);
         }
         dns.borrow().ic_plain.set(false);
         self.deferred_ns
@@ -1176,8 +1176,11 @@ impl Interp {
                         {
                             stub.borrow().ic_plain.set(false);
                             self.gc_pin(&stub);
-                            self.module_ns
-                                .insert(crate::value::Gc::as_ptr(&stub) as usize, live);
+                            self.module_ns.insert(
+                                &self.gc_heap,
+                                crate::value::Gc::as_ptr(&stub) as usize,
+                                live,
+                            );
                         }
                     }
                 }
@@ -1602,7 +1605,7 @@ impl Interp {
             };
             if let Value::Obj(o) = &top {
                 self.generators
-                    .insert(crate::value::Gc::as_ptr(o) as usize, coro);
+                    .insert(&self.gc_heap, crate::value::Gc::as_ptr(o) as usize, coro);
             }
             let top_key = match &top {
                 Value::Obj(o) => crate::value::Gc::as_ptr(o) as usize,

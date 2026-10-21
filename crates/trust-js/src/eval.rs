@@ -4684,7 +4684,8 @@ impl Interp {
         let obj = Object::new(self.extra_protos.get("Promise").cloned());
         let p = Gc::as_ptr(&obj) as usize;
         self.gc_pin(&obj);
-        self.promises.insert(p, PromiseState::default());
+        self.promises
+            .insert(&self.gc_heap, p, PromiseState::default());
         Value::Obj(obj)
     }
 
@@ -4849,7 +4850,7 @@ impl Interp {
             Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return,
         };
-        let (reactions, handled) = match self.promises.get_mut(&ptr) {
+        let (reactions, handled) = match self.promises.get_mut(&self.gc_heap, &ptr) {
             Some(s) if s.status == 0 => {
                 s.status = if fulfilled { 1 } else { 2 };
                 s.value = value.clone();
@@ -4936,7 +4937,7 @@ impl Interp {
         };
         let (status, handled, outstanding) =
             self.promises
-                .get_mut(&ptr)
+                .get_mut(&self.gc_heap, &ptr)
                 .map_or((0, true, None), |state| {
                     let flags = (state.status, state.handled, state.outstanding);
                     // Step 12: set promise.[[PromiseIsHandled]] to true.
@@ -4963,7 +4964,7 @@ impl Interp {
         }
         match status {
             0 => {
-                if let Some(s) = self.promises.get_mut(&ptr) {
+                if let Some(s) = self.promises.get_mut(&self.gc_heap, &ptr) {
                     s.reactions.push((on_f, on_r, result.clone(), host_context));
                 }
             }
@@ -5238,14 +5239,14 @@ impl Interp {
         let Some(ptr) = registry.as_obj().map(|object| Gc::as_ptr(object) as usize) else {
             return Ok(());
         };
-        if let Some(state) = self.finalization_registries.get_mut(&ptr) {
+        if let Some(state) = self.finalization_registries.get_mut(&self.gc_heap, &ptr) {
             state.cleanup_scheduled = false;
         }
         self.weak_metadata.ready_registries.remove(&ptr);
         loop {
             let next = self
                 .finalization_registries
-                .get_mut(&ptr)
+                .get_mut(&self.gc_heap, &ptr)
                 .and_then(|state| {
                     let cell = state.cells.pop_ready()?;
                     Some((state.cleanup_callback.clone(), cell.held_value))
@@ -6517,6 +6518,7 @@ impl Interp {
         // https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation
         self.gc_pin(&ctor_obj);
         self.class_info.insert(
+            &self.gc_heap,
             Gc::as_ptr(&ctor_obj) as usize,
             ClassInfo {
                 fields: inst_fields.into(),
@@ -7037,7 +7039,7 @@ impl Interp {
                         // The TypedArray's `buffer` slot lives in a parallel side table keyed by the
                         // view's pointer, so it must move to `this` alongside its TaInfo.
                         if let Some(v) = self.ta_buffer.remove(&sp) {
-                            self.ta_buffer.insert(dp, v);
+                            self.ta_buffer.insert(&self.gc_heap, dp, v);
                         }
                         if let Some(v) = self.data_views.remove(&sp) {
                             self.data_views.insert(dp, v);
@@ -7059,9 +7061,9 @@ impl Interp {
                             self.regexps.insert(dp, v);
                         }
                         if let Some(v) = self.promises.remove(&sp) {
-                            self.promises.insert(dp, v);
+                            self.promises.insert(&self.gc_heap, dp, v);
                             // The native ctor's resolvers are bound to `src`; forward them.
-                            self.promise_forward.insert(sp, this.clone());
+                            self.promise_forward.insert(&self.gc_heap, sp, this.clone());
                         }
                         if let Some(v) = self.temporal.remove(&sp) {
                             self.temporal.insert(dp, v);

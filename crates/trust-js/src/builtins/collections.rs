@@ -445,7 +445,7 @@ fn collection_ctor(
     };
     if name.starts_with("Weak") {
         i.gc_pin(&obj);
-        i.weak_collection_data.insert(ptr, Vec::new());
+        i.weak_collection_data.insert(&i.gc_heap, ptr, Vec::new());
         i.weak_collection_index
             .insert(ptr, crate::weak_metadata::WeakCollectionIndex::new(kind));
     } else {
@@ -780,21 +780,14 @@ fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
         .copied()
     {
         i.weak_collection_data
-            .get_mut(&ptr)
-            .expect("a weak collection has backing data")[index]
-            .1 = value;
+            .set_value(&i.gc_heap, ptr, index, value);
         return;
     }
     i.weak_metadata.subscribe(
         target.clone(),
         crate::weak_metadata::Subscriber::Collection(ptr),
     );
-    let entries = i
-        .weak_collection_data
-        .get_mut(&ptr)
-        .expect("a weak collection has backing data");
-    let index = entries.len();
-    entries.push((target, value));
+    let index = i.weak_collection_data.push(&i.gc_heap, ptr, target, value);
     i.weak_collection_index
         .get_mut(&ptr)
         .expect("a weak collection has a branded index")

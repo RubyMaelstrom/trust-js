@@ -23,7 +23,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
     i.gc_pin(&obj);
     i.inline_ic_safe.set(false);
     obj.borrow().ic_plain.set(false);
-    i.proxies.insert(p, (target, handler));
+    i.proxies.insert(&i.gc_heap, p, (target, handler));
     Ok(Value::Obj(obj))
 }
 
@@ -35,7 +35,7 @@ fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Valu
         if let Some((target, _)) = i.proxies.get(&ptr).cloned() {
             i.inline_ic_safe.set(false);
             o.borrow().ic_plain.set(false);
-            i.proxies.insert(ptr, (target, Value::Null));
+            i.proxies.insert(&i.gc_heap, ptr, (target, Value::Null));
         }
     }
     Ok(Value::Undefined)

@@ -3417,6 +3417,7 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
     let obj = Object::new(proto);
     i.gc_pin(&obj);
     i.collection_iterators.insert(
+        &i.gc_heap,
         Gc::as_ptr(&obj) as usize,
         crate::ordered_collection::CollectionIterator {
             target: Some(target.clone()),
@@ -3453,7 +3454,7 @@ fn map_set_iter_step(
         };
         Ok(Some(value))
     } else {
-        let state = i.collection_iterators.get_mut(&ptr).unwrap();
+        let state = i.collection_iterators.get_mut(&i.gc_heap, &ptr).unwrap();
         state.target = None;
         state.cursor = None;
         Ok(None)
@@ -8761,7 +8762,7 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
     )));
     if let Value::Obj(object) = &promise {
         let key = Gc::as_ptr(object) as usize;
-        i.generators.insert(key, coroutine);
+        i.generators.insert(&i.gc_heap, key, coroutine);
         i.drive_async(
             key,
             promise.clone(),
@@ -10223,7 +10224,7 @@ fn drive_generator(
         None => return Err(i.make_error("TypeError", "Generator method called on a non-generator")),
     };
     if coro.done() {
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
         return match signal {
             Resume::Throw(e) => Err(e),
             Resume::Return(v) => Ok(iter_result(i, v, true)),
@@ -10232,7 +10233,7 @@ fn drive_generator(
         };
     }
     let suspend = coro.resume(i, signal);
-    i.generators.insert(key, coro);
+    i.generators.insert(&i.gc_heap, key, coro);
     // A `yield*` forwards the inner iterator's result object unwrapped.
     let raw = std::mem::take(&mut i.yield_raw_result);
     match suspend {
@@ -10346,7 +10347,7 @@ pub(crate) fn async_gen_return_fulfil(
         if !coro.done() {
             let _ = coro.resume(i, crate::coroutine::Resume::Return(x.clone()));
         }
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
     }
     let res = i.iter_result_obj(x, true);
     i.resolve_promise(&r, res);
@@ -10367,7 +10368,7 @@ pub(crate) fn async_gen_return_reject(
         if !coro.done() {
             let _ = coro.resume(i, crate::coroutine::Resume::Throw(e.clone()));
         }
-        i.generators.insert(key, coro);
+        i.generators.insert(&i.gc_heap, key, coro);
     }
     i.reject_promise(&r, e);
     i.finish_async_gen_step(key);
