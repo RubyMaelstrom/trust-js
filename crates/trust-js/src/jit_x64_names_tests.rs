@@ -312,3 +312,104 @@ fn native_references_keep_heap_owners_across_collection_and_hint_misses() {
         );
     }
 }
+
+thread_local! {
+    /// The native name-op and native StoreRef counts at each `collect()` of the barrier test.
+    static AT_COLLECTS: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// S6 step 10b: `store_value`'s write barrier (the store's owner's card, its address taken
+/// before `decode_rhs` overwrites R9 and the card set after the store). Each scenario warms a
+/// store site, collects inside its loop (`k === 50`), making the holder old, and has the same
+/// site store values allocated since; the next collection's barrier check (debug builds)
+/// passes, and the counts show the stores after the first collection ran in native code: a
+/// global property and wide bindings from free-name caches (direct, enclosing and deeper
+/// environments), a captured binding (`StoreCap`), and a Reference's global property and
+/// binding (`StoreRef`: a script's stores to a global variable and to a global lexical binding
+/// an earlier script declared).
+#[test]
+fn native_name_stores_record_their_owners_in_cards() {
+    let scenarios = [
+        (
+            "global",
+            false,
+            "var g=null;function setg(v){g=v;}\
+             for(var k=0;k<60;k++){if(k===50)collect();setg({k});}collect();g.k",
+        ),
+        (
+            "enclosing",
+            false,
+            "function outer(){let x=null;function set(v){x=v;}return [set,()=>x];}var p=outer();\
+             for(var k=0;k<60;k++){if(k===50)collect();p[0]({k});}collect();p[1]().k",
+        ),
+        (
+            "parent",
+            false,
+            "function outer(){let x=null;function set(v){let s=v;const keep=()=>s;x=s;}\
+             return [set,()=>x];}var p=outer();\
+             for(var k=0;k<60;k++){if(k===50)collect();p[0]({k});}collect();p[1]().k",
+        ),
+        (
+            "deep",
+            false,
+            "function outer(){let x=null;function middle(){let m=0;\
+             return function(v){let s=v;const keep=()=>s+m;x=s;};}return [middle(),()=>x];}\
+             var p=outer();for(var k=0;k<60;k++){if(k===50)collect();p[0]({k});}\
+             collect();p[1]().k",
+        ),
+        (
+            "captured",
+            false,
+            "function own(){let x=null;const get=()=>x;\
+             for(let k=0;k<60;k++){if(k===50)collect();x={k};}collect();return get().k;}own()",
+        ),
+        (
+            "reference property",
+            true,
+            "var r=null;for(var k=0;k<60;k++){if(k===50)collect();r={k};}collect();r.k",
+        ),
+        (
+            // A script's store to a global lexical binding an earlier script declared.
+            "reference binding",
+            true,
+            "for(var k=0;k<60;k++){if(k===50)collect();h={k};}collect();h.k",
+        ),
+    ];
+    for (name, reference, source) in scenarios {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        engine
+            .interp
+            .def_method(&engine.interp.global, "collect", 0, |interp, _, _| {
+                interp.gc_collect();
+                let counts = (
+                    TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get),
+                    TEST_NATIVE_REFERENCES.with(|counts| counts[2].get()),
+                );
+                AT_COLLECTS.with(|at| at.borrow_mut().push(counts));
+                Ok(Value::Undefined)
+            });
+        engine.eval("let h=null;", false).expect("prelude parses");
+        AT_COLLECTS.with(|at| at.borrow_mut().clear());
+        match engine.eval(source, false).expect("fixture parses") {
+            Completion::Value(value) => assert_eq!(value, "59", "{name}"),
+            Completion::Throw {
+                name: error,
+                message,
+            } => panic!("{name}: {error}: {message}"),
+        }
+        let at = AT_COLLECTS.with(|at| at.borrow().clone());
+        assert_eq!(at.len(), 2, "{name}: two collections");
+        let after = if reference {
+            at[1].1 - at[0].1
+        } else {
+            at[1].0 - at[0].0
+        };
+        assert!(
+            after >= 10,
+            "{name}: {after} native stores after the holder became old"
+        );
+    }
+}

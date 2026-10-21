@@ -1,8 +1,10 @@
 //! The engine's strong object handle.
 //!
 //! [`Gc`] is the `Copy` address of a GC cell holding the `RefCell<Object>` (P1 S2; see
-//! `gc_core`). It dereferences to the `RefCell<Object>`, so `.borrow()`/`.borrow_mut()` work on
-//! a handle. Identity goes through associated functions — [`Gc::as_ptr`], [`Gc::ptr_eq`],
+//! `gc_core`). It dereferences to the `RefCell<Object>`, so `.borrow()` works on a handle;
+//! `.borrow_mut()` and `.try_borrow_mut()` are the handle's own, which record the write in the
+//! object's card first (the write barrier, S6 step 10b). Identity goes through associated
+//! functions — [`Gc::as_ptr`], [`Gc::ptr_eq`],
 //! [`Gc::downgrade`] — so `gc.as_ptr()` names `RefCell::as_ptr` through the deref. Copying a
 //! handle is free and dropping one releases nothing; the collector reclaims unreachable cells.
 
@@ -60,6 +62,29 @@ mod cell {
         #[inline]
         pub fn downgrade(this: &Gc) -> WeakGc {
             WeakGc::of(this)
+        }
+
+        /// Mutably borrow the object, as `RefCell::borrow_mut`, first recording the write in the
+        /// object's card (the write barrier, `gc_core::card_mark`). Every mutable borrow through
+        /// a handle resolves here, before the `Deref` to the `RefCell`. A card set at the borrow
+        /// covers every write made under it: no collection runs while a borrow is outstanding
+        /// (I9), and the card stays set until the next collection starts.
+        #[inline]
+        pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Object> {
+            // SAFETY: a reachable handle names a live object cell (Decision 0 / I1): small (an
+            // object's cell fits the 192-byte class) and of the carded object kind.
+            unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
+            (**self).borrow_mut()
+        }
+
+        /// `RefCell::try_borrow_mut` with the write barrier, as [`Gc::borrow_mut`].
+        #[inline]
+        pub fn try_borrow_mut(
+            &self,
+        ) -> Result<std::cell::RefMut<'_, Object>, std::cell::BorrowMutError> {
+            // SAFETY: as in `borrow_mut`.
+            unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
+            (**self).try_borrow_mut()
         }
     }
 

@@ -197,6 +197,11 @@ impl NativeCallableRetained for NapiCallbackClosure {
     fn scan_retained_memory(&self, _visitor: &mut dyn NativeRetainedMemoryVisitor) {
         // Both captures are non-owning C pointers stored in this callable's inline payload.
     }
+
+    /// No JavaScript value at all.
+    fn reports_fixed_values(&self) -> bool {
+        true
+    }
 }
 
 // Node-API “Working with JavaScript functions” and `napi_define_class` require the callback's
@@ -224,6 +229,11 @@ impl NativeCallableRetained for NapiConstructorClosure {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
         visitor.value(&self.prototype);
     }
+
+    /// The prototype, made before the constructor and never replaced.
+    fn reports_fixed_values(&self) -> bool {
+        true
+    }
 }
 
 struct NapiPromiseExecutor {
@@ -239,6 +249,9 @@ impl NapiPromiseExecutor {
     }
 }
 
+// The executor stores the promise's resolving functions into `slot` when the promise
+// constructor calls it, after the executor was made: its values change, so it keeps the default
+// `reports_fixed_values` (the engine rescans it at every collection).
 impl NativeCallableRetained for NapiPromiseExecutor {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
         visitor.allocation(RetainedManagedAllocation::rc(

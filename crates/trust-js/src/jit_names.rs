@@ -148,7 +148,7 @@ fn emit_deep_name_target_ptr(
     a.bind(done);
 }
 
-fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
+pub(super) fn deep_layout_supported(layout: &crate::value::JitLayout) -> bool {
     layout.scope_parent_valid
         && layout.scope_with_valid
         && layout.scope_parent.is_multiple_of(8)
@@ -356,7 +356,13 @@ pub(super) fn emit_reference_op(
         Op::StoreRef(_) => {
             emit_reference_target_ptr(a, layout, slow);
             emit_target_value_ptr(a, layout, slow);
-            emit_store_name_value(a, layout, slow, fast_done);
+            emit_store_name_value(
+                a,
+                layout,
+                NameStoreOwner::Reference(reference),
+                slow,
+                fast_done,
+            );
         }
         _ => unreachable!(),
     }

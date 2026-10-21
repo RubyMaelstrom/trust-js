@@ -468,9 +468,41 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
     a.bind(done);
 }
 
-/// All semantic guards precede the store commit.
+/// The native stack pointer, whose frame keeps a spare word at [rsp+8]: the prologue reserves 16
+/// bytes, of which only the first saves the caller's strictness.
+const NATIVE_SP: u8 = 4;
+
+/// The write barrier's first half (S6 step 10b; `gc_core::card_mark`): from the store's owner in
+/// R9 (an environment's cell start, or an Object, its cell's start + 8, which lies in the cell's
+/// card), the address of its card, page base + 65,024 + ((owner >> 7) & 511), kept in the
+/// frame's spare word at [rsp+8], where `decode_rhs`, which overwrites R9, cannot reach it. A
+/// card address left there resolves to no cell for the conservative stack scan. Clobbers AX
+/// and R9.
+fn card_address(a: &mut Asm) {
+    use crate::gc_core::{CARD_SHIFT, CARD_TABLE_OFFSET, PAGE_SIZE};
+    // The 16-bit move takes the owner's offset in its page.
+    const _: () = assert!(PAGE_SIZE == 1 << 16 && CARD_TABLE_OFFSET < i32::MAX as usize);
+    a.bytes(&[0x41, 0x0f, 0xb7, 0xc1]); // movzx eax, r9w: the owner's offset in its page
+    a.bytes(&[0xc1, 0xe8, CARD_SHIFT as u8]); // shr eax, 7: its card
+    a.nr_op_imm(4, R9, -(PAGE_SIZE as i32)); // and r9, -65536: the page base
+    a.bytes(&[0x4a, 0x8d, 0x84, 0x08]); // lea rax, [rax + r9 + 65024]: the card's byte
+    a.bytes(&(CARD_TABLE_OFFSET as i32).to_le_bytes());
+    a.nr_store(NATIVE_SP, 8, AX);
+}
+
+/// The write barrier's second half, after the store and before any safepoint: set the card
+/// whose address [`card_address`] kept. Clobbers AX.
+fn card_store(a: &mut Asm) {
+    a.nr_load(AX, NATIVE_SP, 8);
+    a.bytes(&[0xc6, 0x00, 0x01]); // mov byte [rax], 1
+}
+
+/// All semantic guards precede the store commit. The write barrier records the store in its
+/// owner's card: R9 holds the owner only until `decode_rhs`, so the card's address is taken
+/// first and the card set after the store.
 fn store_value(a: &mut Asm, slow: usize) {
     a.nr_mem(true, &[0x8b], R10, SP, -8);
+    card_address(a);
     decode_rhs(a, slow);
     read_word(a, slow);
     owner_pointer(a, slow);
@@ -485,6 +517,7 @@ fn store_value(a: &mut Asm, slow: usize) {
     a.bind(packed);
     a.nr_store(CX, 0, R10);
     a.bind(done);
+    card_store(a);
     a.add_sp(-8);
 }
 

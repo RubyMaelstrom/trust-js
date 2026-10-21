@@ -163,6 +163,25 @@ impl<'a> Marking<'a> {
             }
             next += 1;
         }
+        // S6 step 10b: the native functions whose host reporters' values may change are
+        // rescanned at every collection: their cards are set as it starts, before the barrier's
+        // check (`gc_core::Heap::start_marking`).
+        {
+            #[cfg(debug_assertions)]
+            let core = root.gc_heap.core.borrow();
+            for &function in root.gc_heap.rescanned_natives.borrow().iter() {
+                #[cfg(debug_assertions)]
+                assert!(
+                    core.is_carded_cell(function),
+                    "a rescanned native function at {function:#x} is not a live object"
+                );
+                // SAFETY: an entry names a live object's cell, small and of the carded object
+                // kind: it is evicted between the phases of the collection that finds its
+                // function dead (`Interp::gc_heap_sweep`), before that collection's sweep frees
+                // the cell.
+                unsafe { crate::gc_core::card_mark(function as *const u8) };
+            }
+        }
         let mut hosts = Vec::with_capacity(interps.len());
         let mut realm_members: FastMap<usize, Vec<(usize, usize)>> = FastMap::default();
         let mut templates: FastMap<(usize, usize), Vec<u64>> = FastMap::default();
@@ -446,6 +465,7 @@ impl Interp {
         // Between the phases every cell is intact and new cells are allocated marked: the
         // engine evicts the dead from its tables while their identities are still stable.
         let dead = crate::gc_sweep::DeadObjects::new(heap);
+        crate::gc_sweep::set(&mut heap.rescanned_natives.borrow_mut(), &dead);
         self.gc_heap_sweep_tree(&dead, &native);
         drop(native);
         // Weak handles to dead cells are cleared; a cell a weak handle still names stays

@@ -271,6 +271,8 @@ mod cldr_display_names;
 mod cldr_numbers;
 mod value;
 mod workload_metrics;
+#[cfg(test)]
+mod write_barrier_tests;
 
 use interpreter::Interp;
 use std::time::{Duration, Instant};

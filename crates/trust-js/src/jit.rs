@@ -3165,6 +3165,12 @@ mod asm {
         pub fn mvn_w(&mut self, rd: u32, rm: u32) {
             self.emit(0x2A20_03E0 | (rm << 16) | rd);
         }
+        /// orr xd, xn, #(2^ones - 1): sets the low `ones` bits (ORR (immediate), sf=N=1, immr=0,
+        /// imms=ones-1; Arm 100076, D2.110).
+        pub fn orr_low_ones_x(&mut self, rd: u32, rn: u32, ones: u32) {
+            assert!(rd < 32 && rn < 32 && (1..64).contains(&ones));
+            self.emit(0xB240_0000 | ((ones - 1) << 10) | (rn << 5) | rd);
+        }
         /// and/orr/eor xd, xn, xm — op: 0=and, 1=orr, 2=eor
         pub fn logic_x(&mut self, op: u32, rd: u32, rn: u32, rm: u32) {
             let bits = match op {
@@ -9345,6 +9351,55 @@ fn emit_prop_create_probe(
     a.b(commit);
 }
 
+/// The write barrier's card store (S6 step 10b; `gc_core::card_mark`), emitted after a store of
+/// a word that can be a reference into an object, environment or their storage, before any
+/// safepoint: the card of the cell whose start (an object's or environment's) or Object address
+/// (its cell's start + `obj_from_cell`, in the same 128-byte card) is in `owner` is set, from the
+/// address alone. With base = owner & !0xffff and card = (owner >> 7) & 511, the byte at base +
+/// 65,024 + card becomes 0xff:
+///
+/// ```text
+/// ubfx s2, owner, #7, #9      ; the card
+/// orr  s1, owner, #0xffff     ; base + 65,535, whose low byte (0xff) is the byte stored
+/// sub  s2, s2, #511           ; card - 511: base + 65,535 + (card - 511) = base + 65,024 + card
+/// strb w(s1), [s1, s2]        ; strb's immediate cannot reach 65,024: a register offset
+/// ```
+///
+/// `s1` may be `owner`; `s2` differs from both. One emitter for every site.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_card_mark(a: &mut asm::Asm, owner: u32, s1: u32, s2: u32) {
+    use crate::gc_core::{CARD_SHIFT, CARD_TABLE_BYTES, PAGE_SHIFT, PAGE_SIZE};
+    debug_assert!(s2 != owner && s2 != s1);
+    // The arithmetic below: base + (PAGE_SIZE - 1) + card - (CARD_TABLE_BYTES - 1) is the card's
+    // byte in the table that ends the page, and the low byte of base + (PAGE_SIZE - 1) is set.
+    const _: () = assert!(
+        PAGE_SIZE - CARD_TABLE_BYTES == crate::gc_core::CARD_TABLE_OFFSET
+            && PAGE_SIZE.is_power_of_two()
+            && CARD_TABLE_BYTES.is_power_of_two()
+            && PAGE_SIZE >= 256
+    );
+    a.ubfx(s2, owner, CARD_SHIFT, CARD_TABLE_BYTES.trailing_zeros());
+    a.orr_low_ones_x(s1, owner, PAGE_SHIFT);
+    a.sub_imm(s2, s2, (CARD_TABLE_BYTES - 1) as u32);
+    a.strb_reg(s1, s1, s2);
+}
+
+/// Debug check for [`emit_card_mark`]'s use of an Object address: it lies in its cell's card.
+/// Object cells (192 bytes) start 0 or 64 bytes into a 128-byte card.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn debug_assert_object_in_cell_card(layout: &crate::value::JitLayout) {
+    debug_assert!(
+        layout.obj_from_cell < (1 << crate::gc_core::CARD_SHIFT) / 2,
+        "an Object's address must share its cell's card"
+    );
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9493,6 +9548,8 @@ fn emit_set_prop_inline(
     // Move v (the stack word, in x16) into the entry.
     emit_exec_word_load(a, 16, 20, -8);
     a.stur(16, 15, ev);
+    // The write barrier (site A): the receiver's cell starts at x10.
+    emit_card_mark(a, 10, 9, 17);
     if matches!(recv, PropRecv::Stack) {
         if keep {
             // The RHS word is also the expression's result, over the receiver.
@@ -9531,6 +9588,9 @@ fn emit_set_prop_inline(
         // The predicted key is already owned by the shared layout (validated pre-commit).
         // Only install Property::plain; no per-instance key ownership operation is needed.
         a.stur(16, 15, ev);
+        // The write barrier (site B): the receiver, which can be old (a constructor's `this`
+        // made before the callee's entry poll), starts at x10.
+        emit_card_mark(a, 10, 9, 17);
         a.movz(
             14,
             (crate::value::PROP_WRITABLE
@@ -10056,14 +10116,69 @@ fn emit_store_name_inline(
     let done = a.new_label();
 
     emit_name_ic_value_ptr(a, layout, cache_ptr, slow, true);
-    emit_store_name_value(a, layout, slow, done);
+    emit_store_name_value(a, layout, NameStoreOwner::Cache(cache_ptr), slow, done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
     a.bind(done);
 }
 
+/// Where [`emit_store_name_value`]'s write barrier finds the store's owner, which no register
+/// holds at the store (S6 step 10b): it reloads it.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+enum NameStoreOwner {
+    /// A free-name or captured-binding site, whose `NameIc` cell is at this address: a global
+    /// property's owner is the realm's global object, a binding's the environment the cache's
+    /// mode names ([`emit_name_owner_env`]).
+    Cache(usize),
+    /// A Reference op on this slot: the Reference's object, or its scope.
+    Reference(u16),
+}
+
+/// The environment owning the binding a free-name or captured-binding cache's proof resolved
+/// (`emit_name_ic_value_ptr_in` from the running environment), into x17: by the cache's mode,
+/// the running environment (direct and fixed-layout modes), its parent (depth one: `ic.env` =
+/// parent | 2, or | 6), or the deep descriptor's holder, the running environment's `len - 1`th
+/// parent. The cache is unchanged since the proof. Clobbers x13, x15 and x16.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_name_owner_env(a: &mut asm::Asm, layout: &crate::value::JitLayout, cache_ptr: usize) {
+    use crate::bytecode::lexical_cache::{NativeNameDescriptor, DEEP_NAME_IC};
+    use crate::bytecode::{NAME_IC_OFF_BINDING, NAME_IC_OFF_ENV};
+    use std::mem::offset_of;
+    let ready = a.new_label();
+    let not_depth_one = a.new_label();
+    a.mov_imm64(15, cache_ptr as u64);
+    a.ldr_imm(16, 15, NAME_IC_OFF_ENV);
+    a.ldr_imm(17, 19, offset_of!(JitCtx, env_raw) as u32);
+    a.ubfx(13, 16, 1, 1);
+    a.cbz(13, true, not_depth_one);
+    a.ldr_imm(17, 19, offset_of!(JitCtx, env_parent_raw) as u32);
+    a.bind(not_depth_one);
+    if names::deep_layout_supported(layout) {
+        // Otherwise the deep proof always declines.
+        let walk = a.new_label();
+        a.cmp_imm_x(16, DEEP_NAME_IC as u32);
+        a.b_cond(C_NE, ready);
+        a.ldr_imm(15, 15, NAME_IC_OFF_BINDING);
+        a.ldr_imm(15, 15, offset_of!(NativeNameDescriptor, len) as u32);
+        a.bind(walk);
+        a.sub_imm(15, 15, 1);
+        a.cbz(15, true, ready);
+        a.ldr_imm(17, 17, layout.scope_parent as u32);
+        a.b(walk);
+    }
+    a.bind(ready);
+}
+
 /// Store to an already resolved, checked x14 value address; x7 distinguishes property/binding.
-/// No subsequent operation may resolve the identifier again. Shared by name and Reference ICs.
+/// No subsequent operation may resolve the identifier again. Shared by name and Reference ICs;
+/// `owner` says where the write barrier reloads the store's owner.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -10071,6 +10186,7 @@ fn emit_store_name_inline(
 fn emit_store_name_value(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
+    owner: NameStoreOwner,
     slow: usize,
     done: usize,
 ) {
@@ -10090,6 +10206,23 @@ fn emit_store_name_value(
     // The old word is released by overwriting it, a function's deferred prototype included (a
     // cell, which dies once no word names it): no load, test or helper call.
     a.stur(10, 14, 0);
+    // The write barrier (site C): the property's owner, reloaded.
+    match owner {
+        NameStoreOwner::Cache(_) => {
+            // The realm's global Object (its cell's start + obj_from_cell, in the cell's card).
+            debug_assert_object_in_cell_card(layout);
+            a.ldr_imm(15, 19, std::mem::offset_of!(JitCtx, global_body) as u32);
+        }
+        NameStoreOwner::Reference(_) => {
+            // x8 = the PreparedReference; its object is a cell start.
+            a.ldr_imm(
+                15,
+                8,
+                std::mem::offset_of!(crate::eval::PreparedReference, object) as u32,
+            );
+        }
+    }
+    emit_card_mark(a, 15, 15, 16);
     a.sub_imm(20, 20, 8);
     a.b(done);
 
@@ -10128,6 +10261,25 @@ fn emit_store_name_value(
     emit_exec_decode_wide(a, 8, 9, 10, 11, 13, slow);
     a.stur(9, 14, 0);
     a.stur(10, 14, 8);
+    // The write barrier (site D): the binding's environment, reloaded.
+    match owner {
+        NameStoreOwner::Cache(cache_ptr) => emit_name_owner_env(a, layout, cache_ptr),
+        NameStoreOwner::Reference(reference) => {
+            use crate::eval::{PreparedReference as R, PreparedReferenceSlot as S};
+            use std::mem::{offset_of, size_of};
+            // x8 held the PreparedReference until the operand load above.
+            a.ldr_imm(17, 19, offset_of!(JitCtx, references_raw) as u32);
+            a.mov_imm64(
+                16,
+                (reference as usize * size_of::<S>()
+                    + offset_of!(S, reference)
+                    + offset_of!(R, scope)) as u64,
+            );
+            a.add_shifted(17, 17, 16, 0);
+            a.ldr_imm(17, 17, 0);
+        }
+    }
+    emit_card_mark(a, 17, 17, 16);
     a.sub_imm(20, 20, 8);
     a.b(done);
 }
@@ -12182,6 +12334,8 @@ fn emit_define_elem_inline(
             | crate::value::PROP_CONFIGURABLE) as u64,
     );
     a.stur(1, 17, layout.property_meta as i32);
+    // The write barrier (site E): the array's cell starts at x10.
+    emit_card_mark(a, 10, 9, 17);
     a.add_imm(16, 16, 1);
     let inline_appended = a.new_label();
     let appended = a.new_label();

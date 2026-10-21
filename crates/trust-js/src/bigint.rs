@@ -101,6 +101,7 @@ pub(crate) fn cell_layout() -> crate::gc_core::LayoutDesc {
         trace: crate::gc_box::trace_none,
         weak: None,
         finalize: Some(crate::gc_box::finalize::<BigIntData>),
+        carded: false,
     }
 }
 

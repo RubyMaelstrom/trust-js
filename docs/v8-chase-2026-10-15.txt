@@ -5656,3 +5656,149 @@ agent's change, reviewed):
   barrier's check. The reporter trait's new provided method says
   whether the values are fixed; its default, for embedders, says
   they may change.
+
+Step 10b, marks persist and a write barrier records old cells as
+they are written (an implementation agent's change, reviewed):
+- Marks persist: the sweep keeps small and large cells' marks and
+  clears only waiters and pins, so between collections a marked
+  cell is old (it survived the last collection) and an allocated
+  unmarked one young. A collection starts in Heap::begin_marking,
+  out of line: debug builds check the barrier, then every mark and
+  every card is cleared. dead_cells, is_dead_small_cell and
+  is_dead_target assert in debug builds that a collection is in
+  progress; only the check reads the last collection's marks.
+- Card tables: LayoutDesc::carded is set for objects, environments
+  and deferred prototypes. Their pages end in a 512-byte table, a
+  byte per 128 bytes of the page, and hold 338, 508 and 1,354 cells
+  of 192, 128 and 48 bytes; locate and is_dead_small_cell already
+  bounded the cell index, so no address in a page's tail or table
+  resolves to a cell. gc_core::card_mark sets the card of a cell's
+  start from its address alone, at base + 65,024 + ((addr >> 7) &
+  511): no lookup, load or branch.
+- The barrier's sites: the handles' own borrow_mut and
+  try_borrow_mut (Gc, Env) set the card before borrowing (no
+  collection runs while a borrow is outstanding); store_cap_ic, the
+  deferred prototype's promotion in PackedValue::unpack (the
+  function's card) and its materialization (its own cell's) set it
+  just before their stores. ARM64, one emitter of four
+  instructions (ubfx, orr #0xffff, sub #511, strb with a register
+  offset, storing 0xff): sites A, B and E have the owner in x10; C
+  reloads the realm's global object (a name cache) or the prepared
+  Reference's object; D reloads the binding's environment, by the
+  name cache's mode the running one, its parent or the deep holder
+  len - 1 parents up (20 words with the card), or the Reference's
+  scope. x64's store_value computes the card's address from R9
+  before decode_rhs overwrites it, keeps it in the frame's spare
+  word and sets the card after the store (7 instructions).
+- After begin_marking a collection that scans the native stack
+  zeroes 16 KiB below its frame (256 KiB in debug builds) with the
+  existing scrub_stack: begin_marking's frames held cells' and
+  pages' addresses, which the scan's frames would reuse.
+- Host reporters: NativeCallableRetained::reports_fixed_values,
+  false by default, its contract documented with the trait.
+  RandomStream and napi's callback and constructor closures
+  declare their values fixed, and so, a review change, does
+  Error.captureStackTrace's getter: its frames' names are captured
+  before it is made, and it only builds the formatted lines, a Rust
+  string, later. The plan's amendment named it among the changing
+  reporters; napi's promise executor is the workspace's only one
+  left. Functions with a changing reporter are listed in
+  GcState::rescanned_natives (an Interp field would change the
+  memory inventory's count), registered by make_native_callable and
+  the super() graft, evicted between the phases of the collection
+  that finds them dead, and carded as each collection starts,
+  before the check.
+- The check (debug builds): every marked small cell with a clean
+  card, and every marked large cell, is traced; an edge to an
+  allocated, unmarked cell panics, naming both cells. A failed
+  check in a collection called from compiled code aborts the
+  process, since nothing unwinds out of compiled frames, so the
+  tests make their last collection from Rust.
+- Tests: 9 in gc_core (the tables' geometry, no cell in a table,
+  card_mark's one byte, cards clear as a collection starts, a spare
+  page reused for another kind, survivors marked until the next
+  collection, the readers' assertion, the check's panic and its
+  passing side); 19 engine tests in write_barrier_tests.rs, 12 of
+  them ARM64's (sites A-E, each name-cache mode of D, each kind of
+  Reference) and the review's captured_stack_getter_is_not_rescanned
+  among the 7 that run everywhere; on x86-64,
+  native_name_stores_record_their_owners_in_cards (seven kinds of
+  store, each counted as native). No existing test changed. 28
+  mutations in an export each made a target test fail: every
+  site's card removed, C's and D's owners reloaded wrongly, the
+  reporters' registration, eviction and cards, the check, the
+  sweep keeping the marks, the cards' clearing, the tables (D's
+  Reference mutation after one test change). The review's mutation
+  of x64's store_value, its card store removed, built on zombie in
+  a target dir of its own: the x64 test failed, the check naming an
+  old object with a clean card.
+- Collections (TRUST_JS_PERF_METRICS, --tier=jit): 7, 3, 6 and 15,
+  outputs the same.
+- Gates (the review's, on the reviewed tree):
+  - aarch64: lib 2265/0/7, its test list the parent's plus the 28
+    new tests; clippy clean in the five configurations; rustfmt
+    clean; the workspace builds with all targets without a
+    diagnostic; rustdoc's 40 warnings are 10a's.
+  - Downstream suites: host 36/0/0, timers 5/0/0, fs (no tests), web
+    61/0/1, node 42/0/0, runtime 182/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0; difftest 138 agree, 12 skipped, no crash. The
+    sustained workload at --tier=jit and bytecode: 15 collections,
+    its output 10a's.
+  - The fixtures' code dumps (dumpcmp-10b.py): with the card
+    sequences dropped, every chunk is 10a's in the plain dumps and
+    with the stubs per chunk and inline, but djot's 9 GC-timing-
+    sensitive chunks (4 inline), which are the 8f reference's, the
+    other retention state. Sequences dropped: vue A 44, B 40, C 19,
+    D 19, E 4; react E 10; djot A 366, B 366, C 24, D 24.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier, poisoning and the
+    barrier's check, aarch64, the whole lib suite (2272 tests): 2235
+    pass at interval 1 (7 are ignored), the slow lists' 25 at
+    100 and 5 at 1000.
+  - x86-64 (zombie): clippy clean; lib 2099/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2090 pass, 4 fail and
+    7 are ignored: step 1's three snapshot codec tests and
+    a_dropped_realm_that_ran_the_last_regexp_is_collected (below).
+    Both lists are the parent's plus the 17 new tests that build
+    there. Test262 at --tier=jit: 53575/53575, the report identical
+    to step 1's x86-64 one and the S5 exit gate's aarch64 one.
+    Fixtures: compiles 56/10/160 and 7, 3 and 6 collections,
+    outputs as on aarch64; difftest 138 agree, 12 skipped, no
+    crash.
+  - Per-test GC stress with the verifier, poisoning and the
+    barrier's check, x86-64 (zombie), the whole lib suite, 2106
+    tests: 2073 pass and 7 are ignored at interval 1 (about 3,800
+    s); the slow lists' 22 pass at 100 and their 4 at 1000.
+  - The Windows failure (its Bytecode tier's dropped Realm still
+    live; also in one of the agent's four runs) is a retention flake
+    that 10a made frequent, not 10b. Under Wine the realm tests'
+    module, run 15 times each, fails in 1 run at 9c (a sibling
+    test's dropped Realm live), in 6 at 10a and in 6 at 10b, and in
+    none with 10b's tree taking Windows pages from the allocator as
+    before 10a; on x86-64 Linux 30 of 30 runs pass. Probably address
+    reuse: with a VirtualAlloc for each page, a released heap's
+    page addresses go straight to the next heap, so stale stack
+    words from earlier work resolve to new cells (not traced
+    further). The next commit gives Windows its pages from the
+    allocator again.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 10a
+  a9efdaf98d41, 10b cbee73542a2a from the gated tree, main
+  311ae9ae5658; copies made together; CPU 5, 15 interleaved rounds,
+  medians; the empty script as a control; started once a local
+  inference server had used under 1% of a core for a minute, the
+  other cores 0.66 busy (median), 2.86 at most; outputs equal
+  everywhere):
+  - Against 10a, the barrier's cost: cycles +0.5% on react and djot,
+    +1.0% on vue, +1.1% on the sustained workload at --tier=jit and
+    +2.0% at bytecode (instructions +0.3% to +1.0%); GC pause within
+    1%, every collection still major; peak RSS within 1%.
+  - Against main, 10b's cycles: vue -11.9%, react -14.0%, djot
+    -10.1%, the sustained workload -38.7% (jit) and -31.3%
+    (bytecode). Peak RSS: vue +28%, react +141%, djot +8%, the
+    sustained workload -8.9% (jit and bytecode). GC pause over wall
+    time without the exit collection: vue 3.5%, react 4.6%, djot
+    6.5%, the sustained workload 30.2% (jit) and 22.4% (bytecode);
+    main's, its exit collection included: 0.9%, 0.4%, 2.8%, 35.0%
+    and 28.5%.

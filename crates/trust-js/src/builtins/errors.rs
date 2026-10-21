@@ -481,4 +481,10 @@ impl crate::value::NativeCallableRetained for CapturedTrace {
             trace.for_each_name(|name| visitor.value(&Value::Str(name.clone())));
         }
     }
+
+    /// The frames' names, captured before the getter is made. The getter later builds the
+    /// trace's formatted lines (`StackTrace::lines`), a Rust string, and changes no name.
+    fn reports_fixed_values(&self) -> bool {
+        true
+    }
 }

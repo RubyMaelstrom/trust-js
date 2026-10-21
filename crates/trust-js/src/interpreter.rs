@@ -7106,6 +7106,12 @@ impl Interp {
         retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
     ) -> Gc {
         let obj = Object::new(Some(self.function_proto.clone()));
+        if retained
+            .as_ref()
+            .is_some_and(|reporter| !reporter.reports_fixed_values())
+        {
+            self.register_rescanned_native(&obj);
+        }
         {
             let mut b = obj.borrow_mut();
             b.call = Callable::NativeData(Rc::new(crate::value::NativeCallable {
@@ -7143,6 +7149,15 @@ impl Interp {
         }
         self.register_native_realm(&obj);
         obj
+    }
+
+    /// S6 step 10b: `function` holds a native callable whose host reporter's values may change
+    /// after its creation: every collection rescans it (see `GcState::rescanned_natives`).
+    pub(crate) fn register_rescanned_native(&self, function: &Gc) {
+        self.gc_heap
+            .rescanned_natives
+            .borrow_mut()
+            .insert(Gc::as_ptr(function) as usize);
     }
 
     pub(crate) fn register_native_realm(&self, function: &Gc) {

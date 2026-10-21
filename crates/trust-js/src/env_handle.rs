@@ -2,8 +2,10 @@
 //!
 //! [`Env`] is the `Copy` address of a GC cell holding the `RefCell<Scope>` (P1 S2), traced by
 //! the scope descriptor (see `value::trace_scope_cell`). It dereferences to the
-//! `RefCell<Scope>`, so `.borrow()`/`.borrow_mut()` work on a handle. Identity goes through
-//! associated functions — [`Env::as_ptr`], [`Env::ptr_eq`], [`Env::downgrade`]. Rust frames
+//! `RefCell<Scope>`, so `.borrow()` works on a handle; `.borrow_mut()` and `.try_borrow_mut()`
+//! are the handle's own, which record the write in the record's card first (the write barrier,
+//! S6 step 10b). Identity goes through associated functions — [`Env::as_ptr`],
+//! [`Env::ptr_eq`], [`Env::downgrade`]. Rust frames
 //! hold environments in locals everywhere, where the conservative stack scan finds them.
 
 pub use cell::{Env, WeakEnv};
@@ -57,6 +59,26 @@ mod cell {
         #[inline]
         pub fn into_raw(this: Env) -> *const RefCell<Scope> {
             this.0.as_ptr()
+        }
+
+        /// Mutably borrow the record, as `RefCell::borrow_mut`, first recording the write in the
+        /// record's card (the write barrier, `gc_core::card_mark`; see `Gc::borrow_mut`).
+        #[inline]
+        pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Scope> {
+            // SAFETY: a reachable handle names a live environment cell (Decision 0 / I1): small
+            // (it fills the 128-byte class) and of the carded environment kind.
+            unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
+            (**self).borrow_mut()
+        }
+
+        /// `RefCell::try_borrow_mut` with the write barrier, as [`Env::borrow_mut`].
+        #[inline]
+        pub fn try_borrow_mut(
+            &self,
+        ) -> Result<std::cell::RefMut<'_, Scope>, std::cell::BorrowMutError> {
+            // SAFETY: as in `borrow_mut`.
+            unsafe { crate::gc_core::card_mark(self.0.as_ptr().cast()) };
+            (**self).try_borrow_mut()
         }
     }
 

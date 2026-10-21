@@ -25,7 +25,13 @@
 //!   case asserts in debug builds), and cells are allocated zeroed.
 //! - Dropping the heap finalizes the remaining cells and frees all heap
 //!   memory (I5 teardown).
-//! - Debug builds poison freed cells and verify the marked graph.
+//! - Marks persist from one collection to the next (S6 step 10b): between
+//!   collections a marked cell is old and an allocated unmarked one young. The
+//!   pages of kinds whose cells gain references after initialization end in a
+//!   card table, where the write barrier records each written cell
+//!   ([`card_mark`]); a collection clears marks and cards when it starts.
+//! - Debug builds poison freed cells, verify the marked graph and check the
+//!   write barrier as each collection starts.
 
 use crate::fasthash::FastMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -35,7 +41,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
-const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
+pub(crate) const PAGE_SHIFT: u32 = PAGE_SIZE.trailing_zeros();
 const PAYLOAD_MASK: u64 = 0x0000_ffff_ffff_ffff;
 /// Cells larger than the last class are large objects.
 const SIZE_CLASSES: [usize; 16] = [
@@ -47,6 +53,37 @@ const DEFAULT_MIN_TRIGGER: usize = 1024 * 1024;
 const DEFAULT_GROWTH_PERCENT: usize = 100;
 #[cfg(debug_assertions)]
 const POISON: u64 = 0xdddd_dddd_dddd_dddd;
+
+/// S6 step 10b: a page of a kind whose cells gain references after their initialization
+/// ([`LayoutDesc::carded`]) ends in a card table, a byte per card of `1 << CARD_SHIFT` bytes of
+/// the page. The write barrier sets the card of a written cell's start ([`card_mark`]); a
+/// collection checks the cards (debug builds) and clears them when it starts.
+pub(crate) const CARD_SHIFT: u32 = 7;
+/// The bytes of a carded page's card table, its last: one per card of the page.
+pub(crate) const CARD_TABLE_BYTES: usize = PAGE_SIZE >> CARD_SHIFT;
+/// Where a carded page's card table starts in the page (65,024): no cell reaches it.
+pub(crate) const CARD_TABLE_OFFSET: usize = PAGE_SIZE - CARD_TABLE_BYTES;
+const _: () = assert!(CARD_TABLE_BYTES == 512 && CARD_TABLE_OFFSET == 65_024);
+
+/// The write barrier: record that the cell starting at `cell` was written, by setting its card
+/// (a nonzero byte at its page's base + `CARD_TABLE_OFFSET` + its start's offset in the page >>
+/// `CARD_SHIFT`), from the address alone: no lookup, no load, no branch. A card stays set until
+/// the next collection starts. Generated code stores the same byte (ARM64's `emit_card_mark`,
+/// x64's `card_address` and `card_store`); an Object's address (its cell's start + 8) lies in
+/// its cell's card.
+///
+/// # Safety
+/// `cell` is the start of a live small cell of a carded kind ([`LayoutDesc::carded`]), whose
+/// page therefore ends in its card table.
+#[inline]
+pub(crate) unsafe fn card_mark(cell: *const u8) {
+    let addr = cell as usize;
+    let card = (addr >> CARD_SHIFT) & (CARD_TABLE_BYTES - 1);
+    let table = (addr & !(PAGE_SIZE - 1)) + CARD_TABLE_OFFSET;
+    // SAFETY: the caller's contract: the cell's page is live and carded, and no cell overlaps
+    // its card table.
+    unsafe { ((table + card) as *mut u8).write(1) };
+}
 
 fn size_class(size: usize) -> Option<usize> {
     SIZE_CLASSES.iter().position(|&c| size <= c)
@@ -663,6 +700,12 @@ pub(crate) struct LayoutDesc {
     pub(crate) trace: TraceFn,
     pub(crate) weak: Option<WeakFn>,
     pub(crate) finalize: Option<FinalizeFn>,
+    /// The kind's cells gain references after their initialization (the engine's objects,
+    /// environments and deferred prototypes), through writes the barrier records
+    /// ([`card_mark`]): its pages end in a card table, so a page holds `CARD_TABLE_OFFSET /
+    /// cell size` cells. Cells of other kinds never get a reference after initialization (a
+    /// closure's environment, a string view's owner), and their pages are cells throughout.
+    pub(crate) carded: bool,
 }
 
 /// Receives one reachable cell's weak data during marking, into buffers the
@@ -735,6 +778,11 @@ struct PageMeta {
     cells: usize,
     desc: DescId,
     class: usize,
+    /// The page ends in a card table ([`LayoutDesc::carded`]).
+    carded: bool,
+    /// Set by the marking that found a cell reachable, and kept by the sweep: between
+    /// collections a marked cell is old (it survived the last collection), an allocated unmarked
+    /// one young (allocated since). A collection clears them before it marks.
     marks: Vec<u64>,
     /// Allocated (handed-out) cells. Conservative marking must ignore
     /// free cells: a stale stack word resolving into a free cell would
@@ -759,6 +807,32 @@ struct PageMeta {
 impl PageMeta {
     fn cell_ptr(&self, index: usize) -> usize {
         self.base + index * self.cell_size
+    }
+
+    /// Whether the card of the cell at `index` is set: always false on a page without a card
+    /// table.
+    fn card_set(&self, index: usize) -> bool {
+        if !self.carded {
+            return false;
+        }
+        let card = (index * self.cell_size) >> CARD_SHIFT;
+        // SAFETY: a carded page ends in its card table, which no cell overlaps; the page is
+        // live while its metadata is.
+        unsafe { ((self.base + CARD_TABLE_OFFSET + card) as *const u8).read() != 0 }
+    }
+
+    /// Clear the page's cards, if it has a card table.
+    fn clear_cards(&mut self) {
+        if self.carded {
+            // SAFETY: as in `card_set`.
+            unsafe {
+                std::ptr::write_bytes(
+                    (self.base + CARD_TABLE_OFFSET) as *mut u8,
+                    0,
+                    CARD_TABLE_BYTES,
+                )
+            };
+        }
     }
 
     fn take_free(&mut self) -> Option<*mut u8> {
@@ -790,6 +864,7 @@ struct ClassPages {
 struct LargeObj {
     size: usize,
     desc: DescId,
+    /// See `PageMeta::marks`. A large cell has no card: the write barrier never records one.
     marked: bool,
     waiters: bool,
     /// See `PageMeta::zombies`.
@@ -1302,7 +1377,14 @@ impl Heap {
             (base as usize).is_multiple_of(PAGE_SIZE),
             "GC page off its alignment"
         );
-        let cells = PAGE_SIZE / cell_size;
+        // A carded kind's page ends in its card table, zeroed (clean) like the rest of the page.
+        let carded = self.descs[desc.0 as usize].carded;
+        let cells = if carded {
+            CARD_TABLE_OFFSET / cell_size
+        } else {
+            PAGE_SIZE / cell_size
+        };
+        debug_assert!(!carded || cells * cell_size <= CARD_TABLE_OFFSET);
         // Thread the free list: cell i -> i+1 (stored as i+2), last -> 0.
         for i in 0..cells {
             let next = if i + 1 < cells { (i + 2) as u64 } else { 0 };
@@ -1316,6 +1398,7 @@ impl Heap {
             cells,
             desc,
             class,
+            carded,
             marks: vec![0; words],
             allocated: vec![0; words],
             waiters: vec![0; words],
@@ -1362,7 +1445,9 @@ impl Heap {
     }
 
     /// Resolve a candidate word (raw pointer or tagged word, interior
-    /// addresses included) to its cell. `None` for non-heap words.
+    /// addresses included) to its cell. `None` for non-heap words, among them an address in a
+    /// page's tail past its last cell or in its card table: the bound on the cell's index
+    /// rejects both.
     fn locate(&self, word: u64) -> Option<CellRef> {
         let addr = (word & PAYLOAD_MASK) as usize;
         if addr < 4096 {
@@ -1549,9 +1634,20 @@ impl Heap {
         }
     }
 
+    /// Debug builds: a reader of the current marking's verdict is between a collection's phases.
+    /// Marks persist between collections, where they say which cells are old, not which are
+    /// dead.
+    fn debug_assert_marking_current(&self, reader: &str) {
+        debug_assert!(
+            self.control.collecting.get(),
+            "{reader} read the marks outside a collection, where they say which cells are old"
+        );
+    }
+
     /// The allocated cells of `desc` the current marking left unmarked (between
     /// [`Heap::start_marking`] and [`Heap::finish_collection`]).
     pub(crate) fn dead_cells(&self, desc: DescId) -> Vec<usize> {
+        self.debug_assert_marking_current("dead_cells");
         let mut dead = Vec::new();
         for page in self.pages.iter().flatten().filter(|page| page.desc == desc) {
             for i in 0..page.cells {
@@ -1572,8 +1668,10 @@ impl Heap {
     /// unmarked, zombies apart: between [`Heap::start_marking`] and [`Heap::finish_collection`],
     /// whether [`Heap::dead_cells`] lists `addr` for a descriptor whose cells are all small.
     /// The page table and the page's bits answer, without hashing; large cells are not
-    /// consulted, so a dead large cell's start answers false.
+    /// consulted, so a dead large cell's start answers false. An address in a page's tail or
+    /// card table starts no cell: the bound on the index rejects it.
     pub(crate) fn is_dead_small_cell(&self, addr: usize, desc: DescId) -> bool {
+        self.debug_assert_marking_current("is_dead_small_cell");
         let Some(slot) = self.page_table.get(addr >> PAGE_SHIFT) else {
             return false;
         };
@@ -1587,6 +1685,23 @@ impl Heap {
             && bit(&page.allocated, index)
             && !bit(&page.marks, index)
             && !bit(&page.zombies, index)
+    }
+
+    /// Whether `addr` starts an allocated small cell of a carded kind, which [`card_mark`]
+    /// requires (debug builds' checks of the cells the engine cards itself).
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_carded_cell(&self, addr: usize) -> bool {
+        self.locate(addr as u64)
+            .is_some_and(|cell| match (cell.start == addr, cell.loc) {
+                (true, Loc::Small { page, index }) => {
+                    self.pages[page as usize].as_ref().is_some_and(|p| {
+                        p.carded
+                            && bit(&p.allocated, index as usize)
+                            && !bit(&p.zombies, index as usize)
+                    })
+                }
+                _ => false,
+            })
     }
 
     /// The number of the collection in progress (the first is 1), while one is: for an
@@ -1640,8 +1755,10 @@ impl Heap {
     }
 
     /// Whether `addr` (interior addresses included) lies in a cell of this heap that the
-    /// current marking left unmarked: a weak reference to it must be cleared.
+    /// current marking left unmarked: a weak reference to it must be cleared. Between the phases
+    /// of a collection.
     pub(crate) fn is_dead_target(&self, addr: usize) -> bool {
+        self.debug_assert_marking_current("is_dead_target");
         self.locate(addr as u64)
             .is_some_and(|cell| !self.is_marked(&cell))
     }
@@ -1679,6 +1796,14 @@ impl Heap {
         self.control.pending_collect.set(false);
         self.refresh_due();
         self.stats.collections += 1;
+        self.begin_marking();
+        // `begin_marking` handled cells' and pages' addresses in frames below this one, which the
+        // native stack scan's frames reuse: zero that region first, as the engine zeroes its own
+        // before a collection.
+        #[cfg(not(target_arch = "wasm32"))]
+        if native_roots {
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
+        }
         let mut m = Marker::default();
         #[cfg(test)]
         {
@@ -1716,6 +1841,72 @@ impl Heap {
         #[cfg(test)]
         if let Some(parents) = m.parents.take() {
             self.last_parents = parents;
+        }
+    }
+
+    /// As a collection starts (S6 step 10b): in debug builds, check the write barrier's
+    /// invariant against the last collection's marks and the cards set since
+    /// ([`Heap::check_write_barrier`]); then clear every mark and every card, so that marking
+    /// starts from nothing and the next collection's cards record only what is written from now
+    /// on. Out of line, so that `mark_phase` can zero the frames it used (see there).
+    #[inline(never)]
+    fn begin_marking(&mut self) {
+        if cfg!(debug_assertions) {
+            self.check_write_barrier();
+        }
+        for page in self.pages.iter_mut().flatten() {
+            page.marks.fill(0);
+            page.clear_cards();
+        }
+        for large in self.larges.values_mut() {
+            large.marked = false;
+        }
+    }
+
+    /// The write barrier's invariant, checked in debug builds as each collection starts, before
+    /// its marks and cards clear: an old cell (one the last collection marked) whose card is
+    /// clean holds no traced edge to an allocated, unmarked cell of this heap (one allocated
+    /// since). A cell of a kind without cards, or a large cell, has no card: it never holds such
+    /// an edge. Every collection runs it, so GC stress runs it at every safepoint. Minor
+    /// collections, which trace an old cell only through its set card, rely on it. Panics naming
+    /// the holder's descriptor and address and the target's.
+    fn check_write_barrier(&self) {
+        let mut edges: Vec<*const u8> = Vec::new();
+        let mut check = |holder: usize, desc: DescId| {
+            let desc = &self.descs[desc.0 as usize];
+            edges.clear();
+            (desc.trace)(holder as *const u8, &mut |edge| edges.push(edge));
+            for &edge in &edges {
+                let Some(target) = self.locate(edge as u64) else {
+                    continue;
+                };
+                let unmarked = match target.loc {
+                    Loc::Small { page, index } => {
+                        self.pages[page as usize].as_ref().is_some_and(|p| {
+                            bit(&p.allocated, index as usize) && !bit(&p.marks, index as usize)
+                        })
+                    }
+                    Loc::Large => self.larges.get(&target.start).is_some_and(|l| !l.marked),
+                };
+                assert!(
+                    !unmarked,
+                    "write barrier: old cell {holder:#x} ({}) with a clean card holds an edge to \
+                     unmarked cell {:#x} ({}), allocated since the last collection",
+                    desc.name, target.start, self.descs[target.desc.0 as usize].name
+                );
+            }
+        };
+        for page in self.pages.iter().flatten() {
+            for i in 0..page.cells {
+                if bit(&page.marks, i) && !page.card_set(i) {
+                    check(page.cell_ptr(i), page.desc);
+                }
+            }
+        }
+        for (&start, large) in &self.larges {
+            if large.marked {
+                check(start, large.desc);
+            }
         }
     }
 
@@ -2021,8 +2212,10 @@ impl Heap {
     }
 
     /// Finalize, poison (debug) and free unmarked cells, release empty
-    /// pages, clear marks and pins. Dead cells pinned for weak handles (see
-    /// `PageMeta::pins`) stay allocated as zombies. Returns the live bytes that remain.
+    /// pages, clear waiters and pins. Dead cells pinned for weak handles (see
+    /// `PageMeta::pins`) stay allocated as zombies. The marks stay set: until the next
+    /// collection starts they tell old cells from young ones (see `PageMeta::marks`). Returns
+    /// the live bytes that remain.
     fn sweep(&mut self) -> usize {
         let mut live_bytes = 0usize;
         let mut swept = 0u64;
@@ -2067,7 +2260,6 @@ impl Heap {
             }
             page.free_head = head;
             page.live = live;
-            page.marks.fill(0);
             page.waiters.fill(0);
             page.pins.fill(0);
             let cell_size = page.cell_size;
@@ -2093,7 +2285,6 @@ impl Heap {
         self.larges.retain(|&start, large| {
             let pinned = std::mem::take(&mut large.pinned);
             if large.marked {
-                large.marked = false;
                 large.waiters = false;
                 live_bytes += large.size;
                 return true;
@@ -2334,6 +2525,16 @@ impl Drop for NativeStackScope {
 pub(crate) fn register_thread_native_stack() -> bool {
     native::enter_thread()
 }
+
+/// Native stack a collection zeroes below its frame once `Heap::begin_marking` has run, before it
+/// scans the stack: the frames of debug builds' barrier check, which traces every old cell, and
+/// of the clearing of marks and cards, which reads page addresses.
+#[cfg(not(target_arch = "wasm32"))]
+const BEGIN_MARKING_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
+    256 << 10
+} else {
+    16 << 10
+};
 
 /// Native stack an embedder entry (a script evaluation, a microtask checkpoint) zeroes before
 /// running JavaScript, so the frames it builds hold no stale cell addresses from earlier jobs.
@@ -2978,6 +3179,8 @@ mod tests {
         leaf: DescId,
         weakref: DescId,
         table: DescId,
+        /// A node whose cells gain edges after initialization: its pages end in a card table.
+        carded: DescId,
         /// The words the Fixture's client reports as roots. Boxed, off the native stack: a
         /// collection the heap drives itself, which has no client, does not see them.
         roots: Box<[u64; 64]>,
@@ -2991,24 +3194,35 @@ mod tests {
                 trace: trace_node,
                 weak: None,
                 finalize: None,
+                carded: false,
             });
             let leaf = heap.register_desc(LayoutDesc {
                 name: "leaf",
                 trace: trace_none,
                 weak: None,
                 finalize: Some(fin_count),
+                carded: false,
             });
             let weakref = heap.register_desc(LayoutDesc {
                 name: "weakref",
                 trace: trace_none,
                 weak: Some(weak_target),
                 finalize: None,
+                carded: false,
             });
             let table = heap.register_desc(LayoutDesc {
                 name: "table",
                 trace: trace_none,
                 weak: Some(weak_entries),
                 finalize: None,
+                carded: false,
+            });
+            let carded = heap.register_desc(LayoutDesc {
+                name: "carded node",
+                trace: trace_node,
+                weak: None,
+                finalize: None,
+                carded: true,
             });
             Self {
                 heap,
@@ -3016,6 +3230,7 @@ mod tests {
                 leaf,
                 weakref,
                 table,
+                carded,
                 roots: Box::new([0; 64]),
             }
         }
@@ -4797,6 +5012,400 @@ mod tests {
         assert_eq!(mapped(&fx), [None, None, None]);
     }
 
+    /// The cell of the heap starting at or containing `addr`: whether it is marked.
+    fn is_marked_at(heap: &Heap, addr: usize) -> bool {
+        heap.locate(addr as u64)
+            .is_some_and(|cell| heap.is_marked(&cell))
+    }
+
+    /// Fill a fresh page of `desc` with cells of `size` bytes: the cells' starts, the page's
+    /// first.
+    fn fill_page(fx: &mut Fixture, desc: DescId, size: usize) -> Vec<usize> {
+        let first = fx.heap.alloc(desc, size) as usize;
+        assert_eq!(first % PAGE_SIZE, 0, "a new page's first cell starts it");
+        let cells = fx
+            .heap
+            .pages
+            .iter()
+            .flatten()
+            .find(|p| p.base == first)
+            .unwrap()
+            .cells;
+        let mut all = vec![first];
+        all.extend((1..cells).map(|_| fx.heap.alloc(desc, size) as usize));
+        assert!(all.iter().all(|&cell| cell & !(PAGE_SIZE - 1) == first));
+        all
+    }
+
+    /// A page's bytes.
+    fn page_bytes(base: usize) -> Vec<u8> {
+        // SAFETY: a live page of the heap, which nothing writes meanwhile.
+        unsafe { std::slice::from_raw_parts(base as *const u8, PAGE_SIZE) }.to_vec()
+    }
+
+    /// S6 step 10b: a carded kind's pages end in a 512-byte card table, so they hold
+    /// `(PAGE_SIZE - 512) / size` cells (338, 508 and 1,354 of 192, 128 and 48 bytes) where an
+    /// uncarded kind's hold `PAGE_SIZE / size` (341, 512 and 1,365): the next cell starts a new
+    /// page. A fresh page's table is clean.
+    #[test]
+    fn carded_pages_end_in_a_card_table() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        for (size, carded, full) in [(192, 338, 341), (128, 508, 512), (48, 1354, 1365)] {
+            for (desc, cells) in [(fx.carded, carded), (fx.node, full)] {
+                let all = fill_page(&mut fx, desc, size);
+                let base = all[0];
+                assert_eq!(all.len(), cells, "{size}-byte cells");
+                let page = fx.heap.pages.iter().flatten().find(|p| p.base == base);
+                let page = page.unwrap();
+                assert_eq!(page.carded, desc == fx.carded);
+                assert!(!page.carded || base + cells * size <= base + CARD_TABLE_OFFSET);
+                assert!(
+                    (0..cells).all(|i| !page.card_set(i)),
+                    "a fresh table is clean"
+                );
+                let next = fx.heap.alloc(desc, size) as usize;
+                assert_eq!(
+                    next % PAGE_SIZE,
+                    0,
+                    "the next {size}-byte cell starts a new page"
+                );
+                assert_ne!(next, base);
+            }
+        }
+    }
+
+    /// S6 step 10b: no address in a carded page's tail or card table resolves to a cell, whether
+    /// asked directly (`resolve`, `is_dead_small_cell`), held on the native stack or reported as
+    /// a root: such words mark nothing, while a word in the page's last cell marks that cell.
+    #[test]
+    fn no_cell_resolves_in_a_card_table() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        // Three carded pages, every cell's card set, each page's last cell rooted.
+        let pages: Vec<(usize, usize, usize)> = [192, 128, 48]
+            .into_iter()
+            .map(|size| {
+                let carded = fx.carded;
+                let all = fill_page(&mut fx, carded, size);
+                for &cell in &all {
+                    // SAFETY: a live carded cell.
+                    unsafe { card_mark(cell as *const u8) };
+                }
+                (all[0], size, all.len())
+            })
+            .collect();
+        let last = |page: usize| pages[page].0 + (pages[page].2 - 1) * pages[page].1;
+        for page in 0..3 {
+            fx.roots[page] = tagged(last(page) as *const u8);
+        }
+        for &(base, size, cells) in &pages {
+            let end = base + cells * size;
+            for addr in end..base + PAGE_SIZE {
+                assert_eq!(fx.heap.resolve(addr as u64), None, "{addr:#x}");
+                assert_eq!(
+                    fx.heap.resolve(tagged(addr as *const u8)),
+                    None,
+                    "{addr:#x}"
+                );
+            }
+            assert_eq!(
+                fx.heap.resolve(end as u64 - 1),
+                Some((end - size) as *const u8)
+            );
+        }
+        // Between the phases, a dead cell's start answers, but no address of a tail or a table.
+        assert!(fx.start_marking(&no_edges));
+        for &(base, size, cells) in &pages {
+            assert!(fx.heap.is_dead_small_cell(base, fx.carded));
+            assert!(!fx
+                .heap
+                .is_dead_small_cell(base + (cells - 1) * size, fx.carded));
+            for addr in base + cells * size..base + PAGE_SIZE {
+                assert!(!fx.heap.is_dead_small_cell(addr, fx.carded), "{addr:#x}");
+            }
+        }
+        fx.heap.finish_collection(&[]);
+        assert_eq!(fx.live(), 3);
+        // Words in each live page's table, and one inside page 0's last cell, as roots of a
+        // precise collection beside the other two last cells: only the three cells are marked.
+        let table = |page: usize, card: usize| (pages[page].0 + CARD_TABLE_OFFSET + card) as u64;
+        let words = [
+            table(0, 0),
+            table(1, 300),
+            tagged(table(2, 511) as *const u8),
+            last(0) as u64 + 8,
+        ];
+        fx.roots[..4].copy_from_slice(&words);
+        fx.roots[4] = tagged(last(1) as *const u8);
+        fx.roots[5] = tagged(last(2) as *const u8);
+        let marked = fx.heap.stats().cells_marked;
+        fx.collect();
+        assert_eq!(
+            fx.heap.stats().cells_marked - marked,
+            3,
+            "the three cells only"
+        );
+        assert_eq!(fx.live(), 3);
+        // Page 0's table and last cell as stack words, once page 0's last cell is the only cell
+        // left: only it is marked.
+        fx.roots.fill(0);
+        fx.roots[0] = tagged(last(0) as *const u8);
+        fx.collect();
+        assert_eq!(fx.live(), 1);
+        fx.roots.fill(0);
+        let words = [
+            table(0, 0),
+            table(0, 300),
+            tagged(table(0, 511) as *const u8),
+            last(0) as u64 + 8,
+        ];
+        let marked = fx.heap.stats().cells_marked;
+        assert!(collect_with_words_in_frame(&mut fx.heap, words));
+        assert_eq!(
+            fx.heap.stats().cells_marked - marked,
+            1,
+            "only the last cell"
+        );
+        assert!(fx.heap.is_allocated_word(last(0) as u64));
+        black_box(&top);
+    }
+
+    /// S6 step 10b: `card_mark` sets the card its cell starts in, by the cell's address alone,
+    /// and changes no other byte of the page; the page's metadata then reads the card as set.
+    /// A 192- or 128-byte cell has a card of its own; 48-byte cells share theirs.
+    #[test]
+    fn card_mark_sets_exactly_its_cells_card() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        for size in [192, 128, 48] {
+            let carded = fx.carded;
+            let all = fill_page(&mut fx, carded, size);
+            let base = all[0];
+            for (index, &cell) in all.iter().enumerate() {
+                let card = CARD_TABLE_OFFSET + ((cell - base) >> CARD_SHIFT);
+                let before = page_bytes(base);
+                // SAFETY: a live carded cell.
+                unsafe { card_mark(cell as *const u8) };
+                let after = page_bytes(base);
+                assert_ne!(after[card], 0, "{size}-byte cell {index}'s card");
+                assert!(
+                    (0..PAGE_SIZE).all(|i| i == card || before[i] == after[i]),
+                    "{size}-byte cell {index} changed another byte"
+                );
+                let page = fx.heap.pages.iter().flatten().find(|p| p.base == base);
+                assert!(page.unwrap().card_set(index));
+            }
+            // Exactly the cards cells start in are set.
+            let bytes = page_bytes(base);
+            for card in 0..CARD_TABLE_BYTES {
+                let starts = all.iter().any(|&cell| (cell - base) >> CARD_SHIFT == card);
+                assert_eq!(bytes[CARD_TABLE_OFFSET + card] != 0, starts, "card {card}");
+            }
+            let distinct: std::collections::HashSet<usize> = all
+                .iter()
+                .map(|&cell| (cell - base) >> CARD_SHIFT)
+                .collect();
+            assert_eq!(distinct.len() == all.len(), size >= 128, "{size}");
+        }
+    }
+
+    /// S6 step 10b: a collection clears every card when it starts: between its phases and after
+    /// its sweep, every carded page's table is clean, the survivors' included.
+    #[test]
+    fn cards_clear_when_a_collection_starts() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let cells: Vec<usize> = (0..64)
+            .map(|_| fx.heap.alloc(fx.carded, 128) as usize)
+            .collect();
+        for (slot, &cell) in cells.iter().step_by(2).enumerate() {
+            fx.roots[slot] = tagged(cell as *const u8);
+        }
+        fx.collect();
+        for &cell in &cells[..32] {
+            // SAFETY: a live carded cell (the odd ones are free now: not marked).
+            if fx.heap.is_allocated_word(cell as u64) {
+                unsafe { card_mark(cell as *const u8) };
+            }
+        }
+        let base = cells[0] & !(PAGE_SIZE - 1);
+        let table_clean = || {
+            page_bytes(base)[CARD_TABLE_OFFSET..]
+                .iter()
+                .all(|&byte| byte == 0)
+        };
+        assert!(!table_clean());
+        assert!(fx.start_marking(&no_edges));
+        assert!(table_clean(), "between the phases");
+        fx.heap.finish_collection(&[]);
+        assert!(table_clean(), "after the sweep");
+        assert_eq!(fx.live(), 32);
+    }
+
+    /// S6 step 10b: spare pages are zeroed on reuse, so a page that held a carded kind, its cards
+    /// set, and is reused for an uncarded kind carries no table: its cells reach the page's end,
+    /// zeroed, and resolve to themselves. Reused again for a carded kind, its table is clean.
+    #[test]
+    fn a_spare_page_reused_for_another_kind_carries_no_table() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        let (carded_desc, leaf) = (fx.carded, fx.leaf);
+        let carded = fill_page(&mut fx, carded_desc, 192);
+        let base = carded[0];
+        for &cell in &carded {
+            // SAFETY: a live carded cell.
+            unsafe { card_mark(cell as *const u8) };
+        }
+        fx.collect();
+        assert_eq!(fx.heap.spare_pages, [base]);
+        let leaves = fill_page(&mut fx, leaf, 64);
+        assert_eq!(leaves[0], base, "the spare page is reused");
+        assert_eq!(leaves.len(), PAGE_SIZE / 64);
+        let page = fx
+            .heap
+            .pages
+            .iter()
+            .flatten()
+            .find(|p| p.base == base)
+            .unwrap();
+        assert!(!page.carded);
+        assert!(page_bytes(base).iter().all(|&byte| byte == 0), "zeroed");
+        for &leaf in leaves
+            .iter()
+            .filter(|&&leaf| leaf >= base + CARD_TABLE_OFFSET)
+        {
+            assert_eq!(fx.heap.resolve(leaf as u64 + 8), Some(leaf as *const u8));
+        }
+        // Empty again, then reused for 128-byte carded cells: a clean table.
+        fx.collect();
+        assert_eq!(fx.heap.spare_pages, [base]);
+        let again = fill_page(&mut fx, carded_desc, 128);
+        assert_eq!(again[0], base);
+        let page = fx
+            .heap
+            .pages
+            .iter()
+            .flatten()
+            .find(|p| p.base == base)
+            .unwrap();
+        assert!(page.carded && (0..page.cells).all(|i| !page.card_set(i)));
+    }
+
+    /// S6 step 10b: marks persist. After a collection its survivors stay marked (old) and cells
+    /// allocated since are unmarked (young) until the next collection starts, which clears them
+    /// before it marks: between its phases the marks are its own, so `dead_cells`,
+    /// `is_dead_small_cell` and black allocation answer as before, and after it the marked
+    /// cells are its survivors. Large cells keep their mark the same way.
+    #[test]
+    fn survivors_stay_marked_until_the_next_collection_starts() {
+        let mut fx = Fixture::new();
+        let [a, b, c] = [1, 2, 3].map(|val| fx.alloc_node(0, val) as usize);
+        let large = fx.heap.alloc(fx.node, 8192) as usize;
+        for (slot, cell) in [a, b, large].into_iter().enumerate() {
+            fx.roots[slot] = tagged(cell as *const u8);
+        }
+        fx.collect();
+        assert!(!fx.heap.is_allocated_word(c as u64));
+        let young = fx.alloc_node(0, 4) as usize;
+        let marked = |fx: &Fixture, cell: usize| is_marked_at(&fx.heap, cell);
+        assert!(
+            marked(&fx, a) && marked(&fx, b) && marked(&fx, large),
+            "old"
+        );
+        assert!(!marked(&fx, young), "young");
+        // The next collection keeps `a` and `young` and lets `b` and the large cell die.
+        fx.roots[1] = 0;
+        fx.roots[2] = tagged(young as *const u8);
+        assert!(fx.start_marking(&no_edges));
+        let black = fx.alloc_node(0, 5) as usize;
+        assert!(marked(&fx, a) && marked(&fx, young) && marked(&fx, black));
+        assert!(!marked(&fx, b) && !marked(&fx, large));
+        assert_eq!(fx.heap.dead_cells(fx.node), vec![b, large]);
+        for (cell, dead) in [(a, false), (b, true), (young, false), (black, false)] {
+            assert_eq!(fx.heap.is_dead_small_cell(cell, fx.node), dead, "{cell:#x}");
+        }
+        fx.heap.finish_collection(&[]);
+        assert!(
+            marked(&fx, a) && marked(&fx, young) && marked(&fx, black),
+            "old"
+        );
+        assert!(!fx.heap.is_allocated_word(b as u64));
+        assert_eq!(fx.heap.large_cells(), 0);
+        assert_eq!(fx.live(), 3);
+    }
+
+    /// In debug builds a reader of the current marking's verdict panics outside a collection,
+    /// where the marks say which cells are old.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "dead_cells read the marks outside a collection")]
+    fn dead_cells_outside_a_collection_panics() {
+        let mut fx = Fixture::new();
+        fx.alloc_node(0, 1);
+        fx.collect();
+        fx.heap.dead_cells(fx.node);
+    }
+
+    /// S6 step 10b: the write barrier's check, as a collection starts (debug builds): an old
+    /// carded cell written with a young cell's address and its card set passes, the young cell
+    /// survives through it, and a later write with no card set panics, naming both cells: the
+    /// card set before the first collection does not outlive its start.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "(carded node) with a clean card holds an edge to unmarked cell")]
+    fn write_barrier_check_panics_on_an_old_cell_written_without_its_card() {
+        let mut fx = Fixture::new();
+        let old = fx.heap.alloc(fx.carded, 16);
+        fx.roots[0] = tagged(old);
+        fx.collect();
+        let young = fx.alloc_node(0, 7);
+        // SAFETY: a live carded cell.
+        unsafe { card_mark(old) };
+        set_word(old, 0, tagged(young));
+        fx.collect();
+        assert!(
+            fx.heap.is_allocated_word(young as u64),
+            "kept through `old`"
+        );
+        let second = fx.alloc_node(0, 8);
+        set_word(old, 0, tagged(second));
+        fx.collect();
+    }
+
+    /// The check's passing side: old cells written with their cards set (a carded small cell)
+    /// and old cells whose edges only move to old cells or go (an uncarded cell, a large one)
+    /// let every collection run, and the young cells written survive through their holders.
+    #[test]
+    fn write_barrier_check_passes_with_the_cards_set() {
+        let mut fx = Fixture::new();
+        let holders = [fx.heap.alloc(fx.carded, 16), fx.heap.alloc(fx.carded, 192)];
+        let plain = fx.alloc_node(0, 1);
+        let large = fx.heap.alloc(fx.node, 8192);
+        for (slot, cell) in holders.iter().chain(&[plain, large]).enumerate() {
+            fx.roots[slot] = tagged(*cell);
+        }
+        fx.collect();
+        for round in 0..3 {
+            let young: Vec<*mut u8> = holders.iter().map(|_| fx.alloc_node(0, round)).collect();
+            for (&holder, &target) in holders.iter().zip(&young) {
+                // SAFETY: a live carded cell.
+                unsafe { card_mark(holder) };
+                set_word(holder, 0, tagged(target));
+            }
+            // An old cell may point at another old cell, or at nothing, without a card.
+            set_word(plain, 0, tagged(holders[round as usize % 2]));
+            set_word(large, 0, 0);
+            fx.collect();
+            assert!(young
+                .iter()
+                .all(|&cell| fx.heap.is_allocated_word(cell as u64)));
+        }
+        assert_eq!(fx.live(), 2 + 2 + 2);
+    }
+
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "heap verifier")]
@@ -4818,12 +5427,14 @@ mod tests {
             trace: trace_node,
             weak: None,
             finalize: None,
+            carded: false,
         });
         let blob = heap.register_desc(LayoutDesc {
             name: "blob",
             trace: trace_none,
             weak: None,
             finalize: None,
+            carded: false,
         });
         (heap, node, blob)
     }

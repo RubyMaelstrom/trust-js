@@ -105,7 +105,10 @@ comment/example in the same change.
 - `TRUST_JS_GC_LOG=1` logs collections.
 - `TRUST_JS_GC_STRESS=N` collects at the first safepoint after every N cell allocations and
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
-  use-after-free can take down the whole run).
+  use-after-free can take down the whole run). Debug builds also check the write barrier as
+  every collection starts, so stress checks it at every safepoint: an old cell (one the last
+  collection kept) that holds a cell allocated since must have had its card set when it was
+  written, and a panic `write barrier: old cell …` names both cells.
   `TRUST_JS_GC_LOG=1` lines report live cells, live bytes, small-cell pages (64 KiB
   each) and released pages kept for reuse (`spare`) after each collection.
   `TRUST_JS_GC_MIN_HEAP_BYTES=N` replaces the 8 MiB floor of the heap's byte budget (twice

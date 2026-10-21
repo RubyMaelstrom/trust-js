@@ -34,6 +34,11 @@ impl crate::value::NativeCallableRetained for RandomStream {
         // The reporter's inline Cell is counted by the native-callable walker;
         // there are no further allocations or captured JavaScript values.
     }
+
+    /// No JavaScript value at all.
+    fn reports_fixed_values(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) fn nf_math_sqrt(i: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Value> {

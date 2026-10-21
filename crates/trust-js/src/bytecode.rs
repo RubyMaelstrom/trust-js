@@ -19858,6 +19858,11 @@ impl Chunk {
                 ),
             ));
         }
+        // The binding belongs to `env`, which a cache hit writes without a mutable borrow (a
+        // miss's borrow ended inside `cap_binding_ptr`): the write barrier records the write in
+        // its card, with no safepoint before the store.
+        // SAFETY: `env` names a live environment cell, a small cell of a carded kind.
+        unsafe { crate::gc_core::card_mark(Env::as_ptr(env).cast()) };
         binding.value = value;
         if initialize {
             binding.initialized = true;

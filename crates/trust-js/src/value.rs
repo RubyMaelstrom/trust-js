@@ -97,8 +97,26 @@ pub type NativeCaptureFn = fn(&mut Interp, Value, &[Value], &[Value]) -> Result<
 /// The reporter is stored separately so the established `Rc<NativeClosure>` call surface remains
 /// source-compatible. It must enumerate every allocation below its own inline payload and every
 /// captured JavaScript value: the collector keeps exactly those alive.
+///
+/// The values it reports are edges of the function object it is installed on, which the
+/// collector traces with the object. A value that changes after the function is created (a
+/// callback stored into the closure's state later, for instance) reaches the object without a
+/// write the engine sees, so unless [`NativeCallableRetained::reports_fixed_values`] says
+/// otherwise the engine rescans the function at every collection.
 pub trait NativeCallableRetained {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
+
+    /// Whether the JavaScript values [`NativeCallableRetained::scan_retained_memory`] reports
+    /// are fixed once the function is created: each was made before the function, and none is
+    /// replaced or added later. The default says they may change, and the engine then rescans
+    /// the function at every collection (its write barrier cannot see the reporter's writes).
+    /// A reporter whose values are fixed returns true and saves that work. Returning true for
+    /// values that change is unsound once a collection traces an old function only when its
+    /// card says it was written (a minor collection): a young value only the function reports
+    /// would be freed. Debug builds' write-barrier check panics on such a value.
+    fn reports_fixed_values(&self) -> bool {
+        false
+    }
 }
 
 /// What an opaque [`NativeClosure`] captures (P1 S2, Decision 2): the engine cannot see into
@@ -392,16 +410,16 @@ impl PackedValue {
             PACK_SYM => Value::Sym(unsafe { self.clone_word() }),
             PACK_OBJ => Value::Obj(unsafe { self.clone_word() }),
             PACK_LAZY_PROTO => {
-                let prototype = {
-                    let lazy =
-                        std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
-                    lazy.materialize()
-                };
+                let lazy = std::mem::ManuallyDrop::new(unsafe { self.read_word::<LazyProto>() });
+                let prototype = lazy.materialize();
                 // Promotion is representation-only, invokes no JS and preserves the descriptor
                 // and identity. Subsequent native reads see an ordinary PACK_OBJ, not a thunk.
                 // Dropping the replaced lazy word releases nothing: the cell dies once no word
-                // names it.
+                // names it. The word lives in the function's properties, which this read
+                // writes without a mutable borrow: the write barrier records it in the
+                // function's card, with no safepoint before the store.
                 let bits = PACK_OBJ | unsafe { Self::into_word(prototype.clone()) };
+                lazy.mark_owner_card();
                 drop(PackedValue(Cell::new(self.0.replace(bits))));
                 Value::Obj(prototype)
             }
@@ -911,6 +929,7 @@ fn symbol_cell_layout() -> crate::gc_core::LayoutDesc {
         trace: crate::gc_box::trace_none,
         weak: None,
         finalize: Some(crate::gc_box::finalize::<SymbolData>),
+        carded: false,
     }
 }
 
@@ -2520,6 +2539,15 @@ pub(crate) struct GcState {
     /// held weakly: a template's strings are roots while the template lives. Dead entries are
     /// dropped as they are traced.
     pub(crate) template_roots: RefCell<Vec<std::rc::Weak<TemplateStrings>>>,
+    /// S6 step 10b: the native functions of this heap whose host reporter's values may change
+    /// after their creation (`NativeCallableRetained::reports_fixed_values` is false), by object
+    /// address, registered wherever such a callable is installed (`Interp::make_native_callable`,
+    /// the native `super()` graft). The write barrier cannot see the reporter's writes, so each
+    /// collection sets these functions' cards as it starts (`gc_collect::Marking::new`): every
+    /// collection rescans them. An entry is evicted between the phases of the collection that
+    /// finds its function dead (`Interp::gc_heap_sweep`), like the interpreters' owner tables
+    /// (I8).
+    pub(crate) rescanned_natives: RefCell<crate::fasthash::FastSet<usize>>,
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
@@ -2604,17 +2632,22 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
     let mut core = crate::gc_core::Heap::new();
     core.set_collect_on_alloc(false);
     crate::interpreter::gc_collect::configure_heap(&mut core);
+    // S6 step 10b: objects, environments and deferred prototypes gain references after their
+    // initialization, through writes the barrier records in their pages' card tables
+    // (`gc_core::card_mark`); the other kinds' edges are set when their cells are made.
     let object = core.register_desc(crate::gc_core::LayoutDesc {
         name: "object",
         trace: trace_object_cell,
         weak: None,
         finalize: Some(finalize_object_cell),
+        carded: true,
     });
     let scope = core.register_desc(crate::gc_core::LayoutDesc {
         name: "environment",
         trace: trace_scope_cell,
         weak: None,
         finalize: Some(finalize_scope_cell),
+        carded: true,
     });
     let bigint = core.register_desc(crate::bigint::cell_layout());
     let symbol = core.register_desc(symbol_cell_layout());
@@ -2624,6 +2657,8 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         trace: trace_user_fn_cell,
         weak: None,
         finalize: Some(crate::gc_box::finalize::<UserCallable>),
+        // A closure's environment is set when the closure is made.
+        carded: false,
     });
     // The finalizer drops the cell's `PropertyLayout`, its only Rust-heap owner.
     let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
@@ -2631,6 +2666,8 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         trace: lazy_function_prototype::trace_cell,
         weak: None,
         finalize: Some(crate::gc_box::finalize::<LazyFunctionPrototype>),
+        // Materialization writes the cell's state (`LazyFunctionPrototype::materialize`).
+        carded: true,
     });
     (
         core,
@@ -3436,6 +3473,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         lazy_proto_desc: descs.lazy_proto,
         interned_strings: RefCell::default(),
         template_roots: RefCell::default(),
+        rescanned_natives: RefCell::default(),
     });
     // SAFETY: the word lives in this heap's `GcState`, which the `Rc` keeps at one address for
     // as long as the core, one of its fields, lives; nothing but the core writes it.

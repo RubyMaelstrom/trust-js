@@ -6985,6 +6985,17 @@ impl Interp {
                         if !matches!(src_call, Callable::None)
                             && matches!(dst.borrow().call, Callable::None)
                         {
+                            // `this` now reports the callable's host values too: rescanned at
+                            // every collection if they may change (`GcState::rescanned_natives`).
+                            if let Callable::NativeData(native) = &src_call {
+                                if native
+                                    .retained
+                                    .as_ref()
+                                    .is_some_and(|reporter| !reporter.reports_fixed_values())
+                                {
+                                    self.register_rescanned_native(dst);
+                                }
+                            }
                             let is_ctor = src.borrow().is_constructor;
                             let mut db = dst.borrow_mut();
                             db.call = src_call;

@@ -75,8 +75,23 @@ impl LazyFunctionPrototype {
         }
         props.shape = self.shape;
         let prototype = Object::new_with_parts(Some(parent.clone()), props, Exotic::None);
+        // The write barrier: this cell now names the fresh prototype. No safepoint lies between
+        // the card and the store.
+        // SAFETY: `self` is the payload of a live deferred-prototype cell (`gc_box::new` moves
+        // it in at the cell's start; it is only ever read through its handle), a small cell
+        // of a carded kind.
+        unsafe { crate::gc_core::card_mark(std::ptr::from_ref(self).cast()) };
         *state = State::Materialized(prototype.clone());
         prototype
+    }
+
+    /// Record a write of the function's `prototype` word in the function's card (the write
+    /// barrier): `PackedValue::unpack` promotes the word to the materialized prototype's, under
+    /// a shared borrow of the function.
+    pub(super) fn mark_owner_card(&self) {
+        // SAFETY: the function is alive while its deferred prototype is read (see `owner`), and
+        // an object's cell is a small cell of the carded object kind.
+        unsafe { crate::gc_core::card_mark(Gc::as_ptr(&self.owner).cast()) };
     }
 
     pub(super) fn with_gc_edge(&self, f: impl FnOnce(&Gc)) {
