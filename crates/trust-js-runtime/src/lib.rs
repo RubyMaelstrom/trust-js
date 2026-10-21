@@ -19,8 +19,8 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use trust_js_host::{
-    install, CallbackQueue, DedicatedExecutor, Engine, EvalError, RuntimeInterrupt, TaskCompletion,
-    TaskDecoder, TaskRegistry, ThreadPool, Value,
+    install, CallbackQueue, DedicatedExecutor, Engine, EvalError, Handle, RuntimeInterrupt,
+    TaskCompletion, TaskDecoder, TaskRegistry, ThreadPool, Value,
 };
 
 mod console;
@@ -46,55 +46,22 @@ pub struct Runtime {
     completions: mpsc::Receiver<TaskCompletion>,
     /// The error-reporting shims (see `Runtime::new`): `(error) -> suppressed` for the global
     /// `onerror` convention and `(promise, reason) -> suppressed` for `onunhandledrejection`.
-    fire_error: Value,
-    fire_rejection: Value,
+    /// No JavaScript reference keeps them alive once their globals are deleted: the handles do.
+    fire_error: Handle,
+    fire_rejection: Handle,
 }
 
 /// The callback batch the loop is running. A pass takes everything queued so far out of the
-/// [`CallbackQueue`] (callbacks queued meanwhile wait for the next pass); each stays rooted here,
+/// [`CallbackQueue`] (callbacks queued meanwhile wait for the next pass); each stays held here,
 /// like the queue, until it starts, so a collection inside one callback cannot reclaim the rest.
 #[derive(Default)]
-struct RunningCallbacks(std::collections::VecDeque<(Value, Vec<Value>)>);
-
-impl trust_js_host::HostTrace for RunningCallbacks {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for (callback, args) in &self.0 {
-            visitor.root(callback);
-            for arg in args {
-                visitor.root(arg);
-            }
-        }
-    }
-}
+struct RunningCallbacks(std::collections::VecDeque<(Handle, Vec<Handle>)>);
 
 /// Unhandled rejections being reported, taken from the engine in one batch: each (promise,
-/// reason) pair stays rooted here until its report starts, since `onunhandledrejection` runs
+/// reason) pair stays held here until its report starts, since `onunhandledrejection` runs
 /// script (and may collect) between reports.
 #[derive(Default)]
-struct ReportingRejections(std::collections::VecDeque<(Value, Value)>);
-
-impl trust_js_host::HostTrace for ReportingRejections {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for (promise, reason) in &self.0 {
-            visitor.root(promise);
-            visitor.root(reason);
-        }
-    }
-}
-
-/// The error-reporting shims: no JavaScript reference keeps `fire_rejection` alive once its
-/// global is deleted, and the `Runtime` that holds both may live where no scan looks.
-struct ReportingShims {
-    fire_error: Value,
-    fire_rejection: Value,
-}
-
-impl trust_js_host::HostTrace for ReportingShims {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        visitor.root(&self.fire_error);
-        visitor.root(&self.fire_rejection);
-    }
-}
+struct ReportingRejections(std::collections::VecDeque<(Handle, Handle)>);
 
 impl Default for Runtime {
     fn default() -> Self {
@@ -244,14 +211,15 @@ impl Runtime {
             )
             .expect("error-reporting shim parses");
         let global = engine.global_this();
-        let fire_error = engine
-            .ctx()
-            .get_member(&global, "__trust_js_fire_error")
-            .unwrap_or_else(|_| panic!("error-reporting shim installed"));
-        let fire_rejection = engine
-            .ctx()
-            .get_member(&global, "__trust_js_fire_rejection")
-            .unwrap_or_else(|_| panic!("error-reporting shim installed"));
+        let mut shim = |name: &str| {
+            let shim = engine
+                .ctx()
+                .get_member(&global, name)
+                .unwrap_or_else(|_| panic!("error-reporting shim installed"));
+            Handle::new(&engine, &shim).expect("the engine's own function")
+        };
+        let fire_error = shim("__trust_js_fire_error");
+        let fire_rejection = shim("__trust_js_fire_rejection");
         engine
             .eval(
                 "delete globalThis.__trust_js_fire_error; delete globalThis.__trust_js_fire_rejection;",
@@ -260,10 +228,6 @@ impl Runtime {
             .expect("shim cleanup");
         engine.set_interrupt_handle(interrupt);
         let state = engine.ctx().op_state();
-        state.put(ReportingShims {
-            fire_error: fire_error.clone(),
-            fire_rejection: fire_rejection.clone(),
-        });
         state.put(RunningCallbacks::default());
         state.put(ReportingRejections::default());
         Runtime {
@@ -407,7 +371,7 @@ impl Runtime {
                 self.start_callback_batch();
                 while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_held(&cb, &args);
                 }
                 for task in self.take_due_timers() {
                     progressed = true;
@@ -478,14 +442,16 @@ impl Runtime {
     }
 
     /// Spawn blocking work on the pool; when it finishes, `decode` turns its payload into
-    /// arguments and `callback` runs on the loop thread. This is the pattern async fs ops
-    /// will use from inside native fns (via the `SpawnHandle`/`TaskRegistry` in `OpState`).
+    /// arguments and `callback`, a value of this runtime's engine, runs on the loop thread. This
+    /// is the pattern async fs ops will use from inside native fns (via the
+    /// `SpawnHandle`/`TaskRegistry` in `OpState`).
     pub fn spawn_blocking(
         &mut self,
         work: impl FnOnce() -> Box<dyn std::any::Any + Send> + Send + 'static,
         callback: Value,
         decode: TaskDecoder,
     ) {
+        let callback = Handle::new(&self.engine, &callback).expect("a value of this engine");
         let registry = self
             .engine
             .ctx()
@@ -510,7 +476,7 @@ impl Runtime {
                 self.start_callback_batch();
                 while let Some((cb, args)) = self.next_batch_callback() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_held(&cb, &args);
                 }
                 for task in self.take_due_timers() {
                     progressed = true;
@@ -586,9 +552,9 @@ impl Runtime {
             .extend(queued);
     }
 
-    /// The batch's next callback. It leaves the rooted batch only as it starts: the call roots
-    /// its callee and arguments from then on.
-    fn next_batch_callback(&mut self) -> Option<(Value, Vec<Value>)> {
+    /// The batch's next callback. It leaves the batch as it starts, its handles held by the
+    /// caller until the call returns.
+    fn next_batch_callback(&mut self) -> Option<(Handle, Vec<Handle>)> {
         self.engine
             .ctx()
             .host_mut::<RunningCallbacks>()?
@@ -633,10 +599,17 @@ impl Runtime {
             Ok(payload) => (entry.decode)(self.engine.ctx(), payload),
             Err(failure) => Err(self.engine.ctx().make_error("Error", failure.message)),
         };
+        // The entry's handles hold its callbacks until it is dropped, after the call.
         match result {
-            Ok(args) => self.fire(&entry.on_ok, &args),
+            Ok(args) => {
+                let on_ok = trust_js_host::value(self.engine.ctx(), &entry.on_ok);
+                self.fire(&on_ok, &args)
+            }
             Err(e) => match &entry.on_err {
-                Some(reject) => self.fire(reject, std::slice::from_ref(&e)),
+                Some(reject) => {
+                    let reject = trust_js_host::value(self.engine.ctx(), reject);
+                    self.fire(&reject, std::slice::from_ref(&e))
+                }
                 None => self.report_uncaught(&e),
             },
         }
@@ -644,6 +617,15 @@ impl Runtime {
             return;
         }
         self.report_unhandled_rejections();
+    }
+
+    /// [`Runtime::fire`] for a callback and arguments host state held, which their handles
+    /// hold until the call returns.
+    fn fire_held(&mut self, callback: &Handle, args: &[Handle]) {
+        let ctx = self.engine.ctx();
+        let callback = trust_js_host::value(ctx, callback);
+        let args = trust_js_host::values(ctx, args);
+        self.fire(&callback, &args);
     }
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
@@ -678,9 +660,12 @@ impl Runtime {
         let thrown = match &task.handler {
             trust_js_timers::TimerHandler::Function(callback) => {
                 let this = self.engine.global_this();
+                // The task's handles hold the handler and arguments until it is dropped.
+                let callback = trust_js_host::value(self.engine.ctx(), callback);
+                let args = trust_js_host::values(self.engine.ctx(), &task.args);
                 match self
                     .engine
-                    .call_function_interruptible(callback, this, &task.args)
+                    .call_function_interruptible(&callback, this, &args)
                 {
                     Ok(_) => None,
                     Err(EvalError::Throw(error)) => Some(error),
@@ -717,7 +702,7 @@ impl Runtime {
     fn report_uncaught(&mut self, error: &Value) {
         // HTML "report an exception": the global `onerror` handler runs first; returning `true`
         // suppresses the default report.
-        let fire = self.fire_error.clone();
+        let fire = trust_js_host::value(self.engine.ctx(), &self.fire_error);
         match self.engine.call_function_interruptible(
             &fire,
             Value::Undefined,
@@ -737,11 +722,22 @@ impl Runtime {
         if taken.is_empty() {
             return;
         }
-        self.reporting_rejections().0.extend(taken);
-        while let Some((promise, reason)) = self.reporting_rejections().0.pop_front() {
+        let held = taken.iter().filter_map(|(promise, reason)| {
+            let promise = Handle::new(&self.engine, promise).ok()?;
+            Some((promise, Handle::new(&self.engine, reason).ok()?))
+        });
+        let held: Vec<_> = held.collect();
+        self.reporting_rejections().0.extend(held);
+        while let Some(pair) = self.reporting_rejections().0.pop_front() {
+            // The pair's handles hold it until this report ends.
+            let ctx = self.engine.ctx();
+            let (promise, reason) = (
+                trust_js_host::value(ctx, &pair.0),
+                trust_js_host::value(ctx, &pair.1),
+            );
             // The global `onunhandledrejection` handler runs first; `event.preventDefault()`
             // suppresses the default report.
-            let fire = self.fire_rejection.clone();
+            let fire = trust_js_host::value(self.engine.ctx(), &self.fire_rejection);
             match self.engine.call_function_interruptible(
                 &fire,
                 Value::Undefined,

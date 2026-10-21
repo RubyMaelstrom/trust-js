@@ -31,7 +31,6 @@ fn native_global_callable_from_js() {
 #[test]
 fn extension_installs_state_globals_and_namespaces() {
     struct Counter(u32);
-    trust_js::value_free!(Counter);
     fn bump(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
         let c = ctx.host_mut::<Counter>().expect("state_init ran");
         c.0 += 1;
@@ -300,8 +299,10 @@ fn task_registry_cancellation_prevents_queued_work_from_starting() {
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let pool = ThreadPool::with_limits(1, 2, 128 << 10, completion_tx);
     let mut registry = TaskRegistry::with_canceller(pool.canceller());
-    let first = registry.register(Value::Undefined, None, decode);
-    let second = registry.register(Value::Undefined, None, decode);
+    let engine = Engine::new();
+    let inert = || Handle::new(&engine, &Value::Undefined).expect("a primitive handle");
+    let first = registry.register(inert(), None, decode);
+    let second = registry.register(inert(), None, decode);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     pool.spawn_blocking(first, move || {
@@ -317,4 +318,63 @@ fn task_registry_cancellation_prevents_queued_work_from_starting() {
     assert!(completion_rx
         .recv_timeout(std::time::Duration::from_millis(100))
         .is_err());
+}
+
+/// `queue(callback, arg)`: queue `callback(arg)` on the [`CallbackQueue`] and register it as an
+/// in-flight task's success and failure callbacks; returns the task's id.
+fn queue_both(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    fn decode(_: &mut Ctx, _: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+        Ok(vec![])
+    }
+    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    CallbackQueue::enqueue(ctx, &callback, &args[1..])?;
+    let id = TaskRegistry::register_callbacks(ctx, &callback, Some(&callback), decode)?;
+    Ok(Value::Num(id as f64))
+}
+
+/// Queued callbacks and their arguments, and in-flight tasks' callbacks, are held by handles in
+/// host state: collections keep them though no script value does, and they run afterwards.
+#[test]
+fn queued_and_task_callbacks_survive_collections_in_host_state() {
+    let mut engine = Engine::new();
+    engine.ctx().op_state().put(TaskRegistry::default());
+    engine.define_global("queue", 2, queue_both);
+    let id = eval_str(
+        &mut engine,
+        "globalThis.log = [];
+         queue(function (x) { log.push(x === undefined ? 'settled' : x.tag); },
+               {tag: ['queued', 'arg'].join(' ')})",
+    );
+    for _ in 0..2 {
+        eval_str(
+            &mut engine,
+            "var churn = []; for (let i = 0; i < 3000; i++) churn.push({i}); churn = null; 0",
+        );
+        engine.ctx().collect_garbage_for_host();
+    }
+    let (callback, args) = engine
+        .ctx()
+        .host_mut::<CallbackQueue>()
+        .expect("queue installed")
+        .queue
+        .pop_front()
+        .expect("a queued callback");
+    let (callback, args) = (value(engine.ctx(), &callback), values(engine.ctx(), &args));
+    assert!(engine
+        .call_function(&callback, Value::Undefined, &args)
+        .is_ok());
+    let entry = engine
+        .ctx()
+        .host_mut::<TaskRegistry>()
+        .expect("registry installed")
+        .take(id.parse().expect("a task id"))
+        .expect("the task is in flight");
+    for settle in [Some(&entry.on_ok), entry.on_err.as_ref()] {
+        let settle = value(engine.ctx(), settle.expect("both callbacks"));
+        assert!(engine.call_function(&settle, Value::Undefined, &[]).is_ok());
+    }
+    assert_eq!(
+        eval_str(&mut engine, "log.join()"),
+        "queued arg,settled,settled"
+    );
 }

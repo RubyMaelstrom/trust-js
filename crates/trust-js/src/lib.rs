@@ -121,6 +121,9 @@ mod gc_sweep;
 mod gc_trace;
 #[cfg(test)]
 mod group_by_tests;
+#[cfg(all(test, feature = "embed"))]
+mod handle_tests;
+mod handles;
 mod host;
 mod host_collections;
 mod host_memory;
@@ -994,17 +997,18 @@ impl Engine {
     }
 }
 
-/// Paths the exported macros (`value_free!`) expand to.
-#[doc(hidden)]
-pub mod __private {
-    pub use crate::host::{HostGcVisitor, HostTrace};
-}
-
 /// The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
 /// APIs) built on top of the engine. Gated because everything here is a semver commitment on a
 /// published crate; it stabilizes together with the `trust-js-host`/`trust-js-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
+    /// Rooted handles (S6 step 11a): how Rust code keeps an engine value past the call that
+    /// produced it. A [`Handle`] keeps its value alive wherever it is stored, a [`WeakHandle`]
+    /// names one without keeping it, and a [`CountedHandle`] is strong while its count is
+    /// above 0 (Node-API's references). Each is made from a value through the [`Ctx`] or
+    /// [`Engine`](crate::Engine) whose heap holds it ([`HeapOwner`]), read through the same,
+    /// and refused ([`HandleError`]) with another heap's or once its Engine has dropped.
+    pub use crate::handles::{CountedHandle, Handle, HandleError, HeapOwner, WeakHandle};
     pub use crate::host::{
         HostGc, HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, NativeGcId, OpState,
         ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,

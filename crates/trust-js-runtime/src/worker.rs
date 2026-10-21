@@ -32,7 +32,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use trust_js_host::{
-    ops, CompletionSender, Ctx, Extension, RuntimeInterrupt, TaskId, TaskRegistry, Value,
+    ops, CompletionSender, Ctx, Extension, Handle, RuntimeInterrupt, TaskId, TaskRegistry, Value,
 };
 
 use crate::Runtime;
@@ -62,19 +62,11 @@ pub(crate) struct WorkerRegistry {
     workers: HashMap<u64, WorkerEntry>,
 }
 
-/// Each live worker's main-side dispatch function: a root while the worker is registered.
-impl trust_js_host::HostTrace for WorkerRegistry {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for worker in self.workers.values() {
-            visitor.root(&worker.dispatch);
-        }
-    }
-}
-
 struct WorkerEntry {
     /// `None` once terminated (dropping the sender unblocks the worker's inbox receive).
     to_worker: Option<Sender<ToWorker>>,
-    dispatch: Value,
+    /// The main-side dispatch function, held while the worker is registered.
+    dispatch: Handle,
     stop: Arc<AtomicBool>,
     interrupt: Arc<RuntimeInterrupt>,
     /// Set only by parent-side `terminate()`. Worker-side `close()` shares `stop`, but messages
@@ -137,7 +129,7 @@ pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         .to_string();
     let is_module = matches!(args.get(1), Some(Value::Bool(true)));
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "spawn: dispatch must be a function")),
     };
     let opts = args.get(3).cloned().unwrap_or(Value::Undefined);
@@ -351,9 +343,6 @@ struct WorkerSelf {
     inbox_task: Option<TaskId>,
 }
 
-// The worker side's channel and flags: no JavaScript values.
-trust_js_host::value_free!(WorkerSelf);
-
 /// The worker thread's whole lifecycle: build a realm, run the entry, then pump the loop until
 /// stopped (or, node mode, idle), bridging messages both ways.
 fn run_worker(
@@ -468,6 +457,9 @@ fn arm_worker_inbox(ctx: &mut Ctx, inbox: WorkerInbox) {
     let dispatch = match ctx.get_member(&global, "__workerDispatchMessage") {
         Ok(v) if v.is_callable() => v,
         _ => return,
+    };
+    let Ok(dispatch) = Handle::new(ctx, &dispatch) else {
+        return;
     };
     let keep_alive = ctx
         .op_state()

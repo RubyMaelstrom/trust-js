@@ -15,8 +15,6 @@ use crate::console::ConsoleOut;
 /// Process-start monotonic reference for `hrtime()`.
 struct ProcStart(Instant);
 
-trust_js_host::value_free!(ProcStart);
-
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "process",
@@ -237,10 +235,7 @@ fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
             ))
         }
     };
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs task registry")
-        .register(resolve, Some(reject), decode_stdin_read);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_stdin_read)?;
     let sender = ctx
         .op_state()
         .get::<CompletionSender>()
@@ -466,8 +461,7 @@ fn op_next_tick(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
         Some(cb) if cb.is_callable() => cb.clone(),
         _ => return Err(ctx.make_error("TypeError", "process.nextTick expects a function")),
     };
-    let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
-    CallbackQueue::enqueue(ctx.op_state(), callback, extra);
+    CallbackQueue::enqueue(ctx, &callback, args.get(1..).unwrap_or_default())?;
     Ok(Value::Undefined)
 }
 

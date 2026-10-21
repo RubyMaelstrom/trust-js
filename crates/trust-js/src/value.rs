@@ -2551,6 +2551,9 @@ pub(crate) struct GcState {
     /// collection's marking consumed it, which a minor collection reports instead of the tables
     /// (see `gc_collect::ClientRecords`).
     pub(crate) records: RefCell<crate::interpreter::gc_collect::ClientRecords>,
+    /// S6 step 11a: this heap's rooted handles (`handles::HandleTable`), shared by the handles
+    /// themselves, which keep the table, not the heap, alive.
+    pub(crate) handles: Rc<crate::handles::HandleTable>,
     /// What the client of this heap's last collection reported (test builds).
     #[cfg(test)]
     pub(crate) client_report: RefCell<crate::interpreter::gc_collect::ClientReport>,
@@ -3154,8 +3157,9 @@ pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
 }
 
 /// Ends an Agent's object heap: declared as the interpreter's LAST field, so it runs after every
-/// other field (anything that might still read an object) has dropped. Finalizes every remaining
-/// object, clears weak handles into the heap and frees its memory.
+/// other field (anything that might still read an object) has dropped. Makes the heap's rooted
+/// handles inert, finalizes every remaining object, clears weak handles into the heap and frees
+/// its memory.
 pub(crate) struct HeapRelease(Option<GcHeap>);
 
 impl HeapRelease {
@@ -3179,6 +3183,8 @@ impl Drop for HeapRelease {
         let Some(heap) = &self.0 else {
             return;
         };
+        // S6 step 11a: before the cells go, every handle still held becomes inert.
+        heap.handles.release();
         {
             let core = heap.core.borrow();
             let _ =
@@ -3471,8 +3477,9 @@ thread_local! {
 pub(crate) fn new_gc_heap() -> GcHeap {
     static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let (core, descs) = new_cell_heap();
+    let heap_id = NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let heap = Rc::new(GcState {
-        heap_id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        heap_id,
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
         registry: RefCell::new(SlotRegistry::new()),
@@ -3493,6 +3500,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         template_roots: RefCell::default(),
         rescanned_natives: RefCell::default(),
         records: RefCell::default(),
+        handles: crate::handles::HandleTable::new(heap_id),
         #[cfg(test)]
         client_report: RefCell::default(),
     });

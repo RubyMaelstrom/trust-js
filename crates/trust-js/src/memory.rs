@@ -256,6 +256,14 @@ pub(crate) struct Snapshot {
     shared_array_buffer_backing: SharedBackingCategory,
     wasm_backing: WasmBackingCategory,
     host_resources: HostCategory,
+    /// The heap's live rooted handles, strong and weak (S6 step 11a): a leaked handle keeps
+    /// its value, and what the value reaches, alive.
+    handles: (usize, usize),
+}
+
+/// The `handles` member of the record: the live rooted handles, strong and weak.
+fn handles_json((strong, weak): (usize, usize)) -> String {
+    format!("{{\"strong\":{strong},\"weak\":{weak}}}")
 }
 
 impl Snapshot {
@@ -365,6 +373,7 @@ impl Snapshot {
                 "\"safepoint\":\"post_gc\",\"complete\":{},",
                 "\"managed_requested_bytes\":{},",
                 "\"managed_external_bytes\":{},",
+                "\"handles\":{},",
                 "\"categories\":{{",
                 "\"object_bodies\":{},\"property_storage\":{},",
                 "\"scope_bodies\":{},\"scope_storage\":{},",
@@ -382,6 +391,7 @@ impl Snapshot {
             self.complete(),
             managed_requested.json(),
             managed_external.json(),
+            handles_json(self.handles),
             self.object_bodies.json(),
             self.property_storage.json(),
             self.scope_bodies.json(),
@@ -2408,6 +2418,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
             unclassified_external_entries: totals.host_resources.unclassified_external_entries,
         },
         host_resources: totals.host_resources.into(),
+        handles: interp.gc_heap.handles.counts(),
     }
 }
 
@@ -2430,14 +2441,19 @@ pub(crate) fn json(interp: &Interp) -> String {
     let agent = interp.symbol_agent.borrow();
     match agent.memory_snapshots.get(&heap_id) {
         Some(snapshot) => snapshot.json(agent.agent_id, heap_id),
+        // The live handles are counted as they are made and dropped, so they are available
+        // without a recorded snapshot.
         None => format!(
             concat!(
                 "{{\"schema_version\":1,\"agent_id\":{},\"heap_id\":{},",
                 "\"safepoint\":null,\"complete\":false,",
                 "\"managed_requested_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}},",
-                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}}}}"
+                "\"managed_external_bytes\":{{\"bytes\":null,\"quality\":\"unavailable\",\"reason\":\"no post-collection safepoint has been recorded\"}},",
+                "\"handles\":{}}}"
             ),
-            agent.agent_id, heap_id
+            agent.agent_id,
+            heap_id,
+            handles_json(interp.gc_heap.handles.counts())
         ),
     }
 }
@@ -2465,14 +2481,6 @@ mod tests {
         allocation: Rc<RefCell<Vec<u8>>>,
         value: Value,
         requested_bytes: usize,
-    }
-
-    crate::value_free!(ReportedHostState, ExternalWasmState);
-
-    impl crate::host::HostTrace for ReportedManagedHostState {
-        fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
-            visitor.root(&self.value);
-        }
     }
 
     impl RetainedBytes for ReportedHostState {
@@ -2685,11 +2693,13 @@ mod tests {
                 identity_conflict: false,
                 opaque_storage: false,
             },
+            handles: (2, 1),
         }
         .json(1, 1);
         assert!(json.contains("\"interpreter_side_tables\":{\"bytes\":12"));
         assert!(json.contains("\"managed_requested_bytes\":{\"bytes\":71"));
         assert!(json.contains("\"host_resources\":{\"bytes\":null"));
+        assert!(json.contains("\"handles\":{\"strong\":2,\"weak\":1}"));
     }
 
     #[test]

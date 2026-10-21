@@ -33,7 +33,7 @@ use std::os::raw::c_void;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use trust_js_host::{Ctx, Value};
+use trust_js_host::{Ctx, Handle, Value};
 
 use crate::dylib::DynLib;
 
@@ -121,7 +121,8 @@ fn is_pointer(code: u8) -> bool {
 // ---- host state -------------------------------------------------------------------------------
 
 struct CbEntry {
-    func: Value,
+    /// The JavaScript function, held while the callback is registered.
+    func: Handle,
     arg_codes: Vec<u8>,
     ret_code: u8,
 }
@@ -132,15 +133,6 @@ struct CbEntry {
 struct FfiState {
     libs: Vec<Option<DynLib>>,
     callbacks: Vec<Vec<Option<CbEntry>>>,
-}
-
-/// Registered JSCallbacks' JavaScript functions: roots while registered.
-impl trust_js_host::HostTrace for FfiState {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for entry in self.callbacks.iter().flatten().flatten() {
-            visitor.root(&entry.func);
-        }
-    }
 }
 
 fn ffi_state(ctx: &mut Ctx) -> &mut FfiState {
@@ -599,6 +591,7 @@ pub fn op_register_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
         ));
     }
 
+    let func = trust_js_host::handle(ctx, &func)?;
     let st = ffi_state(ctx);
     let slot = st.callbacks[n].iter().position(|c| c.is_none());
     let Some(k) = slot else {
@@ -655,6 +648,7 @@ fn jscb_dispatch(n: usize, k: usize, raw_args: &[u64]) -> u64 {
             None => return 0,
         }
     };
+    let func = trust_js_host::value(ctx, &func);
 
     let mut js_args = Vec::with_capacity(arg_codes.len());
     for (i, &code) in arg_codes.iter().enumerate() {

@@ -24,7 +24,11 @@
 //! reports the roots, Realm groups and host graphs in full, but of the side-slot tables, the
 //! WeakMap and WeakSet entries and the native functions' [[Realm]] edges only what was written
 //! since the last collection (S6 step 10d, [`ClientRecords`]): an old entry that has not been
-//! written since holds old values, which the last collection traced.
+//! written since holds old values, which the last collection traced. The heap's rooted handles
+//! (S6 step 11a, `handles::HandleTable`) follow the same rule: a major collection reports every
+//! strong handle as a root and clears every weak handle whose target died, a minor one only
+//! the handles written since the last collection; weak handles are cleared between the phases,
+//! before the host sweeps and before any cell is freed.
 
 use super::*;
 use crate::fasthash::{FastMap, FastSet};
@@ -423,7 +427,8 @@ impl NativeFunctionRealms {
 /// What the client of a heap's last collection reported (test builds): the side-slot table
 /// owners (`gc_side_slot_tables!` and `generators`; Realm members, ShadowRealm owners and host
 /// owners apart), the WeakMap and WeakSet entries it registered as ephemerons, by (collection,
-/// key's cell word), and the native functions whose [[Realm]] edges it reported.
+/// key's cell word), the native functions whose [[Realm]] edges it reported, and the entries of
+/// the handle table whose values it reported as roots.
 #[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ClientReport {
@@ -431,6 +436,7 @@ pub(crate) struct ClientReport {
     pub(crate) side_slot_owners: Vec<usize>,
     pub(crate) weak_entries: Vec<(usize, u64)>,
     pub(crate) realm_edges: Vec<usize>,
+    pub(crate) handle_slots: Vec<u32>,
 }
 
 /// One interpreter's host graph for this collection: what its `HostGc` slots report.
@@ -491,6 +497,12 @@ struct Marking<'a> {
     hosts: Vec<RefCell<HostGraph>>,
     /// ShadowRealm object -> the index of its realm's interpreter.
     shadow_owners: FastMap<usize, usize>,
+    /// The realms with code running, as (ShadowRealm object, interpreter index): their roots and
+    /// objects are roots. Listed here, before the stack below the collection is zeroed, so that
+    /// [`MarkClient::roots`] handles no address that is not a root: the native stack scan that
+    /// follows it reuses its frames, and an idle realm's object left in one would look like a
+    /// root there.
+    entered: Vec<(usize, usize)>,
     /// Realm-group members (objects and global environments) → (interpreter, Realm key). A
     /// Realm is not a root: marking any member activates the whole group, as in the old
     /// collector, so a retired Realm is reclaimed with everything it alone keeps alive.
@@ -506,10 +518,15 @@ impl<'a> Marking<'a> {
     fn new(root: &'a Interp, kind: CollectionKind) -> Self {
         let mut interps = vec![root];
         let mut shadow_owners = FastMap::default();
+        let mut entered = Vec::new();
         let mut next = 0;
         while let Some(&interp) = interps.get(next) {
             for (&owner, child) in &interp.shadow_realms {
-                shadow_owners.insert(owner, interps.len());
+                let index = interps.len();
+                shadow_owners.insert(owner, index);
+                if child.shadow_entered() {
+                    entered.push((owner, index));
+                }
                 interps.push(&**child);
             }
             next += 1;
@@ -560,6 +577,7 @@ impl<'a> Marking<'a> {
             interps,
             hosts,
             shadow_owners,
+            entered,
             realm_members,
             templates,
             activated_realms: RefCell::default(),
@@ -654,17 +672,31 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         self.trace_interp_roots(0, &mut words);
         // A realm with code running: its roots, and its ShadowRealm object, which the sweep
         // must not take from under it. Other realms' roots are their objects' side slots.
-        for (&owner, &index) in &self.shadow_owners {
-            if self.interps[index].shadow_entered() {
-                words.word(owner as u64);
-                self.trace_interp_roots(index, &mut words);
-            }
+        for &(owner, index) in &self.entered {
+            words.word(owner as u64);
+            self.trace_interp_roots(index, &mut words);
         }
         // The tree shares one heap; its interned strings live as long as it does.
         if let Some(root) = self.interps.first() {
             crate::value::trace_interned_strings(&root.gc_heap, &mut words);
         }
         crate::gc_trace::trace_thread_roots(&mut words);
+        // The heap's strong handles (S6 step 11a): in a minor collection those written since
+        // the last collection only; the others name old cells.
+        #[cfg(test)]
+        let mut reported = Vec::new();
+        self.interps[0]
+            .gc_heap
+            .handles
+            .trace_roots(self.kind, |_slot, value| {
+                if let Some(word) = value_word(value) {
+                    words.word(word);
+                }
+                #[cfg(test)]
+                reported.push(_slot);
+            });
+        #[cfg(test)]
+        self.report(|report| report.handle_slots = reported);
     }
 
     fn side_slot_owners(&self, owners: &mut dyn FnMut(usize)) {
@@ -811,6 +843,7 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             interp.check_weak_entry_records(&records, heap);
             interp.check_native_realm_records(&registered, heap);
         }
+        self.interps[0].gc_heap.handles.check_records(heap);
     }
 }
 
@@ -936,12 +969,18 @@ impl Interp {
         // alive, in frames below this one; the marker's frames reuse that region.
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        // No handle may be made or made strong until the sweep has freed the dead.
+        heap.handles.set_collecting(true);
         let started = heap.core.borrow_mut().start_marking(true, &marking, kind);
+        if !started {
+            heap.handles.set_collecting(false);
+        }
         started.then(|| {
-            // This marking consumed what the tables recorded since the last collection: what is
-            // written from now on, between the phases and after the sweep included, is recorded
-            // for the next one.
+            // This marking consumed what the tables and the handles recorded since the last
+            // collection: what is written from now on, between the phases and after the sweep
+            // included, is recorded for the next one.
             heap.records.borrow_mut().consume();
+            heap.handles.consume();
             marking.into_native_graphs()
         })
     }
@@ -960,6 +999,13 @@ impl Interp {
         // engine evicts the dead from its tables while their identities are still stable.
         let dead = crate::gc_sweep::DeadObjects::new(heap);
         crate::gc_sweep::set(&mut heap.rescanned_natives.borrow_mut(), &dead);
+        // Weak handles to dead cells are cleared first (S6 step 11a): the host sweeps see them
+        // cleared, and no cell they name is freed while they name it.
+        {
+            let core = heap.core.borrow();
+            heap.handles
+                .clear_dead_weak(kind, |word| core.is_dead_target(word as usize));
+        }
         self.gc_heap_sweep_tree(&dead, &native, kind);
         heap.records.borrow_mut().native_functions_swept.clear();
         drop(native);
@@ -971,6 +1017,7 @@ impl Interp {
             crate::gc_handle::clear_dead_weak_cells(|addr| core.is_dead_target(addr))
         };
         heap.core.borrow_mut().finish_collection(&pinned);
+        heap.handles.set_collecting(false);
         // The heap's bits no longer say what died: from here on only the list's length counts.
         let reclaimed = dead.len();
         drop(dead);

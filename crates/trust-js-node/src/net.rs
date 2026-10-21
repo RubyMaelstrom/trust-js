@@ -217,9 +217,6 @@ pub struct NetRegistry {
     servers: HashMap<u64, ServerEntry>,
 }
 
-// Sockets and servers (events dispatch through queued callbacks): no JavaScript values.
-trust_js_host::value_free!(NetRegistry, DgramRegistry);
-
 struct UdpEntry {
     socket: Arc<UdpSocket>,
     closed: Arc<AtomicBool>,
@@ -385,8 +382,8 @@ fn take_resolve_reject(
     }
 }
 
-fn enqueue(ctx: &mut Ctx, cb: Value, args: Vec<Value>) {
-    CallbackQueue::enqueue(ctx.op_state(), cb, args);
+fn enqueue(ctx: &mut Ctx, cb: Value, args: Vec<Value>) -> Result<(), Value> {
+    CallbackQueue::enqueue(ctx, &cb, &args)
 }
 
 fn arg_u64(args: &[Value], i: usize) -> u64 {
@@ -479,11 +476,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     let port = arg_u64(args, 1) as u16;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(2), args.get(3))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-        resolve,
-        Some(reject),
-        decode_connect,
-    );
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_connect)?;
     completions(ctx).run_blocking(id, move || {
         let result: Result<NetStream, NetErr> = (|| {
             let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
@@ -536,11 +529,7 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
     #[cfg(unix)]
     {
-        let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-            resolve,
-            Some(reject),
-            decode_connect,
-        );
+        let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_connect)?;
         completions(ctx).run_blocking(id, move || {
             let result = UnixStream::connect(&path)
                 .map(NetStream::Unix)
@@ -571,15 +560,16 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let (stream, unref) = match found {
         Some(v) => v,
         None => {
-            enqueue(ctx, resolve, vec![Value::Null]); // gone → treat as EOF
+            enqueue(ctx, resolve, vec![Value::Null])?; // gone → treat as EOF
             return Ok(Value::Undefined);
         }
     };
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_read);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_read)?;
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     if let Some(e) = ctx
         .host_mut::<NetRegistry>()
@@ -637,15 +627,11 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                 port: None,
             },
         );
-        enqueue(ctx, reject, vec![err]);
+        enqueue(ctx, reject, vec![err])?;
         return Ok(Value::Undefined);
     };
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-        resolve,
-        Some(reject),
-        decode_write,
-    );
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_write)?;
     completions(ctx).run_blocking(id, move || {
         let mut s: &NetStream = &stream;
         let result: Result<(), NetErr> = s
@@ -864,15 +850,16 @@ fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let (listener, closed, unref) = match found {
         Some(v) => v,
         None => {
-            enqueue(ctx, resolve, vec![Value::Null]);
+            enqueue(ctx, resolve, vec![Value::Null])?;
             return Ok(Value::Undefined);
         }
     };
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_accept);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_accept)?;
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     if let Some(e) = ctx
         .host_mut::<NetRegistry>()
@@ -1033,15 +1020,16 @@ fn op_udp_recv(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
     let (socket, closed, unref) = match found {
         Some(v) => v,
         None => {
-            enqueue(ctx, resolve, vec![Value::Null]);
+            enqueue(ctx, resolve, vec![Value::Null])?;
             return Ok(Value::Undefined);
         }
     };
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_recv);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_recv)?;
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     if let Some(e) = ctx
         .host_mut::<DgramRegistry>()
@@ -1130,15 +1118,11 @@ fn op_udp_send(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
                 port: None,
             },
         );
-        enqueue(ctx, reject, vec![err]);
+        enqueue(ctx, reject, vec![err])?;
         return Ok(Value::Undefined);
     };
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-        resolve,
-        Some(reject),
-        decode_send,
-    );
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_send)?;
     completions(ctx).run_blocking(id, move || {
         let result: Result<usize, NetErr> = (address.as_str(), port)
             .to_socket_addrs()

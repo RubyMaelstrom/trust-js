@@ -88,8 +88,10 @@ comment/example in the same change.
   exit, before printing it, so the GC counts and pauses include that collection (cause
   `explicit`, a major collection). Collections are counted by cause (`gc_causes`) and by kind
   (`gc_kinds`: `minor`, `major`), and their pauses are also reported by cause
-  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). Diagnostic only;
-  excluded from acceptance timing.
+  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). The managed-memory
+  record counts the heap's live rooted handles (`handles`: `strong` and `weak`), the values
+  host code keeps; a leaked handle keeps its value alive. Diagnostic only; excluded from
+  acceptance timing.
 - Helper-traffic tallies print their top entries to stderr at exit and are diagnostic only:
   `TRUST_JS_JIT_OPSTAT=1` counts ops that reach a JIT helper (`=2` adds the function and
   pc), `TRUST_JS_JIT_CALLSTAT=1` counts why calls reaching the call helper missed the
@@ -133,7 +135,9 @@ comment/example in the same change.
   the same way: a side-table entry that holds such a cell, or belongs to such a cell, must
   have been recorded when it was written, and a panic `side-slot table …`,
   `weak_collection_data: …` or `native_function_realms: …` names the table, the owner and
-  the value.
+  the value. So are the rooted handles' (the values host code keeps): a handle not written
+  since the last collection must name a cell that collection kept (or, if weak, nothing), and
+  a panic `handle table of heap …` names the entry and the cell.
   `TRUST_JS_GC_LOG=1` lines name each collection's kind and report live cells, live bytes,
   small-cell pages (64 KiB each) and released pages kept for reuse (`spare`) after it; a
   minor collection's line adds the young pages it swept, the old cells it traced because

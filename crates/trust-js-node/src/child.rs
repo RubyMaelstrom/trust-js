@@ -35,9 +35,6 @@ pub struct ChildRegistry {
     procs: HashMap<u32, ChildProc>,
 }
 
-// Child processes and their pipes: no JavaScript values.
-trust_js_host::value_free!(ChildRegistry);
-
 impl Drop for ChildRegistry {
     fn drop(&mut self) {
         for process in self.procs.values() {
@@ -229,11 +226,12 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         })
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_read);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_read)?;
     // The task inherits the child's current ref state; `child.ref()`/`unref()` can toggle it later.
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     track_child_task(ctx, child_id, id);
     completions(ctx).run_blocking(id, move || {
@@ -282,11 +280,7 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| p.stdin.clone())
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let id = ctx.host_mut::<TaskRegistry>().expect("registry").register(
-        resolve,
-        Some(reject),
-        decode_ok,
-    );
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_ok)?;
     completions(ctx).run_blocking(id, move || {
         let mut guard = handle.lock().expect("stdin lock");
         let result: Result<(), String> = match guard.as_mut() {
@@ -321,10 +315,11 @@ fn op_wait(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         .map(|p| (p.child.clone(), p.unref))
         .ok_or_else(|| ctx.make_error("Error", "child: unknown process"))?;
 
-    let reg = ctx.host_mut::<TaskRegistry>().expect("registry");
-    let id = reg.register(resolve, Some(reject), decode_exit);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_exit)?;
     if unref {
-        reg.set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
     track_child_task(ctx, child_id, id);
     completions(ctx).run_blocking(id, move || {

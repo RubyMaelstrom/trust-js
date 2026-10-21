@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use trust_js_host::{CompletionSender, Ctx, SpawnHandle, TaskRegistry, Value};
+use trust_js_host::{CompletionSender, Ctx, Handle, SpawnHandle, TaskRegistry, Value};
 
 use crate::http_syntax::{
     self, body_framing, field_value_bytes, header_values, read_body, read_fields, read_line,
@@ -46,20 +46,12 @@ use crate::read_header_pairs;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Live servers, keyed by the id handed to JS. Lives in `OpState`; the accept decoder reads it
 /// to re-arm and the `close` op flips the `closed` flag. JS values (`dispatch`) are `!Send` and
-/// so only ever touched on the loop thread — never moved into a pool closure.
+/// so only ever touched on the loop thread — never moved into a pool closure. Each open entry
+/// holds its dispatch function in a handle while it is registered.
 #[derive(Default)]
 pub(crate) struct ServerRegistry {
     next: u64,
     servers: HashMap<u64, ServerEntry>,
-}
-
-/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
-impl trust_js_host::HostTrace for ServerRegistry {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for entry in self.servers.values() {
-            visitor.root(&entry.dispatch);
-        }
-    }
 }
 
 struct ServerEntry {
@@ -69,7 +61,7 @@ struct ServerEntry {
     closed: Arc<AtomicBool>,
     /// The fixed JS `__dispatch(serverId, connId, ...)` callback (same for every accept of
     /// this server); it looks the user handler up by id.
-    dispatch: Value,
+    dispatch: Handle,
 }
 
 impl Drop for ServerRegistry {
@@ -152,7 +144,7 @@ pub(crate) fn op_server_listen(
         _ => return Err(ctx.make_error("TypeError", "listen: port must be 0..=65535")),
     };
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "listen: dispatch must be a function")),
     };
 
@@ -248,10 +240,7 @@ pub(crate) fn op_server_respond(
     let bytes = build_response(status, &status_text, &headers, &body, &request_method)
         .map_err(|error| ctx.make_error("TypeError", format!("respond: {error}")))?;
 
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_write);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_write)?;
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -395,7 +384,7 @@ fn arm_accept(
     listener: Arc<TcpListener>,
     closed: Arc<AtomicBool>,
     local_addr: SocketAddr,
-    dispatch: Value,
+    dispatch: Handle,
 ) {
     let id = ctx
         .host_mut::<TaskRegistry>()

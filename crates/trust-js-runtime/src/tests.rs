@@ -1648,6 +1648,38 @@ fn worker_message_round_trip_and_structured_clone() {
     assert_eq!(lines, ["reply 10 1000 hi"]);
 }
 
+/// A worker's main-side dispatch function is held by the worker registry's handle (and its
+/// armed inbox task's): a worker that no script variable keeps survives collections on both
+/// threads, and its reply still arrives.
+#[test]
+fn worker_kept_only_by_its_dispatch_survives_collections() {
+    let lines = worker_drive(
+        &[(
+            "collect.mjs",
+            r#"
+            onmessage = (e) => {
+                $262.gc();
+                for (let i = 0; i < 2000; i++) ({ i });
+                $262.gc();
+                postMessage(e.data + 1);
+                close();
+            };
+            "#,
+        )],
+        r#"
+        (() => {
+            const w = new Worker("{DIR}/collect.mjs", { type: "module" });
+            w.onmessage = (e) => console.log("reply", e.data);
+            w.postMessage(41);
+        })();
+        $262.gc();
+        for (let i = 0; i < 2000; i++) ({ i });
+        $262.gc();
+        "#,
+    );
+    assert_eq!(lines, ["reply 42"]);
+}
+
 #[test]
 fn worker_arraybuffer_transfer_detaches_sender_and_preserves_views() {
     let lines = worker_drive(
@@ -2133,6 +2165,31 @@ fn web_serve_roundtrip_over_loopback() {
         out.lines(),
         ["200 hi pong", "200 true 42", "200 got:hey", "closed"]
     );
+}
+
+/// A server's dispatch function is held by the server registry's handle and by each armed
+/// accept's task: collections between requests leave the server serving.
+#[test]
+fn web_serve_dispatch_survives_collections_between_requests() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        (async () => {
+            const server = TRustJS.serve(() => new Response("pong"),
+                                         { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            for (let i = 0; i < 3; i++) {
+                $262.gc();
+                for (let j = 0; j < 2000; j++) ({ j });
+                const r = await fetch(base + "/");
+                console.log(r.status, await r.text());
+            }
+            await server.shutdown();
+        })();
+        "#,
+    );
+    assert_eq!(out.lines(), ["200 pong", "200 pong", "200 pong"]);
 }
 
 #[test]

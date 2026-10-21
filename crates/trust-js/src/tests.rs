@@ -6743,7 +6743,6 @@ fn promise_jobs_restore_their_embedder_settings_context() {
         entered: Vec<u64>,
         leaves: usize,
     }
-    crate::value_free!(ContextTrace);
 
     fn set_context(
         ctx: &mut crate::embed::Ctx,
@@ -6817,7 +6816,6 @@ fn cross_realm_promise_jobs_prepare_the_handler_realm_before_host_settings() {
         entered: Vec<(u64, String)>,
         leaves: usize,
     }
-    crate::value_free!(ContextTrace);
 
     fn set_context(
         ctx: &mut crate::embed::Ctx,

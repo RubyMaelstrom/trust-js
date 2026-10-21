@@ -186,9 +186,6 @@ struct WebState {
     http: http::HttpClient,
 }
 
-// Clocks, entropy, HTTP connections and codec state: no JavaScript values.
-trust_js_host::value_free!(WebState, CodecRegistry, TextDecoderRegistry);
-
 #[derive(Default)]
 struct CodecRegistry {
     next_id: u64,
@@ -762,10 +759,7 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
         _ => return Err(ctx.make_error("TypeError", "__http.request expects (resolve, reject)")),
     };
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_http);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_http)?;
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
@@ -846,7 +840,6 @@ mod api_tests {
     use trust_js_host::{install, Completion, Engine};
 
     use super::extension;
-    use crate::wasm_ops::WasmStore;
 
     // (module
     //   (import "env" "afterGrow" (func $afterGrow))
@@ -1019,11 +1012,7 @@ mod api_tests {
         }
         assert_eq!(eval(&mut engine, "__wasmTestLoad(0)"), "0");
         assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
+            crate::wasm_ops::test_stats(engine.ctx()),
             [0, 1, 1, 4, 0, 1, 0, 1, 1],
             "the exported function root retains its defining instance graph"
         );
@@ -1039,11 +1028,7 @@ mod api_tests {
         crate::wasm_ops::op_release(engine.ctx(), trust_js_host::Value::Undefined, &[token])
             .unwrap_or_else(|_| panic!("could not release final root"));
         assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
+            crate::wasm_ops::test_stats(engine.ctx()),
             [0; 9],
             "the final root releases modules, callbacks, buffers, and every store entity"
         );
@@ -1071,11 +1056,7 @@ mod api_tests {
         );
         assert_eq!(eval(&mut engine, &source), "0");
         assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
+            crate::wasm_ops::test_stats(engine.ctx()),
             [1, 6, 1, 4, 0, 1, 0, 1, 1]
         );
 
@@ -1083,14 +1064,7 @@ mod api_tests {
             engine.collect_garbage_at_idle();
             engine.run_microtasks();
         }
-        assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
-            [0; 9]
-        );
+        assert_eq!(crate::wasm_ops::test_stats(engine.ctx()), [0; 9]);
     }
 
     #[test]
@@ -1125,11 +1099,7 @@ mod api_tests {
             "1"
         );
         assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
+            crate::wasm_ops::test_stats(engine.ctx()),
             [1, 6, 1, 4, 0, 1, 0, 1, 1]
         );
 
@@ -1138,13 +1108,53 @@ mod api_tests {
             engine.collect_garbage_at_idle();
             engine.run_microtasks();
         }
+        assert_eq!(crate::wasm_ops::test_stats(engine.ctx()), [0; 9]);
+    }
+
+    /// The descriptor builders (`WebAssembly.Module.exports`/`imports` and an instance's
+    /// exports) set each new descriptor's members with `[[Set]]`, which runs a setter on
+    /// `Object.prototype`: one that collects and allocates leaves the descriptors already built
+    /// intact, since handles hold them.
+    #[test]
+    fn wasm_descriptor_builders_hold_their_descriptors_across_a_collection_in_a_setter() {
+        let mut engine = Engine::new();
+        install(&mut engine, &[extension()]);
+        let bytes = SHARED_MEMORY_MODULE
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"
+            const module = new WebAssembly.Module(new Uint8Array([{bytes}]));
+            const describe = () => [
+              WebAssembly.Module.exports(module).map(d => d.name + ':' + d.kind).join(),
+              WebAssembly.Module.imports(module).map(d => d.module + '.' + d.name).join(),
+              Object.keys(new WebAssembly.Instance(module, {{ env: {{ afterGrow() {{}} }} }})
+                .exports).join(),
+            ].join(' / ');
+            const expected = describe();
+            for (const key of ['kind', 'name', 'module']) {{
+              Object.defineProperty(Object.prototype, key, {{
+                configurable: true,
+                set(value) {{
+                  $262.gc();
+                  for (let i = 0; i < 2000; i++) ({{ i, s: 'x' + i }});
+                  Object.defineProperty(this, key, {{
+                    value, enumerable: true, configurable: true, writable: true,
+                  }});
+                }},
+              }});
+            }}
+            const observed = describe();
+            for (const key of ['kind', 'name', 'module']) delete Object.prototype[key];
+            observed === expected ? expected : observed + ' != ' + expected
+            "#
+        );
         assert_eq!(
-            engine
-                .ctx()
-                .host_mut::<WasmStore>()
-                .expect("wasm store")
-                .test_stats(),
-            [0; 9]
+            eval(&mut engine, &source),
+            "memory:memory,load:function,store:function,growThenCall:function / env.afterGrow / \
+             memory,load,store,growThenCall"
         );
     }
 }

@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use trust_js_host::{
-    ArrayBufferBytes, Ctx, RetainedExternalAllocation, RetainedExternalMemory, Value, WeakValue,
+    ArrayBufferBytes, Ctx, Handle, RetainedExternalAllocation, RetainedExternalMemory,
+    RootedValues, Value, WeakHandle,
 };
 
 use crate::wasm;
@@ -21,22 +22,13 @@ pub(crate) struct WasmStore {
     modules: HashMap<u32, Rc<Module>>,
     roots: HashMap<u32, WasmRoot>,
     store: Store,
-    /// Imported JS callbacks, indexed by the host id stored in `FuncEntity::Host`.
-    host_funcs: Vec<WeakValue>,
+    /// Imported JS callbacks, indexed by the host id stored in `FuncEntity::Host`, held weakly:
+    /// JavaScript keeps them alive (`_wasmKeepers` in js/wasm.js).
+    host_funcs: Vec<WeakHandle>,
     /// One current fixed-length JS buffer per exposed memory address. The storage is retained
     /// separately so a `memory.grow` executed while `Store` is temporarily moved out for a call
     /// can detach the old buffer and identify a replacement with the grown Data Block.
     memory_buffers: HashMap<usize, MemoryBuffer>,
-}
-
-/// Each memory's JavaScript ArrayBuffer, kept for as long as the store maps it. Host
-/// functions are held weakly.
-impl trust_js_host::HostTrace for WasmStore {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for memory in self.memory_buffers.values() {
-            visitor.root(&memory.buffer);
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -45,9 +37,10 @@ enum WasmRoot {
     Store(StoreRoot),
 }
 
+/// A memory's JavaScript ArrayBuffer, held for as long as the store maps the memory.
 struct MemoryBuffer {
     storage: ArrayBufferBytes,
-    buffer: Value,
+    buffer: Handle,
 }
 
 impl RetainedExternalMemory for WasmStore {
@@ -58,25 +51,29 @@ impl RetainedExternalMemory for WasmStore {
     }
 }
 
+/// The store's live modules, roots, entities, callbacks and memory buffers (tests).
 #[cfg(test)]
-impl WasmStore {
-    pub(crate) fn test_stats(&self) -> [usize; 9] {
-        let counts = self.store.live_entity_counts();
-        [
-            self.modules.len(),
-            self.roots.len(),
-            counts[0],
-            counts[1],
-            counts[2],
-            counts[3],
-            counts[4],
-            self.host_funcs
-                .iter()
-                .filter(|callback| callback.upgrade().is_some())
-                .count(),
-            self.memory_buffers.len(),
-        ]
-    }
+pub(crate) fn test_stats(ctx: &Ctx) -> [usize; 9] {
+    let ws = ctx.host::<WasmStore>().expect("wasm store");
+    let counts = ws.store.live_entity_counts();
+    [
+        ws.modules.len(),
+        ws.roots.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        ws.host_funcs
+            .iter()
+            .filter(|callback| {
+                callback
+                    .upgrade(ctx)
+                    .is_ok_and(|callback| callback.is_some())
+            })
+            .count(),
+        ws.memory_buffers.len(),
+    ]
 }
 
 // ---- value conversion -------------------------------------------------------------------------
@@ -209,7 +206,7 @@ fn sweep_wasm_store(ctx: &mut Ctx) {
 
 struct CtxHost<'a> {
     ctx: &'a mut Ctx,
-    host_funcs: &'a [WeakValue],
+    host_funcs: &'a [WeakHandle],
     error: Option<Value>,
 }
 
@@ -223,7 +220,7 @@ impl Host for CtxHost<'_> {
         let callback = self
             .host_funcs
             .get(id)
-            .and_then(WeakValue::upgrade)
+            .and_then(|callback| callback.upgrade(&*self.ctx).ok().flatten())
             .ok_or("wasm: bad import id")?;
         let js_args: Vec<Value> = args.iter().map(|v| val_to_js(*v)).collect();
         let ret = match self.ctx.invoke(callback, Value::Undefined, &js_args) {
@@ -288,10 +285,12 @@ fn refresh_memory_buffer(ctx: &mut Ctx, memory_addr: usize) -> Result<(), Value>
     else {
         return Ok(());
     };
+    let old_buffer = trust_js_host::value(ctx, &old_buffer);
     if !ctx.detach_array_buffer(&old_buffer) {
         return Err(ctx.make_error("TypeError", "wasm: current Memory buffer is detached"));
     }
     let buffer = ctx.make_host_keyed_array_buffer_from_storage(Rc::clone(&storage))?;
+    let buffer = trust_js_host::handle(ctx, &buffer)?;
     ctx.host_mut::<WasmStore>()
         .expect("wasm store")
         .memory_buffers
@@ -432,33 +431,32 @@ fn module_of(ctx: &mut Ctx, id: u32) -> Result<Rc<Module>, Value> {
         .ok_or_else(|| ctx.make_error("Error", "wasm: unknown module"))
 }
 
+// The descriptor builders below run `[[Set]]` on each new object, which can call a setter
+// (and so collect) while the earlier ones wait: they hold them in `RootedValues`.
+
 pub(crate) fn op_module_exports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let items: Vec<Value> = wasm::export_descriptors(&module)
-        .into_iter()
-        .map(|(name, kind)| {
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            o
-        })
-        .collect();
-    Ok(ctx.make_array(items))
+    let mut items = RootedValues::default();
+    for (name, kind) in wasm::export_descriptors(&module) {
+        let o = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&o, "name", Value::from_string(name));
+        let _ = ctx.set_member(&o, "kind", Value::str(kind));
+        items.push(ctx, &o)?;
+    }
+    Ok(items.into_array(ctx))
 }
 
 pub(crate) fn op_module_imports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let items: Vec<Value> = wasm::import_descriptors(&module)
-        .into_iter()
-        .map(|(m, name, kind)| {
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "module", Value::from_string(m));
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            o
-        })
-        .collect();
-    Ok(ctx.make_array(items))
+    let mut items = RootedValues::default();
+    for (m, name, kind) in wasm::import_descriptors(&module) {
+        let o = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&o, "module", Value::from_string(m));
+        let _ = ctx.set_member(&o, "name", Value::from_string(name));
+        let _ = ctx.set_member(&o, "kind", Value::str(kind));
+        items.push(ctx, &o)?;
+    }
+    Ok(items.into_array(ctx))
 }
 
 /// Private metadata used to convert primitive global imports according to their declared wasm
@@ -469,19 +467,16 @@ pub(crate) fn op_module_import_types(
     a: &[Value],
 ) -> Result<Value, Value> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let items: Vec<Value> = module
-        .imports
-        .iter()
-        .map(|import| {
-            let object = Value::Obj(ctx.new_object());
-            if let wasm::ImportKind::Global(global) = import.kind {
-                let _ = ctx.set_member(&object, "value", Value::str(valtype_name(global.val)));
-                let _ = ctx.set_member(&object, "mutable", Value::Bool(global.mutable));
-            }
-            object
-        })
-        .collect();
-    Ok(ctx.make_array(items))
+    let mut items = RootedValues::default();
+    for import in &module.imports {
+        let object = Value::Obj(ctx.new_object());
+        if let wasm::ImportKind::Global(global) = import.kind {
+            let _ = ctx.set_member(&object, "value", Value::str(valtype_name(global.val)));
+            let _ = ctx.set_member(&object, "mutable", Value::Bool(global.mutable));
+        }
+        items.push(ctx, &object)?;
+    }
+    Ok(items.into_array(ctx))
 }
 
 // Standalone entity allocation (for `new WebAssembly.Memory/Table/Global`).
@@ -527,7 +522,7 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
 
     // Read the JS import descriptors first (borrows ctx only).
     enum Parsed {
-        Func(WeakValue, wasm::parse::FuncType),
+        Func(WeakHandle, wasm::parse::FuncType),
         Mem(usize),
         Table(usize),
         Global(usize),
@@ -549,9 +544,8 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
                         ),
                     ));
                 }
-                let callback = ctx
-                    .downgrade_object_value(&f)
-                    .expect("a callable WebAssembly import is an object");
+                let callback = WeakHandle::new(ctx, &f)
+                    .map_err(|error| ctx.make_error("TypeError", error.to_string()))?;
                 parsed.push(Parsed::Func(
                     callback,
                     module.types[*tyidx as usize].clone(),
@@ -638,23 +632,21 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
             })
             .collect()
     };
-    let exports: Vec<Value> = names
-        .into_iter()
-        .map(|(name, kind, addr)| {
-            let kind = match kind {
-                wasm::ExportKind::Func => "function",
-                wasm::ExportKind::Memory => "memory",
-                wasm::ExportKind::Global => "global",
-                wasm::ExportKind::Table => "table",
-            };
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            let _ = ctx.set_member(&o, "addr", Value::Num(addr as f64));
-            o
-        })
-        .collect();
-    let exports = ctx.make_array(exports);
+    let mut exports = RootedValues::default();
+    for (name, kind, addr) in names {
+        let kind = match kind {
+            wasm::ExportKind::Func => "function",
+            wasm::ExportKind::Memory => "memory",
+            wasm::ExportKind::Global => "global",
+            wasm::ExportKind::Table => "table",
+        };
+        let o = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&o, "name", Value::from_string(name));
+        let _ = ctx.set_member(&o, "kind", Value::str(kind));
+        let _ = ctx.set_member(&o, "addr", Value::Num(addr as f64));
+        exports.push(ctx, &o)?;
+    }
+    let exports = exports.into_array(ctx);
 
     let result = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&result, "inst", Value::Num(inst_idx as f64));
@@ -692,9 +684,9 @@ pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
 pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let addr = num(a, 0) as usize;
     if let Some(buffer) = ctx
-        .host_mut::<WasmStore>()
+        .host::<WasmStore>()
         .and_then(|ws| ws.memory_buffers.get(&addr))
-        .map(|entry| entry.buffer.clone())
+        .map(|entry| trust_js_host::value(ctx, &entry.buffer))
     {
         return Ok(buffer);
     }
@@ -705,6 +697,7 @@ pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
         .map(|memory| Rc::clone(&memory.bytes))
         .ok_or_else(|| ctx.make_error("Error", "wasm: bad memory address"))?;
     let buffer = ctx.make_host_keyed_array_buffer_from_storage(Rc::clone(&storage))?;
+    let held = trust_js_host::handle(ctx, &buffer)?;
     ctx.host_mut::<WasmStore>()
         .expect("wasm store")
         .memory_buffers
@@ -712,7 +705,7 @@ pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
             addr,
             MemoryBuffer {
                 storage,
-                buffer: buffer.clone(),
+                buffer: held,
             },
         );
     Ok(buffer)

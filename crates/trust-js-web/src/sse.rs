@@ -30,19 +30,11 @@ pub(crate) struct SseRegistry {
     conns: HashMap<u64, SseEntry>,
 }
 
-/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
-impl trust_js_host::HostTrace for SseRegistry {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for entry in self.conns.values() {
-            visitor.root(&entry.dispatch);
-        }
-    }
-}
-
 struct SseEntry {
     closed: Arc<AtomicBool>,
     cancel: Arc<Mutex<Option<Arc<TcpStream>>>>,
-    dispatch: Value,
+    /// The JavaScript dispatch function, held while the entry is registered.
+    dispatch: trust_js_host::Handle,
     dead: bool,
 }
 
@@ -107,7 +99,7 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
         .to_string();
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "connect: dispatch must be a function")),
     };
 

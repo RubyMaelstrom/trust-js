@@ -39,10 +39,7 @@ fn op_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         .map_err(|error| ctx.make_error("Error", error.to_string()))?;
     tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry")
-        .register(resolve, Some(reject), decode_connect);
+    let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_connect)?;
     completions(ctx).run_blocking(task, move || {
         let result =
             trust_js_tls::TlsStream::connect_with_options(tcp, &servername, &alpn, verify_peer)
@@ -76,9 +73,6 @@ pub struct TlsRegistry {
     next_listener: u64,
     listeners: std::collections::HashMap<u64, ListenerEntry>,
 }
-
-// TLS sockets and listeners: no JavaScript values.
-trust_js_host::value_free!(TlsRegistry);
 
 struct ListenerEntry {
     listener: Arc<TcpListener>,
@@ -160,10 +154,7 @@ fn op_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         .collect();
     let verify_peer = !matches!(args.get(4), Some(Value::Bool(false)));
     let (resolve, reject) = callbacks(ctx, args.get(5), args.get(6))?;
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry")
-        .register(resolve, Some(reject), decode_connect);
+    let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_connect)?;
     completions(ctx).run_blocking(task, move || {
         let result = (|| -> Result<Connected, String> {
             let addresses: Vec<_> = (host.as_str(), port)
@@ -322,13 +313,10 @@ fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             )
         });
     let Some((listener, closed, context)) = found else {
-        CallbackQueue::enqueue(ctx.op_state(), resolve, vec![Value::Null]);
+        CallbackQueue::enqueue(ctx, &resolve, &[Value::Null])?;
         return Ok(Value::Undefined);
     };
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry")
-        .register(resolve, Some(reject), decode_accept);
+    let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_accept)?;
     completions(ctx).run_blocking(task, move || {
         let result = match listener.accept() {
             Ok((tcp, peer)) if !closed.load(Ordering::SeqCst) => {
@@ -394,13 +382,10 @@ fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         .and_then(|registry| registry.sockets.get(&id))
         .map(|entry| (entry.stream.clone(), entry.closed.clone()));
     let Some((stream, closed)) = found else {
-        CallbackQueue::enqueue(ctx.op_state(), resolve, vec![Value::Null]);
+        CallbackQueue::enqueue(ctx, &resolve, &[Value::Null])?;
         return Ok(Value::Undefined);
     };
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry")
-        .register(resolve, Some(reject), decode_read);
+    let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_read)?;
     completions(ctx).run_blocking(task, move || {
         let result = loop {
             if closed.load(Ordering::SeqCst) {
@@ -466,10 +451,7 @@ fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     let Some(stream) = stream else {
         return Err(ctx.make_error("Error", "TLS socket is closed"));
     };
-    let task = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry")
-        .register(resolve, Some(reject), decode_write);
+    let task = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_write)?;
     completions(ctx).run_blocking(task, move || {
         let result = stream
             .lock()

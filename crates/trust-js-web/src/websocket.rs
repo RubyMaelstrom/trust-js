@@ -609,15 +609,6 @@ pub(crate) struct WsRegistry {
     socks: HashMap<u64, WsEntry>,
 }
 
-/// Each open entry's JavaScript dispatch function: a root while the entry is registered.
-impl trust_js_host::HostTrace for WsRegistry {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for entry in self.socks.values() {
-            visitor.root(&entry.dispatch);
-        }
-    }
-}
-
 struct WsEntry {
     /// Write half; `None` until the handshake completes.
     writer: Option<SharedStream>,
@@ -625,7 +616,8 @@ struct WsEntry {
     close_sent: Arc<AtomicBool>,
     /// Stops the read re-arm after close/error delivery.
     dead: bool,
-    dispatch: Value,
+    /// The JavaScript dispatch function, held while the entry is registered.
+    dispatch: trust_js_host::Handle,
     /// A duplicate OS socket used only to interrupt a blocked reader when the entry is dropped.
     /// It is deliberately outside the TLS/shared-stream mutex.
     cancel: Arc<Mutex<Option<Arc<TcpStream>>>>,
@@ -741,7 +733,7 @@ pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         ));
     }
     let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "connect: dispatch must be a function")),
     };
 
@@ -1273,7 +1265,7 @@ pub(crate) fn op_ws_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
         return Err(ctx.make_error("TypeError", "upgrade: protocol must be an HTTP token"));
     }
     let dispatch = match args.get(4) {
-        Some(v) if v.is_callable() => v.clone(),
+        Some(v) if v.is_callable() => trust_js_host::handle(ctx, v)?,
         _ => return Err(ctx.make_error("TypeError", "upgrade: dispatch must be a function")),
     };
     if decode_base64(&key).is_none_or(|decoded| decoded.len() != 16) {

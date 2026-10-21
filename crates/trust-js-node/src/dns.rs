@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-use trust_js_host::{Ctx, TaskRegistry, Value};
+use trust_js_host::{Ctx, RootedValues, TaskRegistry, Value};
 
 use crate::spawn_handle;
 
@@ -36,10 +36,7 @@ pub fn op_lookup(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     let hostname = arg_str(ctx, args, 0)?;
     let family = arg_num(args, 1) as u8;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.lookup")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_addr_list);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_addr_list)?;
     spawn_handle(ctx).spawn_blocking(id, move || Box::new(system_lookup(&hostname, family)));
     Ok(Value::Undefined)
 }
@@ -64,7 +61,8 @@ fn system_lookup(hostname: &str, family: u8) -> Result<Vec<(String, u8)>, String
     Ok(out)
 }
 
-/// Payload → `[{ address, family }, …]`.
+/// Payload → `[{ address, family }, …]`. Each entry's `[[Set]]` can run a setter (and collect)
+/// while the entries before it wait in `RootedValues`.
 fn decode_addr_list(
     ctx: &mut Ctx,
     payload: Box<dyn std::any::Any + Send>,
@@ -74,16 +72,14 @@ fn decode_addr_list(
         .expect("lookup payload")
     {
         Ok(list) => {
-            let items = list
-                .into_iter()
-                .map(|(address, family)| {
-                    let o = Value::Obj(ctx.new_object());
-                    let _ = ctx.member_set(&o, "address", Value::from_string(address));
-                    let _ = ctx.member_set(&o, "family", Value::Num(family as f64));
-                    o
-                })
-                .collect();
-            Ok(vec![ctx.make_array(items)])
+            let mut items = RootedValues::default();
+            for (address, family) in list {
+                let o = Value::Obj(ctx.new_object());
+                let _ = ctx.member_set(&o, "address", Value::from_string(address));
+                let _ = ctx.member_set(&o, "family", Value::Num(family as f64));
+                items.push(ctx, &o)?;
+            }
+            Ok(vec![items.into_array(ctx)])
         }
         Err(message) => Err(dns_error(ctx, &message)),
     }
@@ -97,10 +93,7 @@ pub fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     let name = arg_str(ctx, args, 0)?;
     let rrtype = arg_str(ctx, args, 1)?;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.resolve")?;
-    let id = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("runtime installs the registry")
-        .register(resolve, Some(reject), decode_records);
+    let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_records)?;
     spawn_handle(ctx).spawn_blocking(id, move || Box::new(udp_resolve(&name, &rrtype)));
     Ok(Value::Undefined)
 }
@@ -358,9 +351,10 @@ fn decode_records(
         .expect("resolve payload")
     {
         Ok(records) => {
-            let items = records
-                .into_iter()
-                .map(|rec| match rec {
+            // As in `decode_addr_list`, the records made so far wait in `RootedValues`.
+            let mut items = RootedValues::default();
+            for rec in records {
+                let item = match rec {
                     Rec::Str(s) => Value::from_string(s),
                     Rec::Mx { priority, exchange } => {
                         let o = Value::Obj(ctx.new_object());
@@ -371,9 +365,10 @@ fn decode_records(
                     Rec::Txt(chunks) => {
                         ctx.make_array(chunks.into_iter().map(Value::from_string).collect())
                     }
-                })
-                .collect();
-            Ok(vec![ctx.make_array(items)])
+                };
+                items.push(ctx, &item)?;
+            }
+            Ok(vec![items.into_array(ctx)])
         }
         Err(message) => Err(dns_error(ctx, &message)),
     }

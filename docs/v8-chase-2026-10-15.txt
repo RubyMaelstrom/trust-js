@@ -6277,3 +6277,111 @@ Step 11 plan (2026-10-21), from a read-only survey of 5a4a1560
 - Not in step 11: TRust's port; minor-aware host tracing (hosts
   report in full at every collection); a Vec<Value<'s>> held across
   a safepoint stays a hole that rooted lists and GC stress guard.
+
+Step 11a, rooted handles (an implementation agent's change,
+reviewed):
+- The table (handles.rs): one per heap's GcState, shared by a
+  ShadowRealm tree: entries of a value, a handle count, a strength
+  and a recorded flag, a free list, the heap's id (a global counter,
+  never reused), an alive flag and a collecting flag. An entry made,
+  given a new value or made strong again is recorded; the records
+  are consumed right after 10d's, once the marking has run, and
+  kept for that collection's weak clearing.
+- The API (embed): Handle, WeakHandle and CountedHandle (N-API's
+  references: strong while the count is above 0, weak at 0, flipped
+  in place), each the table and an entry, so !Send and !Sync; made
+  and read through a HeapOwner (Ctx or Engine, sealed). A value
+  whose cell is not allocated in the owner's heap is refused
+  (Foreign), a handle read through another heap's owner too, one
+  whose heap was released answers Released, and a write while a
+  collection runs is refused (Collecting; debug builds panic).
+- Collections: a major collection reports every strong entry as a
+  root, a minor one the recorded strong entries; weak entries whose
+  targets died are cleared between the phases, right after the dead
+  list is built and before the host sweeps and any cell's freeing
+  (a minor collection examines the recorded ones). Debug builds
+  check, as each collection starts beside 10d's records, that every
+  unrecorded entry names an old cell or, if weak, nothing. The
+  heap's release empties the table and clears its alive flag first,
+  so remaining handles are inert.
+- This repository's stored values moved to handles: host's callback
+  queue and task registry, timers' handlers and arguments, web's
+  server, websocket and SSE dispatch functions and wasm's memory
+  buffer (its host functions as weak handles), node's FFI callbacks
+  and N-API's call-scope arena, the runtime's error and rejection
+  hooks (the duplicate ReportingShims rooting gone), its running
+  callbacks and rejections and its workers' dispatch. OpState and
+  ResourceTable no longer require HostTrace (a type registers its
+  tracing if it reports a graph), and value_free! is gone; until
+  11b makes values unstorable, nothing in the type system stops a
+  host type from storing a raw Value unreported. The two dns
+  decoders and four wasm builders keep their values in a rooted
+  list across [[Set]].
+- N-API: references are counted handles, so napi_get_reference_value
+  answers NULL once the referent died, as Node-API does; the
+  reference napi_wrap returns is weak, so wrapped objects can die;
+  wraps check identity by upgrading a weak handle; deferreds hold
+  strong handles. Finalizers run now: NapiState's sweep, after the
+  weak clearing, moves dead wraps' finalizers to a pending list run
+  at the next call into an addon, in an environment of their own;
+  none runs at teardown or if no addon is called again, and an
+  exception a finalizer throws is dropped (open).
+- The memory snapshot reports the live handles, strong and weak.
+- Along the way: three ShadowRealm retention tests failed on the
+  agent's tree from a latent false root: the client's roots() left
+  each idle realm owner's address in a stack slot that the native
+  stack scan's frame reuses (written only with TRUST_JS_GC_WHY, which
+  is why probes hid it), and the larger frame moved it. Marking::new
+  now lists the entered realms, so roots() touches only real roots.
+- Tests: 15 in handle_tests.rs and an unregistered host type that
+  reports nothing (survival across minor and major collections and
+  promotion, release, inertness after the Engine drops, another
+  heap's handle and value refused, weak handles cleared young at a
+  minor collection and old at a major one, the flip, no stale
+  upgrade at a reused address, the minor collection's report of
+  recorded entries only, should_panic on a bypassed record);
+  downstream: host's callback queue and task registry, armed timers,
+  web's builders under a collecting setter, N-API's references, a
+  dying wrapped object's finalizer and deferreds, a worker kept only
+  by its dispatch and a server, across collections. Changed: host.rs
+  tests register their trace types, memory.rs test types lose
+  value_free!, the timers' inert handler is Code, the task-registry
+  test makes handles, the wraps test checks that the sweep removes
+  dead entries, wasm's test_stats takes a Ctx. Four mutations (the
+  minor collection's record, the weak clearing, the heap id check,
+  the release's clearing) each made tests fail.
+- Gates (the review's, tiered, on the reviewed tree):
+  - aarch64: lib 2307/0/7, its test list the parent's plus the 16
+    new tests; clippy clean in the five configurations; rustfmt
+    clean; rustdoc's 40 warnings are 10d's; the workspace builds
+    with all targets without a diagnostic; git grep finds no
+    value_free! and six HostTrace impls, N-API's (empty, for its
+    sweep) and five test types.
+  - Downstream suites: host 37/0/0, timers 6/0/0, fs (no tests), web
+    62/0/1, node 45/0/0, runtime 184/0/1 (the agent also ran host,
+    timers, web and N-API's at GC stress 1 and the runtime's at
+    100).
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0, 21, 6 and 16 collections; difftest 138 agree,
+    12 skipped, no crash; the sustained workload's 194 collections
+    and output as 10d's. The dumps are 10d's in all three forms.
+  - Test262 at --tier=jit threshold 8: 53575/53575, the report
+    identical to the S5 review fixes'.
+  - Per-test GC stress at interval 1 of the targeted list (1177
+    tests): 1172 pass, 5 are ignored.
+  - x86-64 (zombie): clippy clean; lib 2141/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2133 pass, 3 fail
+    (step 1's snapshot codec tests) and 7 are ignored. Both lists
+    are the parent's plus the 16 new tests. Fixtures: compiles
+    56/10/160 and 21, 6 and 16 collections, outputs as on aarch64;
+    difftest 138 agree, 12 skipped, no crash.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 10d
+  878d81371e7e, 11a 03612778a13c from the gated tree, main
+  311ae9ae5658; copies made together; CPU 5, 15 interleaved rounds,
+  medians; started once a local inference server had used
+  under 1% of a core and all CPUs under two cores for a minute (an
+  owner's process kept one core busy throughout), the other cores
+  1.40 busy (median), 3.02 at most; outputs equal everywhere):
+  - Against 10d: cycles within 0.5% and instructions within 0.05%
+    on every workload, GC pause within 1.4%, peak RSS within 2%:
+    the engine's own paths are unchanged.

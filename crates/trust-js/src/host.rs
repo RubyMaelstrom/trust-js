@@ -44,59 +44,24 @@ pub trait RetainedMemory {
     fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor);
 }
 
-/// What every value an Agent keeps for its host declares (P1 S2, Decision 2): the JavaScript
-/// values it holds, so the type system, not review, enforces that host state is enumerated.
-/// [`OpState::put`] and [`ResourceTable::add`] require it. Report each value that must stay
-/// alive with `root`, or with `edge` from the JavaScript owner that keeps it alive: the
-/// collector keeps alive exactly what this reports. A type that holds no JavaScript values
-/// declares so with [`value_free!`](crate::value_free). These callbacks must not execute
-/// JavaScript, allocate JS objects, or re-enter collection.
+/// A host value that reports a graph of JavaScript values to the collector (P1 S2, Decision 2),
+/// for hosts whose values must live exactly as long as their JavaScript owners do: a value
+/// reported with `edge` stays alive while its owner does, and a native graph ties JavaScript
+/// values to native identities. A value the host simply keeps needs none of this: it keeps the
+/// value in a [`Handle`](crate::embed::Handle) (S6 step 11a), wherever it is stored. A type
+/// is reported at every collection, minor or major, once it is registered with
+/// [`OpState::register_trace`] or [`ResourceTable::register_trace`] (or, as a [`HostGc`], with
+/// [`OpState::register_gc`]). These callbacks must not execute JavaScript, allocate JS objects,
+/// or re-enter collection.
 pub trait HostTrace {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
 }
 
-/// Declare host types that hold no JavaScript values ([`HostTrace`] with nothing to report):
-/// `trust_js::value_free!(Config, Counter);`.
-#[macro_export]
-macro_rules! value_free {
-    ($($host:ty),+ $(,)?) => {
-        $(
-            impl $crate::__private::HostTrace for $host {
-                #[inline]
-                fn trace_gc(&self, _: &mut dyn $crate::__private::HostGcVisitor) {}
-            }
-        )+
-    };
-}
-
-value_free!(
-    (),
-    bool,
-    u8,
-    u16,
-    u32,
-    u64,
-    usize,
-    i32,
-    i64,
-    f64,
-    String,
-    Vec<u8>,
-    std::time::Instant,
-    std::time::Duration,
-    std::path::PathBuf,
-    Rc<std::cell::Cell<usize>>,
-    Rc<std::cell::Cell<bool>>,
-    std::fs::File,
-    std::cell::RefCell<std::fs::File>,
-    std::net::TcpStream,
-    std::net::TcpListener,
-    std::net::UdpSocket,
-);
-
 /// Native caches can own JavaScript references without making them permanent roots: beside the
 /// [`HostTrace`] enumeration (whose unreported handles the cache does not keep alive), they
-/// release job-scoped roots and evict dead handles. Register with [`OpState::register_gc`].
+/// release job-scoped roots and evict dead handles. Register with [`OpState::register_gc`],
+/// which also registers the type's [`HostTrace`]. The sweeps run between a collection's phases,
+/// after the weak [`Handle`](crate::embed::Handle)s whose targets died have been cleared.
 /// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
 pub trait HostGc: HostTrace {
     /// Release temporary native roots at the same synchronous-job boundary as ClearKeptObjects.
@@ -167,7 +132,7 @@ pub trait HostGcVisitor {
     fn native_root(&mut self, _id: NativeGcId) {}
 }
 
-/// A host value's [`HostTrace`], recorded when it is stored.
+/// A registered host type's [`HostTrace`].
 type HostTracer = fn(&dyn Any, &mut dyn HostGcVisitor);
 
 fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisitor) {
@@ -318,21 +283,23 @@ pub struct OpState {
     managed_reporters: HashMap<TypeId, ManagedReporter>,
     external_reporters: HashMap<TypeId, ExternalReporter>,
     gc_reporters: HashMap<TypeId, GcReporter>,
-    /// Every slot's [`HostTrace`] (the host roots of a collection).
+    /// The [`HostTrace`] of each type registered for collections' reports
+    /// ([`OpState::register_trace`], [`OpState::register_gc`]).
     tracers: crate::fasthash::FastMap<TypeId, HostTracer>,
     pub resources: ResourceTable,
 }
 
 impl OpState {
-    /// Store `value` in the `T` slot with its [`HostTrace`].
-    fn insert<T: Any + HostTrace>(&mut self, value: T) -> TypeId {
+    /// Store `value` in the `T` slot.
+    fn insert<T: Any>(&mut self, value: T) -> TypeId {
         let type_id = TypeId::of::<T>();
         self.map.insert(type_id, Box::new(value));
-        self.tracers.insert(type_id, host_tracer::<T>);
         type_id
     }
-    /// Install (or replace) the `T` slot.
-    pub fn put<T: Any + HostTrace>(&mut self, value: T) {
+    /// Install (or replace) the `T` slot. Its JavaScript values, if any, are kept in
+    /// [`Handle`](crate::embed::Handle)s, or reported as a graph by a type registered with
+    /// [`OpState::register_trace`].
+    pub fn put<T: Any>(&mut self, value: T) {
         let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
@@ -341,7 +308,7 @@ impl OpState {
     /// Install a slot whose owned heap storage participates in retained-memory diagnostics and
     /// which retains no separately allocated external backing. Use
     /// [`Self::put_retained_with_external_memory`] when both kinds are present.
-    pub fn put_retained<T: Any + HostTrace + RetainedBytes>(&mut self, value: T) {
+    pub fn put_retained<T: Any + RetainedBytes>(&mut self, value: T) {
         let type_id = self.insert(value);
         self.retained_reporters
             .insert(type_id, report_retained::<T>);
@@ -350,7 +317,7 @@ impl OpState {
     }
     /// Install a slot whose shared allocations and JavaScript roots participate in the
     /// identity-aware Agent-wide retained-memory visit and which owns no external backing.
-    pub fn put_retained_memory<T: Any + HostTrace + RetainedMemory>(&mut self, value: T) {
+    pub fn put_retained_memory<T: Any + RetainedMemory>(&mut self, value: T) {
         let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters
@@ -358,7 +325,7 @@ impl OpState {
         self.external_reporters.remove(&type_id);
     }
     /// Install a slot that reports external backing while leaving its host metadata unavailable.
-    pub fn put_external_memory<T: Any + HostTrace + RetainedExternalMemory>(&mut self, value: T) {
+    pub fn put_external_memory<T: Any + RetainedExternalMemory>(&mut self, value: T) {
         let type_id = self.insert(value);
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
@@ -366,9 +333,7 @@ impl OpState {
             .insert(type_id, report_external::<T>);
     }
     /// Install a slot that reports both host metadata and external backing.
-    pub fn put_retained_with_external_memory<
-        T: Any + HostTrace + RetainedBytes + RetainedExternalMemory,
-    >(
+    pub fn put_retained_with_external_memory<T: Any + RetainedBytes + RetainedExternalMemory>(
         &mut self,
         value: T,
     ) {
@@ -381,7 +346,7 @@ impl OpState {
     }
     /// Install a slot with identity-aware managed-memory and external-backing reporters.
     pub fn put_retained_memory_with_external_memory<
-        T: Any + HostTrace + RetainedMemory + RetainedExternalMemory,
+        T: Any + RetainedMemory + RetainedExternalMemory,
     >(
         &mut self,
         value: T,
@@ -405,17 +370,25 @@ impl OpState {
         self.retained_reporters.remove(&type_id);
         self.managed_reporters.remove(&type_id);
         self.external_reporters.remove(&type_id);
-        self.tracers.remove(&type_id);
         Some(*value.downcast().ok()?)
     }
     pub fn has<T: Any>(&self) -> bool {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
-    /// Opt an installed host type into the collector's [`HostGc`] callbacks (job end and
-    /// sweep). Replacing a slot of the same Rust type preserves this registration; an absent
-    /// slot is simply not visited.
+    /// Opt a host type into the collector's [`HostTrace`] reports: from now on every collection
+    /// asks the `T` slot, while there is one, for its graph. The registration belongs to the Rust
+    /// type, not to a slot: replacing or taking the slot keeps it, and an absent slot is simply
+    /// not visited.
+    pub fn register_trace<T: Any + HostTrace>(&mut self) {
+        self.tracers.insert(TypeId::of::<T>(), host_tracer::<T>);
+    }
+
+    /// Opt a host type into the collector's [`HostGc`] callbacks (job end and sweep) and, as a
+    /// [`HostTrace`], its reports ([`OpState::register_trace`]). Replacing a slot of the same Rust
+    /// type preserves this registration; an absent slot is simply not visited.
     pub fn register_gc<T: Any + HostGc>(&mut self) {
+        self.register_trace::<T>();
         self.gc_reporters.insert(
             TypeId::of::<T>(),
             GcReporter {
@@ -430,8 +403,8 @@ impl OpState {
         );
     }
 
-    /// Report the host's JavaScript values: every slot's and resource's [`HostTrace`], the
-    /// host roots.
+    /// Report the host's JavaScript graphs: the [`HostTrace`] of every slot and resource whose
+    /// type is registered.
     pub(crate) fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
         for (key, tracer) in &self.tracers {
             if let Some(value) = self.map.get(key) {
@@ -553,43 +526,47 @@ pub struct ResourceTable {
     retained_reporters: HashMap<ResourceId, RetainedReporter>,
     managed_reporters: HashMap<ResourceId, ManagedReporter>,
     external_reporters: HashMap<ResourceId, ExternalReporter>,
-    /// Every resource's [`HostTrace`].
-    tracers: HashMap<ResourceId, HostTracer>,
+    /// The [`HostTrace`] of each resource type registered for collections' reports
+    /// ([`ResourceTable::register_trace`]).
+    tracers: HashMap<TypeId, HostTracer>,
 }
 
 impl ResourceTable {
     /// Store `resource` under a fresh id. Ids are never reused, so once ids 0..u32::MAX have been
     /// handed out the id space is exhausted and this panics rather than recycle an id a script
-    /// may still hold.
-    pub fn add<T: Any + HostTrace>(&mut self, resource: T) -> ResourceId {
+    /// may still hold. Its JavaScript values, if any, are kept in
+    /// [`Handle`](crate::embed::Handle)s, or reported as a graph by a type registered with
+    /// [`ResourceTable::register_trace`].
+    pub fn add<T: Any>(&mut self, resource: T) -> ResourceId {
         let rid = self.next;
         self.next = rid
             .checked_add(1)
             .expect("ResourceTable id space exhausted; ids are never reused");
         self.map.insert(rid, Rc::new(resource));
-        self.tracers.insert(rid, host_tracer::<T>);
         rid
+    }
+    /// Opt a resource type into the collector's [`HostTrace`] reports: every collection asks
+    /// each open resource of type `T` for its graph.
+    pub fn register_trace<T: Any + HostTrace>(&mut self) {
+        self.tracers.insert(TypeId::of::<T>(), host_tracer::<T>);
     }
     /// Add a resource whose owned heap storage participates in retained-memory diagnostics and
     /// which retains no separately allocated external backing. Use
     /// [`Self::add_retained_with_external_memory`] when both kinds are present.
-    pub fn add_retained<T: Any + HostTrace + RetainedBytes>(&mut self, resource: T) -> ResourceId {
+    pub fn add_retained<T: Any + RetainedBytes>(&mut self, resource: T) -> ResourceId {
         let rid = self.add(resource);
         self.retained_reporters.insert(rid, report_retained::<T>);
         rid
     }
     /// Add a resource whose shared allocations and JavaScript roots participate in the
     /// identity-aware Agent-wide retained-memory visit.
-    pub fn add_retained_memory<T: Any + HostTrace + RetainedMemory>(
-        &mut self,
-        resource: T,
-    ) -> ResourceId {
+    pub fn add_retained_memory<T: Any + RetainedMemory>(&mut self, resource: T) -> ResourceId {
         let rid = self.add(resource);
         self.managed_reporters.insert(rid, managed_reporter::<T>());
         rid
     }
     /// Add a resource that reports external backing while leaving its host metadata unavailable.
-    pub fn add_external_memory<T: Any + HostTrace + RetainedExternalMemory>(
+    pub fn add_external_memory<T: Any + RetainedExternalMemory>(
         &mut self,
         resource: T,
     ) -> ResourceId {
@@ -598,9 +575,7 @@ impl ResourceTable {
         rid
     }
     /// Add a resource that reports both host metadata and external backing.
-    pub fn add_retained_with_external_memory<
-        T: Any + HostTrace + RetainedBytes + RetainedExternalMemory,
-    >(
+    pub fn add_retained_with_external_memory<T: Any + RetainedBytes + RetainedExternalMemory>(
         &mut self,
         resource: T,
     ) -> ResourceId {
@@ -610,7 +585,7 @@ impl ResourceTable {
     }
     /// Add a resource with identity-aware managed-memory and external-backing reporters.
     pub fn add_retained_memory_with_external_memory<
-        T: Any + HostTrace + RetainedMemory + RetainedExternalMemory,
+        T: Any + RetainedMemory + RetainedExternalMemory,
     >(
         &mut self,
         resource: T,
@@ -619,10 +594,13 @@ impl ResourceTable {
         self.external_reporters.insert(rid, report_external::<T>);
         rid
     }
-    /// Report every open resource's JavaScript values.
+    /// Report the JavaScript graph of every open resource whose type is registered.
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
-        for (rid, tracer) in &self.tracers {
-            if let Some(resource) = self.map.get(rid) {
+        if self.tracers.is_empty() {
+            return;
+        }
+        for resource in self.map.values() {
+            if let Some(tracer) = self.tracers.get(&(**resource).type_id()) {
                 tracer(resource.as_ref(), visitor);
             }
         }
@@ -640,7 +618,6 @@ impl ResourceTable {
         self.retained_reporters.remove(&rid);
         self.managed_reporters.remove(&rid);
         self.external_reporters.remove(&rid);
-        self.tracers.remove(&rid);
         value
     }
     /// Live handle count — the event loop stays alive while this is non-zero.
@@ -927,7 +904,6 @@ mod tests {
     struct Reported(Vec<u8>);
 
     struct External(crate::interpreter::ArrayBufferBytes);
-    crate::value_free!(Reported, External);
 
     impl RetainedBytes for Reported {
         fn retained_bytes(&self) -> usize {
@@ -1012,7 +988,8 @@ mod resource_id_tests {
     }
 }
 
-/// P1 S2: a host's JavaScript values live exactly as its [`HostTrace`] reports.
+/// P1 S2: the JavaScript values of a host type registered for tracing live exactly as its
+/// [`HostTrace`] reports.
 #[cfg(test)]
 mod host_trace_tests {
     use super::*;
@@ -1061,6 +1038,12 @@ mod host_trace_tests {
     #[test]
     fn host_slots_and_resources_keep_what_they_report() {
         let mut engine = crate::Engine::new();
+        engine.interp.op_state().register_trace::<Slots>();
+        engine
+            .interp
+            .op_state()
+            .resources
+            .register_trace::<Resource>();
         // The handles live in host state only (and in this helper's frame while it runs).
         let (owner_weak, target_weak, rid) = crate::gc_test::in_frame(|| {
             let owner = marker(2.0);
@@ -1104,9 +1087,32 @@ mod host_trace_tests {
         );
     }
 
+    /// Tracing is opt-in (S6 step 11a): a type stored without registering its [`HostTrace`]
+    /// reports nothing, and what only it holds dies. Host state keeps values in handles.
+    #[test]
+    fn an_unregistered_host_type_reports_nothing() {
+        let mut engine = crate::Engine::new();
+        let root_weak = crate::gc_test::in_frame(|| {
+            let root = marker(1.0);
+            let weak = crate::value::Gc::downgrade(root.as_obj().unwrap());
+            engine.interp.op_state().put(Slots {
+                root,
+                owner: Value::Undefined,
+                target: Value::Undefined,
+            });
+            weak
+        });
+        engine.interp.gc_collect();
+        assert!(
+            !crate::gc_test::alive(&root_weak),
+            "an unregistered type keeps nothing alive"
+        );
+    }
+
     #[test]
     fn host_edges_keep_targets_while_their_owner_lives() {
         let mut engine = crate::Engine::new();
+        engine.interp.op_state().register_trace::<Slots>();
         let target_weak = crate::gc_test::in_frame(|| {
             let owner = marker(2.0);
             let target = marker(3.0);

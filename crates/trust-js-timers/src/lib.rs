@@ -5,13 +5,14 @@
 //! fires. The runtime's event loop drives everything: it asks [`Timers::next_deadline`] how
 //! long it may block, and fires [`Timers::take_due`] callbacks each turn. `setImmediate`
 //! doesn't touch the heap at all — it queues on the loop's [`CallbackQueue`] for the next
-//! turn.
+//! turn. A timer's handler function and arguments are held by handles until the timer is
+//! cleared or has run.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
-use trust_js_host::{ops, CallbackQueue, Ctx, Extension, Value};
+use trust_js_host::{ops, CallbackQueue, Ctx, Extension, Handle, Value};
 
 /// The extension a runtime installs: the five timer globals plus the [`Timers`] state.
 pub fn extension() -> Extension {
@@ -33,13 +34,13 @@ pub fn extension() -> Extension {
 
 #[derive(Clone)]
 pub enum TimerHandler {
-    Function(Value),
+    Function(Handle),
     Code(String),
 }
 
 struct Entry {
     handler: TimerHandler,
-    args: Vec<Value>,
+    args: Vec<Handle>,
     timeout: Duration,
     repeat: bool,
     /// Unique internal value for the currently armed invocation. A due task carries this token so
@@ -55,7 +56,7 @@ pub struct TimerTask {
     id: u32,
     handle: u64,
     pub handler: TimerHandler,
-    pub args: Vec<Value>,
+    pub args: Vec<Handle>,
     nesting: u32,
 }
 
@@ -69,20 +70,6 @@ pub struct Timers {
     entries: HashMap<u32, Entry>,
     /// Timer nesting level of the currently running timer task, or zero outside one.
     current_nesting: u32,
-}
-
-/// Armed timers' handler functions and arguments run later: roots until cleared or run.
-impl trust_js_host::HostTrace for Timers {
-    fn trace_gc(&self, visitor: &mut dyn trust_js_host::HostGcVisitor) {
-        for entry in self.entries.values() {
-            if let TimerHandler::Function(handler) = &entry.handler {
-                visitor.root(handler);
-            }
-            for arg in &entry.args {
-                visitor.root(arg);
-            }
-        }
-    }
 }
 
 impl Timers {
@@ -114,7 +101,7 @@ impl Timers {
     fn schedule(
         &mut self,
         handler: TimerHandler,
-        args: Vec<Value>,
+        args: Vec<Handle>,
         timeout: Duration,
         repeat: bool,
     ) -> u32 {
@@ -259,7 +246,9 @@ fn webidl_long(number: f64) -> i32 {
 /// before the algorithm clamps negative and deeply nested timeouts.
 fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Value> {
     let handler = match args.first() {
-        Some(callback) if callback.is_callable() => TimerHandler::Function(callback.clone()),
+        Some(callback) if callback.is_callable() => {
+            TimerHandler::Function(trust_js_host::handle(ctx, callback)?)
+        }
         Some(code) => TimerHandler::Code(ctx.coerce_string(code)?.to_string()),
         None => {
             let kind = if repeat { "setInterval" } else { "setTimeout" };
@@ -271,7 +260,7 @@ fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Val
         None => 0,
     };
     let delay = Duration::from_millis(timeout.max(0) as u64);
-    let extra: Vec<Value> = args.iter().skip(2).cloned().collect();
+    let extra = trust_js_host::handles(ctx, args.get(2..).unwrap_or_default())?;
     let timers = ctx.host_mut::<Timers>().expect("timers state installed");
     let id = timers.schedule(handler, extra, delay, repeat);
     Ok(Value::Num(id as f64))
@@ -303,8 +292,7 @@ fn op_set_immediate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         Some(cb) if cb.is_callable() => cb.clone(),
         _ => return Err(ctx.make_error("TypeError", "setImmediate expects a function")),
     };
-    let extra: Vec<Value> = args.iter().skip(1).cloned().collect();
-    CallbackQueue::enqueue(ctx.op_state(), callback, extra);
+    CallbackQueue::enqueue(ctx, &callback, args.get(1..).unwrap_or_default())?;
     Ok(Value::Undefined)
 }
 
@@ -312,8 +300,9 @@ fn op_set_immediate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 mod tests {
     use super::*;
 
+    /// A handler these tests never run: code, which needs no engine to hold.
     fn inert_handler() -> TimerHandler {
-        TimerHandler::Function(Value::Undefined)
+        TimerHandler::Code(String::new())
     }
 
     #[test]
@@ -383,5 +372,76 @@ mod tests {
         timers.clear(id);
         assert!(!timers.begin_task(&task));
         assert!(!timers.has_pending());
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+    use trust_js_host::{install, Completion, Engine};
+
+    fn eval(engine: &mut Engine, source: &str) -> String {
+        match engine.eval(source, false).expect("timer fixture parses") {
+            Completion::Value(value) => value,
+            Completion::Throw { name, message } => panic!("{name}: {message}"),
+        }
+    }
+
+    /// Armed timers hold their handler functions and arguments in handles: collections keep
+    /// them though no script value does, and the due tasks run afterwards, an interval twice.
+    #[test]
+    fn armed_timers_keep_their_handlers_and_arguments_across_collections() {
+        let mut engine = Engine::new();
+        install(&mut engine, &[extension()]);
+        eval(
+            &mut engine,
+            "globalThis.log = [];
+             setTimeout(function (x) { log.push(x.tag); }, 0, {tag: ['timeout', 'arg'].join(' ')});
+             globalThis.interval = setInterval(function (x) { log.push(x.tag); }, 0,
+                                               {tag: ['interval', 'arg'].join(' ')});
+             0",
+        );
+        let mut runs = 0;
+        for _ in 0..2 {
+            for _ in 0..2 {
+                eval(
+                    &mut engine,
+                    "var churn = []; for (let i = 0; i < 3000; i++) churn.push({i}); churn = null; 0",
+                );
+                engine.ctx().collect_garbage_for_host();
+            }
+            let now = Instant::now() + Duration::from_secs(1);
+            let due = engine
+                .ctx()
+                .host_mut::<Timers>()
+                .expect("timers")
+                .take_due(now);
+            for task in due {
+                assert!(engine
+                    .ctx()
+                    .host_mut::<Timers>()
+                    .expect("timers")
+                    .begin_task(&task));
+                let TimerHandler::Function(handler) = &task.handler else {
+                    panic!("a function handler")
+                };
+                let handler = trust_js_host::value(engine.ctx(), handler);
+                let args = trust_js_host::values(engine.ctx(), &task.args);
+                assert!(engine
+                    .call_function(&handler, Value::Undefined, &args)
+                    .is_ok());
+                runs += 1;
+                engine
+                    .ctx()
+                    .host_mut::<Timers>()
+                    .expect("timers")
+                    .finish_task(&task, now);
+            }
+        }
+        assert_eq!(runs, 3);
+        assert_eq!(
+            eval(&mut engine, "clearInterval(interval); log.join()"),
+            "timeout arg,interval arg,interval arg"
+        );
     }
 }
