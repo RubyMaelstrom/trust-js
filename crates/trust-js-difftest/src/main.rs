@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use trust_js::bytecode::Tier;
+use trust_js::Tier;
 use trust_js::{Completion, Engine};
 
 /// A counting allocator with a hard live-bytes cap. When a `--check` child engages the cap, any

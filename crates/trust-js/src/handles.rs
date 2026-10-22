@@ -6,8 +6,9 @@
 //! cleared between a collection's phases once its target is found dead, before any cell is
 //! freed, so a weak handle never yields a freed cell or a new one at a reused address. Each
 //! Agent heap has one table, which a ShadowRealm tree shares. The table knows its heap's
-//! identity and whether the heap still exists: a handle used with another heap's `Ctx` or
-//! `Engine`, or after its own Engine has dropped, is refused instead of naming a freed cell.
+//! identity and whether the heap still exists: a handle read through another heap's context, or
+//! after its own Engine has dropped, is refused instead of naming a freed cell. Handles are made
+//! from a scope's values and read back into a scope (S6 step 11b, `scope`).
 //!
 //! Collections read the table by kind ([`CollectionKind`]). A major collection reports every
 //! strong entry as a root and clears every weak entry whose target died. A minor collection
@@ -218,6 +219,18 @@ impl HandleTable {
         *self.slots.borrow_mut() = Slots::default();
     }
 
+    /// Each value the table's entries hold, strong or weak (the memory snapshot: the JavaScript
+    /// values a host keeps are its handles').
+    pub(crate) fn for_each_value(&self, mut f: impl FnMut(&Value)) {
+        for slot in self.slots.borrow().entries.iter() {
+            if slot.count > 0 {
+                if let Some(value) = &slot.value {
+                    f(value);
+                }
+            }
+        }
+    }
+
     /// The live entries, strong and weak (the memory snapshot).
     pub(crate) fn counts(&self) -> (usize, usize) {
         let slots = self.slots.borrow();
@@ -234,50 +247,27 @@ impl HandleTable {
 }
 
 #[cfg(feature = "embed")]
-pub use api::{CountedHandle, Handle, HandleError, HeapOwner, WeakHandle};
+pub use api::{CountedHandle, Handle, HandleError, WeakHandle};
 
 /// The embedder's API over the table (`trust_js::embed`).
 #[cfg(feature = "embed")]
 mod api {
     use super::{HandleTable, Slot};
     use crate::gc_core::CellAge;
-    use crate::value::{GcHeap, Value};
+    use crate::scope::{Ctx, Value};
+    use crate::value::GcHeap;
     use std::rc::Rc;
 
-    mod sealed {
-        /// The heap behind a [`super::HeapOwner`].
-        pub struct OwnerHeap<'a>(pub(crate) &'a crate::value::GcHeap);
-
-        pub trait Sealed {
-            fn owner_heap(&self) -> OwnerHeap<'_>;
-        }
+    /// The heap of a scope's context.
+    fn heap_of<'a>(cx: &'a Ctx<'_>) -> &'a GcHeap {
+        &cx.interp().gc_heap
     }
-
-    /// What owns a heap: a [`Ctx`](crate::embed::Ctx) or an [`Engine`](crate::Engine). Handles
-    /// are made from a value through its owner, and read through the owner they were made with.
-    pub trait HeapOwner: sealed::Sealed {}
-
-    impl sealed::Sealed for crate::interpreter::Interp {
-        fn owner_heap(&self) -> sealed::OwnerHeap<'_> {
-            sealed::OwnerHeap(&self.gc_heap)
-        }
-    }
-
-    impl HeapOwner for crate::interpreter::Interp {}
-
-    impl sealed::Sealed for crate::Engine {
-        fn owner_heap(&self) -> sealed::OwnerHeap<'_> {
-            sealed::OwnerHeap(&self.interp.gc_heap)
-        }
-    }
-
-    impl HeapOwner for crate::Engine {}
 
     /// Why a handle could not be made or read.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum HandleError {
-        /// The handle belongs to another heap than the `Ctx` or `Engine` it was used with, or
-        /// the value to another heap than the one asked to hold it.
+        /// The handle belongs to another Engine's heap than the context it was read through,
+        /// or the value to another heap than the context's.
         Foreign,
         /// The handle's heap has been released: its Engine has dropped.
         Released,
@@ -299,7 +289,7 @@ mod api {
     impl std::error::Error for HandleError {}
 
     impl HandleTable {
-        /// Whether a handle of this table may be read through the owner of the heap `heap_id`.
+        /// Whether a handle of this table may be read through a context of the heap `heap_id`.
         fn check_owner(&self, heap_id: u64) -> Result<(), HandleError> {
             if !self.alive.get() {
                 Err(HandleError::Released)
@@ -326,7 +316,7 @@ mod api {
         }
 
         /// A new entry holding `value`, strong or weak, named by one handle; recorded.
-        fn make(&self, value: Value, strong: bool) -> Result<u32, HandleError> {
+        fn make(&self, value: crate::value::Value, strong: bool) -> Result<u32, HandleError> {
             self.check_writable()?;
             let mut slots = self.slots.borrow_mut();
             let index = match slots.free.pop() {
@@ -387,12 +377,12 @@ mod api {
         }
 
         /// Entry `index`'s value (`None` once a weak entry's target has died).
-        fn value(&self, index: u32) -> Option<Value> {
+        fn value(&self, index: u32) -> Option<crate::value::Value> {
             self.slots.borrow().entries[index as usize].value.clone()
         }
 
         /// Give entry `index` a new value (`value` is the heap's); recorded.
-        fn set_value(&self, index: u32, value: Value) -> Result<(), HandleError> {
+        fn set_value(&self, index: u32, value: crate::value::Value) -> Result<(), HandleError> {
             self.check_writable()?;
             let mut slots = self.slots.borrow_mut();
             slots.entries[index as usize].value = Some(value);
@@ -426,7 +416,7 @@ mod api {
     }
 
     /// Whether `value` may enter `heap`'s table: a cell value must be one of `heap`'s live cells.
-    fn check_value(heap: &GcHeap, value: &Value) -> Result<(), HandleError> {
+    fn check_value(heap: &GcHeap, value: &crate::value::Value) -> Result<(), HandleError> {
         heap.handles.check_writable()?;
         if let Some(word) = value.cell_word() {
             let core = heap
@@ -440,51 +430,53 @@ mod api {
         Ok(())
     }
 
-    /// A new entry of `owner`'s heap holding `value`.
+    /// A new entry of `cx`'s heap holding `value`.
     fn make(
-        owner: &impl HeapOwner,
-        value: &Value,
+        cx: &Ctx<'_>,
+        value: &Value<'_>,
         strong: bool,
     ) -> Result<(Rc<HandleTable>, u32), HandleError> {
-        let heap = owner.owner_heap().0;
-        check_value(heap, value)?;
-        let slot = heap.handles.make(value.clone(), strong)?;
+        let heap = heap_of(cx);
+        let value = value.into_internal();
+        check_value(heap, &value)?;
+        let slot = heap.handles.make(value, strong)?;
         Ok((heap.handles.clone(), slot))
     }
 
     /// A strong handle: keeps an engine value alive, wherever the handle is stored, until the
     /// handle drops. Clones share one entry of the heap's handle table, and the last to drop
-    /// frees it. A handle is read through the [`HeapOwner`] of its heap; with another heap's,
-    /// or once its Engine has dropped (it is then inert), reading it errs. It is neither `Send`
-    /// nor `Sync`.
+    /// frees it. A handle is made from a scope's value and read into a scope of its own Engine;
+    /// with another Engine's context, or once its Engine has dropped (it is then inert),
+    /// reading it errs. It is neither `Send` nor `Sync`.
     pub struct Handle {
         table: Rc<HandleTable>,
         slot: u32,
     }
 
     impl Handle {
-        /// Hold `value`, one of `owner`'s values.
-        pub fn new(owner: &impl HeapOwner, value: &Value) -> Result<Handle, HandleError> {
-            let (table, slot) = make(owner, value, true)?;
+        /// Hold `value`, one of `cx`'s values.
+        pub fn new<'s>(cx: &Ctx<'s>, value: &Value<'s>) -> Result<Handle, HandleError> {
+            let (table, slot) = make(cx, value, true)?;
             Ok(Handle { table, slot })
         }
 
-        /// The value, read through the owner of the handle's heap.
-        pub fn get(&self, owner: &impl HeapOwner) -> Result<Value, HandleError> {
-            self.table
-                .check_owner(owner.owner_heap().0.handles.heap_id)?;
-            Ok(self
-                .table
-                .value(self.slot)
-                .expect("a strong handle's entry keeps its value"))
+        /// The value, read into the scope `cx`, a scope of the handle's Engine.
+        pub fn get<'s>(&self, cx: &Ctx<'s>) -> Result<Value<'s>, HandleError> {
+            self.table.check_owner(heap_of(cx).handles.heap_id)?;
+            Ok(Value::from_internal(
+                self.table
+                    .value(self.slot)
+                    .expect("a strong handle's entry keeps its value"),
+            ))
         }
 
-        /// Hold `value` instead, one of `owner`'s values; every clone of this handle sees it.
-        pub fn set(&self, owner: &impl HeapOwner, value: &Value) -> Result<(), HandleError> {
-            let heap = owner.owner_heap().0;
+        /// Hold `value` instead, one of `cx`'s values; every clone of this handle sees it.
+        pub fn set<'s>(&self, cx: &Ctx<'s>, value: &Value<'s>) -> Result<(), HandleError> {
+            let heap = heap_of(cx);
             self.table.check_owner(heap.handles.heap_id)?;
-            check_value(heap, value)?;
-            self.table.set_value(self.slot, value.clone())
+            let value = value.into_internal();
+            check_value(heap, &value)?;
+            self.table.set_value(self.slot, value)
         }
 
         /// The handle's entry (tests).
@@ -539,33 +531,42 @@ mod api {
     /// A weak handle: names an engine value without keeping it alive. Once a collection finds
     /// the value dead, the handle is cleared, between the collection's phases and before the
     /// value's cell is freed, so it never yields a freed value or a new one at the same address.
-    /// Primitive values are never cleared. Clones share one entry; as [`Handle`] otherwise.
+    /// Primitive values are never cleared. Clones share one entry; as [`Handle`] otherwise. It is
+    /// also how a [`HostTrace`](crate::embed::HostTrace) reports the values of its graph.
     pub struct WeakHandle {
         table: Rc<HandleTable>,
         slot: u32,
     }
 
     impl WeakHandle {
-        /// Name `value`, one of `owner`'s values, weakly.
-        pub fn new(owner: &impl HeapOwner, value: &Value) -> Result<WeakHandle, HandleError> {
-            let (table, slot) = make(owner, value, false)?;
+        /// Name `value`, one of `cx`'s values, weakly.
+        pub fn new<'s>(cx: &Ctx<'s>, value: &Value<'s>) -> Result<WeakHandle, HandleError> {
+            let (table, slot) = make(cx, value, false)?;
             Ok(WeakHandle { table, slot })
         }
 
-        /// The value while it lives (`None` once a collection has found it dead), read through
-        /// the owner of the handle's heap.
-        pub fn upgrade(&self, owner: &impl HeapOwner) -> Result<Option<Value>, HandleError> {
-            self.table
-                .check_owner(owner.owner_heap().0.handles.heap_id)?;
-            Ok(self.table.value(self.slot))
+        /// The value while it lives (`None` once a collection has found it dead), read into the
+        /// scope `cx`, a scope of the handle's Engine.
+        pub fn upgrade<'s>(&self, cx: &Ctx<'s>) -> Result<Option<Value<'s>>, HandleError> {
+            self.table.check_owner(heap_of(cx).handles.heap_id)?;
+            Ok(self.table.value(self.slot).map(Value::from_internal))
         }
 
         /// Whether the handle will never yield its value again: a collection found it dead, or
-        /// the handle's Engine has dropped. It reads no value, so it needs no owner: a host's
-        /// sweep (`HostGc`), which runs between a collection's phases after the weak handles
-        /// to dead values have been cleared, can ask it.
+        /// the handle's Engine has dropped. It reads no value, so it needs no context: a host's
+        /// sweep ([`HostGc`](crate::embed::HostGc)), which runs between a collection's phases
+        /// after the weak handles to dead values have been cleared, can ask it.
         pub fn is_cleared(&self) -> bool {
             !self.table.alive.get() || self.table.value(self.slot).is_none()
+        }
+
+        /// The handle's value for a collection of the heap `heap_id` reading a host's report
+        /// (`HostGcVisitor`): `None` once cleared, or when the handle is another heap's.
+        pub(crate) fn reported(&self, heap_id: u64) -> Option<crate::value::Value> {
+            if !self.table.alive.get() || self.table.heap_id != heap_id {
+                return None;
+            }
+            self.table.value(self.slot)
         }
 
         /// The handle's entry (tests).
@@ -612,13 +613,13 @@ mod api {
     }
 
     impl CountedHandle {
-        /// Name `value`, one of `owner`'s values, with `count` (strongly when it is above 0).
-        pub fn new(
-            owner: &impl HeapOwner,
-            value: &Value,
+        /// Name `value`, one of `cx`'s values, with `count` (strongly when it is above 0).
+        pub fn new<'s>(
+            cx: &Ctx<'s>,
+            value: &Value<'s>,
             count: u32,
         ) -> Result<CountedHandle, HandleError> {
-            let (table, slot) = make(owner, value, count > 0)?;
+            let (table, slot) = make(cx, value, count > 0)?;
             Ok(CountedHandle { table, slot, count })
         }
 
@@ -654,11 +655,10 @@ mod api {
         }
 
         /// The value while it lives (`None` once a collection has found it dead at a count of 0),
-        /// read through the owner of the handle's heap.
-        pub fn get(&self, owner: &impl HeapOwner) -> Result<Option<Value>, HandleError> {
-            self.table
-                .check_owner(owner.owner_heap().0.handles.heap_id)?;
-            Ok(self.table.value(self.slot))
+        /// read into the scope `cx`, a scope of the handle's Engine.
+        pub fn get<'s>(&self, cx: &Ctx<'s>) -> Result<Option<Value<'s>>, HandleError> {
+            self.table.check_owner(heap_of(cx).handles.heap_id)?;
+            Ok(self.table.value(self.slot).map(Value::from_internal))
         }
     }
 

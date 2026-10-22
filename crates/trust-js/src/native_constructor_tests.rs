@@ -2,7 +2,7 @@
 //! built-ins: ECMA-262 #sec-builtincallorconstruct / #sec-getfunctionrealm,
 //! local snapshot e28783d5fc9dc12b3de905961e2c71410b38a202.
 
-use crate::{bytecode::Tier, value::Value, Completion, Engine};
+use crate::{bytecode::Tier, embed::Value, Completion, Engine};
 
 #[test]
 fn native_constructor_context_survives_reentry_and_reports_function_realms() {
@@ -10,37 +10,35 @@ fn native_constructor_context_survives_reentry_and_reports_function_realms() {
         let mut engine = Engine::new();
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
-        let ctor = engine.interp.new_native_fn_with_captures(
-            "HostConstructor",
-            1,
-            |ctx, _, args, _| {
-                let target = ctx.constructor_new_target();
-                if !ctx.is_constructing() {
-                    return Ok(target);
-                }
-                if let Some(callback) = args.first() {
-                    ctx.invoke(callback.clone(), Value::Undefined, &[])?;
-                }
-                assert!(ctx.values_strict_equal(&target, &ctx.constructor_new_target()));
-                Ok(target)
-            },
-            vec![],
-        );
-        let prototype = Value::Obj(engine.interp.new_object());
-        engine.interp.set_constructor_prototype(&ctor, &prototype);
-        let global = engine.interp.global_this();
-        engine
-            .interp
-            .member_set(&global, "HostConstructor", ctor)
-            .unwrap_or_else(|_| panic!("install host constructor"));
+        engine.scope(|cx| {
+            let ctor = cx.new_native_fn_with_captures(
+                "HostConstructor",
+                1,
+                |ctx, _, args, _| {
+                    let target = ctx.constructor_new_target();
+                    if !ctx.is_constructing() {
+                        return Ok(target);
+                    }
+                    if let Some(callback) = args.first() {
+                        ctx.invoke(*callback, Value::Undefined, &[])?;
+                    }
+                    assert!(ctx.values_strict_equal(&target, &ctx.constructor_new_target()));
+                    Ok(target)
+                },
+                &[],
+            );
+            let prototype = Value::Obj(cx.new_object());
+            cx.set_constructor_prototype(&ctor, &prototype);
+            let global = cx.global_this();
+            cx.member_set(&global, "HostConstructor", ctor)
+                .unwrap_or_else(|_| panic!("install host constructor"));
+            let foreign = cx.create_embed_realm();
+            cx.member_set(&global, "foreign", foreign)
+                .unwrap_or_else(|_| panic!("install foreign Realm"));
+        });
         engine.define_global("functionRealm", 1, |ctx, _, args| {
             ctx.callable_realm_global(args.first().unwrap_or(&Value::Undefined))
         });
-        let foreign = engine.interp.create_embed_realm();
-        engine
-            .interp
-            .member_set(&global, "foreign", foreign)
-            .unwrap_or_else(|_| panic!("install foreign Realm"));
         let source = r#"
             (() => {
                 function check(v, m) { if (!v) throw Error(m); }

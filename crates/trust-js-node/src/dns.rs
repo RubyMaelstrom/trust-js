@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-use trust_js_host::{Ctx, RootedValues, TaskRegistry, Value};
+use trust_js_host::{Ctx, TaskRegistry, Value, ValueList};
 
 use crate::spawn_handle;
 
@@ -32,7 +32,11 @@ enum Rec {
 
 /// `__dns.lookup(hostname, family, resolve, reject)` — resolve a hostname to addresses through the
 /// system resolver. `family` is 0 (any), 4, or 6; the glue picks one vs. all.
-pub fn op_lookup(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_lookup<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let hostname = arg_str(ctx, args, 0)?;
     let family = arg_num(args, 1) as u8;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.lookup")?;
@@ -62,22 +66,22 @@ fn system_lookup(hostname: &str, family: u8) -> Result<Vec<(String, u8)>, String
 }
 
 /// Payload → `[{ address, family }, …]`. Each entry's `[[Set]]` can run a setter (and collect)
-/// while the entries before it wait in `RootedValues`.
-fn decode_addr_list(
-    ctx: &mut Ctx,
+/// while the entries before it wait in a rooted `ValueList`.
+fn decode_addr_list<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<(String, u8)>, String>>()
         .expect("lookup payload")
     {
         Ok(list) => {
-            let mut items = RootedValues::default();
+            let mut items = ValueList::new();
             for (address, family) in list {
                 let o = Value::Obj(ctx.new_object());
-                let _ = ctx.member_set(&o, "address", Value::from_string(address));
+                let _ = ctx.member_set(&o, "address", ctx.string(address));
                 let _ = ctx.member_set(&o, "family", Value::Num(family as f64));
-                items.push(ctx, &o)?;
+                items.push(o);
             }
             Ok(vec![items.into_array(ctx)])
         }
@@ -89,7 +93,11 @@ fn decode_addr_list(
 
 /// `__dns.resolve(hostname, rrtype, resolve, reject)` — a record-type query (A/AAAA/CNAME/NS/MX/
 /// TXT/PTR) over UDP.
-pub fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_resolve<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = arg_str(ctx, args, 0)?;
     let rrtype = arg_str(ctx, args, 1)?;
     let (resolve, reject) = settle_pair(ctx, args, 2, "__dns.resolve")?;
@@ -101,10 +109,14 @@ pub fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 /// `__dns.getServers()` — the nameserver addresses from `/etc/resolv.conf`, as strings, for
 /// `dns.getServers()` / the default `Resolver`'s initial server list. Reading the file is cheap,
 /// so this stays synchronous rather than going through the blocking pool.
-pub fn op_get_servers(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub fn op_get_servers<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let items = resolv_nameservers()
         .into_iter()
-        .map(|ip| Value::from_string(ip.to_string()))
+        .map(|ip| ctx.string(ip.to_string()))
         .collect();
     Ok(ctx.make_array(items))
 }
@@ -342,31 +354,31 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize, String> {
 }
 
 /// Records payload → the value array Node's `resolve*` callbacks receive.
-fn decode_records(
-    ctx: &mut Ctx,
+fn decode_records<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<Rec>, String>>()
         .expect("resolve payload")
     {
         Ok(records) => {
-            // As in `decode_addr_list`, the records made so far wait in `RootedValues`.
-            let mut items = RootedValues::default();
+            // As in `decode_addr_list`, the records made so far wait in a `ValueList`.
+            let mut items = ValueList::new();
             for rec in records {
                 let item = match rec {
-                    Rec::Str(s) => Value::from_string(s),
+                    Rec::Str(s) => ctx.string(s),
                     Rec::Mx { priority, exchange } => {
                         let o = Value::Obj(ctx.new_object());
                         let _ = ctx.member_set(&o, "priority", Value::Num(priority as f64));
-                        let _ = ctx.member_set(&o, "exchange", Value::from_string(exchange));
+                        let _ = ctx.member_set(&o, "exchange", ctx.string(exchange));
                         o
                     }
                     Rec::Txt(chunks) => {
-                        ctx.make_array(chunks.into_iter().map(Value::from_string).collect())
+                        ctx.make_array(chunks.into_iter().map(|chunk| ctx.string(chunk)).collect())
                     }
                 };
-                items.push(ctx, &item)?;
+                items.push(item);
             }
             Ok(vec![items.into_array(ctx)])
         }
@@ -376,33 +388,31 @@ fn decode_records(
 
 // ---- shared helpers --------------------------------------------------------------------------
 
-fn arg_str(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> {
+fn arg_str<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], i: usize) -> Result<String, Value<'s>> {
     Ok(ctx
         .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
         .to_string())
 }
 
-fn arg_num(args: &[Value], i: usize) -> f64 {
+fn arg_num<'s>(args: &[Value<'s>], i: usize) -> f64 {
     args.get(i).and_then(|v| v.as_num_opt()).unwrap_or(0.0)
 }
 
 /// The trailing `(resolve, reject)` callback pair the glue passes at index `at`.
-fn settle_pair(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn settle_pair<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     at: usize,
     who: &str,
-) -> Result<(Value, Value), Value> {
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (args.get(at), args.get(at + 1)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            Ok((res.clone(), rej.clone()))
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => Ok((*res, *rej)),
         _ => Err(ctx.make_error("TypeError", format!("{who} expects (resolve, reject)"))),
     }
 }
 
 /// A DNS error carrying the `code` Node users switch on (best-effort mapping).
-fn dns_error(ctx: &mut Ctx, message: &str) -> Value {
+fn dns_error<'s>(ctx: &mut Ctx<'s>, message: &str) -> Value<'s> {
     let err = ctx.make_error("Error", message.to_string());
     let code = if message.contains("NXDOMAIN") || message.contains("no matching") {
         "ENOTFOUND"
@@ -411,6 +421,6 @@ fn dns_error(ctx: &mut Ctx, message: &str) -> Value {
     } else {
         "EAI_FAIL"
     };
-    let _ = ctx.set_member(&err, "code", Value::str(code));
+    let _ = ctx.set_member(&err, "code", ctx.str(code));
     err
 }

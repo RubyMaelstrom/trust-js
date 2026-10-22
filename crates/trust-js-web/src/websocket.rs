@@ -691,23 +691,23 @@ struct ReadResult {
     reader: Option<WsReader>,
 }
 
-fn ws_registry(ctx: &mut Ctx) -> &mut WsRegistry {
+fn ws_registry<'a>(ctx: &'a mut Ctx<'_>) -> &'a mut WsRegistry {
     ctx.host_mut::<WsRegistry>()
         .expect("web installs WsRegistry")
 }
 
-fn fresh_mask(ctx: &mut Ctx) -> Result<[u8; 4], Value> {
+fn fresh_mask<'s>(ctx: &mut Ctx<'s>) -> Result<[u8; 4], Value<'s>> {
     crate::web_random_bytes(ctx, 4)?
         .try_into()
         .map_err(|_| ctx.make_error("Error", "WebSocket masking entropy returned wrong length"))
 }
 
-fn encode_endpoint_frame(
-    ctx: &mut Ctx,
+fn encode_endpoint_frame<'s>(
+    ctx: &mut Ctx<'s>,
     masked: bool,
     opcode: u8,
     payload: &[u8],
-) -> Result<Vec<u8>, Value> {
+) -> Result<Vec<u8>, Value<'s>> {
     if masked {
         Ok(encode_frame(opcode, payload, fresh_mask(ctx)?))
     } else {
@@ -719,7 +719,11 @@ fn encode_endpoint_frame(
 /// socket's lifecycle then flows entirely through `dispatch(kind, ...)`:
 /// `("open", protocol)`, `("text", string)`, `("binary", u8array)`,
 /// `("close", code, reason, wasClean)`, `("error", message)`.
-pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_ws_connect<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -967,10 +971,10 @@ fn valid_protocol_list(protocols: &str) -> bool {
             .all(crate::http_syntax::is_token)
 }
 
-fn decode_connect(
-    ctx: &mut Ctx,
+fn decode_connect<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let ConnectResult { id, outcome } = *payload.downcast::<ConnectResult>().expect("ws payload");
     match outcome {
         Err(msg) => {
@@ -978,10 +982,7 @@ fn decode_connect(
                 e.dead = true;
             }
             ws_registry(ctx).socks.remove(&id);
-            Ok(vec![
-                Value::from_string("error".into()),
-                Value::from_string(msg),
-            ])
+            Ok(vec![ctx.string("error".into()), ctx.string(msg)])
         }
         Ok(ConnectedSocket {
             stream,
@@ -996,8 +997,8 @@ fn decode_connect(
                         Err(error) => {
                             ws_registry(ctx).socks.remove(&id);
                             return Ok(vec![
-                                Value::from_string("error".into()),
-                                Value::from_string(format!("clone WebSocket read half: {error}")),
+                                ctx.string("error".into()),
+                                ctx.string(format!("clone WebSocket read half: {error}")),
                             ]);
                         }
                     };
@@ -1012,13 +1013,13 @@ fn decode_connect(
             {
                 let reg = ws_registry(ctx);
                 let Some(entry) = reg.socks.get_mut(&id) else {
-                    return Ok(vec![Value::from_string("close".into()), Value::Num(1006.0)]);
+                    return Ok(vec![ctx.string("close".into()), Value::Num(1006.0)]);
                 };
                 if entry.dead {
                     reg.socks.remove(&id);
                     return Ok(vec![
-                        Value::from_string("error".into()),
-                        Value::from_string("WebSocket connection was cancelled".into()),
+                        ctx.string("error".into()),
+                        ctx.string("WebSocket connection was cancelled".into()),
                     ]);
                 }
                 entry.writer = Some(writer.clone());
@@ -1034,15 +1035,12 @@ fn decode_connect(
                 masked: true,
             };
             arm_read(ctx, id, reader);
-            Ok(vec![
-                Value::from_string("open".into()),
-                Value::from_string(protocol),
-            ])
+            Ok(vec![ctx.string("open".into()), ctx.string(protocol)])
         }
     }
 }
 
-fn arm_read(ctx: &mut Ctx, id: u64, mut reader: WsReader) {
+fn arm_read<'s>(ctx: &mut Ctx<'s>, id: u64, mut reader: WsReader) {
     let dispatch = match ws_registry(ctx).socks.get(&id) {
         Some(e) if !e.dead => e.dispatch.clone(),
         _ => return,
@@ -1067,7 +1065,10 @@ fn arm_read(ctx: &mut Ctx, id: u64, mut reader: WsReader) {
     });
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let ReadResult {
         id,
         outcome,
@@ -1078,17 +1079,14 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             if let Some(r) = reader {
                 arm_read(ctx, id, r);
             }
-            Ok(vec![
-                Value::from_string("text".into()),
-                Value::from_string(s),
-            ])
+            Ok(vec![ctx.string("text".into()), ctx.string(s)])
         }
         Ok(WsEvent::Binary(b)) => {
             let arr = ctx.make_uint8array(&b)?;
             if let Some(r) = reader {
                 arm_read(ctx, id, r);
             }
-            Ok(vec![Value::from_string("binary".into()), arr])
+            Ok(vec![ctx.string("binary".into()), arr])
         }
         Ok(WsEvent::Close(code, reason)) => {
             // Echo the close (once) so the TCP close handshake completes cleanly (§5.5.1),
@@ -1112,9 +1110,9 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
                 }
             }
             Ok(vec![
-                Value::from_string("close".into()),
+                ctx.string("close".into()),
                 Value::Num(code as f64),
-                Value::from_string(reason),
+                ctx.string(reason),
                 Value::Bool(clean),
             ])
         }
@@ -1130,23 +1128,24 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
                 }
             }
             Ok(vec![
-                Value::from_string("fail".into()),
+                ctx.string("fail".into()),
                 Value::Num(code as f64),
-                Value::from_string(msg.to_string()),
+                ctx.string(msg.to_string()),
             ])
         }
         Err(WsError::Io(msg)) => {
             ws_registry(ctx).socks.remove(&id);
-            Ok(vec![
-                Value::from_string("io".into()),
-                Value::from_string(msg),
-            ])
+            Ok(vec![ctx.string("io".into()), ctx.string(msg)])
         }
     }
 }
 
 /// `__ws.send(id, stringOrBytes)` — encodes and writes one masked data frame on the loop thread.
-pub(crate) fn op_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_ws_send<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = match args.first() {
         Some(Value::Num(n)) => *n as u64,
         _ => return Err(ctx.make_error("TypeError", "send: bad socket id")),
@@ -1181,7 +1180,11 @@ pub(crate) fn op_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
 
 /// `__ws.close(id, code, reason)` — sends the close frame (once); the read loop then surfaces
 /// the peer's echo as the close event.
-pub(crate) fn op_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_ws_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = match args.first() {
         Some(Value::Num(n)) => *n as u64,
         _ => return Err(ctx.make_error("TypeError", "close: bad socket id")),
@@ -1249,7 +1252,11 @@ pub(crate) fn op_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
 /// `("text", string)`, `("binary", u8array)`, `("close", code, reason, wasClean)`,
 /// `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died). There is no
 /// "open" event: the connection is open the moment this op returns.
-pub(crate) fn op_ws_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_ws_upgrade<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let conn_id = match args.first() {
         Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
         _ => return Err(ctx.make_error("TypeError", "upgrade: bad connection id")),

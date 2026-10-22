@@ -193,7 +193,7 @@ pub fn get_option(
 }
 
 /// Install `supportedLocalesOf` on a service constructor.
-pub fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
+pub(crate) fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
     let f = it.make_native("supportedLocalesOf", 1, |i, _t, a| {
         let requested = canonicalize_locale_list(i, &arg(a, 0))?;
         // Validate the options bag's localeMatcher (per spec) then filter by supported language.
@@ -215,7 +215,7 @@ pub fn install_supported_locales(it: &mut Interp, ctor: &Gc) {
 }
 
 /// Brand-check helper: fetch the internal slot object of a service instance, or throw TypeError.
-pub fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Value> {
+pub(crate) fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Value> {
     match this.as_obj() {
         Some(o) if o.borrow().internal_slots().contains(marker) => Ok(o.clone()),
         _ => Err(i.make_error("TypeError", "method called on an incompatible receiver")),
@@ -226,7 +226,7 @@ pub fn brand_slot(i: &mut Interp, this: &Value, marker: &str) -> Result<Gc, Valu
 /// intrinsic prototype for this service.
 /// OrdinaryCreateFromConstructor's proto lookup: `Get(newTarget, "prototype")` (propagating a
 /// poisoned getter's error), falling back to the intrinsic prototype when it isn't an object.
-pub fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
+pub(crate) fn instance_proto(i: &mut Interp, intrinsic: &str) -> Result<Option<Gc>, Value> {
     if let Value::Obj(nt) = &i.new_target {
         let nt = nt.clone();
         match i.get_member_key(&Value::Obj(nt.clone()), "prototype") {

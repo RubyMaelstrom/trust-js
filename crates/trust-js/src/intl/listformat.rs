@@ -11,7 +11,7 @@ use super::{
 use crate::interpreter::Interp;
 use crate::value::{set_data, set_internal_slot, Value};
 
-pub fn install(it: &mut Interp, ns: &crate::value::Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &crate::value::Gc) {
     let (ctor, proto) = make_service(it, ns, "ListFormat", 0, construct);
     install_supported_locales(it, &ctor);
 

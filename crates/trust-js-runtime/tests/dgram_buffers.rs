@@ -20,7 +20,7 @@ impl Write for Captured {
 fn udp_socket_buffer_sizes_are_native_and_validated() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

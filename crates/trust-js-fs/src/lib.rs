@@ -108,36 +108,46 @@ const JS_PROMISES: &str = r#"
 }
 "#;
 
-fn arg_string(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> {
+fn arg_string<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], i: usize) -> Result<String, Value<'s>> {
     Ok(ctx
         .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
         .to_string())
 }
 
-fn io_error(ctx: &mut Ctx, op: &str, path: &str, e: std::io::Error) -> Value {
+fn io_error<'s>(ctx: &mut Ctx<'s>, op: &str, path: &str, e: std::io::Error) -> Value<'s> {
     ctx.make_error("Error", format!("{op} '{path}': {e}"))
 }
 
 // ---- sync path ops ----
 
-fn op_read_file_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_file_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     match std::fs::read(&path) {
-        Ok(bytes) => Ok(Value::from_string(
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )),
+        Ok(bytes) => Ok(ctx.string(String::from_utf8_lossy(&bytes).into_owned())),
         Err(e) => Err(io_error(ctx, "readFileSync", &path, e)),
     }
 }
 
-fn op_write_file_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write_file_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let data = arg_string(ctx, args, 1)?;
     std::fs::write(&path, data).map_err(|e| io_error(ctx, "writeFileSync", &path, e))?;
     Ok(Value::Undefined)
 }
 
-fn op_append_file_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_append_file_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let data = arg_string(ctx, args, 1)?;
     std::fs::OpenOptions::new()
@@ -149,12 +159,20 @@ fn op_append_file_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
     Ok(Value::Undefined)
 }
 
-fn op_exists_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_exists_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     Ok(Value::Bool(std::path::Path::new(&path).exists()))
 }
 
-fn op_unlink_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_unlink_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     std::fs::remove_file(&path).map_err(|e| io_error(ctx, "unlinkSync", &path, e))?;
     Ok(Value::Undefined)
@@ -162,20 +180,28 @@ fn op_unlink_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 
 /// Recursive by default (`create_dir_all`) — Node needs `{ recursive: true }`, but the
 /// non-recursive failure mode is a trap nobody wants; revisit with an options argument.
-fn op_mkdir_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_mkdir_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     std::fs::create_dir_all(&path).map_err(|e| io_error(ctx, "mkdirSync", &path, e))?;
     Ok(Value::Undefined)
 }
 
-fn op_readdir_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_readdir_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let entries = std::fs::read_dir(&path).map_err(|e| io_error(ctx, "readdirSync", &path, e))?;
     let mut names: Vec<String> = entries
         .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
         .collect();
     names.sort();
-    Ok(ctx.make_array(names.into_iter().map(Value::from_string).collect()))
+    Ok(ctx.make_array(names.into_iter().map(|name| ctx.string(name)).collect()))
 }
 
 // ---- handle ops (ResourceTable) ----
@@ -184,7 +210,11 @@ fn op_readdir_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 /// File` while the table hands out shared `Rc`s.
 type FsHandle = RefCell<File>;
 
-fn op_open_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_open_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let mode = match args.get(1) {
         None | Some(Value::Undefined) => "r".to_string(),
@@ -211,7 +241,10 @@ fn op_open_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     Ok(Value::Num(rid as f64))
 }
 
-fn fd_handle(ctx: &mut Ctx, args: &[Value]) -> Result<std::rc::Rc<FsHandle>, Value> {
+fn fd_handle<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+) -> Result<std::rc::Rc<FsHandle>, Value<'s>> {
     let fd = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))?;
     let handle = (fd.is_finite() && fd >= 0.0)
         .then(|| ctx.resource_table().get::<FsHandle>(fd as u32))
@@ -220,19 +253,25 @@ fn fd_handle(ctx: &mut Ctx, args: &[Value]) -> Result<std::rc::Rc<FsHandle>, Val
 }
 
 /// Read everything from the handle's current position (sequential reads consume the file).
-fn op_read_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_fd_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let handle = fd_handle(ctx, args)?;
     let mut bytes = Vec::new();
     handle
         .borrow_mut()
         .read_to_end(&mut bytes)
         .map_err(|e| io_error(ctx, "readSync", "fd", e))?;
-    Ok(Value::from_string(
-        String::from_utf8_lossy(&bytes).into_owned(),
-    ))
+    Ok(ctx.string(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-fn op_write_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write_fd_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let data = arg_string(ctx, args, 1)?;
     let handle = fd_handle(ctx, args)?;
     handle
@@ -242,7 +281,11 @@ fn op_write_fd_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     Ok(Value::Undefined)
 }
 
-fn op_close_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let fd = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))?;
     if fd.is_finite() && fd >= 0.0 {
         // Drop closes the file once the last Rc clone (a read/write mid-flight) is gone.
@@ -256,7 +299,11 @@ fn op_close_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 /// `preadSync(fd, length, position)` — read up to `length` bytes; seek to `position` first
 /// when it is a non-negative number, otherwise read from the handle's current offset. Returns
 /// a `Uint8Array` (may be shorter than `length` at EOF).
-fn op_pread_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_pread_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let length = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     let position = args.get(2).and_then(|v| v.as_num_opt());
     let handle = fd_handle(ctx, args)?;
@@ -280,7 +327,11 @@ fn op_pread_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 
 /// `pwriteSync(fd, data, position)` — `data` is a string or a `Uint8Array`; seek to `position`
 /// first when it is a non-negative number. Returns the number of bytes written.
-fn op_pwrite_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_pwrite_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = match args.get(1) {
         Some(v) => match ctx.typed_array_bytes(v) {
             Some(b) => b,
@@ -301,7 +352,7 @@ fn op_pwrite_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 }
 
 /// A Node `Stats`-shaped raw object from a handle's metadata (JS `makeStats` adds the methods).
-fn stat_value(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
+fn stat_value<'s>(ctx: &mut Ctx<'s>, meta: &std::fs::Metadata) -> Value<'s> {
     let ms = |t: std::io::Result<std::time::SystemTime>| -> f64 {
         t.ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -319,7 +370,7 @@ fn stat_value(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
         "other"
     };
     let o = Value::Obj(ctx.new_object());
-    let set = |k: &str, v: f64, ctx: &mut Ctx| {
+    let set = |k: &str, v: f64, ctx: &mut Ctx<'s>| {
         let _ = ctx.set_member(&o, k, Value::Num(v));
     };
     set("size", meta.len() as f64, ctx);
@@ -363,12 +414,16 @@ fn stat_value(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
         set("blksize", 4096.0, ctx);
         set("blocks", ((meta.len() + 511) / 512) as f64, ctx);
     }
-    let _ = ctx.set_member(&o, "kind", Value::str(kind));
+    let _ = ctx.set_member(&o, "kind", ctx.str(kind));
     o
 }
 
 /// `fstatSync(fd)`.
-fn op_fstat_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_fstat_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let handle = fd_handle(ctx, args)?;
     let meta = handle
         .borrow()
@@ -378,7 +433,11 @@ fn op_fstat_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 }
 
 /// `ftruncateSync(fd, len)`.
-fn op_ftruncate_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_ftruncate_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let len = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     let handle = fd_handle(ctx, args)?;
     handle
@@ -393,7 +452,11 @@ fn op_ftruncate_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 }
 
 /// `fsyncSync(fd)`.
-fn op_fsync_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_fsync_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let handle = fd_handle(ctx, args)?;
     handle
         .borrow()
@@ -403,7 +466,11 @@ fn op_fsync_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 }
 
 /// `fdatasyncSync(fd)`.
-fn op_fdatasync_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_fdatasync_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let handle = fd_handle(ctx, args)?;
     handle
         .borrow()
@@ -413,7 +480,11 @@ fn op_fdatasync_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 }
 
 /// `fchmodSync(fd, mode)`.
-fn op_fchmod_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_fchmod_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mode = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as u32;
     let handle = fd_handle(ctx, args)?;
     #[cfg(unix)]
@@ -438,7 +509,11 @@ fn op_fchmod_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
-fn op_fchown_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_fchown_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let uid = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as u32;
     let gid = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))? as u32;
     let handle = fd_handle(ctx, args)?;
@@ -458,7 +533,11 @@ fn op_fchown_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 
 /// `futimesSync(fd, atimeSec, mtimeSec)` — set access/modification times on an open handle.
 /// Backed by the BSD `futimes(2)` (present on macOS and glibc Linux); a clean error elsewhere.
-fn op_futimes_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_futimes_sync<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let atime = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     let mtime = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))?;
     let handle = fd_handle(ctx, args)?;
@@ -483,7 +562,7 @@ fn op_futimes_sync(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     {
         let _ = (atime, mtime, handle);
         let err = ctx.make_error("Error", "ENOSYS: futimes is not supported on this platform");
-        let _ = ctx.set_member(&err, "code", Value::str("ENOSYS"));
+        let _ = ctx.set_member(&err, "code", ctx.str("ENOSYS"));
         Err(err)
     }
 }
@@ -517,7 +596,11 @@ extern "C" {
 // ---- async ops (threadpool + TaskRegistry; called only by the js_init glue) ----
 
 /// `(path, resolve, reject)`: read off-thread, settle the promise on the loop.
-fn op_read_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let (resolve, reject) = settle_args(ctx, args, "__fs_async.read")?;
     let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_read)?;
@@ -533,7 +616,11 @@ fn op_read_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 }
 
 /// `(path, data, resolve, reject)`.
-fn op_write_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write_async<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_string(ctx, args, 0)?;
     let data = arg_string(ctx, args, 1)?;
     let (resolve, reject) = settle_args(ctx, &args[1..], "__fs_async.write")?;
@@ -546,36 +633,41 @@ fn op_write_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 }
 
 /// The trailing `(resolve, reject)` pair the glue passes; anything else is a glue bug.
-fn settle_args(ctx: &mut Ctx, args: &[Value], who: &str) -> Result<(Value, Value), Value> {
+fn settle_args<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    who: &str,
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (args.get(1), args.get(2)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            Ok((res.clone(), rej.clone()))
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => Ok((*res, *rej)),
         _ => Err(ctx.make_error("TypeError", format!("{who} expects (resolve, reject)"))),
     }
 }
 
-fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
+fn spawn_handle<'s>(ctx: &mut Ctx<'s>) -> SpawnHandle {
     ctx.op_state()
         .get::<SpawnHandle>()
         .expect("runtime installs the spawn handle")
         .clone()
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<String, String>>()
         .expect("read payload")
     {
-        Ok(text) => Ok(vec![Value::from_string(text)]),
+        Ok(text) => Ok(vec![ctx.string(text)]),
         Err(message) => Err(ctx.make_error("Error", message)),
     }
 }
 
-fn decode_write(
-    ctx: &mut Ctx,
+fn decode_write<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<(), String>>()
         .expect("write payload")

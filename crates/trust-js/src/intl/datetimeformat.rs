@@ -46,7 +46,7 @@ fn temporal_to_ms(t: &crate::temporal::Temporal) -> f64 {
     }
 }
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DateTimeFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "formatToParts", 1, |i, this, a| {

@@ -17,7 +17,11 @@ pub const TLS_OPS: &[OpDecl] = ops![
     "closeServer" (1) => op_close_server,
 ];
 
-fn op_upgrade(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_upgrade<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let socket_id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let servername = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -118,27 +122,31 @@ struct Connected {
     alpn: String,
 }
 
-fn callbacks(
-    ctx: &mut Ctx,
-    resolve: Option<&Value>,
-    reject: Option<&Value>,
-) -> Result<(Value, Value), Value> {
+fn callbacks<'s>(
+    ctx: &mut Ctx<'s>,
+    resolve: Option<&Value<'s>>,
+    reject: Option<&Value<'s>>,
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (resolve, reject) {
         (Some(resolve), Some(reject)) if resolve.is_callable() && reject.is_callable() => {
-            Ok((resolve.clone(), reject.clone()))
+            Ok((*resolve, *reject))
         }
         _ => Err(ctx.make_error("TypeError", "TLS op expects resolve and reject callbacks")),
     }
 }
 
-fn completions(ctx: &mut Ctx) -> CompletionSender {
+fn completions<'s>(ctx: &mut Ctx<'s>) -> CompletionSender {
     ctx.op_state()
         .get::<CompletionSender>()
         .expect("runtime installs completion sender")
         .clone()
 }
 
-fn op_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_connect<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -200,10 +208,10 @@ fn op_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     Ok(Value::Undefined)
 }
 
-fn decode_connect(
-    ctx: &mut Ctx,
+fn decode_connect<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let connected = *payload
         .downcast::<Result<Connected, String>>()
         .expect("TLS connect payload");
@@ -213,7 +221,10 @@ fn decode_connect(
     )
 }
 
-fn register_connected(ctx: &mut Ctx, connected: Connected) -> Result<Vec<Value>, Value> {
+fn register_connected<'s>(
+    ctx: &mut Ctx<'s>,
+    connected: Connected,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let Connected {
         stream,
         local,
@@ -234,17 +245,21 @@ fn register_connected(ctx: &mut Ctx, connected: Connected) -> Result<Vec<Value>,
     );
     Ok(vec![
         Value::Num(id as f64),
-        Value::from_string(local.ip().to_string()),
+        ctx.string(local.ip().to_string()),
         Value::Num(local.port() as f64),
-        Value::from_string(peer.ip().to_string()),
+        ctx.string(peer.ip().to_string()),
         Value::Num(peer.port() as f64),
-        Value::from_string(protocol),
-        Value::from_string(cipher),
-        Value::from_string(alpn),
+        ctx.string(protocol),
+        ctx.string(cipher),
+        ctx.string(alpn),
     ])
 }
 
-fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_listen<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -284,11 +299,7 @@ fn op_listen(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     );
     let result = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&result, "serverId", Value::Num(id as f64));
-    let _ = ctx.set_member(
-        &result,
-        "address",
-        Value::from_string(local.ip().to_string()),
-    );
+    let _ = ctx.set_member(&result, "address", ctx.string(local.ip().to_string()));
     let _ = ctx.set_member(&result, "port", Value::Num(local.port() as f64));
     Ok(result)
 }
@@ -299,7 +310,11 @@ enum AcceptResult {
     Error(String),
 }
 
-fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_accept<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let (resolve, reject) = callbacks(ctx, args.get(1), args.get(2))?;
     let found = ctx
@@ -348,10 +363,10 @@ fn op_accept(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     Ok(Value::Undefined)
 }
 
-fn decode_accept(
-    ctx: &mut Ctx,
+fn decode_accept<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<AcceptResult>()
         .expect("TLS accept payload")
@@ -362,7 +377,11 @@ fn decode_accept(
     }
 }
 
-fn op_close_server(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close_server<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let entry = ctx
         .host_mut::<TlsRegistry>()
@@ -374,7 +393,11 @@ fn op_close_server(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
-fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let (resolve, reject) = callbacks(ctx, args.get(1), args.get(2))?;
     let found = ctx
@@ -427,7 +450,10 @@ fn op_read(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Undefined)
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<u8>, String>>()
         .expect("TLS read payload")
@@ -438,7 +464,11 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
     }
 }
 
-fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     let bytes = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
@@ -464,10 +494,10 @@ fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     Ok(Value::Undefined)
 }
 
-fn decode_write(
-    ctx: &mut Ctx,
+fn decode_write<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<usize, String>>()
         .expect("TLS write payload")
@@ -477,7 +507,11 @@ fn decode_write(
     }
 }
 
-fn op_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64;
     if let Some(entry) = ctx
         .host_mut::<TlsRegistry>()

@@ -37,11 +37,12 @@ use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
 #[path = "property_shape_tests.rs"]
 mod property_shape_tests;
 
-pub use crate::gc_handle::{Gc, WeakGc};
+pub(crate) use crate::gc_handle::{Gc, WeakGc};
 
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
-/// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
-pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
+/// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract. An embedder's
+/// `embed::NativeFn` is the same machine function over the scoped types (`scope::native_fn`).
+pub(crate) type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
 /// One identity-bearing allocation retained below a data-carrying native callable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -80,52 +81,38 @@ impl RetainedManagedAllocation {
 /// Canonical sinks available to a native callable's retained-memory reporter.
 pub trait NativeRetainedMemoryVisitor {
     fn allocation(&mut self, allocation: RetainedManagedAllocation);
-    fn value(&mut self, value: &Value);
 }
 
-/// A native function that carries captured state, unlike the bare-`fn` [`NativeFn`]. The embedder
-/// uses this to wrap host callbacks that need associated data a function pointer cannot hold.
-pub type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
+/// A native function that carries captured state, unlike the bare-`fn` [`NativeFn`]. Its state
+/// holds no JavaScript value (S6 step 11b): those are engine captures ([`CaptureClosure`]).
+pub(crate) type NativeClosure = dyn Fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
 
 /// A native operation with engine-owned JavaScript captures. Unlike opaque Rust
 /// closures, these captures participate in the collector's ordinary reachability
 /// graph. The final slice contains the immutable registration-time captures.
-pub type NativeCaptureFn = fn(&mut Interp, Value, &[Value], &[Value]) -> Result<Value, Value>;
+pub(crate) type NativeCaptureFn =
+    fn(&mut Interp, Value, &[Value], &[Value]) -> Result<Value, Value>;
 
-/// Retained-memory and capture companion for a [`NativeClosure`].
-///
-/// The reporter is stored separately so the established `Rc<NativeClosure>` call surface remains
-/// source-compatible. It must enumerate every allocation below its own inline payload and every
-/// captured JavaScript value: the collector keeps exactly those alive.
-///
-/// The values it reports are edges of the function object it is installed on, which the
-/// collector traces with the object. A value that changes after the function is created (a
-/// callback stored into the closure's state later, for instance) reaches the object without a
-/// write the engine sees, so unless [`NativeCallableRetained::reports_fixed_values`] says
-/// otherwise the engine rescans the function at every collection.
+/// A [`NativeClosure`] with engine-owned JavaScript captures, the final slice: a native
+/// function that carries Rust state and JavaScript values both (S6 step 11b).
+pub(crate) type CaptureClosure =
+    dyn Fn(&mut Interp, Value, &[Value], &[Value]) -> Result<Value, Value>;
+
+/// Retained-memory companion of a native closure's Rust state, for the managed-memory
+/// diagnostics: it enumerates every allocation below its own inline payload. It reports no
+/// JavaScript value (S6 step 11b): a native closure keeps its values as engine captures, which
+/// the collector traces with the function.
 pub trait NativeCallableRetained {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor);
-
-    /// Whether the JavaScript values [`NativeCallableRetained::scan_retained_memory`] reports
-    /// are fixed once the function is created: each was made before the function, and none is
-    /// replaced or added later. The default says they may change, and the engine then rescans
-    /// the function at every collection (its write barrier cannot see the reporter's writes).
-    /// A reporter whose values are fixed returns true and saves that work. Returning true for
-    /// values that change is unsound once a collection traces an old function only when its
-    /// card says it was written (a minor collection): a young value only the function reports
-    /// would be freed. Debug builds' write-barrier check panics on such a value.
-    fn reports_fixed_values(&self) -> bool {
-        false
-    }
 }
 
-/// What an opaque [`NativeClosure`] captures (P1 S2, Decision 2): the engine cannot see into
-/// a Rust closure, so its JavaScript captures are declared where it is registered.
+/// The retained-memory companion of a native closure's Rust state: what its allocations are for
+/// the managed-memory diagnostics.
 pub enum NativeCaptures {
-    /// The closure holds no JavaScript values.
+    /// The closure's state is not described.
     None,
-    /// Its captured JavaScript values (and managed allocations) are reported by this companion,
-    /// which may share the closure's state allocation.
+    /// Its state's managed allocations are reported by this companion, which may share the
+    /// closure's state allocation.
     Reported(Rc<dyn NativeCallableRetained>),
 }
 
@@ -148,7 +135,7 @@ impl NativeCaptures {
 /// reads stay valid.
 #[derive(Clone, Default)]
 #[repr(u64)]
-pub enum Value {
+pub(crate) enum Value {
     #[default]
     Undefined = 0,
     /// The spec's EMPTY completion marker: produced only by *statement* evaluation (declarations
@@ -1889,8 +1876,8 @@ impl Value {
         Value::Str(s.into().into())
     }
     /// A string value's engine text, unchanged: every code unit survives a round trip through
-    /// [`Value::from_engine_text`]. Convert it with `embed::engine_to_text` before treating it
-    /// as Rust text. `None` for any other value; see `Ctx::coerce_engine_text` for ToString.
+    /// [`Value::from_engine_text`] (tests; embedders read `embed::JsString`).
+    #[cfg(test)]
     pub fn as_engine_text(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
@@ -1898,7 +1885,8 @@ impl Value {
         }
     }
     /// A string value as Rust text: the conversion to a Web IDL `USVString`, in which every lone
-    /// surrogate becomes U+FFFD. `None` for any other value; see `Ctx::coerce_string` for ToString.
+    /// surrogate becomes U+FFFD (tests; embedders read `embed::JsString`).
+    #[cfg(test)]
     pub fn as_text(&self) -> Option<std::borrow::Cow<'_, str>> {
         match self {
             Value::Str(s) => Some(crate::jstr::to_text(s)),
@@ -1917,15 +1905,7 @@ impl Value {
     pub fn bigint_from_i128(v: i128) -> Value {
         Value::BigInt(crate::bigint::JsBigInt::from_i128(v))
     }
-    /// Read a BigInt as an `i64` (wrapping past ±2^63), for the embedder's 64-bit bridge. `None`
-    /// when the value isn't a BigInt.
-    pub fn bigint_as_i64(&self) -> Option<i64> {
-        match self {
-            Value::BigInt(b) => Some(b.to_i128_wrapping() as i64),
-            _ => None,
-        }
-    }
-    pub fn as_obj(&self) -> Option<&Gc> {
+    pub(crate) fn as_obj(&self) -> Option<&Gc> {
         match self {
             Value::Obj(o) => Some(o),
             _ => None,
@@ -2073,6 +2053,11 @@ pub(crate) enum NativeCallableBody {
         function: NativeCaptureFn,
         captures: Box<[Value]>,
     },
+    /// A closure with engine-owned captures (S6 step 11b).
+    CapturedClosure {
+        function: Rc<CaptureClosure>,
+        captures: Box<[Value]>,
+    },
 }
 
 /// `repr(C)`: the JIT's code-keyed call probe reads `func`, `env` and `realm` at fixed offsets
@@ -2217,7 +2202,7 @@ impl Exotic {
     }
 }
 
-pub struct Object {
+pub(crate) struct Object {
     /// Agent-owned collector state. Objects can be created while a suspended execution context is
     /// running on a coroutine worker and later die on the driver thread; carrying the owner makes
     /// registry removal independent of whichever native thread happens to execute `Drop`.
@@ -2538,15 +2523,11 @@ pub(crate) struct GcState {
     /// held weakly: a template's strings are roots while the template lives. Dead entries are
     /// dropped as they are traced.
     pub(crate) template_roots: RefCell<Vec<std::rc::Weak<TemplateStrings>>>,
-    /// S6 step 10b: the native functions of this heap whose host reporter's values may change
-    /// after their creation (`NativeCallableRetained::reports_fixed_values` is false), by object
-    /// address, registered wherever such a callable is installed (`Interp::make_native_callable`,
-    /// the native `super()` graft). The write barrier cannot see the reporter's writes, so each
-    /// collection sets these functions' cards as it starts (`gc_collect::Marking::new`): every
-    /// collection rescans them. An entry is evicted between the phases of the collection that
-    /// finds its function dead (`Interp::gc_heap_sweep`), like the interpreters' owner tables
-    /// (I8).
-    pub(crate) rescanned_natives: RefCell<crate::fasthash::FastSet<usize>>,
+    /// S6 step 11b: the Realms an embedder entered and has not left (`Ctx::enter_realm`), each
+    /// with the state of the Realm it replaced, which is a root of every collection until the
+    /// entry is left. Innermost last.
+    #[cfg(feature = "embed")]
+    pub(crate) entered_realms: RefCell<Vec<EnteredRealm>>,
     /// S6 step 10d: what the tables of this heap's interpreters wrote since the last
     /// collection's marking consumed it, which a minor collection reports instead of the tables
     /// (see `gc_collect::ClientRecords`).
@@ -2560,6 +2541,17 @@ pub(crate) struct GcState {
 }
 
 pub(crate) type GcHeap = Rc<GcState>;
+
+/// A Realm an embedder entered (`GcState::entered_realms`).
+#[cfg(feature = "embed")]
+pub(crate) struct EnteredRealm {
+    /// The interpreter that entered it, by address.
+    pub(crate) interp: usize,
+    /// The entered Realm's key (its global object's address).
+    pub(crate) key: usize,
+    /// The state of the Realm it replaced, restored when the entry is left.
+    pub(crate) saved: crate::interpreter::RealmState,
+}
 
 /// The live-object count and, beside it, the cell heap's due word: 1 exactly while
 /// `gc_core::Heap::collection_due` holds (the byte budget is spent, the stress interval reached
@@ -2917,25 +2909,16 @@ impl crate::gc_trace::GcTrace for Property {
 
 impl crate::gc_trace::GcTrace for NativeCallable {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        struct Retained<'a>(&'a mut dyn crate::gc_trace::GcSink);
-        impl NativeRetainedMemoryVisitor for Retained<'_> {
-            fn allocation(&mut self, _: RetainedManagedAllocation) {}
-            fn value(&mut self, value: &Value) {
-                self.0.value(value);
-            }
-        }
         match &self.body {
-            NativeCallableBody::Captured { captures, .. } => {
+            NativeCallableBody::Captured { captures, .. }
+            | NativeCallableBody::CapturedClosure { captures, .. } => {
                 for capture in captures.iter() {
                     sink.value(capture);
                 }
             }
-            // An opaque closure's captures are visible only through its retained reporter;
-            // one without a reporter must not hold JavaScript values (Decision 2).
+            // An opaque closure holds no JavaScript values (Decision 2; S6 step 11b): a
+            // closure keeps its values as engine captures.
             NativeCallableBody::Opaque(_) => {}
-        }
-        if let Some(retained) = &self.retained {
-            retained.scan_retained_memory(&mut Retained(sink));
         }
     }
 }
@@ -3185,6 +3168,9 @@ impl Drop for HeapRelease {
         };
         // S6 step 11a: before the cells go, every handle still held becomes inert.
         heap.handles.release();
+        // S6 step 11b: and every Realm entered and not left is forgotten.
+        #[cfg(feature = "embed")]
+        heap.entered_realms.borrow_mut().clear();
         {
             let core = heap.core.borrow();
             let _ =
@@ -3498,7 +3484,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         lazy_proto_desc: descs.lazy_proto,
         interned_strings: RefCell::default(),
         template_roots: RefCell::default(),
-        rescanned_natives: RefCell::default(),
+        #[cfg(feature = "embed")]
+        entered_realms: RefCell::default(),
         records: RefCell::default(),
         handles: crate::handles::HandleTable::new(heap_id),
         #[cfg(test)]
@@ -7624,12 +7611,12 @@ pub(crate) fn canonical_index(k: &str) -> Option<u32> {
 }
 
 /// Convenience: define a plain own data property by key/value.
-pub fn set_data(obj: &Gc, key: &str, value: Value) {
+pub(crate) fn set_data(obj: &Gc, key: &str, value: Value) {
     obj.borrow_mut().props.insert(key, Property::plain(value));
 }
 
 /// Convenience: define a non-enumerable builtin property by key/value.
-pub fn set_builtin(obj: &Gc, key: &str, value: Value) {
+pub(crate) fn set_builtin(obj: &Gc, key: &str, value: Value) {
     obj.borrow_mut().props.insert(key, Property::builtin(value));
 }
 

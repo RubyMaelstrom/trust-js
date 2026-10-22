@@ -6987,17 +6987,6 @@ impl Interp {
                         if !matches!(src_call, Callable::None)
                             && matches!(dst.borrow().call, Callable::None)
                         {
-                            // `this` now reports the callable's host values too: rescanned at
-                            // every collection if they may change (`GcState::rescanned_natives`).
-                            if let Callable::NativeData(native) = &src_call {
-                                if native
-                                    .retained
-                                    .as_ref()
-                                    .is_some_and(|reporter| !reporter.reports_fixed_values())
-                                {
-                                    self.register_rescanned_native(dst);
-                                }
-                            }
                             let is_ctor = src.borrow().is_constructor;
                             let mut db = dst.borrow_mut();
                             db.call = src_call;
@@ -8887,7 +8876,7 @@ impl Interp {
         }
     }
 
-    pub fn to_number(&mut self, v: &Value) -> Result<f64, Abrupt> {
+    pub(crate) fn to_number(&mut self, v: &Value) -> Result<f64, Abrupt> {
         Ok(match v {
             Value::Undefined | Value::Empty => f64::NAN,
             Value::Null => 0.0,
@@ -8940,7 +8929,7 @@ impl Interp {
         Ok(to_int32(n) as u32)
     }
 
-    pub fn to_string(&mut self, v: &Value) -> Result<crate::lstr::LStr, Abrupt> {
+    pub(crate) fn to_string(&mut self, v: &Value) -> Result<crate::lstr::LStr, Abrupt> {
         match v {
             Value::Undefined | Value::Empty => Ok(crate::lstr::LStr::from("undefined")),
             Value::Null => Ok(crate::lstr::LStr::from("null")),

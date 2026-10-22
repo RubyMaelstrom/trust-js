@@ -9,7 +9,7 @@
 //! handle is free and dropping one releases nothing; the collector reclaims unreachable cells.
 
 pub(crate) use cell::{clear_dead_weak_cells, WeakRef};
-pub use cell::{Gc, WeakGc};
+pub(crate) use cell::{Gc, WeakGc};
 
 mod cell {
     use crate::value::Object;
@@ -20,7 +20,7 @@ mod cell {
     /// A handle to a heap object: the address of its cell; see the module documentation.
     #[repr(transparent)]
     #[derive(Clone, Copy)]
-    pub struct Gc(NonNull<RefCell<Object>>);
+    pub(crate) struct Gc(NonNull<RefCell<Object>>);
 
     impl Gc {
         /// Allocate `object` in `heap`, the agent heap that owns it.
@@ -45,22 +45,17 @@ mod cell {
         }
 
         #[inline]
-        pub fn into_raw(this: Gc) -> *const RefCell<Object> {
+        pub(crate) fn as_ptr(this: &Gc) -> *const RefCell<Object> {
             this.0.as_ptr()
         }
 
         #[inline]
-        pub fn as_ptr(this: &Gc) -> *const RefCell<Object> {
-            this.0.as_ptr()
-        }
-
-        #[inline]
-        pub fn ptr_eq(a: &Gc, b: &Gc) -> bool {
+        pub(crate) fn ptr_eq(a: &Gc, b: &Gc) -> bool {
             a.0 == b.0
         }
 
         #[inline]
-        pub fn downgrade(this: &Gc) -> WeakGc {
+        pub(crate) fn downgrade(this: &Gc) -> WeakGc {
             WeakGc::of(this)
         }
 
@@ -106,7 +101,7 @@ mod cell {
     /// A weak object handle. [`WeakGc::upgrade`] yields a [`Gc`] until a collection (or the
     /// heap's teardown) finds the target dead and clears the shared cell.
     #[derive(Clone, Default)]
-    pub struct WeakGc(WeakRef);
+    pub(crate) struct WeakGc(WeakRef);
 
     /// The untyped weak reference behind [`WeakGc`] and `WeakEnv`: a target address and a flag
     /// the owning heap clears when the target dies. Never cleared means never upgraded twice
@@ -149,6 +144,7 @@ mod cell {
             self.0.as_ref().map_or(0, |cell| cell.ptr)
         }
 
+        #[cfg(test)]
         #[inline]
         pub(crate) fn handles(&self) -> usize {
             self.0.as_ref().map_or(0, Rc::strong_count)
@@ -174,12 +170,12 @@ mod cell {
 
         /// A handle that never upgrades.
         #[inline]
-        pub fn new() -> WeakGc {
+        pub(crate) fn new() -> WeakGc {
             WeakGc(WeakRef::default())
         }
 
         #[inline]
-        pub fn upgrade(&self) -> Option<Gc> {
+        pub(crate) fn upgrade(&self) -> Option<Gc> {
             // SAFETY: the alive flag is cleared before the target's cell is freed.
             self.0
                 .live_ptr()
@@ -193,7 +189,7 @@ mod cell {
         }
 
         #[inline]
-        pub fn ptr_eq(&self, other: &WeakGc) -> bool {
+        pub(crate) fn ptr_eq(&self, other: &WeakGc) -> bool {
             self.as_ptr() == other.as_ptr()
         }
 
@@ -202,6 +198,7 @@ mod cell {
             usize::from(self.0.live_ptr().is_some())
         }
 
+        #[cfg(test)]
         #[inline]
         pub fn weak_count(&self) -> usize {
             self.0.handles()

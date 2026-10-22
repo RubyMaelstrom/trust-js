@@ -281,7 +281,7 @@ impl SqliteState {
 }
 
 /// Fetch (or lazily install) the `SqliteState`.
-fn state(ctx: &mut Ctx) -> &mut SqliteState {
+fn state<'a>(ctx: &'a mut Ctx<'_>) -> &'a mut SqliteState {
     if ctx.host_mut::<SqliteState>().is_none() {
         ctx.op_state().put(SqliteState::default());
     }
@@ -289,7 +289,7 @@ fn state(ctx: &mut Ctx) -> &mut SqliteState {
 }
 
 /// Ensure the libsqlite3 API is loaded, returning an honest JS error if it cannot be.
-fn ensure_api(ctx: &mut Ctx) -> Result<(), Value> {
+fn ensure_api<'s>(ctx: &mut Ctx<'s>) -> Result<(), Value<'s>> {
     if state(ctx).api.is_none() {
         let custom_path = state(ctx).custom_path.clone();
         match Api::load(custom_path.as_deref()) {
@@ -329,15 +329,15 @@ pub const SQLITE_OPS: &[OpDecl] = ops![
 
 // ---- helpers ---------------------------------------------------------------------------------
 
-fn arg_u32(args: &[Value], i: usize) -> u32 {
+fn arg_u32<'s>(args: &[Value<'s>], i: usize) -> u32 {
     args.get(i).and_then(Value::as_num_opt).unwrap_or(0.0) as u32
 }
 
-fn arg_i32(args: &[Value], i: usize) -> i32 {
+fn arg_i32<'s>(args: &[Value<'s>], i: usize) -> i32 {
     args.get(i).and_then(Value::as_num_opt).unwrap_or(0.0) as i32
 }
 
-fn arg_bool(args: &[Value], i: usize) -> bool {
+fn arg_bool<'s>(args: &[Value<'s>], i: usize) -> bool {
     matches!(args.get(i), Some(Value::Bool(true)))
 }
 
@@ -353,19 +353,19 @@ unsafe fn cstr(p: *const c_char) -> String {
 /// Build the JS error a failed SQLite call throws. It carries `__sqlite = true` (so the JS glue
 /// rethrows it as a real `SQLiteError`), the `errno` (SQLite's extended result code), and — for
 /// every code except the generic `SQLITE_ERROR` (1) — the `code` name string, matching Bun.
-fn sqlite_err(ctx: &mut Ctx, errno: i32, message: String) -> Value {
+fn sqlite_err<'s>(ctx: &mut Ctx<'s>, errno: i32, message: String) -> Value<'s> {
     let err = ctx.make_error("Error", message);
     let _ = ctx.set_member(&err, "__sqlite", Value::Bool(true));
     let _ = ctx.set_member(&err, "errno", Value::Num(errno as f64));
     if let Some(code) = result_code_name(errno) {
-        let _ = ctx.set_member(&err, "code", Value::str(code));
+        let _ = ctx.set_member(&err, "code", ctx.str(code));
     }
     err
 }
 
 /// The current error (extended code + message) for a db handle, as the JS error value. The `api`
 /// borrow is confined to a short block so the caller keeps `&mut ctx` for `sqlite_err`.
-fn db_error(ctx: &mut Ctx, db: *mut c_void, fallback: &str) -> Value {
+fn db_error<'s>(ctx: &mut Ctx<'s>, db: *mut c_void, fallback: &str) -> Value<'s> {
     let (errno, msg) = {
         let api = state(ctx).api.as_ref().unwrap();
         unsafe { ((api.extended_errcode)(db), cstr((api.errmsg)(db))) }
@@ -379,14 +379,14 @@ fn db_error(ctx: &mut Ctx, db: *mut c_void, fallback: &str) -> Value {
 }
 
 /// Look up the db pointer for a handle, or throw "closed database" — matching Bun's message.
-fn db_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, Value> {
+fn db_ptr<'s>(ctx: &mut Ctx<'s>, id: u32) -> Result<*mut c_void, Value<'s>> {
     match state(ctx).dbs.get(&id) {
         Some(db) => Ok(db.ptr),
         None => Err(ctx.make_error("Error", "Cannot use a closed database")),
     }
 }
 
-fn stmt_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, Value> {
+fn stmt_ptr<'s>(ctx: &mut Ctx<'s>, id: u32) -> Result<*mut c_void, Value<'s>> {
     match state(ctx).stmts.get(&id) {
         Some(s) => Ok(s.ptr),
         // Bun's exact message for a use-after-finalize.
@@ -398,7 +398,11 @@ fn stmt_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, Value> {
 
 /// `open(path, flags) -> dbId`. Lazily loads libsqlite3; an absent/too-old library is the honest
 /// error the `Database` constructor throws.
-fn op_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_open<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -435,7 +439,11 @@ fn op_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 
 /// `close(dbId)`. Finalizes every live statement owned by this db first (SQLite requires it),
 /// then closes the connection.
-fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let st = state(ctx);
     if st.api.is_none() {
@@ -461,7 +469,11 @@ fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// `prepare(dbId, sql) -> stmtId`. Compiles the first statement in `sql`.
-fn op_prepare(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_prepare<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let sql = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -502,7 +514,11 @@ fn op_prepare(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Num(sid as f64))
 }
 
-fn op_finalize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_finalize<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let st = state(ctx);
     if let Some(s) = st.stmts.remove(&sid) {
@@ -517,7 +533,11 @@ fn op_finalize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 /// cleared only when `clearBindings` is true (before a fresh parameter set is bound); a plain
 /// post-run reset keeps them so a later no-argument call reuses them and `toString()` shows the
 /// last-bound SQL — both verified Bun behaviors.
-fn op_reset(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_reset<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let clear = arg_bool(args, 1);
     let stmt = stmt_ptr(ctx, sid)?;
@@ -533,7 +553,11 @@ fn op_reset(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 
 /// `bind(stmtId, index, value)` — bind one value at the 1-based parameter index, dispatching on
 /// the JS value's type to the matching `sqlite3_bind_*`.
-fn op_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_bind<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let index = arg_i32(args, 1);
     let value = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -627,7 +651,11 @@ fn op_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// `step(stmtId) -> 1 (a row is available) | 0 (done)`. Any other result is a run-time error.
-fn op_step(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_step<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
     let rc = {
@@ -645,7 +673,11 @@ fn op_step(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     }
 }
 
-fn op_column_count(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_column_count<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
     let api = state(ctx).api.as_ref().unwrap();
@@ -654,20 +686,23 @@ fn op_column_count(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// `columnNames(stmtId) -> [name, ...]` — the result columns' names, in order.
-fn op_column_names(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_column_names<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
-    let names = {
+    let names: Vec<String> = {
         let api = state(ctx).api.as_ref().unwrap();
         let n = unsafe { (api.column_count)(stmt) };
         let mut names = Vec::with_capacity(n as usize);
         for i in 0..n {
-            names.push(Value::from_string(unsafe {
-                cstr((api.column_name)(stmt, i))
-            }));
+            names.push(unsafe { cstr((api.column_name)(stmt, i)) });
         }
         names
     };
+    let names = names.into_iter().map(|name| ctx.string(name)).collect();
     Ok(ctx.make_array(names))
 }
 
@@ -684,7 +719,11 @@ enum Cell {
 /// `row(stmtId, safeIntegers) -> [value, ...]` — the current row's column values, typed per Bun:
 /// INTEGER → number (bigint when `safeIntegers`), REAL → number, TEXT → string, BLOB → Uint8Array,
 /// NULL → null. Assumes the last `step` returned a row.
-fn op_row(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_row<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let safe = arg_bool(args, 1);
     let stmt = stmt_ptr(ctx, sid)?;
@@ -733,13 +772,13 @@ fn op_row(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         let v = match cell {
             Cell::Int(n) => {
                 if safe {
-                    Value::bigint_from_i64(n)
+                    ctx.bigint_from_i64(n)
                 } else {
                     Value::Num(n as f64)
                 }
             }
             Cell::Float(f) => Value::Num(f),
-            Cell::Text(s) => Value::from_string(s),
+            Cell::Text(s) => ctx.string(s),
             Cell::Blob(b) => ctx.make_uint8array(&b)?,
             Cell::Null => Value::Null,
         };
@@ -748,7 +787,11 @@ fn op_row(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(ctx.make_array(values))
 }
 
-fn op_bind_parameter_count(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_bind_parameter_count<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
     let api = state(ctx).api.as_ref().unwrap();
@@ -758,7 +801,11 @@ fn op_bind_parameter_count(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<V
 
 /// `bindParameterName(stmtId, index) -> name | null` — the source name of the 1-based parameter
 /// (`$a`/`:a`/`@a`), or null for a positional `?`.
-fn op_bind_parameter_name(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_bind_parameter_name<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let index = arg_i32(args, 1);
     let stmt = stmt_ptr(ctx, sid)?;
@@ -767,13 +814,17 @@ fn op_bind_parameter_name(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
     if p.is_null() {
         Ok(Value::Null)
     } else {
-        Ok(Value::from_string(unsafe { cstr(p) }))
+        Ok(ctx.string(unsafe { cstr(p) }))
     }
 }
 
 /// `bindParameterIndex(stmtId, name) -> index` — the 1-based index of a named parameter, or 0 if
 /// there is no such parameter.
-fn op_bind_parameter_index(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_bind_parameter_index<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let name = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -791,7 +842,11 @@ fn op_bind_parameter_index(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<V
 /// `exec(dbId, sql) -> { changes, lastInsertRowid }` — run one or more statements with no
 /// bindings (Bun's `db.exec` / the no-parameter `db.run`). `changes` is the delta in the
 /// connection's total change count across the whole batch.
-fn op_exec(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_exec<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let sql = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -841,7 +896,11 @@ fn op_exec(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(obj)
 }
 
-fn op_changes(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_changes<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let db = db_ptr(ctx, id)?;
     let api = state(ctx).api.as_ref().unwrap();
@@ -852,7 +911,11 @@ fn op_changes(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
 /// `totalChanges(dbId)` — the connection's cumulative change count. The JS glue diffs it around a
 /// statement execution so a read-only statement reports `changes: 0` (Bun's semantics), which
 /// plain `sqlite3_changes` (last write, however long ago) cannot express.
-fn op_total_changes(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_total_changes<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let db = db_ptr(ctx, id)?;
     let api = state(ctx).api.as_ref().unwrap();
@@ -861,14 +924,18 @@ fn op_total_changes(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, V
 }
 
 /// `lastInsertRowid(dbId, safeIntegers) -> number | bigint`.
-fn op_last_insert_rowid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_last_insert_rowid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let safe = arg_bool(args, 1);
     let db = db_ptr(ctx, id)?;
     let api = state(ctx).api.as_ref().unwrap();
     let n = unsafe { (api.last_insert_rowid)(db) };
     if safe {
-        Ok(Value::bigint_from_i64(n))
+        Ok(ctx.bigint_from_i64(n))
     } else {
         Ok(Value::Num(n as f64))
     }
@@ -876,27 +943,39 @@ fn op_last_insert_rowid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
 
 /// `expandedSql(stmtId) -> string` — the SQL with its current bindings inlined (Bun's
 /// `Statement.toString()`).
-fn op_expanded_sql(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_expanded_sql<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
     let api = state(ctx).api.as_ref().unwrap();
     let p = unsafe { (api.expanded_sql)(stmt) };
     if p.is_null() {
-        return Ok(Value::from_string(String::new()));
+        return Ok(ctx.string(String::new()));
     }
     let s = unsafe { cstr(p) };
     unsafe { (api.free)(p as *mut c_void) };
-    Ok(Value::from_string(s))
+    Ok(ctx.string(s))
 }
 
-fn op_libversion(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_libversion<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     ensure_api(ctx)?;
     let api = state(ctx).api.as_ref().unwrap();
     let v = unsafe { cstr((api.libversion)()) };
-    Ok(Value::from_string(v))
+    Ok(ctx.string(v))
 }
 
-fn op_set_custom_sqlite(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_custom_sqlite<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -917,7 +996,11 @@ fn op_set_custom_sqlite(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
     Ok(Value::Undefined)
 }
 
-fn op_load_extension(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_load_extension<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let db = db_ptr(ctx, id)?;
     let path = ctx
@@ -959,7 +1042,11 @@ fn op_load_extension(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
-fn op_file_control(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_file_control<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let command = arg_i32(args, 1);
     let db = db_ptr(ctx, id)?;
@@ -988,7 +1075,11 @@ fn op_file_control(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 /// `serialize(dbId) -> Uint8Array` — a byte-for-byte snapshot of the main database (what a
 /// `VACUUM INTO` of it would contain). Honest throw when the system libsqlite3 predates
 /// `sqlite3_serialize`.
-fn op_serialize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_serialize<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = arg_u32(args, 0);
     let db = db_ptr(ctx, id)?;
     let bytes: Vec<u8> = {
@@ -1016,7 +1107,11 @@ fn op_serialize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
 
 /// `deserialize(bytes) -> dbId` — open a fresh in-memory database whose contents are the given
 /// serialized image (read-write; SQLite owns a resizable copy of the bytes).
-fn op_deserialize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_deserialize<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     ensure_api(ctx)?;
     let buf = args.first().cloned().unwrap_or(Value::Undefined);
     let bytes: Vec<u8> = match ctx.typed_array_raw(&buf) {

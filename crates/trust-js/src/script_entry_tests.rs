@@ -331,7 +331,6 @@ fn compiled_script_top_level_deadline_bypasses_author_handlers_and_recovers() {
 #[cfg(feature = "embed")]
 #[test]
 fn compiled_script_nested_host_entry_masks_outer_function_caller_and_restores_it() {
-    use crate::Value;
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -346,21 +345,15 @@ fn compiled_script_nested_host_entry_masks_outer_function_caller_and_restores_it
             match result {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(crate::embed::EvalError::Throw(error))) => Err(error),
-                _ => Err(Value::lstr("nested Script failed".to_owned())),
+                _ => Err(ctx.str("nested Script failed")),
             }
         });
-        let root = engine.global_this();
-        let child = engine.ctx().create_embed_realm();
-        engine
-            .ctx()
-            .member_set(&root, "child", child.clone())
-            .ok()
-            .unwrap();
-        engine
-            .ctx()
-            .member_set(&child, "parent", root)
-            .ok()
-            .unwrap();
+        engine.scope(|cx| {
+            let root = cx.global_this();
+            let child = cx.create_embed_realm();
+            cx.member_set(&root, "child", child).ok().unwrap();
+            cx.member_set(&child, "parent", root).ok().unwrap();
+        });
         assert_eq!(
             value(
                 &mut engine,

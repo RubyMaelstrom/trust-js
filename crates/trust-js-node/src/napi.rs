@@ -42,7 +42,7 @@ use std::rc::Rc;
 
 use trust_js_host::{
     CountedHandle, Ctx, Handle, HostGc, HostGcVisitor, HostTrace, NativeCallableRetained,
-    NativeClosure, NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value, WeakHandle,
+    NativeRetainedMemoryVisitor, Value, WeakHandle,
 };
 
 use crate::dylib::DynLib;
@@ -86,22 +86,25 @@ const NAPI_AUTO_LENGTH: usize = usize::MAX;
 
 // ---- env / handle machinery ------------------------------------------------------------------
 
-/// The concrete backing of an [`napi_env`]: a pointer to the engine plus a per-call arena of
-/// boxed values that keeps every [`napi_value`] alive for the duration of the call (in
+/// The concrete backing of an [`napi_env`]: a pointer to the engine's context plus a per-call
+/// arena of handles that keeps every [`napi_value`] alive for the duration of the call (in
 /// [`NapiState::handles`]).
 pub struct Env {
-    interp: *mut Ctx,
+    /// The context of the native call (or engine scope) the env serves, its scope's lifetime
+    /// erased: the env lives within that call, and each N-API function reads the values it
+    /// uses into a scope of its own ([`Env::interp`]), never storing one.
+    interp: *mut Ctx<'static>,
     /// Where this call's handles start in [`NapiState::handles`]; dropping the env releases
     /// them (calls nest, so envs drop in reverse order of creation).
     scope_start: usize,
     /// An exception raised by the addon (`napi_throw*`), surfaced to JS once the call returns.
-    pending: Option<Value>,
+    pending: Option<Handle>,
 }
 
 impl Env {
-    fn new(interp: *mut Ctx) -> Env {
+    fn new(interp: *mut Ctx<'_>) -> Env {
         let mut env = Env {
-            interp,
+            interp: interp.cast(),
             scope_start: 0,
             pending: None,
         };
@@ -109,27 +112,49 @@ impl Env {
         env
     }
 
-    /// Box a value into the handle arena and return a stable `napi_value` handle to it. A cell
-    /// value is held by a rooted handle until the call's arena is released.
-    fn handle(&mut self, v: Value) -> napi_value {
-        let boxed = Box::new(v);
-        let ptr = (&*boxed as *const Value) as *mut c_void;
-        let root = match &*boxed {
-            // A value an addon handles is its engine's, and no N-API function runs inside a
-            // collection (only then is a handle refused), so the handle is always made.
-            Value::Obj(_) | Value::Str(_) | Value::Sym(_) | Value::BigInt(_) => {
-                Handle::new(unsafe { self.interp() }, &boxed).ok()
-            }
-            _ => None,
-        };
-        unsafe { self.napi_state() }.handles.push((boxed, root));
+    /// Hold a value in the handle arena and return a stable `napi_value` handle to it: the
+    /// address of a boxed handle, which keeps the value until the call's arena is released.
+    fn handle(&mut self, v: Value<'_>) -> napi_value {
+        // A value an addon handles is its engine's, and no N-API function runs inside a
+        // collection (only then is a handle refused), so the handle is always made.
+        let handle = Box::new(
+            Handle::new(unsafe { self.interp() }, &v).expect("a value of the addon's engine"),
+        );
+        let ptr = (&*handle as *const Handle) as *mut c_void;
+        unsafe { self.napi_state() }.handles.push(handle);
         ptr
     }
 
+    /// The value behind a `napi_value`, read into the calling function's scope. A null handle
+    /// reads as `undefined`.
+    unsafe fn value<'s>(&self, v: napi_value) -> Value<'s> {
+        if v.is_null() {
+            Value::Undefined
+        } else {
+            (*(v as *const Handle))
+                .get(self.interp())
+                .expect("a handle of the addon's engine")
+        }
+    }
+
+    /// Raise `error` as the call's pending exception.
+    fn set_pending(&mut self, error: Value<'_>) {
+        let held =
+            Handle::new(unsafe { self.interp() }, &error).expect("a value of the addon's engine");
+        self.pending = Some(held);
+    }
+
+    /// Take the call's pending exception, read into the scope `cx`.
+    fn take_pending<'s>(&mut self, cx: &Ctx<'s>) -> Option<Value<'s>> {
+        self.pending
+            .take()
+            .map(|error| error.get(cx).expect("a handle of the addon's engine"))
+    }
+
     /// Run the finalizers of wrapped objects that have died since the last call into an addon
-    /// (see [`NapiState::sweep_gc`]): after their collection, outside it, before addon code
-    /// runs again. They run in an env of their own, so that an exception one raises is not
-    /// taken for the call's (it is dropped).
+    /// (see [`NapiState`]'s sweep): after their collection, outside it, before addon code runs
+    /// again. They run in an env of their own, so that an exception one raises is not taken for
+    /// the call's (it is dropped).
     fn run_pending_finalizers(&mut self) {
         let pending = std::mem::take(&mut unsafe { self.napi_state() }.pending_finalizers);
         if pending.is_empty() {
@@ -141,10 +166,12 @@ impl Env {
         }
     }
 
-    /// Recover `&mut Ctx`. Unsafe: relies on the call happening on the engine's loop thread.
+    /// Recover the context, in a scope of the caller's choosing. Unsafe: relies on the call
+    /// happening on the engine's loop thread, within the native call the env serves; the values
+    /// read through it do not outlive the N-API function that reads them.
     #[allow(clippy::mut_from_ref)]
-    unsafe fn interp<'a>(&self) -> &'a mut Ctx {
-        &mut *self.interp
+    unsafe fn interp<'s, 'a>(&self) -> &'a mut Ctx<'s> {
+        &mut *self.interp.cast::<Ctx<'s>>()
     }
 }
 
@@ -157,20 +184,12 @@ impl Drop for Env {
     }
 }
 
-/// A native call's arguments, behind an [`napi_callback_info`].
+/// A native call's receiver and arguments, behind an [`napi_callback_info`], as `napi_value`s
+/// of the call's arena.
 pub struct CbInfo {
-    this: Value,
-    args: Vec<Value>,
+    this: napi_value,
+    args: Vec<napi_value>,
     data: *mut c_void,
-}
-
-/// Clone the `Value` behind a handle. A null handle reads as `undefined`.
-unsafe fn value_of(v: napi_value) -> Value {
-    if v.is_null() {
-        Value::Undefined
-    } else {
-        (*(v as *const Value)).clone()
-    }
 }
 
 /// Read a possibly-NUL-terminated (`NAPI_AUTO_LENGTH`) or length-counted UTF-8 C string.
@@ -199,15 +218,18 @@ fn to_int32(n: f64) -> i32 {
 
 /// Wrap an addon C callback (`cb` + its `data`) as a TRust JS function value. When JS calls it, a
 /// fresh [`Env`] and [`CbInfo`] are built and the C callback is invoked.
-fn make_callback_fn(interp: &mut Ctx, name: &str, cb: napi_callback, data: *mut c_void) -> Value {
+fn make_callback_fn<'s>(
+    interp: &mut Ctx<'s>,
+    name: &str,
+    cb: napi_callback,
+    data: *mut c_void,
+) -> Value<'s> {
     let state = Rc::new(NapiCallbackClosure { callback: cb, data });
     let callable_state = state.clone();
     interp.new_native_fn(
         name,
         0,
-        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
-            callable_state.call(interp, this, args)
-        }) as Rc<NativeClosure>,
+        move |interp, this, args| callable_state.call(interp, this, args),
         trust_js_host::NativeCaptures::Reported(state),
     )
 }
@@ -218,7 +240,12 @@ struct NapiCallbackClosure {
 }
 
 impl NapiCallbackClosure {
-    fn call(&self, interp: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    fn call<'s>(
+        &self,
+        interp: &mut Ctx<'s>,
+        this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
         invoke_napi_callback(interp, self.callback, self.data, this, args)
     }
 }
@@ -227,99 +254,97 @@ impl NativeCallableRetained for NapiCallbackClosure {
     fn scan_retained_memory(&self, _visitor: &mut dyn NativeRetainedMemoryVisitor) {
         // Both captures are non-owning C pointers stored in this callable's inline payload.
     }
-
-    /// No JavaScript value at all.
-    fn reports_fixed_values(&self) -> bool {
-        true
-    }
 }
 
 // Node-API “Working with JavaScript functions” and `napi_define_class` require the callback's
 // opaque `data` pointer and the already-created instance/prototype relationship to survive until
-// invocation. Reporter structs preserve those callback semantics while exposing only actual
-// managed owners to TRust JS's diagnostic visitor.
+// invocation. The constructor keeps its prototype as an engine capture (S6 step 11b): the C
+// callback and its data are the closure's Rust state.
 struct NapiConstructorClosure {
-    prototype: Value,
     callback: napi_callback,
     data: *mut c_void,
 }
 
 impl NapiConstructorClosure {
-    fn call(&self, interp: &mut Ctx, this: Value, args: &[Value]) -> Result<Value, Value> {
+    /// A call of the constructor whose prototype is `prototype` (its capture).
+    fn call<'s>(
+        &self,
+        interp: &mut Ctx<'s>,
+        this: Value<'s>,
+        args: &[Value<'s>],
+        prototype: &Value<'s>,
+    ) -> Result<Value<'s>, Value<'s>> {
         let instance = match this {
-            Value::Undefined => interp.new_object_with_proto(&self.prototype),
+            Value::Undefined => interp.new_object_with_proto(prototype),
             other => other,
         };
-        invoke_napi_callback(interp, self.callback, self.data, instance.clone(), args)?;
+        invoke_napi_callback(interp, self.callback, self.data, instance, args)?;
         Ok(instance)
     }
 }
 
 impl NativeCallableRetained for NapiConstructorClosure {
-    fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
-        visitor.value(&self.prototype);
-    }
-
-    /// The prototype, made before the constructor and never replaced.
-    fn reports_fixed_values(&self) -> bool {
-        true
+    fn scan_retained_memory(&self, _visitor: &mut dyn NativeRetainedMemoryVisitor) {
+        // Both captures are non-owning C pointers stored in this callable's inline payload;
+        // the prototype is an engine capture of the function.
     }
 }
 
+/// `napi_create_promise`'s executor: the Promise constructor calls it with the resolving
+/// functions, which it keeps in handles (Rust state) for the deferred.
 struct NapiPromiseExecutor {
-    slot: Rc<std::cell::RefCell<(Value, Value)>>,
+    slot: Rc<std::cell::RefCell<Option<(Handle, Handle)>>>,
 }
 
 impl NapiPromiseExecutor {
-    fn call(&self, _interp: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-        let resolve = args.first().cloned().unwrap_or(Value::Undefined);
-        let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
-        *self.slot.borrow_mut() = (resolve, reject);
+    fn call<'s>(
+        &self,
+        interp: &mut Ctx<'s>,
+        _this: Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<Value<'s>, Value<'s>> {
+        let resolve = args.first().copied().unwrap_or(Value::Undefined);
+        let reject = args.get(1).copied().unwrap_or(Value::Undefined);
+        let resolve = trust_js_host::handle(interp, &resolve)?;
+        let reject = trust_js_host::handle(interp, &reject)?;
+        *self.slot.borrow_mut() = Some((resolve, reject));
         Ok(Value::Undefined)
     }
 }
 
-// The executor stores the promise's resolving functions into `slot` when the promise
-// constructor calls it, after the executor was made: its values change, so it keeps the default
-// `reports_fixed_values` (the engine rescans it at every collection).
 impl NativeCallableRetained for NapiPromiseExecutor {
     fn scan_retained_memory(&self, visitor: &mut dyn NativeRetainedMemoryVisitor) {
-        visitor.allocation(RetainedManagedAllocation::rc(
+        visitor.allocation(trust_js_host::RetainedManagedAllocation::rc(
             "trust-js-node.napi-promise-executor-slot",
             &self.slot,
-            std::mem::size_of::<std::cell::RefCell<(Value, Value)>>(),
+            std::mem::size_of::<std::cell::RefCell<Option<(Handle, Handle)>>>(),
         ));
-        let slot = self.slot.borrow();
-        visitor.value(&slot.0);
-        visitor.value(&slot.1);
     }
 }
 
 /// Drive one call into an addon C callback, translating its return / thrown exception back into
 /// the engine's `Result<Value, Value>`.
-fn invoke_napi_callback(
-    ip: &mut Ctx,
+fn invoke_napi_callback<'s>(
+    ip: &mut Ctx<'s>,
     cb: napi_callback,
     data: *mut c_void,
-    this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+    this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let cb = match cb {
         Some(f) => f,
         None => return Ok(Value::Undefined),
     };
     let mut env = Env::new(ip as *mut Ctx);
     env.run_pending_finalizers();
-    let mut info = CbInfo {
-        this,
-        args: args.to_vec(),
-        data,
-    };
+    let this = env.handle(this);
+    let args = args.iter().map(|arg| env.handle(*arg)).collect();
+    let mut info = CbInfo { this, args, data };
     let ret = unsafe { cb(&mut env as *mut Env, &mut info as *mut CbInfo) };
-    if let Some(err) = env.pending.take() {
+    if let Some(err) = env.take_pending(ip) {
         return Err(err);
     }
-    Ok(unsafe { value_of(ret) })
+    Ok(unsafe { env.value(ret) })
 }
 
 // ---- the loader op ---------------------------------------------------------------------------
@@ -336,10 +361,11 @@ pub struct AddonRegistry {
 /// registered async work. Lives in `OpState`, reached from an [`Env`] via the engine pointer.
 #[derive(Default)]
 struct NapiState {
-    /// The values behind the `napi_value`s of the calls in progress, innermost call last, each
-    /// cell value held by a handle. The `Box` is load-bearing: a napi_value is a raw pointer
-    /// into this arena, so each value needs a stable heap address that survives the Vec growing.
-    handles: Vec<(Box<Value>, Option<Handle>)>,
+    /// The handles behind the `napi_value`s of the calls in progress, innermost call last, each
+    /// holding its value. The `Box` is load-bearing: a napi_value is a raw pointer into this
+    /// arena, so each handle needs a stable heap address that survives the Vec growing.
+    #[allow(clippy::vec_box)]
+    handles: Vec<Box<Handle>>,
     /// References, each a counted handle: strong while its count is above 0, weak at 0.
     refs: Vec<Option<CountedHandle>>,
     ref_free: Vec<usize>,
@@ -383,7 +409,7 @@ impl HostTrace for NapiState {
 /// cleared: a wrap whose object died leaves the table, and its finalizer waits for the next
 /// call into an addon, outside the collection.
 impl HostGc for NapiState {
-    fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {
+    fn sweep_gc_with_native(&mut self, _: &dyn Fn(trust_js_host::NativeGcId) -> bool) {
         let pending = &mut self.pending_finalizers;
         self.wraps.retain(|_, wrap| {
             if !wrap.object.is_cleared() {
@@ -462,7 +488,7 @@ impl Env {
     /// The native pointer wrapped onto `object`, an object at `addr`. The entry's weak handle
     /// still names a live object, which is the one at `addr`: it was cleared before any dead
     /// object's address could be reused.
-    unsafe fn unwrap(&self, object: &Value, addr: usize) -> Option<*mut c_void> {
+    unsafe fn unwrap<'s>(&self, object: &Value<'s>, addr: usize) -> Option<*mut c_void> {
         let (weak, native) = self
             .napi_state()
             .wraps
@@ -489,7 +515,11 @@ fn decode_slot(handle: *mut c_void) -> Option<usize> {
 
 /// `__node.loadNativeAddon(path)` — dlopen a `.node` addon, run its N-API registration, and
 /// return the exports object.
-pub fn op_load_addon(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_load_addon<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     keep_napi_exports();
 
     let path = ctx
@@ -512,13 +542,13 @@ pub fn op_load_addon(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     let exports = Value::Obj(ctx.new_object());
     let mut env = Env::new(ctx as *mut Ctx);
     env.run_pending_finalizers();
-    let exports_handle = env.handle(exports.clone());
+    let exports_handle = env.handle(exports);
     let ret = unsafe { register(&mut env as *mut Env, exports_handle) };
-    let pending = env.pending.take();
+    let pending = env.take_pending(ctx);
     let result = if ret.is_null() {
         exports
     } else {
-        unsafe { value_of(ret) }
+        unsafe { env.value(ret) }
     };
 
     // Retain the library so its code stays mapped for the process lifetime.
@@ -628,7 +658,8 @@ pub unsafe extern "C" fn napi_create_string_utf8(
 ) -> napi_status {
     let env = &mut *env;
     let string = read_utf8(s, len);
-    *result = env.handle(Value::from_string(string));
+    let string = env.interp().string(string);
+    *result = env.handle(string);
     NAPI_OK
 }
 
@@ -684,8 +715,8 @@ pub unsafe extern "C" fn napi_typeof(
     value: napi_value,
     result: *mut c_int,
 ) -> napi_status {
-    let _ = env;
-    let v = value_of(value);
+    let env = &*env;
+    let v = env.value(value);
     let t = if matches!(v, Value::Null) {
         NAPI_NULL
     } else {
@@ -710,8 +741,8 @@ pub unsafe extern "C" fn napi_get_value_double(
     value: napi_value,
     result: *mut f64,
 ) -> napi_status {
-    let _ = env;
-    match value_of(value).as_num_opt() {
+    let env = &*env;
+    match env.value(value).as_num_opt() {
         Some(n) => {
             *result = n;
             NAPI_OK
@@ -726,8 +757,8 @@ pub unsafe extern "C" fn napi_get_value_int32(
     value: napi_value,
     result: *mut i32,
 ) -> napi_status {
-    let _ = env;
-    match value_of(value).as_num_opt() {
+    let env = &*env;
+    match env.value(value).as_num_opt() {
         Some(n) => {
             *result = to_int32(n);
             NAPI_OK
@@ -742,8 +773,8 @@ pub unsafe extern "C" fn napi_get_value_uint32(
     value: napi_value,
     result: *mut u32,
 ) -> napi_status {
-    let _ = env;
-    match value_of(value).as_num_opt() {
+    let env = &*env;
+    match env.value(value).as_num_opt() {
         Some(n) => {
             *result = to_int32(n) as u32;
             NAPI_OK
@@ -758,8 +789,8 @@ pub unsafe extern "C" fn napi_get_value_bool(
     value: napi_value,
     result: *mut bool,
 ) -> napi_status {
-    let _ = env;
-    match value_of(value) {
+    let env = &*env;
+    match env.value(value) {
         Value::Bool(b) => {
             *result = b;
             NAPI_OK
@@ -777,11 +808,11 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
     result: *mut usize,
 ) -> napi_status {
     let env = &mut *env;
-    let v = value_of(value);
+    let v = env.value(value);
     let s = match env.interp().coerce_string(&v) {
         Ok(s) => s,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -815,14 +846,15 @@ pub unsafe extern "C" fn napi_coerce_to_string(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let v = value_of(value);
+    let v = env.value(value);
     match env.interp().coerce_string(&v) {
         Ok(s) => {
-            *result = env.handle(Value::str(s));
+            let string = env.interp().str(s);
+            *result = env.handle(string);
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -838,12 +870,12 @@ pub unsafe extern "C" fn napi_set_named_property(
     value: napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
+    let obj = env.value(object);
     let name = read_utf8(utf8name, NAPI_AUTO_LENGTH);
-    match env.interp().member_set(&obj, &name, value_of(value)) {
+    match env.interp().member_set(&obj, &name, env.value(value)) {
         Ok(()) => NAPI_OK,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -857,7 +889,7 @@ pub unsafe extern "C" fn napi_get_named_property(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
+    let obj = env.value(object);
     let name = read_utf8(utf8name, NAPI_AUTO_LENGTH);
     match env.interp().member_get(&obj, &name) {
         Ok(v) => {
@@ -865,7 +897,7 @@ pub unsafe extern "C" fn napi_get_named_property(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -879,7 +911,7 @@ pub unsafe extern "C" fn napi_has_named_property(
     result: *mut bool,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
+    let obj = env.value(object);
     let name = read_utf8(utf8name, NAPI_AUTO_LENGTH);
     match env.interp().member_get(&obj, &name) {
         Ok(v) => {
@@ -887,7 +919,7 @@ pub unsafe extern "C" fn napi_has_named_property(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -901,18 +933,18 @@ pub unsafe extern "C" fn napi_set_property(
     value: napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
-    let k = match env.interp().coerce_string(&value_of(key)) {
+    let obj = env.value(object);
+    let k = match env.interp().coerce_string(&env.value(key)) {
         Ok(k) => k.to_string(),
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
-    match env.interp().member_set(&obj, &k, value_of(value)) {
+    match env.interp().member_set(&obj, &k, env.value(value)) {
         Ok(()) => NAPI_OK,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -926,11 +958,11 @@ pub unsafe extern "C" fn napi_get_property(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
-    let k = match env.interp().coerce_string(&value_of(key)) {
+    let obj = env.value(object);
+    let k = match env.interp().coerce_string(&env.value(key)) {
         Ok(k) => k.to_string(),
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -940,7 +972,7 @@ pub unsafe extern "C" fn napi_get_property(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -954,14 +986,14 @@ pub unsafe extern "C" fn napi_set_element(
     value: napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
+    let obj = env.value(object);
     match env
         .interp()
-        .member_set(&obj, &index.to_string(), value_of(value))
+        .member_set(&obj, &index.to_string(), env.value(value))
     {
         Ok(()) => NAPI_OK,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -975,14 +1007,14 @@ pub unsafe extern "C" fn napi_get_element(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(object);
+    let obj = env.value(object);
     match env.interp().member_get(&obj, &index.to_string()) {
         Ok(v) => {
             *result = env.handle(v);
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -1005,15 +1037,17 @@ pub unsafe extern "C" fn napi_get_cb_info(
         let cap = *argc;
         if !argv.is_null() {
             for i in 0..cap {
-                let v = info.args.get(i).cloned().unwrap_or(Value::Undefined);
-                *argv.add(i) = env.handle(v);
+                *argv.add(i) = match info.args.get(i) {
+                    Some(arg) => *arg,
+                    None => env.handle(Value::Undefined),
+                };
             }
         }
         // Report the true argument count (may exceed the caller's buffer capacity).
         *argc = info.args.len();
     }
     if !this_arg.is_null() {
-        *this_arg = env.handle(info.this.clone());
+        *this_arg = info.this;
     }
     if !data.is_null() {
         *data = info.data;
@@ -1031,11 +1065,11 @@ pub unsafe extern "C" fn napi_call_function(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let recv = value_of(recv);
-    let func = value_of(func);
+    let recv = env.value(recv);
+    let func = env.value(func);
     let mut args = Vec::with_capacity(argc);
     for i in 0..argc {
-        args.push(value_of(*argv.add(i)));
+        args.push(env.value(*argv.add(i)));
     }
     match env.interp().invoke(func, recv, &args) {
         Ok(v) => {
@@ -1045,7 +1079,7 @@ pub unsafe extern "C" fn napi_call_function(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -1056,7 +1090,7 @@ pub unsafe extern "C" fn napi_call_function(
 #[no_mangle]
 pub unsafe extern "C" fn napi_throw(env: napi_env, error: napi_value) -> napi_status {
     let env = &mut *env;
-    env.pending = Some(value_of(error));
+    env.set_pending(env.value(error));
     NAPI_OK
 }
 
@@ -1065,7 +1099,7 @@ unsafe fn throw_named(env: napi_env, kind: &str, msg: *const c_char) -> napi_sta
     let env = &mut *env;
     let message = read_utf8(msg, NAPI_AUTO_LENGTH);
     let err = env.interp().make_error(kind, message);
-    env.pending = Some(err);
+    env.set_pending(err);
     NAPI_OK
 }
 
@@ -1106,7 +1140,7 @@ pub unsafe extern "C" fn napi_create_error(
     let env = &mut *env;
     let message = env
         .interp()
-        .coerce_string(&value_of(msg))
+        .coerce_string(&env.value(msg))
         .map(|s| s.to_string())
         .unwrap_or_default();
     let err = env.interp().make_error("Error", message);
@@ -1130,7 +1164,8 @@ pub unsafe extern "C" fn napi_get_and_clear_last_exception(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let v = env.pending.take().unwrap_or(Value::Undefined);
+    let cx = env.interp();
+    let v = env.take_pending(cx).unwrap_or(Value::Undefined);
     *result = env.handle(v);
     NAPI_OK
 }
@@ -1181,7 +1216,7 @@ pub unsafe extern "C" fn napi_strict_equals(
     let env = &mut *env;
     *result = env
         .interp()
-        .values_strict_equal(&value_of(lhs), &value_of(rhs));
+        .values_strict_equal(&env.value(lhs), &env.value(rhs));
     NAPI_OK
 }
 
@@ -1192,7 +1227,7 @@ pub unsafe extern "C" fn napi_is_error(
     result: *mut bool,
 ) -> napi_status {
     let env = &mut *env;
-    *result = env.interp().is_error_value(&value_of(value));
+    *result = env.interp().is_error_value(&env.value(value));
     NAPI_OK
 }
 
@@ -1203,7 +1238,7 @@ pub unsafe extern "C" fn napi_get_prototype(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let value = value_of(object);
+    let value = env.value(object);
     // Node's CHECK_TO_OBJECT: ToObject, so null and undefined are not objects.
     if matches!(value, Value::Undefined | Value::Null) {
         return NAPI_OBJECT_EXPECTED;
@@ -1216,7 +1251,7 @@ pub unsafe extern "C" fn napi_get_prototype(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -1232,7 +1267,7 @@ pub unsafe extern "C" fn napi_create_reference(
     result: *mut napi_ref,
 ) -> napi_status {
     let env = &mut *env;
-    let v = value_of(value);
+    let v = env.value(value);
     let Ok(entry) = CountedHandle::new(env.interp(), &v, initial_refcount) else {
         return NAPI_INVALID_ARG;
     };
@@ -1335,7 +1370,7 @@ pub unsafe extern "C" fn napi_wrap(
     result: *mut napi_ref,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(js_object);
+    let obj = env.value(js_object);
     let Some(addr) = env.interp().object_addr(&obj) else {
         return NAPI_INVALID_ARG;
     };
@@ -1366,7 +1401,7 @@ pub unsafe extern "C" fn napi_unwrap(
     result: *mut *mut c_void,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(js_object);
+    let obj = env.value(js_object);
     let Some(addr) = env.interp().object_addr(&obj) else {
         return NAPI_INVALID_ARG;
     };
@@ -1381,7 +1416,7 @@ pub unsafe extern "C" fn napi_remove_wrap(
     result: *mut *mut c_void,
 ) -> napi_status {
     let env = &mut *env;
-    let obj = value_of(js_object);
+    let obj = env.value(js_object);
     let Some(addr) = env.interp().object_addr(&obj) else {
         return NAPI_INVALID_ARG;
     };
@@ -1415,17 +1450,15 @@ pub unsafe extern "C" fn napi_define_class(
     // produces an object with the right shape before the C constructor wraps native state onto it.
     let proto = Value::Obj(interp.new_object());
     let state = Rc::new(NapiConstructorClosure {
-        prototype: proto.clone(),
         callback: constructor,
         data,
     });
     let callable_state = state.clone();
-    let ctor = interp.new_native_fn(
+    let ctor = interp.new_native_closure_with_captures(
         &name,
         0,
-        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
-            callable_state.call(interp, this, args)
-        }) as Rc<NativeClosure>,
+        move |interp, this, args, captures| callable_state.call(interp, this, args, &captures[0]),
+        &[proto],
         trust_js_host::NativeCaptures::Reported(state),
     );
     interp.set_constructor_prototype(&ctor, &proto);
@@ -1435,15 +1468,15 @@ pub unsafe extern "C" fn napi_define_class(
     for i in 0..property_count {
         let d = &*properties.add(i);
         let target = if d.attributes & NAPI_STATIC != 0 {
-            ctor.clone()
+            ctor
         } else {
-            proto.clone()
+            proto
         };
         let pname = if !d.utf8name.is_null() {
             read_utf8(d.utf8name, NAPI_AUTO_LENGTH)
         } else {
             env.interp()
-                .coerce_string(&value_of(d.name))
+                .coerce_string(&env.value(d.name))
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         };
@@ -1462,7 +1495,7 @@ pub unsafe extern "C" fn napi_define_class(
             env.interp()
                 .define_accessor_value(&target, &pname, g, s, enumerable);
         } else if !d.value.is_null() {
-            let _ = env.interp().member_set(&target, &pname, value_of(d.value));
+            let _ = env.interp().member_set(&target, &pname, env.value(d.value));
         }
     }
 
@@ -1479,10 +1512,10 @@ pub unsafe extern "C" fn napi_new_instance(
     result: *mut napi_value,
 ) -> napi_status {
     let env = &mut *env;
-    let ctor = value_of(constructor);
+    let ctor = env.value(constructor);
     let mut args = Vec::with_capacity(argc);
     for i in 0..argc {
-        args.push(value_of(*argv.add(i)));
+        args.push(env.value(*argv.add(i)));
     }
     match env.interp().construct_value(ctor, &args) {
         Ok(v) => {
@@ -1490,7 +1523,7 @@ pub unsafe extern "C" fn napi_new_instance(
             NAPI_OK
         }
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -1510,38 +1543,33 @@ pub unsafe extern "C" fn napi_create_promise(
     let promise_ctor = match interp.member_get(&global, "Promise") {
         Ok(c) => c,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
 
-    // Capture the executor's (resolve, reject) — the Promise constructor calls the executor
-    // synchronously, so the slot is populated by the time `construct_value` returns.
-    let slot: Rc<std::cell::RefCell<(Value, Value)>> = Rc::new(std::cell::RefCell::new((
-        Value::Undefined,
-        Value::Undefined,
-    )));
-    let state = Rc::new(NapiPromiseExecutor { slot: slot.clone() });
+    // Capture the executor's (resolve, reject) in handles — the Promise constructor calls the
+    // executor synchronously, so the slot is filled by the time `construct_value` returns.
+    let state = Rc::new(NapiPromiseExecutor {
+        slot: Rc::new(std::cell::RefCell::new(None)),
+    });
+    let slot = state.slot.clone();
     let callable_state = state.clone();
     let executor = interp.new_native_fn(
         "",
         2,
-        Rc::new(move |interp: &mut Ctx, this: Value, args: &[Value]| {
-            callable_state.call(interp, this, args)
-        }) as Rc<NativeClosure>,
+        move |interp, this, args| callable_state.call(interp, this, args),
         trust_js_host::NativeCaptures::Reported(state),
     );
 
     let p = match interp.construct_value(promise_ctor, &[executor]) {
         Ok(p) => p,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
-    let (resolve, reject) = slot.borrow().clone();
-    let (Ok(resolve), Ok(reject)) = (Handle::new(interp, &resolve), Handle::new(interp, &reject))
-    else {
+    let Some((resolve, reject)) = slot.borrow_mut().take() else {
         return NAPI_INVALID_ARG;
     };
 
@@ -1577,11 +1605,11 @@ unsafe fn settle_deferred(
     let settler = trust_js_host::value(env.interp(), &settler);
     match env
         .interp()
-        .invoke(settler, Value::Undefined, &[value_of(value)])
+        .invoke(settler, Value::Undefined, &[env.value(value)])
     {
         Ok(_) => NAPI_OK,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             NAPI_PENDING_EXCEPTION
         }
     }
@@ -1624,7 +1652,7 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
     let buf = match env.interp().make_uint8array(bytes) {
         Ok(b) => b,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -1659,7 +1687,7 @@ pub unsafe extern "C" fn napi_create_external_buffer(
     let buf = match env.interp().make_uint8array(bytes) {
         Ok(b) => b,
         Err(e) => {
-            env.pending = Some(e);
+            env.set_pending(e);
             return NAPI_PENDING_EXCEPTION;
         }
     };
@@ -1678,7 +1706,7 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
     byte_offset: *mut usize,
 ) -> napi_status {
     let env = &mut *env;
-    let v = value_of(typedarray);
+    let v = env.value(typedarray);
     let Some((code, byte_len, ptr)) = env.interp().typed_array_raw(&v) else {
         return NAPI_INVALID_ARG;
     };
@@ -1888,20 +1916,23 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    use trust_js_host::RetainedManagedAllocation;
+
     #[derive(Default)]
     struct RetainedVisit {
         allocations: Vec<RetainedManagedAllocation>,
-        values: Vec<Value>,
     }
 
     impl NativeRetainedMemoryVisitor for RetainedVisit {
         fn allocation(&mut self, allocation: RetainedManagedAllocation) {
             self.allocations.push(allocation);
         }
+    }
 
-        fn value(&mut self, value: &Value) {
-            self.values.push(value.clone());
-        }
+    /// The engine's context, as N-API's `Env` keeps it: a raw pointer, valid while the engine
+    /// lives (its interpreter is boxed), its scope's lifetime erased.
+    fn ctx_ptr(engine: &mut trust_js_host::Engine) -> *mut Ctx<'static> {
+        engine.scope(|cx| (cx as *mut Ctx<'_>).cast())
     }
 
     #[test]
@@ -1949,7 +1980,7 @@ mod tests {
     #[test]
     fn handles_keep_their_values_across_a_collection() {
         let mut engine = trust_js_host::Engine::new();
-        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        let mut env = Env::new(ctx_ptr(&mut engine));
         let objects: Vec<napi_value> = (0..64).map(|i| marked_object(&mut env, i as f64)).collect();
         let ctx = unsafe { env.interp() };
         ctx.collect_garbage_for_host();
@@ -1975,7 +2006,7 @@ mod tests {
     /// own; their addresses.
     #[inline(never)]
     fn wrap_objects_of_a_finished_call(engine: &mut trust_js_host::Engine) -> Vec<usize> {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         (0..100)
             .map(|i| {
                 let object = marked_object(&mut call, i as f64);
@@ -1994,7 +2025,7 @@ mod tests {
                     let mut native: *mut c_void = std::ptr::null_mut();
                     assert_eq!(napi_unwrap(&mut call, object, &mut native), NAPI_OK);
                     assert_eq!(native, (i + 1) as *mut c_void);
-                    call.interp().object_addr(&value_of(object)).unwrap()
+                    call.interp().object_addr(&call.value(object)).unwrap()
                 }
             })
             .collect()
@@ -2007,7 +2038,7 @@ mod tests {
     fn wraps_end_with_their_objects() {
         let mut engine = trust_js_host::Engine::new();
         let addresses = wrap_objects_of_a_finished_call(&mut engine);
-        let mut outer = Env::new(engine.ctx() as *mut Ctx);
+        let mut outer = Env::new(ctx_ptr(&mut engine));
         let ctx = unsafe { outer.interp() };
         ctx.collect_garbage_for_host();
         let state = unsafe { outer.napi_state() };
@@ -2048,7 +2079,7 @@ mod tests {
         mark: f64,
         count: u32,
     ) -> napi_ref {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         let object = marked_object(&mut call, mark);
         let mut reference: napi_ref = std::ptr::null_mut();
         unsafe {
@@ -2064,7 +2095,7 @@ mod tests {
     /// its own.
     #[inline(never)]
     fn referenced_mark(engine: &mut trust_js_host::Engine, reference: napi_ref) -> Option<f64> {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         let mut object: napi_value = std::ptr::null_mut();
         unsafe {
             assert_eq!(
@@ -2091,7 +2122,7 @@ mod tests {
         reference: napi_ref,
         delta: i32,
     ) -> u32 {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         let mut count = u32::MAX;
         let status = unsafe {
             if delta > 0 {
@@ -2113,14 +2144,14 @@ mod tests {
         let strong = reference_of_a_finished_call(&mut engine, 1.0, 1);
         let weak = reference_of_a_finished_call(&mut engine, 2.0, 0);
         for _ in 0..2 {
-            engine.ctx().collect_garbage_for_host();
+            engine.collect_garbage_at_idle();
         }
         assert_eq!(referenced_mark(&mut engine, strong), Some(1.0));
         assert_eq!(referenced_mark(&mut engine, weak), None, "count 0: it died");
         assert_eq!(adjust_reference(&mut engine, strong, -1), 0);
         assert_eq!(adjust_reference(&mut engine, strong, 1), 1);
         assert_eq!(adjust_reference(&mut engine, strong, 1), 2);
-        engine.ctx().collect_garbage_for_host();
+        engine.collect_garbage_at_idle();
         assert_eq!(referenced_mark(&mut engine, strong), Some(1.0));
         assert_eq!(adjust_reference(&mut engine, strong, -1), 1);
         assert_eq!(adjust_reference(&mut engine, strong, -1), 0);
@@ -2129,7 +2160,7 @@ mod tests {
             Some(1.0),
             "not collected yet"
         );
-        engine.ctx().collect_garbage_for_host();
+        engine.collect_garbage_at_idle();
         assert_eq!(
             referenced_mark(&mut engine, strong),
             None,
@@ -2137,7 +2168,7 @@ mod tests {
         );
         assert_eq!(adjust_reference(&mut engine, strong, 1), 1);
         assert_eq!(referenced_mark(&mut engine, strong), None, "and stays dead");
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(&mut engine));
         for reference in [strong, weak] {
             assert_eq!(
                 unsafe { napi_delete_reference(&mut call, reference) },
@@ -2165,7 +2196,7 @@ mod tests {
     /// wrap's reference.
     #[inline(never)]
     fn wrap_with_finalizer(engine: &mut trust_js_host::Engine, n: usize, remove: bool) -> napi_ref {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         let object = marked_object(&mut call, n as f64);
         let mut reference: napi_ref = std::ptr::null_mut();
         unsafe {
@@ -2202,19 +2233,22 @@ mod tests {
         let _removed = wrap_with_finalizer(&mut engine, 4, true);
         let kept = wrap_with_finalizer(&mut engine, 5, false);
         assert_eq!(adjust_reference(&mut engine, kept, 1), 1);
-        engine.ctx().collect_garbage_for_host();
+        engine.collect_garbage_at_idle();
         assert!(
             FINALIZED.with(|calls| calls.borrow().is_empty()),
             "no finalizer runs inside the collection"
         );
-        let call = invoke_napi_callback(
-            engine.ctx(),
-            Some(empty_callback),
-            std::ptr::null_mut(),
-            Value::Undefined,
-            &[],
-        );
-        assert!(call.is_ok());
+        let call = engine.scope(|cx| {
+            invoke_napi_callback(
+                cx,
+                Some(empty_callback),
+                std::ptr::null_mut(),
+                Value::Undefined,
+                &[],
+            )
+            .is_ok()
+        });
+        assert!(call);
         let mut finalized = FINALIZED.with(|calls| calls.take());
         finalized.sort_unstable();
         assert_eq!(finalized, [(1, 101), (2, 102), (3, 103)]);
@@ -2227,7 +2261,7 @@ mod tests {
     /// A deferred made in a call that has returned, its promise stored as `globalThis.pending`.
     #[inline(never)]
     fn deferred_of_a_finished_call(engine: &mut trust_js_host::Engine) -> napi_deferred {
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(engine));
         let mut deferred: napi_deferred = std::ptr::null_mut();
         let mut promise: napi_value = std::ptr::null_mut();
         let mut global: napi_value = std::ptr::null_mut();
@@ -2264,9 +2298,9 @@ mod tests {
                     false,
                 )
                 .is_ok());
-            engine.ctx().collect_garbage_for_host();
+            engine.collect_garbage_at_idle();
         }
-        let mut call = Env::new(engine.ctx() as *mut Ctx);
+        let mut call = Env::new(ctx_ptr(&mut engine));
         let mut text: napi_value = std::ptr::null_mut();
         unsafe {
             assert_eq!(
@@ -2282,18 +2316,24 @@ mod tests {
         }
         drop(call);
         engine.run_microtasks();
-        let global = engine.global_this();
-        let settled = engine
-            .ctx()
-            .member_get(&global, "settled")
-            .unwrap_or_else(|_| panic!("settled"));
-        assert_eq!(settled.as_text().as_deref(), Some("resolved"));
+        let settled = engine.scope(|cx| {
+            let global = cx.global_this();
+            let settled = cx
+                .member_get(&global, "settled")
+                .unwrap_or_else(|_| panic!("settled"));
+            settled.as_text().map(|text| text.into_owned())
+        });
+        assert_eq!(settled.as_deref(), Some("resolved"));
     }
 
     #[test]
     fn get_prototype_runs_the_proxy_trap() {
         let mut engine = trust_js_host::Engine::new();
-        let Ok(Ok(values)) = engine.eval_value(
+        engine.scope(get_prototype_checks);
+    }
+
+    fn get_prototype_checks(cx: &mut Ctx<'_>) {
+        let Ok(Ok(values)) = cx.eval_value(
             "globalThis.target = {}; globalThis.reported = {};
              [new Proxy(target, {getPrototypeOf: () => reported}),
               new Proxy(target, {getPrototypeOf() { throw new RangeError('trap'); }}),
@@ -2301,7 +2341,7 @@ mod tests {
         ) else {
             panic!("fixture evaluates")
         };
-        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        let mut env = Env::new(cx as *mut Ctx);
         let interp = unsafe { env.interp() };
         let mut item = |index: &str| {
             interp
@@ -2319,20 +2359,20 @@ mod tests {
                 unsafe { napi_get_prototype(&mut env, handle, &mut result) },
                 NAPI_OK
             );
-            let Value::Obj(prototype) = (unsafe { value_of(result) }) else {
+            let Value::Obj(prototype) = (unsafe { env.value(result) }) else {
                 panic!("an object prototype")
             };
             let Value::Obj(expected) = &reported else {
                 panic!("an object")
             };
-            assert!(std::ptr::eq(prototype.as_ptr(), expected.as_ptr()));
+            assert!(prototype == *expected);
         }
         let handle = env.handle(throwing);
         assert_eq!(
             unsafe { napi_get_prototype(&mut env, handle, &mut result) },
             NAPI_PENDING_EXCEPTION
         );
-        assert!(env.pending.take().is_some());
+        assert!(env.take_pending(interp).is_some());
         let handle = env.handle(null);
         assert_eq!(
             unsafe { napi_get_prototype(&mut env, handle, &mut result) },
@@ -2340,10 +2380,16 @@ mod tests {
         );
     }
 
+    /// The callback closures' Rust state reports its allocations only (S6 step 11b): the
+    /// constructor's prototype is an engine capture, passed to its call, and the promise
+    /// executor keeps the resolving functions in handles.
     #[test]
     fn retained_callback_wrappers_preserve_callback_and_capture_semantics() {
         let mut engine = trust_js_host::Engine::new();
-        let interp = engine.ctx();
+        engine.scope(retained_callback_checks);
+    }
+
+    fn retained_callback_checks(interp: &mut Ctx<'_>) {
         let callback = NapiCallbackClosure {
             callback: None,
             data: std::ptr::null_mut(),
@@ -2358,21 +2404,19 @@ mod tests {
 
         let prototype = Value::Obj(interp.new_object());
         let constructor = NapiConstructorClosure {
-            prototype: prototype.clone(),
             callback: None,
             data: std::ptr::null_mut(),
         };
-        let Ok(constructor_result) = constructor.call(interp, Value::Undefined, &[]) else {
+        let Ok(constructor_result) = constructor.call(interp, Value::Undefined, &[], &prototype)
+        else {
             panic!("empty N-API constructor should not throw")
         };
-        assert!(matches!(constructor_result, Value::Obj(_)));
+        let made = interp.prototype_of(&constructor_result);
+        assert!(interp.values_strict_equal(&made, &prototype));
         constructor.scan_retained_memory(&mut visit);
-        assert!(matches!(visit.values.last(), Some(Value::Obj(_))));
+        assert!(visit.allocations.is_empty());
 
-        let slot = Rc::new(std::cell::RefCell::new((
-            Value::Undefined,
-            Value::Undefined,
-        )));
+        let slot = Rc::new(std::cell::RefCell::new(None));
         let executor = NapiPromiseExecutor { slot: slot.clone() };
         assert!(executor
             .call(
@@ -2381,10 +2425,13 @@ mod tests {
                 &[Value::Num(3.0), Value::Num(4.0)],
             )
             .is_ok());
-        assert_eq!(slot.borrow().0.as_num_opt(), Some(3.0));
-        assert_eq!(slot.borrow().1.as_num_opt(), Some(4.0));
+        {
+            let slot = slot.borrow();
+            let (resolve, reject) = slot.as_ref().expect("the executor ran");
+            assert_eq!(resolve.get(interp).unwrap().as_num_opt(), Some(3.0));
+            assert_eq!(reject.get(interp).unwrap().as_num_opt(), Some(4.0));
+        }
         executor.scan_retained_memory(&mut visit);
         assert_eq!(visit.allocations.len(), 1);
-        assert_eq!(visit.values.len(), 3);
     }
 }

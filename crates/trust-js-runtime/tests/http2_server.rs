@@ -60,7 +60,7 @@ fn server_handles_multiplexed_node_requests() {
 
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
@@ -169,7 +169,7 @@ fn secure_server_negotiates_h2_with_node_client() {
     });
 
     let mut runtime = Runtime::new();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(Captured::default()),
         err: Box::new(Captured::default()),
     });

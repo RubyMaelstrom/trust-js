@@ -56,11 +56,6 @@ mod cell {
             Env(unsafe { NonNull::new_unchecked(ptr.cast_mut()) })
         }
 
-        #[inline]
-        pub fn into_raw(this: Env) -> *const RefCell<Scope> {
-            this.0.as_ptr()
-        }
-
         /// Mutably borrow the record, as `RefCell::borrow_mut`, first recording the write in the
         /// record's card (the write barrier, `gc_core::card_mark`; see `Gc::borrow_mut`).
         #[inline]
@@ -71,7 +66,10 @@ mod cell {
             (**self).borrow_mut()
         }
 
-        /// `RefCell::try_borrow_mut` with the write barrier, as [`Env::borrow_mut`].
+        /// `RefCell::try_borrow_mut` with the write barrier, as [`Env::borrow_mut`]. Kept though
+        /// only tests call it: it shadows the `RefCell` method the handle derefs to, which
+        /// would record no write.
+        #[allow(dead_code)]
         #[inline]
         pub fn try_borrow_mut(
             &self,
@@ -101,6 +99,8 @@ mod cell {
             WeakEnv(WeakRef::default())
         }
 
+        /// The record while it lives (tests).
+        #[cfg(test)]
         #[inline]
         pub fn upgrade(&self) -> Option<Env> {
             // SAFETY: the alive flag is cleared before the record's cell is freed.
@@ -112,11 +112,6 @@ mod cell {
         #[inline]
         pub fn as_ptr(&self) -> *const RefCell<Scope> {
             self.0.ptr() as *const RefCell<Scope>
-        }
-
-        #[inline]
-        pub fn ptr_eq(&self, other: &WeakEnv) -> bool {
-            self.as_ptr() == other.as_ptr()
         }
 
         #[inline]

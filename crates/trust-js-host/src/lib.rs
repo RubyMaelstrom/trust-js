@@ -14,8 +14,10 @@
 //!   (JS values are `!Send`, so they never cross threads; off-thread work refers to its
 //!   callback by [`TaskId`]).
 //!
-//! Host state keeps the JavaScript values it stores in [`Handle`]s (rooted handles): a value
-//! lives while a handle to it does, wherever the handle is stored, so `OpState` slots need no
+//! JavaScript values live in scopes (S6 step 11b): a native function's values, `Value<'s>`, are
+//! its call's, and an engine-level operation's are those of an [`Engine::scope`]. Host state
+//! keeps the values it stores past their scope in [`Handle`]s (rooted handles): a value lives
+//! while a handle to it does, wherever the handle is stored, so `OpState` slots need no
 //! tracing. [`handle`] makes one from a native function's arguments.
 
 use std::any::Any;
@@ -58,14 +60,15 @@ fn install_task_panic_hook() {
     });
 }
 
-pub use trust_js::bytecode::Tier;
 pub use trust_js::embed::{
-    ArrayBufferBytes, CountedHandle, Ctx, EvalError, Handle, HandleError, HeapOwner, HostGc,
-    HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, NativeCallableRetained, NativeCaptures,
-    NativeClosure, NativeFn, NativeRetainedMemoryVisitor, OpState, ResourceId, ResourceTable,
-    RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory, RetainedManagedAllocation,
-    RetainedMemory, Value, WeakHandle, WeakValue,
+    ArrayBufferBytes, BigInt, CountedHandle, Ctx, EvalError, Handle, HandleError, HostGc,
+    HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, JsString, NativeCallableRetained,
+    NativeCaptureFn, NativeCaptures, NativeFn, NativeGcId, NativeRetainedMemoryVisitor, Object,
+    OpState, ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
+    RetainedExternalMemory, RetainedManagedAllocation, RetainedMemory, Symbol, Value, ValueList,
+    WeakHandle,
 };
+pub use trust_js::Tier;
 pub use trust_js::{
     Completion, Engine, ExecutionOutcome, InterruptReason, ParseError, RuntimeInterrupt,
 };
@@ -82,46 +85,26 @@ pub mod zstd;
 /// A [`Handle`] on `value` in `ctx`'s heap, for host state that keeps it. A native function's
 /// arguments are its heap's values, and no collection runs while it does, so this fails only
 /// on misuse (a value of another Engine), with a thrown `TypeError`.
-pub fn handle(ctx: &mut Ctx, value: &Value) -> Result<Handle, Value> {
+pub fn handle<'s>(ctx: &mut Ctx<'s>, value: &Value<'s>) -> Result<Handle, Value<'s>> {
     Handle::new(ctx, value).map_err(|error| ctx.make_error("TypeError", error.to_string()))
 }
 
 /// [`handle`] for each of `values`.
-pub fn handles(ctx: &mut Ctx, values: &[Value]) -> Result<Vec<Handle>, Value> {
+pub fn handles<'s>(ctx: &mut Ctx<'s>, values: &[Value<'s>]) -> Result<Vec<Handle>, Value<'s>> {
     values.iter().map(|value| handle(ctx, value)).collect()
 }
 
 /// The value of `handle`, which host state of `ctx`'s Engine keeps: made by [`handle`] in the
 /// same heap, which lives as long as the state does, so it always reads.
-pub fn value(ctx: &Ctx, handle: &Handle) -> Value {
+pub fn value<'s>(ctx: &Ctx<'s>, handle: &Handle) -> Value<'s> {
     handle
         .get(ctx)
         .expect("host state reads its handles through its own Engine")
 }
 
 /// [`value`] for each of `handles`.
-pub fn values(ctx: &Ctx, handles: &[Handle]) -> Vec<Value> {
+pub fn values<'s>(ctx: &Ctx<'s>, handles: &[Handle]) -> Vec<Value<'s>> {
     handles.iter().map(|handle| value(ctx, handle)).collect()
-}
-
-/// Values a native function builds one by one while JavaScript may run between them: a
-/// `[[Set]]` can call a setter, which can collect, and a value held only in a Rust `Vec` would
-/// not survive it. Each is held by a handle until the list becomes an array.
-#[derive(Default)]
-pub struct RootedValues(Vec<Handle>);
-
-impl RootedValues {
-    /// Hold `value`, one of `ctx`'s, at the end of the list.
-    pub fn push(&mut self, ctx: &mut Ctx, value: &Value) -> Result<(), Value> {
-        self.0.push(handle(ctx, value)?);
-        Ok(())
-    }
-
-    /// A new array of the values, in order (making it runs no JavaScript).
-    pub fn into_array(self, ctx: &mut Ctx) -> Value {
-        let values = values(ctx, &self.0);
-        ctx.make_array(values)
-    }
 }
 
 /// One native op: a named native function with its JS arity.
@@ -182,7 +165,7 @@ impl Extension {
 pub fn install(engine: &mut Engine, extensions: &[Extension]) {
     for ext in extensions {
         if let Some(init) = ext.state_init {
-            init(engine.ctx().op_state());
+            init(engine.op_state());
         }
         for op in ext.globals {
             engine.define_global(op.name, op.len, op.f);
@@ -250,7 +233,11 @@ pub struct CallbackQueue {
 
 impl CallbackQueue {
     /// Queue `callback(args...)` for the next loop turn.
-    pub fn enqueue(ctx: &mut Ctx, callback: &Value, args: &[Value]) -> Result<(), Value> {
+    pub fn enqueue<'s>(
+        ctx: &mut Ctx<'s>,
+        callback: &Value<'s>,
+        args: &[Value<'s>],
+    ) -> Result<(), Value<'s>> {
         let callback = handle(ctx, callback)?;
         let args = handles(ctx, args)?;
         let state = ctx.op_state();
@@ -629,8 +616,10 @@ impl CompletionSender {
 }
 
 /// Turns a completed task's `Send` payload back into JS callback arguments, on the loop
-/// thread. `Err` is a JS value to report as an uncaught exception (later: a rejection).
-pub type TaskDecoder = fn(&mut Ctx, Box<dyn Any + Send>) -> Result<Vec<Value>, Value>;
+/// thread, in the scope of the callback's call. `Err` is a JS value to report as an uncaught
+/// exception (later: a rejection).
+pub type TaskDecoder =
+    for<'s> fn(&mut Ctx<'s>, Box<dyn Any + Send>) -> Result<Vec<Value<'s>>, Value<'s>>;
 
 /// In-flight async tasks: `TaskId -> (JS callback, payload decoder)`. Lives in [`OpState`];
 /// the op that spawns work registers here, the loop settles from [`TaskCompletion`]s. The
@@ -691,12 +680,12 @@ impl TaskRegistry {
     }
     /// [`TaskRegistry::register`] in `ctx`'s registry, holding the callbacks `on_ok` and
     /// `on_err` (a native function's arguments) in handles.
-    pub fn register_callbacks(
-        ctx: &mut Ctx,
-        on_ok: &Value,
-        on_err: Option<&Value>,
+    pub fn register_callbacks<'s>(
+        ctx: &mut Ctx<'s>,
+        on_ok: &Value<'s>,
+        on_err: Option<&Value<'s>>,
         decode: TaskDecoder,
-    ) -> Result<TaskId, Value> {
+    ) -> Result<TaskId, Value<'s>> {
         let on_ok = handle(ctx, on_ok)?;
         let on_err = on_err.map(|on_err| handle(ctx, on_err)).transpose()?;
         Ok(ctx

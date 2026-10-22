@@ -19,6 +19,9 @@
 // on purpose: converting an object can run user `valueOf`/`toString`/getters, which mutate the
 // realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
 #![allow(clippy::wrong_self_convention)]
+// Without `embed`, the engine's embedder entry points (host state, the internals behind the scoped
+// API) have no caller: the `embed` build is the one whose dead code the lint checks (S6 step 11b).
+#![cfg_attr(not(feature = "embed"), allow(dead_code))]
 // Handles are `Copy` (P1 S2) and packed words have no drop glue (S5): code written for
 // reference-counted handles still clones, drops or forgets them where such a handle was
 // retained or released.
@@ -59,7 +62,9 @@ mod binding_reference_tests;
 mod bootstrap_operation_tests;
 mod builtins;
 pub use interpreter::SharedMem;
-pub mod bytecode;
+mod bytecode;
+/// The execution tiers ([`Engine::set_tier`]).
+pub use bytecode::Tier;
 mod cache;
 mod callback;
 mod callee_name;
@@ -179,6 +184,10 @@ mod regex_emoji;
 mod regex_fold;
 #[cfg(test)]
 mod regexp_tests;
+#[cfg(feature = "embed")]
+mod scope;
+#[cfg(all(test, feature = "embed"))]
+mod scope_tests;
 #[cfg(all(test, feature = "embed"))]
 mod script_caller_tests;
 #[cfg(test)]
@@ -905,11 +914,11 @@ impl Engine {
         })
     }
 
-    /// Select the execution tier (see [`bytecode::Tier`]). `Interp` never touches any codegen
+    /// Select the execution tier (see [`Tier`]). `Interp` never touches any codegen
     /// path; `Bytecode` compiles eligible functions after
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls; `Jit` is the default and lowers
     /// eligible bytecode to native code where the backend supports the host architecture.
-    pub fn set_tier(&mut self, tier: bytecode::Tier) {
+    pub fn set_tier(&mut self, tier: Tier) {
         self.interp.tier = tier;
     }
 
@@ -997,58 +1006,203 @@ impl Engine {
     }
 }
 
-/// The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
-/// APIs) built on top of the engine. Gated because everything here is a semver commitment on a
-/// published crate; it stabilizes together with the `trust-js-host`/`trust-js-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
-    /// Rooted handles (S6 step 11a): how Rust code keeps an engine value past the call that
-    /// produced it. A [`Handle`] keeps its value alive wherever it is stored, a [`WeakHandle`]
-    /// names one without keeping it, and a [`CountedHandle`] is strong while its count is
-    /// above 0 (Node-API's references). Each is made from a value through the [`Ctx`] or
-    /// [`Engine`](crate::Engine) whose heap holds it ([`HeapOwner`]), read through the same,
-    /// and refused ([`HandleError`]) with another heap's or once its Engine has dropped.
-    pub use crate::handles::{CountedHandle, Handle, HandleError, HeapOwner, WeakHandle};
+    //! The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
+    //! APIs) built on top of the engine. Gated because everything here is a semver commitment on a
+    //! published crate; it stabilizes together with the `trust-js-host`/`trust-js-runtime` crates.
+    //!
+    //! # Scopes and values
+    //!
+    //! A JavaScript value in Rust is a [`Value<'s>`](Value): a primitive, or an opaque handle to a
+    //! string, Symbol, BigInt or object cell ([`JsString`], [`Symbol`], [`BigInt`], [`Object`]).
+    //! The lifetime `'s` names the *scope* that produced the value, and every value lives exactly
+    //! as long as its scope: it cannot be stored in a `'static` structure (host state, a
+    //! thread-local, a closure kept by the engine), returned from its scope, mixed with another
+    //! scope's values (the brand is invariant, so two scopes' values never unify), or sent to
+    //! another thread. A scope is
+    //!
+    //! - one native function call: a [`NativeFn`] is
+    //!   `for<'s> fn(&mut Ctx<'s>, Value<'s>, &[Value<'s>]) -> Result<Value<'s>, Value<'s>>`, so
+    //!   its receiver, arguments and results belong to the call; or
+    //! - one [`Engine::scope`](crate::Engine::scope) closure, where engine-level host code (an
+    //!   event loop firing a callback, a test reading a global) runs:
+    //!
+    //! ```
+    //! let mut engine = trust_js::Engine::new();
+    //! engine.eval("globalThis.double = (x) => x * 2", false).unwrap();
+    //! let n = engine.scope(|cx| {
+    //!     let global = cx.global_this();
+    //!     let double = cx.member_get(&global, "double").unwrap();
+    //!     let result = cx.call_function(&double, trust_js::embed::Value::Undefined,
+    //!                                   &[trust_js::embed::Value::Num(21.0)]);
+    //!     result.ok().and_then(|value| value.as_num_opt())
+    //! });
+    //! assert_eq!(n, Some(42.0));
+    //! ```
+    //!
+    //! The scope's [`Ctx<'s>`](Ctx) carries every method that takes or returns a value; strings
+    //! and BigInts are made through it ([`Ctx::str`], [`Ctx::bigint_from_i64`]), so they belong to
+    //! its heap. While a scope runs, the values in its Rust stack frames are roots of every
+    //! collection. Values in Rust heap memory are not: a list of values held across a call that can
+    //! run JavaScript (and so collect) is a [`ValueList`], whose values stay rooted.
+    //!
+    //! # Handles
+    //!
+    //! A value kept past its scope is kept in a rooted handle: a [`Handle`] keeps its value alive
+    //! wherever it is stored, a [`WeakHandle`] names one without keeping it (and is cleared, before
+    //! the cell is freed, once a collection finds it dead), and a [`CountedHandle`] is strong while
+    //! its count is above 0 (Node-API's references). Each is made from a value through a scope's
+    //! context and read back into a scope ([`Handle::new`], [`Handle::get`]), is `!Send`, and is
+    //! refused ([`HandleError`]) with another Engine's context or once its Engine has dropped,
+    //! when it is inert.
+    //!
+    //! ```
+    //! use trust_js::embed::{Handle, Value, ValueList};
+    //! let mut engine = trust_js::Engine::new();
+    //! // A list of values built while JavaScript runs (and may collect) between the pushes.
+    //! let kept = engine.scope(|cx| {
+    //!     let mut list = ValueList::new();
+    //!     for n in 0..3 {
+    //!         list.push(cx.eval_value(&format!("({{n: {n}}})")).unwrap().unwrap());
+    //!         cx.collect_garbage_for_host();
+    //!     }
+    //!     let array = list.into_array(cx);
+    //!     Handle::new(cx, &array).unwrap()
+    //! });
+    //! engine.collect_garbage_at_idle();
+    //! let length = engine.scope(|cx| {
+    //!     let array = kept.get(cx).unwrap();
+    //!     cx.member_get(&array, "length").unwrap().as_num_opt()
+    //! });
+    //! assert_eq!(length, Some(3.0));
+    //! ```
+    //!
+    //! What a scoped value cannot do is checked at compile time. A value cannot be stored in a
+    //! `'static` structure such as host state, so it cannot outlive its call:
+    //!
+    //! ```compile_fail,E0521
+    //! use trust_js::embed::{Ctx, Value};
+    //! struct Kept<'s>(Value<'s>);
+    //! fn keep<'s>(
+    //!     cx: &mut Ctx<'s>,
+    //!     _: Value<'s>,
+    //!     args: &[Value<'s>],
+    //! ) -> Result<Value<'s>, Value<'s>> {
+    //!     // `OpState` holds `'static` types only.
+    //!     cx.op_state().put(Kept(args[0]));
+    //!     Ok(Value::Undefined)
+    //! }
+    //! ```
+    //!
+    //! It cannot be returned out of its scope, so a value kept past its Engine does not compile
+    //! either (a [`Handle`] kept past its Engine is inert):
+    //!
+    //! ```compile_fail
+    //! let kept = {
+    //!     let mut engine = trust_js::Engine::new();
+    //!     engine.scope(|cx| cx.global_this())
+    //! };
+    //! ```
+    //!
+    //! nor be kept in a collection outside its scope, across the collections between scopes (a
+    //! [`ValueList`] keeps values inside one):
+    //!
+    //! ```compile_fail,E0521
+    //! let mut engine = trust_js::Engine::new();
+    //! let mut kept = Vec::new();
+    //! engine.scope(|cx| kept.push(cx.new_object()));
+    //! engine.collect_garbage_at_idle();
+    //! ```
+    //!
+    //! Two scopes' values never meet, even of the same thread's Engines:
+    //!
+    //! ```compile_fail,E0521
+    //! let (mut first, mut second) = (trust_js::Engine::new(), trust_js::Engine::new());
+    //! first.scope(|a| {
+    //!     second.scope(|b| {
+    //!         let object = trust_js::embed::Value::Obj(a.new_object());
+    //!         let global = b.global_this();
+    //!         let _ = b.member_set(&global, "foreign", object);
+    //!     })
+    //! });
+    //! ```
+    //!
+    //! and neither a value nor a handle crosses to another thread:
+    //!
+    //! ```compile_fail,E0277
+    //! let mut engine = trust_js::Engine::new();
+    //! let handle = engine.scope(|cx| {
+    //!     let global = cx.global_this();
+    //!     trust_js::embed::Handle::new(cx, &global).unwrap()
+    //! });
+    //! std::thread::spawn(move || drop(handle));
+    //! ```
+    //!
+    //! ```compile_fail,E0277
+    //! let mut engine = trust_js::Engine::new();
+    //! engine.scope(|cx| {
+    //!     let global = cx.global_this();
+    //!     std::thread::scope(|threads| {
+    //!         threads.spawn(move || drop(global));
+    //!     });
+    //! });
+    //! ```
+    //!
+    //! # Host state and the host traits
+    //!
+    //! Rust state lives in [`OpState`] (typed slots and a [`ResourceTable`]), reached through
+    //! [`Ctx::op_state`] or [`Engine::op_state`](crate::Engine::op_state). It holds JavaScript
+    //! values in handles and needs no tracing. A host whose values must live exactly as long as
+    //! their JavaScript owners do (a DOM) reports a graph instead, by registering a [`HostTrace`]
+    //! type ([`OpState::register_trace`]): at every collection its visitor ([`HostGcVisitor`])
+    //! receives weak handles as roots, as logical edges from an owner, and as the JavaScript ends
+    //! of a native graph ([`NativeGcId`]). A [`HostGc`] type also hears about each job's end and
+    //! sweeps its caches between a collection's phases, after the weak handles whose values died
+    //! have been cleared. These callbacks run no JavaScript and allocate nothing in the engine.
+    //! The retained-memory reporters ([`RetainedBytes`], [`RetainedMemory`],
+    //! [`RetainedExternalMemory`], [`NativeCallableRetained`]) describe Rust allocations for the
+    //! managed-memory diagnostics; the JavaScript values a host keeps are its handles.
+
+    pub use crate::handles::{CountedHandle, Handle, HandleError, WeakHandle};
     pub use crate::host::{
         HostGc, HostGcVisitor, HostRetainedMemoryVisitor, HostTrace, NativeGcId, OpState,
         ResourceId, ResourceTable, RetainedBytes, RetainedExternalAllocation,
         RetainedExternalMemory, RetainedMemory,
     };
-    /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
-    /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
-    pub use crate::interpreter::{ArrayBufferBytes, Interp as Ctx, WeakValue};
-    /// JS values. Matching/constructing the primitive variants is supported API; object
-    /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
-    /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
-    /// [`Ctx::new_native_fn`] when the host function must capture state, declaring its
-    /// JavaScript captures ([`NativeCaptures`]). For JavaScript captures, prefer
-    /// [`Ctx::new_native_fn_with_captures`]: the engine owns those, while an opaque
-    /// closure's are traced only as its reporter enumerates them.
-    pub use crate::value::{
-        NativeCallableRetained, NativeCaptureFn, NativeCaptures, NativeClosure, NativeFn,
-        NativeRetainedMemoryVisitor, RetainedManagedAllocation, Value,
+    pub use crate::interpreter::ArrayBufferBytes;
+    pub use crate::scope::{
+        BigInt, Ctx, EvalError, HostJobContextEnter, HostJobContextLeave, IndexedLength,
+        IndexedNames, JsString, NativeCaptureFn, NativeFn, Object, Symbol, Value, ValueList,
     };
+    pub use crate::value::{
+        NativeCallableRetained, NativeCaptures, NativeRetainedMemoryVisitor,
+        RetainedManagedAllocation,
+    };
+    pub use crate::{RealmEntry, RealmError};
 
-    /// Rust text in the engine representation used by [`Value::from_engine_text`]: every
+    /// Rust text in the engine representation used by [`Ctx::string_from_engine_text`]: every
     /// character in U+10F800..=U+10FFFF becomes its pair of private-use scalars. Use it where
     /// a host stores decoded text (a parsed document, a network message) beside engine text.
     pub fn text_to_engine(text: &str) -> std::borrow::Cow<'_, str> {
         crate::jstr::from_text(text)
     }
 
-    /// Engine text (from [`Value::as_engine_text`] or `Ctx::coerce_engine_text`) as Rust text:
-    /// the Web IDL `USVString` conversion, in which every lone surrogate becomes U+FFFD.
+    /// Engine text (from [`JsString::as_engine_text`] or [`Ctx::coerce_engine_text`]) as Rust
+    /// text: the Web IDL `USVString` conversion, in which every lone surrogate becomes U+FFFD.
     pub fn engine_to_text(engine_text: &str) -> std::borrow::Cow<'_, str> {
         crate::jstr::to_text(engine_text)
     }
-
-    /// Non-parse failure from an interrupt-aware embedding entry point.
-    pub enum EvalError {
-        Throw(Value),
-        Interrupted(crate::InterruptReason),
-    }
 }
 
+/// The engine form of an interrupt-aware entry point's failure (`embed::EvalError`).
+#[cfg(feature = "embed")]
+pub(crate) enum EvalFailure {
+    Throw(Value),
+    Interrupted(InterruptReason),
+}
+
+/// The engine side of the embedder's evaluation and callback entry points (`embed::Ctx`).
 #[cfg(feature = "embed")]
 impl interpreter::Interp {
     /// Set the opaque host settings token captured by subsequently-created promise reactions.
@@ -1057,46 +1211,34 @@ impl interpreter::Interp {
     /// Realm to restore the corresponding environment settings object. Embedders that represent
     /// more than one host settings object inside a single engine Realm can use this token to
     /// preserve that additional distinction without changing ECMAScript-visible values.
-    pub fn set_host_job_context(&mut self, context: u64) {
+    pub(crate) fn set_host_job_context(&mut self, context: u64) {
         self.switch_host_job_context(context);
     }
 
     /// Parse and evaluate one ECMAScript Script Record in this realm while a host operation is
-    /// already running.
+    /// already running, its `Error.prototype.stack` frames reporting `origin`.
     ///
     /// HTML's "run a classic script" algorithm can synchronously enter a new ScriptEvaluation
     /// from parser or DOM insertion work. This is deliberately not `eval`: ScriptEvaluation uses
     /// the Realm's persistent `[[GlobalEnv]]` as both its lexical and variable environment, while
     /// indirect eval gives lexical declarations a fresh eval-only environment. As with
-    /// [`Engine::eval_value_interruptible`], the embedder owns the following microtask checkpoint.
-    pub fn eval_classic_script_interruptible(
-        &mut self,
-        src: &str,
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        self.eval_classic_script_interruptible_with_origin(src, None)
-    }
-
-    /// [`Self::eval_classic_script_interruptible`] for a script whose `Error.prototype.stack`
-    /// frames report `origin`: the script's URL or, for an inline `<script>`, its document's
-    /// URL with the element's starting line and column (`<anonymous>` when None).
-    pub fn eval_classic_script_interruptible_with_origin(
+    /// `Ctx::eval_value_interruptible`, the embedder owns the following microtask checkpoint.
+    pub(crate) fn eval_classic_script(
         &mut self,
         src: &str,
         origin: Option<&SourceOrigin<'_>>,
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
         let (body, source) = parse_host_script_from(src, false, origin)?;
         Ok(self.eval_classic_body(&body, Some(source)))
     }
 
-    /// Decode and evaluate a precompiled ECMAScript Script Record in the
-    /// active Realm. This is the snapshot counterpart of
-    /// [`Self::eval_classic_script_interruptible`]: browser embedders can
-    /// install the same static platform bootstrap in many Window Realms
-    /// without reparsing it for every nested Document.
-    pub fn eval_classic_snapshot_interruptible(
+    /// Decode and evaluate a precompiled ECMAScript Script Record in the active Realm: the
+    /// snapshot counterpart of [`Self::eval_classic_script`], with which browser embedders
+    /// install the same static platform bootstrap in many Window Realms without reparsing it.
+    pub(crate) fn eval_classic_snapshot(
         &mut self,
         bytes: &[u8],
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
         let body = snapshot::decode(bytes).map_err(|message| ParseError {
             message,
             line: 0,
@@ -1105,8 +1247,8 @@ impl interpreter::Interp {
         Ok(self.eval_classic_body(&body, None))
     }
 
-    /// [`Self::eval_classic_snapshot_interruptible`] for static host bootstrap code that many
-    /// Realms of this Agent install, such as a browser's Window platform prelude.
+    /// [`Self::eval_classic_snapshot`] for static host bootstrap code that many Realms of this
+    /// Agent install, such as a browser's Window platform prelude.
     ///
     /// The first call decodes the snapshot; the Agent retains the program and every later call
     /// with the same `&'static` bytes evaluates that same Script body in the active Realm.
@@ -1121,10 +1263,10 @@ impl interpreter::Interp {
     /// behaves like evaluating one Script twice rather than parsing its source again: tagged
     /// templates reuse that Realm's template objects (GetTemplateObject keys the Realm's
     /// [[TemplateMap]] by Parse Node). Different Realms always get their own.
-    pub fn eval_shared_classic_snapshot_interruptible(
+    pub(crate) fn eval_shared_classic_snapshot(
         &mut self,
         bytes: &'static [u8],
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
         let body = self
             .shared_snapshot_program(bytes)
             .map_err(|message| ParseError {
@@ -1143,67 +1285,303 @@ impl interpreter::Interp {
         &mut self,
         body: &[ast::Stmt],
         source: Option<std::rc::Rc<stack_trace::ScriptSource>>,
-    ) -> Result<embed::Value, embed::EvalError> {
+    ) -> Result<Value, EvalFailure> {
         match self.run_classic_program(body, source) {
-            Ok(embed::Value::Empty) => Ok(embed::Value::Undefined),
+            Ok(Value::Empty) => Ok(Value::Undefined),
             Ok(value) => Ok(value),
             Err(interpreter::Abrupt::Throw(value)) => {
                 crate::jit::perf_error_escaped();
-                Err(embed::EvalError::Throw(value))
+                Err(EvalFailure::Throw(value))
+            }
+            Err(interpreter::Abrupt::Interrupt(reason)) => Err(EvalFailure::Interrupted(reason)),
+            Err(_) => Ok(Value::Undefined),
+        }
+    }
+
+    /// `Ctx::eval_value_interruptible_with_origin`: one synchronous script job whose completion
+    /// comes back as a value, with no microtask checkpoint (the caller owns the event loop). The
+    /// spec's EMPTY completion (a value-less final statement) is lowered to `undefined`.
+    pub(crate) fn eval_value_entry(
+        &mut self,
+        src: &str,
+        origin: Option<&SourceOrigin<'_>>,
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
+        let (body, source) = parse_host_script_from(src, false, origin)?;
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+        );
+        self.strict = directive_strict;
+        let result = match self.run_program_from(&body, Some(source)) {
+            Ok(Value::Empty) => Ok(Value::Undefined),
+            Ok(value) => Ok(value),
+            Err(interpreter::Abrupt::Throw(value)) => {
+                crate::jit::perf_error_escaped();
+                Err(EvalFailure::Throw(value))
             }
             Err(interpreter::Abrupt::Interrupt(reason)) => {
-                Err(embed::EvalError::Interrupted(reason))
+                self.gc_task_boundary();
+                Err(EvalFailure::Interrupted(reason))
             }
-            Err(_) => Ok(embed::Value::Undefined),
+            Err(_) => Ok(Value::Undefined),
+        };
+        // This embedding entry runs one synchronous ECMAScript job. Promise jobs, if any, are
+        // deliberately owned by the caller and begin with a fresh [[KeptAlive]] list.
+        self.clear_kept_objects();
+        Ok(result)
+    }
+
+    /// `Ctx::eval_snapshot_value_interruptible`: [`Self::eval_value_entry`] for a snapshot.
+    pub(crate) fn eval_snapshot_value_entry(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
+        let result = self.eval_classic_snapshot(bytes)?;
+        if matches!(&result, Err(EvalFailure::Interrupted(_))) {
+            self.gc_task_boundary();
+        }
+        self.clear_kept_objects();
+        Ok(result)
+    }
+
+    /// `Ctx::eval_shared_snapshot_value_interruptible`: [`Self::eval_snapshot_value_entry`]
+    /// through the Agent's shared program table.
+    pub(crate) fn eval_shared_snapshot_value_entry(
+        &mut self,
+        bytes: &'static [u8],
+    ) -> Result<Result<Value, EvalFailure>, ParseError> {
+        let result = self.eval_shared_classic_snapshot(bytes)?;
+        if matches!(&result, Err(EvalFailure::Interrupted(_))) {
+            self.gc_task_boundary();
+        }
+        self.clear_kept_objects();
+        Ok(result)
+    }
+
+    /// `Ctx::call_callback_interruptible`: call `func` as the event loop fires a callback, with
+    /// a captured host callback source context; host interruption stays control flow.
+    pub(crate) fn call_callback_entry(
+        &mut self,
+        func: &Value,
+        this: Value,
+        args: &[Value],
+        script_caller: &Value,
+    ) -> Result<Value, EvalFailure> {
+        if let Err(abrupt) = self.interrupt_poll_force() {
+            let error = match abrupt {
+                interpreter::Abrupt::Interrupt(reason) => EvalFailure::Interrupted(reason),
+                interpreter::Abrupt::Throw(value) => EvalFailure::Throw(value),
+                _ => EvalFailure::Throw(Value::Undefined),
+            };
+            self.gc_task_boundary();
+            return Err(error);
+        }
+        let result = self
+            .with_callback_script_caller(script_caller, |interp| {
+                interp.call_callback(func.clone(), this, args)
+            })
+            .map_err(|abrupt| match abrupt {
+                interpreter::Abrupt::Throw(value) => EvalFailure::Throw(value),
+                interpreter::Abrupt::Interrupt(reason) => EvalFailure::Interrupted(reason),
+                _ => EvalFailure::Throw(Value::Undefined),
+            });
+        self.clear_kept_objects();
+        if matches!(result, Err(EvalFailure::Interrupted(_))) {
+            self.gc_task_boundary();
+        }
+        result
+    }
+
+    /// Drain the promises rejected without a handler, as `(context, promise, reason)` in
+    /// rejection order (HTML's about-to-be-notified rejected promises list).
+    pub(crate) fn take_unhandled_rejection_values(&mut self) -> Vec<(u64, Value, Value)> {
+        if self.unhandled_rejections.is_empty() {
+            return Vec::new();
+        }
+        let mut rejections: Vec<_> = std::mem::take(&mut self.unhandled_rejections)
+            .into_values()
+            .collect();
+        rejections.sort_unstable_by_key(|(order, ..)| *order);
+        rejections
+            .into_iter()
+            .map(|(_, promise, reason, context)| (context, promise, reason))
+            .collect()
+    }
+
+    /// `Engine::run_microtasks`: a microtask checkpoint, then the task boundary.
+    pub(crate) fn run_microtasks_entry(&mut self) {
+        self.activate_gc_heap();
+        self.drain_microtasks();
+        self.gc_task_boundary();
+    }
+
+    /// `Engine::run_microtasks_interruptible`: a checkpoint keeping a host interruption as
+    /// control flow (pending jobs are discarded when a running job is killed).
+    pub(crate) fn run_microtasks_interruptible_entry(
+        &mut self,
+    ) -> Result<(), crate::InterruptReason> {
+        self.activate_gc_heap();
+        if let Err(reason) = self.drain_microtasks_interruptible() {
+            self.gc_task_boundary();
+            return Err(reason);
+        }
+        self.gc_task_boundary();
+        Ok(())
+    }
+
+    /// Whether promise-reaction jobs are queued.
+    pub(crate) fn has_pending_jobs(&self) -> bool {
+        !self.microtasks.is_empty()
+            || !self.pending_finalization_cleanup.is_empty()
+            || self.async_waits_ready()
+    }
+
+    /// `Ctx::enter_realm`: make `realm_global`'s Realm the active one, keeping the caller's on
+    /// the heap's stack of entered Realms (`GcState::entered_realms`), whose states are roots.
+    pub(crate) fn enter_embed_realm_entry(
+        &mut self,
+        realm_global: &Value,
+    ) -> Result<RealmEntry, Value> {
+        let (key, saved) = self.enter_embed_realm(realm_global)?;
+        let mut entered = self.gc_heap.entered_realms.borrow_mut();
+        entered.push(crate::value::EnteredRealm {
+            interp: std::ptr::from_ref(self) as usize,
+            key,
+            saved,
+        });
+        Ok(RealmEntry {
+            heap: crate::value::heap_id(&self.gc_heap),
+            depth: entered.len(),
+        })
+    }
+
+    /// `Ctx::leave_realm`: restore the Realm that was active when `entry` was entered. Panics
+    /// unless `entry` is this interpreter's innermost.
+    pub(crate) fn leave_embed_realm_entry(&mut self, entry: RealmEntry) {
+        let innermost = {
+            let mut entered = self.gc_heap.entered_realms.borrow_mut();
+            assert!(
+                entry.heap == crate::value::heap_id(&self.gc_heap)
+                    && entry.depth == entered.len()
+                    && entered
+                        .last()
+                        .is_some_and(|last| last.interp == std::ptr::from_ref(self) as usize),
+                "a RealmEntry is left by its own Engine, innermost first"
+            );
+            entered.pop().expect("the innermost entry")
+        };
+        self.leave_embed_realm(innermost.key, innermost.saved);
+    }
+}
+
+/// Why a Realm could not be entered from the Engine level ([`Engine::enter_realm`],
+/// [`Engine::with_embed_realm`]).
+#[cfg(feature = "embed")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmError {
+    /// The handle naming the Realm's global could not be read: another Engine's, or its Engine
+    /// has dropped.
+    Handle(embed::HandleError),
+    /// The value is not the global object of one of this Engine's Realms.
+    NotARealm,
+}
+
+#[cfg(feature = "embed")]
+impl std::fmt::Display for RealmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RealmError::Handle(error) => write!(f, "{error}"),
+            RealmError::NotARealm => {
+                f.write_str("not the global object of one of this engine's realms")
+            }
         }
     }
 }
 
-/// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
-/// pointers (they cannot capture); Rust state lives in [`embed::OpState`], reached through the
-/// `&mut Ctx` argument.
+#[cfg(feature = "embed")]
+impl std::error::Error for RealmError {}
+
+/// Embedder methods (`feature = "embed"`). Engine-level code that takes or returns JavaScript
+/// values runs in a [`scope`](Engine::scope); what needs no value (configuration, checkpoints,
+/// host state) is here too.
 #[cfg(feature = "embed")]
 impl Engine {
-    /// Direct access to the native-function context (also where [`embed::OpState`] lives, via
-    /// [`embed::Ctx::op_state`]).
-    pub fn ctx(&mut self) -> &mut embed::Ctx {
+    /// Run `f` in a new scope of this Engine: its [`embed::Ctx`] makes and uses values, which
+    /// live as long as the scope (`'s`), so none of them can be stored, returned from `f` or
+    /// meet another scope's. Values the embedder keeps past the scope are kept in
+    /// [`embed::Handle`]s.
+    pub fn scope<R>(&mut self, f: impl for<'s> FnOnce(&mut embed::Ctx<'s>) -> R) -> R {
         self.interp.activate_gc_heap();
-        &mut self.interp
+        // SAFETY: `f` is generic over the scope's lifetime, so no value of the scope leaves it
+        // or meets another scope's, and the context borrows the Engine while the scope runs.
+        f(unsafe { embed::Ctx::new(&mut self.interp) })
     }
 
-    /// Run an engine-level host operation in `realm_global`'s Realm, then
+    /// Host state ([`embed::OpState`]): typed per-subsystem slots and the resource table.
+    pub fn op_state(&mut self) -> &mut embed::OpState {
+        self.interp.op_state()
+    }
+
+    /// Shorthand for `op_state().get_mut::<T>()`.
+    pub fn host_mut<T: std::any::Any>(&mut self) -> Option<&mut T> {
+        self.interp.host_mut()
+    }
+
+    /// Shorthand for `op_state().get::<T>()`.
+    pub fn host<T: std::any::Any>(&self) -> Option<&T> {
+        self.interp.host()
+    }
+
+    /// Set the opaque host settings token captured by subsequently-created promise reactions
+    /// (see [`embed::Ctx::set_host_job_context`]).
+    pub fn set_host_job_context(&mut self, context: u64) {
+        self.interp.activate_gc_heap();
+        self.interp.set_host_job_context(context);
+    }
+
+    /// The opaque host settings token of the active host operation.
+    pub fn host_job_context(&self) -> u64 {
+        self.interp.host_job_context()
+    }
+
+    /// Retire one embedder settings object after its owning Document is destroyed (see
+    /// [`embed::Ctx::release_host_job_context`]).
+    pub fn release_host_job_context(&mut self, context: u64) -> bool {
+        self.interp.activate_gc_heap();
+        self.interp.release_host_job_context(context)
+    }
+
+    /// Run an engine-level host operation in the Realm whose global `realm_global` holds, then
     /// restore the caller's Realm. This is the task counterpart of
-    /// [`embed::Ctx::with_embed_realm`]: embedders use it when an asynchronous
-    /// completion needs entry points that live on [`Engine`] itself, such as
-    /// classic/module evaluation or an explicit microtask checkpoint.
+    /// [`embed::Ctx::with_embed_realm`]: embedders use it when an asynchronous completion needs
+    /// entry points that live on [`Engine`] itself, such as module evaluation.
     pub fn with_embed_realm<R>(
         &mut self,
-        realm_global: &embed::Value,
+        realm_global: &embed::Handle,
         operation: impl FnOnce(&mut Self) -> R,
-    ) -> Result<R, embed::Value> {
-        self.interp.activate_gc_heap();
-        let (key, saved) = self.interp.enter_embed_realm(realm_global)?;
+    ) -> Result<R, RealmError> {
+        let entry = self.enter_realm(realm_global)?;
         let result = operation(self);
-        self.interp.leave_embed_realm(key, saved);
+        self.leave_realm(entry);
         Ok(result)
     }
 
-    /// [`Engine::with_embed_realm`] for an operation that spans its
-    /// embedder's own state as well as the engine: `realm_global`'s Realm is
-    /// the active one until the returned entry is passed to
-    /// [`Engine::leave_realm`]. Entries nest like `with_embed_realm` calls:
-    /// leave the innermost first.
-    pub fn enter_realm(&mut self, realm_global: &embed::Value) -> Result<RealmEntry, embed::Value> {
-        self.interp.activate_gc_heap();
-        let (key, saved) = self.interp.enter_embed_realm(realm_global)?;
-        Ok(RealmEntry { key, saved })
+    /// [`Engine::with_embed_realm`] for an operation that spans its embedder's own state as
+    /// well as the engine: the Realm whose global `realm_global` holds is the active one until
+    /// the returned entry is passed to [`Engine::leave_realm`]. Entries nest like
+    /// `with_embed_realm` calls: leave the innermost first.
+    pub fn enter_realm(&mut self, realm_global: &embed::Handle) -> Result<RealmEntry, RealmError> {
+        self.scope(|cx| {
+            let global = realm_global.get(cx).map_err(RealmError::Handle)?;
+            cx.enter_realm(&global).map_err(|_| RealmError::NotARealm)
+        })
     }
 
-    /// Restore the Realm that was active when `entry` was entered, keeping
-    /// what the entered Realm's operations changed.
+    /// Restore the Realm that was active when `entry` was entered, keeping what the entered
+    /// Realm's operations changed. Panics unless `entry` is this Engine's innermost.
     pub fn leave_realm(&mut self, entry: RealmEntry) {
         self.interp.activate_gc_heap();
-        self.interp.leave_embed_realm(entry.key, entry.saved);
+        self.interp.leave_embed_realm_entry(entry);
     }
 
     /// Install this realm's wall-clock source, in milliseconds since the Unix epoch.
@@ -1221,9 +1599,10 @@ impl Engine {
     /// work to their job path.
     pub fn set_host_job_context_hooks(
         &mut self,
-        enter: fn(&mut embed::Ctx, u64),
-        leave: fn(&mut embed::Ctx),
+        enter: embed::HostJobContextEnter,
+        leave: embed::HostJobContextLeave,
     ) {
+        let (enter, leave) = crate::scope::host_job_context_hooks(enter, leave);
         self.interp.host_job_context_enter = Some(enter);
         self.interp.host_job_context_leave = Some(leave);
     }
@@ -1239,123 +1618,12 @@ impl Engine {
         self.interp.capture_job_script_caller = enabled;
     }
 
-    /// The realm's global object — the root from which an embedder reaches user-defined JS
-    /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
-    pub fn global_this(&self) -> embed::Value {
-        Value::Obj(self.interp.global.clone())
-    }
-
-    /// Return the promise representing a loaded module's evaluation, including top-level await.
-    /// An embedder can attach its script-element completion steps after
-    /// [`Engine::eval_module_attrs_interruptible`] returns without mistaking suspension for
-    /// successful evaluation.
-    pub fn module_evaluation_promise(&self, key: &str) -> Option<embed::Value> {
-        self.interp.module_evaluation_promise(key)
-    }
-
-    /// [`eval`](Engine::eval), but the completion comes back as real values (`Err` = the
-    /// thrown value) and NO microtask checkpoint runs — the caller owns the event loop and
-    /// decides when jobs fire (a REPL runs its runtime to quiescence between inputs). The
-    /// spec's EMPTY completion (a value-less final statement) is lowered to `undefined`.
-    pub fn eval_value(
-        &mut self,
-        src: &str,
-    ) -> Result<Result<embed::Value, embed::Value>, ParseError> {
-        Ok(match self.eval_value_interruptible(src)? {
-            Ok(value) => Ok(value),
-            Err(embed::EvalError::Throw(value)) => Err(value),
-            Err(embed::EvalError::Interrupted(reason)) => Err(self
-                .interp
-                .make_error(Self::legacy_interrupt_name(reason), reason.message())),
-        })
-    }
-
-    /// [`Engine::eval_value`] with host interruption kept distinct from a catchable JavaScript
-    /// throw. Browser embedders should use this entry point.
-    pub fn eval_value_interruptible(
-        &mut self,
-        src: &str,
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        self.eval_value_interruptible_with_origin(src, None)
-    }
-
-    /// [`Engine::eval_value_interruptible`] for a script whose `Error.prototype.stack` frames
-    /// report `origin` (`<anonymous>` when None).
-    pub fn eval_value_interruptible_with_origin(
-        &mut self,
-        src: &str,
-        origin: Option<&SourceOrigin<'_>>,
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        scrubbed(|| self.eval_value_interruptible_with_origin_inner(src, origin))
-    }
-
-    fn eval_value_interruptible_with_origin_inner(
-        &mut self,
-        src: &str,
-        origin: Option<&SourceOrigin<'_>>,
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let (body, source) = parse_host_script_from(src, false, origin)?;
-        let directive_strict = matches!(
-            body.first(),
-            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
-        );
-        self.interp.strict = directive_strict;
-        let result = match self.interp.run_program_from(&body, Some(source)) {
-            Ok(Value::Empty) => Ok(Value::Undefined),
-            Ok(value) => Ok(value),
-            Err(interpreter::Abrupt::Throw(value)) => {
-                crate::jit::perf_error_escaped();
-                Err(embed::EvalError::Throw(value))
-            }
-            Err(interpreter::Abrupt::Interrupt(reason)) => {
-                self.interp.gc_task_boundary();
-                Err(embed::EvalError::Interrupted(reason))
-            }
-            Err(_) => Ok(Value::Undefined),
-        };
-        // This embedding entry runs one synchronous ECMAScript job. Promise jobs, if any, are
-        // deliberately owned by the caller and begin with a fresh [[KeptAlive]] list.
-        self.interp.clear_kept_objects();
-        Ok(result)
-    }
-
-    /// Snapshot counterpart of [`Self::eval_value_interruptible`]. Executes one
-    /// synchronous script job in the active Realm; the embedder still owns the
-    /// following microtask checkpoint. No agent event loop is drained here.
-    pub fn eval_snapshot_value_interruptible(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let result = self.interp.eval_classic_snapshot_interruptible(bytes)?;
-        if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
-            self.interp.gc_task_boundary();
-        }
-        self.interp.clear_kept_objects();
-        Ok(result)
-    }
-
-    /// [`Self::eval_snapshot_value_interruptible`] through the Agent's shared program table:
-    /// see [`embed::Ctx::eval_shared_classic_snapshot_interruptible`]. Later Realms that
-    /// evaluate the same static snapshot reuse this decode and the code compiled for it.
-    pub fn eval_shared_snapshot_value_interruptible(
-        &mut self,
-        bytes: &'static [u8],
-    ) -> Result<Result<embed::Value, embed::EvalError>, ParseError> {
-        let result = self
-            .interp
-            .eval_shared_classic_snapshot_interruptible(bytes)?;
-        if matches!(&result, Err(embed::EvalError::Interrupted(_))) {
-            self.interp.gc_task_boundary();
-        }
-        self.interp.clear_kept_objects();
-        Ok(result)
-    }
-
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
     pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
         self.interp.activate_gc_heap();
         let global = self.interp.global.clone();
-        self.interp.def_method(&global, name, len, f);
+        self.interp
+            .def_method(&global, name, len, crate::scope::native_fn(f));
     }
 
     /// Define `globalThis.<name>` as a namespace object (like `Math`) with the given
@@ -1364,10 +1632,11 @@ impl Engine {
         self.interp.activate_gc_heap();
         let ns = self.interp.new_object();
         for (op, len, f) in ops {
-            self.interp.def_method(&ns, op, *len, *f);
+            let f = crate::scope::native_fn(*f);
+            self.interp.def_method(&ns, op, *len, f);
             // Qualify the diagnostic identity (`ns.op`); the bare `op` label recorded by
             // `def_method` would otherwise collide across namespaces sharing method names.
-            crate::jit::perf_native_relabel(*f as usize, format!("{name}.{op}"));
+            crate::jit::perf_native_relabel(f as usize, format!("{name}.{op}"));
         }
         self.interp.global.borrow_mut().props.insert(
             crate::value::encode_string_key(name).as_ref(),
@@ -1375,92 +1644,15 @@ impl Engine {
         );
     }
 
-    /// Call a JS function value; `Err` is the thrown value. This is how the runtime's event
-    /// loop re-enters the engine to fire a timer/IO callback, so it must work on every
-    /// execution tier, not just the interpreter.
-    pub fn call_function(
-        &mut self,
-        func: &embed::Value,
-        this: embed::Value,
-        args: &[embed::Value],
-    ) -> Result<embed::Value, embed::Value> {
-        match self.call_function_interruptible(func, this, args) {
-            Ok(value) => Ok(value),
-            Err(embed::EvalError::Throw(value)) => Err(value),
-            Err(embed::EvalError::Interrupted(reason)) => Err(self
-                .interp
-                .make_error(Self::legacy_interrupt_name(reason), reason.message())),
-        }
-    }
-
-    /// [`Engine::call_function`] with a host interruption kept out of JavaScript exception flow.
-    pub fn call_function_interruptible(
-        &mut self,
-        func: &embed::Value,
-        this: embed::Value,
-        args: &[embed::Value],
-    ) -> Result<embed::Value, embed::EvalError> {
-        self.call_callback_interruptible(func, this, args, &Value::Undefined)
-    }
-
-    /// Call with a captured host callback source context. Unlike an ordinary call, self-hosted
-    /// platform frames below the callback cannot replace its incumbent source. The original
-    /// function still executes in its own Realm, and interruptions remain host control flow.
-    pub fn call_callback_interruptible(
-        &mut self,
-        func: &embed::Value,
-        this: embed::Value,
-        args: &[embed::Value],
-        script_caller: &embed::Value,
-    ) -> Result<embed::Value, embed::EvalError> {
-        self.interp.activate_gc_heap();
-        if let Err(abrupt) = self.interp.interrupt_poll_force() {
-            let error = match abrupt {
-                interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
-                interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
-                _ => embed::EvalError::Throw(Value::Undefined),
-            };
-            self.interp.gc_task_boundary();
-            return Err(error);
-        }
-        let result = self
-            .interp
-            .with_callback_script_caller(script_caller, |ctx| {
-                ctx.call_callback(func.clone(), this, args)
-            })
-            .map_err(|abrupt| match abrupt {
-                interpreter::Abrupt::Throw(value) => embed::EvalError::Throw(value),
-                interpreter::Abrupt::Interrupt(reason) => embed::EvalError::Interrupted(reason),
-                _ => embed::EvalError::Throw(Value::Undefined),
-            });
-        self.interp.clear_kept_objects();
-        if matches!(result, Err(embed::EvalError::Interrupted(_))) {
-            self.interp.gc_task_boundary();
-        }
-        result
-    }
-
     /// Drain the microtask (promise-reaction) queue to quiescence.
     pub fn run_microtasks(&mut self) {
-        self.interp.activate_gc_heap();
-        self.interp.drain_microtasks();
-        self.interp.gc_task_boundary();
+        self.interp.run_microtasks_entry();
     }
 
     /// Run a microtask checkpoint while preserving host interruption as control flow. Pending jobs
     /// are discarded when a running job is killed; they must not be resumed as a later task.
     pub fn run_microtasks_interruptible(&mut self) -> Result<(), crate::InterruptReason> {
-        scrubbed(|| self.run_microtasks_interruptible_inner())
-    }
-
-    fn run_microtasks_interruptible_inner(&mut self) -> Result<(), crate::InterruptReason> {
-        self.interp.activate_gc_heap();
-        if let Err(reason) = self.interp.drain_microtasks_interruptible() {
-            self.interp.gc_task_boundary();
-            return Err(reason);
-        }
-        self.interp.gc_task_boundary();
-        Ok(())
+        scrubbed(|| self.interp.run_microtasks_interruptible_entry())
     }
 
     /// Collect garbage when the host event loop is about to block for external input.
@@ -1502,9 +1694,9 @@ impl Engine {
     }
 
     /// Drain and return the reasons of promises rejected without a handler (after a microtask
-    /// checkpoint, these are genuine unhandled rejections). The runtime reports them; the bare
-    /// engine ignores them, so test262 semantics are unaffected.
-    pub fn take_unhandled_rejections(&mut self) -> Vec<embed::Value> {
+    /// checkpoint, these are genuine unhandled rejections), each held by a handle. The runtime
+    /// reports them; the bare engine ignores them, so test262 semantics are unaffected.
+    pub fn take_unhandled_rejections(&mut self) -> Vec<embed::Handle> {
         self.take_unhandled_rejections_full()
             .into_iter()
             .map(|(_promise, reason)| reason)
@@ -1513,7 +1705,7 @@ impl Engine {
 
     /// [`Engine::take_unhandled_rejections`], keeping the promise alongside each reason (what a
     /// global `unhandledrejection` handler receives as `event.promise` / `event.reason`).
-    pub fn take_unhandled_rejections_full(&mut self) -> Vec<(embed::Value, embed::Value)> {
+    pub fn take_unhandled_rejections_full(&mut self) -> Vec<(embed::Handle, embed::Handle)> {
         self.take_unhandled_rejections_in_contexts()
             .into_iter()
             .map(|(_, promise, reason)| (promise, reason))
@@ -1526,26 +1718,15 @@ impl Engine {
     /// list, so an embedder with several Window Realms notifies each global of its own.
     pub fn take_unhandled_rejections_in_contexts(
         &mut self,
-    ) -> Vec<(u64, embed::Value, embed::Value)> {
-        if self.interp.unhandled_rejections.is_empty() {
-            return Vec::new();
-        }
-        // HTML's about-to-be-notified rejected promises list keeps rejection order.
-        let mut rejections: Vec<_> = std::mem::take(&mut self.interp.unhandled_rejections)
-            .into_values()
-            .collect();
-        rejections.sort_unstable_by_key(|(order, ..)| *order);
-        rejections
-            .into_iter()
-            .map(|(_, promise, reason, context)| (context, promise, reason))
-            .collect()
+    ) -> Vec<(u64, embed::Handle, embed::Handle)> {
+        self.scope(|cx| cx.take_unhandled_rejections_in_contexts())
     }
 
     /// The HostPromiseRejectionTracker "handle" operations on promises the host added to its
     /// outstanding rejected promises weak set ([`embed::Ctx::add_outstanding_rejection`]), as
     /// `(promise, reason)`: HTML queues a `rejectionhandled` event for each.
-    pub fn take_handled_rejections(&mut self) -> Vec<(embed::Value, embed::Value)> {
-        self.interp.take_handled_rejections()
+    pub fn take_handled_rejections(&mut self) -> Vec<(embed::Handle, embed::Handle)> {
+        self.scope(|cx| cx.take_handled_rejections())
     }
 
     /// [`Engine::take_handled_rejections`] as `(context, promise, reason)`, with the host
@@ -1553,16 +1734,14 @@ impl Engine {
     /// its `rejectionhandled` event fires at that global.
     pub fn take_handled_rejections_in_contexts(
         &mut self,
-    ) -> Vec<(u64, embed::Value, embed::Value)> {
-        self.interp.take_handled_rejections_in_contexts()
+    ) -> Vec<(u64, embed::Handle, embed::Handle)> {
+        self.scope(|cx| cx.take_handled_rejections_in_contexts())
     }
 
     /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is
     /// really over).
     pub fn has_pending_jobs(&self) -> bool {
-        !self.interp.microtasks.is_empty()
-            || !self.interp.pending_finalization_cleanup.is_empty()
-            || self.interp.async_waits_ready()
+        self.interp.has_pending_jobs()
     }
 
     /// When the earliest pending `Atomics.waitAsync` times out. Its promise resolves at the first
@@ -1635,11 +1814,11 @@ mod module_host_context_tests {
                     true
                 },
             );
-            engine.ctx().set_host_job_context(17);
+            engine.set_host_job_context(17);
             engine
                 .eval("import('first').catch(() => {});", false)
                 .unwrap();
-            engine.ctx().set_host_job_context(23);
+            engine.set_host_job_context(23);
             engine
                 .eval("import('second').catch(() => {});", false)
                 .unwrap();
@@ -1654,11 +1833,16 @@ mod module_host_context_tests {
     }
 }
 
-/// A Realm [`Engine::enter_realm`] made active, which [`Engine::leave_realm`]
-/// leaves again.
+/// A Realm [`embed::Ctx::enter_realm`] or [`Engine::enter_realm`] made active, which
+/// [`Engine::leave_realm`] (or [`embed::Ctx::leave_realm`]) leaves again: a token of its Engine's
+/// stack of entered Realms. The Engine keeps the state of the Realm it replaced, as a root of
+/// its collections, until the entry is left.
 #[cfg(feature = "embed")]
 #[must_use = "a Realm entered must be left"]
+#[derive(Debug)]
 pub struct RealmEntry {
-    key: usize,
-    saved: interpreter::RealmState,
+    /// The heap whose stack holds the entry (`value::heap_id`).
+    heap: u64,
+    /// The stack's height with the entry on top.
+    depth: usize,
 }

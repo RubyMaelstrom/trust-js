@@ -323,7 +323,7 @@ fn net_err(syscall: &'static str, e: &std::io::Error, addr: Option<(String, u16)
 
 /// Build the JS Error a rejected socket op throws: message shaped like Node's
 /// (`connect ECONNREFUSED 127.0.0.1:80`) with `code`/`syscall`/`address`/`port`.
-fn net_error_value(ctx: &mut Ctx, e: &NetErr) -> Value {
+fn net_error_value<'s>(ctx: &mut Ctx<'s>, e: &NetErr) -> Value<'s> {
     let mut msg = format!("{} {}", e.syscall, e.code);
     if let Some(a) = &e.address {
         msg.push(' ');
@@ -336,10 +336,10 @@ fn net_error_value(ctx: &mut Ctx, e: &NetErr) -> Value {
         msg = format!("{}: {}", e.syscall, e.message);
     }
     let err = ctx.make_error("Error", msg);
-    let _ = ctx.set_member(&err, "code", Value::str(e.code));
-    let _ = ctx.set_member(&err, "syscall", Value::str(e.syscall));
+    let _ = ctx.set_member(&err, "code", ctx.str(e.code));
+    let _ = ctx.set_member(&err, "syscall", ctx.str(e.syscall));
     if let Some(a) = &e.address {
-        let _ = ctx.set_member(&err, "address", Value::from_string(a.clone()));
+        let _ = ctx.set_member(&err, "address", ctx.string(a.clone()));
     }
     if let Some(p) = e.port {
         let _ = ctx.set_member(&err, "port", Value::Num(p as f64));
@@ -356,37 +356,37 @@ fn family_of(addr: &SocketAddr) -> &'static str {
 }
 
 /// `{ address, family, port }` — the shape of Node's `socket.address()` / `server.address()`.
-fn addr_object(ctx: &mut Ctx, addr: &SocketAddr) -> Value {
+fn addr_object<'s>(ctx: &mut Ctx<'s>, addr: &SocketAddr) -> Value<'s> {
     let o = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&o, "address", Value::from_string(addr.ip().to_string()));
-    let _ = ctx.set_member(&o, "family", Value::str(family_of(addr)));
+    let _ = ctx.set_member(&o, "address", ctx.string(addr.ip().to_string()));
+    let _ = ctx.set_member(&o, "family", ctx.str(family_of(addr)));
     let _ = ctx.set_member(&o, "port", Value::Num(addr.port() as f64));
     o
 }
 
-fn completions(ctx: &mut Ctx) -> CompletionSender {
+fn completions<'s>(ctx: &mut Ctx<'s>) -> CompletionSender {
     ctx.op_state()
         .get::<CompletionSender>()
         .expect("runtime installs the completion sender")
         .clone()
 }
 
-fn take_resolve_reject(
-    ctx: &mut Ctx,
-    res: Option<&Value>,
-    rej: Option<&Value>,
-) -> Result<(Value, Value), Value> {
+fn take_resolve_reject<'s>(
+    ctx: &mut Ctx<'s>,
+    res: Option<&Value<'s>>,
+    rej: Option<&Value<'s>>,
+) -> Result<(Value<'s>, Value<'s>), Value<'s>> {
     match (res, rej) {
-        (Some(r), Some(j)) if r.is_callable() && j.is_callable() => Ok((r.clone(), j.clone())),
+        (Some(r), Some(j)) if r.is_callable() && j.is_callable() => Ok((*r, *j)),
         _ => Err(ctx.make_error("TypeError", "net op expects (resolve, reject)")),
     }
 }
 
-fn enqueue(ctx: &mut Ctx, cb: Value, args: Vec<Value>) -> Result<(), Value> {
+fn enqueue<'s>(ctx: &mut Ctx<'s>, cb: Value<'s>, args: Vec<Value<'s>>) -> Result<(), Value<'s>> {
     CallbackQueue::enqueue(ctx, &cb, &args)
 }
 
-fn arg_u64(args: &[Value], i: usize) -> u64 {
+fn arg_u64<'s>(args: &[Value<'s>], i: usize) -> u64 {
     args.get(i).and_then(Value::as_num_opt).unwrap_or(0.0) as u64
 }
 
@@ -394,7 +394,7 @@ fn arg_u64(args: &[Value], i: usize) -> u64 {
 
 /// Insert a freshly connected `TcpStream` into the registry and produce the JS descriptor
 /// `[socketId, localAddress, localPort, remoteAddress, remotePort, family]`.
-fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, Value> {
+fn register_stream<'s>(ctx: &mut Ctx<'s>, stream: NetStream) -> Result<Vec<Value<'s>>, Value<'s>> {
     let local = stream
         .local_addr()
         .map_err(|e| ctx.make_error("Error", format!("local_addr: {e}")))?;
@@ -417,11 +417,11 @@ fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, Value
     match (local, peer) {
         (Some(local), Some(peer)) => Ok(vec![
             Value::Num(id as f64),
-            Value::from_string(local.ip().to_string()),
+            ctx.string(local.ip().to_string()),
             Value::Num(local.port() as f64),
-            Value::from_string(peer.ip().to_string()),
+            ctx.string(peer.ip().to_string()),
             Value::Num(peer.port() as f64),
-            Value::str(family_of(&peer)),
+            ctx.str(family_of(&peer)),
         ]),
         _ => Ok(vec![
             Value::Num(id as f64),
@@ -434,7 +434,7 @@ fn register_stream(ctx: &mut Ctx, stream: NetStream) -> Result<Vec<Value>, Value
     }
 }
 
-pub(crate) fn take_stream(ctx: &mut Ctx, id: u64) -> Result<TcpStream, Value> {
+pub(crate) fn take_stream<'s>(ctx: &mut Ctx<'s>, id: u64) -> Result<TcpStream, Value<'s>> {
     let entry = ctx
         .host_mut::<NetRegistry>()
         .expect("net registry installed")
@@ -469,7 +469,11 @@ fn path_err(syscall: &'static str, path: String, error: std::io::Error) -> NetEr
 
 /// `(host, port, resolve, reject)` — resolve the host, connect, and settle with the socket
 /// descriptor (see [`register_stream`]) or reject with an errno-tagged error.
-fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_connect<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -509,10 +513,10 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Undefined)
 }
 
-fn decode_connect(
-    ctx: &mut Ctx,
+fn decode_connect<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<NetStream, NetErr>>()
         .expect("connect payload")
@@ -522,7 +526,11 @@ fn decode_connect(
     }
 }
 
-fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_connect_path<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -549,7 +557,11 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// `(socketId, resolve, reject)` — read one chunk; resolves with a Uint8Array, or `null` at EOF.
-fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
 
@@ -593,7 +605,10 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_read<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<u8>, NetErr>>()
         .expect("read payload")
@@ -605,7 +620,11 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 }
 
 /// `(socketId, bytes, resolve, reject)` — write all bytes; resolves when flushed.
-fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let data = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
@@ -643,10 +662,10 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     Ok(Value::Undefined)
 }
 
-fn decode_write(
-    ctx: &mut Ctx,
+fn decode_write<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<(), NetErr>>()
         .expect("write payload")
@@ -657,7 +676,11 @@ fn decode_write(
 }
 
 /// `(socketId)` — half-close: shut the write half so the peer sees EOF; our read half stays open.
-fn op_end_writable(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_end_writable<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     if let Some(e) = ctx
         .host_mut::<NetRegistry>()
@@ -669,7 +692,11 @@ fn op_end_writable(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// `(socketId)` — full close: shut both halves (waking a blocked read) and drop the handle.
-fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     if let Some(reg) = ctx.host_mut::<NetRegistry>() {
         if let Some(e) = reg.sockets.remove(&sid) {
@@ -680,7 +707,11 @@ fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// `(socketId, on)` — `socket.setNoDelay`. Returns whether it took effect.
-fn op_set_no_delay(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_no_delay<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let on = !matches!(args.get(1), Some(Value::Bool(false)));
     let ok = ctx
@@ -693,7 +724,11 @@ fn op_set_no_delay(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 
 /// `(socketId, on, initialDelayMs)` — `socket.setKeepAlive`, via `setsockopt(SO_KEEPALIVE)` on
 /// unix (std exposes no keepalive). A no-op returning `false` elsewhere.
-fn op_set_keep_alive(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_keep_alive<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let on = matches!(args.get(1), Some(Value::Bool(true)));
     let delay_ms = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0);
@@ -713,7 +748,11 @@ fn op_set_keep_alive(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
 }
 
 /// `(socketId)` — `socket.address()`; `null` if the socket is gone.
-fn op_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_address<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let addr = ctx
         .host_mut::<NetRegistry>()
@@ -727,7 +766,11 @@ fn op_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
 
 /// `(socketId, unref)` — `socket.ref()`/`unref()`; toggles whether the pending read keeps the
 /// loop alive.
-fn op_socket_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_socket_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let unref = matches!(args.get(1), Some(Value::Bool(true)));
     let pending = ctx.host_mut::<NetRegistry>().and_then(|r| {
@@ -751,7 +794,11 @@ fn op_socket_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 /// `(host, port, backlog)` — bind a listener (synchronous, like `std`); returns
 /// `{ serverId, address, port, family }` or throws an errno-tagged error (`EADDRINUSE`, …). The
 /// `backlog` is accepted but inert (std uses its default and exposes no setter).
-fn op_listen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_listen<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mut host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -789,17 +836,17 @@ fn op_listen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 
     let o = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&o, "serverId", Value::Num(id as f64));
-    let _ = ctx.set_member(
-        &o,
-        "address",
-        Value::from_string(local_addr.ip().to_string()),
-    );
+    let _ = ctx.set_member(&o, "address", ctx.string(local_addr.ip().to_string()));
     let _ = ctx.set_member(&o, "port", Value::Num(local_addr.port() as f64));
-    let _ = ctx.set_member(&o, "family", Value::str(family_of(&local_addr)));
+    let _ = ctx.set_member(&o, "family", ctx.str(family_of(&local_addr)));
     Ok(o)
 }
 
-fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_listen_path<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -824,7 +871,7 @@ fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
         );
         let object = Value::Obj(ctx.new_object());
         let _ = ctx.set_member(&object, "serverId", Value::Num(id as f64));
-        let _ = ctx.set_member(&object, "address", Value::from_string(path));
+        let _ = ctx.set_member(&object, "address", ctx.string(path));
         Ok(object)
     }
     #[cfg(not(unix))]
@@ -838,7 +885,11 @@ fn op_listen_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 
 /// `(serverId, resolve, reject)` — accept one connection; resolves with a socket descriptor (see
 /// [`register_stream`]) or `null` once the server is closed.
-fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_accept<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
 
@@ -888,10 +939,10 @@ enum AcceptResult {
     Closed,
 }
 
-fn decode_accept(
-    ctx: &mut Ctx,
+fn decode_accept<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload.downcast::<AcceptResult>().expect("accept payload") {
         AcceptResult::Conn(stream) => register_stream(ctx, stream),
         AcceptResult::Closed => Ok(vec![Value::Null]),
@@ -900,7 +951,11 @@ fn decode_accept(
 
 /// `(serverId)` — stop the listener: flag it closed and poke it with a throwaway connection so the
 /// blocked `accept()` wakes and reports closed.
-fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_close_server<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let target = ctx
         .host_mut::<NetRegistry>()
@@ -914,7 +969,11 @@ fn op_close_server(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// `(serverId)` — `server.address()`; `null` if the server is gone.
-fn op_server_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_server_address<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let addr = ctx
         .host_mut::<NetRegistry>()
@@ -923,13 +982,17 @@ fn op_server_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
     Ok(match addr {
         Some(ServerAddress::Tcp(a)) => addr_object(ctx, &a),
         #[cfg(unix)]
-        Some(ServerAddress::Unix(path)) => Value::from_string(path),
+        Some(ServerAddress::Unix(path)) => ctx.string(path),
         None => Value::Null,
     })
 }
 
 /// `(serverId, unref)` — `server.ref()`/`unref()`.
-fn op_server_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_server_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let unref = matches!(args.get(1), Some(Value::Bool(true)));
     let pending = ctx.host_mut::<NetRegistry>().and_then(|r| {
@@ -952,7 +1015,11 @@ fn op_server_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 
 /// `(type, host, port, resolve, reject)` — bind a UDP socket (`type` = "udp4"|"udp6");
 /// resolves with `{ socketId, address, port, family }` or rejects with an errno-tagged error.
-fn op_udp_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_bind<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let kind = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -1000,15 +1067,19 @@ fn op_udp_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 
     let o = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&o, "socketId", Value::Num(id as f64));
-    let _ = ctx.set_member(&o, "address", Value::from_string(local.ip().to_string()));
+    let _ = ctx.set_member(&o, "address", ctx.string(local.ip().to_string()));
     let _ = ctx.set_member(&o, "port", Value::Num(local.port() as f64));
-    let _ = ctx.set_member(&o, "family", Value::str(family_of(&local)));
+    let _ = ctx.set_member(&o, "family", ctx.str(family_of(&local)));
     Ok(o)
 }
 
 /// `(socketId, resolve, reject)` — receive one datagram; resolves with
 /// `{ data, address, port, family, size }` or `null` once the socket is closed.
-fn op_udp_recv(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_recv<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
 
@@ -1072,7 +1143,10 @@ enum RecvResult {
     Err(NetErr),
 }
 
-fn decode_recv(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_recv<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload.downcast::<RecvResult>().expect("recv payload") {
         RecvResult::Closed => Ok(vec![Value::Null]),
         RecvResult::Err(e) => Err(net_error_value(ctx, &e)),
@@ -1081,9 +1155,9 @@ fn decode_recv(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             let data = ctx.make_uint8array(&bytes)?;
             let o = Value::Obj(ctx.new_object());
             let _ = ctx.set_member(&o, "data", data);
-            let _ = ctx.set_member(&o, "address", Value::from_string(from.ip().to_string()));
+            let _ = ctx.set_member(&o, "address", ctx.string(from.ip().to_string()));
             let _ = ctx.set_member(&o, "port", Value::Num(from.port() as f64));
-            let _ = ctx.set_member(&o, "family", Value::str(family_of(&from)));
+            let _ = ctx.set_member(&o, "family", ctx.str(family_of(&from)));
             let _ = ctx.set_member(&o, "size", Value::Num(size as f64));
             Ok(vec![o])
         }
@@ -1092,7 +1166,11 @@ fn decode_recv(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 
 /// `(socketId, bytes, port, address, resolve, reject)` — send to `address:port`; resolves with the
 /// byte count. JS pre-slices the buffer, so `bytes` is already the exact payload.
-fn op_udp_send(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_send<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let data = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
@@ -1145,7 +1223,10 @@ fn op_udp_send(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
     Ok(Value::Undefined)
 }
 
-fn decode_send(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_send<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<usize, NetErr>>()
         .expect("send payload")
@@ -1156,7 +1237,11 @@ fn decode_send(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
 }
 
 /// `(socketId)` — close: flag it so the recv thread exits at its next poll, and drop the handle.
-fn op_udp_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     if let Some(reg) = ctx.host_mut::<DgramRegistry>() {
         if let Some(e) = reg.sockets.remove(&sid) {
@@ -1166,7 +1251,11 @@ fn op_udp_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     Ok(Value::Undefined)
 }
 
-fn op_udp_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_address<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let addr = ctx
         .host_mut::<DgramRegistry>()
@@ -1179,12 +1268,12 @@ fn op_udp_address(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 }
 
 /// Look a UDP socket up and run `f` on it, mapping an error to an errno-tagged JS throw.
-fn with_udp(
-    ctx: &mut Ctx,
+fn with_udp<'s>(
+    ctx: &mut Ctx<'s>,
     sid: u64,
     syscall: &'static str,
     f: impl FnOnce(&Arc<UdpSocket>, bool) -> std::io::Result<()>,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let found = ctx
         .host_mut::<DgramRegistry>()
         .and_then(|r| r.sockets.get(&sid))
@@ -1201,13 +1290,21 @@ fn with_udp(
     }
 }
 
-fn op_udp_set_broadcast(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_set_broadcast<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let on = matches!(args.get(1), Some(Value::Bool(true)));
     with_udp(ctx, sid, "setBroadcast", |s, _| s.set_broadcast(on))
 }
 
-fn op_udp_set_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_set_ttl<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
     // std's set_ttl sets IP_TTL, which is invalid on an IPv6 socket; Node sets
@@ -1222,7 +1319,11 @@ fn op_udp_set_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 }
 
 /// IPv4 multicast TTL is real; IPv6 has no std setter, so `udp6` throws honestly.
-fn op_udp_set_multicast_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_set_multicast_ttl<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let ttl = args.get(1).and_then(Value::as_num_opt).unwrap_or(1.0) as u32;
     let kind6 = ctx
@@ -1241,7 +1342,11 @@ fn op_udp_set_multicast_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
     })
 }
 
-fn op_udp_set_multicast_loop(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_set_multicast_loop<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let on = matches!(args.get(1), Some(Value::Bool(true)));
     with_udp(ctx, sid, "setMulticastLoopback", |s, kind6| {
@@ -1253,11 +1358,11 @@ fn op_udp_set_multicast_loop(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result
     })
 }
 
-fn op_udp_set_multicast_interface(
-    ctx: &mut Ctx,
-    _t: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+fn op_udp_set_multicast_interface<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let interface = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -1356,22 +1461,42 @@ fn parse_v6(s: &str) -> Result<Ipv6Addr, ()> {
 
 /// `(socketId, multicastAddress, interface)` — join a multicast group. For udp4 `interface` is an
 /// IPv4 address (default `0.0.0.0`); for udp6 it is an interface index (default 0).
-fn op_udp_add_membership(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_add_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     udp_membership(ctx, args, true)
 }
-fn op_udp_drop_membership(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_drop_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     udp_membership(ctx, args, false)
 }
 
-fn op_udp_add_source_membership(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_add_source_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     udp_source_membership(ctx, args, true)
 }
 
-fn op_udp_drop_source_membership(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_drop_source_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     udp_source_membership(ctx, args, false)
 }
 
-fn udp_source_membership(ctx: &mut Ctx, args: &[Value], join: bool) -> Result<Value, Value> {
+fn udp_source_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    join: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let source_text = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -1505,7 +1630,11 @@ fn set_source_membership(
     ))
 }
 
-fn udp_membership(ctx: &mut Ctx, args: &[Value], join: bool) -> Result<Value, Value> {
+fn udp_membership<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    join: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let mcast = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -1557,7 +1686,11 @@ fn udp_membership(ctx: &mut Ctx, args: &[Value], join: bool) -> Result<Value, Va
 }
 
 /// `(socketId, unref)` — `dgram.ref()`/`unref()`.
-fn op_udp_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_ref<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let unref = matches!(args.get(1), Some(Value::Bool(true)));
     let pending = ctx.host_mut::<DgramRegistry>().and_then(|r| {
@@ -1576,7 +1709,11 @@ fn op_udp_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     Ok(Value::Undefined)
 }
 
-fn op_udp_get_buffer_size(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_get_buffer_size<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let receive = matches!(args.get(1), Some(Value::Bool(true)));
     let socket = ctx
@@ -1589,7 +1726,11 @@ fn op_udp_get_buffer_size(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         .map_err(|error| net_error_value(ctx, &net_err("getsockopt", &error, None)))
 }
 
-fn op_udp_set_buffer_size(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_udp_set_buffer_size<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let sid = arg_u64(args, 0);
     let receive = matches!(args.get(1), Some(Value::Bool(true)));
     let size = arg_u64(args, 2).min(i32::MAX as u64) as i32;

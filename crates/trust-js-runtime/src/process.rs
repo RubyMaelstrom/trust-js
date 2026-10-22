@@ -162,8 +162,12 @@ const JS_INIT: &str = r#"(() => {
 /// The data properties (`argv`, `env`, `platform`) — snapshots taken at startup, like Node's.
 /// Runs after `install` because it needs the `process` object that install created.
 pub(crate) fn install_data_props(engine: &mut Engine) {
-    let global = engine.global_this();
-    let ctx = engine.ctx();
+    engine.scope(install_data_props_in);
+}
+
+/// [`install_data_props`] in the scope `ctx`.
+fn install_data_props_in(ctx: &mut Ctx<'_>) {
+    let global = ctx.global_this();
     let process = match ctx.get_member(&global, "process") {
         Ok(v @ Value::Obj(_)) => v,
         _ => unreachable!("install() defined the process namespace"),
@@ -172,27 +176,27 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
     let argv0_str = std::env::args()
         .next()
         .unwrap_or_else(|| "trust-js".to_string());
-    let argv: Vec<Value> = std::env::args().map(Value::from_string).collect();
+    let argv: Vec<Value> = std::env::args().map(|arg| ctx.string(arg)).collect();
     let argv = ctx.make_array(argv);
     let _ = ctx.set_member(&process, "argv", argv);
 
     // argv0/execPath mirror argv[0] (the running binary), like Node. These are set here rather
     // than in the JS glue because the glue runs before this data-prop pass, so argv isn't ready
     // there yet. `title` defaults to the executable's basename (settable afterwards).
-    let _ = ctx.set_member(&process, "argv0", Value::from_string(argv0_str.clone()));
-    let _ = ctx.set_member(&process, "execPath", Value::from_string(argv0_str.clone()));
+    let _ = ctx.set_member(&process, "argv0", ctx.string(argv0_str.clone()));
+    let _ = ctx.set_member(&process, "execPath", ctx.string(argv0_str.clone()));
     let title = argv0_str
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("trust-js")
         .to_string();
-    let _ = ctx.set_member(&process, "title", Value::from_string(title));
+    let _ = ctx.set_member(&process, "title", ctx.string(title));
 
     let env = ctx.new_object();
     let env = Value::Obj(env);
     for (k, v) in std::env::vars() {
-        let _ = ctx.set_member(&env, &k, Value::from_string(v));
+        let _ = ctx.set_member(&env, &k, ctx.string(v));
     }
     let _ = ctx.set_member(&process, "env", env);
 
@@ -200,7 +204,7 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
         "macos" => "darwin", // Node's name for it
         other => other,
     };
-    let _ = ctx.set_member(&process, "platform", Value::str(platform));
+    let _ = ctx.set_member(&process, "platform", ctx.str(platform));
 
     let _ = ctx.set_member(&process, "pid", Value::Num(std::process::id() as f64));
     // Node's architecture names, not Rust's (native addons resolve their platform binary by these).
@@ -210,23 +214,35 @@ pub(crate) fn install_data_props(engine: &mut Engine) {
         "x86" => "ia32",
         other => other,
     };
-    let _ = ctx.set_member(&process, "arch", Value::str(arch));
+    let _ = ctx.set_member(&process, "arch", ctx.str(arch));
 }
 
 /// `(chunk)` — write raw bytes to stdout (no trailing newline, unlike `console.log`). A typed
 /// array is written as-is; anything else is coerced to a string. Backs `process.stdout.write`.
-fn op_write_stdout(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write_stdout<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     write_raw(ctx, args, false)
 }
-fn op_write_stderr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_write_stderr<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     write_raw(ctx, args, true)
 }
 
 /// `(resolve, reject)` — read one chunk from the process's stdin without blocking the loop.
-fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_stdin<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let (resolve, reject) = match (args.first(), args.get(1)) {
         (Some(resolve), Some(reject)) if resolve.is_callable() && reject.is_callable() => {
-            (resolve.clone(), reject.clone())
+            (*resolve, *reject)
         }
         _ => {
             return Err(ctx.make_error(
@@ -255,10 +271,10 @@ fn op_read_stdin(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Undefined)
 }
 
-fn decode_stdin_read(
-    ctx: &mut Ctx,
+fn decode_stdin_read<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<Vec<u8>, String>>()
         .expect("stdin read payload")
@@ -269,7 +285,11 @@ fn decode_stdin_read(
     }
 }
 
-fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value> {
+fn write_raw<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    to_err: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let arg = args.first().unwrap_or(&Value::Undefined);
     let bytes = match ctx.typed_array_bytes(arg) {
         Some(b) => b,
@@ -291,7 +311,11 @@ fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value
 
 /// `[seconds, nanoseconds]` elapsed since process start, from a monotonic clock (Node's
 /// `process.hrtime()` contract). The js_init wrapper handles the optional `prev` diff + `.bigint`.
-fn op_hrtime(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_hrtime<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let start = ctx
         .host_mut::<ProcStart>()
         .expect("process start installed")
@@ -306,7 +330,11 @@ fn op_hrtime(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Valu
 /// Real per-process CPU, resident-memory, and kernel resource counters from `getrusage(2)`.
 /// The compact array keeps the native boundary cheap; trust-js-node assigns Node's public names.
 #[cfg(unix)]
-fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_metrics<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mut usage = std::mem::MaybeUninit::<ffi::RUsage>::zeroed();
     if unsafe { ffi::getrusage(ffi::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return Err(ctx.make_error(
@@ -434,18 +462,30 @@ fn system_memory(_rss: u64) -> (u64, u64) {
 }
 
 #[cfg(not(unix))]
-fn op_metrics(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_metrics<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(ctx.make_array(vec![Value::Num(0.0); 14]))
 }
 
-fn op_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_cwd<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     match std::env::current_dir() {
-        Ok(p) => Ok(Value::from_string(p.to_string_lossy().into_owned())),
+        Ok(p) => Ok(ctx.string(p.to_string_lossy().into_owned())),
         Err(e) => Err(ctx.make_error("Error", format!("cwd unavailable: {e}"))),
     }
 }
 
-fn op_exit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_exit<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let code = match args.first() {
         Some(v) => ctx.coerce_number(v)? as i32,
         None => 0,
@@ -456,9 +496,13 @@ fn op_exit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 /// Queued on the loop's callback queue: runs next turn, before timers. (Node runs nextTick
 /// callbacks even sooner — between microtask checkpoints — but "before any timer" is the
 /// part programs rely on; noted as a deliberate approximation.)
-fn op_next_tick(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_next_tick<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let callback = match args.first() {
-        Some(cb) if cb.is_callable() => cb.clone(),
+        Some(cb) if cb.is_callable() => *cb,
         _ => return Err(ctx.make_error("TypeError", "process.nextTick expects a function")),
     };
     CallbackQueue::enqueue(ctx, &callback, args.get(1..).unwrap_or_default())?;
@@ -467,7 +511,11 @@ fn op_next_tick(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 
 /// `(dir)` — change the process working directory (`std::env::set_current_dir`). Cross-platform,
 /// no FFI. Throws with the OS error on failure (matching `process.chdir`).
-fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_chdir<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let dir = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -479,14 +527,22 @@ fn op_chdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 
 /// `process.abort()` — terminate immediately (SIGABRT, core dump where enabled). `std::process::abort`
 /// is the real thing; never returns.
-fn op_abort(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_abort<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     std::process::abort();
 }
 
 /// `(pid, signal)` — deliver `signal` to `pid` via libc `kill(2)`. Real on unix; a no-op that
 /// reports failure elsewhere (TRust JS ships unix-first). The JS wrapper maps signal names to numbers.
 #[cfg(unix)]
-fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_kill<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i32;
     let sig = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
     let rc = unsafe { ffi::kill(pid, sig) };
@@ -497,14 +553,22 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
     }
 }
 #[cfg(not(unix))]
-fn op_kill(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_kill<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "process.kill is not supported on this platform"))
 }
 
 /// `([mask])` — read (no-arg, via the standard read-then-restore) or set the file-mode creation
 /// mask through libc `umask(2)`. Returns the previous mask. Unix-only; returns 0 off unix.
 #[cfg(unix)]
-fn op_umask(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_umask<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let prev = match args.first() {
         Some(v) if !matches!(v, Value::Undefined) => {
             let m = ctx.coerce_number(v)? as u32;
@@ -521,35 +585,63 @@ fn op_umask(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     Ok(Value::Num((prev & 0o7777) as f64))
 }
 #[cfg(not(unix))]
-fn op_umask(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_umask<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(0.0))
 }
 
 // Process-identity getters. POSIX-only; off unix they return `undefined` and the JS_INIT wiring
 // leaves `process.getuid` &c. undefined, matching Node (which does not define them on Windows).
 #[cfg(unix)]
-fn op_getuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getuid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(unsafe { ffi::getuid() } as f64))
 }
 #[cfg(unix)]
-fn op_geteuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_geteuid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(unsafe { ffi::geteuid() } as f64))
 }
 #[cfg(unix)]
-fn op_getgid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getgid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(unsafe { ffi::getgid() } as f64))
 }
 #[cfg(unix)]
-fn op_getegid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getegid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(unsafe { ffi::getegid() } as f64))
 }
 #[cfg(unix)]
-fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getppid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(unsafe { ffi::getppid() } as f64))
 }
 
 #[cfg(unix)]
-fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_execve<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use std::ffi::CString;
     use std::os::raw::c_char;
 
@@ -590,7 +682,7 @@ fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 #[cfg(unix)]
-fn identity_result(ctx: &mut Ctx, rc: i32, name: &str) -> Result<Value, Value> {
+fn identity_result<'s>(ctx: &mut Ctx<'s>, rc: i32, name: &str) -> Result<Value<'s>, Value<'s>> {
     if rc == 0 {
         Ok(Value::Undefined)
     } else {
@@ -601,27 +693,47 @@ fn identity_result(ctx: &mut Ctx, rc: i32, name: &str) -> Result<Value, Value> {
     }
 }
 #[cfg(unix)]
-fn op_setuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_setuid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setuid(id) }, "setuid")
 }
 #[cfg(unix)]
-fn op_seteuid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_seteuid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::seteuid(id) }, "seteuid")
 }
 #[cfg(unix)]
-fn op_setgid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_setgid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setgid(id) }, "setgid")
 }
 #[cfg(unix)]
-fn op_setegid(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_setegid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as u32;
     identity_result(ctx, unsafe { ffi::setegid(id) }, "setegid")
 }
 #[cfg(unix)]
-fn op_getgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_getgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let count = unsafe { ffi::getgroups(0, std::ptr::null_mut()) };
     if count < 0 {
         return Err(ctx.make_error(
@@ -641,7 +753,11 @@ fn op_getgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Valu
     Ok(ctx.make_array(groups.into_iter().map(|id| Value::Num(id as f64)).collect()))
 }
 #[cfg(unix)]
-fn op_setgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_setgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let text = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -660,7 +776,11 @@ fn op_setgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
     )
 }
 #[cfg(unix)]
-fn op_initgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_initgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use std::ffi::CString;
     let user = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -675,55 +795,107 @@ fn op_initgroups(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
     )
 }
 #[cfg(not(unix))]
-fn op_setuid(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_setuid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "setuid is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_seteuid(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_seteuid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "seteuid is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_setgid(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_setgid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "setgid is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_setegid(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_setegid<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "setegid is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_getgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_getgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(ctx.make_array(Vec::new()))
 }
 #[cfg(not(unix))]
-fn op_setgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_setgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "setgroups is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_initgroups(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_initgroups<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "initgroups is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_execve(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_execve<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Err(ctx.make_error("Error", "process.execve is not supported on this platform"))
 }
 #[cfg(not(unix))]
-fn op_getuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getuid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Undefined)
 }
 #[cfg(not(unix))]
-fn op_geteuid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_geteuid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Undefined)
 }
 #[cfg(not(unix))]
-fn op_getgid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getgid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Undefined)
 }
 #[cfg(not(unix))]
-fn op_getegid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getegid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Undefined)
 }
 #[cfg(not(unix))]
-fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+fn op_getppid<'s>(
+    _ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    _a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // getppid is meaningless without the unix parent model; 0 is the honest "unknown".
     Ok(Value::Num(0.0))
 }

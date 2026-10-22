@@ -6385,3 +6385,133 @@ reviewed):
   - Against 10d: cycles within 0.5% and instructions within 0.05%
     on every workload, GC pause within 1.4%, peak RSS within 2%:
     the engine's own paths are unchanged.
+
+Step 11b, the scoped embed API (an implementation agent's change,
+reviewed):
+- Values: the embed API's Value<'s> is an enum of Undefined, Null,
+  Bool, Num and opaque BigInt, Str, Sym and Obj wrappers, each
+  repr(transparent) over its cell's address with an invariant, !Send
+  brand (PhantomData<*mut &'s ()>) and no deref; Object has get, set,
+  call, is_callable and addr and compares by identity. The types are
+  the engine's own in layout (repr(u64) with the same discriminants,
+  the internal EMPTY marker read as undefined; static assertions and
+  a test), so a native written against them is the same machine
+  function: the engine stores and calls it unchanged, and generated
+  code is 11a's.
+- Scopes: Ctx<'s>, a repr(transparent) facade over the interpreter
+  with 127 methods, each first switching to its own Engine's heap;
+  Engine::scope takes a for<'s> closure, and Engine's 56 other
+  methods take no values. NativeFn and NativeCaptureFn are for<'s>
+  over (&mut Ctx<'s>, Value<'s>, &[Value<'s>]); native closures keep
+  their JavaScript values as engine captures and may carry Rust
+  state. Handle::new(cx, &v) and handle.get(cx) cross a scope's edge;
+  ValueList<'s>, over the engine's rooted vector, replaces 11a's
+  RootedValues at the six builders.
+- Internals out of the public API: Gc, WeakGc, Object, Abrupt and the
+  internal value are pub(crate) (git grep finds them in no public
+  signature, 44 at 11a), the bytecode module private with Tier
+  re-exported; the public items (rustdoc's JSON, every reachable
+  item's signature and fields) are listed in target/s6-step11b.
+- Host traits: HostGcVisitor's edge, root, js_to_native and
+  native_to_js take weak handles (native_edge and native_root stay);
+  internal, supports_native, is_minor, native_old_generation,
+  HostGc::sweep_gc and unstable_collect_young_for_host_tests are
+  gone; sweep_gc_with_native runs after dead values' weak handles are
+  cleared and before any cell is freed. NativeCallableRetained and the
+  retained-memory visitors report no values, which retires 10b's
+  rescanned natives and reports_fixed_values (Error.captureStackTrace's
+  getter keeps its frame names as engine captures).
+- RealmEntry is a token of (heap, depth): the Engine keeps the saved
+  Realm states on a stack traced as roots, and leaving checks the
+  Engine and that the entry is the innermost.
+- The migration (functions generic over 's, natives among them):
+  engine glue and tests 37 (19), host 11 (3), timers 5 (4), fs 30
+  (22), web 87 (55), node 240 (154), runtime 68 (54), repl 1; the cli
+  unchanged, difftest one path. Not mechanical: each napi_value points
+  to a boxed handle read into the current call's scope; the runtime's
+  event loop runs in scopes, with values kept across checkpoints in
+  handles and the rejection APIs returning handles; the REPL keeps
+  each completion in a handle.
+- Found on the way: deleting an apparently dead Env::try_borrow_mut
+  broke a write-barrier test, because the call fell through Env's
+  Deref to RefCell's method, which bypasses the barrier; restored.
+  Gc's and Env's Deref to RefCell, crate-private now, stays a way
+  around the barrier (open, step 12).
+- Tests: removed the three rescanned-native tests (the table is
+  gone); added captured_stack_getter_keeps_its_frame_names and nine
+  scope tests (scoped values are the engine's, natives receive,
+  return and throw every kind, two ValueList tests, a scope's heap
+  after another Engine's, closure state with captures, a replaced
+  Realm kept until left, two RealmEntry panics). Six compile_fail
+  doctests, each checked for its error: a value stored in OpState
+  (E0521), returned out of scope (a lifetime error), pushed into an
+  outer Vec (E0521), two Engines' scopes mixed (E0521), and a Handle
+  or a Value sent to another thread (E0277). Changed beyond porting:
+  explicit_collections_are_major drops the removed entry; the host
+  graph and trace tests and the HostGc impls in handle_tests and
+  weak_metadata report through weak handles (embed-only now); the
+  two cross-Engine mutation tests became internal tests; the foreign
+  value of handles_and_values_of_another_engine_are_refused is built
+  from the internal form, as no scoped path makes one.
+- Gates (the review's: step 11's close, the tiered gates'
+  milestone, on the reviewed tree):
+  - aarch64: lib 2314/0/7, its test list the parent's less the three
+    rescanned-native tests plus the 10 new; the doctests 9 pass (1
+    ignored), the six compile_fail ones among them; clippy clean in
+    the five configurations; rustfmt clean; rustdoc's warnings 8,
+    none new and 32 gone; the workspace builds with all targets
+    without a diagnostic; git grep finds Gc, WeakGc, Object or
+    Abrupt in no public signature.
+  - Downstream suites: host 37/0/0, timers 6/0/0, fs (no tests), web
+    62/0/1, node 45/0/0, runtime 184/0/1.
+  - Fixtures at --tier=jit (no-LTO release): compiles 56/10/160,
+    outputs as at S0, 21, 6 and 16 collections; difftest 138 agree,
+    12 skipped, no crash; the sustained workload's 194 collections
+    and output as 11a's. The dumps are 11a's in all three forms.
+  - Test262 at --tier=jit: 53575/53575 at threshold 8 and 53573 of
+    53575 at 0, the reports identical to the S5 review fixes'.
+  - Per-test GC stress with the verifier, poisoning and the debug
+    checks, aarch64, the whole lib suite (2321 tests): 2284 pass at
+    interval 1 (7 are ignored), the slow lists' 25 at 100 and 5 at
+    1000.
+  - x86-64 (zombie): clippy clean; lib 2148/0/7. Windows: clippy as
+    its baseline (23 diagnostics); under Wine 2140 pass, 3 fail
+    (step 1's snapshot codec tests) and 7 are ignored. Both lists
+    are the parent's less the three plus the 10. Test262 at
+    --tier=jit: 53575/53575, the report identical to step 1's
+    x86-64 one and the S5 exit gate's aarch64 one. Fixtures:
+    compiles 56/10/160 and 21, 6 and 16 collections, outputs as on
+    aarch64; difftest 138 agree, 12 skipped, no crash.
+  - Per-test GC stress, x86-64 (zombie), the whole lib suite, 2155
+    tests: 2122 pass and 7 are ignored at interval 1 (2,524 s); the
+    slow lists' 22 pass at 100 and their 4 at 1000.
+- Measured (gcmeasure.py; fat-LTO engines from fresh exports, 11a
+  03612778a13c, 11b adbe71c66a3e from the gated tree, main
+  311ae9ae5658; copies made together; CPU 5, 15 interleaved rounds,
+  medians; started once a local inference server had used
+  under 1% of a core and all CPUs under two cores for a minute (an
+  owner's process kept one core busy throughout), the other cores
+  1.36 busy (median), 3.41 at most; outputs equal everywhere):
+  - Against 11a: cycles within 0.5% and instructions within 0.11%
+    on every workload, GC pause within 0.7%, peak RSS within 1.8%.
+
+Step 11 closed (2026-10-22): the plan f43c3136, 11a d8651ca5, 11b
+(this commit).
+- The embed API's values are scoped (Value<'s>, Ctx<'s>,
+  Engine::scope) and cannot be stored, returned out of their scope,
+  mixed between Engines or sent to another thread (six compile_fail
+  doctests); what Rust keeps lives in rooted handles, checked
+  against their heap and inert once it is released; no public item
+  exposes the engine's cells. This repository's crates are migrated;
+  TRust is ported after the merge review (the owner's decision).
+- Performance and the fixtures' code are 10d's: the engine's own
+  paths did not change.
+- Open items carried past step 11, each recorded where it arose:
+  - N-API finalizers run at the next call into an addon, none at
+    teardown, and an exception a finalizer throws is dropped (11a).
+  - Gc's and Env's Deref to RefCell, crate-private now, is a way
+    around the write barrier (11b).
+  - In release builds an internal EMPTY marker reaching a native's
+    arguments would be undefined behaviour; debug builds assert it
+    never does (11b).
+  - Step 10's list stands.

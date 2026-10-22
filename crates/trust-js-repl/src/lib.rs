@@ -1,7 +1,7 @@
 //! trust-js-repl — the interactive shell.
 //!
 //! One realm for the whole session. Each submitted input is evaluated **without** a microtask
-//! checkpoint (`Engine::eval_value`), then the runtime's event loop runs to quiescence, so
+//! checkpoint (`Ctx::eval_value`), then the runtime's event loop runs to quiescence, so
 //! awaited promises and timers settle (and their console output streams) *before* the result
 //! prints and the next prompt appears. Incomplete input — an unclosed block, template, or
 //! paren — is detected by the parser's `at_eof` flag and keeps reading on a `..` continuation
@@ -17,8 +17,23 @@
 //! holds the prompt hostage until cleared (Ctrl-C kills the process; there is no per-line
 //! signal handling in pure std).
 
-use trust_js_host::Value;
+use trust_js_host::{Ctx, Handle, ParseError, Value};
 use trust_js_runtime::{describe_error, render_value, Runtime};
+
+/// An input's completion, its value (or the value it threw) held by a handle across the loop's
+/// run to quiescence.
+type Held = Result<Result<Handle, Handle>, ParseError>;
+
+/// Evaluate `src` in a scope of `ctx`'s engine, holding the completion.
+fn eval_held(ctx: &mut Ctx<'_>, src: &str) -> Held {
+    fn hold<'s>(ctx: &Ctx<'s>, value: Value<'s>) -> Handle {
+        Handle::new(ctx, &value).expect("the engine's own value")
+    }
+    Ok(match ctx.eval_value(src)? {
+        Ok(value) => Ok(hold(ctx, value)),
+        Err(thrown) => Err(hold(ctx, thrown)),
+    })
+}
 
 pub struct Repl {
     runtime: Runtime,
@@ -78,7 +93,8 @@ impl Repl {
         self.buffer.push('\n');
         let src = self.buffer.clone();
 
-        match self.runtime.engine().eval_value(&src) {
+        let completion = self.runtime.engine().scope(|cx| eval_held(cx, &src));
+        match completion {
             Err(e) if e.at_eof => Step::More, // incomplete: keep the buffer
             Err(e) => {
                 self.buffer.clear();
@@ -93,7 +109,7 @@ impl Repl {
                 self.buffer.clear();
                 self.runtime.run_to_completion();
                 match completion {
-                    Ok(v) => self.finish_value(v),
+                    Ok(v) => self.finish_value(&v),
                     Err(e) => self.finish_thrown(&e),
                 }
             }
@@ -116,48 +132,66 @@ impl Repl {
                  (v) => {{ globalThis.__repl_settled = {{ ok: true, value: v }}; }},
                  (e) => {{ globalThis.__repl_settled = {{ ok: false, value: e }}; }});"
         );
-        let completion = [expr, stmt]
-            .into_iter()
-            .find_map(|wrapped| self.runtime.engine().eval_value(&wrapped).ok())?;
+        let completion = [expr, stmt].into_iter().find_map(|wrapped| {
+            self.runtime
+                .engine()
+                .scope(|cx| eval_held(cx, &wrapped))
+                .ok()
+        })?;
         if let Err(e) = completion {
             // A sync throw from the wrapper itself (rare; async bodies reject instead).
             return Some(self.finish_thrown(&e));
         }
         self.runtime.run_to_completion();
 
-        let global = self.runtime.engine().global_this();
-        let ctx = self.runtime.engine().ctx();
-        let settled = ctx.get_member(&global, "__repl_settled").ok()?;
-        let _ = ctx.set_member(&global, "__repl_settled", Value::Undefined);
-        if matches!(settled, Value::Undefined) {
+        // The settlement: `None` when the awaited promise never settled, else whether it was
+        // fulfilled and its value or reason, held.
+        let settled = self.runtime.engine().scope(|ctx| {
+            let global = ctx.global_this();
+            let settled = ctx.get_member(&global, "__repl_settled").ok()?;
+            let _ = ctx.set_member(&global, "__repl_settled", Value::Undefined);
+            if matches!(settled, Value::Undefined) {
+                return Some(None);
+            }
+            let ok = matches!(ctx.get_member(&settled, "ok"), Ok(Value::Bool(true)));
+            let value = ctx.get_member(&settled, "value").ok()?;
+            Some(Some((
+                ok,
+                Handle::new(ctx, &value).expect("the engine's own value"),
+            )))
+        })?;
+        let Some((ok, value)) = settled else {
             // The awaited promise never settled (e.g. `await new Promise(() => {})`): the
             // loop went idle with it still pending. Say so instead of printing a value.
             return Some(Step::Done("[promise never settled]".into()));
-        }
-        let ok = matches!(ctx.get_member(&settled, "ok"), Ok(Value::Bool(true)));
-        let value = ctx.get_member(&settled, "value").ok()?;
+        };
         Some(if ok {
-            self.finish_value(value)
+            self.finish_value(&value)
         } else {
             self.finish_thrown(&value)
         })
     }
 
     /// Record `_` and render the result line.
-    fn finish_value(&mut self, v: Value) -> Step {
-        let global = self.runtime.engine().global_this();
-        let ctx = self.runtime.engine().ctx();
-        let _ = ctx.set_member(&global, "_", v.clone());
-        let text = match &v {
-            // Quote strings so `"42"` and `42` are distinguishable, as every REPL does.
-            Value::Str(_) => format!("'{}'", v.as_text().unwrap_or_default()),
-            other => render_value(ctx, other),
-        };
+    fn finish_value(&mut self, held: &Handle) -> Step {
+        let text = self.runtime.engine().scope(|ctx| {
+            let v = held.get(ctx).expect("the engine's own handle");
+            let global = ctx.global_this();
+            let _ = ctx.set_member(&global, "_", v);
+            match &v {
+                // Quote strings so `"42"` and `42` are distinguishable, as every REPL does.
+                Value::Str(_) => format!("'{}'", v.as_text().unwrap_or_default()),
+                other => render_value(ctx, other),
+            }
+        });
         Step::Done(text)
     }
 
-    fn finish_thrown(&mut self, e: &Value) -> Step {
-        let text = describe_error(self.runtime.engine().ctx(), e);
+    fn finish_thrown(&mut self, held: &Handle) -> Step {
+        let text = self.runtime.engine().scope(|ctx| {
+            let e = held.get(ctx).expect("the engine's own handle");
+            describe_error(ctx, &e)
+        });
         Step::Done(format!("Uncaught {text}"))
     }
 

@@ -609,25 +609,38 @@ impl Visitor {
                 }
                 // Keep the immutable registration label in the canonical string family.
                 self.rc_str(&value.identity);
-                let crate::value::NativeCallableBody::Opaque(function) = &value.body else {
-                    if let crate::value::NativeCallableBody::Captured { captures, .. } = &value.body
-                    {
-                        if first {
-                            self.callable_metadata = self
-                                .callable_metadata
-                                .saturating_add(size_of_val(captures.as_ref()));
-                        }
-                        for capture in captures {
-                            self.value(capture);
-                        }
+                // A closure's Rust state: its allocation, and what its reporter describes (an
+                // unreported closure leaves the record a lower bound).
+                let closure: Option<(usize, usize)> = match &value.body {
+                    crate::value::NativeCallableBody::Opaque(function) => Some((
+                        Rc::as_ptr(function) as *const () as usize,
+                        size_of_val(function.as_ref()),
+                    )),
+                    crate::value::NativeCallableBody::Captured { .. } => None,
+                    crate::value::NativeCallableBody::CapturedClosure { function, .. } => Some((
+                        Rc::as_ptr(function) as *const () as usize,
+                        size_of_val(function.as_ref()),
+                    )),
+                };
+                // Engine-owned captures.
+                if let crate::value::NativeCallableBody::Captured { captures, .. }
+                | crate::value::NativeCallableBody::CapturedClosure { captures, .. } =
+                    &value.body
+                {
+                    if first {
+                        self.callable_metadata = self
+                            .callable_metadata
+                            .saturating_add(size_of_val(captures.as_ref()));
                     }
+                    for capture in captures {
+                        self.value(capture);
+                    }
+                }
+                let Some((closure_identity, closure_bytes)) = closure else {
                     return;
                 };
-                let closure_identity = Rc::as_ptr(function) as *const () as usize;
                 if self.native_closure_allocations.insert(closure_identity) {
-                    self.callable_metadata = self
-                        .callable_metadata
-                        .saturating_add(size_of_val(function.as_ref()));
+                    self.callable_metadata = self.callable_metadata.saturating_add(closure_bytes);
                 }
                 if let Some(reporter) = &value.retained {
                     self.reported_native_closures.insert(closure_identity);
@@ -1132,10 +1145,6 @@ impl crate::value::NativeRetainedMemoryVisitor for Visitor {
             }
         }
     }
-
-    fn value(&mut self, value: &Value) {
-        Visitor::value(self, value);
-    }
 }
 
 struct HostMemoryAdapter<'a> {
@@ -1168,10 +1177,6 @@ impl crate::host::HostRetainedMemoryVisitor for HostMemoryAdapter<'_> {
                 }
             }
         }
-    }
-
-    fn value(&mut self, value: &Value) {
-        self.visitor.value(value);
     }
 
     fn opaque_storage(&mut self) {
@@ -1228,6 +1233,11 @@ fn scan_realm(
             memory: &mut host_memory,
         });
     totals.host_resources.add(host_memory);
+    // The JavaScript values a host keeps are its handles' (S6 step 11b).
+    interp
+        .gc_heap
+        .handles
+        .for_each_value(|value| visitor.value(value));
     let (gc_heap_bytes, gc_heap_exact) = visitor.gc_heap(&interp.gc_heap);
     totals.interpreter_side_tables.add(gc_heap_bytes);
     if !gc_heap_exact {
@@ -2461,10 +2471,9 @@ pub(crate) fn json(interp: &Interp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{
-        HostRetainedMemoryVisitor, RetainedBytes, RetainedExternalAllocation,
-        RetainedExternalMemory, RetainedMemory,
-    };
+    #[cfg(feature = "embed")]
+    use crate::host::{HostRetainedMemoryVisitor, RetainedMemory};
+    use crate::host::{RetainedBytes, RetainedExternalAllocation, RetainedExternalMemory};
     use crate::lstr::LStr;
     use crate::value::Props;
 
@@ -2474,12 +2483,14 @@ mod tests {
 
     struct ReportedNativeClosure {
         allocation: Rc<RefCell<Vec<u8>>>,
-        value: Value,
     }
 
+    /// Host state reporting a shared allocation; its JavaScript values are handles.
+    #[cfg(feature = "embed")]
     struct ReportedManagedHostState {
         allocation: Rc<RefCell<Vec<u8>>>,
-        value: Value,
+        /// Held for its value, which the snapshot reads through the handle table.
+        _value: Option<crate::handles::Handle>,
         requested_bytes: usize,
     }
 
@@ -2495,6 +2506,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed")]
     impl RetainedMemory for ReportedManagedHostState {
         fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor) {
             visitor.allocation(crate::value::RetainedManagedAllocation::rc(
@@ -2502,7 +2514,6 @@ mod tests {
                 &self.allocation,
                 self.requested_bytes,
             ));
-            visitor.value(&self.value);
         }
     }
 
@@ -2518,7 +2529,6 @@ mod tests {
                 &self.allocation,
                 requested_bytes,
             ));
-            visitor.value(&self.value);
         }
     }
 
@@ -2775,25 +2785,39 @@ mod tests {
         );
     }
 
+    /// The allocations host state reports are counted once per identity, and the JavaScript
+    /// values it keeps, in handles (S6 step 11b), once per value.
+    #[cfg(feature = "embed")]
     #[test]
     fn identity_aware_host_allocations_and_values_are_deduplicated() {
-        let mut interp = Interp::new();
-        let baseline_strings = measure(&interp, &[], &[]).strings_symbols_bigints.bytes;
+        let mut engine = crate::Engine::new();
+        let baseline_strings = measure(&engine.interp, &[], &[])
+            .strings_symbols_bigints
+            .bytes;
         let allocation = Rc::new(RefCell::new(Vec::<u8>::with_capacity(83)));
         let string = LStr::from("host-retained string");
         let requested_bytes = size_of::<RefCell<Vec<u8>>>() + allocation.borrow().capacity();
+        let held = engine.scope(|cx| {
+            crate::handles::Handle::new(
+                cx,
+                &crate::scope::Value::from_internal(Value::Str(string.clone())),
+            )
+            .expect("a handle")
+        });
         let make_reporter = || ReportedManagedHostState {
             allocation: allocation.clone(),
-            value: Value::Str(string.clone()),
+            _value: Some(held.clone()),
             requested_bytes,
         };
-        interp.host_state.put_retained_memory(make_reporter());
-        interp
-            .host_state
+        engine.op_state().put_retained_memory(make_reporter());
+        engine
+            .op_state()
             .resources
             .add_retained_memory(make_reporter());
+        drop(held);
+        let interp = &mut engine.interp;
 
-        let snapshot = measure(&interp, &[], &[]);
+        let snapshot = measure(interp, &[], &[]);
         assert_eq!(snapshot.host_resources.unavailable_entries, 0);
         assert!(!snapshot.host_resources.identity_conflict);
         assert!(snapshot.host_resources.reported_bytes >= requested_bytes);
@@ -2810,10 +2834,10 @@ mod tests {
             .host_state
             .put_retained_memory(ReportedManagedHostState {
                 allocation,
-                value: Value::Undefined,
+                _value: None,
                 requested_bytes: requested_bytes + 1,
             });
-        let conflicting = measure(&interp, &[], &[]);
+        let conflicting = measure(interp, &[], &[]);
         assert!(conflicting.host_resources.identity_conflict);
         assert!(!conflicting.complete());
         assert!(conflicting
@@ -3001,6 +3025,8 @@ mod tests {
         assert!(snapshot.complete());
     }
 
+    /// Native closures with Rust state and engine captures (S6 step 11b): the allocations
+    /// their reporters describe and the values they capture are each counted once.
     #[test]
     fn reported_native_closure_allocations_and_values_are_deduplicated() {
         let interp = Interp::new();
@@ -3009,11 +3035,10 @@ mod tests {
         let make_closure = || {
             let state = Rc::new(ReportedNativeClosure {
                 allocation: allocation.clone(),
-                value: Value::Str(string.clone()),
             });
             let callable_state = state.clone();
-            let callable: Rc<crate::value::NativeClosure> = Rc::new(
-                move |_: &mut Interp, _: Value, _: &[Value]| -> Result<Value, Value> {
+            let callable: Rc<crate::value::CaptureClosure> = Rc::new(
+                move |_: &mut Interp, _: Value, _: &[Value], _: &[Value]| -> Result<Value, Value> {
                     std::hint::black_box(&callable_state);
                     Ok(Value::Undefined)
                 },
@@ -3024,17 +3049,19 @@ mod tests {
             )
         };
         let (first_callable, first_reporter) = make_closure();
-        let first = interp.make_native_closure(
+        let first = interp.make_native_capture_closure(
             "first",
             0,
             first_callable,
+            vec![Value::Str(string.clone())],
             crate::value::NativeCaptures::Reported(first_reporter),
         );
         let (second_callable, second_reporter) = make_closure();
-        let second = interp.make_native_closure(
+        let second = interp.make_native_capture_closure(
             "second",
             0,
             second_callable,
+            vec![Value::Str(string.clone())],
             crate::value::NativeCaptures::Reported(second_reporter),
         );
         let snapshot = measure(&interp, &[first, second], &[]);
@@ -3047,14 +3074,20 @@ mod tests {
         let (first_func, first_retained) = make_closure();
         let first_callable =
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                body: crate::value::NativeCallableBody::Opaque(first_func),
+                body: crate::value::NativeCallableBody::CapturedClosure {
+                    function: first_func,
+                    captures: vec![Value::Str(string.clone())].into_boxed_slice(),
+                },
                 retained: Some(first_retained),
                 identity: Rc::from("first"),
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
             crate::value::Callable::NativeData(Rc::new(crate::value::NativeCallable {
-                body: crate::value::NativeCallableBody::Opaque(second_func),
+                body: crate::value::NativeCallableBody::CapturedClosure {
+                    function: second_func,
+                    captures: vec![Value::Str(string.clone())].into_boxed_slice(),
+                },
                 retained: Some(second_retained),
                 identity: Rc::from("second"),
             }));

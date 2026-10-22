@@ -20,7 +20,7 @@ impl Write for Captured {
 fn s3_presign_matches_sigv4_vector_and_validates_credentials() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
@@ -62,7 +62,7 @@ fn s3_presign_matches_sigv4_vector_and_validates_credentials() {
 fn s3_client_executes_signed_object_lifecycle() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

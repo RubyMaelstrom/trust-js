@@ -1924,23 +1924,6 @@ impl Heap {
             && !bit(&page.zombies, index)
     }
 
-    /// Whether `addr` starts an allocated small cell of a carded kind, which [`card_mark`]
-    /// requires (debug builds' checks of the cells the engine cards itself).
-    #[cfg(debug_assertions)]
-    pub(crate) fn is_carded_cell(&self, addr: usize) -> bool {
-        self.locate(addr as u64)
-            .is_some_and(|cell| match (cell.start == addr, cell.loc) {
-                (true, Loc::Small { page, index }) => {
-                    self.pages[page as usize].as_ref().is_some_and(|p| {
-                        p.carded
-                            && bit(&p.allocated, index as usize)
-                            && !bit(&p.zombies, index as usize)
-                    })
-                }
-                _ => false,
-            })
-    }
-
     /// The number of the collection in progress (the first is 1), while one is: for an
     /// embedder's, from [`Heap::start_marking`] until [`Heap::finish_collection`] has swept.
     #[cfg(debug_assertions)]

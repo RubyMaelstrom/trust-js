@@ -32,7 +32,7 @@ fn test_runtime() -> (Runtime, Captured, Captured) {
     let mut rt = Runtime::new();
     let out = Captured::default();
     let err = Captured::default();
-    rt.engine().ctx().op_state().put(console::ConsoleOut {
+    rt.engine().op_state().put(console::ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(err.clone()),
     });
@@ -258,13 +258,14 @@ fn spawn_blocking_completion_settles_on_the_loop() {
         &mut rt,
         "globalThis.onDone = (n) => console.log('got', n); 0",
     );
-    let g = rt.engine().global_this();
-    let cb = rt
-        .engine()
-        .ctx()
-        .get_member(&g, "onDone")
-        .map_err(|_| ())
-        .expect("defined above");
+    let cb = rt.engine().scope(|cx| {
+        let g = cx.global_this();
+        let cb = cx
+            .get_member(&g, "onDone")
+            .map_err(|_| ())
+            .expect("defined above");
+        trust_js_host::Handle::new(cx, &cb).expect("a handle")
+    });
     rt.spawn_blocking(
         || {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -288,13 +289,14 @@ fn panicking_blocking_task_reports_failure_without_stranding_the_loop() {
         &mut rt,
         "globalThis.onDone = (n) => console.log('after panic', n); 0",
     );
-    let global = rt.engine().global_this();
-    let callback = rt
-        .engine()
-        .ctx()
-        .get_member(&global, "onDone")
-        .map_err(|_| ())
-        .expect("callback exists");
+    let callback = rt.engine().scope(|cx| {
+        let global = cx.global_this();
+        let callback = cx
+            .get_member(&global, "onDone")
+            .map_err(|_| ())
+            .expect("callback exists");
+        trust_js_host::Handle::new(cx, &callback).expect("a handle")
+    });
     rt.spawn_blocking(
         || panic!("native boom"),
         callback.clone(),
@@ -2101,8 +2103,8 @@ fn perf_boot_breakdown() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let pool = ThreadPool::new(4, tx);
         let mut engine = trust_js_host::Engine::new();
-        engine.ctx().op_state().put(pool.handle());
-        engine.ctx().op_state().put(TaskRegistry::default());
+        engine.op_state().put(pool.handle());
+        engine.op_state().put(TaskRegistry::default());
         let exts = [
             trust_js_timers::extension(),
             console::extension(),

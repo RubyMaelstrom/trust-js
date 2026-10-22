@@ -197,19 +197,15 @@ fn the_task_boundary_collects_minorly_unless_a_major_collection_is_due() {
     assert_eq!(since(&engine, before), (0, 1));
 }
 
-/// Explicit requests collect majorly: the engine's, the host's (and its test entry for young
-/// state, which has no minor form), `$262.gc`, the idle collection (with `embed`), the
-/// performance metrics' exit collection, and ArrayBuffer pressure.
+/// Explicit requests collect majorly: the engine's, the host's, `$262.gc`, the idle collection
+/// (with `embed`), the performance metrics' exit collection, and ArrayBuffer pressure.
 #[test]
 fn explicit_collections_are_major() {
     let mut engine = engine(Tier::Interp);
-    let requests: [(&str, fn(&mut Engine)); 6] = [
+    let requests: [(&str, fn(&mut Engine)); 5] = [
         ("Interp::gc_collect", |engine| engine.interp.gc_collect()),
         ("collect_garbage_for_host", |engine| {
             engine.interp.collect_garbage_for_host();
-        }),
-        ("unstable_collect_young_for_host_tests", |engine| {
-            engine.interp.unstable_collect_young_for_host_tests();
         }),
         ("$262.gc", |engine| {
             eval(engine, "$262.gc(); 0");

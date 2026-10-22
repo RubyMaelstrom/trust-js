@@ -1,7 +1,7 @@
 //! Embedder host state: typed per-subsystem storage plus an integer-keyed table of open
-//! handles, reachable from native functions through their `&mut Interp` argument. This is how
-//! a runtime layer (event loop, fs, timers) keeps Rust state despite `NativeFn` being a bare
-//! `fn` pointer that cannot capture.
+//! handles, reachable from native functions through their context (`embed::Ctx::op_state`).
+//! This is how a runtime layer (event loop, fs, timers) keeps Rust state despite `NativeFn`
+//! being a bare `fn` pointer that cannot capture.
 //!
 //! Modeled on deno_core's `OpState` + `ResourceTable`.
 
@@ -9,7 +9,9 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::value::{RetainedManagedAllocation, Value};
+#[cfg(feature = "embed")]
+use crate::handles::WeakHandle;
+use crate::value::RetainedManagedAllocation;
 
 /// Reports heap storage retained by an embedder-owned value.
 ///
@@ -23,12 +25,11 @@ pub trait RetainedBytes {
 
 type RetainedReporter = fn(&dyn Any) -> usize;
 
-/// Canonical sinks available to an embedder-owned value's retained-memory reporter.
+/// Canonical sinks available to an embedder-owned value's retained-memory reporter. The
+/// JavaScript values a host keeps are its handles, which the memory snapshot counts itself.
 pub trait HostRetainedMemoryVisitor {
     /// Report one identity-bearing allocation retained below the registered host value.
     fn allocation(&mut self, allocation: RetainedManagedAllocation);
-    /// Report a JavaScript value retained by the host so its engine-owned graph is visited once.
-    fn value(&mut self, value: &Value);
     /// Mark requested bytes as a documented lower bound because a standard-library container or
     /// channel does not expose its complete allocation layout.
     fn opaque_storage(&mut self);
@@ -37,9 +38,9 @@ pub trait HostRetainedMemoryVisitor {
     fn unavailable(&mut self);
 }
 
-/// Identity-aware retained-memory reporting for embedder values that own shared allocations or
-/// JavaScript roots. The registered value's inline payload is counted by [`OpState`]; the reporter
-/// enumerates allocations and values below that payload.
+/// Identity-aware retained-memory reporting for embedder values that own shared allocations. The
+/// registered value's inline payload is counted by [`OpState`]; the reporter enumerates the
+/// allocations below that payload.
 pub trait RetainedMemory {
     fn scan_retained_memory(&self, visitor: &mut dyn HostRetainedMemoryVisitor);
 }
@@ -47,40 +48,33 @@ pub trait RetainedMemory {
 /// A host value that reports a graph of JavaScript values to the collector (P1 S2, Decision 2),
 /// for hosts whose values must live exactly as long as their JavaScript owners do: a value
 /// reported with `edge` stays alive while its owner does, and a native graph ties JavaScript
-/// values to native identities. A value the host simply keeps needs none of this: it keeps the
-/// value in a [`Handle`](crate::embed::Handle) (S6 step 11a), wherever it is stored. A type
-/// is reported at every collection, minor or major, once it is registered with
-/// [`OpState::register_trace`] or [`ResourceTable::register_trace`] (or, as a [`HostGc`], with
-/// [`OpState::register_gc`]). These callbacks must not execute JavaScript, allocate JS objects,
-/// or re-enter collection.
+/// values to native identities. The host names each value by a
+/// [`WeakHandle`](crate::embed::WeakHandle), which keeps nothing by itself: what keeps the
+/// value is the report, made again at every collection. A value the host simply keeps needs
+/// none of this: it keeps the value in a [`Handle`](crate::embed::Handle) (S6 step 11a),
+/// wherever it is stored. A type is reported at every collection, minor or major, once it is
+/// registered with [`OpState::register_trace`] or [`ResourceTable::register_trace`] (or, as a
+/// [`HostGc`], with [`OpState::register_gc`]). These callbacks must not execute JavaScript,
+/// allocate JS objects, or re-enter collection.
 pub trait HostTrace {
     fn trace_gc(&self, visitor: &mut dyn HostGcVisitor);
 }
 
-/// Native caches can own JavaScript references without making them permanent roots: beside the
-/// [`HostTrace`] enumeration (whose unreported handles the cache does not keep alive), they
-/// release job-scoped roots and evict dead handles. Register with [`OpState::register_gc`],
-/// which also registers the type's [`HostTrace`]. The sweeps run between a collection's phases,
-/// after the weak [`Handle`](crate::embed::Handle)s whose targets died have been cleared.
+/// A host graph with native caches: beside its [`HostTrace`] report, it releases job-scoped
+/// state at each job's end and sweeps its caches once a collection has decided what died.
+/// Register with [`OpState::register_gc`], which also registers the type's [`HostTrace`].
 /// These callbacks must not execute JavaScript, allocate JS objects, or re-enter collection.
 pub trait HostGc: HostTrace {
     /// Release temporary native roots at the same synchronous-job boundary as ClearKeptObjects.
     /// This may update native bookkeeping only: no JavaScript, JS allocation or collection.
     /// Persistent async work must own explicit roots rather than relying on a job lease.
     fn end_job(&mut self) {}
-    /// Remove every cache handle that `is_live` rejects before the JS heap is swept.
-    /// Do not retain new handles or change the graph during this phase.
-    fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool);
-    /// Joint native/JavaScript sweep. Native identities were traced in this collection, so only
-    /// identities rejected by this callback may be reclaimed. Existing JS-only hosts need no
-    /// changes; native graph users override this and leave the legacy sweep conservative.
-    fn sweep_gc_with_native(
-        &mut self,
-        is_live: &dyn Fn(&Value) -> bool,
-        _native_is_live: &dyn Fn(NativeGcId) -> bool,
-    ) {
-        self.sweep_gc(is_live);
-    }
+    /// Sweep the host's caches between a collection's phases, after the weak handles whose
+    /// values died have been cleared ([`WeakHandle::is_cleared`](crate::embed::WeakHandle::is_cleared))
+    /// and before any cell is freed: drop what names a dead value. Native identities were traced
+    /// in this collection, so only identities `native_is_live` rejects may be reclaimed. Do not
+    /// make handles or change the graph during this phase.
+    fn sweep_gc_with_native(&mut self, native_is_live: &dyn Fn(NativeGcId) -> bool);
 }
 
 /// A native graph node, independent of JavaScript object allocation. The host owns the identity
@@ -93,43 +87,27 @@ pub struct NativeGcId {
     pub id: usize,
 }
 
+/// The collector's side of a [`HostTrace`] report. Its JavaScript ends are weak handles of the
+/// collecting Engine (another Engine's, or a cleared one, report nothing); the host reports its
+/// whole graph at every collection, minor or major.
 pub trait HostGcVisitor {
-    /// Whether this is a minor (nursery) collection, for which a host could enumerate only its
-    /// young and remembered state. The collector asks every host for its whole graph at every
-    /// collection, minor or major, so this is false.
-    fn is_minor(&self) -> bool {
-        false
-    }
-    /// Declare the old prefix of a host's monotonic native identity domain (every ID below
-    /// `first_young_id`) for a minor collection. False means the collection needs the host's
-    /// full native graph; the collector traces host graphs in full at every collection, minor
-    /// or major, so every collector returns false.
-    fn native_old_generation(
-        &mut self,
-        _domain: &'static str,
-        _owner: usize,
-        _first_young_id: usize,
-    ) -> bool {
-        false
-    }
-    /// Has no effect and keeps nothing alive. (Reference counting used it to discount a
-    /// native-owned handle.)
-    fn internal(&mut self, value: &Value);
     /// A logical edge from a live owner to a retained value: `value` stays alive while `owner`
     /// does.
-    fn edge(&mut self, owner: &Value, value: &Value);
+    #[cfg(feature = "embed")]
+    fn edge(&mut self, owner: &WeakHandle, value: &WeakHandle);
     /// A value reachable from a native root not represented by a JS owner.
-    fn root(&mut self, value: &Value);
-    /// Whether this visitor traces a native graph (`native_edge`, `js_to_native`,
-    /// `native_to_js`, `native_root`). An old or third-party visitor may not: a host must then
-    /// report the values its native graph keeps alive with `root` or `edge` instead.
-    fn supports_native(&self) -> bool {
-        false
-    }
-    fn native_edge(&mut self, _from: NativeGcId, _to: NativeGcId) {}
-    fn js_to_native(&mut self, _owner: &Value, _to: NativeGcId) {}
-    fn native_to_js(&mut self, _from: NativeGcId, _value: &Value) {}
-    fn native_root(&mut self, _id: NativeGcId) {}
+    #[cfg(feature = "embed")]
+    fn root(&mut self, value: &WeakHandle);
+    /// An edge between two native identities.
+    fn native_edge(&mut self, from: NativeGcId, to: NativeGcId);
+    /// An edge from a JavaScript owner (an object) to a native identity.
+    #[cfg(feature = "embed")]
+    fn js_to_native(&mut self, owner: &WeakHandle, to: NativeGcId);
+    /// An edge from a native identity to a JavaScript value.
+    #[cfg(feature = "embed")]
+    fn native_to_js(&mut self, from: NativeGcId, value: &WeakHandle);
+    /// A native identity that is a root.
+    fn native_root(&mut self, id: NativeGcId);
 }
 
 /// A registered host type's [`HostTrace`].
@@ -145,7 +123,7 @@ fn host_tracer<T: Any + HostTrace>(value: &dyn Any, visitor: &mut dyn HostGcVisi
 #[derive(Clone, Copy)]
 struct GcReporter {
     end_job: fn(&mut dyn Any),
-    sweep_native: fn(&mut dyn Any, &dyn Fn(&Value) -> bool, &dyn Fn(NativeGcId) -> bool),
+    sweep_native: fn(&mut dyn Any, &dyn Fn(NativeGcId) -> bool),
 }
 
 #[derive(Clone, Copy)]
@@ -393,11 +371,11 @@ impl OpState {
             TypeId::of::<T>(),
             GcReporter {
                 end_job: |value| value.downcast_mut::<T>().unwrap().end_job(),
-                sweep_native: |value, is_live, native_is_live| {
+                sweep_native: |value, native_is_live| {
                     value
                         .downcast_mut::<T>()
                         .unwrap()
-                        .sweep_gc_with_native(is_live, native_is_live)
+                        .sweep_gc_with_native(native_is_live)
                 },
             },
         );
@@ -422,14 +400,10 @@ impl OpState {
         }
     }
 
-    pub(crate) fn sweep_gc_with_native(
-        &mut self,
-        is_live: &dyn Fn(&Value) -> bool,
-        native_is_live: &dyn Fn(NativeGcId) -> bool,
-    ) {
+    pub(crate) fn sweep_gc_with_native(&mut self, native_is_live: &dyn Fn(NativeGcId) -> bool) {
         for (key, reporter) in &self.gc_reporters {
             if let Some(value) = self.map.get_mut(key) {
-                (reporter.sweep_native)(value.as_mut(), is_live, native_is_live);
+                (reporter.sweep_native)(value.as_mut(), native_is_live);
             }
         }
     }
@@ -701,14 +675,25 @@ impl ResourceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "embed")]
+    use crate::handles::WeakHandle;
+    #[cfg(feature = "embed")]
+    use crate::scope::Value;
 
+    /// A host graph reported through weak handles (S6 step 11b, `embed`): the report, made at
+    /// every collection, keeps the values; the weak handles keep nothing and are cleared once
+    /// their values die.
+    #[cfg(feature = "embed")]
     #[derive(Default)]
     struct NativeCache {
-        values: Vec<Value>,
+        values: Vec<WeakHandle>,
         edges: Vec<(usize, usize)>,
         roots: Vec<usize>,
+        /// What the last sweep saw cleared, per value.
+        swept: Vec<bool>,
     }
 
+    #[cfg(feature = "embed")]
     impl HostTrace for NativeCache {
         fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
             for &(owner, target) in &self.edges {
@@ -720,18 +705,44 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed")]
     impl HostGc for NativeCache {
-        fn sweep_gc(&mut self, is_live: &dyn Fn(&Value) -> bool) {
-            // Keep indices stable in this synthetic cache.
-            for value in &mut self.values {
-                if !is_live(value) {
-                    *value = Value::Undefined;
-                }
-            }
+        fn sweep_gc_with_native(&mut self, _: &dyn Fn(NativeGcId) -> bool) {
+            // The weak handles of the dead are cleared before the sweep.
+            self.swept = self.values.iter().map(WeakHandle::is_cleared).collect();
         }
     }
 
+    /// Weak handles to `names`, globals of `engine`, and internal weak references for watching
+    /// them die, made in a frame of their own.
+    #[cfg(feature = "embed")]
+    fn weak_globals(
+        engine: &mut crate::Engine,
+        names: &[&str],
+    ) -> (Vec<WeakHandle>, Vec<crate::interpreter::WeakValue>) {
+        crate::gc_test::in_frame(|| {
+            engine.scope(|cx| {
+                let global = cx.global_this();
+                names
+                    .iter()
+                    .map(|name| {
+                        let value = cx
+                            .member_get(&global, name)
+                            .unwrap_or_else(|_| panic!("global {name}"));
+                        (
+                            WeakHandle::new(cx, &value).expect("a weak handle"),
+                            cx.interp()
+                                .downgrade_object_value(&value.into_internal())
+                                .expect("an object"),
+                        )
+                    })
+                    .unzip()
+            })
+        })
+    }
+
     #[test]
+    #[cfg(feature = "embed")]
     fn host_gc_edges_preserve_ephemerons_and_release_unrooted_cycles() {
         let mut engine = crate::Engine::new();
         engine
@@ -746,103 +757,69 @@ mod tests {
                 false,
             )
             .unwrap();
-        // Strong handles live only in this helper frame (the collector scans the stack).
-        let (target_weak, payload_weak) = crate::gc_test::in_frame(|| {
-            let global = Value::Obj(engine.interp.global.clone());
-            let owner = engine
-                .interp
-                .member_get(&global, "owner")
-                .unwrap_or_else(|_| panic!("owner"));
-            let target = engine
-                .interp
-                .member_get(&global, "target")
-                .unwrap_or_else(|_| panic!("target"));
-            let payload = engine
-                .interp
-                .member_get(&global, "payload")
-                .unwrap_or_else(|_| panic!("payload"));
-            let target_weak = engine.interp.downgrade_object_value(&target).unwrap();
-            let payload_weak = engine.interp.downgrade_object_value(&payload).unwrap();
-            engine.interp.op_state().put(NativeCache {
-                // Two cache handles to one target must both be discounted, but logical edges
-                // must not be counted as additional strong owners.
-                values: vec![owner, target.clone(), target],
-                edges: vec![(0, 1), (1, 0)],
-                ..Default::default()
-            });
-            (target_weak, payload_weak)
+        let (handles, weak) = weak_globals(&mut engine, &["owner", "target", "payload"]);
+        let [_, target_weak, payload_weak] = &weak[..] else {
+            unreachable!()
+        };
+        let [owner, target, _] = &handles[..] else {
+            unreachable!()
+        };
+        engine.op_state().put(NativeCache {
+            // Two handles to one target, and edges in both directions.
+            values: vec![owner.clone(), target.clone(), target.clone()],
+            edges: vec![(0, 1), (1, 0)],
+            ..Default::default()
         });
-        engine.interp.op_state().register_gc::<NativeCache>();
+        engine.op_state().register_gc::<NativeCache>();
         engine.eval("target = payload = null", false).unwrap();
         engine.interp.gc_collect();
-        assert!(crate::gc_test::alive(&target_weak));
+        assert!(crate::gc_test::alive(target_weak));
         assert!(
-            crate::gc_test::alive(&payload_weak),
+            crate::gc_test::alive(payload_weak),
             "native edge activates WeakMap value"
         );
 
         engine.eval("owner = null", false).unwrap();
-        engine
-            .interp
-            .op_state()
-            .get_mut::<NativeCache>()
-            .unwrap()
-            .roots
-            .push(1);
+        engine.host_mut::<NativeCache>().unwrap().roots.push(1);
         engine.interp.gc_collect();
         assert!(
-            crate::gc_test::alive(&payload_weak),
+            crate::gc_test::alive(payload_weak),
             "native root activates entire component"
         );
-        engine
-            .interp
-            .op_state()
-            .get_mut::<NativeCache>()
-            .unwrap()
-            .roots
-            .clear();
+        engine.host_mut::<NativeCache>().unwrap().roots.clear();
         engine.interp.gc_collect();
-        assert!(!crate::gc_test::alive(&target_weak));
-        assert!(!crate::gc_test::alive(&payload_weak));
-        assert!(engine
-            .interp
-            .op_state()
-            .get::<NativeCache>()
-            .unwrap()
-            .values
-            .iter()
-            .all(|value| matches!(value, Value::Undefined)));
+        assert!(!crate::gc_test::alive(target_weak));
+        assert!(!crate::gc_test::alive(payload_weak));
+        let cache = engine.host::<NativeCache>().unwrap();
+        assert!(cache.values.iter().all(WeakHandle::is_cleared));
+        assert_eq!(cache.swept, [true; 3], "the sweep saw them cleared");
     }
 
     /// A GC registration belongs to its Rust type, not to the slot it was made beside: a
     /// collection skips the taken slot and sweeps a later slot of the type.
     #[test]
+    #[cfg(feature = "embed")]
     fn host_gc_registration_outlives_a_taken_slot() {
         let mut engine = crate::Engine::new();
-        engine.interp.op_state().register_gc::<NativeCache>();
-        engine.interp.op_state().put(NativeCache::default());
-        engine.interp.op_state().take::<NativeCache>();
+        engine.op_state().register_gc::<NativeCache>();
+        engine.op_state().put(NativeCache::default());
+        engine.op_state().take::<NativeCache>();
         engine.interp.gc_collect();
-        // The value's handles live only in this helper frame (the collector scans the stack).
+        // The value lives only in this helper frame (the collector scans the stack).
         crate::gc_test::in_frame(|| {
-            let value = Value::Obj(engine.interp.new_object());
-            engine.interp.op_state().put(NativeCache {
+            let value = engine.scope(|cx| {
+                WeakHandle::new(cx, &Value::Obj(cx.new_object())).expect("a weak handle")
+            });
+            engine.op_state().put(NativeCache {
                 values: vec![value],
                 ..Default::default()
             });
         });
         engine.interp.gc_collect();
-        assert!(
-            matches!(
-                engine
-                    .interp
-                    .op_state()
-                    .get::<NativeCache>()
-                    .unwrap()
-                    .values[..],
-                [Value::Undefined]
-            ),
-            "the later slot's unrooted value is swept"
+        assert_eq!(
+            engine.host::<NativeCache>().unwrap().swept,
+            [true],
+            "the later slot's unreported value is swept"
         );
     }
 
@@ -850,6 +827,7 @@ mod tests {
     /// continuation: while the generator lives, both its captured payload and the host's target
     /// do, and once it is unreachable a collection frees both and its continuation.
     #[test]
+    #[cfg(feature = "embed")]
     fn host_gc_and_continuations_share_an_owner_without_losing_either_edge() {
         let mut engine = crate::Engine::new();
         engine
@@ -860,34 +838,25 @@ mod tests {
                 yield 0; yield payload.n;
             })();
             mixedOwner.next();
+            var nativeTarget = {};
         "#,
                 false,
             )
             .unwrap();
-        // Strong handles live only in this helper frame (the collector scans the stack).
-        let (owner_weak, native_weak) = crate::gc_test::in_frame(|| {
-            let global = Value::Obj(engine.interp.global.clone());
-            let owner = engine
-                .interp
-                .member_get(&global, "mixedOwner")
-                .unwrap_or_else(|_| panic!("generator owner"));
-            let owner_weak = engine.interp.downgrade_object_value(&owner).unwrap();
-            let native_target = Value::Obj(engine.interp.new_object());
-            let native_weak = engine
-                .interp
-                .downgrade_object_value(&native_target)
-                .unwrap();
-            engine.interp.op_state().put(NativeCache {
-                values: vec![owner, native_target],
-                edges: vec![(0, 1)],
-                ..Default::default()
-            });
-            (owner_weak, native_weak)
+        let (handles, weak) = weak_globals(&mut engine, &["mixedOwner", "nativeTarget"]);
+        engine.eval("nativeTarget = null", false).unwrap();
+        let [owner_weak, native_weak] = &weak[..] else {
+            unreachable!()
+        };
+        engine.op_state().put(NativeCache {
+            values: handles,
+            edges: vec![(0, 1)],
+            ..Default::default()
         });
-        engine.interp.op_state().register_gc::<NativeCache>();
+        engine.op_state().register_gc::<NativeCache>();
         engine.interp.gc_collect();
         assert!(
-            crate::gc_test::alive(&native_weak),
+            crate::gc_test::alive(native_weak),
             "the native edge shares the coroutine owner"
         );
         match engine.eval("mixedOwner.next().value", false).unwrap() {
@@ -896,8 +865,8 @@ mod tests {
         }
         engine.eval("mixedOwner = null", false).unwrap();
         engine.interp.gc_collect();
-        assert!(!crate::gc_test::alive(&owner_weak));
-        assert!(!crate::gc_test::alive(&native_weak));
+        assert!(!crate::gc_test::alive(owner_weak));
+        assert!(!crate::gc_test::alive(native_weak));
         assert!(engine.interp.generators.is_empty());
     }
 
@@ -989,17 +958,18 @@ mod resource_id_tests {
 }
 
 /// P1 S2: the JavaScript values of a host type registered for tracing live exactly as its
-/// [`HostTrace`] reports.
-#[cfg(test)]
+/// [`HostTrace`] reports, through weak handles (S6 step 11b).
+#[cfg(all(test, feature = "embed"))]
 mod host_trace_tests {
     use super::*;
-    use crate::value::Object;
+    use crate::handles::WeakHandle;
+    use crate::scope::{Ctx, Value};
 
-    /// Reports `root` as a root and `target` as an edge from `owner`; `hidden` goes unreported.
+    /// Reports `root` as a root and `target` as an edge from `owner`.
     struct Slots {
-        root: Value,
-        owner: Value,
-        target: Value,
+        root: WeakHandle,
+        owner: WeakHandle,
+        target: WeakHandle,
     }
 
     impl HostTrace for Slots {
@@ -1009,7 +979,7 @@ mod host_trace_tests {
         }
     }
 
-    struct Resource(Value);
+    struct Resource(WeakHandle);
 
     impl HostTrace for Resource {
         fn trace_gc(&self, visitor: &mut dyn HostGcVisitor) {
@@ -1017,94 +987,84 @@ mod host_trace_tests {
         }
     }
 
-    fn marker(value: f64) -> Value {
-        let object = Object::new(None);
-        object
-            .borrow_mut()
-            .props
-            .insert("n", crate::value::Property::plain(Value::Num(value)));
-        Value::Obj(object)
+    /// A fresh object `{n: value}`, weakly.
+    fn marker(cx: &mut Ctx<'_>, value: f64) -> WeakHandle {
+        let object = Value::Obj(cx.new_object());
+        cx.member_set(&object, "n", Value::Num(value))
+            .unwrap_or_else(|_| panic!("set n"));
+        WeakHandle::new(cx, &object).expect("a weak handle")
     }
 
-    fn n(value: &Value) -> f64 {
-        let object = value.as_obj().expect("an object").borrow();
-        object
-            .props
-            .get("n")
-            .and_then(|property| property.value().as_num_opt())
-            .expect("marker number")
+    /// The `n` of a live marker.
+    fn n(engine: &mut crate::Engine, marker: &WeakHandle) -> f64 {
+        engine.scope(|cx| {
+            let object = marker
+                .upgrade(cx)
+                .expect("the engine's handle")
+                .expect("a live marker");
+            cx.member_get(&object, "n")
+                .ok()
+                .and_then(|n| n.as_num_opt())
+                .expect("marker number")
+        })
     }
 
     #[test]
     fn host_slots_and_resources_keep_what_they_report() {
         let mut engine = crate::Engine::new();
-        engine.interp.op_state().register_trace::<Slots>();
-        engine
-            .interp
-            .op_state()
-            .resources
-            .register_trace::<Resource>();
-        // The handles live in host state only (and in this helper's frame while it runs).
-        let (owner_weak, target_weak, rid) = crate::gc_test::in_frame(|| {
-            let owner = marker(2.0);
-            let target = marker(3.0);
-            engine.interp.op_state().put(Slots {
-                root: marker(1.0),
-                owner: owner.clone(),
-                target: target.clone(),
+        engine.op_state().register_trace::<Slots>();
+        engine.op_state().resources.register_trace::<Resource>();
+        // The markers live in host state only (and in this helper's frame while it runs).
+        let rid = crate::gc_test::in_frame(|| {
+            let (slots, resource) = engine.scope(|cx| {
+                (
+                    Slots {
+                        root: marker(cx, 1.0),
+                        owner: marker(cx, 2.0),
+                        target: marker(cx, 3.0),
+                    },
+                    Resource(marker(cx, 4.0)),
+                )
             });
-            let rid = engine
-                .interp
-                .op_state()
-                .resources
-                .add(Resource(marker(4.0)));
-            (
-                crate::value::Gc::downgrade(owner.as_obj().unwrap()),
-                crate::value::Gc::downgrade(target.as_obj().unwrap()),
-                rid,
-            )
+            engine.op_state().put(slots);
+            engine.op_state().resources.add(resource)
         });
         engine.interp.gc_collect();
         engine.interp.gc_collect();
-        let slots = engine.interp.op_state().get::<Slots>().expect("slots");
-        assert_eq!(n(&slots.root), 1.0, "a root survives");
+        let root = engine.host::<Slots>().expect("slots").root.clone();
+        assert_eq!(n(&mut engine, &root), 1.0, "a root survives");
         let resource = engine
-            .interp
             .op_state()
             .resources
             .get::<Resource>(rid)
             .expect("resource");
-        assert_eq!(n(&resource.0), 4.0, "a resource's root survives");
-        // Nothing keeps the edge's owner alive, so neither it nor its target survives; the
-        // slot's handles are dead and must not be used.
-        assert!(
-            !crate::gc_test::alive(&owner_weak),
-            "an unrooted owner dies"
+        assert_eq!(
+            n(&mut engine, &resource.0),
+            4.0,
+            "a resource's root survives"
         );
-        assert!(
-            !crate::gc_test::alive(&target_weak),
-            "its edge target dies with it"
-        );
+        // Nothing keeps the edge's owner alive, so neither it nor its target survives.
+        let slots = engine.host::<Slots>().expect("slots");
+        assert!(slots.owner.is_cleared(), "an unrooted owner dies");
+        assert!(slots.target.is_cleared(), "its edge target dies with it");
     }
 
     /// Tracing is opt-in (S6 step 11a): a type stored without registering its [`HostTrace`]
-    /// reports nothing, and what only it holds dies. Host state keeps values in handles.
+    /// reports nothing, and what only it holds dies.
     #[test]
     fn an_unregistered_host_type_reports_nothing() {
         let mut engine = crate::Engine::new();
-        let root_weak = crate::gc_test::in_frame(|| {
-            let root = marker(1.0);
-            let weak = crate::value::Gc::downgrade(root.as_obj().unwrap());
-            engine.interp.op_state().put(Slots {
-                root,
-                owner: Value::Undefined,
-                target: Value::Undefined,
+        crate::gc_test::in_frame(|| {
+            let slots = engine.scope(|cx| Slots {
+                root: marker(cx, 1.0),
+                owner: marker(cx, 2.0),
+                target: marker(cx, 3.0),
             });
-            weak
+            engine.op_state().put(slots);
         });
         engine.interp.gc_collect();
         assert!(
-            !crate::gc_test::alive(&root_weak),
+            engine.host::<Slots>().expect("slots").root.is_cleared(),
             "an unregistered type keeps nothing alive"
         );
     }
@@ -1112,51 +1072,48 @@ mod host_trace_tests {
     #[test]
     fn host_edges_keep_targets_while_their_owner_lives() {
         let mut engine = crate::Engine::new();
-        engine.interp.op_state().register_trace::<Slots>();
-        let target_weak = crate::gc_test::in_frame(|| {
-            let owner = marker(2.0);
-            let target = marker(3.0);
-            // The owner is reachable from the global object.
-            engine
-                .interp
-                .global
-                .borrow_mut()
-                .props
-                .insert("owner", crate::value::Property::plain(owner.clone()));
-            engine.interp.op_state().put(Slots {
-                root: Value::Undefined,
-                owner,
-                target: target.clone(),
+        engine.op_state().register_trace::<Slots>();
+        crate::gc_test::in_frame(|| {
+            let slots = engine.scope(|cx| {
+                let slots = Slots {
+                    root: marker(cx, 1.0),
+                    owner: marker(cx, 2.0),
+                    target: marker(cx, 3.0),
+                };
+                // The owner is reachable from the global object.
+                let owner = slots.owner.upgrade(cx).unwrap().unwrap();
+                let global = cx.global_this();
+                cx.member_set(&global, "owner", owner)
+                    .unwrap_or_else(|_| panic!("set owner"));
+                slots
             });
-            crate::value::Gc::downgrade(target.as_obj().unwrap())
+            engine.op_state().put(slots);
         });
         engine.interp.gc_collect();
-        assert!(
-            crate::gc_test::alive(&target_weak),
-            "a live owner keeps its target"
-        );
-        let slots = engine.interp.op_state().get::<Slots>().expect("slots");
-        assert_eq!(n(&slots.target), 3.0);
+        let target = engine.host::<Slots>().expect("slots").target.clone();
+        assert!(!target.is_cleared(), "a live owner keeps its target");
+        assert_eq!(n(&mut engine, &target), 3.0);
     }
 
+    /// A native closure keeps the JavaScript values it captures as engine captures, which live
+    /// as long as the function (S6 step 11b; before it, a reporter declared them).
     #[test]
     fn reported_native_closure_captures_survive() {
         let mut engine = crate::Engine::new();
         crate::gc_test::in_frame(|| {
-            let captured = marker(5.0);
-            let reporter = Rc::new(crate::gc_test::CapturedValues(vec![captured.clone()]));
-            let read = engine.interp.new_native_fn(
-                "readCaptured",
-                0,
-                Rc::new(move |_, _, _| Ok(Value::Num(n(&captured)))),
-                crate::value::NativeCaptures::Reported(reporter),
-            );
-            engine
-                .interp
-                .global
-                .borrow_mut()
-                .props
-                .insert("readCaptured", crate::value::Property::plain(read));
+            engine.scope(|cx| {
+                let captured = marker(cx, 5.0).upgrade(cx).unwrap().unwrap();
+                let read = cx.new_native_closure_with_captures(
+                    "readCaptured",
+                    0,
+                    |cx, _, _, captures| cx.member_get(&captures[0], "n"),
+                    &[captured],
+                    crate::value::NativeCaptures::None,
+                );
+                let global = cx.global_this();
+                cx.member_set(&global, "readCaptured", read)
+                    .unwrap_or_else(|_| panic!("install"));
+            });
         });
         engine.interp.gc_collect();
         engine.interp.gc_collect();

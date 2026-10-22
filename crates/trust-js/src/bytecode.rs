@@ -104,15 +104,22 @@ pub struct IcState {
     pub mid4_shape: u32,
 }
 
-/// Byte offsets into an [`IcState`] `Cell`, for the JIT inline templates.
+/// Byte offsets into an [`IcState`] `Cell`, for the JIT inline templates (the prototype-chain
+/// offsets for the aarch64 templates only).
 pub const IC_OFF_RECV_SHAPE: u32 = 0;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_HOLDER_SHAPE: u32 = 4;
 pub const IC_OFF_SLOT: u32 = 8;
 pub const IC_OFF_DEPTH: u32 = 12;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID_OK: u32 = 13;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID_SHAPE: u32 = 16;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID2_SHAPE: u32 = 20;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID3_SHAPE: u32 = 24;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID4_SHAPE: u32 = 28;
 
 pub const IC_EMPTY: u8 = u8::MAX;
@@ -970,7 +977,9 @@ pub struct InlineTarget {
     pub expected_genv: usize,
     /// Keeps the planning global-environment allocation from address reuse, without owning
     /// any bindings or Realm objects. Self-hosted callees may have a private environment
-    /// that does not retain this global environment. Native guards have no epoch check.
+    /// that does not retain this global environment. Native guards have no epoch check. Held,
+    /// never read.
+    #[allow(dead_code)]
     pub genv_pin: crate::interpreter::WeakEnv,
     pub argc: u16,
     /// Sloppy callee that reads `this`: the receiver must already be an object (the generic
@@ -1568,7 +1577,9 @@ pub enum Op {
     StoreCapInit(u32),
     /// `++`/`--` on a captured local, in place (the env-homed `UpdateLocal`).
     UpdateCap(u32, UpdKind),
-    /// `++`/`--` on a free binding resolved through the closure/global environment.
+    /// `++`/`--` on a free binding resolved through the closure/global environment. No
+    /// compiler path emits it (the module was public until S6 step 11b); its handlers stay.
+    #[allow(dead_code)]
     UpdateName(u32, UpdKind),
     /// [`Op::UpdateName`] with a per-site generation-checked name cache. The JIT uses it for a
     /// guarded numeric update; misses retain the complete free-name/ToNumeric semantics.
@@ -1615,6 +1626,8 @@ pub enum Op {
     /// after a suspended `super()` call, so entry-time frame seeding is not equivalent.
     LoadLexicalThis,
     /// RequireObjectCoercible on the top stack value while retaining it as a Reference base.
+    /// No compiler path emits it (as for [`Op::UpdateName`]).
+    #[allow(dead_code)]
     RequireObject,
     /// `obj.name`. First operand is the name index; second is the per-site inline-cache index into
     /// `Chunk::caches` (see `Interp::get_prop_ic`).
@@ -1703,6 +1716,8 @@ pub enum Op {
     /// tree-walker's normative Reference/GetV/default/IteratorClose implementation rather than
     /// maintaining a second subtly different algorithm. The compiler admits only patterns that
     /// cannot suspend this activation; the enclosing VM for-of handler owns any abrupt close.
+    /// No compiler path emits it (as for [`Op::UpdateName`]).
+    #[allow(dead_code)]
     AssignTarget(u32),
     /// Object assignment-rest: pop `count` already-normalized excluded property keys and the
     /// source value, then push CopyDataProperties(source, excludedNames).
@@ -1928,7 +1943,9 @@ pub enum Op {
     SuperUpdate(UpdKind),
     /// Push the realm-cached frozen template object for `Chunk::templates[site]`.
     TemplateObject(u32),
-    /// Tagged templates must reject a non-callable tag before evaluating substitutions.
+    /// Tagged templates must reject a non-callable tag before evaluating substitutions. No
+    /// compiler path emits it (as for [`Op::UpdateName`]).
+    #[allow(dead_code)]
     RequireCallable,
     /// Retained uncommon expression evaluated through the normative tree-walker against a
     /// projected view of this VM frame. Direct yield/await never enters this bridge.
@@ -8136,7 +8153,9 @@ pub struct InlineWay {
     pub check_this: bool,
     pub uses_this: bool,
     /// Free names the callee reads. The splice resolves them from the callee's own
-    /// [[Environment]] (`Op::LoadNameIn`), so caller bindings never shadow them.
+    /// [[Environment]] (`Op::LoadNameIn`), so caller bindings never shadow them. Recorded with
+    /// the plan; no Rust code reads it (the module was public until S6 step 11b).
+    #[allow(dead_code)]
     pub free_names: Vec<Rc<str>>,
     /// Exact caller environment required by the guard (zero: none). Splices no longer depend
     /// on the caller's environment; retained for the guard's encoding.

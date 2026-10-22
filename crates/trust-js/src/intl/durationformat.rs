@@ -25,7 +25,7 @@ const UNITS: &[(&str, &str)] = &[
     ("nanoseconds", "nanosecond"),
 ];
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DurationFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 1, |i, this, a| {

@@ -129,11 +129,11 @@ struct Accepted {
 
 /// `__http_server.listen(hostname, port, dispatch)` -> `[serverId, boundPort]`. Binds, registers
 /// the server, and arms the first accept. Throws if the bind fails.
-pub(crate) fn op_server_listen(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(crate) fn op_server_listen<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let host = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -187,11 +187,11 @@ pub(crate) fn op_server_listen(
 /// Serializes the response and writes it on the pool; the promise settles when the write
 /// finishes (or the client hung up). The socket is taken out of the resource table here, so a
 /// second respond on the same connection rejects.
-pub(crate) fn op_server_respond(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
+pub(crate) fn op_server_respond<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let conn_id = match args.first() {
         Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
         _ => return Err(ctx.make_error("TypeError", "respond: bad connection id")),
@@ -217,9 +217,7 @@ pub(crate) fn op_server_respond(
         .coerce_string(args.get(5).unwrap_or(&Value::Undefined))?
         .to_string();
     let (resolve, reject) = match (args.get(6), args.get(7)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            (res.clone(), rej.clone())
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => (*res, *rej),
         _ => return Err(ctx.make_error("TypeError", "respond expects (resolve, reject)")),
     };
 
@@ -253,7 +251,11 @@ pub(crate) fn op_server_respond(
 
 /// `__http_server.close(serverId)`. Flags the listener closed and pokes it with a throwaway
 /// connection so the blocked `accept()` wakes, sees the flag, and stops re-arming.
-pub(crate) fn op_server_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_server_close<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = match args.first() {
         Some(Value::Num(n)) if *n >= 0.0 => *n as u64,
         _ => return Ok(Value::Undefined),
@@ -286,12 +288,12 @@ fn wake_listener(local_addr: SocketAddr) {
 }
 
 /// `__http_server.version()` -> the runtime version string (backs `TRustJS.version`).
-pub(crate) fn op_server_version(
-    _ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
-    Ok(Value::from_string(env!("CARGO_PKG_VERSION").to_string()))
+pub(crate) fn op_server_version<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
+    Ok(_ctx.string(env!("CARGO_PKG_VERSION").to_string()))
 }
 
 // ---- completion decoders (run on the loop thread with &mut Ctx) --------------------------------
@@ -299,10 +301,10 @@ pub(crate) fn op_server_version(
 /// Settle one accept: on a request, stash the socket, re-arm the next accept, and return the
 /// args for `__dispatch(serverId, connId, method, url, headers, body, remoteHost, remotePort)`.
 /// On close, return `[serverId, -1]` (JS resolves `finished`) and do not re-arm.
-fn decode_accept(
-    ctx: &mut Ctx,
+fn decode_accept<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let AcceptTaskResult { server_id, outcome } = *payload
         .downcast::<AcceptTaskResult>()
         .expect("accept payload");
@@ -351,21 +353,21 @@ fn decode_accept(
     Ok(vec![
         Value::Num(server_id as f64),
         Value::Num(conn_id as f64),
-        Value::from_string(method),
-        Value::from_string(url),
+        ctx.string(method),
+        ctx.string(url),
         headers_val,
         body_val,
-        Value::from_string(peer.ip().to_string()),
+        ctx.string(peer.ip().to_string()),
         Value::Num(peer.port() as f64),
     ])
 }
 
 /// Settle a response write: `resolve()` on success, `reject(error)` if the socket write failed
 /// (client hung up mid-response, etc.).
-fn decode_write(
-    ctx: &mut Ctx,
+fn decode_write<'s>(
+    ctx: &mut Ctx<'s>,
     payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     match *payload
         .downcast::<Result<(), String>>()
         .expect("write payload")
@@ -378,8 +380,8 @@ fn decode_write(
 // ---- helpers ----------------------------------------------------------------------------------
 
 /// Register a fresh accept task (its `on_ok` is `dispatch`) and spawn it on the pool.
-fn arm_accept(
-    ctx: &mut Ctx,
+fn arm_accept<'s>(
+    ctx: &mut Ctx<'s>,
     server_id: u64,
     listener: Arc<TcpListener>,
     closed: Arc<AtomicBool>,
@@ -671,15 +673,10 @@ fn write_all_and_close(stream: TcpStream, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn header_pairs_to_js(ctx: &Ctx, headers: &[(String, String)]) -> Value {
+fn header_pairs_to_js<'s>(ctx: &Ctx<'s>, headers: &[(String, String)]) -> Value<'s> {
     let pairs = headers
         .iter()
-        .map(|(k, v)| {
-            ctx.make_array(vec![
-                Value::from_string(k.clone()),
-                Value::from_string(v.clone()),
-            ])
-        })
+        .map(|(k, v)| ctx.make_array(vec![ctx.string(k.clone()), ctx.string(v.clone())]))
         .collect();
     ctx.make_array(pairs)
 }

@@ -7,17 +7,18 @@
 //! The values a test watches are made in helper frames of their own, so that only handles keep
 //! them (see `gc_test`). The tests of survival run their engines' stress collections under
 //! `TRUST_JS_GC_STRESS`; those that watch what a particular collection does run on quiet engines
-//! (no stress or task-boundary collections).
+//! (no stress or task-boundary collections). Handles are made from a scope's values and read
+//! back into a scope (S6 step 11b).
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::embed::{CountedHandle, Handle, HandleError, WeakHandle};
+use crate::embed::{CountedHandle, Ctx, Handle, HandleError, Value, WeakHandle};
 use crate::gc_core::{CellAge, CollectionKind};
 use crate::gc_test::{alive, HiddenAddress};
-use crate::host::{HostGc, HostGcVisitor, HostTrace};
+use crate::host::{HostGc, HostGcVisitor, HostTrace, NativeGcId};
 use crate::interpreter::gc_collect::ClientReport;
-use crate::value::{Gc, Value, WeakGc};
+use crate::value::{Gc, WeakGc};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -27,12 +28,21 @@ fn eval(engine: &mut Engine, source: &str) -> String {
     }
 }
 
-/// The value of `source`, evaluated without a microtask checkpoint.
-fn value_of(engine: &mut Engine, source: &str) -> Value {
-    match engine.eval_value(source).expect("handle fixture parses") {
+/// The value of `source` in the scope `cx`, evaluated without a microtask checkpoint.
+fn value_of<'s>(cx: &mut Ctx<'s>, source: &str) -> Value<'s> {
+    match cx.eval_value(source).expect("handle fixture parses") {
         Ok(value) => value,
         Err(_) => panic!("{source} threw"),
     }
+}
+
+/// A handle to the value of `source`, made in a frame of its own.
+#[inline(never)]
+fn handle_of(engine: &mut Engine, source: &str) -> Handle {
+    engine.scope(|cx| {
+        let value = value_of(cx, source);
+        Handle::new(cx, &value).expect("a handle to a value of the engine")
+    })
 }
 
 /// An engine whose heap runs no stress or task-boundary collections: for tests that watch what
@@ -44,66 +54,80 @@ fn quiet_engine() -> Engine {
     engine
 }
 
+/// The engine handle of the object `value` is, watched weakly.
+fn observe(value: &Value<'_>) -> WeakGc {
+    Gc::downgrade(&value.as_obj().expect("an object").gc())
+}
+
 /// A new object `{tag}`, held only by the returned handle, and a weak observer of it; made in a
 /// frame of its own.
 #[inline(never)]
 fn held_object(engine: &mut Engine, tag: &str) -> (Handle, WeakGc) {
-    let value = value_of(engine, &format!("({{tag: '{tag}'}})"));
-    let handle = Handle::new(engine, &value).expect("a handle to a value of the engine");
-    let object = value.as_obj().expect("an object");
-    (handle, Gc::downgrade(object))
+    engine.scope(|cx| {
+        let value = value_of(cx, &format!("({{tag: '{tag}'}})"));
+        let handle = Handle::new(cx, &value).expect("a handle to a value of the engine");
+        (handle, observe(&value))
+    })
 }
 
 /// A new object, named only by the returned weak handle, and its address; made in a frame of
 /// its own.
 #[inline(never)]
 fn weak_object(engine: &mut Engine) -> (WeakHandle, HiddenAddress) {
-    let value = value_of(engine, "({tag: 'weak'})");
-    let weak = WeakHandle::new(engine, &value).expect("a weak handle to a value of the engine");
-    (weak, HiddenAddress::of(&value))
+    engine.scope(|cx| {
+        let value = value_of(cx, "({tag: 'weak'})");
+        let weak = WeakHandle::new(cx, &value).expect("a weak handle to a value of the engine");
+        (weak, HiddenAddress::of(value.as_internal()))
+    })
 }
 
 /// A new object held only by a counted handle of `count`, and a weak observer of it; made in a
 /// frame of its own.
 #[inline(never)]
 fn counted_object(engine: &mut Engine, count: u32) -> (CountedHandle, WeakGc) {
-    let value = value_of(engine, "({tag: 'counted'})");
-    let counted = CountedHandle::new(engine, &value, count).expect("a counted handle");
-    (counted, Gc::downgrade(value.as_obj().expect("an object")))
+    engine.scope(|cx| {
+        let value = value_of(cx, "({tag: 'counted'})");
+        let counted = CountedHandle::new(cx, &value, count).expect("a counted handle");
+        (counted, observe(&value))
+    })
 }
 
 /// The tag of the object `handle` holds, read in a frame of its own.
 #[inline(never)]
 fn tag(engine: &mut Engine, handle: &Handle) -> String {
-    let value = handle.get(engine).expect("the engine's handle");
-    let tag = engine
-        .interp
-        .member_get(&value, "tag")
-        .unwrap_or_else(|_| panic!("reading the tag threw"));
-    tag.as_text().expect("a string tag").into_owned()
+    engine.scope(|cx| {
+        let value = handle.get(cx).expect("the engine's handle");
+        let tag = cx
+            .member_get(&value, "tag")
+            .unwrap_or_else(|_| panic!("reading the tag threw"));
+        tag.as_text().expect("a string tag").into_owned()
+    })
 }
 
 /// The age of the cell `handle` holds, asked in a frame of its own.
 #[inline(never)]
-fn age(engine: &Engine, handle: &Handle) -> Option<CellAge> {
-    let word = handle
-        .get(engine)
-        .expect("the engine's handle")
-        .cell_word()
-        .expect("a cell value");
-    engine.interp.gc_heap.core.borrow().cell_age(word)
+fn age(engine: &mut Engine, handle: &Handle) -> Option<CellAge> {
+    engine.scope(|cx| {
+        let word = handle
+            .get(cx)
+            .expect("the engine's handle")
+            .into_internal()
+            .cell_word()
+            .expect("a cell value");
+        cx.interp().gc_heap.core.borrow().cell_age(word)
+    })
 }
 
 /// Whether `weak` still names its value, asked in a frame of its own.
 #[inline(never)]
-fn named(engine: &Engine, weak: &WeakHandle) -> bool {
-    weak.upgrade(engine).expect("the engine's handle").is_some()
+fn named(engine: &mut Engine, weak: &WeakHandle) -> bool {
+    engine.scope(|cx| weak.upgrade(cx).expect("the engine's handle").is_some())
 }
 
 /// Whether the counted handle still names its value, asked in a frame of its own.
 #[inline(never)]
-fn counted_named(engine: &Engine, counted: &CountedHandle) -> bool {
-    counted.get(engine).expect("the engine's handle").is_some()
+fn counted_named(engine: &mut Engine, counted: &CountedHandle) -> bool {
+    engine.scope(|cx| counted.get(cx).expect("the engine's handle").is_some())
 }
 
 /// What the client of the heap's last collection reported.
@@ -134,11 +158,15 @@ fn a_handle_keeps_a_young_object_through_minor_and_major_collections() {
     engine.interp.gc_collect();
     let (handle, weak) = held_object(&mut engine, "young");
     if !stressed() {
-        assert_eq!(age(&engine, &handle), Some(CellAge::Young));
+        assert_eq!(age(&mut engine, &handle), Some(CellAge::Young));
     }
     engine.interp.gc_collect_minor();
     assert!(alive(&weak), "the minor collection kept it");
-    assert_eq!(age(&engine, &handle), Some(CellAge::Old), "and promoted it");
+    assert_eq!(
+        age(&mut engine, &handle),
+        Some(CellAge::Old),
+        "and promoted it"
+    );
     eval(&mut engine, "for (let i = 0; i < 3000; i++) ({i}); 0");
     engine.interp.gc_collect();
     assert!(alive(&weak), "the major collection kept it");
@@ -153,7 +181,7 @@ fn a_handle_keeps_an_old_object_that_nothing_else_holds() {
     let mut engine = Engine::new();
     let (handle, weak) = held_object(&mut engine, "old");
     engine.interp.gc_collect();
-    assert_eq!(age(&engine, &handle), Some(CellAge::Old));
+    assert_eq!(age(&mut engine, &handle), Some(CellAge::Old));
     for _ in 0..3 {
         eval(
             &mut engine,
@@ -190,8 +218,8 @@ struct Kept(Vec<Handle>);
 
 /// `keep(value)`: hold `value` in the host state, in a handle made through the native call's
 /// context.
-fn keep(ctx: &mut crate::embed::Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
+fn keep<'s>(ctx: &mut Ctx<'s>, _: Value<'s>, args: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
+    let value = args.first().copied().unwrap_or(Value::Undefined);
     let handle =
         Handle::new(ctx, &value).map_err(|e| ctx.make_error("TypeError", e.to_string()))?;
     ctx.host_mut::<Kept>().expect("kept state").0.push(handle);
@@ -204,7 +232,7 @@ fn keep(ctx: &mut crate::embed::Ctx, _: Value, args: &[Value]) -> Result<Value, 
 #[test]
 fn host_state_keeps_values_in_handles_made_through_the_native_context() {
     let mut engine = Engine::new();
-    engine.interp.op_state().put(Kept::default());
+    engine.op_state().put(Kept::default());
     engine.define_global("keep", 1, keep);
     eval(
         &mut engine,
@@ -218,13 +246,13 @@ fn host_state_keeps_values_in_handles_made_through_the_native_context() {
         engine.interp.gc_collect_minor();
         engine.interp.gc_collect();
     }
-    let kept = std::mem::take(&mut engine.interp.op_state().get_mut::<Kept>().expect("kept").0);
+    let kept = std::mem::take(&mut engine.host_mut::<Kept>().expect("kept").0);
     assert_eq!(tag(&mut engine, &kept[0]), "kept object");
-    let string = kept[1].get(&engine).expect("the engine's handle");
-    assert_eq!(
-        string.as_text().as_deref(),
-        Some("a string made at run time")
-    );
+    let string = engine.scope(|cx| {
+        let string = kept[1].get(cx).expect("the engine's handle");
+        string.as_text().map(|text| text.into_owned())
+    });
+    assert_eq!(string.as_deref(), Some("a string made at run time"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -234,57 +262,71 @@ fn host_state_keeps_values_in_handles_made_through_the_native_context() {
 /// dropping it do not touch the freed heap.
 #[test]
 fn handles_of_a_dropped_engine_are_inert() {
-    let other = Engine::new();
+    let mut other = Engine::new();
     let (strong, weak, mut counted) = {
         let mut engine = Engine::new();
-        let value = value_of(&mut engine, "({tag: 'gone'})");
-        (
-            Handle::new(&engine, &value).expect("a handle"),
-            WeakHandle::new(&engine, &value).expect("a weak handle"),
-            CountedHandle::new(&engine, &value, 1).expect("a counted handle"),
-        )
+        engine.scope(|cx| {
+            let value = value_of(cx, "({tag: 'gone'})");
+            (
+                Handle::new(cx, &value).expect("a handle"),
+                WeakHandle::new(cx, &value).expect("a weak handle"),
+                CountedHandle::new(cx, &value, 1).expect("a counted handle"),
+            )
+        })
     };
-    assert_eq!(err(strong.get(&other)), HandleError::Released);
-    assert_eq!(err(weak.upgrade(&other)), HandleError::Released);
+    other.scope(|cx| {
+        assert_eq!(err(strong.get(cx)), HandleError::Released);
+        assert_eq!(err(weak.upgrade(cx)), HandleError::Released);
+        assert_eq!(err(counted.get(cx)), HandleError::Released);
+    });
     assert!(
         weak.is_cleared(),
         "a released heap's weak handle is cleared"
     );
-    assert_eq!(err(counted.get(&other)), HandleError::Released);
     assert_eq!(err(strong.downgrade()), HandleError::Released);
     assert_eq!(err(counted.decrement()), HandleError::Released);
     let clone = strong.clone();
-    assert_eq!(err(clone.get(&other)), HandleError::Released);
+    other.scope(|cx| assert_eq!(err(clone.get(cx)), HandleError::Released));
     drop((clone, strong, weak.clone(), weak, counted));
 }
 
-/// A handle used with another Engine, or a value of another Engine given to one, is refused,
-/// and the handle still reads through its own Engine.
+/// A handle read through another Engine's scope is refused, and still reads through its own
+/// Engine. A value of another Engine cannot reach a scope (its brand is another scope's: see
+/// the embed module's compile_fail examples); the handles' own check refuses one made to cross
+/// regardless, here forged from the engine's internal value.
 #[test]
 fn handles_and_values_of_another_engine_are_refused() {
     let mut first = Engine::new();
-    let second = Engine::new();
-    let value = value_of(&mut first, "({tag: 'first'})");
-    let handle = Handle::new(&first, &value).expect("a handle");
-    assert_eq!(err(handle.get(&second)), HandleError::Foreign);
-    assert_eq!(err(Handle::new(&second, &value)), HandleError::Foreign);
-    assert_eq!(err(WeakHandle::new(&second, &value)), HandleError::Foreign);
-    assert_eq!(
-        err(CountedHandle::new(&second, &value, 1)),
-        HandleError::Foreign
-    );
-    assert_eq!(err(handle.set(&second, &value)), HandleError::Foreign);
-    let weak = handle.downgrade().expect("a weak handle");
-    assert_eq!(err(weak.upgrade(&second)), HandleError::Foreign);
-    // A string is a cell of its own Engine's heap too.
-    let text = value_of(&mut first, "['first', 'engine'].join(' ')");
-    assert_eq!(err(Handle::new(&second, &text)), HandleError::Foreign);
-    // Primitives belong to no heap.
-    let number = Handle::new(&second, &Value::Num(1.5)).expect("a primitive");
-    assert_eq!(
-        number.get(&second).expect("its own").as_num_opt(),
-        Some(1.5)
-    );
+    let mut second = Engine::new();
+    let handle = handle_of(&mut first, "({tag: 'first'})");
+    let text = handle_of(&mut first, "['first', 'engine'].join(' ')");
+    // The engine values, unbranded (the crate's own form): forged into the second's scopes.
+    let (object, string) = first.scope(|cx| {
+        (
+            handle.get(cx).unwrap().into_internal(),
+            text.get(cx).unwrap().into_internal(),
+        )
+    });
+    second.scope(|cx| {
+        assert_eq!(err(handle.get(cx)), HandleError::Foreign);
+        let foreign = Value::from_internal(object.clone());
+        assert_eq!(err(Handle::new(cx, &foreign)), HandleError::Foreign);
+        assert_eq!(err(WeakHandle::new(cx, &foreign)), HandleError::Foreign);
+        assert_eq!(
+            err(CountedHandle::new(cx, &foreign, 1)),
+            HandleError::Foreign
+        );
+        assert_eq!(err(handle.set(cx, &foreign)), HandleError::Foreign);
+        let weak = handle.downgrade().expect("a weak handle");
+        assert_eq!(err(weak.upgrade(cx)), HandleError::Foreign);
+        // A string is a cell of its own Engine's heap too.
+        let foreign = Value::from_internal(string.clone());
+        assert_eq!(err(Handle::new(cx, &foreign)), HandleError::Foreign);
+        // Primitives belong to no heap.
+        let number = Handle::new(cx, &Value::Num(1.5)).expect("a primitive");
+        assert_eq!(number.get(cx).expect("its own").as_num_opt(), Some(1.5));
+    });
+    drop((object, string));
     assert_eq!(tag(&mut first, &handle), "first");
 }
 
@@ -297,10 +339,10 @@ fn a_weak_handle_to_a_young_object_is_cleared_by_a_minor_collection() {
     let mut engine = quiet_engine();
     engine.interp.gc_collect();
     let (weak, _) = weak_object(&mut engine);
-    assert!(named(&engine, &weak));
+    assert!(named(&mut engine, &weak));
     assert!(!weak.is_cleared());
     engine.interp.gc_collect_minor();
-    assert!(!named(&engine, &weak));
+    assert!(!named(&mut engine, &weak));
     assert!(weak.is_cleared());
 }
 
@@ -313,15 +355,18 @@ fn a_weak_handle_to_an_old_object_is_cleared_by_a_major_collection() {
     let (strong, observer) = held_object(&mut engine, "old");
     let weak = strong.downgrade().expect("a weak handle");
     engine.interp.gc_collect();
-    assert_eq!(age(&engine, &strong), Some(CellAge::Old));
+    assert_eq!(age(&mut engine, &strong), Some(CellAge::Old));
     drop(strong);
     engine.interp.gc_collect_minor();
     assert!(
-        named(&engine, &weak),
+        named(&mut engine, &weak),
         "a minor collection frees no old cell"
     );
     engine.interp.gc_collect();
-    assert!(!named(&engine, &weak), "a major collection found it dead");
+    assert!(
+        !named(&mut engine, &weak),
+        "a major collection found it dead"
+    );
     assert!(!alive(&observer));
 }
 
@@ -342,17 +387,20 @@ fn a_counted_handle_is_strong_above_zero_and_weak_at_zero() {
     assert!(alive(&weak), "weak and strong again: kept");
     assert_eq!(counted.decrement(), Ok(1));
     assert_eq!(counted.decrement(), Ok(0));
-    assert!(counted_named(&engine, &counted), "not collected yet");
+    assert!(counted_named(&mut engine, &counted), "not collected yet");
     engine.interp.gc_collect();
     assert!(!alive(&weak), "a count of 0 let it die");
-    assert!(!counted_named(&engine, &counted));
+    assert!(!counted_named(&mut engine, &counted));
     assert_eq!(counted.increment(), Ok(1));
-    assert!(!counted_named(&engine, &counted), "a dead value stays dead");
+    assert!(
+        !counted_named(&mut engine, &counted),
+        "a dead value stays dead"
+    );
     // A young value at a count of 0 dies at a minor collection.
     let (counted, weak) = counted_object(&mut engine, 0);
     engine.interp.gc_collect_minor();
     assert!(!alive(&weak));
-    assert!(!counted_named(&engine, &counted));
+    assert!(!counted_named(&mut engine, &counted));
 }
 
 /// Whether a cell is allocated at `address` again, asked in a frame of its own.
@@ -373,7 +421,7 @@ fn a_weak_handle_never_yields_a_new_object_at_its_dead_objects_address() {
     engine.interp.gc_collect();
     let (weak, address) = weak_object(&mut engine);
     engine.interp.gc_collect_minor();
-    assert!(!named(&engine, &weak), "cleared as its object died");
+    assert!(!named(&mut engine, &weak), "cleared as its object died");
     assert!(!reallocated(&engine, address), "its cell was freed");
     eval(
         &mut engine,
@@ -383,7 +431,7 @@ fn a_weak_handle_never_yields_a_new_object_at_its_dead_objects_address() {
         reallocated(&engine, address),
         "a new object took the dead object's address"
     );
-    assert!(!named(&engine, &weak));
+    assert!(!named(&mut engine, &weak));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -397,8 +445,10 @@ fn a_minor_collection_reports_only_the_handles_written_since_the_last_collection
     let mut engine = quiet_engine();
     let (first, _) = held_object(&mut engine, "first");
     let (keeper, _) = held_object(&mut engine, "counted");
-    let kept = keeper.get(&engine).expect("the engine's handle");
-    let mut counted = CountedHandle::new(&engine, &kept, 0).expect("a counted handle");
+    let mut counted = engine.scope(|cx| {
+        let kept = keeper.get(cx).expect("the engine's handle");
+        CountedHandle::new(cx, &kept, 0).expect("a counted handle")
+    });
     engine.interp.gc_collect();
     let major = report(&engine);
     assert_eq!(major.kind, Some(CollectionKind::Major));
@@ -414,8 +464,10 @@ fn a_minor_collection_reports_only_the_handles_written_since_the_last_collection
     let _weak = second.downgrade().expect("a weak handle");
     engine.interp.gc_collect_minor();
     assert_eq!(report(&engine).handle_slots, vec![second.slot()], "made");
-    let young = value_of(&mut engine, "({tag: 'retargeted'})");
-    first.set(&engine, &young).expect("a value of the engine");
+    engine.scope(|cx| {
+        let young = value_of(cx, "({tag: 'retargeted'})");
+        first.set(cx, &young).expect("a value of the engine");
+    });
     engine.interp.gc_collect_minor();
     assert_eq!(
         report(&engine).handle_slots,
@@ -479,21 +531,20 @@ impl HostTrace for WriteInSweep {
 }
 
 impl HostGc for WriteInSweep {
-    fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {
+    fn sweep_gc_with_native(&mut self, _: &dyn Fn(NativeGcId) -> bool) {
         self.result.set(Some(self.handle.downgrade().map(drop)));
     }
 }
 
 /// A sweep of `engine`'s host state writes a handle at its next collection.
 fn write_in_sweep(engine: &mut Engine) -> Rc<Cell<Option<Result<(), HandleError>>>> {
-    let value = value_of(engine, "({})");
     let result = Rc::new(Cell::new(None));
-    let handle = Handle::new(engine, &value).expect("a handle");
-    engine.interp.op_state().put(WriteInSweep {
+    let handle = handle_of(engine, "({})");
+    engine.op_state().put(WriteInSweep {
         handle,
         result: result.clone(),
     });
-    engine.interp.op_state().register_gc::<WriteInSweep>();
+    engine.op_state().register_gc::<WriteInSweep>();
     result
 }
 
@@ -525,11 +576,13 @@ fn writing_a_handle_during_a_collection_is_refused() {
 #[test]
 fn the_memory_record_counts_the_live_handles() {
     let mut engine = Engine::new();
-    let value = value_of(&mut engine, "({})");
-    let strong = Handle::new(&engine, &value).expect("a handle");
+    let strong = handle_of(&mut engine, "({})");
     let clone = strong.clone();
     let weak = strong.downgrade().expect("a weak handle");
-    let counted = CountedHandle::new(&engine, &value, 0).expect("a counted handle");
+    let counted = engine.scope(|cx| {
+        let value = strong.get(cx).expect("the engine's handle");
+        CountedHandle::new(cx, &value, 0).expect("a counted handle")
+    });
     let json = crate::memory::json(&engine.interp);
     assert!(
         json.contains("\"handles\":{\"strong\":1,\"weak\":2}"),

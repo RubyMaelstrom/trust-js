@@ -8,8 +8,6 @@
 use crate::bytecode::Tier;
 use crate::value::{Gc, Property, Value};
 use crate::{Completion, Engine};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// An engine at `tier` whose `collect()` collects (explicitly, from inside the running code).
 fn engine(tier: Tier) -> Engine {
@@ -143,135 +141,27 @@ fn deferred_prototype_materialization_records_its_cell() {
     assert_eq!(eval(&mut engine, "F.prototype === undefined"), "true");
 }
 
-/// A host reporter whose values change after its function's creation (the default
-/// `reports_fixed_values`): the function is rescanned at every collection, its card set as each
-/// starts. Here the reporter's value changes outside the engine altogether.
+/// `Error.captureStackTrace`'s getter keeps its frames' names, engine strings, as engine
+/// captures of the getter (S6 step 11b; before it, its host reporter reported them): they
+/// survive minor and major collections, and the stack reads after them.
 #[test]
-fn changing_host_reporter_is_rescanned_at_every_collection() {
-    struct Slot(RefCell<Value>);
-    impl crate::value::NativeCallableRetained for Slot {
-        fn scan_retained_memory(
-            &self,
-            visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor,
-        ) {
-            visitor.value(&self.0.borrow());
-        }
-    }
-    let mut engine = engine(Tier::Interp);
-    let slot = Rc::new(Slot(RefCell::new(Value::Undefined)));
-    let held = slot.clone();
-    let keep = engine.interp.new_native_fn(
-        "keep",
-        0,
-        Rc::new(move |_, _, _| Ok(held.0.borrow().clone())),
-        crate::value::NativeCaptures::Reported(slot.clone()),
-    );
-    let function = keep.as_obj().copied().expect("a function");
-    assert!(engine
-        .interp
-        .gc_heap
-        .rescanned_natives
-        .borrow()
-        .contains(&(Gc::as_ptr(&function) as usize)));
-    engine
-        .interp
-        .global
-        .borrow_mut()
-        .props
-        .insert("keep", Property::builtin(keep));
-    engine.interp.gc_collect();
-    for round in 0..3 {
-        let young = engine.interp.new_object();
-        young
-            .borrow_mut()
-            .props
-            .insert("round", Property::plain(Value::Num(f64::from(round))));
-        *slot.0.borrow_mut() = Value::Obj(young);
-        engine.interp.gc_collect();
-        assert_eq!(eval(&mut engine, "keep().round"), round.to_string());
-    }
-    // A reporter whose values are fixed is not rescanned.
-    let fixed = engine.interp.new_native_fn(
-        "fixed",
-        0,
-        Rc::new(|_, _, _| Ok(Value::Undefined)),
-        crate::value::NativeCaptures::Reported(Rc::new(FixedValues)),
-    );
-    let fixed = fixed.as_obj().copied().expect("a function");
-    assert!(!engine
-        .interp
-        .gc_heap
-        .rescanned_natives
-        .borrow()
-        .contains(&(Gc::as_ptr(&fixed) as usize)));
-}
-
-/// A reporter that declares its (absent) values fixed.
-struct FixedValues;
-
-impl crate::value::NativeCallableRetained for FixedValues {
-    fn scan_retained_memory(&self, _: &mut dyn crate::value::NativeRetainedMemoryVisitor) {}
-
-    fn reports_fixed_values(&self) -> bool {
-        true
-    }
-}
-
-/// `Error.captureStackTrace`'s getter reports its frames' names, captured before it is made and
-/// never changed (only the formatted lines, a Rust string, are built later): its values are
-/// fixed, and it is not rescanned.
-#[test]
-fn captured_stack_getter_is_not_rescanned() {
+fn captured_stack_getter_keeps_its_frame_names() {
     let mut engine = engine(Tier::Interp);
     let source = r#"
         function named() { var e = {}; Error.captureStackTrace(e); return e; }
         var e = named();
-        var get = Object.getOwnPropertyDescriptor(e, "stack").get;
         0
     "#;
     eval(&mut engine, source);
-    let get = global_object(&mut engine, "get");
-    assert!(!engine
-        .interp
-        .gc_heap
-        .rescanned_natives
-        .borrow()
-        .contains(&(Gc::as_ptr(&get) as usize)));
-    engine.interp.gc_collect();
-    assert_eq!(eval(&mut engine, "/at named/.test(e.stack)"), "true");
-}
-
-/// A rescanned function's entry goes with it: the collection that finds it dead evicts it
-/// before its cell is freed.
-#[test]
-fn a_dead_rescanned_function_leaves_the_table() {
-    let mut engine = engine(Tier::Interp);
-    // The function's address, complemented: the conservative stack scan would keep a cell
-    // whose address this frame holds.
-    let hidden = crate::gc_test::in_frame(|| {
-        let keep = engine.interp.new_native_fn(
-            "keep",
-            0,
-            Rc::new(|_, _, _| Ok(Value::Undefined)),
-            crate::value::NativeCaptures::Reported(Rc::new(crate::gc_test::CapturedValues(
-                Vec::new(),
-            ))),
+    for _ in 0..2 {
+        eval(
+            &mut engine,
+            "var churn = []; for (let i = 0; i < 3000; i++) churn.push({i}); churn = null; 0",
         );
-        !(Gc::as_ptr(keep.as_obj().expect("a function")) as usize)
-    });
-    let listed = |engine: &Engine| {
-        crate::gc_test::in_frame(|| {
-            engine
-                .interp
-                .gc_heap
-                .rescanned_natives
-                .borrow()
-                .contains(&!hidden)
-        })
-    };
-    assert!(listed(&engine));
-    engine.interp.gc_collect();
-    assert!(!listed(&engine), "evicted with its function");
+        engine.interp.gc_collect_minor();
+        engine.interp.gc_collect();
+    }
+    assert_eq!(eval(&mut engine, "/at named/.test(e.stack)"), "true");
 }
 
 #[cfg(all(

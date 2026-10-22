@@ -691,15 +691,19 @@ fn sha512_variant(v: u32) -> (&'static [u64; 8], usize) {
 
 // ---- ops --------------------------------------------------------------------------------------
 
-fn bytes_arg(ctx: &Ctx, args: &[Value], idx: usize) -> Option<Vec<u8>> {
+fn bytes_arg<'s>(ctx: &Ctx<'s>, args: &[Value<'s>], idx: usize) -> Option<Vec<u8>> {
     ctx.typed_array_bytes(args.get(idx)?)
 }
 
-fn make_aes(ctx: &mut Ctx, key: &[u8]) -> Result<Aes, Value> {
+fn make_aes<'s>(ctx: &mut Ctx<'s>, key: &[u8]) -> Result<Aes, Value<'s>> {
     Aes::new(key).ok_or_else(|| ctx.make_error("Error", "Invalid AES key length"))
 }
 
-fn op_aes_ecb(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_aes_ecb<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let encrypt = matches!(args.first(), Some(Value::Bool(true)));
     let key = bytes_arg(ctx, args, 1)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
@@ -713,7 +717,11 @@ fn op_aes_ecb(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     ctx.make_uint8array(&out)
 }
 
-fn op_aes_cbc(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_aes_cbc<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let encrypt = matches!(args.first(), Some(Value::Bool(true)));
     let key = bytes_arg(ctx, args, 1)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
@@ -734,7 +742,11 @@ fn op_aes_cbc(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     ctx.make_uint8array(&out)
 }
 
-fn op_aes_ctr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_aes_ctr<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = bytes_arg(ctx, args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 1)
@@ -751,7 +763,11 @@ fn op_aes_ctr(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
     ctx.make_uint8array(&out)
 }
 
-fn op_aes_gcm_encrypt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_aes_gcm_encrypt<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = bytes_arg(ctx, args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 1)
@@ -768,7 +784,11 @@ fn op_aes_gcm_encrypt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
     ctx.make_uint8array(&out)
 }
 
-fn op_aes_gcm_decrypt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_aes_gcm_decrypt<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = bytes_arg(ctx, args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 1)
@@ -788,7 +808,11 @@ fn op_aes_gcm_decrypt(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 
 /// `gcmInit(key, iv)` — the initial GCM counter block `inc32(J0)`, so the JS glue can stream the
 /// GCTR keystream itself (via batched `aesEcb` calls) while Rust keeps the GHASH math.
-fn op_gcm_init(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_gcm_init<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = bytes_arg(ctx, args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 1)
@@ -803,7 +827,11 @@ fn op_gcm_init(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Val
 
 /// `gcmTag(key, iv, aad, ciphertext)` — the full 16-byte GCM authentication tag over already
 /// accumulated ciphertext (both encrypt and decrypt sides verify/emit through this).
-fn op_gcm_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_gcm_tag<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let key = bytes_arg(ctx, args, 0)
         .ok_or_else(|| ctx.make_error("TypeError", "key must be a buffer"))?;
     let iv = bytes_arg(ctx, args, 1)
@@ -822,7 +850,11 @@ fn op_gcm_tag(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 
 /// `sha512(variant, data)` — one-shot SHA-512-family digest.
 /// Variant: 0 = sha512, 1 = sha384, 2 = sha512-224, 3 = sha512-256.
-fn op_sha512(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_sha512<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().and_then(|v| v.as_num_opt()).unwrap_or(0.0) as u32;
     let data = bytes_arg(ctx, args, 1)
         .ok_or_else(|| ctx.make_error("TypeError", "data must be a buffer"))?;
@@ -833,7 +865,11 @@ fn op_sha512(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 
 /// `scryptRomix(B, N, r)` — run ROMix over each `128*r`-byte block of `B` (there are `p` of them).
 /// `B` comes from the JS PBKDF2 expansion; the result is fed back into the final PBKDF2 pass.
-fn op_scrypt_romix(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_scrypt_romix<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mut b =
         bytes_arg(ctx, args, 0).ok_or_else(|| ctx.make_error("TypeError", "B must be a buffer"))?;
     let n = args.get(1).and_then(|v| v.as_num_opt()).unwrap_or(0.0) as u64;

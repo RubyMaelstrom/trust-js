@@ -21,7 +21,7 @@ impl Write for Captured {
 fn rsa_no_padding_supports_public_and_private_transforms() {
     let mut rt = Runtime::new();
     let out = Captured::default();
-    rt.engine().ctx().op_state().put(ConsoleOut {
+    rt.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

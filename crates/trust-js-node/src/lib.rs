@@ -39,7 +39,7 @@ mod sqlite;
 mod tls;
 
 /// The runtime's blocking-work spawner (threadpool), for async ops.
-fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
+fn spawn_handle<'s>(ctx: &mut Ctx<'s>) -> SpawnHandle {
     ctx.op_state()
         .get::<SpawnHandle>()
         .expect("runtime installs the spawn handle")
@@ -175,63 +175,99 @@ pub fn extension() -> Extension {
 const JS_GLUE: &str = include_str!(concat!(env!("OUT_DIR"), "/node_glue.js"));
 const JS_GLUE_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node_glue.snap"));
 
-fn arg_path(ctx: &mut Ctx, args: &[Value]) -> Result<String, Value> {
+fn arg_path<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<String, Value<'s>> {
     Ok(ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string())
 }
 
-fn op_is_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_is_file<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     Ok(Value::Bool(Path::new(&p).is_file()))
 }
 
-fn op_is_proxy(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_is_proxy<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Bool(
         ctx.is_proxy_value(args.first().unwrap_or(&Value::Undefined)),
     ))
 }
 
-fn op_collect_garbage(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_collect_garbage<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(ctx.collect_garbage_for_host() as f64))
 }
 
-fn op_heap_object_count(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_heap_object_count<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     Ok(Value::Num(ctx.live_object_count() as f64))
 }
 
-fn op_drain_microtasks(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_drain_microtasks<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     ctx.drain_microtasks_for_host();
     Ok(Value::Undefined)
 }
 
-fn op_transform_jsx(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_transform_jsx<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let source = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
     jsx::transform(&source)
-        .map(Value::from_string)
+        .map(|code| ctx.string(code))
         .map_err(|message| ctx.make_error("SyntaxError", message))
 }
 
-fn op_is_dir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_is_dir<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     Ok(Value::Bool(Path::new(&p).is_dir()))
 }
 
 /// Read a module/JSON source as text; a miss is an error the resolver turns into
 /// MODULE_NOT_FOUND context.
-fn op_read_text(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_text<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::read_to_string(&p) {
-        Ok(s) => Ok(Value::from_string(s)),
+        Ok(s) => Ok(ctx.string(s)),
         Err(e) => Err(ctx.make_error("Error", format!("cannot read '{p}': {e}"))),
     }
 }
 
 /// Read a file as raw bytes (a Uint8Array), for `fs.readFileSync` without an encoding — the text
 /// path corrupts binary. Errors carry the errno `code` Node users switch on.
-fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_read_bytes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::read(&p) {
         Ok(bytes) => ctx.make_uint8array(&bytes),
@@ -242,7 +278,7 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
                 std::io::ErrorKind::PermissionDenied => "EACCES",
                 _ => "EIO",
             };
-            let _ = ctx.set_member(&err, "code", Value::str(code));
+            let _ = ctx.set_member(&err, "code", ctx.str(code));
             Err(err)
         }
     }
@@ -250,17 +286,21 @@ fn op_read_bytes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
 
 /// Canonicalize (resolve symlinks) for the module cache key; falls back to the input when the
 /// path doesn't exist yet (matching how the JS resolver probes candidates).
-fn op_realpath(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_realpath<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::canonicalize(&p) {
-        Ok(c) => Ok(Value::from_string(c.to_string_lossy().into_owned())),
-        Err(_) => Ok(Value::from_string(p)),
+        Ok(c) => Ok(ctx.string(c.to_string_lossy().into_owned())),
+        Err(_) => Ok(ctx.string(p)),
     }
 }
 
 /// Build a Stats-shaped object from real filesystem metadata (the JS glue wraps it with the
 /// `isFile()`/`isDirectory()`/… methods). `kind` lets the glue answer those without re-probing.
-fn stat_object(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
+fn stat_object<'s>(ctx: &mut Ctx<'s>, meta: &std::fs::Metadata) -> Value<'s> {
     let ms = |t: std::io::Result<std::time::SystemTime>| -> f64 {
         t.ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -278,7 +318,7 @@ fn stat_object(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
         "other"
     };
     let o = Value::Obj(ctx.new_object());
-    let set = |o: &Value, k: &str, v: f64, ctx: &mut Ctx| {
+    let set = |o: &Value<'s>, k: &str, v: f64, ctx: &mut Ctx<'s>| {
         let _ = ctx.set_member(o, k, Value::Num(v));
     };
     set(&o, "size", meta.len() as f64, ctx);
@@ -344,12 +384,12 @@ fn stat_object(ctx: &mut Ctx, meta: &std::fs::Metadata) -> Value {
         set(&o, "blksize", 4096.0, ctx);
         set(&o, "blocks", ((meta.len() + 511) / 512) as f64, ctx);
     }
-    let _ = ctx.set_member(&o, "kind", Value::str(kind));
+    let _ = ctx.set_member(&o, "kind", ctx.str(kind));
     o
 }
 
 /// An errno-tagged filesystem error (the `code` Node users switch on), from a `std::io::Error`.
-fn fs_error(ctx: &mut Ctx, op: &str, path: &str, e: &std::io::Error) -> Value {
+fn fs_error<'s>(ctx: &mut Ctx<'s>, op: &str, path: &str, e: &std::io::Error) -> Value<'s> {
     let code = match e.kind() {
         std::io::ErrorKind::NotFound => "ENOENT",
         std::io::ErrorKind::PermissionDenied => "EACCES",
@@ -362,14 +402,18 @@ fn fs_error(ctx: &mut Ctx, op: &str, path: &str, e: &std::io::Error) -> Value {
         },
     };
     let err = ctx.make_error("Error", format!("{code}: {e}, {op} '{path}'"));
-    let _ = ctx.set_member(&err, "code", Value::str(code));
-    let _ = ctx.set_member(&err, "path", Value::str(path));
-    let _ = ctx.set_member(&err, "syscall", Value::str(op));
+    let _ = ctx.set_member(&err, "code", ctx.str(code));
+    let _ = ctx.set_member(&err, "path", ctx.str(path));
+    let _ = ctx.set_member(&err, "syscall", ctx.str(op));
     err
 }
 
 /// `stat(path)` — follow symlinks.
-fn op_stat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_stat<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::metadata(&p) {
         Ok(m) => Ok(stat_object(ctx, &m)),
@@ -378,7 +422,11 @@ fn op_stat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 }
 
 /// `lstat(path)` — do not follow symlinks.
-fn op_lstat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_lstat<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::symlink_metadata(&p) {
         Ok(m) => Ok(stat_object(ctx, &m)),
@@ -387,7 +435,11 @@ fn op_lstat(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 }
 
 /// `rm(path, recursive, force)` — remove a file or directory tree.
-fn op_rm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_rm<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     let recursive = matches!(args.get(1), Some(Value::Bool(true)));
     let force = matches!(args.get(2), Some(Value::Bool(true)));
@@ -410,7 +462,11 @@ fn op_rm(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// `mkdir(path, recursive)` — returns the first created directory (Node's recursive contract).
-fn op_mkdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_mkdir<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     let recursive = matches!(args.get(1), Some(Value::Bool(true)));
     let result = if recursive {
@@ -419,7 +475,7 @@ fn op_mkdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
         std::fs::create_dir(&p)
     };
     match result {
-        Ok(()) => Ok(Value::from_string(p)),
+        Ok(()) => Ok(ctx.string(p)),
         Err(e) if recursive && e.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(Value::Undefined)
         }
@@ -428,7 +484,11 @@ fn op_mkdir(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 }
 
 /// `rename(from, to)`.
-fn op_rename(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_rename<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let from = arg_path(ctx, args)?;
     let to = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -440,7 +500,11 @@ fn op_rename(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 }
 
 /// `copyFile(from, to)`.
-fn op_copy_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_copy_file<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let from = arg_path(ctx, args)?;
     let to = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -452,7 +516,11 @@ fn op_copy_file(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
 }
 
 /// `readdirTypes(path)` — directory entries as `[name, kind]` pairs for `withFileTypes`.
-fn op_readdir_types(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_readdir_types<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     let entries = std::fs::read_dir(&p).map_err(|e| fs_error(ctx, "scandir", &p, &e))?;
     let mut items = Vec::new();
@@ -464,23 +532,31 @@ fn op_readdir_types(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
             Ok(ft) if ft.is_file() => "file",
             _ => "other",
         };
-        let pair = ctx.make_array(vec![Value::from_string(name), Value::str(kind)]);
+        let pair = ctx.make_array(vec![ctx.string(name), ctx.str(kind)]);
         items.push(pair);
     }
     Ok(ctx.make_array(items))
 }
 
 /// `readlink(path)`.
-fn op_readlink(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_readlink<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::read_link(&p) {
-        Ok(target) => Ok(Value::from_string(target.to_string_lossy().into_owned())),
+        Ok(target) => Ok(ctx.string(target.to_string_lossy().into_owned())),
         Err(e) => Err(fs_error(ctx, "readlink", &p, &e)),
     }
 }
 
 /// `symlink(target, path)`.
-fn op_symlink(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_symlink<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let target = arg_path(ctx, args)?;
     let link = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -506,7 +582,11 @@ fn op_symlink(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 }
 
 /// `access(path)` — existence/readability check; rejects with ENOENT if absent.
-fn op_access(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_access<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     match std::fs::metadata(&p) {
         Ok(_) => Ok(Value::Undefined),
@@ -515,7 +595,11 @@ fn op_access(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 }
 
 /// `chmod(path, mode)`.
-fn op_chmod(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_chmod<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     let mode = args.get(1).and_then(|v| v.as_num_opt()).unwrap_or(0.0) as u32;
     // Unix applies the full POSIX mode. Windows has no POSIX permissions — the only bit it can
@@ -542,7 +626,12 @@ fn op_chmod(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
 }
 
 #[cfg(unix)]
-fn ownership_path(ctx: &mut Ctx, args: &[Value], op: &str, follow: bool) -> Result<Value, Value> {
+fn ownership_path<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    op: &str,
+    follow: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_path(ctx, args)?;
     let uid = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let gid = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
@@ -556,7 +645,11 @@ fn ownership_path(ctx: &mut Ctx, args: &[Value], op: &str, follow: bool) -> Resu
         .map_err(|error| fs_error(ctx, op, &path, &error))
 }
 
-fn op_chown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_chown<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     #[cfg(unix)]
     {
         ownership_path(ctx, args, "chown", true)
@@ -568,7 +661,11 @@ fn op_chown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value>
     }
 }
 
-fn op_lchown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_lchown<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     #[cfg(unix)]
     {
         ownership_path(ctx, args, "lchown", false)
@@ -580,7 +677,11 @@ fn op_lchown(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     }
 }
 
-fn op_lchmod(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_lchmod<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = arg_path(ctx, args)?;
     let mode = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     #[cfg(target_os = "macos")]
@@ -616,7 +717,11 @@ extern "C" {
 
 /// `mkdtemp(prefix)` — create a uniquely-named temp directory and return its path. Uniqueness
 /// comes from the OS-assigned pid plus a monotonically bumped counter (no RNG dependency).
-fn op_mkdtemp(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_mkdtemp<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let prefix = arg_path(ctx, args)?;
@@ -625,7 +730,7 @@ fn op_mkdtemp(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = format!("{prefix}{:06x}{:04x}", pid, n & 0xffff);
         match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(Value::from_string(candidate)),
+            Ok(()) => return Ok(ctx.string(candidate)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(fs_error(ctx, "mkdtemp", &candidate, &e)),
         }
@@ -634,7 +739,11 @@ fn op_mkdtemp(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Valu
 }
 
 /// `link(existingPath, newPath)` — create a hard link.
-fn op_link(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_link<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let existing = arg_path(ctx, args)?;
     let new = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -672,7 +781,12 @@ extern "C" {
     fn lutimes(path: *const std::os::raw::c_char, times: *const Timeval) -> i32;
 }
 
-fn set_times(ctx: &mut Ctx, args: &[Value], follow: bool, op: &str) -> Result<Value, Value> {
+fn set_times<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    follow: bool,
+    op: &str,
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     let atime = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))?;
     let mtime = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))?;
@@ -703,16 +817,24 @@ fn set_times(ctx: &mut Ctx, args: &[Value], follow: bool, op: &str) -> Result<Va
             "Error",
             format!("ENOSYS: {op} is not supported on this platform, {op} '{p}'"),
         );
-        let _ = ctx.set_member(&err, "code", Value::str("ENOSYS"));
+        let _ = ctx.set_member(&err, "code", ctx.str("ENOSYS"));
         Err(err)
     }
 }
 
-fn op_utimes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_utimes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     set_times(ctx, args, true, "utime")
 }
 
-fn op_lutimes(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_lutimes<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     set_times(ctx, args, false, "lutime")
 }
 
@@ -758,7 +880,11 @@ extern "C" {
     fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> i32;
 }
 
-fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_statfs<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let p = arg_path(ctx, args)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -780,7 +906,7 @@ fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         }
         let s = unsafe { buf.assume_init() };
         let o = Value::Obj(ctx.new_object());
-        let set = |k: &str, v: f64, ctx: &mut Ctx| {
+        let set = |k: &str, v: f64, ctx: &mut Ctx<'s>| {
             let _ = ctx.set_member(&o, k, Value::Num(v));
         };
         set("type", 0.0, ctx);
@@ -798,14 +924,18 @@ fn op_statfs(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
             "Error",
             format!("ENOSYS: statfs is not supported on this platform, statfs '{p}'"),
         );
-        let _ = ctx.set_member(&err, "code", Value::str("ENOSYS"));
+        let _ = ctx.set_member(&err, "code", ctx.str("ENOSYS"));
         Err(err)
     }
 }
 
 /// One object of OS facts the JS `os` shim reads (snapshotted like Node's are). `hostname`
 /// is separate because it can do I/O.
-fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_os_info<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let platform = match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",
@@ -850,7 +980,7 @@ fn op_os_info(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Val
             .to_string(),
         ),
     ] {
-        let _ = ctx.set_member(&obj, k, Value::from_string(v));
+        let _ = ctx.set_member(&obj, k, ctx.string(v));
     }
     let _ = ctx.set_member(&obj, "cpus", Value::Num(cpus as f64));
     Ok(obj)
@@ -866,7 +996,11 @@ fn os_release() -> String {
 
 /// Best-effort hostname without a syscall or crate: env, then the file Linux writes it to,
 /// then a safe default.
-fn op_hostname(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_hostname<'s>(
+    _ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let name = std::env::var("HOSTNAME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -877,7 +1011,7 @@ fn op_hostname(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "localhost".to_string());
-    Ok(Value::from_string(name))
+    Ok(_ctx.string(name))
 }
 
 // ---- os.getPriority / os.setPriority, over getpriority(2)/setpriority(2) ----
@@ -920,14 +1054,18 @@ fn priority_errno_code(errno: i32) -> &'static str {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn priority_error(ctx: &mut Ctx, errno: i32) -> Value {
+fn priority_error<'s>(ctx: &mut Ctx<'s>, errno: i32) -> Value<'s> {
     let obj = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&obj, "errno", Value::Num(-(errno as f64)));
-    let _ = ctx.set_member(&obj, "code", Value::str(priority_errno_code(errno)));
+    let _ = ctx.set_member(&obj, "code", ctx.str(priority_errno_code(errno)));
     obj
 }
 
-fn op_os_getpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_os_getpriority<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -951,7 +1089,11 @@ fn op_os_getpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     }
 }
 
-fn op_os_setpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_os_setpriority<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let pid = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as i64;
     let prio = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as i32;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -973,11 +1115,11 @@ fn op_os_setpriority(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
 
 // ---- node:zlib, over the shared DEFLATE codec ----
 
-fn zlib_compress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn zlib_compress_op<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     codec: fn(&[u8]) -> Vec<u8>,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
@@ -985,11 +1127,11 @@ fn zlib_compress_op(
     ctx.make_uint8array(&codec(&bytes))
 }
 
-fn zlib_decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn zlib_decompress_op<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     codec: fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray"));
@@ -1000,38 +1142,82 @@ fn zlib_decompress_op(
     }
 }
 
-fn op_zlib_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_deflate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_compress_op(ctx, a, trust_js_host::deflate::zlib_compress)
 }
-fn op_zlib_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_inflate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_decompress_op(ctx, a, trust_js_host::deflate::zlib_decompress)
 }
-fn op_zlib_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_deflate_raw<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_compress_op(ctx, a, trust_js_host::deflate::deflate)
 }
-fn op_zlib_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_inflate_raw<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_decompress_op(ctx, a, trust_js_host::deflate::inflate)
 }
-fn op_zlib_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_gzip<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_compress_op(ctx, a, trust_js_host::deflate::gzip_compress)
 }
-fn op_zlib_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_gunzip<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_decompress_op(ctx, a, trust_js_host::deflate::gzip_decompress)
 }
-fn op_zlib_brotli_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_brotli_compress<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_compress_op(ctx, a, trust_js_host::brotli::brotli_compress)
 }
-fn op_zlib_brotli_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_brotli_decompress<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_decompress_op(ctx, a, trust_js_host::brotli::brotli_decompress)
 }
-fn op_zlib_zstd_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_zstd_compress<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_compress_op(ctx, a, trust_js_host::zstd::zstd_compress)
 }
-fn op_zlib_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_zstd_decompress<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     zlib_decompress_op(ctx, a, trust_js_host::zstd::zstd_decompress)
 }
 /// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
-fn op_zlib_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_zlib_crc32<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let v = a.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "zlib.crc32 expects a Buffer/TypedArray"));

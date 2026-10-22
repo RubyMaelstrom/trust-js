@@ -10,7 +10,7 @@ use crate::interpreter::Interp;
 use crate::intl::tags;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "DisplayNames", 2, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "of", 1, |i, this, a| of(i, &this, &arg(a, 0)));

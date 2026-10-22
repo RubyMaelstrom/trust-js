@@ -40,7 +40,9 @@ struct View {
     offset: usize,
 }
 
-/// See the module docs. `repr(transparent)`-thin: one pointer.
+/// See the module docs. `repr(transparent)`: one pointer, which the embedder's scoped strings
+/// (`scope::JsString`) are too.
+#[repr(transparent)]
 pub struct LStr {
     p: NonNull<Header>,
 }

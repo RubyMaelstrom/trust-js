@@ -1,16 +1,20 @@
-//! Shared embed objects obey ordinary [[Get]]/[[Set]] across Engine boundaries.
-//! Official local ECMA-262 snapshot e28783d5, OrdinaryGet, OrdinarySetWithOwnDescriptor,
-//! OrdinaryGetOwnProperty. Cache identities are not part of the observable semantics.
+//! Property shapes stay sound when one Engine's object is written through another's
+//! interpreter: [[Get]]/[[Set]] stay ordinary. Official local ECMA-262 snapshot e28783d5,
+//! OrdinaryGet, OrdinarySetWithOwnDescriptor, OrdinaryGetOwnProperty. Cache identities are not
+//! part of the observable semantics. No embedder can make such a write (S6 step 11b: scoped
+//! values are branded by their scope, handles checked), so these are internal tests.
 
 use super::*;
 use crate::{bytecode::Tier, Completion, Engine};
 
+/// The engine value of `source` (unbranded: the crate's own form).
 fn value(engine: &mut Engine, source: &str) -> Value {
-    engine
-        .eval_value(source)
-        .expect("parse")
-        .ok()
-        .expect("evaluate")
+    engine.scope(|cx| {
+        cx.eval_value(source)
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("evaluate"))
+            .into_internal()
+    })
 }
 
 fn run(engine: &mut Engine, source: &str) -> String {
@@ -28,8 +32,9 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         let local = value(&mut owner, "({alpha:1,gamma:2})");
         let mut foreign = Engine::new();
         let _different_prefix = value(&mut foreign, "({beta:1})");
+        foreign.interp.activate_gc_heap();
         assert!(foreign
-            .ctx()
+            .interp
             .set_member_key(&original, "delta", Value::Num(3.0))
             .is_ok());
         assert_ne!(
@@ -38,14 +43,15 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         );
         owner.set_tier(tier);
         owner.set_tier_threshold(0);
-        let global = owner.global_this();
+        owner.interp.activate_gc_heap();
+        let global = owner.interp.global_this();
         owner
-            .ctx()
+            .interp
             .set_member_key(&global, "a", local)
             .ok()
             .unwrap();
         owner
-            .ctx()
+            .interp
             .set_member_key(&global, "b", original)
             .ok()
             .unwrap();

@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use trust_js_host::{
-    ArrayBufferBytes, Ctx, Handle, RetainedExternalAllocation, RetainedExternalMemory,
-    RootedValues, Value, WeakHandle,
+    ArrayBufferBytes, Ctx, Handle, RetainedExternalAllocation, RetainedExternalMemory, Value,
+    ValueList, WeakHandle,
 };
 
 use crate::wasm;
@@ -53,7 +53,7 @@ impl RetainedExternalMemory for WasmStore {
 
 /// The store's live modules, roots, entities, callbacks and memory buffers (tests).
 #[cfg(test)]
-pub(crate) fn test_stats(ctx: &Ctx) -> [usize; 9] {
+pub(crate) fn test_stats<'s>(ctx: &Ctx<'s>) -> [usize; 9] {
     let ws = ctx.host::<WasmStore>().expect("wasm store");
     let counts = ws.store.live_entity_counts();
     [
@@ -78,10 +78,10 @@ pub(crate) fn test_stats(ctx: &Ctx) -> [usize; 9] {
 
 // ---- value conversion -------------------------------------------------------------------------
 
-fn val_to_js(v: Val) -> Value {
+fn val_to_js<'s>(ctx: &Ctx<'s>, v: Val) -> Value<'s> {
     match v {
         Val::I32(x) => Value::Num(x as f64),
-        Val::I64(x) => Value::bigint_from_i64(x),
+        Val::I64(x) => ctx.bigint_from_i64(x),
         Val::F32(x) => Value::Num(x as f64),
         Val::F64(x) => Value::Num(x),
         Val::Ref(_) => Value::Null,
@@ -91,7 +91,7 @@ fn val_to_js(v: Val) -> Value {
 /// WebAssembly JS API § ToWebAssemblyValue. Conversion failures must propagate to JavaScript;
 /// silently substituting zero changes observable calls and can turn a user exception into memory
 /// corruption inside the guest.
-fn js_to_val(ctx: &mut Ctx, v: &Value, ty: ValType) -> Result<Val, Value> {
+fn js_to_val<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>, ty: ValType) -> Result<Val, Value<'s>> {
     match ty {
         ValType::I32 => {
             let number = ctx.coerce_number(v)?;
@@ -135,11 +135,16 @@ fn valtype_name(ty: ValType) -> &'static str {
     }
 }
 
-fn num(a: &[Value], i: usize) -> f64 {
+fn num<'s>(a: &[Value<'s>], i: usize) -> f64 {
     a.get(i).and_then(Value::as_num_opt).unwrap_or(0.0)
 }
 
-fn u32_arg(ctx: &mut Ctx, args: &[Value], index: usize, what: &str) -> Result<u32, Value> {
+fn u32_arg<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    index: usize,
+    what: &str,
+) -> Result<u32, Value<'s>> {
     match args.get(index).and_then(Value::as_num_opt) {
         Some(number)
             if number.is_finite()
@@ -156,12 +161,12 @@ fn u32_arg(ctx: &mut Ctx, args: &[Value], index: usize, what: &str) -> Result<u3
     }
 }
 
-fn optional_u32_arg(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn optional_u32_arg<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     index: usize,
     what: &str,
-) -> Result<Option<u32>, Value> {
+) -> Result<Option<u32>, Value<'s>> {
     if matches!(args.get(index), None | Some(Value::Undefined)) {
         Ok(None)
     } else {
@@ -169,7 +174,7 @@ fn optional_u32_arg(
     }
 }
 
-fn sweep_wasm_store(ctx: &mut Ctx) {
+fn sweep_wasm_store<'s>(ctx: &mut Ctx<'s>) {
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     let store_roots = ws.roots.values().filter_map(|root| match root {
         WasmRoot::Store(root) => Some(*root),
@@ -204,13 +209,13 @@ fn sweep_wasm_store(ctx: &mut Ctx) {
 
 // ---- host bridge ------------------------------------------------------------------------------
 
-struct CtxHost<'a> {
-    ctx: &'a mut Ctx,
+struct CtxHost<'a, 's> {
+    ctx: &'a mut Ctx<'s>,
     host_funcs: &'a [WeakHandle],
-    error: Option<Value>,
+    error: Option<Value<'s>>,
 }
 
-impl Host for CtxHost<'_> {
+impl Host for CtxHost<'_, '_> {
     fn call_host(
         &mut self,
         id: usize,
@@ -222,7 +227,7 @@ impl Host for CtxHost<'_> {
             .get(id)
             .and_then(|callback| callback.upgrade(&*self.ctx).ok().flatten())
             .ok_or("wasm: bad import id")?;
-        let js_args: Vec<Value> = args.iter().map(|v| val_to_js(*v)).collect();
+        let js_args: Vec<Value> = args.iter().map(|v| val_to_js(self.ctx, *v)).collect();
         let ret = match self.ctx.invoke(callback, Value::Undefined, &js_args) {
             Ok(v) => v,
             Err(e) => {
@@ -277,7 +282,7 @@ impl Host for CtxHost<'_> {
 /// A successful grow detaches the old fixed buffer and creates a new fixed buffer over the same,
 /// now-grown block. This is also called synchronously from the `memory.grow` instruction before a
 /// later imported JavaScript function can observe `Memory.buffer`.
-fn refresh_memory_buffer(ctx: &mut Ctx, memory_addr: usize) -> Result<(), Value> {
+fn refresh_memory_buffer<'s>(ctx: &mut Ctx<'s>, memory_addr: usize) -> Result<(), Value<'s>> {
     let Some((storage, old_buffer)) = ctx
         .host_mut::<WasmStore>()
         .and_then(|ws| ws.memory_buffers.get(&memory_addr))
@@ -300,7 +305,11 @@ fn refresh_memory_buffer(ctx: &mut Ctx, memory_addr: usize) -> Result<(), Value>
 
 /// Run store function `func_addr`, moving the store (and host callbacks) out of OpState so the
 /// interpreter can borrow them mutably while `CtxHost` re-enters JS for imports; then move back.
-fn run_func(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>, Value> {
+fn run_func<'s>(
+    ctx: &mut Ctx<'s>,
+    func_addr: usize,
+    args: Vec<Val>,
+) -> Result<Vec<Val>, Value<'s>> {
     let (mut store, host_funcs) = {
         let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
         (
@@ -329,17 +338,25 @@ fn run_func(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>,
 
 // ---- ops --------------------------------------------------------------------------------------
 
-fn arg_bytes(ctx: &mut Ctx, args: &[Value]) -> Result<Vec<u8>, Value> {
+fn arg_bytes<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>]) -> Result<Vec<u8>, Value<'s>> {
     ctx.typed_array_bytes(args.first().unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "WebAssembly: expected a BufferSource"))
 }
 
-pub(crate) fn op_validate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_validate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = arg_bytes(ctx, a)?;
     Ok(Value::Bool(wasm::validate(&bytes)))
 }
 
-pub(crate) fn op_compile(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_compile<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = arg_bytes(ctx, a)?;
     match wasm::decode(&bytes) {
         Ok(module) => {
@@ -356,7 +373,11 @@ pub(crate) fn op_compile(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value,
 
 /// Register one JavaScript wrapper as a store root. FinalizationRegistry releases the opaque
 /// token; the address itself is not a reference count because instances and tables form graphs.
-pub(crate) fn op_retain(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_retain<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let kind = u32_arg(ctx, a, 0, "root kind")?;
     let address = u32_arg(ctx, a, 1, "root address")?;
     let exhausted = ctx.make_error("RangeError", "wasm: root token space exhausted");
@@ -411,7 +432,11 @@ pub(crate) fn op_retain(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, 
     Ok(Value::Num(token as f64))
 }
 
-pub(crate) fn op_release(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_release<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let token = u32_arg(ctx, a, 0, "root token")?;
     let removed = ctx
         .host_mut::<WasmStore>()
@@ -425,62 +450,74 @@ pub(crate) fn op_release(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
-fn module_of(ctx: &mut Ctx, id: u32) -> Result<Rc<Module>, Value> {
+fn module_of<'s>(ctx: &mut Ctx<'s>, id: u32) -> Result<Rc<Module>, Value<'s>> {
     ctx.host_mut::<WasmStore>()
         .and_then(|s| s.modules.get(&id).cloned())
         .ok_or_else(|| ctx.make_error("Error", "wasm: unknown module"))
 }
 
 // The descriptor builders below run `[[Set]]` on each new object, which can call a setter
-// (and so collect) while the earlier ones wait: they hold them in `RootedValues`.
+// (and so collect) while the earlier ones wait: they hold them in a rooted `ValueList`.
 
-pub(crate) fn op_module_exports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_module_exports<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let mut items = RootedValues::default();
+    let mut items = ValueList::new();
     for (name, kind) in wasm::export_descriptors(&module) {
         let o = Value::Obj(ctx.new_object());
-        let _ = ctx.set_member(&o, "name", Value::from_string(name));
-        let _ = ctx.set_member(&o, "kind", Value::str(kind));
-        items.push(ctx, &o)?;
+        let _ = ctx.set_member(&o, "name", ctx.string(name));
+        let _ = ctx.set_member(&o, "kind", ctx.str(kind));
+        items.push(o);
     }
     Ok(items.into_array(ctx))
 }
 
-pub(crate) fn op_module_imports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_module_imports<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let mut items = RootedValues::default();
+    let mut items = ValueList::new();
     for (m, name, kind) in wasm::import_descriptors(&module) {
         let o = Value::Obj(ctx.new_object());
-        let _ = ctx.set_member(&o, "module", Value::from_string(m));
-        let _ = ctx.set_member(&o, "name", Value::from_string(name));
-        let _ = ctx.set_member(&o, "kind", Value::str(kind));
-        items.push(ctx, &o)?;
+        let _ = ctx.set_member(&o, "module", ctx.string(m));
+        let _ = ctx.set_member(&o, "name", ctx.string(name));
+        let _ = ctx.set_member(&o, "kind", ctx.str(kind));
+        items.push(o);
     }
     Ok(items.into_array(ctx))
 }
 
 /// Private metadata used to convert primitive global imports according to their declared wasm
 /// value type. `WebAssembly.Module.imports()` itself remains the standard three-field descriptor.
-pub(crate) fn op_module_import_types(
-    ctx: &mut Ctx,
-    _t: Value,
-    a: &[Value],
-) -> Result<Value, Value> {
+pub(crate) fn op_module_import_types<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let module = module_of(ctx, num(a, 0) as u32)?;
-    let mut items = RootedValues::default();
+    let mut items = ValueList::new();
     for import in &module.imports {
         let object = Value::Obj(ctx.new_object());
         if let wasm::ImportKind::Global(global) = import.kind {
-            let _ = ctx.set_member(&object, "value", Value::str(valtype_name(global.val)));
+            let _ = ctx.set_member(&object, "value", ctx.str(valtype_name(global.val)));
             let _ = ctx.set_member(&object, "mutable", Value::Bool(global.mutable));
         }
-        items.push(ctx, &object)?;
+        items.push(object);
     }
     Ok(items.into_array(ctx))
 }
 
 // Standalone entity allocation (for `new WebAssembly.Memory/Table/Global`).
-pub(crate) fn op_alloc_memory(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_alloc_memory<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let min = u32_arg(ctx, a, 0, "memory initial")? as usize;
     let max = optional_u32_arg(ctx, a, 1, "memory maximum")?;
     let result = ctx
@@ -492,7 +529,11 @@ pub(crate) fn op_alloc_memory(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
         .map(|address| Value::Num(address as f64))
         .map_err(|error| ctx.make_error("RangeError", error))
 }
-pub(crate) fn op_alloc_table(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_alloc_table<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let min = u32_arg(ctx, a, 0, "table initial")? as usize;
     let max = optional_u32_arg(ctx, a, 1, "table maximum")?;
     let result = ctx
@@ -504,7 +545,11 @@ pub(crate) fn op_alloc_table(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
         .map(|address| Value::Num(address as f64))
         .map_err(|error| ctx.make_error("RangeError", error))
 }
-pub(crate) fn op_alloc_global(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_alloc_global<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let type_name = ctx.coerce_string(a.get(2).unwrap_or(&Value::Undefined))?;
     let ty = valtype_of(&type_name)
         .ok_or_else(|| ctx.make_error("TypeError", "unsupported WebAssembly global type"))?;
@@ -516,7 +561,11 @@ pub(crate) fn op_alloc_global(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
 
 /// `(moduleId, resolvedImports) -> { inst, exports: [{name, kind, addr}] }`. `resolvedImports` is a
 /// flat array in module-import order: `{fn}` | `{memAddr}` | `{tableAddr}` | `{globalAddr}`.
-pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_instantiate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let module = module_of(ctx, num(a, 0) as u32)?;
     let resolved = a.get(1).cloned().unwrap_or(Value::Undefined);
 
@@ -632,7 +681,7 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
             })
             .collect()
     };
-    let mut exports = RootedValues::default();
+    let mut exports = ValueList::new();
     for (name, kind, addr) in names {
         let kind = match kind {
             wasm::ExportKind::Func => "function",
@@ -641,10 +690,10 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
             wasm::ExportKind::Table => "table",
         };
         let o = Value::Obj(ctx.new_object());
-        let _ = ctx.set_member(&o, "name", Value::from_string(name));
-        let _ = ctx.set_member(&o, "kind", Value::str(kind));
+        let _ = ctx.set_member(&o, "name", ctx.string(name));
+        let _ = ctx.set_member(&o, "kind", ctx.str(kind));
         let _ = ctx.set_member(&o, "addr", Value::Num(addr as f64));
-        exports.push(ctx, &o)?;
+        exports.push(o);
     }
     let exports = exports.into_array(ctx);
 
@@ -655,7 +704,11 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
 }
 
 /// `(funcAddr, argsArray) -> resultsArray`.
-pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_call<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let func_addr = num(a, 0) as usize;
     let args_arr = a.get(1).cloned().unwrap_or(Value::Undefined);
 
@@ -675,13 +728,17 @@ pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
     }
 
     let results = run_func(ctx, func_addr, args)?;
-    let js: Vec<Value> = results.into_iter().map(val_to_js).collect();
+    let js: Vec<Value> = results.into_iter().map(|v| val_to_js(ctx, v)).collect();
     Ok(ctx.make_array(js))
 }
 
 // ---- memory / table / global accessors (by store address) -------------------------------------
 
-pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_mem_buffer<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     if let Some(buffer) = ctx
         .host::<WasmStore>()
@@ -711,7 +768,11 @@ pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
     Ok(buffer)
 }
 
-pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_mem_grow<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let delta = num(a, 1) as i32;
     let previous = {
@@ -727,7 +788,11 @@ pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value
     Ok(Value::Num(previous as f64))
 }
 
-pub(crate) fn op_table_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_table_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let i = num(a, 1) as usize;
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
@@ -745,7 +810,11 @@ pub(crate) fn op_table_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Valu
     }
 }
 
-pub(crate) fn op_table_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_table_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let i = num(a, 1) as usize;
     let faddr = a.get(2).and_then(Value::as_num_opt);
@@ -765,7 +834,11 @@ pub(crate) fn op_table_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Valu
     }
 }
 
-pub(crate) fn op_table_size(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_table_size<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     Ok(Value::Num(
@@ -778,7 +851,11 @@ pub(crate) fn op_table_size(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
     ))
 }
 
-pub(crate) fn op_global_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_global_get<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let v = ctx
         .host_mut::<WasmStore>()
@@ -786,10 +863,14 @@ pub(crate) fn op_global_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
         .and_then(Option::as_ref)
         .map(|g| g.val)
         .ok_or_else(|| ctx.make_error("Error", "wasm: bad global address"))?;
-    Ok(val_to_js(v))
+    Ok(val_to_js(ctx, v))
 }
 
-pub(crate) fn op_global_info(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_global_info<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let (ty, mutable) = ctx
         .host_mut::<WasmStore>()
@@ -798,12 +879,16 @@ pub(crate) fn op_global_info(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
         .map(|global| (global.ty, global.mutable))
         .ok_or_else(|| ctx.make_error("Error", "wasm: bad global address"))?;
     let info = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&info, "value", Value::str(valtype_name(ty)));
+    let _ = ctx.set_member(&info, "value", ctx.str(valtype_name(ty)));
     let _ = ctx.set_member(&info, "mutable", Value::Bool(mutable));
     Ok(info)
 }
 
-pub(crate) fn op_global_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_global_set<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let addr = num(a, 0) as usize;
     let raw = a.get(1).cloned().unwrap_or(Value::Undefined);
     // Coerce to the global's existing value type.

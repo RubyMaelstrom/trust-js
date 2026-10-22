@@ -11,7 +11,7 @@ use super::{
 use crate::interpreter::Interp;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "PluralRules", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "select", 1, |i, this, args| {

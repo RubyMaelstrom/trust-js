@@ -20,7 +20,7 @@ impl Write for Captured {
 fn csrf_tokens_interoperate_with_bun_and_reject_tampering() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

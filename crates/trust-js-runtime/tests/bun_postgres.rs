@@ -150,7 +150,7 @@ fn postgres_adapter_uses_extended_protocol_and_decodes_rows() {
 
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });
@@ -222,7 +222,7 @@ fn postgres_adapter_authenticates_with_scram_sha_256() {
     });
     let mut runtime = Runtime::new();
     let out = Captured::default();
-    runtime.engine().ctx().op_state().put(ConsoleOut {
+    runtime.engine().op_state().put(ConsoleOut {
         out: Box::new(out.clone()),
         err: Box::new(Captured::default()),
     });

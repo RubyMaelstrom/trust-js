@@ -40,7 +40,7 @@ fn valid_type(s: &str) -> bool {
             .all(|p| p.len() >= 3 && p.len() <= 8 && is_alnum(p))
 }
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (_ctor, proto) = make_service(it, ns, "Locale", 1, locale_construct);
 
     def_getter(it, &proto, "baseName", |i, this, _| {

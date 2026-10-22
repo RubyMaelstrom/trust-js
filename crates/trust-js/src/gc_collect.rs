@@ -439,9 +439,12 @@ pub(crate) struct ClientReport {
     pub(crate) handle_slots: Vec<u32>,
 }
 
-/// One interpreter's host graph for this collection: what its `HostGc` slots report.
+/// One interpreter's host graph for this collection: what its registered host types report.
 #[derive(Default)]
 struct HostGraph {
+    /// The collecting heap's identity: the weak handles a host reports are read for it alone.
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    heap_id: u64,
     roots: Vec<u64>,
     /// Logical edges: each value is reachable while its owner is.
     edges: Vec<(usize, u64)>,
@@ -449,38 +452,41 @@ struct HostGraph {
 }
 
 impl HostGcVisitor for HostGraph {
-    fn supports_native(&self) -> bool {
-        true
-    }
-
     fn native_edge(&mut self, from: NativeGcId, to: NativeGcId) {
         self.native.native_edge(from, to);
     }
 
-    fn js_to_native(&mut self, owner: &Value, to: NativeGcId) {
-        self.native.js_to_native(owner, to);
+    #[cfg(feature = "embed")]
+    fn js_to_native(&mut self, owner: &crate::handles::WeakHandle, to: NativeGcId) {
+        if let Some(owner) = owner.reported(self.heap_id) {
+            self.native.js_to_native(&owner, to);
+        }
     }
 
-    fn native_to_js(&mut self, from: NativeGcId, value: &Value) {
-        self.native.native_to_js(from, value);
+    #[cfg(feature = "embed")]
+    fn native_to_js(&mut self, from: NativeGcId, value: &crate::handles::WeakHandle) {
+        if let Some(value) = value.reported(self.heap_id) {
+            self.native.native_to_js(from, &value);
+        }
     }
 
     fn native_root(&mut self, id: NativeGcId) {
         self.native.native_root(id);
     }
 
-    /// A cache handle lives only through the edges and roots reported for it; the host's
-    /// sweep drops it once its value dies.
-    fn internal(&mut self, _: &Value) {}
-
-    fn edge(&mut self, owner: &Value, value: &Value) {
-        if let (Value::Obj(owner), Some(value)) = (owner, value_word(value)) {
-            self.edges.push((Gc::as_ptr(owner) as usize, value));
+    #[cfg(feature = "embed")]
+    fn edge(&mut self, owner: &crate::handles::WeakHandle, value: &crate::handles::WeakHandle) {
+        if let (Some(Value::Obj(owner)), Some(value)) = (
+            owner.reported(self.heap_id),
+            value.reported(self.heap_id).as_ref().and_then(value_word),
+        ) {
+            self.edges.push((Gc::as_ptr(&owner) as usize, value));
         }
     }
 
-    fn root(&mut self, value: &Value) {
-        if let Some(word) = value_word(value) {
+    #[cfg(feature = "embed")]
+    fn root(&mut self, value: &crate::handles::WeakHandle) {
+        if let Some(word) = value.reported(self.heap_id).as_ref().and_then(value_word) {
             self.roots.push(word);
         }
     }
@@ -531,30 +537,14 @@ impl<'a> Marking<'a> {
             }
             next += 1;
         }
-        // S6 step 10b: the native functions whose host reporters' values may change are
-        // rescanned at every collection: their cards are set as it starts, before the barrier's
-        // check (`gc_core::Heap::start_marking`).
-        {
-            #[cfg(debug_assertions)]
-            let core = root.gc_heap.core.borrow();
-            for &function in root.gc_heap.rescanned_natives.borrow().iter() {
-                #[cfg(debug_assertions)]
-                assert!(
-                    core.is_carded_cell(function),
-                    "a rescanned native function at {function:#x} is not a live object"
-                );
-                // SAFETY: an entry names a live object's cell, small and of the carded object
-                // kind: it is evicted between the phases of the collection that finds its
-                // function dead (`Interp::gc_heap_sweep`), before that collection's sweep frees
-                // the cell.
-                unsafe { crate::gc_core::card_mark(function as *const u8) };
-            }
-        }
         let mut hosts = Vec::with_capacity(interps.len());
         let mut realm_members: FastMap<usize, Vec<(usize, usize)>> = FastMap::default();
         let mut templates: FastMap<(usize, usize), Vec<u64>> = FastMap::default();
         for (index, interp) in interps.iter().enumerate() {
-            let mut host = HostGraph::default();
+            let mut host = HostGraph {
+                heap_id: crate::value::heap_id(&root.gc_heap),
+                ..HostGraph::default()
+            };
             interp.host_state.trace_gc(&mut host);
             hosts.push(RefCell::new(host));
             for (&key, realm) in &interp.realms {
@@ -679,6 +669,12 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         // The tree shares one heap; its interned strings live as long as it does.
         if let Some(root) = self.interps.first() {
             crate::value::trace_interned_strings(&root.gc_heap, &mut words);
+            // The Realms an embedder replaced by entering others, until it leaves them (S6 step
+            // 11b, `GcState::entered_realms`).
+            #[cfg(feature = "embed")]
+            for entered in root.gc_heap.entered_realms.borrow().iter() {
+                entered.saved.trace_gc(&mut words);
+            }
         }
         crate::gc_trace::trace_thread_roots(&mut words);
         // The heap's strong handles (S6 step 11a): in a minor collection those written since
@@ -998,7 +994,6 @@ impl Interp {
         // Between the phases every cell is intact and new cells are allocated marked: the
         // engine evicts the dead from its tables while their identities are still stable.
         let dead = crate::gc_sweep::DeadObjects::new(heap);
-        crate::gc_sweep::set(&mut heap.rescanned_natives.borrow_mut(), &dead);
         // Weak handles to dead cells are cleared first (S6 step 11a): the host sweeps see them
         // cleared, and no cell they name is freed while they name it.
         {

@@ -1144,13 +1144,13 @@ pub fn rapidhash(seed: u64, input: &[u8]) -> u64 {
 // unsigned with `BigInt.asUintN(64, ...)` on the JS side), 32-bit families as a Number.
 // ================================================================================================
 
-fn arg_bytes(ctx: &mut Ctx, a: &[Value], who: &str) -> Result<Vec<u8>, Value> {
+fn arg_bytes<'s>(ctx: &mut Ctx<'s>, a: &[Value<'s>], who: &str) -> Result<Vec<u8>, Value<'s>> {
     let v = a.first().unwrap_or(&Value::Undefined);
     ctx.typed_array_bytes(v)
         .ok_or_else(|| ctx.make_error("TypeError", format!("{who} expects a Buffer/TypedArray")))
 }
 
-fn arg_seed(a: &[Value]) -> u64 {
+fn arg_seed<'s>(a: &[Value<'s>]) -> u64 {
     match a.get(1) {
         Some(v) => v
             .bigint_as_i64()
@@ -1162,22 +1162,30 @@ fn arg_seed(a: &[Value]) -> u64 {
 }
 
 #[inline]
-fn u64_big(v: u64) -> Value {
-    Value::bigint_from_i64(v as i64)
+fn u64_big<'s>(ctx: &Ctx<'s>, v: u64) -> Value<'s> {
+    ctx.bigint_from_i64(v as i64)
 }
 
 macro_rules! hash_op64 {
     ($name:ident, $who:literal, $call:expr) => {
-        pub fn $name(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+        pub fn $name<'s>(
+            ctx: &mut Ctx<'s>,
+            _t: Value<'s>,
+            a: &[Value<'s>],
+        ) -> Result<Value<'s>, Value<'s>> {
             let bytes = arg_bytes(ctx, a, $who)?;
             let f: fn(u64, &[u8]) -> u64 = $call;
-            Ok(u64_big(f(arg_seed(a), &bytes)))
+            Ok(u64_big(ctx, f(arg_seed(a), &bytes)))
         }
     };
 }
 macro_rules! hash_op32 {
     ($name:ident, $who:literal, $call:expr) => {
-        pub fn $name(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+        pub fn $name<'s>(
+            ctx: &mut Ctx<'s>,
+            _t: Value<'s>,
+            a: &[Value<'s>],
+        ) -> Result<Value<'s>, Value<'s>> {
             let bytes = arg_bytes(ctx, a, $who)?;
             let f: fn(u32, &[u8]) -> u32 = $call;
             Ok(Value::Num(f(arg_seed(a) as u32, &bytes) as f64))
@@ -1196,14 +1204,22 @@ hash_op32!(op_murmur32v3, "Bun.hash.murmur32v3", murmur32v3);
 hash_op32!(op_murmur32v2, "Bun.hash.murmur32v2", murmur32v2);
 
 /// cityHash32 ignores the seed entirely (Bun-observable behavior).
-pub fn op_city_hash32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub fn op_city_hash32<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = arg_bytes(ctx, a, "Bun.hash.cityHash32")?;
     Ok(Value::Num(city_hash32(&bytes) as f64))
 }
 /// xxHash3 uses only the low 32 bits of the seed (Bun's wrapper narrows to u32).
-pub fn op_xx_hash3(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub fn op_xx_hash3<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let bytes = arg_bytes(ctx, a, "Bun.hash.xxHash3")?;
-    Ok(u64_big(xx_hash3(arg_seed(a) as u32, &bytes)))
+    Ok(u64_big(ctx, xx_hash3(arg_seed(a) as u32, &bytes)))
 }
 
 // ================================================================================================

@@ -327,14 +327,22 @@ impl WebState {
     }
 }
 
-fn op_perf_now(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_perf_now<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<WebState>().expect("web state installed");
     let start = state.clock_start();
     Ok(Value::Num(start.elapsed().as_secs_f64() * 1000.0))
 }
 
 /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
-fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_time_origin<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let state = ctx.host_mut::<WebState>().expect("web state installed");
     state.clock_start();
     Ok(Value::Num(state.time_origin_ms))
@@ -342,7 +350,11 @@ fn op_time_origin(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value,
 
 // ---- encoding ----
 
-fn op_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_encode<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     // WHATWG Encoding §7.4 declares the input as USVString: valid surrogate pairs become their
     // scalar value and every unpaired surrogate becomes U+FFFD before UTF-8 encoding.
     let s = ctx.coerce_usv_string(args.first().unwrap_or(&Value::Undefined))?;
@@ -350,7 +362,11 @@ fn op_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
     ctx.make_uint8array(&bytes)
 }
 
-fn op_decoder_start(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_decoder_start<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let label = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -377,11 +393,11 @@ fn op_decoder_start(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
         .insert(id, TextDecoderState::new(encoding, fatal, ignore_bom));
     Ok(ctx.make_array(vec![
         Value::Num(f64::from(id)),
-        Value::from_string(encoding.name().to_ascii_lowercase()),
+        ctx.string(encoding.name().to_ascii_lowercase()),
     ]))
 }
 
-fn text_decoder_id(value: Option<&Value>) -> Option<u32> {
+fn text_decoder_id<'s>(value: Option<&Value<'s>>) -> Option<u32> {
     value
         .and_then(Value::as_num_opt)
         .filter(|id| {
@@ -390,7 +406,11 @@ fn text_decoder_id(value: Option<&Value>) -> Option<u32> {
         .map(|id| id as u32)
 }
 
-fn op_decoder_push(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_decoder_push<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = text_decoder_id(args.first())
         .ok_or_else(|| ctx.make_error("TypeError", "invalid TextDecoder id"))?;
     let bytes = ctx
@@ -416,7 +436,11 @@ fn op_decoder_push(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         .map_err(|error| ctx.make_error("TypeError", error))
 }
 
-fn op_decoder_drop(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_decoder_drop<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if let Some(id) = text_decoder_id(args.first()) {
         ctx.host_mut::<TextDecoderRegistry>()
             .expect("web installs text decoder registry")
@@ -429,7 +453,11 @@ fn op_decoder_drop(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 // ---- url ----
 
 /// `(input, base?)` -> component object. Throws TypeError, as the URL constructor must.
-fn op_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_url_parse<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let input = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -442,7 +470,11 @@ fn op_url_parse(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Va
     url_to_value(ctx, u)
 }
 
-fn op_url_mutate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_url_mutate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let href = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -457,7 +489,7 @@ fn op_url_mutate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     url_to_value(ctx, url)
 }
 
-fn url_to_value(ctx: &mut Ctx, u: url::Url) -> Result<Value, Value> {
+fn url_to_value<'s>(ctx: &mut Ctx<'s>, u: url::Url) -> Result<Value<'s>, Value<'s>> {
     let obj = Value::Obj(ctx.new_object());
     let port = u.port.map(|p| p.to_string()).unwrap_or_default();
     let href = u.href();
@@ -486,7 +518,7 @@ fn url_to_value(ctx: &mut Ctx, u: url::Url) -> Result<Value, Value> {
         ("href", href),
         ("origin", origin),
     ] {
-        let _ = ctx.set_member(&obj, k, Value::from_string(v));
+        let _ = ctx.set_member(&obj, k, ctx.string(v));
     }
     Ok(obj)
 }
@@ -495,11 +527,11 @@ fn url_to_value(ctx: &mut Ctx, u: url::Url) -> Result<Value, Value> {
 
 /// `n` cryptographically-random bytes (the WebSocket handshake key needs these, same source as
 /// `crypto.getRandomValues`).
-pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
+pub(crate) fn web_random_bytes<'s>(ctx: &mut Ctx<'s>, n: usize) -> Result<Vec<u8>, Value<'s>> {
     random_bytes(ctx, n)
 }
 
-fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
+fn random_bytes<'s>(ctx: &mut Ctx<'s>, n: usize) -> Result<Vec<u8>, Value<'s>> {
     let state = ctx.host_mut::<WebState>().expect("web state installed");
     if state.urandom.is_none() {
         match File::open("/dev/urandom") {
@@ -522,7 +554,11 @@ fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
 }
 
 /// Fill the given typed array in place (the glue enforces the 65536-byte quota + returns it).
-fn op_random_fill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_random_fill<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().cloned().unwrap_or(Value::Undefined);
     let Some(existing) = ctx.typed_array_bytes(&v) else {
         return Err(ctx.make_error("TypeError", "getRandomValues expects a typed array"));
@@ -532,13 +568,17 @@ fn op_random_fill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
-fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+fn op_uuid<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    _args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let mut b = random_bytes(ctx, 16)?;
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10
     let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
     let s = h.join("");
-    Ok(Value::from_string(format!(
+    Ok(ctx.string(format!(
         "{}-{}-{}-{}-{}",
         &s[0..8],
         &s[8..12],
@@ -548,7 +588,11 @@ fn op_uuid(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value>
     )))
 }
 
-fn op_sha256(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_sha256<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "digest expects a BufferSource"));
@@ -559,7 +603,11 @@ fn op_sha256(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
 
 // ---- compression (DEFLATE/zlib/gzip, backing CompressionStream/DecompressionStream) ----
 
-fn compress_op(ctx: &mut Ctx, args: &[Value], codec: fn(&[u8]) -> Vec<u8>) -> Result<Value, Value> {
+fn compress_op<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    codec: fn(&[u8]) -> Vec<u8>,
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "compression expects a BufferSource"));
@@ -567,11 +615,11 @@ fn compress_op(ctx: &mut Ctx, args: &[Value], codec: fn(&[u8]) -> Vec<u8>) -> Re
     ctx.make_uint8array(&codec(&bytes))
 }
 
-fn decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
+fn decompress_op<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
     codec: fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().unwrap_or(&Value::Undefined);
     let Some(bytes) = ctx.typed_array_bytes(v) else {
         return Err(ctx.make_error("TypeError", "decompression expects a BufferSource"));
@@ -582,32 +630,64 @@ fn decompress_op(
     }
 }
 
-fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_deflate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     compress_op(ctx, a, trust_js_host::deflate::zlib_compress)
 }
-fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_inflate<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     decompress_op(ctx, a, trust_js_host::deflate::zlib_decompress)
 }
-fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_deflate_raw<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     compress_op(ctx, a, trust_js_host::deflate::deflate)
 }
-fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_inflate_raw<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     decompress_op(ctx, a, trust_js_host::deflate::inflate)
 }
-fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_gzip<'s>(ctx: &mut Ctx<'s>, _t: Value<'s>, a: &[Value<'s>]) -> Result<Value<'s>, Value<'s>> {
     compress_op(ctx, a, trust_js_host::deflate::gzip_compress)
 }
-fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_gunzip<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     decompress_op(ctx, a, trust_js_host::deflate::gzip_decompress)
 }
-fn op_brotli(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_brotli<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     compress_op(ctx, a, trust_js_host::brotli::brotli_compress)
 }
-fn op_unbrotli(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_unbrotli<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     decompress_op(ctx, a, trust_js_host::brotli::brotli_decompress)
 }
 
-fn op_decompress_start(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_decompress_start<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let format = ctx
         .coerce_string(a.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -638,7 +718,11 @@ fn op_decompress_start(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, V
     Ok(Value::Num(id as f64))
 }
 
-fn op_compress_start(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_compress_start<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let format = ctx
         .coerce_string(a.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -664,14 +748,18 @@ fn op_compress_start(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Val
     Ok(Value::Num(id as f64))
 }
 
-fn codec_id(value: Option<&Value>) -> Option<u64> {
+fn codec_id<'s>(value: Option<&Value<'s>>) -> Option<u64> {
     value
         .and_then(Value::as_num_opt)
         .filter(|id| id.is_finite() && *id > 0.0 && id.fract() == 0.0)
         .map(|id| id as u64)
 }
 
-fn op_decompress_push(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_decompress_push<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id =
         codec_id(a.first()).ok_or_else(|| ctx.make_error("TypeError", "invalid decoder id"))?;
     let bytes = ctx
@@ -697,7 +785,11 @@ fn op_decompress_push(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
     Ok(ctx.make_array(vec![output, Value::Bool(done), Value::Bool(needs_input)]))
 }
 
-fn op_decompress_drop(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_decompress_drop<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     if let Some(id) = codec_id(a.first()) {
         let registry = ctx
             .host_mut::<CodecRegistry>()
@@ -708,7 +800,11 @@ fn op_decompress_drop(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
     Ok(Value::Undefined)
 }
 
-fn op_compress_push(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+fn op_compress_push<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    a: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id =
         codec_id(a.first()).ok_or_else(|| ctx.make_error("TypeError", "invalid encoder id"))?;
     let bytes = ctx
@@ -737,7 +833,11 @@ fn op_compress_push(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Valu
 
 /// `(method, url, headerPairs, bodyOrUndefined, credentials, resolve, reject)`: one HTTP request
 /// on the threadpool, settled through the TaskRegistry like every async op.
-fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_http_request<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let method = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -754,9 +854,7 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
     };
     let credentials = matches!(args.get(4), Some(Value::Bool(true)));
     let (resolve, reject) = match (args.get(5), args.get(6)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            (res.clone(), rej.clone())
-        }
+        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => (*res, *rej),
         _ => return Err(ctx.make_error("TypeError", "__http.request expects (resolve, reject)")),
     };
     let id = TaskRegistry::register_callbacks(ctx, &resolve, Some(&reject), decode_http)?;
@@ -777,7 +875,10 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
 }
 
 /// A JS `[[k, v], ...]` array into Rust pairs, via the curated member API.
-pub(crate) fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String, String)>, Value> {
+pub(crate) fn read_header_pairs<'s>(
+    ctx: &mut Ctx<'s>,
+    v: &Value<'s>,
+) -> Result<Vec<(String, String)>, Value<'s>> {
     let mut out = Vec::new();
     if v.as_obj().is_none() {
         return Ok(out);
@@ -811,7 +912,10 @@ pub(crate) fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String,
 }
 
 /// Build the raw-response object the JS glue wraps into a `Response`.
-fn decode_http(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_http<'s>(
+    ctx: &mut Ctx<'s>,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value<'s>>, Value<'s>> {
     let result = *payload
         .downcast::<Result<http::HttpResponse, String>>()
         .expect("http payload");
@@ -821,12 +925,12 @@ fn decode_http(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
     };
     let obj = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&obj, "status", Value::Num(response.status as f64));
-    let _ = ctx.set_member(&obj, "statusText", Value::from_string(response.status_text));
-    let _ = ctx.set_member(&obj, "url", Value::from_string(response.url));
+    let _ = ctx.set_member(&obj, "statusText", ctx.string(response.status_text));
+    let _ = ctx.set_member(&obj, "url", ctx.string(response.url));
     let pairs: Vec<Value> = response
         .headers
         .into_iter()
-        .map(|(k, v)| ctx.make_array(vec![Value::from_string(k), Value::from_string(v)]))
+        .map(|(k, v)| ctx.make_array(vec![ctx.string(k), ctx.string(v)]))
         .collect();
     let headers = ctx.make_array(pairs);
     let _ = ctx.set_member(&obj, "headers", headers);
@@ -991,7 +1095,20 @@ mod api_tests {
             "#
         );
         assert_eq!(eval(&mut engine, &source), "0");
-        let global = engine.global_this();
+        /// Release the store root of the global wrapper `name` (`op_release`).
+        fn release(engine: &mut Engine, name: &str) {
+            engine.scope(|cx| {
+                let global = cx.global_this();
+                let wrapper = cx
+                    .get_member(&global, name)
+                    .unwrap_or_else(|_| panic!("missing wrapper {name}"));
+                let token = cx
+                    .get_member(&wrapper, "_root")
+                    .unwrap_or_else(|_| panic!("missing root token for {name}"));
+                crate::wasm_ops::op_release(cx, trust_js_host::Value::Undefined, &[token])
+                    .unwrap_or_else(|_| panic!("could not release root for {name}"));
+            });
+        }
         for name in [
             "__wasmTestModule",
             "__wasmTestInstance",
@@ -999,36 +1116,18 @@ mod api_tests {
             "__wasmTestStore",
             "__wasmTestGrow",
         ] {
-            let wrapper = engine
-                .ctx()
-                .get_member(&global, name)
-                .unwrap_or_else(|_| panic!("missing wrapper {name}"));
-            let token = engine
-                .ctx()
-                .get_member(&wrapper, "_root")
-                .unwrap_or_else(|_| panic!("missing root token for {name}"));
-            crate::wasm_ops::op_release(engine.ctx(), trust_js_host::Value::Undefined, &[token])
-                .unwrap_or_else(|_| panic!("could not release root for {name}"));
+            release(&mut engine, name);
         }
         assert_eq!(eval(&mut engine, "__wasmTestLoad(0)"), "0");
         assert_eq!(
-            crate::wasm_ops::test_stats(engine.ctx()),
+            engine.scope(|cx| crate::wasm_ops::test_stats(cx)),
             [0, 1, 1, 4, 0, 1, 0, 1, 1],
             "the exported function root retains its defining instance graph"
         );
 
-        let load = engine
-            .ctx()
-            .get_member(&global, "__wasmTestLoad")
-            .unwrap_or_else(|_| panic!("missing load wrapper"));
-        let token = engine
-            .ctx()
-            .get_member(&load, "_root")
-            .unwrap_or_else(|_| panic!("missing load root"));
-        crate::wasm_ops::op_release(engine.ctx(), trust_js_host::Value::Undefined, &[token])
-            .unwrap_or_else(|_| panic!("could not release final root"));
+        release(&mut engine, "__wasmTestLoad");
         assert_eq!(
-            crate::wasm_ops::test_stats(engine.ctx()),
+            engine.scope(|cx| crate::wasm_ops::test_stats(cx)),
             [0; 9],
             "the final root releases modules, callbacks, buffers, and every store entity"
         );
@@ -1056,7 +1155,7 @@ mod api_tests {
         );
         assert_eq!(eval(&mut engine, &source), "0");
         assert_eq!(
-            crate::wasm_ops::test_stats(engine.ctx()),
+            engine.scope(|cx| crate::wasm_ops::test_stats(cx)),
             [1, 6, 1, 4, 0, 1, 0, 1, 1]
         );
 
@@ -1064,7 +1163,7 @@ mod api_tests {
             engine.collect_garbage_at_idle();
             engine.run_microtasks();
         }
-        assert_eq!(crate::wasm_ops::test_stats(engine.ctx()), [0; 9]);
+        assert_eq!(engine.scope(|cx| crate::wasm_ops::test_stats(cx)), [0; 9]);
     }
 
     #[test]
@@ -1099,7 +1198,7 @@ mod api_tests {
             "1"
         );
         assert_eq!(
-            crate::wasm_ops::test_stats(engine.ctx()),
+            engine.scope(|cx| crate::wasm_ops::test_stats(cx)),
             [1, 6, 1, 4, 0, 1, 0, 1, 1]
         );
 
@@ -1108,7 +1207,7 @@ mod api_tests {
             engine.collect_garbage_at_idle();
             engine.run_microtasks();
         }
-        assert_eq!(crate::wasm_ops::test_stats(engine.ctx()), [0; 9]);
+        assert_eq!(engine.scope(|cx| crate::wasm_ops::test_stats(cx)), [0; 9]);
     }
 
     /// The descriptor builders (`WebAssembly.Module.exports`/`imports` and an instance's

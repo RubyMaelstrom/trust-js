@@ -20,15 +20,20 @@ fn backing(engine: &mut Engine, source: &Value) -> Value {
     engine.interp.for_in_keys(source).ok().unwrap().into_value()
 }
 
+/// The engine value of `source` (unbranded: the crate's own form).
 #[cfg(feature = "embed")]
 fn owned_value(engine: &mut Engine, source: &str) -> Value {
-    engine
-        .eval_value(source)
-        .expect("parse")
-        .ok()
-        .expect("evaluate")
+    engine.scope(|cx| {
+        cx.eval_value(source)
+            .expect("parse")
+            .unwrap_or_else(|_| panic!("evaluate"))
+            .into_internal()
+    })
 }
 
+/// An internal test (S6 step 11b): no embedder can give one Engine's object to another (scoped
+/// values are branded by their scope, and handles are checked), so the foreign mutation is made
+/// through the other engine's interpreter directly.
 #[test]
 #[cfg(feature = "embed")]
 fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
@@ -37,8 +42,9 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
     let same_heap = owned_value(&mut owner, "({alpha:1,gamma:2})");
     let mut foreign = Engine::new();
     let _foreign_shape = owned_value(&mut foreign, "({beta:1})");
+    foreign.interp.activate_gc_heap();
     assert!(foreign
-        .ctx()
+        .interp
         .set_member_key(&original, "delta", Value::Num(3.0))
         .is_ok());
     assert_ne!(
@@ -56,7 +62,7 @@ fn for_in_cache_ignores_shape_ids_assigned_under_foreign_mutation() {
         (key_at(&second, 0), key_at(&second, 1)),
         ("alpha".into(), "delta".into())
     );
-    foreign.ctx();
+    foreign.interp.activate_gc_heap();
     original
         .as_obj()
         .unwrap()

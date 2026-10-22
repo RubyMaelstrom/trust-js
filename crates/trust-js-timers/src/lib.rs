@@ -244,7 +244,11 @@ fn webidl_long(number: f64) -> i32 {
 
 /// WHATWG HTML timer initialization steps. Web IDL converts the handler union and `long` delay
 /// before the algorithm clamps negative and deeply nested timeouts.
-fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Value> {
+fn schedule_op<'s>(
+    ctx: &mut Ctx<'s>,
+    args: &[Value<'s>],
+    repeat: bool,
+) -> Result<Value<'s>, Value<'s>> {
     let handler = match args.first() {
         Some(callback) if callback.is_callable() => {
             TimerHandler::Function(trust_js_host::handle(ctx, callback)?)
@@ -266,17 +270,29 @@ fn schedule_op(ctx: &mut Ctx, args: &[Value], repeat: bool) -> Result<Value, Val
     Ok(Value::Num(id as f64))
 }
 
-fn op_set_timeout(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_timeout<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     schedule_op(ctx, args, false)
 }
 
-fn op_set_interval(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_interval<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     schedule_op(ctx, args, true)
 }
 
 /// Shared by `clearTimeout`/`clearInterval` (per spec either clears either kind). Unknown or
 /// non-numeric ids are ignored.
-fn op_clear_timer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_clear_timer<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = match args.first() {
         Some(value) => webidl_long(ctx.coerce_number(value)?),
         None => 0,
@@ -287,9 +303,13 @@ fn op_clear_timer(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, 
 }
 
 /// Queue for the next loop turn (after microtasks, before timers get another look).
-fn op_set_immediate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_immediate<'s>(
+    ctx: &mut Ctx<'s>,
+    _this: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let callback = match args.first() {
-        Some(cb) if cb.is_callable() => cb.clone(),
+        Some(cb) if cb.is_callable() => *cb,
         _ => return Err(ctx.make_error("TypeError", "setImmediate expects a function")),
     };
     CallbackQueue::enqueue(ctx, &callback, args.get(1..).unwrap_or_default())?;
@@ -408,31 +428,25 @@ mod collection_tests {
                     &mut engine,
                     "var churn = []; for (let i = 0; i < 3000; i++) churn.push({i}); churn = null; 0",
                 );
-                engine.ctx().collect_garbage_for_host();
+                engine.collect_garbage_at_idle();
             }
             let now = Instant::now() + Duration::from_secs(1);
-            let due = engine
-                .ctx()
-                .host_mut::<Timers>()
-                .expect("timers")
-                .take_due(now);
+            let due = engine.host_mut::<Timers>().expect("timers").take_due(now);
             for task in due {
                 assert!(engine
-                    .ctx()
                     .host_mut::<Timers>()
                     .expect("timers")
                     .begin_task(&task));
                 let TimerHandler::Function(handler) = &task.handler else {
                     panic!("a function handler")
                 };
-                let handler = trust_js_host::value(engine.ctx(), handler);
-                let args = trust_js_host::values(engine.ctx(), &task.args);
-                assert!(engine
-                    .call_function(&handler, Value::Undefined, &args)
-                    .is_ok());
+                assert!(engine.scope(|cx| {
+                    let handler = trust_js_host::value(cx, handler);
+                    let args = trust_js_host::values(cx, &task.args);
+                    cx.call_function(&handler, Value::Undefined, &args).is_ok()
+                }));
                 runs += 1;
                 engine
-                    .ctx()
                     .host_mut::<Timers>()
                     .expect("timers")
                     .finish_task(&task, now);

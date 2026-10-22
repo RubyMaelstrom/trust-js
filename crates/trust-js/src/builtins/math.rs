@@ -32,12 +32,7 @@ impl RandomStream {
 impl crate::value::NativeCallableRetained for RandomStream {
     fn scan_retained_memory(&self, _visitor: &mut dyn crate::value::NativeRetainedMemoryVisitor) {
         // The reporter's inline Cell is counted by the native-callable walker;
-        // there are no further allocations or captured JavaScript values.
-    }
-
-    /// No JavaScript value at all.
-    fn reports_fixed_values(&self) -> bool {
-        true
+        // there are no further allocations.
     }
 }
 

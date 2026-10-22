@@ -8,7 +8,7 @@ use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_data, set_internal_slot, Gc, Value};
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "RelativeTimeFormat", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "format", 2, |i, this, args| {

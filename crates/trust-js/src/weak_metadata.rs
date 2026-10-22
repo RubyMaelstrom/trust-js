@@ -640,11 +640,13 @@ mod tests {
     /// queued, where a safepoint runs neither: the target kept for the job survives a
     /// collection until then, and the first collection after it clears the target's WeakRef. An
     /// entirely empty later boundary still runs the hook.
+    #[cfg(feature = "embed")]
     #[test]
     fn weak_metadata_empty_queue_does_not_skip_kept_objects_or_host_job_hooks() {
+        /// Reports `held` as a root until the job ends.
         struct JobRoots {
             calls: Rc<Cell<usize>>,
-            held: Option<Value>,
+            held: Option<crate::handles::WeakHandle>,
         }
         impl crate::host::HostTrace for JobRoots {
             fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
@@ -655,7 +657,7 @@ mod tests {
         }
 
         impl crate::host::HostGc for JobRoots {
-            fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {}
+            fn sweep_gc_with_native(&mut self, _: &dyn Fn(crate::host::NativeGcId) -> bool) {}
             fn end_job(&mut self) {
                 self.calls.set(self.calls.get() + 1);
                 self.held = None;
@@ -670,9 +672,13 @@ mod tests {
             let target = WeakTarget::of(&value).unwrap();
             let owner = reference(&mut engine.interp, &target);
             engine.interp.kept_alive.push(value.clone());
+            let held = engine.scope(|cx| {
+                crate::handles::WeakHandle::new(cx, &crate::scope::Value::from_internal(value))
+                    .expect("a weak handle")
+            });
             engine.interp.host_state.put(JobRoots {
                 calls: calls.clone(),
-                held: Some(value),
+                held: Some(held),
             });
             (target, owner)
         });

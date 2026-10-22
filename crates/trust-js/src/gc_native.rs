@@ -165,15 +165,18 @@ mod tests {
         }));
     }
 
+    /// A host whose JavaScript values live only through its native graph: weak handles that
+    /// the graph's report keeps (S6 step 11b).
+    #[cfg(feature = "embed")]
     struct MixedHost {
-        values: Vec<Value>,
+        values: Vec<crate::handles::WeakHandle>,
         root: bool,
         live_native: Vec<bool>,
     }
 
+    #[cfg(feature = "embed")]
     impl crate::host::HostTrace for MixedHost {
         fn trace_gc(&self, visitor: &mut dyn crate::host::HostGcVisitor) {
-            assert!(visitor.supports_native());
             for (id, value) in self.values.iter().enumerate() {
                 visitor.js_to_native(value, node(5, id));
                 visitor.native_to_js(node(5, id), value);
@@ -188,82 +191,50 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embed")]
     impl crate::host::HostGc for MixedHost {
-        fn sweep_gc(&mut self, _: &dyn Fn(&Value) -> bool) {
-            panic!("mixed collector must supply native liveness");
-        }
-        fn sweep_gc_with_native(
-            &mut self,
-            live: &dyn Fn(&Value) -> bool,
-            native_live: &dyn Fn(NativeGcId) -> bool,
-        ) {
+        fn sweep_gc_with_native(&mut self, native_live: &dyn Fn(NativeGcId) -> bool) {
             self.live_native = (0..self.values.len())
                 .map(|id| native_live(node(5, id)))
                 .collect();
-            for value in &mut self.values {
-                if !live(value) {
-                    *value = Value::Undefined;
-                }
-            }
         }
     }
 
+    #[cfg(feature = "embed")]
     #[test]
     fn mixed_native_heap_and_ephemerons_share_the_full_collector_fixed_point() {
         let mut engine = crate::Engine::new();
         engine.eval("var key={}, bridge={}, payload={n:42}, owner={}; var map = new WeakMap([[key,bridge]]);", false).unwrap();
-        // Strong handles live only in this helper frame (the collector scans the stack).
-        let weak: Vec<_> = crate::gc_test::in_frame(|| {
-            let global = Value::Obj(engine.interp.global.clone());
-            let mut values = Vec::new();
-            for name in ["owner", "key", "bridge", "payload"] {
-                values.push(
-                    engine
-                        .interp
-                        .member_get(&global, name)
-                        .unwrap_or_else(|_| panic!("global")),
-                );
-            }
-            let weak = values
-                .iter()
-                .map(|v| crate::value::Gc::downgrade(v.as_obj().unwrap()))
-                .collect();
-            engine.interp.op_state().put(MixedHost {
+        // The values live only in this helper frame (the collector scans the stack) and as weak
+        // handles in host state.
+        crate::gc_test::in_frame(|| {
+            let values = engine.scope(|cx| {
+                let global = cx.global_this();
+                ["owner", "key", "bridge", "payload"]
+                    .map(|name| {
+                        let value = cx
+                            .member_get(&global, name)
+                            .unwrap_or_else(|_| panic!("global"));
+                        crate::handles::WeakHandle::new(cx, &value).expect("a weak handle")
+                    })
+                    .to_vec()
+            });
+            engine.op_state().put(MixedHost {
                 values,
                 root: true,
                 live_native: Vec::new(),
             });
-            weak
         });
-        engine.interp.op_state().register_gc::<MixedHost>();
+        engine.op_state().register_gc::<MixedHost>();
         engine.eval("key=bridge=payload=owner=null", false).unwrap();
         engine.interp.gc_collect();
-        assert!(weak.iter().all(|v| crate::gc_test::alive(&v)));
-        assert_eq!(
-            engine
-                .interp
-                .op_state()
-                .get::<MixedHost>()
-                .unwrap()
-                .live_native,
-            [true; 4]
-        );
-        engine
-            .interp
-            .op_state()
-            .get_mut::<MixedHost>()
-            .unwrap()
-            .root = false;
+        let host = engine.host::<MixedHost>().unwrap();
+        assert!(host.values.iter().all(|value| !value.is_cleared()));
+        assert_eq!(host.live_native, [true; 4]);
+        engine.host_mut::<MixedHost>().unwrap().root = false;
         engine.interp.gc_collect();
-        assert!(weak.iter().all(|v| !crate::gc_test::alive(&v)));
-        assert_eq!(
-            engine
-                .interp
-                .op_state()
-                .get::<MixedHost>()
-                .unwrap()
-                .live_native,
-            [false; 4]
-        );
+        let host = engine.host::<MixedHost>().unwrap();
+        assert!(host.values.iter().all(|value| value.is_cleared()));
+        assert_eq!(host.live_native, [false; 4]);
     }
 }

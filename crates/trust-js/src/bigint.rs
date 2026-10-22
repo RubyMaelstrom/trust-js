@@ -68,7 +68,10 @@ fn unstoppable<T>(result: Result<T, Stop>) -> T {
     }
 }
 
+/// `repr(transparent)`: one cell handle, which the embedder's scoped BigInts
+/// (`scope::BigInt`) are too.
 #[derive(Clone, Debug)]
+#[repr(transparent)]
 pub struct JsBigInt(Payload);
 
 #[derive(Debug)]

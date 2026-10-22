@@ -693,14 +693,15 @@ impl BufferData {
     }
 }
 
-/// An embedder-held weak reference to a JavaScript object. Native resource graphs use this for
-/// callbacks whose strong lifetime is represented by a reachable JavaScript wrapper; retaining a
-/// strong `Value` in both graphs would turn otherwise collectable cross-boundary cycles immortal.
+/// A weak reference to a JavaScript object, for tests that watch an object die (embedders use
+/// `embed::WeakHandle`).
+#[cfg(test)]
 #[derive(Clone)]
-pub struct WeakValue(crate::value::WeakGc);
+pub(crate) struct WeakValue(crate::value::WeakGc);
 
+#[cfg(test)]
 impl WeakValue {
-    pub fn upgrade(&self) -> Option<Value> {
+    pub(crate) fn upgrade(&self) -> Option<Value> {
         self.0.upgrade().map(Value::Obj)
     }
 }
@@ -1288,7 +1289,7 @@ impl Interp {
 
 impl FnFrame {
     /// A strong handle to the callee, reconstructed from `fn_ptr` (see its aliveness invariant).
-    pub fn callee(&self) -> Gc {
+    pub(crate) fn callee(&self) -> Gc {
         let p = self.fn_ptr as *const RefCell<crate::value::Object>;
         unsafe { Gc::from_raw(p) }
     }
@@ -2582,7 +2583,7 @@ pub fn nearest_var_env(env: &Env) -> Env {
 }
 
 /// A non-local completion. Expressions only raise `Throw`; the rest flow out of statements.
-pub enum Abrupt {
+pub(crate) enum Abrupt {
     Throw(Value),
     /// Host control completion. It is deliberately not a thrown Value: HTML script termination
     /// bypasses author `catch` and `finally` blocks.
@@ -2594,7 +2595,7 @@ pub enum Abrupt {
     Continue(Option<String>, Value),
 }
 
-pub type Completion = Result<Value, Abrupt>;
+pub(crate) type Completion = Result<Value, Abrupt>;
 
 /// UpdateEmpty: replace an EMPTY statement-completion value with `undefined`.
 pub(crate) fn update_empty(v: Value) -> Value {
@@ -2614,7 +2615,7 @@ pub(crate) fn update_abrupt_empty(a: Abrupt, v: Value) -> Abrupt {
 }
 
 /// Extract the thrown value from an abrupt completion (non-throw completions surface as undefined).
-pub fn abrupt_value(a: Abrupt) -> Value {
+pub(crate) fn abrupt_value(a: Abrupt) -> Value {
     match a {
         Abrupt::Throw(v) => v,
         _ => Value::Undefined,
@@ -4938,7 +4939,11 @@ impl Interp {
     /// ParseScript then ScriptEvaluation (ECMA-262 #sec-scriptevaluation), so top-level
     /// `let`/`const`/`class` declarations join that Realm's global lexical environment, unlike
     /// an indirect `eval`. A parse failure is that Realm's SyntaxError.
-    pub fn eval_in_realm(&mut self, realm_global: &Value, src: &str) -> Result<Value, Abrupt> {
+    pub(crate) fn eval_in_realm(
+        &mut self,
+        realm_global: &Value,
+        src: &str,
+    ) -> Result<Value, Abrupt> {
         let text = crate::jstr::from_text(src);
         self.eval_script_in_realm(realm_global, &text)
     }
@@ -5128,18 +5133,9 @@ impl Interp {
     }
 
     /// The HostPromiseRejectionTracker "handle" operations since the last call on promises of
-    /// an outstanding rejected promises weak set, as `(promise, reason)` in order: each is a
-    /// `rejectionhandled` event the host queues (HTML #unhandled-promise-rejections).
-    pub fn take_handled_rejections(&mut self) -> Vec<(Value, Value)> {
-        self.take_handled_rejections_in_contexts()
-            .into_iter()
-            .map(|(_, promise, reason)| (promise, reason))
-            .collect()
-    }
-
-    /// [`Self::take_handled_rejections`] as `(context, promise, reason)`: the host settings
-    /// context whose global's outstanding rejected promises weak set held the promise, where
-    /// HTML fires its `rejectionhandled` event.
+    /// an outstanding rejected promises weak set, as `(context, promise, reason)` in order: each
+    /// is a `rejectionhandled` event the host queues (HTML #unhandled-promise-rejections) at the
+    /// global of the host settings context whose weak set held the promise.
     pub fn take_handled_rejections_in_contexts(&mut self) -> Vec<(u64, Value, Value)> {
         std::mem::take(&mut self.handled_rejections)
             .into_iter()
@@ -5648,11 +5644,11 @@ impl Interp {
         value
     }
 
-    pub fn throw(&self, kind: &str, message: impl Into<String>) -> Abrupt {
+    pub(crate) fn throw(&self, kind: &str, message: impl Into<String>) -> Abrupt {
         Abrupt::Throw(self.make_error(kind, message))
     }
     #[allow(dead_code)]
-    pub fn type_err<T>(&self, message: impl Into<String>) -> Result<T, Abrupt> {
+    pub(crate) fn type_err<T>(&self, message: impl Into<String>) -> Result<T, Abrupt> {
         Err(self.throw("TypeError", message))
     }
 
@@ -6157,7 +6153,7 @@ impl Interp {
 
     // ----- object construction ----------------------------------------------------------------
 
-    pub fn new_object(&self) -> Gc {
+    pub(crate) fn new_object(&self) -> Gc {
         Object::new(Some(self.object_proto.clone()))
     }
 
@@ -6453,9 +6449,9 @@ impl Interp {
         v.as_obj().map(|o| Gc::as_ptr(o) as usize)
     }
 
-    /// Downgrade an object Value for a native graph whose owner is already represented in the JS
-    /// heap. The weak handle preserves identity without independently keeping the object alive.
-    pub fn downgrade_object_value(&self, v: &Value) -> Option<WeakValue> {
+    /// Downgrade an object Value (tests watching it die).
+    #[cfg(test)]
+    pub(crate) fn downgrade_object_value(&self, v: &Value) -> Option<WeakValue> {
         v.as_obj().map(|object| WeakValue(Gc::downgrade(object)))
     }
 
@@ -6483,23 +6479,6 @@ impl Interp {
         self.gc_next = self.live_object_limit;
         self.gc_task_allocated = crate::value::heap_allocated_objects(&self.gc_heap);
         before.saturating_sub(live)
-    }
-
-    /// Diagnostic collection for embedder graph/barrier conformance tests: a full (major)
-    /// collection, as [`Interp::collect_garbage_for_host`] runs. Host graphs are reported in
-    /// full at every collection, minor or major (`HostGcVisitor::is_minor` is false). It is not
-    /// a supported scheduling API.
-    #[doc(hidden)]
-    pub fn unstable_collect_young_for_host_tests(&mut self) -> i64 {
-        self.activate_gc_heap();
-        let before = crate::value::heap_live_objects(&self.gc_heap);
-        #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
-        self.gc_collect_with_cause(
-            crate::value::GcCause::Explicit,
-            Some(crate::gc_core::CollectionKind::Major),
-        );
-        before.saturating_sub(crate::value::heap_live_objects(&self.gc_heap))
     }
 
     /// Create a pending intrinsic Promise and its resolving functions for a host operation.
@@ -7042,6 +7021,12 @@ impl Interp {
                     let _captures = crate::rooting::root_slice(captures);
                     function(self, this, args, captures)
                 }
+                crate::value::NativeCallableBody::CapturedClosure { function, captures } => {
+                    // As above; the closure lives while this call holds it.
+                    let _captures = crate::rooting::root_slice(captures);
+                    let function = function.clone();
+                    function(self, this, args, captures)
+                }
             },
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
@@ -7116,6 +7101,28 @@ impl Interp {
         )
     }
 
+    /// A function object backed by a native closure that carries Rust state and JavaScript
+    /// captures both (S6 step 11b): the captures are owned and traced by the engine, as
+    /// [`Self::new_native_fn_with_captures`]'s, and passed to the closure as its last argument.
+    pub(crate) fn make_native_capture_closure(
+        &self,
+        name: &str,
+        len: usize,
+        function: Rc<crate::value::CaptureClosure>,
+        captures: Vec<Value>,
+        retained: crate::value::NativeCaptures,
+    ) -> Gc {
+        self.make_native_callable(
+            name,
+            len,
+            crate::value::NativeCallableBody::CapturedClosure {
+                function,
+                captures: captures.into_boxed_slice(),
+            },
+            retained.into_reporter(),
+        )
+    }
+
     fn make_native_callable(
         &self,
         name: &str,
@@ -7124,12 +7131,6 @@ impl Interp {
         retained: Option<std::rc::Rc<dyn crate::value::NativeCallableRetained>>,
     ) -> Gc {
         let obj = Object::new(Some(self.function_proto.clone()));
-        if retained
-            .as_ref()
-            .is_some_and(|reporter| !reporter.reports_fixed_values())
-        {
-            self.register_rescanned_native(&obj);
-        }
         {
             let mut b = obj.borrow_mut();
             b.call = Callable::NativeData(Rc::new(crate::value::NativeCallable {
@@ -7150,7 +7151,7 @@ impl Interp {
         obj
     }
 
-    pub fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
+    pub(crate) fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
         let obj = Object::new(Some(self.function_proto.clone()));
         crate::jit::perf_native_register(f as usize, name);
         {
@@ -7167,15 +7168,6 @@ impl Interp {
         }
         self.register_native_realm(&obj);
         obj
-    }
-
-    /// S6 step 10b: `function` holds a native callable whose host reporter's values may change
-    /// after its creation: every collection rescans it (see `GcState::rescanned_natives`).
-    pub(crate) fn register_rescanned_native(&self, function: &Gc) {
-        self.gc_heap
-            .rescanned_natives
-            .borrow_mut()
-            .insert(Gc::as_ptr(function) as usize);
     }
 
     pub(crate) fn register_native_realm(&self, function: &Gc) {
@@ -7291,7 +7283,7 @@ impl Interp {
     }
 
     /// Define a native method on `target` (non-enumerable, as built-ins are).
-    pub fn def_method(&self, target: &Gc, name: &str, len: usize, f: NativeFn) {
+    pub(crate) fn def_method(&self, target: &Gc, name: &str, len: usize, f: NativeFn) {
         let func = self.make_native(name, len, f);
         target.borrow_mut().props.insert(
             crate::value::encode_string_key(name).as_ref(),
@@ -7334,18 +7326,18 @@ impl Interp {
 
     /// [`Self::invoke`] keeping a host interruption distinct from a JavaScript throw.
     #[cfg(feature = "embed")]
-    pub fn invoke_interruptible(
+    pub(crate) fn invoke_interruptible(
         &mut self,
         callee: Value,
         this: Value,
         args: &[Value],
-    ) -> Result<Value, crate::embed::EvalError> {
+    ) -> Result<Value, crate::EvalFailure> {
         // Callback entry polls without the cadence divider, as the engine-level entry points do.
         self.interrupt_poll_force()
             .and_then(|()| self.call_callback(callee, this, args))
             .map_err(|abrupt| match abrupt {
-                Abrupt::Interrupt(reason) => crate::embed::EvalError::Interrupted(reason),
-                other => crate::embed::EvalError::Throw(abrupt_value(other)),
+                Abrupt::Interrupt(reason) => crate::EvalFailure::Interrupted(reason),
+                other => crate::EvalFailure::Throw(abrupt_value(other)),
             })
     }
 
@@ -7421,11 +7413,6 @@ impl Interp {
         self.to_string(v)
             .map(|s| Rc::from(s.as_str()))
             .map_err(abrupt_value)
-    }
-
-    /// The JS string with the characters of Rust text; the same as [`Value::from_string`].
-    pub fn string_from_utf8(&self, value: String) -> Value {
-        Value::from_string(value)
     }
 
     /// The bytes a TypedArray view covers (`None` when `v` isn't a typed array or its buffer
@@ -7977,7 +7964,7 @@ impl Interp {
 
     /// Read an author String key. Every String, including a leading-NUL name, is
     /// distinct from every Symbol key; hosts cannot forge an encoded Symbol identity.
-    pub fn get_member(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
+    pub(crate) fn get_member(&mut self, base: &Value, key: &str) -> Result<Value, Abrupt> {
         self.get_member_key(base, &crate::value::encode_string_key(key))
     }
 
@@ -10098,7 +10085,12 @@ impl Interp {
     }
 
     /// Write an author String key; see [`Self::get_member`] for its key boundary.
-    pub fn set_member(&mut self, base: &Value, key: &str, value: Value) -> Result<(), Abrupt> {
+    pub(crate) fn set_member(
+        &mut self,
+        base: &Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Abrupt> {
         self.set_member_key(base, &crate::value::encode_string_key(key), value)
     }
 
@@ -11441,13 +11433,8 @@ impl Interp {
         native: &crate::gc_native::NativeGcGraph,
         kind: crate::gc_core::CollectionKind,
     ) {
-        self.host_state.sweep_gc_with_native(
-            &|value| match value {
-                Value::Obj(object) => !garbage_objects.contains(Gc::as_ptr(object) as usize),
-                _ => true,
-            },
-            &|id| native.is_live(id),
-        );
+        self.host_state
+            .sweep_gc_with_native(&|id| native.is_live(id));
 
         // Drop template entries owned by a dead Realm before the sweep releases its global.
         // Checking the Realm table as well as the dead objects handles stale pointer-keyed entries
@@ -11968,7 +11955,12 @@ impl Interp {
         Some(result)
     }
 
-    pub fn call(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Abrupt> {
+    pub(crate) fn call(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
         // I1: callers often hold the argument list in a Rust-heap buffer.
         let _arguments = crate::rooting::root_slice(args);
         self.depth += 1;
@@ -15659,7 +15651,7 @@ impl Interp {
         }
     }
 
-    pub fn construct(&mut self, callee: Value, args: &[Value]) -> Result<Value, Abrupt> {
+    pub(crate) fn construct(&mut self, callee: Value, args: &[Value]) -> Result<Value, Abrupt> {
         let nt = callee.clone();
         self.construct_nt(callee, args, nt)
     }

@@ -20,7 +20,7 @@ pub(super) fn available_collations() -> &'static [&'static str] {
     &COLLATIONS
 }
 
-pub fn install(it: &mut Interp, ns: &Gc) {
+pub(crate) fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "Collator", 0, construct);
     install_supported_locales(it, &ctor);
     it.def_method(&proto, "resolvedOptions", 0, resolved_options);

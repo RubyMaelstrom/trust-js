@@ -135,7 +135,7 @@ struct FfiState {
     callbacks: Vec<Vec<Option<CbEntry>>>,
 }
 
-fn ffi_state(ctx: &mut Ctx) -> &mut FfiState {
+fn ffi_state<'a>(ctx: &'a mut Ctx<'_>) -> &'a mut FfiState {
     if ctx.host_mut::<FfiState>().is_none() {
         let st = FfiState {
             callbacks: (0..=MAX_ARGS)
@@ -151,27 +151,27 @@ fn ffi_state(ctx: &mut Ctx) -> &mut FfiState {
 thread_local! {
     /// The engine pointer for the currently-executing outgoing native call, so a JSCallback thunk
     /// can re-enter JS. Null outside any FFI call (a foreign-thread invocation).
-    static CURRENT_CTX: Cell<*mut Ctx> = const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_CTX: Cell<*mut Ctx<'static>> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 // ---- small arg helpers ------------------------------------------------------------------------
 
-fn ptr_num_arg(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<u64, Value> {
+fn ptr_num_arg<'s>(ctx: &mut Ctx<'s>, args: &[Value<'s>], i: usize) -> Result<u64, Value<'s>> {
     value_to_pointer(ctx, args.get(i).unwrap_or(&Value::Undefined))
 }
 
-fn type_error(ctx: &mut Ctx, msg: impl Into<String>) -> Value {
+fn type_error<'s>(ctx: &mut Ctx<'s>, msg: impl Into<String>) -> Value<'s> {
     ctx.make_error("TypeError", msg.into())
 }
 
-fn plain_error(ctx: &mut Ctx, msg: impl Into<String>) -> Value {
+fn plain_error<'s>(ctx: &mut Ctx<'s>, msg: impl Into<String>) -> Value<'s> {
     ctx.make_error("Error", msg.into())
 }
 
 /// Convert a JS value used as a pointer/cstring/function argument into a raw address, matching
 /// Bun's acceptance rules: numbers are addresses, typed arrays contribute their backing pointer,
 /// null/undefined are 0, and strings/bigints are refused with Bun's exact messages.
-fn value_to_pointer(ctx: &mut Ctx, v: &Value) -> Result<u64, Value> {
+fn value_to_pointer<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> Result<u64, Value<'s>> {
     match v {
         Value::Num(n) => Ok(*n as i64 as u64),
         Value::Null | Value::Undefined => Ok(0),
@@ -198,13 +198,13 @@ fn value_to_pointer(ctx: &mut Ctx, v: &Value) -> Result<u64, Value> {
 }
 
 /// Marshal one JS argument into either the integer or float register stream, per its declared type.
-fn marshal_arg(
-    ctx: &mut Ctx,
+fn marshal_arg<'s>(
+    ctx: &mut Ctx<'s>,
     code: u8,
-    v: &Value,
+    v: &Value<'s>,
     ints: &mut Vec<u64>,
     floats: &mut Vec<FArg>,
-) -> Result<(), Value> {
+) -> Result<(), Value<'s>> {
     if is_float(code) {
         let n = ctx.coerce_number(v)?;
         floats.push(if code == T_F32 {
@@ -242,7 +242,7 @@ fn marshal_arg(
 }
 
 /// Decode a native return value (raw register bits) into the JS value the declared type implies.
-fn marshal_return(raw: RawRet, code: u8) -> Value {
+fn marshal_return<'s>(ctx: &Ctx<'s>, raw: RawRet, code: u8) -> Value<'s> {
     match code {
         T_VOID => Value::Undefined,
         T_CHAR | T_I8 => Value::Num((raw.int as u8 as i8) as f64),
@@ -252,8 +252,8 @@ fn marshal_return(raw: RawRet, code: u8) -> Value {
         T_I32 => Value::Num((raw.int as u32 as i32) as f64),
         T_U32 => Value::Num((raw.int as u32) as f64),
         T_BOOL => Value::Bool(raw.int & 1 != 0),
-        T_I64 => Value::bigint_from_i128((raw.int as i64) as i128),
-        T_U64 => Value::bigint_from_u64(raw.int),
+        T_I64 => ctx.bigint_from_i128((raw.int as i64) as i128),
+        T_U64 => ctx.bigint_from_u64(raw.int),
         T_I64_FAST => Value::Num((raw.int as i64) as f64),
         T_U64_FAST => Value::Num(raw.int as f64),
         T_F32 => Value::Num(raw.f32 as f64),
@@ -307,7 +307,7 @@ unsafe fn invoke_native(
 
 // ---- ops --------------------------------------------------------------------------------------
 
-fn arr_len(ctx: &mut Ctx, v: &Value) -> usize {
+fn arr_len<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>) -> usize {
     match ctx.member_get(v, "length") {
         Ok(Value::Num(n)) => n as usize,
         _ => 0,
@@ -315,7 +315,11 @@ fn arr_len(ctx: &mut Ctx, v: &Value) -> usize {
 }
 
 /// `__ffi.dlopen(path)` → an opaque library id (kept mapped for the process lifetime).
-pub fn op_dlopen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_dlopen<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let path = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
@@ -327,7 +331,11 @@ pub fn op_dlopen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 }
 
 /// `__ffi.dlsym(libId, name)` → the symbol's raw address as a number, or a Bun-style throw.
-pub fn op_dlsym(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_dlsym<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
     let name = ctx
         .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
@@ -346,7 +354,11 @@ pub fn op_dlsym(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value
 }
 
 /// `__ffi.dlclose(libId)` — unmap a library (its symbols dangle afterward).
-pub fn op_dlclose(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_dlclose<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
     let st = ffi_state(ctx);
     if let Some(slot) = st.libs.get_mut(id) {
@@ -357,7 +369,11 @@ pub fn op_dlclose(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 
 /// Compile one C translation unit into a temporary shared library using the host toolchain.
 /// Arguments are already tokenized by the JS layer and NUL-separated, so no shell is involved.
-pub fn op_cc(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_cc<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let source = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
@@ -406,7 +422,7 @@ pub fn op_cc(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
             .arg(&output);
         match command.output() {
             Ok(result) if result.status.success() => {
-                return Ok(Value::from_string(output.to_string_lossy().into_owned()));
+                return Ok(ctx.string(output.to_string_lossy().into_owned()));
             }
             Ok(result) => failures.push(format!(
                 "{compiler}: {}",
@@ -423,7 +439,11 @@ pub fn op_cc(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 }
 
 /// `__ffi.call(fnPtr, retCode, [argCodes], [args])` — marshal, trampoline, and marshal back.
-pub fn op_call(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_call<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let fnptr = ptr_num_arg(ctx, args, 0)? as *const c_void;
     let ret_code = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as u8;
     let codes_v = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -449,15 +469,19 @@ pub fn op_call(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
     }
 
     // Publish the engine pointer so a JSCallback fired *during* this call can re-enter JS.
-    let prev = CURRENT_CTX.with(|c| c.replace(ctx as *mut Ctx));
+    let prev = CURRENT_CTX.with(|c| c.replace((ctx as *mut Ctx<'s>).cast()));
     let raw = unsafe { invoke_native(fnptr, &ints, &floats, ret_code) };
     CURRENT_CTX.with(|c| c.set(prev));
 
-    Ok(marshal_return(raw, ret_code))
+    Ok(marshal_return(ctx, raw, ret_code))
 }
 
 /// `__ffi.ptr(typedArray, byteOffset?)` → the backing address as a number.
-pub fn op_ptr(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_ptr<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let v = args.first().cloned().unwrap_or(Value::Undefined);
     let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
     match ctx.typed_array_raw(&v) {
@@ -472,7 +496,11 @@ pub fn op_ptr(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
 /// `__ffi.read(ptr, offset, kind)` — a DataView-style read from a raw address (little-endian, as
 /// on both supported targets). `kind`: 0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=u64 7=i64 8=f32 9=f64
 /// 10=ptr 11=intptr.
-pub fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_read<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let base = ptr_num_arg(ctx, args, 0)?;
     let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
     let kind = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))? as u8;
@@ -485,8 +513,8 @@ pub fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
             3 => Value::Num((p as *const i16).read_unaligned() as f64),
             4 => Value::Num((p as *const u32).read_unaligned() as f64),
             5 => Value::Num((p as *const i32).read_unaligned() as f64),
-            6 => Value::bigint_from_u64((p as *const u64).read_unaligned()),
-            7 => Value::bigint_from_i128((p as *const i64).read_unaligned() as i128),
+            6 => ctx.bigint_from_u64((p as *const u64).read_unaligned()),
+            7 => ctx.bigint_from_i128((p as *const i64).read_unaligned() as i128),
             8 => Value::Num((p as *const f32).read_unaligned() as f64),
             9 => Value::Num((p as *const f64).read_unaligned()),
             10 | 11 => Value::Num((p as *const usize).read_unaligned() as f64),
@@ -497,12 +525,16 @@ pub fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 }
 
 /// `__ffi.readCString(ptr, byteOffset, byteLength)` — decode UTF-8 (`byteLength < 0` ⇒ NUL-scan).
-pub fn op_read_cstring(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_read_cstring<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let base = ptr_num_arg(ctx, args, 0)?;
     let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
     let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(-1.0)))?;
     if base == 0 {
-        return Ok(Value::str(""));
+        return Ok(ctx.str(""));
     }
     let p = (base as usize + off) as *const u8;
     let bytes: &[u8] = unsafe {
@@ -516,15 +548,17 @@ pub fn op_read_cstring(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value
             std::slice::from_raw_parts(p, len as usize)
         }
     };
-    Ok(Value::from_string(
-        String::from_utf8_lossy(bytes).into_owned(),
-    ))
+    Ok(ctx.string(String::from_utf8_lossy(bytes).into_owned()))
 }
 
 /// `__ffi.toArrayBuffer(ptr, byteOffset, byteLength)` — a *copy* of native memory as an
 /// ArrayBuffer. (Bun returns a zero-copy view; TRust JS's ArrayBuffers own their storage, so this
 /// snapshots the bytes — reads match, writes do not propagate back to native memory.)
-pub fn op_to_array_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_to_array_buffer<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let base = ptr_num_arg(ctx, args, 0)?;
     let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
     let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(0.0)))? as usize;
@@ -539,7 +573,11 @@ pub fn op_to_array_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
 
 /// `__ffi.toBuffer(ptr, byteOffset, byteLength)` — like [`op_to_array_buffer`] but a Uint8Array
 /// copy (the JS glue rewraps it as a Node `Buffer`).
-pub fn op_to_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_to_buffer<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let base = ptr_num_arg(ctx, args, 0)?;
     let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
     let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(0.0)))? as usize;
@@ -553,7 +591,11 @@ pub fn op_to_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, V
 
 /// `__ffi.registerCallback(fn, [argCodes], retCode)` → `[thunkPtr, id]`, or an honest throw for
 /// signatures the pooled integer-only thunks can't serve.
-pub fn op_register_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_register_callback<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let func = args.first().cloned().unwrap_or(Value::Undefined);
     if !func.is_callable() {
         return Err(type_error(ctx, "bun:ffi JSCallback expects a function"));
@@ -611,7 +653,11 @@ pub fn op_register_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
 }
 
 /// `__ffi.unregisterCallback(id)` — free a JSCallback slot.
-pub fn op_unregister_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
+pub fn op_unregister_callback<'s>(
+    ctx: &mut Ctx<'s>,
+    _t: Value<'s>,
+    args: &[Value<'s>],
+) -> Result<Value<'s>, Value<'s>> {
     let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
     let (n, k) = (id / JSCB_POOL, id % JSCB_POOL);
     let st = ffi_state(ctx);
@@ -634,8 +680,11 @@ fn jscb_dispatch(n: usize, k: usize, raw_args: &[u64]) -> u64 {
     }
     // SAFETY: single-threaded engine; the outgoing native call in `op_call` is on this same stack
     // and is not using `&mut Ctx` while the callee runs (mirrors the N-API re-entry contract).
-    let ctx = unsafe { &mut *ptr };
+    jscb_dispatch_in(unsafe { &mut *ptr }, n, k, raw_args)
+}
 
+/// [`jscb_dispatch`] in the scope of the native call it re-enters.
+fn jscb_dispatch_in<'s>(ctx: &mut Ctx<'s>, n: usize, k: usize, raw_args: &[u64]) -> u64 {
     let (func, arg_codes, ret_code) = {
         let st = ffi_state(ctx);
         match st
@@ -653,7 +702,7 @@ fn jscb_dispatch(n: usize, k: usize, raw_args: &[u64]) -> u64 {
     let mut js_args = Vec::with_capacity(arg_codes.len());
     for (i, &code) in arg_codes.iter().enumerate() {
         let raw = raw_args.get(i).copied().unwrap_or(0);
-        js_args.push(cb_arg_to_value(raw, code));
+        js_args.push(cb_arg_to_value(ctx, raw, code));
     }
 
     match ctx.invoke(func, Value::Undefined, &js_args) {
@@ -671,7 +720,7 @@ fn jscb_dispatch(n: usize, k: usize, raw_args: &[u64]) -> u64 {
 
 /// Present a raw integer-register argument to the JS callback as Bun would: pointers as numbers
 /// (0 ⇒ null), 64-bit ints as BigInt, narrower ints as numbers, bool as boolean.
-fn cb_arg_to_value(raw: u64, code: u8) -> Value {
+fn cb_arg_to_value<'s>(ctx: &Ctx<'s>, raw: u64, code: u8) -> Value<'s> {
     if is_pointer(code) {
         return if raw == 0 {
             Value::Null
@@ -687,14 +736,14 @@ fn cb_arg_to_value(raw: u64, code: u8) -> Value {
         T_I32 => Value::Num((raw as u32 as i32) as f64),
         T_U32 => Value::Num((raw as u32) as f64),
         T_BOOL => Value::Bool(raw & 1 != 0),
-        T_I64 | T_I64_FAST => Value::bigint_from_i128((raw as i64) as i128),
-        T_U64 | T_U64_FAST => Value::bigint_from_u64(raw),
+        T_I64 | T_I64_FAST => ctx.bigint_from_i128((raw as i64) as i128),
+        T_U64 | T_U64_FAST => ctx.bigint_from_u64(raw),
         _ => Value::Num(raw as f64),
     }
 }
 
 /// Reduce a JS callback's return value to the raw register bits the native caller expects.
-fn cb_return_to_raw(ctx: &mut Ctx, v: &Value, ret_code: u8) -> u64 {
+fn cb_return_to_raw<'s>(ctx: &mut Ctx<'s>, v: &Value<'s>, ret_code: u8) -> u64 {
     if ret_code == T_VOID {
         return 0;
     }
