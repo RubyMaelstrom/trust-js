@@ -25,7 +25,7 @@ mod cell {
     impl Gc {
         /// Allocate `object` in `heap`, the agent heap that owns it.
         #[inline]
-        pub(crate) fn new_in(heap: &crate::value::GcHeap, object: RefCell<Object>) -> Gc {
+        pub(crate) fn new_in(heap: &crate::value::GcState, object: RefCell<Object>) -> Gc {
             let cell = crate::value::alloc_object_cell(heap);
             // SAFETY: a fresh cell sized and aligned for `RefCell<Object>`. Allocation never
             // collects, so the cell is initialized before any collection can trace it.

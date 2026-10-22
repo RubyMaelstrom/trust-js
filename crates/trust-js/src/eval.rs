@@ -5351,7 +5351,7 @@ impl Interp {
         let switch_host_context = job.realm.is_some() && job.host_context != previous_host_context;
         if switch_host_context {
             if let Some(enter) = self.host_job_context_enter {
-                enter(self, job.host_context);
+                self.with_host_callback(|interp| enter(interp, job.host_context));
             }
             self.switch_host_job_context(job.host_context);
         }
@@ -5375,7 +5375,7 @@ impl Interp {
                 Err(Abrupt::Interrupt(reason)) => {
                     if switch_host_context {
                         if let Some(leave) = self.host_job_context_leave {
-                            leave(self);
+                            self.with_host_callback(leave);
                         }
                         self.switch_host_job_context(previous_host_context);
                     }
@@ -5390,7 +5390,7 @@ impl Interp {
         }
         if switch_host_context {
             if let Some(leave) = self.host_job_context_leave {
-                leave(self);
+                self.with_host_callback(leave);
             }
             self.switch_host_job_context(previous_host_context);
         }

@@ -90,6 +90,7 @@ fn invoke(
         propstat_enabled: false,
         inline_recompile_at: inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         activation: None,
         resume_activation: std::ptr::null_mut(),
         resume_pc: 0,

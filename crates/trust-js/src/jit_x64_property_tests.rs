@@ -85,7 +85,7 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
                 .interp
                 .set_member_key(&receiver, "value", Value::Undefined)
                 .unwrap_or_else(|_| panic!("fixture operation throws"));
-            engine.collect_garbage_at_idle();
+            engine.interp.collect_garbage_for_host();
             assert!(crate::builtins::same_value_pub(&result, &expected));
         }
         assert_eq!(

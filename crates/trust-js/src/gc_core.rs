@@ -1110,6 +1110,9 @@ pub(crate) struct Heap {
     /// The embedder's copy of [`Heap::collection_due`], as a word that code polls without
     /// calling into the heap (see [`Heap::attach_due_word`]).
     due_word: Option<NonNull<Cell<u64>>>,
+    /// The embedder's live-cell count for one descriptor, stored at a stable address beside
+    /// its due word. Allocation increments it; each swept page subtracts its newly dead cells.
+    live_count: Option<(DescId, NonNull<Cell<i64>>)>,
     /// Allocated bytes past which [`Heap::alloc`] recomputes the due word: the byte trigger;
     /// under a stress interval the current total (the allocation count decides, so every
     /// allocation recomputes); `usize::MAX` once due (no allocation can make it false; marking,
@@ -1166,6 +1169,7 @@ impl Heap {
             marked_bytes: 0,
             collect_on_alloc: true,
             due_word: None,
+            live_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             #[cfg(test)]
@@ -1307,6 +1311,31 @@ impl Heap {
     pub(crate) unsafe fn attach_due_word(&mut self, word: NonNull<Cell<u64>>) {
         self.due_word = Some(word);
         self.refresh_due();
+    }
+
+    /// Publish the number of allocated, non-zombie cells of `desc` through `count`. Only the
+    /// heap writes it, including on teardown; its address stays usable by generated polls.
+    ///
+    /// # Safety
+    /// `count` must remain valid at its address, and written by no one else, until the heap
+    /// has been dropped (including its final `release_all`).
+    pub(crate) unsafe fn attach_live_count(&mut self, desc: DescId, count: NonNull<Cell<i64>>) {
+        // SAFETY: the caller keeps the count valid until the heap is dropped.
+        unsafe { count.as_ref() }.set(self.live_count(desc) as i64);
+        self.live_count = Some((desc, count));
+    }
+
+    /// Whether `addr` is the start of an initialized, non-zombie cell of `desc`. This resolves
+    /// ownership without reading the cell, including when another heap is active.
+    pub(crate) fn owns_cell(&self, addr: usize, desc: DescId) -> bool {
+        self.locate(addr as u64).is_some_and(|cell| {
+            cell.start == addr
+                && cell.desc == desc
+                && matches!(
+                    self.cell_age(addr as u64),
+                    Some(CellAge::Old | CellAge::Young)
+                )
+        })
     }
 
     /// Collections run so far (without the page walk of [`Heap::stats`]).
@@ -1474,6 +1503,13 @@ impl Heap {
                 .locate(ptr as u64)
                 .expect("a fresh cell resolves to itself");
             self.mark(&cell);
+        }
+        if let Some((counted, count)) = self.live_count {
+            if desc == counted {
+                // SAFETY: `attach_live_count` keeps the count valid until this heap is dropped.
+                let count = unsafe { count.as_ref() };
+                count.set(count.get() + 1);
+            }
         }
         self.stats.allocations += 1;
         self.allocated_bytes = self.allocated_bytes.saturating_add(cost);
@@ -1936,7 +1972,6 @@ impl Heap {
 
     /// The allocated, non-zombie cells of `desc`: after a collection, the live ones.
     /// How many cells [`Heap::live_cells`] would list.
-    #[cfg(test)]
     pub(crate) fn live_count(&self, desc: DescId) -> usize {
         let paged: usize = self
             .pages
@@ -2210,6 +2245,16 @@ impl Heap {
     fn sweep_phase(&mut self) {
         let kind = self.collecting_kind;
         let freed = self.sweep(kind);
+        if cfg!(debug_assertions) {
+            if let Some((desc, count)) = self.live_count {
+                // SAFETY: `attach_live_count`'s contract.
+                assert_eq!(
+                    unsafe { count.as_ref() }.get(),
+                    self.live_count(desc) as i64,
+                    "GC live-cell accounting"
+                );
+            }
+        }
         // What the heap holds now: its live cells, zombies and, after a minor collection, the old
         // cells that died since a collection last marked them.
         let held = self.allocated_bytes.saturating_sub(freed);
@@ -2534,6 +2579,8 @@ impl Heap {
         self.young_pages.clear();
         let mut swept = 0u64;
         let descs = &self.descs;
+        let live_count = self.live_count;
+        let mut counted_dead = 0i64;
         self.larges.retain(|&start, large| {
             let pinned = std::mem::take(&mut large.pinned);
             if large.marked {
@@ -2543,6 +2590,9 @@ impl Heap {
             large.waiters = false;
             if !large.zombie {
                 swept += 1;
+                if live_count.is_some_and(|(desc, _)| desc == large.desc) {
+                    counted_dead += 1;
+                }
                 if let Some(finalize) = descs[large.desc.0 as usize].finalize {
                     finalize(start as *mut u8);
                 }
@@ -2561,6 +2611,11 @@ impl Heap {
             unsafe { dealloc(start as *mut u8, large_layout(large.size)) };
             false
         });
+        if let Some((_, count)) = live_count {
+            // SAFETY: `attach_live_count`'s contract.
+            let count = unsafe { count.as_ref() };
+            count.set(count.get() - counted_dead);
+        }
         self.large_span = match (self.larges.first_key_value(), self.larges.last_key_value()) {
             (Some((&lo, _)), Some((&last, large))) => (lo, last + large.size),
             _ => (usize::MAX, 0),
@@ -2621,6 +2676,14 @@ impl Heap {
         page.waiters.fill(0);
         page.pins.fill(0);
         self.stats.cells_swept += swept;
+        if let Some((desc, count)) = self.live_count {
+            if page.desc == desc {
+                // Zombies were counted only on their first sweep, when finalized.
+                // SAFETY: `attach_live_count`'s contract.
+                let count = unsafe { count.as_ref() };
+                count.set(count.get() - swept as i64);
+            }
+        }
         if live == 0 {
             self.release_page(index);
         }
@@ -2745,6 +2808,10 @@ impl Heap {
         }
         self.large_span = (usize::MAX, 0);
         self.allocated_bytes = 0;
+        if let Some((_, count)) = self.live_count {
+            // SAFETY: `attach_live_count`'s contract.
+            unsafe { count.as_ref() }.set(0);
+        }
         self.swept_bytes = 0;
         self.major_due = false;
         self.major_requested = false;
@@ -4396,6 +4463,66 @@ mod tests {
         assert!(due(&fx) && fx.heap.collection_pending());
         fx.collect();
         assert!(!due(&fx));
+    }
+
+    /// Descriptor accounting follows allocations and newly finalized cells, independently of
+    /// whether their storage is retained for weak pins or whether the collection is minor.
+    #[test]
+    fn live_cell_count_tracks_pages_large_cells_zombies_and_teardown() {
+        // The heap's raw counter pointer stays valid through its Drop, as in GcState.
+        let count = Box::new(Cell::new(-1));
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_nursery_bytes(Some(1024 * 1024));
+        // SAFETY: `count` outlives the heap and no other code writes it.
+        unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+        let small = fx.heap.alloc(fx.leaf, 16);
+        let large = fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 16);
+        fx.alloc_node(0, 7); // another descriptor never contributes
+        for _ in 0..4100 {
+            fx.heap.alloc(fx.leaf, 16);
+        }
+        assert_eq!(count.get(), 4102);
+        fx.roots[0] = small as u64;
+        fx.roots[1] = large as u64;
+        fx.collect();
+        assert_eq!(count.get(), 2);
+
+        // An old object without a root stays counted through a minor collection; both kinds
+        // of new dead cell are decremented once even when their memory becomes a zombie.
+        fx.roots.fill(0);
+        let young_small = fx.heap.alloc(fx.leaf, 16);
+        let young_large = fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 32);
+        assert_eq!(count.get(), 4);
+        assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
+        // A cell allocated between phases is black and counted immediately.
+        let black = fx.heap.alloc(fx.leaf, 16);
+        assert_eq!(count.get(), 5);
+        fx.heap
+            .finish_collection(&[young_small as usize, young_large as usize]);
+        assert_eq!(count.get(), 3);
+        assert_eq!(fx.heap.cell_age(young_small as u64), Some(CellAge::Dead));
+        assert_eq!(fx.heap.cell_age(young_large as u64), Some(CellAge::Dead));
+        assert_eq!(fx.heap.live_count(fx.leaf), 3);
+
+        // Unpinning the zombies frees storage without another death. Old live cells survive
+        // the minor collection; the following major collection drops their count to zero.
+        fx.collect_minor();
+        assert_eq!(count.get(), 3);
+        // A zombie on a page with no new allocations waits for a major sweep; large cells
+        // are swept every time. Neither kind is included in the published live count.
+        assert!(fx.heap.is_allocated_word(young_small as u64));
+        assert!(!fx.heap.is_allocated_word(young_large as u64));
+        assert!(fx.heap.is_allocated_word(black as u64));
+        fx.collect();
+        assert_eq!(count.get(), 0);
+        fx.heap.alloc(fx.leaf, 16);
+        fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 64);
+        assert_eq!(count.get(), 2);
+        fx.heap.release_all();
+        assert_eq!(count.get(), 0);
+        fx.heap.release_all();
+        assert_eq!(count.get(), 0);
     }
 
     #[test]

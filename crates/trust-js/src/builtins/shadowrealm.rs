@@ -129,8 +129,9 @@ fn shadow_import_value(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value
             .clone()
             .ok_or_else(|| i.make_error("TypeError", "no module loader available"))?;
         let base = i.import_base.clone();
-        let (key, src) = loader(&spec, &base, None)
-            .ok_or_else(|| i.make_error("TypeError", format!("module not found: {spec}")))?;
+        let loaded = i.with_host_callback(|_| loader(&spec, &base, None));
+        let (key, src) =
+            loaded.ok_or_else(|| i.make_error("TypeError", format!("module not found: {spec}")))?;
         let (loaded, ns, value) = {
             let mut entry = i.enter_shadow(&realm).expect("checked above");
             let sub = entry.interp();

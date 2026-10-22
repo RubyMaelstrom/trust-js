@@ -28,7 +28,8 @@ impl WeakCell for crate::value::WeakGc {
     }
 
     fn heap(&self) -> Option<crate::value::GcHeap> {
-        self.upgrade().map(|object| object.borrow().gc_heap.clone())
+        self.upgrade()
+            .map(|object| crate::value::object_heap(crate::value::Gc::as_ptr(&object) as usize))
     }
 }
 
@@ -56,7 +57,9 @@ impl WeakCell for crate::interpreter::WeakValue {
 
     fn heap(&self) -> Option<crate::value::GcHeap> {
         match self.upgrade() {
-            Some(crate::value::Value::Obj(object)) => Some(object.borrow().gc_heap.clone()),
+            Some(crate::value::Value::Obj(object)) => Some(crate::value::object_heap(
+                crate::value::Gc::as_ptr(&object) as usize,
+            )),
             _ => None,
         }
     }

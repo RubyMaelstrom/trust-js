@@ -238,3 +238,46 @@ fn warm_assignment_expressions_use_native_stores_without_losing_rhs_owners() {
     engine.interp.gc_collect();
     assert_eq!(eval(&mut engine, "o.field.id"), "23");
 }
+
+/// Every native entry captures its own heap's shape directory. Alternating Engines must keep
+/// filling and committing creation ICs through the directory of the current activation.
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+fn creation_ics_use_each_active_heaps_shape_directory() {
+    let mut first = Engine::new();
+    let mut second = Engine::new();
+    for (engine, key) in [(&mut first, "alpha"), (&mut second, "beta")] {
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        eval(
+            engine,
+            &format!(
+                "function create(v){{var o={{}};o.{key}=v;return o;}}\
+             for(var warm=0;warm<400;warm++)create(warm);"
+            ),
+        );
+    }
+    for _ in 0..4 {
+        for (engine, key) in [(&mut first, "alpha"), (&mut second, "beta")] {
+            let before = crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get);
+            assert_eq!(
+                eval(
+                    engine,
+                    &format!(
+                        "for(var n=0;n<40;n++){{if(create(n).{key}!==n)throw Error('field');}}\
+                 create(123).{key}"
+                    )
+                ),
+                "123"
+            );
+            assert_eq!(
+                crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get),
+                before,
+                "a warm creation commits through the active directory without a helper"
+            );
+        }
+    }
+}

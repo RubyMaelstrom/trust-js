@@ -745,6 +745,7 @@ impl<'s> Ctx<'s> {
     /// Rust string cannot hold a lone surrogate; build one from code units with
     /// [`Ctx::string_from_utf16`].
     pub fn str(&self, s: impl AsRef<str>) -> Value<'s> {
+        let s = s.as_ref();
         self.it_ref();
         Value::from_internal(Internal::str(s))
     }
@@ -768,6 +769,7 @@ impl<'s> Ctx<'s> {
     /// converted by [`text_to_engine`](crate::embed::text_to_engine); Rust text passed here
     /// directly loses characters in U+10F800..=U+10FFFF to lone surrogates.
     pub fn string_from_engine_text(&self, s: impl Into<String>) -> Value<'s> {
+        let s = s.into();
         self.it_ref();
         Value::from_internal(Internal::from_engine_text(s))
     }
@@ -828,6 +830,7 @@ impl<'s> Ctx<'s> {
 
     /// A new Error of the current Realm: `kind` names its constructor (`"TypeError"`, ...).
     pub fn make_error(&self, kind: &str, message: impl Into<String>) -> Value<'s> {
+        let message = message.into();
         Value::from_internal(self.it_ref().make_error(kind, message))
     }
 

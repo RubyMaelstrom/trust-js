@@ -25946,6 +25946,7 @@ mod return_slot_tests {
             propstat_enabled: false,
             inline_recompile_at: 100,
             live_objects: std::ptr::null(),
+            shape_layouts: std::ptr::null(),
         }
     }
 

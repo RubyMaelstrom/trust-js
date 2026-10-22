@@ -3933,8 +3933,8 @@ impl Drop for Interp {
         // The whole Agent is ending, not merely reaching a GC safepoint: the heap's owner
         // (`heap_release`) finalizes and frees every cell once all other fields have dropped,
         // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.
-        // Do not let a driver thread retain this Agent's heap and its object registry after its
-        // interpreter dies. Objects already carry their own owner through the ensuing field drops.
+        // Do not let the driver thread retain this Agent after its interpreter dies. Heap
+        // release runs after the ensuing field drops, while the heap is still available.
         // A ShadowRealm sharing its parent's heap and symbols has the parent's Agent identity.
         if !self.gc_heap_root() {
             return;
@@ -5555,6 +5555,43 @@ impl Interp {
         crate::value::enter_agent(&self.gc_heap, &self.symbol_agent)
     }
 
+    /// Run one host callback, then restore this interpreter's Agent before returning or
+    /// unwinding. An Engine's public entry leaves its Agent active, so nested host execution
+    /// must not redirect subsequent allocations. No Rc clone occurs when the Agent stayed
+    /// active: restoration first compares its identities.
+    #[inline]
+    pub(crate) fn with_host_callback<R>(&mut self, callback: impl FnOnce(&mut Self) -> R) -> R {
+        struct RestoreAgent(*mut Interp);
+        impl Drop for RestoreAgent {
+            fn drop(&mut self) {
+                // SAFETY: the scoped invocation keeps its exclusive Interp borrow alive and
+                // stationary. The callback's reborrow derives from this same raw pointer and
+                // has ended before Drop reads through it, including on unwind. No pointer to
+                // a sibling field is kept across the mutable callback reborrow.
+                unsafe { (&*self.0).activate_gc_heap() };
+            }
+        }
+        let interp = self as *mut Self;
+        let _restore = RestoreAgent(interp);
+        // SAFETY: the pointer comes from this call's exclusive borrow, which is not used again
+        // until this reborrow ends. Scoped host contexts cannot replace or move the Interp.
+        callback(unsafe { &mut *interp })
+    }
+
+    /// The read-only form of `with_host_callback`, requiring no raw pointers: the shared
+    /// interpreter borrow stays alive through the query and its restoration guard.
+    #[inline]
+    pub(crate) fn with_host_query<R>(&self, query: impl FnOnce(&Self) -> R) -> R {
+        struct RestoreAgent<'a>(&'a Interp);
+        impl Drop for RestoreAgent<'_> {
+            fn drop(&mut self) {
+                self.0.activate_gc_heap();
+            }
+        }
+        let _restore = RestoreAgent(self);
+        query(self)
+    }
+
     // ----- error helpers ----------------------------------------------------------------------
 
     pub fn make_error(&self, kind: &str, message: impl Into<String>) -> Value {
@@ -6396,14 +6433,14 @@ impl Interp {
         let switch_context = context != previous_context;
         if switch_context {
             if let Some(enter) = self.host_job_context_enter {
-                enter(self, context);
+                self.with_host_callback(|interp| enter(interp, context));
             }
             self.switch_host_job_context(context);
         }
         let result = self.with_script_entry(operation);
         if switch_context {
             if let Some(leave) = self.host_job_context_leave {
-                leave(self);
+                self.with_host_callback(leave);
             }
             self.switch_host_job_context(previous_context);
         }
@@ -6502,9 +6539,10 @@ impl Interp {
     /// as fallbacks. Consumers apply their own precision rules (`Date` truncates to milliseconds).
     pub(crate) fn wall_now_ms(&self) -> f64 {
         if let Some(clock) = &self.wall_clock {
-            return clock();
+            return self.with_host_query(|_| clock());
         }
-        if let Some(ms) = crate::host_now_ms() {
+        let host_now = self.with_host_query(|_| crate::host_now_ms());
+        if let Some(ms) = host_now {
             return ms;
         }
         std::time::SystemTime::now()
@@ -7008,28 +7046,30 @@ impl Interp {
         let perf_started = crate::jit::perf_stage_start();
         // I1: the arguments often live in the caller's Rust-heap buffer.
         let _arguments = crate::rooting::root_slice(args);
-        let result = match call {
-            Callable::Native(f) => f(self, this, args),
-            Callable::NativeData(data) => match &data.body {
-                crate::value::NativeCallableBody::Opaque(f) => {
-                    let f = f.clone();
-                    f(self, this, args)
-                }
-                crate::value::NativeCallableBody::Captured { function, captures } => {
-                    // An active invocation keeps its captures alive (I1): its function object
-                    // may become unreachable while it runs.
-                    let _captures = crate::rooting::root_slice(captures);
-                    function(self, this, args, captures)
-                }
-                crate::value::NativeCallableBody::CapturedClosure { function, captures } => {
-                    // As above; the closure lives while this call holds it.
-                    let _captures = crate::rooting::root_slice(captures);
-                    let function = function.clone();
-                    function(self, this, args, captures)
-                }
-            },
-            _ => unreachable!("dispatch_native on a non-native callable"),
-        };
+        let result = self.with_host_callback(|interp| {
+            match call {
+                Callable::Native(f) => f(interp, this, args),
+                Callable::NativeData(data) => match &data.body {
+                    crate::value::NativeCallableBody::Opaque(f) => {
+                        let f = f.clone();
+                        f(interp, this, args)
+                    }
+                    crate::value::NativeCallableBody::Captured { function, captures } => {
+                        // An active invocation keeps its captures alive (I1): its function object
+                        // may become unreachable while it runs.
+                        let _captures = crate::rooting::root_slice(captures);
+                        function(interp, this, args, captures)
+                    }
+                    crate::value::NativeCallableBody::CapturedClosure { function, captures } => {
+                        // As above; the closure lives while this call holds it.
+                        let _captures = crate::rooting::root_slice(captures);
+                        let function = function.clone();
+                        function(interp, this, args, captures)
+                    }
+                },
+                _ => unreachable!("dispatch_native on a non-native callable"),
+            }
+        });
         crate::jit::perf_native_end(
             perf_started,
             result.is_ok(),
@@ -9319,10 +9359,9 @@ impl Interp {
         self.host_indexed
             .get(&(Gc::as_ptr(object) as usize))
             .map(|properties| {
-                properties
-                    .live
-                    .as_ref()
-                    .map_or(properties.length, |live| (live.length)(self, &live.state))
+                properties.live.as_ref().map_or(properties.length, |live| {
+                    self.with_host_query(|interp| (live.length)(interp, &live.state))
+                })
             })
     }
 
@@ -13479,7 +13518,9 @@ impl Interp {
                     let _arguments = crate::rooting::root_slice(arguments);
                     let native_result = with_execution_stack(self.depth, || {
                         let perf_started = crate::jit::perf_stage_start();
-                        let result = nf(self, (&*this_slot).unpack(), arguments);
+                        let result = self.with_host_callback(|interp| {
+                            nf(interp, (&*this_slot).unpack(), arguments)
+                        });
                         crate::jit::perf_native_end(
                             perf_started,
                             result.is_ok(),

@@ -1001,6 +1001,7 @@ impl Interp {
             heap.handles
                 .clear_dead_weak(kind, |word| core.is_dead_target(word as usize));
         }
+        crate::value::sweep_object_metadata(heap, &dead);
         self.gc_heap_sweep_tree(&dead, &native, kind);
         heap.records.borrow_mut().native_functions_swept.clear();
         drop(native);

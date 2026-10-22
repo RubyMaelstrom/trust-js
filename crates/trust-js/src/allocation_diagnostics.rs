@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::panic::Location;
 
 const MAX_SITES: usize = 256;
-const MAX_SLOTS: usize = 262_144;
+const MAX_LIVE_BIRTHS: usize = 262_144;
 const FAMILIES: [&str; 7] = [
     "ordinary",
     "callable",
@@ -37,7 +37,7 @@ struct Site {
 pub(super) struct State {
     sites: BTreeMap<(&'static str, u32, &'static str), usize>,
     counts: Vec<Site>,
-    births: Vec<Option<Birth>>,
+    births: crate::fasthash::FastMap<usize, Birth>,
     generation: u64,
     ordinal: u64,
     untracked_allocations: u64,
@@ -690,7 +690,7 @@ impl LivePropertyInventory {
 impl State {
     pub(super) fn born(
         &mut self,
-        slot: usize,
+        cell: usize,
         caller: &'static Location<'static>,
         exotic: &Exotic,
         capacity: usize,
@@ -706,26 +706,29 @@ impl State {
             self.counts.push(Site::default());
             Some(index)
         });
-        let Some(site) = index.filter(|_| slot < MAX_SLOTS) else {
+        let Some(site) = index.filter(|_| self.births.len() < MAX_LIVE_BIRTHS) else {
             self.untracked_allocations += 1;
             return;
         };
         self.counts[site].allocations += 1;
         self.counts[site].requested_named_capacity += capacity as u64;
-        self.births.resize(self.births.len().max(slot + 1), None);
         assert!(
-            self.births[slot].is_none(),
-            "registry slot is not already alive"
+            self.births
+                .insert(
+                    cell,
+                    Birth {
+                        site,
+                        ordinal: self.ordinal,
+                        generation: self.generation,
+                    }
+                )
+                .is_none(),
+            "object address is not already alive"
         );
-        self.births[slot] = Some(Birth {
-            site,
-            ordinal: self.ordinal,
-            generation: self.generation,
-        });
     }
 
-    pub(super) fn died(&mut self, slot: usize) {
-        let Some(birth) = self.births.get_mut(slot).and_then(Option::take) else {
+    pub(super) fn died(&mut self, cell: usize) {
+        let Some(birth) = self.births.remove(&cell) else {
             return;
         };
         let age = self.ordinal.wrapping_sub(birth.ordinal);
@@ -786,15 +789,10 @@ pub(super) fn report(heap: &GcHeap) {
     let mut live = [0; 7];
     let mut borrowed = 0;
     let mut inventory = LivePropertyInventory::new(state.counts.len());
-    let registry = heap.registry.borrow();
-    for (slot, &object) in registry
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, object)| !object.is_null())
-    {
-        // SAFETY: a non-null registry entry names a live object; `Object::drop` clears it first.
-        let object = unsafe { &*object };
+    let cells = heap.core.borrow().live_cells(heap.object_desc);
+    for cell in cells {
+        // SAFETY: every listed cell is an initialized object which has not been finalized.
+        let object = unsafe { &*(cell as *const std::cell::RefCell<super::Object>) };
         let Ok(object) = object.try_borrow() else {
             borrowed += 1;
             inventory.unavailable_borrows += 1;
@@ -820,8 +818,7 @@ pub(super) fn report(heap: &GcHeap) {
         inventory.families[family].add_assign(&current);
         if let Some(site) = state
             .births
-            .get(slot)
-            .and_then(Option::as_ref)
+            .get(&cell)
             .map(|birth| birth.site)
             .filter(|site| *site < inventory.sites.len())
         {
@@ -841,7 +838,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slot_reuse_and_collection_age_do_not_retain_objects() {
+    fn address_reuse_and_collection_age_do_not_retain_objects() {
         let mut state = State::default();
         state.born(0, Location::caller(), &Exotic::None, 4);
         state.died(0);
@@ -858,8 +855,11 @@ mod tests {
                 .sum::<u64>(),
             1
         );
-        assert!(state.births.iter().all(Option::is_none));
-        state.born(MAX_SLOTS, Location::caller(), &Exotic::None, 0);
+        assert!(state.births.is_empty());
+        for cell in 0..MAX_LIVE_BIRTHS {
+            state.born(cell, Location::caller(), &Exotic::None, 0);
+        }
+        state.born(MAX_LIVE_BIRTHS, Location::caller(), &Exotic::None, 0);
         assert_eq!(state.untracked_allocations, 1);
     }
 

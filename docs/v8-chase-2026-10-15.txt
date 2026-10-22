@@ -6606,3 +6606,141 @@ disassembly beside it) and the owner's decision:
 - Not in step 12: element-range dirtiness and a per-page card
   summary (step 10's open items); N-API finalizers at teardown
   (11a's).
+
+Step 12a review amendment (2026-10-22), before the fix:
+- Allocating in the active heap makes host reentry restoration an
+  object-safety requirement. A native can enter another Engine,
+  return without another outer Ctx operation, and leave the other
+  heap active for the caller's next object allocation. The old
+  prototype-derived heap concealed that path for ordinary objects.
+- Restore the owning Agent at native and other host callback
+  boundaries before allocation resumes, including error paths.
+  The existing enter_agent fast path alone cannot do this: when
+  already active it saves no restoration state. Tests exercise
+  nested Engine execution and post-callback allocation at all tiers.
+- Weak owner lookup must skip unrelated heaps currently borrowed
+  for sweeping: dropping native Rust state can drop a captured
+  Engine whose weak metadata unsubscribes from its own live heap.
+  Cover collection-triggered nested destruction and teardown.
+
+Step 12b review amendment (2026-10-22), before implementation:
+- The layout-edge audit found that heap-local layout rebuilding
+  alone cannot make foreign parsed-code reuse safe. Function's
+  global code/code2 slots also cache heap-local constants and JIT
+  immediates; thread-rooted chunk constants can outlive their heap.
+- Runtime caches are selected by never-reused heap identity, with
+  a cheap primary entry, bounded foreign entries and weak lifetime
+  tokens cleared before heap release. Realm-compatibility checks
+  stay inside the selected heap. Active frames retain immutable
+  chunks. A foreign entry is rebuilt from neutral AST/compiler
+  recipes without reading old Props, layouts or constant values.
+- Heap-local weak registrations trace the actual FunctionMaps and
+  Chunk owners, including late literal/initializer publication.
+  Compilation roots temporary constants until the chunk takes
+  them and registers its roots, with no intervening safepoint.
+  Constructor hints use the existing conditional side-slot table
+  and minor-write records. Private-layout validation deduplicates
+  actual owning-slot addresses, not repeated trace visits.
+
+Step 12a, heap-level object accounting (an implementation agent's
+change, reviewed; 2026-10-22):
+- Object no longer holds its heap's Rc, registry slot or weak-watch
+  flag. Allocation uses the active Agent heap. The core increments
+  its attached object count at allocation and subtracts newly dead
+  cells while sweeping each page or large cell, including pinned
+  zombies exactly once. Release resets it; debug builds compare it
+  with live_cells. Snapshots use that same live-cell enumeration.
+- Weak observers are keyed by object address and removed before
+  freeing, with foreign watches routed to the target's actual heap.
+  The sparse thread-local heap directory keeps weak entries only.
+  Unsubscription tolerates a heap already borrowed for sweeping;
+  nested captured Engine destruction cannot borrow that core again.
+  Notifications enqueue identities; cleanup does not run inside GC.
+- Finalization skips objects without Rust-owned payloads. The check
+  covers layouts, spills, sidecars, callables, exotic state, native
+  data and accessors; the object census still sees every death.
+- The creation IC reads the fixed shape directory from JitCtx,
+  replacing its receiver-to-heap load and address calculation.
+  Release DWARF: Object 168 to 160 bytes (RefCell<Object> remains in
+  the 192-byte cell class), Interp 5792 to 5776, JitCtx 320 to 328
+  and JitFrame 2368 to 2376. The fixed JitCtx prefix is unchanged.
+- The recorded reentry amendment: native dispatch, committed native
+  calls, clocks, module loaders, settings hooks and live collection
+  queries restore the owning Agent before engine execution resumes,
+  including exceptions and unwinding. Scoped input conversions run
+  before activation. Cross-heap prototypes are rejected in debug
+  builds; allocation does not borrow a same-heap prototype.
+- Tests cover count timing, snapshots, limits, minor/major death,
+  weak address reuse, native payload drops, creation commits and
+  nested host reentry at all tiers. Three independent release
+  mutations fail their exact tests: missing count subtraction
+  (4102 versus 2), observer eviction (table not empty), and native
+  owner restoration (new object in the wrong heap). Focused checks:
+  66 debug tests, 28 at stress 1 and five diagnostics tests pass.
+- Commit gate, source frozen throughout (start/end hashes equal):
+  - aarch64 lib 2329/0/7, 15 new tests and none removed; workspace
+    all-target build without diagnostics; downstream host 37/0/0,
+    timers 6/0/0, fs no tests, web 62/0/1, node 45/0/0 and runtime
+    184/0/1. Rustdoc retains its eight baseline warnings.
+  - Test262 at JIT threshold 8: 53575/53575, report identical to the
+    accepted baseline. Targeted per-test GC stress: 1642 pass and
+    seven ignored at interval 1, no failures or timeout retries.
+  - Fixtures: compiles 56/10/160, collections 21/6/16, outputs as
+    before; sustained allocation at JIT and bytecode keeps its
+    output and 194 collections. Difftest: 138 agree, 12 budget
+    skips, no crashes.
+  - zombie: x64 lib 2162/0/7, Wine 2154/3/7 (only the three known
+    snapshot codec failures), lists +14/-0. x64 clippy clean;
+    Windows retains its 23 baseline diagnostics. Fixtures and
+    difftest agree with the local gate.
+- Two test-only feature corrections followed the frozen gate:
+  the new clock test uses the internal clock slot, and an existing
+  x64 property test calls the internal collector wrapper. Production
+  source is unchanged. All five local clippy configurations pass;
+  exact clock tests pass locally with/without embed. Both corrected
+  tests pass on default x64, embed x64 and Wine; x64 default/small
+  clippy also pass. Formatting and diff checks are clean.
+- After the usual address normalization, every fixture chunk in
+  all three dump modes equals 11b's with only measured field moves
+  and the exact directory rewrite (dumpcmp12a.py); no GC-timing
+  exemptions. Deliberate wrong prologue and directory-base registers
+  are both rejected by the
+  comparator. Evidence is in target/s6-step12ar.
+- Measured on crystal aarch64, CPU 5, rustc 1.99.0: fresh fat-LTO,
+  one-codegen-unit release exports (11b adbe71c66a3e, reviewed 12a
+  5ea1c66f0230, main 311ae9ae5658), copies made together, 15
+  interleaved rounds of empty/vue/react/djot/sustained at JIT and
+  sustained at bytecode. The 4/6 MiB trials use the same 12a binary
+  with TRUST_JS_GC_MIN_HEAP_BYTES; the default remains 8 MiB.
+  - Waited 360 seconds for quiet: inference used 41 ticks and all
+    CPUs 6238 ticks in the last minute. During the 450 valid runs,
+    other cores were 0.38 busy at median, 2.52 at most; no scaled
+    counter, nonzero exit or output difference. Data and summaries:
+    target/s6-step10/m12a.
+  - Against 11b, vue/react/djot cycles +0.7/-0.3/-0.2%, instructions
+    +0.29/-0.20/-0.39%, GC pauses -3.5/-4.2/-3.7%; peak RSS
+    -1.0/+3.1/-1.7%. React's measured ranges overlap (22.7-25.2 MB
+    before, 22.7-25.5 after). Empty-script cycles are unchanged.
+  - Sustained allocation: JIT/bytecode cycles -0.5/-1.7%, GC pauses
+    -1.7/-2.0%, peak RSS -2.9/-1.8%. Median longest pauses improve
+    from 18.2/18.1 to 18.0/17.8 ms; the largest observed bytecode
+    pause is 20.8 ms, versus 18.7 before.
+  - The 4/6 MiB floors do not change React's collections or work;
+    its median RSS moves -1.4/-1.1%, within the same ranges. For
+    Djot, 4 MiB lowers peak RSS 5.5% but raises total GC pause 4.8%
+    (6 MiB raises it 6.0% with only 0.4% lower RSS). Both worsen
+    Djot's open GC-time bound, without closing React's memory bound,
+    so no default change is made.
+  - Against main, fixture JIT cycles are 12.1/14.7/8.3% lower.
+    React's peak RSS remains +48.3% (bound +25%); Djot's GC share
+    excluding exit remains 7.6% (bound 5%). These remain open for
+    the S6 exit review; vue/react GC share is 3.6/4.4%.
+  - Compilation costs, same binaries/tier and 15 paired rounds:
+    vue/djot native compile time -0.8/+0.4%; generated code bytes
+    -0.04/0/-0.07% on vue/react/djot. React's short timings had a
+    noisy initial +6.4% median difference. A separate 100-pair
+    capture gives 1.557 versus 1.556 ms (-0.04%), with a paired
+    bootstrap 95% interval of -4.1 to +5.7%; no reproducible
+    increase. Bytecode compile time there is unchanged. Both
+    captures retain every sample under m12a-compile and
+    m12a-compile-react; all exits, outputs and counters are valid.

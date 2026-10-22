@@ -1133,9 +1133,6 @@ pub struct JitLayout {
     pub props_layout: usize,
     /// Stored layout Rc pointer -> the key Vec header.
     pub layout_data_off: usize,
-    /// Owning Agent heap Rc within Object, and its stored Rc pointer -> nullable page directory.
-    pub obj_heap: usize,
-    pub heap_layouts: usize,
     pub shape_layout_entry_size: usize,
     pub shape_layout_entry_id: usize,
     pub shape_layout_entry_keys: usize,
@@ -1520,10 +1517,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let layout_ok = layout_data_off < 256
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
         && unsafe { *(&empty_layout as *const Option<PropertyLayout> as *const usize) } == 0;
-    let object = sample.borrow();
-    let heap_word = unsafe { *(&object.gc_heap as *const GcHeap as *const usize) };
-    let shapes = object.gc_heap.shapes.borrow();
-    let heap_layouts = (shapes.layouts.pages.as_ptr() as usize).wrapping_sub(heap_word);
     let page = Some(Box::new(
         std::array::from_fn::<_, SHAPE_LAYOUT_PAGE_SIZE, _>(|_| LayoutEntry::default()),
     ));
@@ -1532,8 +1525,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let shape_layout_entry_size = std::mem::size_of::<LayoutEntry>();
     let shape_layout_entry_id = offset_of!(LayoutEntry, shape);
     let shape_layout_entry_keys = offset_of!(LayoutEntry, keys);
-    let heap_layouts_ok = heap_layouts < 32768
-        && std::mem::size_of::<Option<Box<LayoutPage>>>() == std::mem::size_of::<usize>()
+    let shape_directory_ok = std::mem::size_of::<Option<Box<LayoutPage>>>()
+        == std::mem::size_of::<usize>()
         && page_word == page.as_deref().unwrap().as_ptr() as usize
         && unsafe { *(&no_page as *const Option<Box<LayoutPage>> as *const usize) } == 0
         && shape_layout_entry_size == 16
@@ -1752,7 +1745,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && thin_vec_ok
         && key_vec_ok
         && layout_ok
-        && heap_layouts_ok;
+        && shape_directory_ok;
     JitLayout {
         obj_from_cell,
         repr,
@@ -1774,8 +1767,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_data_off,
-        obj_heap: offset_of!(Object, gc_heap),
-        heap_layouts,
         shape_layout_entry_size,
         shape_layout_entry_id,
         shape_layout_entry_keys,
@@ -2203,10 +2194,6 @@ impl Exotic {
 }
 
 pub(crate) struct Object {
-    /// Agent-owned collector state. Objects can be created while a suspended execution context is
-    /// running on a coroutine worker and later die on the driver thread; carrying the owner makes
-    /// registry removal independent of whichever native thread happens to execute `Drop`.
-    pub(crate) gc_heap: GcHeap,
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
     pub(crate) extensible: bool,
@@ -2224,13 +2211,74 @@ pub(crate) struct Object {
     /// and for bound functions and callable proxies whose target was one. A native with an own
     /// data `prototype` is a constructor too (`Interp::value_is_constructor`).
     pub(crate) is_constructor: bool,
-    gc_weak_observed: Cell<bool>,
-    /// The object's slot in its heap's registry, fixed for its lifetime (`Object::drop` and
-    /// weak-target watches key on it).
-    pub(crate) gc_internal: Cell<u32>,
 }
 
 impl Object {
+    /// Whether finalization has any owned allocation to release. Exhaustive field and variant
+    /// matches make new storage participate in this decision. Property words and cell handles
+    /// have no owning drops, but inline properties can own accessor boxes and a layout Rc.
+    fn owns_payload(&self) -> bool {
+        let Self {
+            proto: _,
+            props,
+            extensible: _,
+            call,
+            exotic,
+            ic_plain: _,
+            native_typed_array,
+            is_constructor: _,
+        } = self;
+        let Props {
+            entries,
+            proto_flag: _,
+            shape: _,
+            elems,
+            mirror_flags: _,
+            mirror_holes: _,
+            has_far: _,
+            elem_mode: _,
+            proto_slot: _,
+            len_slot: _,
+        } = props;
+        let NamedEntries { fields, layout } = entries;
+        fields.spilled()
+            || layout.is_some()
+            || elems.0.is_some()
+            || native_typed_array.is_some()
+            || fields.iter().any(|property| {
+                let Property { packed: _, meta } = property;
+                meta & !PROP_FLAG_MASK != 0
+            })
+            || match call {
+                Callable::None | Callable::Native(_) | Callable::User(_) => false,
+                Callable::NativeData(_)
+                | Callable::Bound(_)
+                | Callable::WrappedShadow(_)
+                | Callable::WrappedCross(_)
+                | Callable::AccessorGet(_)
+                | Callable::AccessorSet(_)
+                | Callable::PropGet(_)
+                | Callable::PropSet(_)
+                | Callable::PrivatePropGet(_)
+                | Callable::PrivatePropSet(_) => true,
+            }
+            || match exotic {
+                Exotic::None
+                | Exotic::Array
+                | Exotic::BoolWrap(_)
+                | Exotic::NumWrap(_)
+                | Exotic::SymWrap(_)
+                | Exotic::Arguments
+                | Exotic::Error(None) => false,
+                Exotic::Collection(_)
+                | Exotic::StrWrap(_)
+                | Exotic::BigIntWrap(_)
+                | Exotic::Error(Some(_))
+                | Exotic::ArrayIterator(_)
+                | Exotic::StringIterator(_) => true,
+            }
+    }
+
     /// Engine state shares the existing lazy storage allocation but remains separate from
     /// ECMAScript properties. Author strings, reflection, proxies and integrity levels cannot
     /// address this map (ECMA-262 6.1.7.2). Ordinary objects retain their compact body layout.
@@ -2290,27 +2338,21 @@ impl Object {
     /// replacement on every object.
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
-        let heap = proto
-            .as_ref()
-            .map(|prototype| prototype.borrow().gc_heap.clone())
-            .unwrap_or_else(active_gc_heap);
-        {
-            heap.live.set(heap.live.get() + 1);
-            heap.allocated.set(heap.allocated.get().wrapping_add(1));
-            let mut reg = heap.registry.borrow_mut();
-            let slot = reg.reserve();
-            let slot_u32: u32 = slot.try_into().expect("object registry exceeded u32 slots");
-            #[cfg(feature = "architecture-diagnostics")]
-            heap.diagnostics.borrow_mut().born(
-                slot,
-                std::panic::Location::caller(),
-                &exotic,
-                props.entries.capacity(),
+        #[cfg(feature = "architecture-diagnostics")]
+        let caller = std::panic::Location::caller();
+        with_active_gc_heap(|heap| {
+            debug_assert!(
+                proto.as_ref().is_none_or(|prototype| {
+                    heap.core
+                        .borrow()
+                        .owns_cell(Gc::as_ptr(prototype) as usize, heap.object_desc)
+                }),
+                "object prototype belongs to another Agent heap (I6)"
             );
+            heap.allocated.set(heap.allocated.get().wrapping_add(1));
             let obj = Gc::new_in(
-                &heap,
+                heap,
                 RefCell::new(Object {
-                    gc_heap: heap.clone(),
                     proto,
                     props,
                     extensible: true,
@@ -2319,13 +2361,20 @@ impl Object {
                     ic_plain: Cell::new(true),
                     native_typed_array: None,
                     is_constructor: false,
-                    gc_weak_observed: Cell::new(false),
-                    gc_internal: Cell::new(slot_u32),
                 }),
             );
-            reg.publish(slot, Gc::as_ptr(&obj));
+            #[cfg(feature = "architecture-diagnostics")]
+            {
+                let object = obj.borrow();
+                heap.diagnostics.borrow_mut().born(
+                    Gc::as_ptr(&obj) as usize,
+                    caller,
+                    &object.exotic,
+                    object.props.entries.capacity(),
+                );
+            }
             obj
-        }
+        })
     }
 }
 
@@ -2401,101 +2450,10 @@ impl InternalSlots {
     }
 }
 
-impl Drop for Object {
-    fn drop(&mut self) {
-        // Remove the registry entry before the object's cell is freed. Tombstone reuse is O(1),
-        // does not touch another (possibly borrowed) object, and bounds registry memory by peak
-        // simultaneously-live objects instead of cumulative allocation count.
-        let slot = self.gc_internal.get() as usize;
-        #[cfg(feature = "architecture-diagnostics")]
-        self.gc_heap.diagnostics.borrow_mut().died(slot);
-        self.gc_heap.registry.borrow_mut().remove(slot);
-        if self.gc_weak_observed.get() {
-            let observers = {
-                let mut watched = self.gc_heap.weak_observers.borrow_mut();
-                let observers = watched.remove(&slot);
-                crate::weak_metadata::shrink_map(&mut watched);
-                observers
-            };
-            if let Some(observers) = observers {
-                observers.notify();
-            }
-        }
-        self.gc_heap.live.set(self.gc_heap.live.get() - 1);
-    }
-}
-
-// Every heap object is registered through a non-owning slot and the live count is maintained via
-// Object::new / Drop. `Object::drop` (the cell's finalizer) clears its slot before the cell is
-// freed, so every non-null entry names an object whose cell is not yet freed.
-struct SlotRegistry<T> {
-    entries: Vec<*const RefCell<T>>,
-    free: Vec<usize>,
-}
-
-impl<T> SlotRegistry<T> {
-    const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-
-    /// Reserve a slot for an allocation that [`SlotRegistry::publish`] will register.
-    #[inline]
-    fn reserve(&mut self) -> usize {
-        match self.free.pop() {
-            Some(slot) => slot,
-            None => {
-                let slot = self.entries.len();
-                self.entries.push(std::ptr::null());
-                slot
-            }
-        }
-    }
-
-    /// Register a reserved slot as a live entry.
-    #[inline]
-    fn publish(&mut self, slot: usize, entry: *const RefCell<T>) {
-        self.entries[slot] = entry;
-    }
-
-    /// Remove a live entry synchronously with its destruction. Stale or foreign slots are ignored.
-    #[inline]
-    fn remove(&mut self, slot: usize) {
-        if slot >= self.entries.len()
-            || std::mem::replace(&mut self.entries[slot], std::ptr::null()).is_null()
-        {
-            return;
-        }
-        self.free.push(slot);
-    }
-
-    /// Every live entry's address.
-    fn entry_ptrs(&self) -> impl Iterator<Item = *const RefCell<T>> + '_ {
-        self.entries
-            .iter()
-            .copied()
-            .filter(|entry| !entry.is_null())
-    }
-
-    fn requested_bytes(&self) -> usize {
-        self.entries
-            .capacity()
-            .saturating_mul(std::mem::size_of::<*const RefCell<T>>())
-            .saturating_add(
-                self.free
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<usize>()),
-            )
-    }
-}
-
 pub(crate) struct GcState {
     heap_id: u64,
     #[cfg(feature = "architecture-diagnostics")]
     diagnostics: RefCell<allocation_diagnostics::State>,
-    registry: RefCell<SlotRegistry<Object>>,
     weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
     shapes: RefCell<ShapeTable>,
     array_length_shape: Cell<u32>,
@@ -2575,10 +2533,6 @@ impl LiveCount {
 
     fn get(&self) -> i64 {
         self.count.get()
-    }
-
-    fn set(&self, count: i64) {
-        self.count.set(count);
     }
 
     fn as_ptr(&self) -> *mut i64 {
@@ -2801,7 +2755,6 @@ pub(crate) fn alloc_scope_cell() -> *mut RefCell<crate::interpreter::Scope> {
 impl crate::gc_trace::GcTrace for Object {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Object {
-            gc_heap: _,
             proto,
             props,
             extensible: _,
@@ -2810,8 +2763,6 @@ impl crate::gc_trace::GcTrace for Object {
             ic_plain: _,
             native_typed_array: _, // byte storage only
             is_constructor: _,
-            gc_weak_observed: _,
-            gc_internal: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);
@@ -2946,16 +2897,20 @@ impl PackedValue {
     }
 }
 
-/// Run `Object::drop` and release the object's Rust-heap payload when its cell dies.
+/// Release the object's owned Rust payload. Empty ordinary objects need no destructor; cell
+/// edges are uncounted. Keep the census outside that fast path so it observes every death.
 fn finalize_object_cell(cell: *mut u8) {
+    // SAFETY: a dying object is initialized and no borrow may cross a safepoint (I9).
+    let object = unsafe { &mut *cell.cast::<RefCell<Object>>() }.get_mut();
     if layout_census::enabled() {
-        // SAFETY: a dying cell is initialized and borrowed by no one.
-        if let Ok(object) = unsafe { (*(cell as *const RefCell<Object>)).try_borrow_unguarded() } {
-            layout_census::record(layout_census::DEAD, object);
-        }
+        layout_census::record(layout_census::DEAD, object);
     }
-    // SAFETY: object cells are initialized by `Gc::new_in` before any collection or teardown.
-    unsafe { std::ptr::drop_in_place(cell as *mut RefCell<Object>) };
+    if object.owns_payload() {
+        // SAFETY: object cells are initialized before any collection or teardown, and finalized
+        // exactly once. Payloadless objects may be forgotten because none of their drops free
+        // memory or deliver notifications (those are evicted before the sweep).
+        unsafe { std::ptr::drop_in_place(object) };
+    }
 }
 
 /// The S3 layout census (`TRUST_JS_GC_CENSUS=1`; diagnostic only): how many named
@@ -3132,7 +3087,7 @@ pub(crate) mod layout_census {
 const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
-pub(crate) fn alloc_object_cell(heap: &GcHeap) -> *mut RefCell<Object> {
+pub(crate) fn alloc_object_cell(heap: &GcState) -> *mut RefCell<Object> {
     heap.core
         .borrow_mut()
         .alloc(heap.object_desc, std::mem::size_of::<RefCell<Object>>())
@@ -3176,12 +3131,64 @@ impl Drop for HeapRelease {
             let _ =
                 crate::gc_handle::clear_dead_weak_cells(|ptr| core.resolve(ptr as u64).is_some());
         }
+        // Notify foreign observing heaps before these addresses can be reused. Notifications
+        // enqueue identities only; cleanup callbacks still wait for a host job checkpoint.
+        for (_, observers) in heap.weak_observers.borrow_mut().drain() {
+            observers.notify();
+        }
+        #[cfg(feature = "architecture-diagnostics")]
+        {
+            let cells = heap.core.borrow().live_cells(heap.object_desc);
+            let mut diagnostics = heap.diagnostics.borrow_mut();
+            for cell in cells {
+                diagnostics.died(cell);
+            }
+        }
         heap.core.borrow_mut().release_all();
+        // Do not keep even a Weak allocation for a retired Engine until the next Agent switch.
+        KNOWN_GC_HEAPS.with(|known| {
+            known
+                .borrow_mut()
+                .retain(|entry| entry.strong_count() != 0 && entry.as_ptr() != Rc::as_ptr(heap));
+        });
     }
 }
 
-/// Sparse destruction watches. Objects that have never been weak targets perform only the flag
-/// check, with no hash lookup or queue operation on destruction.
+/// Evict object death metadata while every dead cell is still intact. Address keys disappear
+/// before freeing, including when weak pins reserve finalized cells as zombies.
+pub(crate) fn sweep_object_metadata(heap: &GcHeap, dead: &crate::gc_sweep::DeadObjects<'_>) {
+    #[cfg(feature = "architecture-diagnostics")]
+    {
+        let mut diagnostics = heap.diagnostics.borrow_mut();
+        for cell in dead.iter() {
+            diagnostics.died(cell);
+        }
+    }
+    let mut watched = heap.weak_observers.borrow_mut();
+    if watched.is_empty() || dead.is_empty() {
+        return;
+    }
+    if dead.len() < watched.capacity() {
+        for cell in dead.iter() {
+            if let Some(observers) = watched.remove(&cell) {
+                observers.notify();
+            }
+        }
+    } else {
+        let cells: Vec<_> = watched
+            .keys()
+            .copied()
+            .filter(|&cell| dead.contains(cell))
+            .collect();
+        for cell in cells {
+            watched.remove(&cell).unwrap().notify();
+        }
+    }
+    crate::weak_metadata::shrink_map(&mut watched);
+}
+
+/// Sparse destruction watches, owned by the target's heap. A foreign observing interpreter may
+/// have another heap active; locate the actual owner from heap metadata without an object field.
 pub(crate) fn observe_weak_target(
     target: &crate::interpreter::WeakTarget,
     queue: &Rc<crate::weak_metadata::DeathQueue>,
@@ -3189,16 +3196,13 @@ pub(crate) fn observe_weak_target(
     use crate::weak_metadata::DeathObservers;
     match target.upgrade() {
         Some(Value::Obj(object)) => {
-            let object = object.borrow();
-            let slot = object.gc_internal.get() as usize;
-            object
-                .gc_heap
+            let cell = Gc::as_ptr(&object) as usize;
+            object_heap(cell)
                 .weak_observers
                 .borrow_mut()
-                .entry(slot)
+                .entry(cell)
                 .or_insert_with(|| DeathObservers::new(target.clone()))
                 .subscribe(queue);
-            object.gc_weak_observed.set(true);
         }
         Some(Value::Sym(symbol)) => {
             symbol
@@ -3220,15 +3224,14 @@ pub(crate) fn unobserve_weak_target(
 ) {
     match target.upgrade() {
         Some(Value::Obj(object)) => {
-            let object = object.borrow();
-            let slot = object.gc_internal.get() as usize;
-            let mut watched = object.gc_heap.weak_observers.borrow_mut();
+            let cell = Gc::as_ptr(&object) as usize;
+            let heap = object_heap(cell);
+            let mut watched = heap.weak_observers.borrow_mut();
             if watched
-                .get_mut(&slot)
+                .get_mut(&cell)
                 .is_some_and(|observers| observers.unsubscribe(queue))
             {
-                watched.remove(&slot);
-                object.gc_weak_observed.set(false);
+                watched.remove(&cell);
                 crate::weak_metadata::shrink_map(&mut watched);
             }
         }
@@ -3250,8 +3253,7 @@ pub(crate) fn scan_gc_heap_retained_memory(
     heap: &GcHeap,
     visitor: &mut crate::memory::Visitor,
 ) -> (usize, bool) {
-    let mut bytes =
-        std::mem::size_of::<GcState>().saturating_add(heap.registry.borrow().requested_bytes());
+    let mut bytes = std::mem::size_of::<GcState>();
     {
         let observed = heap.weak_observers.borrow();
         bytes = bytes.saturating_add(
@@ -3441,9 +3443,12 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
 }
 
 thread_local! {
+    /// Heap ownership lookup for the sparse object weak-observer paths. Weak references never
+    /// retain an Engine; creation and actual Agent switches prune retired heaps. A coroutine
+    /// worker learns the shared heap when it activates it, without enlarging Object or WeakGc.
+    static KNOWN_GC_HEAPS: RefCell<Vec<std::rc::Weak<GcState>>> = const { RefCell::new(Vec::new()) };
     /// The ECMAScript Agent surrounding the code currently running on this native thread. This is
-    /// an activation pointer, not collector ownership: each object carries its Agent's heap, and
-    /// `Interp` restores this pointer whenever execution moves between the driver and a coroutine
+    /// the allocation heap: `Interp` restores it whenever execution moves between the driver and a coroutine
     /// worker. See ECMA-262, Agents and GeneratorResume/RunSuspendedContext.
     static ACTIVE_GC_HEAP: RefCell<Option<GcHeap>> = const { RefCell::new(None) };
     /// Symbol identity/registry state for the surrounding Agent. It is separate from `GcHeap`
@@ -3468,7 +3473,6 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         heap_id,
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
-        registry: RefCell::new(SlotRegistry::new()),
         weak_observers: RefCell::new(Default::default()),
         shapes: RefCell::new(ShapeTable::new()),
         array_length_shape: Cell::new(SHAPE_EMPTY),
@@ -3495,9 +3499,52 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     // as long as the core, one of its fields, lives; nothing but the core writes it.
     unsafe {
         let word = std::ptr::NonNull::from(&heap.live.due);
-        heap.core.borrow_mut().attach_due_word(word);
+        let mut core = heap.core.borrow_mut();
+        core.attach_due_word(word);
+        core.attach_live_count(heap.object_desc, std::ptr::NonNull::from(&heap.live.count));
     }
+    remember_gc_heap(&heap);
     heap
+}
+
+fn remember_gc_heap(heap: &GcHeap) {
+    KNOWN_GC_HEAPS.with(|known| {
+        let mut known = known.borrow_mut();
+        known.retain(|heap| heap.strong_count() != 0);
+        if !known.iter().any(|entry| entry.as_ptr() == Rc::as_ptr(heap)) {
+            known.push(Rc::downgrade(heap));
+        }
+    });
+}
+
+pub(crate) fn object_heap(cell: usize) -> GcHeap {
+    let owns = |heap: &GcHeap| match heap.core.try_borrow() {
+        Ok(core) => core.owns_cell(cell, heap.object_desc),
+        // A collected native payload can drop a foreign observing Engine while this core is
+        // borrowed by sweep. Its existing observer entry already proves ownership: insertion
+        // checked the descriptor, and eviction removes the address before freeing the cell.
+        // This path only removes a subscription; sweep callbacks cannot run JS or create one.
+        Err(_) => heap.weak_observers.borrow().contains_key(&cell),
+    };
+    let active = active_gc_heap();
+    if owns(&active) {
+        return active;
+    }
+    // A native payload's destructor can retire a nested Engine while an unrelated active heap
+    // is sweeping under a mutable core borrow. Skip that unrelated candidate; never borrow the
+    // heap list while releasing candidate Rcs (their destructors can retire another heap).
+    let candidates = KNOWN_GC_HEAPS.with(|known| {
+        let mut known = known.borrow_mut();
+        known.retain(|heap| heap.strong_count() != 0);
+        known
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect::<Vec<_>>()
+    });
+    candidates
+        .into_iter()
+        .find(owns)
+        .expect("a live weak target belongs to a known Agent heap")
 }
 
 pub(crate) fn heap_id(heap: &GcHeap) -> u64 {
@@ -3563,6 +3610,7 @@ pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) {
         if tag.get() == next {
             return;
         }
+        remember_gc_heap(heap);
         ACTIVE_GC_HEAP.with(|active| *active.borrow_mut() = Some(heap.clone()));
         ACTIVE_SYMBOL_AGENT.with(|active| *active.borrow_mut() = Some(symbols.clone()));
         tag.set(next);
@@ -3713,6 +3761,19 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
 }
 
+/// This heap's fixed-size shape-directory array, borrowed by each native activation. Its pages
+/// may be replaced as shapes are cached, but the directory itself stays inside the stable heap.
+pub(crate) fn shape_layouts_ptr(heap: &GcHeap) -> *const u8 {
+    // Derive the raw address from RefCell's UnsafeCell, without a shared Ref whose provenance
+    // a later mutable shape-table borrow could invalidate. GcState stays at its Rc allocation;
+    // `pages` is an in-place fixed array, never a resizing vector. Native probes use it only
+    // outside shape-table borrows, with no helper or author code between their read and commit.
+    let shapes = heap.shapes.as_ptr();
+    // SAFETY: the RefCell is initialized and remains in this heap for the activation's life.
+    // addr_of! only computes its field's address; it neither reads nor creates a reference.
+    unsafe { std::ptr::addr_of!((*shapes).layouts.pages).cast() }
+}
+
 #[cfg(all(
     test,
     any(target_arch = "aarch64", target_arch = "x86_64"),
@@ -3768,21 +3829,14 @@ mod jit_heap_tests {
     }
 }
 
-/// One registry slot cycle, for the allocation micro-benchmark.
-#[cfg(test)]
-pub(crate) fn bench_registry_cycle(heap: &GcHeap, entry: *const Object) {
-    let mut registry = heap.registry.borrow_mut();
-    let slot = registry.reserve();
-    registry.publish(slot, entry.cast());
-    registry.remove(slot);
-}
-
+/// The initialized object cells not yet swept (zombies excluded).
 pub(crate) fn heap_gc_snapshot(heap: &GcHeap) -> Vec<Gc> {
-    // SAFETY: registry entries are live object cells (removed by `Object::drop`).
-    heap.registry
-        .borrow()
-        .entry_ptrs()
-        .map(|entry| unsafe { Gc::from_raw(entry) })
+    let cells = heap.core.borrow().live_cells(heap.object_desc);
+    // SAFETY: allocation initializes every object before a safepoint can run; a snapshot never
+    // includes a finalized cell, even if weak pins keep its address reserved as a zombie.
+    cells
+        .into_iter()
+        .map(|cell| unsafe { Gc::from_raw(cell as *const RefCell<Object>) })
         .collect()
 }
 
@@ -7702,4 +7756,229 @@ pub fn f64_to_f16(value: f64) -> u16 {
         h = h.wrapping_add(1); // carry into exponent is intentional
     }
     sign | h
+}
+
+#[cfg(test)]
+mod object_accounting_tests {
+    use super::*;
+    use crate::gc_core::{CollectionKind, EdgeSink, MarkClient};
+    use crate::interpreter::WeakTarget;
+    use crate::weak_metadata::{Subscriber, WeakMetadata};
+
+    struct Roots(Vec<u64>);
+    impl MarkClient for Roots {
+        fn roots(&self, sink: &mut dyn FnMut(u64)) {
+            for &word in &self.0 {
+                sink(word);
+            }
+        }
+        fn side_slot_owners(&self, _: &mut dyn FnMut(usize)) {}
+        fn trace_side_slots(&self, _: usize, _: &mut dyn FnMut(u64)) {}
+        fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
+    }
+
+    /// Drive the real object descriptor with precise roots, so death assertions do not depend
+    /// on conservative retention in the test's frame. Preserve the production phase ordering.
+    fn collect(heap: &GcHeap, roots: &[Gc], kind: CollectionKind) {
+        let client = Roots(roots.iter().map(|o| Gc::as_ptr(o) as u64).collect());
+        assert!(heap.core.borrow_mut().start_marking(false, &client, kind));
+        let dead = crate::gc_sweep::DeadObjects::new(heap);
+        sweep_object_metadata(heap, &dead);
+        let pins = {
+            let core = heap.core.borrow();
+            crate::gc_handle::clear_dead_weak_cells(|cell| core.is_dead_target(cell))
+        };
+        heap.core.borrow_mut().finish_collection(&pins);
+    }
+
+    #[test]
+    fn object_count_and_snapshots_follow_minor_major_and_teardown() {
+        let heap = new_gc_heap();
+        let symbols = new_symbol_agent();
+        let _active = enter_agent(&heap, &symbols);
+        let release = HeapRelease::new(&heap);
+        let count = live_objects_ptr(&heap);
+        let objects: Vec<_> = (0..1100).map(|_| Object::new(None)).collect();
+        let pinned = Gc::downgrade(&objects[1]);
+        assert_eq!(heap_live_objects(&heap), 1100);
+        collect(&heap, &[objects[0], objects[2]], CollectionKind::Major);
+        assert!(pinned.upgrade().is_none());
+        assert_eq!(heap_live_objects(&heap), 2);
+        let mut snapshot: Vec<_> = heap_gc_snapshot(&heap).iter().map(Gc::as_ptr).collect();
+        snapshot.sort_unstable();
+        let mut expected = [Gc::as_ptr(&objects[0]), Gc::as_ptr(&objects[2])];
+        expected.sort_unstable();
+        assert_eq!(snapshot, expected);
+        let young = Object::new(None);
+        for _ in 0..100 {
+            Object::new(None);
+        }
+        collect(&heap, &[objects[0], young], CollectionKind::Minor);
+        assert_eq!(
+            heap_live_objects(&heap),
+            3,
+            "old garbage stays counted until a major"
+        );
+        assert_eq!(heap_gc_snapshot(&heap).len(), 3);
+        collect(&heap, &[objects[0], young], CollectionKind::Major);
+        assert_eq!(heap_live_objects(&heap), 2);
+        assert_eq!(count, live_objects_ptr(&heap));
+        // SAFETY: the heap owns this stable counter throughout the test.
+        assert_eq!(unsafe { *count }, 2);
+        drop(release);
+        assert_eq!(heap_live_objects(&heap), 0);
+        assert!(heap_gc_snapshot(&heap).is_empty());
+        assert!(pinned.upgrade().is_none());
+        heap.core.borrow_mut().release_all();
+        assert_eq!(heap_live_objects(&heap), 0);
+    }
+
+    #[test]
+    fn object_allocation_uses_active_heap_without_borrowing_its_prototype() {
+        let active = crate::Engine::new();
+        let prototype = Object::new(None);
+        let before = heap_live_objects(&active.interp.gc_heap);
+        let borrowed = prototype.borrow_mut();
+        let object = Object::new(Some(prototype));
+        assert!(active.interp.gc_heap.core.borrow().owns_cell(
+            Gc::as_ptr(&object) as usize,
+            active.interp.gc_heap.object_desc,
+        ));
+        assert_eq!(heap_live_objects(&active.interp.gc_heap), before + 1);
+        assert!(Gc::ptr_eq(&object.borrow().proto.unwrap(), &prototype));
+        drop(borrowed);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "object prototype belongs to another Agent heap (I6)")]
+    fn object_allocation_rejects_foreign_prototypes() {
+        let _owner = crate::Engine::new();
+        let prototype = Object::new(None);
+        let _active = crate::Engine::new();
+        Object::new(Some(prototype));
+    }
+
+    #[test]
+    fn object_observers_follow_foreign_heaps_removal_and_address_reuse() {
+        let heap = new_gc_heap();
+        let symbols = new_symbol_agent();
+        let _active = enter_agent(&heap, &symbols);
+        let release = HeapRelease::new(&heap);
+        let target = Object::new(None);
+        let address = Gc::as_ptr(&target) as usize;
+        let weak = WeakTarget::of(&Value::Obj(target)).unwrap();
+        let foreign = crate::Engine::new();
+        let mut first = WeakMetadata::default();
+        let mut second = WeakMetadata::default();
+        first.subscribe(weak.clone(), Subscriber::WeakRef(1));
+        second.subscribe(weak.clone(), Subscriber::WeakRef(2));
+        assert_eq!(heap.weak_observers.borrow().len(), 1);
+        assert!(foreign.interp.gc_heap.weak_observers.borrow().is_empty());
+        first.unsubscribe(weak.key(), Subscriber::WeakRef(1));
+        assert_eq!(heap.weak_observers.borrow().len(), 1);
+        second.unsubscribe(weak.key(), Subscriber::WeakRef(2));
+        assert!(heap.weak_observers.borrow().is_empty());
+        second.subscribe(weak.clone(), Subscriber::WeakRef(2));
+        collect(&heap, &[], CollectionKind::Major);
+        assert!(weak.upgrade().is_none());
+        assert!(heap.weak_observers.borrow().is_empty());
+        assert_eq!(second.take_deaths().len(), 1);
+        assert_eq!(
+            second.take_subscribers(weak.key()),
+            vec![Subscriber::WeakRef(2)]
+        );
+        // The old identity is now unobserved, so its pinned cell can be freed and reused.
+        drop(weak);
+        collect(&heap, &[], CollectionKind::Major);
+        activate_agent(&heap, &symbols);
+        let reused = (0..1024)
+            .map(|_| Object::new(None))
+            .find(|o| Gc::as_ptr(o) as usize == address)
+            .expect("the released page reuses the original cell");
+        let weak = WeakTarget::of(&Value::Obj(reused)).unwrap();
+        first.subscribe(weak.clone(), Subscriber::WeakRef(3));
+        assert!(
+            first.take_deaths().is_empty(),
+            "new identity must not inherit an old notification"
+        );
+        assert!(weak.upgrade().is_some());
+        drop(release);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            first.take_deaths().len(),
+            1,
+            "teardown notifies the new observer once"
+        );
+        assert!(heap.weak_observers.borrow().is_empty());
+    }
+
+    #[test]
+    fn object_payload_finalization_keeps_layouts_spills_sidecars_accessors_and_natives() {
+        struct Witness(Rc<Cell<usize>>);
+        impl Drop for Witness {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let heap = new_gc_heap();
+        let symbols = new_symbol_agent();
+        let _active = enter_agent(&heap, &symbols);
+        let release = HeapRelease::new(&heap);
+        let plain = Object::new(None);
+        assert!(!plain.borrow().owns_payload());
+        let named = Object::new(None);
+        named
+            .borrow_mut()
+            .props
+            .insert("field", Property::plain(Value::Num(1.0)));
+        let layout = named
+            .borrow()
+            .props
+            .entries
+            .layout
+            .as_ref()
+            .unwrap()
+            .clone();
+        let refs = Rc::strong_count(&layout);
+        assert!(named.borrow().owns_payload());
+        let spilled = Object::new_with_capacity(None, INLINE_NAMED_SLOTS + 1);
+        assert!(spilled.borrow().owns_payload());
+        let sidecar = Object::new(None);
+        sidecar
+            .borrow_mut()
+            .internal_slots_mut()
+            .insert("state", Property::plain(Value::Num(2.0)));
+        assert!(sidecar.borrow().owns_payload());
+        let accessor = Object::new(None);
+        // Even a partial map with no key layout must release an inline accessor box.
+        accessor
+            .borrow_mut()
+            .props
+            .entries
+            .fields
+            .push(Property::accessor_prop(None, None, true, true));
+        assert!(accessor.borrow().owns_payload());
+        let dropped = Rc::new(Cell::new(0));
+        let witness = Witness(dropped.clone());
+        let native = Object::new(None);
+        native.borrow_mut().call = Callable::NativeData(Rc::new(NativeCallable {
+            body: NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
+                let _keep = &witness;
+                Ok(Value::Undefined)
+            })),
+            retained: None,
+            identity: Rc::from("finalization witness"),
+        }));
+        assert!(native.borrow().owns_payload());
+        collect(&heap, &[], CollectionKind::Major);
+        assert_eq!(
+            Rc::strong_count(&layout),
+            refs - 1,
+            "the inline object's layout Rc is released"
+        );
+        assert_eq!(dropped.get(), 1, "native Rust state drops exactly once");
+        drop(release);
+        assert_eq!(dropped.get(), 1);
+    }
 }

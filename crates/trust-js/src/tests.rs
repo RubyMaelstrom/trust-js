@@ -7102,8 +7102,8 @@ fn engine_teardown_reclaims_the_entire_object_and_environment_graph() {
                 ),
                 "ready"
             );
-            // A full ordinary collection must preserve these live roots, and must not
-            // leave scratch reference counts where Object::drop expects registry slots.
+            // A full ordinary collection preserves these live roots and leaves its object
+            // census valid for the following teardown.
             engine.interp.gc_collect();
             let heap = Rc::downgrade(&engine.interp.gc_heap);
             let objects: Vec<_> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
@@ -7152,9 +7152,9 @@ fn engine_teardown_preserves_another_live_agent_on_the_same_thread() {
     drop(retired);
     assert!(retired_heap.upgrade().is_none());
     let object = crate::value::Object::new(None);
-    assert!(std::rc::Rc::ptr_eq(
-        &object.borrow().gc_heap,
-        &active.interp.gc_heap
+    assert!(active.interp.gc_heap.core.borrow().owns_cell(
+        crate::value::Gc::as_ptr(&object) as usize,
+        active.interp.gc_heap.object_desc,
     ));
     assert_eq!(run_in(&mut active, "kept.self.n + 1"), "42");
     active.interp.gc_collect();

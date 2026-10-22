@@ -714,7 +714,8 @@ impl Interp {
         };
         let context = module_map_context(referrer);
         let public_referrer = module_map_url(referrer);
-        match loader(specifier, public_referrer, attr_type) {
+        let loaded = self.with_host_callback(|_| loader(specifier, public_referrer, attr_type));
+        match loaded {
             Some((canonical, source)) => Ok((module_map_key(context, &canonical), source)),
             None => Err(self.throw(
                 "TypeError",
@@ -1821,7 +1822,10 @@ impl Interp {
         if let Some(loader) = self.dynamic_module_loader.clone() {
             let request_id = self.next_dynamic_import_id;
             self.next_dynamic_import_id = self.next_dynamic_import_id.wrapping_add(1).max(1);
-            if loader(request_id, host_context, specifier, referrer, attr_type) {
+            let accepted = self.with_host_callback(|_| {
+                loader(request_id, host_context, specifier, referrer, attr_type)
+            });
+            if accepted {
                 self.pending_dynamic_imports.insert(
                     request_id,
                     PendingDynamicImport {

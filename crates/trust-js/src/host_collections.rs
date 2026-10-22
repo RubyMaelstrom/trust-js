@@ -15,7 +15,8 @@ impl Interp {
             .and_then(|properties| properties.live.as_ref())
             .is_some_and(|live| {
                 live.names.is_some_and(|names| {
-                    names(self, &live.state)
+                    let supported = self.with_host_query(|interp| names(interp, &live.state));
+                    supported
                         .iter()
                         .any(|name| name == crate::value::decode_string_key(key))
                 })
@@ -118,7 +119,8 @@ impl Interp {
             return Ok(Vec::new());
         };
         let mut result = Vec::new();
-        for name in names(self, &live.state) {
+        let supported = self.with_host_query(|interp| names(interp, &live.state));
+        for name in supported {
             let name = crate::value::encode_owned_string_key(name);
             if self.host_named_visible(object, &name)? {
                 result.push(name);

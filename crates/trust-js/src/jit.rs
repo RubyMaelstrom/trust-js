@@ -1791,11 +1791,14 @@ pub struct JitCtx {
     pub callstat_enabled: bool,
     pub propstat_enabled: bool,
     pub inline_recompile_at: u32,
-    /// Address of the executing thread's live-object counter. Compiled chunks may cross thread
-    /// boundaries with generator/async interpreter handoff, so this TLS address must be captured
+    /// Address of this Agent heap's live-object counter. Compiled chunks may cross thread
+    /// boundaries with generator/async interpreter handoff, so this heap address must be captured
     /// when an activation starts rather than embedded while machine code is compiled. The
     /// heap's due word follows the count (`value::LiveCount`): polls load both.
     pub live_objects: *const i64,
+    /// The active heap's fixed shape-directory array. Creation ICs index this directly instead
+    /// of following an owning heap pointer in each receiver. Layouts remain pinned by the heap.
+    pub shape_layouts: *const u8,
     pub(crate) activation: Option<Box<crate::bytecode::NativeActivation>>,
     /// Native slices borrow VmCoro's authoritative heap state only while running. Ordinary
     /// entries leave this null; chunk identity prevents a nested direct call from aliasing it.
@@ -1911,6 +1914,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             propstat_enabled: _,
             inline_recompile_at: _,
             live_objects: _,
+            shape_layouts: _, // Rust-owned layouts, not managed cell edges
             activation,
             // `drive_vm`'s borrow of its own frame state, which it registers (VM_FRAMES) for
             // its whole call: the references, environments and stack this points at.
@@ -5228,9 +5232,8 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         && (layout.layout_data_off + layout.vec_len_off).is_multiple_of(8)
         && layout.layout_data_off + layout.vec_ptr_off < 4096
         && layout.layout_data_off + layout.vec_len_off < 4096
-        && layout.obj_heap.is_multiple_of(8)
-        && layout.obj_heap / 8 < 4096
-        && layout.heap_layouts.is_multiple_of(8)
+        && std::mem::offset_of!(JitCtx, shape_layouts).is_multiple_of(8)
+        && std::mem::offset_of!(JitCtx, shape_layouts) / 8 < 4096
         && layout.shape_layout_entry_size == 16
         && layout.shape_layout_entry_id == 0
         && layout.shape_layout_entry_keys == 8
@@ -9302,14 +9305,12 @@ fn emit_prop_create_probe(
     }
     a.b(key_ready);
     a.bind(transition_layout);
-    // The receiver's owning heap pins cached layouts. The shape table cannot change between
+    // This activation's heap pins cached layouts. The shape table cannot change between
     // this probe and commit: no helper, allocation, GC or user code runs in that interval.
-    a.ldr_imm(16, 11, layout.obj_heap as u32);
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, shape_layouts) as u32);
     a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
     // A bounded paged directory caches globally unique shape identities. Indexing chooses
     // only a candidate: the complete stored ID must match before borrowing its key layout.
-    a.mov_imm64(17, layout.heap_layouts as u64);
-    a.add_shifted(16, 16, 17, 0);
     a.ubfx(17, 14, 6, 6);
     a.add_shifted(16, 16, 17, 3);
     a.ldr_imm(16, 16, 0); // Option<Box<LayoutPage>> is a nullable allocation pointer.
@@ -17896,6 +17897,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         activation: None,
         resume_activation: state,
         references_raw: (&mut *state.references).as_mut_ptr(),
@@ -18035,6 +18037,7 @@ pub fn run(
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots.as_mut_ptr(),
@@ -18178,6 +18181,7 @@ impl JitFrame {
                 propstat_enabled: crate::bytecode::jit_propstat_enabled(),
                 inline_recompile_at: crate::bytecode::inline_recompile_at(),
                 live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+                shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
                 activation: None,
                 resume_activation: std::ptr::null_mut(),
                 resume_pc: 0,
@@ -18520,6 +18524,7 @@ unsafe fn run_moved_oversized(
         propstat_enabled: crate::bytecode::jit_propstat_enabled(),
         inline_recompile_at: crate::bytecode::inline_recompile_at(),
         live_objects: crate::value::live_objects_ptr(&i.gc_heap),
+        shape_layouts: crate::value::shape_layouts_ptr(&i.gc_heap),
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots_ptr,

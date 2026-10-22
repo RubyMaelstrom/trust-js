@@ -702,6 +702,7 @@ fn return_context() -> super::JitCtx {
         propstat_enabled: false,
         inline_recompile_at: 0,
         live_objects: std::ptr::null(),
+        shape_layouts: std::ptr::null(),
         activation: None,
         resume_activation: std::ptr::null_mut(),
         resume_pc: 0,

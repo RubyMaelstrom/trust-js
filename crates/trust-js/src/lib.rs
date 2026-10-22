@@ -50,6 +50,8 @@ macro_rules! env_value {
     }};
 }
 
+#[cfg(test)]
+mod agent_activation_tests;
 mod array_binding;
 #[cfg(test)]
 mod array_binding_tests;
