@@ -100,6 +100,7 @@ mod for_in_cache_tests;
 mod function_realm_identity_tests;
 #[cfg(test)]
 mod function_realm_lifetime_tests;
+mod function_runtime;
 mod gc_box;
 mod gc_core;
 #[cfg(test)]
@@ -1848,3 +1849,6 @@ pub struct RealmEntry {
     /// The stack's height with the entry on top.
     depth: usize,
 }
+
+#[cfg(test)]
+mod function_runtime_tests;

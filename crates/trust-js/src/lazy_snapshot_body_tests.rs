@@ -201,6 +201,7 @@ fn lazily_decoded_bodies_behave_like_parsed_source_in_every_tier() {
             if tier != Tier::Interp {
                 assert!(
                     global_function(it, "hot")
+                        .runtime()
                         .code
                         .get()
                         .is_some_and(Option::is_some),
@@ -294,6 +295,7 @@ fn bootstrap_function(body: &[crate::ast::Stmt]) -> Rc<crate::ast::Function> {
 
 fn has_native_code(function: &crate::ast::Function) -> bool {
     function
+        .runtime()
         .code
         .get()
         .and_then(Option::as_ref)
@@ -327,7 +329,7 @@ fn run_once_bootstrap_functions_never_get_native_code() {
     let bootstrap = bootstrap_function(&program);
     assert!(bootstrap.run_once);
     assert!(
-        bootstrap.code.get().is_some_and(Option::is_some),
+        bootstrap.runtime().code.get().is_some_and(Option::is_some),
         "explicitly forced bytecode compiles the bootstrap on its first call"
     );
     assert!(!has_native_code(&bootstrap), "but it runs on the VM");
@@ -427,7 +429,10 @@ fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
             eval_string(it, "bootstrapTotal")
         };
         assert_eq!(run(it), expected, "{tier:?}");
-        assert!(bootstrap.code.get().is_none(), "{tier:?}: interpreted");
+        assert!(
+            bootstrap.runtime().code.get().is_none(),
+            "{tier:?}: interpreted"
+        );
         // Each later Realm of the Agent calls it once more.
         for realm in 1..=threshold {
             let child = it.create_realm();
@@ -438,7 +443,7 @@ fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
             );
         }
         assert!(
-            bootstrap.code.get().is_some_and(Option::is_some),
+            bootstrap.runtime().code.get().is_some_and(Option::is_some),
             "{tier:?}: the call-count threshold compiles it"
         );
         assert!(!has_native_code(&bootstrap), "{tier:?}: on the VM");
@@ -455,7 +460,7 @@ fn huge_run_once_bootstrap_bodies_are_interpreted_until_the_call_threshold() {
     }
     assert_eq!(eval_string(it, "bootstrapTotal"), expected);
     assert!(
-        bootstrap_function(&parsed).code.get().is_none(),
+        bootstrap_function(&parsed).runtime().code.get().is_none(),
         "parsed source also defers cold-loop compilation"
     );
 }

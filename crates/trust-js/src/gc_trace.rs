@@ -17,6 +17,11 @@ pub(crate) trait GcSink {
     fn word(&mut self, word: u64);
 
     #[inline]
+    fn layout(&mut self, layout: &crate::value::PropertyLayout) {
+        self.word(layout.cell_word());
+    }
+
+    #[inline]
     fn object(&mut self, object: &Gc) {
         self.word(Gc::as_ptr(object) as u64);
     }
@@ -51,6 +56,11 @@ impl GcTrace for Gc {
     fn trace_gc(&self, sink: &mut dyn GcSink) {
         sink.object(self);
     }
+}
+
+/// A weak constructor pin is identity/lifetime bookkeeping, never a strong edge.
+impl GcTrace for crate::value::WeakGc {
+    fn trace_gc(&self, _: &mut dyn GcSink) {}
 }
 
 impl GcTrace for crate::lstr::LStr {

@@ -914,6 +914,14 @@ struct CellRef {
     loc: Loc,
 }
 
+/// A resolved address is not necessarily allocated: conservative words can name free or
+/// weakly pinned dead cells. Only the two live outcomes can seed a positive-word cache.
+enum MarkOutcome {
+    Rejected,
+    AlreadyMarked,
+    NewlyMarked { has_waiters: bool },
+}
+
 /// An edge whose value is reachable once its conditions are marked.
 struct CondEdge {
     owner: Option<CellRef>,
@@ -998,6 +1006,15 @@ pub(crate) enum MarkSource {
 /// can outlive the cells it describes.
 #[derive(Default)]
 struct Marker {
+    /// Exact words proven to name allocated, non-zombie marked cells. This cache is born
+    /// before native-stack scanning and dies with this marker, before sweeping or any
+    /// post-marking allocation. Any conservative observation names an already-marked cell, adding no new
+    /// lifetime or rooting; card-owner worklist tracing is never suppressed.
+    positive_words: PositiveWords,
+    #[cfg(test)]
+    word_lookups: usize,
+    #[cfg(test)]
+    word_cache_hits: usize,
     /// What is marking now, and (when retention tracing) each cell's first marker.
     #[cfg(test)]
     source: MarkSource,
@@ -1009,6 +1026,42 @@ struct Marker {
     waiting: FastMap<usize, Vec<u32>>,
     ready: Vec<u32>,
     trace_scratch: Vec<*const u8>,
+}
+
+/// A small direct-mapped table of exact positive words. Cell and page bits both
+/// participate so aligned shared prototype/layout addresses do not systematically collide.
+const MARK_CACHE_WORDS: usize = 32;
+const _: () = assert!(MARK_CACHE_WORDS.is_power_of_two());
+/// Amortize cache probes on short descriptor traces. Larger batches still mark every word,
+/// including repetitions, through the uncached specialization selected once in `drain`.
+const MARK_CACHE_BATCH_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct PositiveWords {
+    words: [u64; MARK_CACHE_WORDS],
+    #[cfg(test)]
+    probes: Cell<usize>,
+}
+
+impl PositiveWords {
+    #[inline]
+    fn index(word: u64) -> usize {
+        ((word >> 4) ^ (word >> 16)) as usize & (MARK_CACHE_WORDS - 1)
+    }
+
+    #[inline]
+    fn contains(&self, word: u64) -> bool {
+        #[cfg(test)]
+        self.probes.set(self.probes.get() + 1);
+        // Zero is an empty entry, never a proven allocated cell. Hash collisions only
+        // replace an entry: a hit still requires equality of the complete original word.
+        word != 0 && self.words[Self::index(word)] == word
+    }
+
+    #[inline]
+    fn insert(&mut self, word: u64) {
+        self.words[Self::index(word)] = word;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1725,55 +1778,90 @@ impl Heap {
         }
     }
 
-    /// Set the mark of an allocated cell. `Some(has_waiters)` when newly
-    /// marked; `None` when already marked or free (conservative or stale
-    /// hits on free cells are ignored).
-    fn mark(&mut self, cell: &CellRef) -> Option<bool> {
+    /// Set the mark of an allocated live cell, distinguishing an existing mark from a
+    /// rejected free/zombie address without resolving the candidate a second time.
+    #[inline]
+    fn mark(&mut self, cell: &CellRef) -> MarkOutcome {
         match cell.loc {
             Loc::Small { page, index } => {
-                let page = self.pages[page as usize].as_mut()?;
+                let Some(page) = self.pages[page as usize].as_mut() else {
+                    return MarkOutcome::Rejected;
+                };
                 let index = index as usize;
-                if !bit(&page.allocated, index)
-                    || bit(&page.zombies, index)
-                    || bit(&page.marks, index)
-                {
-                    return None;
+                if !bit(&page.allocated, index) || bit(&page.zombies, index) {
+                    return MarkOutcome::Rejected;
+                }
+                if bit(&page.marks, index) {
+                    return MarkOutcome::AlreadyMarked;
                 }
                 set_bit(&mut page.marks, index, true);
                 self.marked_bytes += page.cell_size;
-                Some(bit(&page.waiters, index))
+                MarkOutcome::NewlyMarked {
+                    has_waiters: bit(&page.waiters, index),
+                }
             }
             Loc::Large => {
-                let large = self.larges.get_mut(&cell.start)?;
-                if large.marked || large.zombie {
-                    return None;
+                let Some(large) = self.larges.get_mut(&cell.start) else {
+                    return MarkOutcome::Rejected;
+                };
+                if large.zombie {
+                    return MarkOutcome::Rejected;
+                }
+                if large.marked {
+                    return MarkOutcome::AlreadyMarked;
                 }
                 large.marked = true;
                 self.marked_bytes += large.size;
-                Some(large.waiters)
-            }
-        }
-    }
-
-    fn mark_cell(&mut self, cell: CellRef, m: &mut Marker) {
-        if let Some(has_waiters) = self.mark(&cell) {
-            #[cfg(test)]
-            if let Some(parents) = &mut m.parents {
-                parents.insert(cell.start, m.source);
-            }
-            self.stats.cells_marked += 1;
-            m.worklist.push((cell.start, cell.desc));
-            if has_waiters {
-                if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
-                    m.ready.extend(edges);
+                MarkOutcome::NewlyMarked {
+                    has_waiters: large.waiters,
                 }
             }
         }
     }
 
-    fn mark_word(&mut self, word: u64, m: &mut Marker) {
+    /// Return true only after this cell is proven live and all first-mark bookkeeping,
+    /// including waiter notifications, is complete. A caller may then cache its exact word.
+    #[inline]
+    fn mark_cell(&mut self, cell: CellRef, m: &mut Marker) -> bool {
+        match self.mark(&cell) {
+            MarkOutcome::Rejected => false,
+            MarkOutcome::AlreadyMarked => true,
+            MarkOutcome::NewlyMarked { has_waiters } => {
+                #[cfg(test)]
+                if let Some(parents) = &mut m.parents {
+                    parents.insert(cell.start, m.source);
+                }
+                self.stats.cells_marked += 1;
+                m.worklist.push((cell.start, cell.desc));
+                if has_waiters {
+                    if let Some(edges) = m.waiting.remove(&(cell.start >> 4)) {
+                        m.ready.extend(edges);
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_word<const USE_CACHE: bool>(&mut self, word: u64, m: &mut Marker) {
+        if USE_CACHE && m.positive_words.contains(word) {
+            #[cfg(test)]
+            {
+                m.word_cache_hits += 1;
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            m.word_lookups += 1;
+        }
         if let Some(cell) = self.locate(word) {
-            self.mark_cell(cell, m);
+            // Even the uncached specialization must complete every first-mark side effect.
+            let live = self.mark_cell(cell, m);
+            if USE_CACHE && live {
+                m.positive_words.insert(word);
+            }
         }
     }
 
@@ -2082,7 +2170,7 @@ impl Heap {
         // A minor collection traces the old cells whose cards were set, although they are
         // marked: they may hold the only edges to young cells.
         m.worklist.append(&mut self.card_cells);
-        client.roots(&mut |word| self.mark_word(word, &mut m));
+        client.roots(&mut |word| self.mark_word::<true>(word, &mut m));
         if native_roots {
             self.mark_native_stack(&mut m);
         }
@@ -2336,7 +2424,7 @@ impl Heap {
                 {
                     m.source = MarkSource::Stack(p);
                 }
-                self.mark_word(word, m);
+                self.mark_word::<true>(word, m);
                 p += 8;
             }
         }
@@ -2376,8 +2464,16 @@ impl Heap {
                 let mut edges = std::mem::take(&mut m.trace_scratch);
                 edges.clear();
                 trace(cell as *const u8, &mut |edge| edges.push(edge));
-                for &edge in &edges {
-                    self.mark_word(edge as u64, m);
+                // The size check is once per descriptor batch, never a per-word policy test.
+                // This is an amortization heuristic, not a claim that large batches are unique.
+                if edges.len() <= MARK_CACHE_BATCH_LIMIT {
+                    for &edge in &edges {
+                        self.mark_word::<true>(edge as u64, m);
+                    }
+                } else {
+                    for &edge in &edges {
+                        self.mark_word::<false>(edge as u64, m);
+                    }
                 }
                 m.trace_scratch = edges;
             }
@@ -2422,14 +2518,14 @@ impl Heap {
                         owner: conditions[0].map_or(0, |cell| cell.start),
                     };
                 }
-                self.mark_word(word, m);
+                self.mark_word::<true>(word, m);
             }
             EdgeValue::SideSlots(owner) => {
                 #[cfg(test)]
                 {
                     m.source = MarkSource::SideSlots(owner);
                 }
-                client.trace_side_slots(owner, &mut |word| self.mark_word(word, m));
+                client.trace_side_slots(owner, &mut |word| self.mark_word::<true>(word, m));
             }
         }
         #[cfg(test)]
@@ -6161,6 +6257,766 @@ mod tests {
         let a = fx.alloc_node(0x0000_0000_00de_ad00, 1);
         fx.roots[0] = tagged(a);
         fx.collect();
+    }
+
+    mod positive_word_cache {
+        use super::*;
+
+        fn trace_object(cell: *const u8, sink: &mut dyn FnMut(*const u8)) {
+            // A synthetic object's prototype, shared layout and independent child.
+            for index in 0..3 {
+                let edge = word(cell, index);
+                if edge != 0 {
+                    sink((edge & PAYLOAD_MASK) as *const u8);
+                }
+            }
+        }
+
+        fn trace_batch(cell: *const u8, sink: &mut dyn FnMut(*const u8)) {
+            for index in 0..word(cell, 0) as usize {
+                sink((word(cell, index + 1) & PAYLOAD_MASK) as *const u8);
+            }
+        }
+
+        fn alloc_batch(fx: &mut Fixture, edges: &[*mut u8]) -> (*mut u8, DescId) {
+            let desc = fx.heap.register_desc(LayoutDesc {
+                name: "edge batch",
+                trace: trace_batch,
+                finalize: None,
+                carded: false,
+            });
+            let cell = fx.heap.alloc(desc, (edges.len() + 1) * 8);
+            set_word(cell, 0, edges.len() as u64);
+            for (index, &edge) in edges.iter().enumerate() {
+                set_word(cell, index + 1, tagged(edge));
+            }
+            (cell, desc)
+        }
+
+        #[test]
+        fn drain_selects_cached_at_64_and_uncached_at_65_edges() {
+            assert_eq!(MARK_CACHE_BATCH_LIMIT, 64, "the measured trial threshold");
+            for count in [64, 65] {
+                let mut fx = Fixture::new();
+                fx.heap.set_collect_on_alloc(false);
+                let child = fx.heap.alloc(fx.leaf, 16);
+                let target = fx.alloc_node(tagged(child), 1);
+                let (batch, _) = alloc_batch(&mut fx, &vec![target; count]);
+                let mut marker = Marker::default();
+                let before = fx.heap.stats().cells_marked;
+                fx.heap.mark_word::<true>(tagged(batch), &mut marker);
+                fx.heap.drain(&mut marker, &NoClient);
+                fx.heap.verify(&marker);
+                assert_eq!(fx.heap.stats().cells_marked - before, 3);
+                assert!(is_marked_at(&fx.heap, child as usize));
+                if count == 64 {
+                    assert_eq!(marker.positive_words.probes.get(), count + 2);
+                    assert_eq!(marker.word_cache_hits, 63, "short-batch repeated hits");
+                    assert_eq!(marker.word_lookups, 3);
+                } else {
+                    assert_eq!(
+                        marker.positive_words.probes.get(),
+                        2,
+                        "only root and child probe"
+                    );
+                    assert_eq!(marker.word_cache_hits, 0, "large batches never probe cache");
+                    assert_eq!(
+                        marker.word_lookups,
+                        count + 2,
+                        "each word resolves and marks"
+                    );
+                    assert!(!marker.positive_words.contains(target as u64));
+                }
+            }
+        }
+
+        #[test]
+        fn large_batch_retains_sole_targets_descendants_and_ephemeron_wakeups() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let count = MARK_CACHE_BATCH_LIMIT + 1;
+            let children: Vec<_> = (0..count).map(|_| fx.heap.alloc(fx.leaf, 16)).collect();
+            let targets: Vec<_> = children
+                .iter()
+                .map(|&child| fx.alloc_node(tagged(child), 1))
+                .collect();
+            let mut edges = targets.clone();
+            edges.push(*targets.last().unwrap()); // Adjacent repeat detects accidental caching.
+            let (batch, batch_desc) = alloc_batch(&mut fx, &edges);
+            let conditional_child = fx.heap.alloc(fx.leaf, 16);
+            let conditional = fx.alloc_node(tagged(conditional_child), 2);
+            let mut marker = Marker {
+                parents: Some(FastMap::default()),
+                ..Marker::default()
+            };
+            fx.heap.mark_word::<true>(tagged(batch), &mut marker);
+            fx.heap.drain(&mut marker, &NoClient);
+            fx.heap.verify(&marker);
+            assert_eq!(
+                marker.word_cache_hits, 0,
+                "the large adjacent repeat is uncached"
+            );
+            assert_eq!(marker.word_lookups, 1 + edges.len() + count);
+            assert_eq!(marker.parents.as_ref().unwrap().len(), 1 + 2 * count);
+            assert!(targets.iter().all(|target| matches!(
+                marker.parents.as_ref().unwrap().get(&(*target as usize)),
+                Some(MarkSource::Cell(owner)) if *owner == batch as usize
+            )));
+
+            // Only the batch is a precise root. Rust vectors/closure captures are excluded;
+            // the first target must wake the conditional edge when the uncached loop marks it.
+            fx.roots[0] = tagged(batch);
+            let ephemeron = |sink: &mut EdgeSink<'_>| {
+                sink.ephemeron(batch, tagged(targets[0]), tagged(conditional));
+            };
+            let before = fx.heap.stats().cells_marked;
+            fx.collect_with(&ephemeron);
+            assert_eq!(
+                fx.heap.stats().cells_marked - before,
+                (1 + 2 * count + 2) as u64
+            );
+            let assert_live = |fx: &Fixture| {
+                assert!(fx.heap.owns_cell(batch as usize, batch_desc));
+                for (&target, &child) in targets.iter().zip(&children) {
+                    assert!(fx.heap.owns_cell(target as usize, fx.node), "sole target");
+                    assert!(
+                        fx.heap.owns_cell(child as usize, fx.leaf),
+                        "sole descendant"
+                    );
+                }
+                assert!(
+                    fx.heap.owns_cell(conditional as usize, fx.node),
+                    "waiter value"
+                );
+                assert!(
+                    fx.heap.owns_cell(conditional_child as usize, fx.leaf),
+                    "waiter child"
+                );
+            };
+            assert_live(&fx); // Before any further allocation could reuse a missing edge's cell.
+            assert!(fx.start_marking_kind(&ephemeron, CollectionKind::Minor));
+            fx.heap.finish_collection(&[]);
+            assert_live(&fx);
+            fx.roots[0] = 0;
+            fx.collect_with(&ephemeron);
+            assert!(!allocated(&fx, batch as usize));
+            for (&target, &child) in targets.iter().zip(&children) {
+                assert!(!allocated(&fx, target as usize));
+                assert!(!allocated(&fx, child as usize));
+            }
+            assert!(!allocated(&fx, conditional as usize));
+            assert!(!allocated(&fx, conditional_child as usize));
+        }
+
+        struct BatchTrees {
+            targets: Vec<*mut u8>,
+            children: Vec<*mut u8>,
+            conditional: *mut u8,
+            conditional_child: *mut u8,
+        }
+
+        impl BatchTrees {
+            fn new(fx: &mut Fixture) -> Self {
+                let children: Vec<_> = (0..MARK_CACHE_BATCH_LIMIT + 1)
+                    .map(|_| fx.heap.alloc(fx.leaf, 16))
+                    .collect();
+                let targets = children
+                    .iter()
+                    .map(|&child| fx.alloc_node(tagged(child), 1))
+                    .collect();
+                let conditional_child = fx.heap.alloc(fx.leaf, 16);
+                let conditional = fx.alloc_node(tagged(conditional_child), 2);
+                Self {
+                    targets,
+                    children,
+                    conditional,
+                    conditional_child,
+                }
+            }
+
+            fn edges(&self) -> Vec<*mut u8> {
+                let mut edges = self.targets.clone();
+                edges.push(*self.targets.last().unwrap());
+                assert!(edges.len() > MARK_CACHE_BATCH_LIMIT);
+                edges
+            }
+
+            fn cells(&self) -> impl Iterator<Item = *mut u8> + '_ {
+                self.targets
+                    .iter()
+                    .chain(&self.children)
+                    .copied()
+                    .chain([self.conditional, self.conditional_child])
+            }
+
+            fn assert_age(&self, fx: &Fixture, expected: CellAge) {
+                for cell in self.cells() {
+                    assert_eq!(fx.heap.cell_age(cell as u64), Some(expected), "{cell:p}");
+                }
+            }
+
+            fn assert_live(&self, fx: &Fixture) {
+                for (&target, &child) in self.targets.iter().zip(&self.children) {
+                    assert!(fx.heap.owns_cell(target as usize, fx.node), "sole target");
+                    assert!(
+                        fx.heap.owns_cell(child as usize, fx.leaf),
+                        "sole descendant"
+                    );
+                }
+                assert!(
+                    fx.heap.owns_cell(self.conditional as usize, fx.node),
+                    "waiter value"
+                );
+                assert!(
+                    fx.heap.owns_cell(self.conditional_child as usize, fx.leaf),
+                    "waiter child"
+                );
+            }
+
+            fn assert_dead(&self, fx: &Fixture) {
+                for cell in self.cells() {
+                    assert!(!allocated(fx, cell as usize), "{cell:p} must be reclaimed");
+                }
+            }
+        }
+
+        #[test]
+        fn first_minor_large_young_batch_retains_sole_trees_and_wakes_waiters() {
+            let mut fx = Fixture::new();
+            // Explicit precise collections preserve the young precondition even under STRESS=1.
+            fx.heap.set_collect_on_alloc(false);
+            let trees = BatchTrees::new(&mut fx);
+            let (batch, desc) = alloc_batch(&mut fx, &trees.edges());
+            fx.roots[0] = batch as u64;
+            let ephemeron = |sink: &mut EdgeSink<'_>| {
+                sink.ephemeron(batch, tagged(trees.targets[0]), tagged(trees.conditional));
+            };
+            // No preliminary mark/major may promote the batch and make this minor vacuous.
+            assert_eq!(fx.heap.collections(), 0);
+            assert_eq!(fx.heap.cell_age(batch as u64), Some(CellAge::Young));
+            trees.assert_age(&fx, CellAge::Young);
+            let marked = fx.heap.stats().cells_marked;
+            // Only the batch is rooted. Native scanning excludes these vectors and captures.
+            assert!(fx.start_marking_kind(&ephemeron, CollectionKind::Minor));
+            fx.heap.finish_collection(&[]);
+            assert_eq!(fx.heap.collections(), 1);
+            assert_eq!(fx.heap.minor_collections(), 1);
+            assert_eq!(fx.heap.stats().last_card_cells, 0);
+            assert_eq!(fx.heap.stats().cells_marked - marked, 133);
+            assert!(fx.heap.owns_cell(batch as usize, desc));
+            trees.assert_live(&fx); // Before another allocation can reuse an omitted edge.
+            assert_eq!(fx.heap.cell_age(batch as u64), Some(CellAge::Old));
+            trees.assert_age(&fx, CellAge::Old);
+            fx.collect_with(&ephemeron);
+            assert!(fx.heap.owns_cell(batch as usize, desc));
+            trees.assert_live(&fx);
+            fx.roots[0] = 0;
+            fx.collect_with(&ephemeron);
+            assert_eq!(fx.live(), 0);
+            assert!(!allocated(&fx, batch as usize));
+            trees.assert_dead(&fx);
+        }
+
+        #[test]
+        fn old_carded_large_batch_traces_sole_young_trees_and_wakes_waiters() {
+            let mut fx = Fixture::new();
+            // Keep the newly published targets young until this test's explicit minor.
+            fx.heap.set_collect_on_alloc(false);
+            let desc = fx.heap.register_desc(LayoutDesc {
+                name: "carded edge batch",
+                trace: trace_batch,
+                finalize: None,
+                carded: true,
+            });
+            let edge_count = MARK_CACHE_BATCH_LIMIT + 2;
+            let batch = fx.heap.alloc(desc, (edge_count + 1) * 8);
+            set_word(batch, 0, edge_count as u64); // Other words start zeroed.
+            fx.roots[0] = batch as u64; // Exactly the raw word also queued by the dirty card.
+            fx.collect();
+            assert_eq!(fx.live(), 1);
+            assert_eq!(fx.heap.cell_age(batch as u64), Some(CellAge::Old));
+            let trees = BatchTrees::new(&mut fx);
+            let edges = trees.edges();
+            assert_eq!(edges.len(), edge_count);
+            // SAFETY: an allocated small carded cell; mark before publishing its young edges.
+            unsafe { card_mark(batch) };
+            for (index, edge) in edges.into_iter().enumerate() {
+                set_word(batch, index + 1, tagged(edge));
+            }
+            let ephemeron = |sink: &mut EdgeSink<'_>| {
+                sink.ephemeron(batch, tagged(trees.targets[0]), tagged(trees.conditional));
+            };
+            assert_eq!(fx.heap.collections(), 1);
+            assert_eq!(fx.heap.cell_age(batch as u64), Some(CellAge::Old));
+            trees.assert_age(&fx, CellAge::Young);
+            let marked = fx.heap.stats().cells_marked;
+            // The raw root becomes a positive before its independent card trace drains.
+            // Its >64 young edges must still mark their descendants and wake the waiter.
+            assert!(fx.start_marking_kind(&ephemeron, CollectionKind::Minor));
+            fx.heap.finish_collection(&[]);
+            assert_eq!(fx.heap.collections(), 2);
+            assert_eq!(fx.heap.minor_collections(), 1);
+            assert_eq!(fx.heap.stats().last_card_cells, 1);
+            assert_eq!(
+                fx.heap.stats().cells_marked - marked,
+                132,
+                "only young targets mark anew"
+            );
+            assert!(fx.heap.owns_cell(batch as usize, desc));
+            trees.assert_live(&fx);
+            trees.assert_age(&fx, CellAge::Old);
+            fx.collect_with(&ephemeron);
+            assert!(fx.heap.owns_cell(batch as usize, desc));
+            trees.assert_live(&fx);
+            fx.roots[0] = 0;
+            fx.collect_with(&ephemeron);
+            assert_eq!(fx.live(), 0);
+            assert!(!allocated(&fx, batch as usize));
+            trees.assert_dead(&fx);
+        }
+
+        #[test]
+        fn uncached_words_always_locate_mark_and_leave_the_positive_table_untouched() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let child = fx.heap.alloc(fx.leaf, 16);
+            let cached = fx.alloc_node(tagged(child), 1);
+            let other_child = fx.heap.alloc(fx.leaf, 16);
+            let uncached = fx.heap.alloc(fx.node, 8192);
+            set_word(uncached, 0, tagged(other_child));
+            let mut marker = Marker::default();
+            let before = fx.heap.stats().cells_marked;
+            fx.heap.mark_word::<true>(cached as u64, &mut marker);
+            assert!(marker.positive_words.contains(cached as u64));
+            let table = marker.positive_words.words;
+            let probes = marker.positive_words.probes.get();
+            for (index, candidate) in [cached as u64, uncached as u64, uncached as u64, 0]
+                .into_iter()
+                .enumerate()
+            {
+                fx.heap.mark_word::<false>(candidate, &mut marker);
+                assert_eq!(marker.word_lookups, index + 2, "uncached means heap lookup");
+                assert_eq!(
+                    marker.word_cache_hits, 0,
+                    "even an existing positive is not probed"
+                );
+                assert_eq!(
+                    marker.positive_words.probes.get(),
+                    probes,
+                    "no cache lookup"
+                );
+                assert_eq!(
+                    marker.positive_words.words, table,
+                    "no insertion or replacement"
+                );
+            }
+            assert_eq!(
+                fx.heap.stats().cells_marked - before,
+                2,
+                "new large target marked once"
+            );
+            assert_eq!(
+                marker.worklist.len(),
+                2,
+                "first-mark trace work is still queued"
+            );
+            fx.heap.drain(&mut marker, &NoClient);
+            fx.heap.verify(&marker);
+            assert_eq!(fx.heap.stats().cells_marked - before, 4);
+            assert!(is_marked_at(&fx.heap, child as usize));
+            assert!(is_marked_at(&fx.heap, other_child as usize));
+        }
+
+        #[test]
+        fn shared_prototype_layout_fan_in_hits_without_losing_first_mark_work() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let object = fx.heap.register_desc(LayoutDesc {
+                name: "prototype/layout fan-in",
+                trace: trace_object,
+                finalize: None,
+                carded: false,
+            });
+            let [prototype_child, layout_child] = [0; 2].map(|_| fx.heap.alloc(fx.leaf, 16));
+            let prototype = fx.alloc_node(tagged(prototype_child), 1);
+            let layout = fx.alloc_node(tagged(layout_child), 2);
+            let objects: Vec<*mut u8> = (0..48)
+                .map(|_| {
+                    let child = fx.heap.alloc(fx.leaf, 16);
+                    let cell = fx.heap.alloc(object, 32);
+                    for (index, edge) in [prototype, layout, child].into_iter().enumerate() {
+                        set_word(cell, index, tagged(edge));
+                    }
+                    cell
+                })
+                .collect();
+            let mut marker = Marker {
+                parents: Some(FastMap::default()),
+                ..Marker::default()
+            };
+            let before = fx.heap.stats().cells_marked;
+            for &cell in &objects {
+                fx.heap.mark_word::<true>(tagged(cell), &mut marker);
+            }
+            fx.heap.drain(&mut marker, &NoClient);
+            fx.heap.verify(&marker); // Independent validation never reads the cache.
+            assert_eq!(fx.heap.stats().cells_marked - before, 100);
+            assert_eq!(marker.parents.as_ref().unwrap().len(), 100);
+            assert!(matches!(
+                marker.parents.as_ref().unwrap().get(&(prototype as usize)),
+                Some(MarkSource::Cell(owner)) if *owner == *objects.last().unwrap() as usize
+            ));
+            assert_eq!(marker.word_lookups + marker.word_cache_hits, 194);
+            assert!(
+                marker.word_cache_hits >= 24,
+                "shared edges must bypass repeated locate/mark checks: {} hits / {} lookups",
+                marker.word_cache_hits,
+                marker.word_lookups
+            );
+            for &cell in &[prototype_child, layout_child] {
+                assert!(is_marked_at(&fx.heap, cell as usize));
+            }
+        }
+
+        #[test]
+        fn tagged_raw_and_interior_words_cache_only_exact_words_for_small_and_large_cells() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let mut marker = Marker::default();
+            for size in [16, 8192] {
+                let child = fx.heap.alloc(fx.leaf, 16);
+                let parent = fx.heap.alloc(fx.node, size);
+                set_word(parent, 0, tagged(child));
+                let raw = parent as u64;
+                for candidate in [
+                    raw,
+                    TAG | raw,
+                    0x7ffe_0000_0000_0000 | raw,
+                    raw + 8,
+                    TAG | (raw + 8),
+                ] {
+                    let lookups = marker.word_lookups;
+                    let hits = marker.word_cache_hits;
+                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    assert_eq!(
+                        marker.word_lookups,
+                        lookups + 1,
+                        "distinct exact word {candidate:#x}"
+                    );
+                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    assert_eq!(marker.word_cache_hits, hits + 1, "repeat {candidate:#x}");
+                }
+                assert_eq!(marker.worklist.len(), 1);
+                // The first variant marks the parent; subsequent variants are already-live
+                // positives. Neither may duplicate its worklist entry or lose its child.
+                fx.heap.drain(&mut marker, &NoClient);
+                assert!(is_marked_at(&fx.heap, child as usize));
+            }
+            assert_eq!(fx.heap.stats().cells_marked, 4);
+            fx.heap.verify(&marker);
+        }
+
+        #[test]
+        fn direct_collisions_keep_both_rooted_trees_and_their_distinct_descendants() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let parents: Vec<*mut u8> = (0..MARK_CACHE_WORDS + 1)
+                .map(|_| fx.alloc_node(0, 1))
+                .collect();
+            let (first, second) = (parents[0], parents[MARK_CACHE_WORDS]);
+            let bucket = PositiveWords::index(tagged(first));
+            assert_ne!(first, second);
+            assert_eq!(
+                PositiveWords::index(tagged(second)),
+                bucket,
+                "deliberate real-cell collision"
+            );
+            let children: Vec<*mut u8> = (0..2)
+                .map(|_| {
+                    (0..MARK_CACHE_WORDS)
+                        .map(|_| fx.heap.alloc(fx.leaf, 16))
+                        .find(|&child| PositiveWords::index(child as u64) != bucket)
+                        .expect("a descendant in another bucket")
+                })
+                .collect();
+            set_word(first, 0, tagged(children[0]));
+            set_word(second, 0, tagged(children[1]));
+            fx.roots[0] = tagged(first);
+            fx.roots[1] = tagged(second);
+            fx.collect(); // Precise: the two colliding roots are the only holders.
+            assert!(
+                fx.heap.owns_cell(second as usize, fx.node),
+                "collision must keep the second rooted tree"
+            );
+            assert!(
+                fx.heap.owns_cell(children[1] as usize, fx.leaf),
+                "collision must keep its descendant"
+            );
+            assert!(fx.heap.owns_cell(first as usize, fx.node));
+            assert!(fx.heap.owns_cell(children[0] as usize, fx.leaf));
+            assert_eq!(fx.live(), 4);
+            assert_eq!(fx.heap.stats().cells_marked, 4);
+        }
+
+        #[test]
+        fn fresh_major_and_minor_markers_do_not_retain_removed_roots_or_hide_reused_addresses() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let anchor = fx.alloc_node(0, 1);
+            let old_child = fx.alloc_node(0, 2);
+            let old = fx.alloc_node(tagged(old_child), 3);
+            fx.roots[0] = tagged(anchor);
+            fx.roots[1] = tagged(old);
+            fx.collect();
+            fx.collect_minor();
+            assert_eq!(fx.live(), 3);
+            fx.roots[1] = 0;
+            fx.collect();
+            assert!(!allocated(&fx, old as usize));
+            assert!(!allocated(&fx, old_child as usize));
+            let child = fx.heap.alloc(fx.leaf, 16);
+            let reused = (0..PAGE_SIZE / 16)
+                .map(|_| fx.alloc_node(0, 4))
+                .find(|&candidate| candidate == old)
+                .expect("the anchored node page reuses the actual old address");
+            assert_eq!(reused, old);
+            set_word(reused, 0, tagged(child));
+            fx.roots[1] = tagged(reused); // Exactly the old word, now with a new descendant.
+            fx.collect();
+            assert_eq!(fx.live(), 3);
+            assert!(fx.heap.owns_cell(child as usize, fx.leaf));
+            assert!(fx.heap.owns_cell(reused as usize, fx.node));
+            fx.collect_minor();
+            assert!(fx.heap.owns_cell(child as usize, fx.leaf));
+            fx.roots[1] = 0;
+            fx.collect();
+            assert_eq!(fx.live(), 1);
+            assert!(!allocated(&fx, reused as usize));
+            assert!(!allocated(&fx, child as usize));
+        }
+
+        #[test]
+        fn a_cached_raw_old_root_still_traces_its_card_and_sole_young_tree() {
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let old = fx.heap.alloc(fx.carded, 16);
+            fx.roots[0] = old as u64; // Exactly the raw word queued by the card table.
+            fx.collect();
+            let child = fx.heap.alloc(fx.leaf, 16);
+            let young = fx.alloc_node(tagged(child), 7);
+            // SAFETY: an allocated small carded cell. These are the young tree's only roots.
+            unsafe { card_mark(old) };
+            set_word(old, 0, tagged(young));
+            assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Young));
+            assert_eq!(fx.heap.cell_age(child as u64), Some(CellAge::Young));
+            {
+                let mut probe = Marker::default();
+                fx.heap.mark_word::<true>(old as u64, &mut probe);
+                assert!(
+                    probe.positive_words.contains(old as u64),
+                    "old allocated marks are positives"
+                );
+                assert!(
+                    probe.worklist.is_empty(),
+                    "the existing mark does not queue another trace"
+                );
+            }
+            // Actual minor marking queues the dirty card first, then processes this same
+            // raw root. No other positive root intervenes before draining its queued trace.
+            // Cache membership must never deduplicate that independent card-owner worklist.
+            let marked = fx.heap.stats().cells_marked;
+            fx.collect_minor(); // Precise roots: Rust locals cannot keep the young tree alive.
+            assert_eq!(fx.heap.stats().last_card_cells, 1);
+            assert_eq!(fx.heap.stats().cells_marked - marked, 2);
+            assert!(fx.heap.owns_cell(young as usize, fx.node));
+            assert!(fx.heap.owns_cell(child as usize, fx.leaf));
+            assert_eq!(fx.heap.cell_age(child as u64), Some(CellAge::Old));
+        }
+
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        #[test]
+        fn native_major_cache_words_do_not_retain_a_previous_cycles_only_root() {
+            #[inline(never)]
+            fn warm_from_hidden(heap: &mut Heap, hidden: u64) -> bool {
+                // Only this popped frame decodes the address. Four adjacent volatile roots
+                // exercise the real conservative scanner and its repeated positive words.
+                collect_with_words_in_frame(heap, [!hidden; 4])
+            }
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            FIN_COUNT.with(|count| count.set(0));
+            let top = 0u64;
+            let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+            for round in 0..2 {
+                let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+                crate::gc_core::scrub_stack(64 * 1024);
+                let marked = fx.heap.stats().cells_marked;
+                assert!(warm_from_hidden(&mut fx.heap, hidden));
+                assert_eq!(fx.live(), 1, "native words kept round {round}'s cell");
+                assert_eq!(fx.heap.stats().cells_marked - marked, 1);
+                // This removes dead helper/collector frames while retaining only the
+                // complemented address in this frame; it does not decode or root the cell.
+                crate::gc_core::scrub_stack(64 * 1024);
+                assert!(fx.heap.collect());
+                assert_eq!(
+                    fx.live(),
+                    0,
+                    "a fresh native major must not see cached old words"
+                );
+                assert_eq!(FIN_COUNT.with(Cell::get), round + 1);
+                assert!(fx.heap.collect());
+                assert_eq!(fx.live(), 0);
+                assert_eq!(FIN_COUNT.with(Cell::get), round + 1, "finalization is once");
+                black_box(hidden);
+            }
+            black_box(&top);
+        }
+
+        #[test]
+        fn repeated_free_zombie_foreign_and_zero_words_never_become_positives() {
+            let mut fx = Fixture::new();
+            let mut foreign = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            foreign.heap.set_collect_on_alloc(false);
+            FIN_COUNT.with(|count| count.set(0));
+            let anchor = fx.heap.alloc(fx.leaf, 16);
+            let free = fx.heap.alloc(fx.leaf, 16);
+            let zombie = fx.heap.alloc(fx.leaf, 16);
+            let large_free = fx.heap.alloc(fx.leaf, 8192);
+            let large_zombie = fx.heap.alloc(fx.leaf, 8192);
+            let other = foreign.alloc_node(0, 5);
+            fx.roots[0] = tagged(anchor);
+            assert!(fx.start_marking(&no_edges));
+            fx.heap
+                .finish_collection(&[zombie as usize, large_zombie as usize]);
+            assert_eq!(FIN_COUNT.with(Cell::get), 4);
+            assert_eq!(fx.heap.cell_age(zombie as u64), Some(CellAge::Dead));
+            assert_eq!(fx.heap.cell_age(large_zombie as u64), Some(CellAge::Dead));
+            let rejected = [
+                0,
+                123,
+                free as u64,
+                tagged(free),
+                free as u64 + 8,
+                zombie as u64,
+                tagged(zombie),
+                large_free as u64,
+                large_zombie as u64,
+                tagged(large_zombie),
+                other as u64,
+                tagged(other),
+            ];
+            let mut marker = Marker::default();
+            let marked = fx.heap.stats().cells_marked;
+            for _ in 0..3 {
+                for &candidate in &rejected {
+                    fx.heap.mark_word::<true>(candidate, &mut marker);
+                    assert!(!marker.positive_words.contains(candidate), "{candidate:#x}");
+                }
+            }
+            assert_eq!(marker.word_lookups, rejected.len() * 3);
+            assert_eq!(marker.word_cache_hits, 0);
+            assert_eq!(fx.heap.stats().cells_marked, marked);
+            assert!(marker.worklist.is_empty());
+            assert_eq!(foreign.heap.cell_age(other as u64), Some(CellAge::Young));
+            assert!(fx.start_marking(&no_edges));
+            fx.heap
+                .finish_collection(&[zombie as usize, large_zombie as usize]);
+            assert_eq!(FIN_COUNT.with(Cell::get), 4, "zombies finalize once");
+            fx.collect(); // Unpinning releases storage, without another finalization.
+            assert_eq!(FIN_COUNT.with(Cell::get), 4);
+            assert!(!allocated(&fx, zombie as usize));
+            assert!(!allocated(&fx, large_zombie as usize));
+        }
+
+        #[test]
+        fn reverse_ephemeron_wakeups_and_conditional_side_slots_reach_their_descendants() {
+            struct ChainClient {
+                roots: [u64; 2],
+                map: usize,
+                keys: Vec<usize>,
+                tail: usize,
+                dead_owner: usize,
+                dead_value: usize,
+            }
+            impl MarkClient for ChainClient {
+                fn roots(&self, sink: &mut dyn FnMut(u64)) {
+                    for &root in &self.roots {
+                        sink(root);
+                    }
+                }
+                fn side_slot_owners(&self, sink: &mut dyn FnMut(usize)) {
+                    sink(*self.keys.last().unwrap());
+                    sink(self.dead_owner);
+                }
+                fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
+                    if owner == *self.keys.last().unwrap() {
+                        sink(tagged(self.tail as *const u8));
+                        sink(tagged(self.tail as *const u8)); // Repeated positive, after wakeups.
+                    } else if owner == self.dead_owner {
+                        sink(self.dead_value as u64);
+                    }
+                }
+                fn ephemerons(&self, sink: &mut EdgeSink<'_>) {
+                    for pair in self.keys.windows(2).rev() {
+                        for _ in 0..2 {
+                            sink.ephemeron(
+                                self.map as *const u8,
+                                tagged(pair[0] as *const u8),
+                                tagged(pair[1] as *const u8),
+                            );
+                        }
+                    }
+                }
+            }
+            let mut fx = Fixture::new();
+            fx.heap.set_collect_on_alloc(false);
+            let map = fx.heap.alloc(fx.leaf, 8192);
+            let keys: Vec<usize> = (0..9)
+                .map(|index| {
+                    fx.heap
+                        .alloc(fx.leaf, if index % 3 == 2 { 8192 } else { 16 })
+                        as usize
+                })
+                .collect();
+            let bridge = fx.alloc_node(tagged(keys[0] as *const u8), 1);
+            let child = fx.heap.alloc(fx.leaf, 16);
+            let tail = fx.alloc_node(tagged(child), 2);
+            let dead_owner = fx.heap.alloc(fx.leaf, 16);
+            let dead_value = fx.alloc_node(tagged(dead_owner), 3);
+            let mut client = ChainClient {
+                roots: [tagged(map), tagged(bridge)],
+                map: map as usize,
+                keys,
+                tail: tail as usize,
+                dead_owner: dead_owner as usize,
+                dead_value: dead_value as usize,
+            };
+            let before = fx.heap.stats().cells_marked;
+            assert!(fx.heap.start_marking(false, &client, CollectionKind::Major));
+            fx.heap.finish_collection(&[]);
+            assert_eq!(
+                fx.heap.stats().cells_marked - before,
+                (client.keys.len() + 4) as u64
+            );
+            assert!(fx.heap.owns_cell(child as usize, fx.leaf));
+            assert!(client
+                .keys
+                .iter()
+                .all(|&cell| fx.heap.owns_cell(cell, fx.leaf)));
+            assert!(!allocated(&fx, dead_owner as usize));
+            assert!(!allocated(&fx, dead_value as usize));
+            client.roots[1] = 0;
+            assert!(fx.heap.start_marking(false, &client, CollectionKind::Major));
+            fx.heap.finish_collection(&[]);
+            assert_eq!(
+                fx.live(),
+                1,
+                "only the map remains when the first key loses its root"
+            );
+            assert!(!allocated(&fx, child as usize));
+            assert!(!allocated(&fx, tail as usize));
+        }
     }
 
     // Timing probes behind the S1 review numbers, run with

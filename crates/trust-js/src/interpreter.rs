@@ -573,7 +573,8 @@ fn function_profile_enter(
             // In particular, do not call an author's getters or keep extra JS
             // roots alive. This distinguishes a slow caller from a callee whose
             // compiled entry is unavailable or ineligible for cached dispatch.
-            let compiled = func.execution_code_for(genv);
+            let runtime = func.runtime();
+            let compiled = runtime.execution_code_for(genv);
             let chunk = compiled.and_then(Option::as_ref);
             let code = chunk.and_then(|chunk| chunk.jit.get());
             let tier = match (compiled, chunk, code) {
@@ -3320,7 +3321,7 @@ pub struct Interp {
     /// that need an activation (notably Prototype-style `initialize.apply(this, arguments)`
     /// wrappers), so fresh instances share keys and reserve slots for creation-IC appends.
     pub(crate) construct_capacity_hints:
-        crate::fasthash::FastMap<usize, (crate::value::WeakGc, crate::value::PropertyLayout)>,
+        gc_collect::SideSlotTable<(crate::value::WeakGc, crate::value::PropertyLayout)>,
     /// `Symbol.iterator`, cached so the iterator protocol can look up `obj[@@iterator]` cheaply.
     pub(crate) iterator_sym: Option<crate::value::SymbolRef>,
     /// Well-known symbols, minted once per Interp — additional realms (`$262.createRealm()`) reuse
@@ -4070,6 +4071,7 @@ macro_rules! gc_side_slot_tables {
             async_gen_queue,
             finalization_registries,
             mapped_arguments,
+            construct_capacity_hints,
         )
     };
 }
@@ -6163,7 +6165,7 @@ impl Interp {
                 let Callable::User(user) = &object.borrow().call else {
                     return CallEnvironmentKind::Unknown;
                 };
-                match user.func.code.get() {
+                match user.func.runtime().code.get() {
                     Some(Some(chunk)) if chunk.requires_activation_environment() => {
                         CallEnvironmentKind::Captured
                     }
@@ -7814,19 +7816,18 @@ impl Interp {
         // (an ordinary function's is a plain object). Only ordinary functions are constructors.
         let has_prototype = !is_arrow && (is_generator || (!is_async && !is_method));
         crate::workload_metrics::function_created(&func, has_prototype);
-        // Per-FUNCTION map templates (see `ast::Function::fn_maps`): the shape transitions, key
-        // hashing, and the name string are paid once; every closure instance clones the finished
-        // maps (entry-vector copy, refcount bumps) and patches the two identity-dependent values
-        // in place — value writes never touch the shape.
-        let maps = func.fn_maps.get_or_init(|| {
+        // Per-function, heap-local map templates (see `FunctionRuntime::fn_maps`) pay the shape
+        // transitions, key hashing and name string once. Each closure copies the field words,
+        // shares the layout, and patches the two identity-dependent values in place; value
+        // writes never touch the shape.
+        let runtime = func.runtime();
+        let maps = runtime.fn_maps.get_or_init(|| {
             let arity = func
                 .params
                 .iter()
                 .take_while(|p| p.default.is_none() && !p.rest)
                 .count();
             let name = Value::lstr(func.name.clone().unwrap_or_default());
-            let roots = crate::value::TemplateRoots::new();
-            roots.pin(&name);
             let mut p = crate::value::Props::new();
             p.insert(
                 crate::value::fn_key(0), // "length"
@@ -7856,35 +7857,26 @@ impl Interp {
             } else {
                 None
             };
-            Box::new(crate::ast::FunctionMaps {
+            p.mark_layout_shared();
+            if let Some(props) = &pp {
+                props.mark_layout_shared();
+            }
+            let maps = Rc::new(crate::ast::FunctionMaps {
                 function: p,
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
                 heap: crate::value::active_heap_id(),
-                roots,
-            })
+            });
+            crate::value::register_code_roots(&maps);
+            maps
         });
         let proto_map = &maps.prototype;
         // SetFunctionName: NamedEvaluation of an anonymous function expression, or a concise
         // method's key (MethodDefinitionEvaluation). A function with its own name keeps it; the
         // template's `name` slot is entry 1 with the "" value.
         let named = name.filter(|_| func.name.is_none());
-        // The templates' name strings are cells of the heap that built them, which
-        // another engine's heap (or a later engine on this thread) must not reference.
-        let foreign = maps.heap != crate::value::active_heap_id();
+        debug_assert_eq!(maps.heap, crate::value::active_heap_id());
         let fn_map = match named {
-            _ if foreign => {
-                let mut props = maps.function.clone();
-                let text = named.map_or_else(
-                    || func.name.clone().unwrap_or_default().to_string(),
-                    |name| name.to_string(),
-                );
-                assert!(
-                    props.set_value_at(1, Value::lstr(text)),
-                    "function name slot"
-                );
-                props
-            }
             None => maps.function.clone(),
             Some(name) => {
                 let mut named = maps.named.borrow_mut();
@@ -7903,7 +7895,7 @@ impl Interp {
                         );
                         if named.is_none() {
                             *named = Some((name.clone(), props.clone()));
-                            maps.roots.pin(&name_value);
+                            props.mark_layout_shared();
                         }
                         props
                     }
@@ -11560,7 +11552,7 @@ impl Interp {
             call_overflow: _,
             native_callback_cache: _,
             proxy_trap_caches: _,
-            construct_capacity_hints: _,
+            construct_capacity_hints,
             global_env_pins: _,
             htmldda: _,
             symbol_agent: _,
@@ -11727,6 +11719,7 @@ impl Interp {
         crate::gc_sweep::set(async_gen_busy, dead);
         async_gen_queue.evict_dead(dead);
         mapped_arguments.evict_dead(dead);
+        construct_capacity_hints.evict_dead(dead);
         crate::gc_sweep::map(deferred_ns, dead);
         promise_forward.evict_dead(dead);
         crate::gc_sweep::map(temporal_cal, dead);
@@ -11754,8 +11747,7 @@ impl Interp {
         if let Some(caches) = &self.proxy_trap_caches {
             caches.prune_dead();
         }
-        self.construct_capacity_hints
-            .retain(|_, (pin, _)| pin.strong_count() != 0);
+
         if self
             .global_env_pins
             .iter()
@@ -13668,7 +13660,7 @@ impl Interp {
     }
 
     /// Bounded, feedback-adaptive second-stage compile of a hot chunk's function with its callees
-    /// spliced inline. On success the new chunk lands in `Function::code2` and the global call-IC
+    /// spliced inline. On success the new chunk lands in `FunctionRuntime::code2` and the global call-IC
     /// epoch bumps, so every cached caller re-resolves and picks it up; the old chunk stays
     /// alive (and correct) beneath any pointers already handed out.
     pub(crate) fn try_inline_recompile(
@@ -13691,7 +13683,8 @@ impl Interp {
         // Alive because the callee object that carried this IC is alive and its `call` field is
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
-        if func.code2.get().is_some() {
+        let runtime = func.runtime();
+        if runtime.code2.get().is_some() {
             chunk.inline_retry_at.set(0);
             crate::jit::perf_inline_suppressed();
             return;
@@ -13725,7 +13718,7 @@ impl Interp {
                     head.replace('\n', " ")
                 );
             }
-            let _ = func.code2.set(Some(chunk2));
+            let _ = runtime.code2.set(Some(chunk2));
             chunk.inline_retry_at.set(0);
             crate::bytecode::invalidate_call_caches();
         } else {
@@ -13770,13 +13763,16 @@ impl Interp {
             .props
             .shared_layout()
             .expect("non-empty instance layout");
-        if let Some((_, cached)) = self.construct_capacity_hints.get_mut(&key) {
+        if let Some((_, cached)) = self.construct_capacity_hints.get_mut(&self.gc_heap, &key) {
             if cached.len() < observed {
                 *cached = layout.clone();
             }
         } else if self.construct_capacity_hints.len() < 65536 {
-            self.construct_capacity_hints
-                .insert(key, (Gc::downgrade(constructor), layout.clone()));
+            self.construct_capacity_hints.insert(
+                &self.gc_heap,
+                key,
+                (Gc::downgrade(constructor), layout.clone()),
+            );
         }
     }
 
@@ -13867,6 +13863,7 @@ impl Interp {
                     if same_realm {
                         let runtime = user
                             .func
+                            .runtime()
                             .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                             .and_then(Option::as_ref)
                             .filter(|initializer_chunk| {
@@ -14467,7 +14464,8 @@ impl Interp {
             }
             (b.props.shape(), slot as u32)
         };
-        let chunk = match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
+        let runtime = func.runtime();
+        let chunk = match runtime.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -14513,7 +14511,9 @@ impl Interp {
                 crate::bytecode::CALL_IC_NEEDS_ENV
             } else {
                 chunk.jit_direct_flags(&code)
-                    | (((chunk.inline_attempted.get() || func.code2.get().is_some()) as u8) << 2)
+                    | (((chunk.inline_attempted.get() || func.runtime().code2.get().is_some())
+                        as u8)
+                        << 2)
             },
             func: Rc::as_ptr(&func),
             epoch,
@@ -14589,7 +14589,8 @@ impl Interp {
         // Not yet tiered / didn't compile / no machine code → generic (which counts calls up).
         // Function's chunk handles remain set-once, but native residency is
         // reclaimable. Hold the owned code lease through GC and the whole call.
-        let chunk = match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
+        let runtime = func.runtime();
+        let chunk = match runtime.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
             Some(Some(c)) => c,
             _ => return None,
         };
@@ -14645,7 +14646,8 @@ impl Interp {
                                 crate::bytecode::CALL_IC_NEEDS_ENV
                             } else {
                                 chunk.jit_direct_flags(&code)
-                                    | (((chunk.inline_attempted.get() || func.code2.get().is_some())
+                                    | (((chunk.inline_attempted.get()
+                                        || func.runtime().code2.get().is_some())
                                         as u8)
                                         << 2)
                             }) | if func.is_arrow {
@@ -14813,9 +14815,9 @@ impl Interp {
             // Closures under a `with` scope stay on the tree-walker (see `Scope::under_with`).
             && allow_compiled_body
         {
-            if func.code.get().is_none() {
-                let n = func.calls.get().saturating_add(1);
-                func.calls.set(n);
+            if func.runtime().code.get().is_none() {
+                let n = func.runtime().calls.get().saturating_add(1);
+                func.runtime().calls.set(n);
                 // Cold loop-containing functions obey the same call threshold as other
                 // bodies. A long-running first invocation transfers its already-instantiated
                 // function frame at a settled hot backedge instead of replaying its prologue.
@@ -14831,10 +14833,11 @@ impl Interp {
                         let head: String = src.chars().take(70).collect();
                         eprintln!("[tier] bail: {}", head.replace('\n', " "));
                     }
-                    let _ = func.code.set(compiled);
+                    let _ = func.runtime().code.set(compiled);
                 }
             }
             if let Some(chunk) = func
+                .runtime()
                 .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| !chunk.prepared_entry && (!is_construct || !chunk.has_tail_calls()))
@@ -14877,14 +14880,15 @@ impl Interp {
         // tree-walker (each time the per-function call count crosses a power of ten).
         static AST_HOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !func
+            .runtime()
             .code
             .get()
             .and_then(Option::as_ref)
             .is_some_and(|chunk| chunk.prepared_entry)
             && *AST_HOT.get_or_init(|| std::env::var_os("TRUST_JS_AST_HOT").is_some())
         {
-            let n = func.calls.get().saturating_add(1);
-            func.calls.set(n);
+            let n = func.runtime().calls.get().saturating_add(1);
+            func.runtime().calls.set(n);
             if n >= 1000 && (n == 1000 || n == 10_000 || n == 100_000 || n == 1_000_000) {
                 let name = func.name.as_deref().unwrap_or("<anon>");
                 let src: String = func
@@ -15129,6 +15133,7 @@ impl Interp {
             && allow_compiled_body
         {
             if let Some(chunk) = func
+                .runtime()
                 .execution_code_for(Env::as_ptr(&self.global_env) as usize)
                 .and_then(Option::as_ref)
                 .filter(|chunk| chunk.prepared_entry)
@@ -15240,10 +15245,10 @@ impl Interp {
         gen_proto: Option<Value>,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        if func.code.get().is_none() {
-            let _ = func.code.set(crate::bytecode::compile(func));
+        if func.runtime().code.get().is_none() {
+            let _ = func.runtime().code.set(crate::bytecode::compile(func));
         }
-        let continuation = if let Some(Some(chunk)) = func.code.get() {
+        let continuation = if let Some(Some(chunk)) = func.runtime().code.get() {
             let this_val = if chunk.needs_frame_this() {
                 self.get_var("this", scope)?
             } else {
@@ -15319,12 +15324,15 @@ impl Interp {
         // `Tier::Interp` disables bytecode as an ordinary optimization, but an async function's
         // chunk is also its heap-owned execution context. Use it whenever available so selecting
         // the reference tier never silently reintroduces an OS-thread continuation.
-        if func.code.get().is_none() {
-            let n = func.calls.get().saturating_add(1);
-            func.calls.set(n);
-            let _ = func.code.set(crate::bytecode::compile(func));
+        if func.runtime().code.get().is_none() {
+            let n = func.runtime().calls.get().saturating_add(1);
+            func.runtime().calls.set(n);
+            let _ = func.runtime().code.set(crate::bytecode::compile(func));
         }
-        match func.execution_code_for(Env::as_ptr(&self.global_env) as usize) {
+        match func
+            .runtime()
+            .execution_code_for(Env::as_ptr(&self.global_env) as usize)
+        {
             Some(Some(chunk)) => Some(chunk.clone()),
             _ => None,
         }

@@ -51,7 +51,8 @@ fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
     let crate::value::Callable::User(user) = &object.call else {
         panic!("fixture is an ordinary function")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_TYPEOF_HELPERS.with(std::cell::Cell::get);
@@ -256,7 +257,8 @@ fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
     let crate::value::Callable::User(user) = &object.call else {
         panic!("ordinary fixture")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_VOID_HELPERS.with(std::cell::Cell::get);
@@ -427,7 +429,8 @@ fn in_operator_dense_element_hits_stay_native() {
     let crate::value::Callable::User(user) = &object.call else {
         panic!("ordinary fixture")
     };
-    let chunk = user.func.execution_code().and_then(Option::as_ref).unwrap();
+    let runtime = user.func.runtime();
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     drop(object);
     let before = crate::bytecode::TEST_JIT_IN_HELPERS.with(std::cell::Cell::get);

@@ -293,18 +293,6 @@ use exec_values::*;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-#[path = "jit_ownership.rs"]
-mod ownership;
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-use ownership::*;
-
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
 #[path = "jit_storage.rs"]
 mod storage;
 #[cfg(all(
@@ -1486,6 +1474,7 @@ mod executable_code_budget_tests {
         let chunk = match &object.borrow().call {
             Callable::User(user) => user
                 .func
+                .runtime()
                 .code
                 .get()
                 .and_then(Option::as_ref)
@@ -2031,7 +2020,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
 /// Helper table indices (multiplied by 8 in the emitted `ldr`).
 pub const H_EXEC: usize = 0;
 pub const H_COND: usize = 1;
-pub const H_RETURN: usize = 2;
+// Index2 retains the synthetic return helper; native returns publish ctx.ret directly.
 pub const H_PUSH_HANDLER: usize = 3;
 pub const H_POP_HANDLER: usize = 4;
 pub const H_UNWIND: usize = 5;
@@ -6798,19 +6787,36 @@ fn emit_call_inline_marked(
     // call's last safepoint.
     emit_helper_end_poll(a, l_unwind);
 }
-/// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
-/// an immediate in the site's own code, or w8 in the chunk's shared intrinsic stub.
 #[cfg(all(
+    test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+thread_local! { pub(super) static TEST_FAST_MATH_INTRINSICS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+extern "C" fn record_fast_math_intrinsic() {
+    TEST_FAST_MATH_INTRINSICS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! { pub(super) static TEST_CHAIN_PROPERTY_STORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_chain_property_store() {
+    TEST_CHAIN_PROPERTY_STORES.with(|count| count.set(count.get() + 1));
+}
+
 /// Inline Math numeric intrinsics (ECMA-262 §21.3.2: floor, ceil, trunc, abs, fround, clz32,
 /// imul, max, min) at a `CallWithThis(argc)` hit whose call IC proved the exact builtin
 /// (x9 = its `INTRINSIC_MATH_*` id, x10 = the callee's cell address). Stack, top last:
 /// `[this, callee, args...]`. Every guard precedes the single commit: all arguments must be
-/// Numbers (so ToNumber/ToInt32 run no author code) and `this` must be Undefined (a plain
-/// identifier call, `U(a, b)`) or an Object (`Math.f(x)`); any other shape takes `hit_slow`,
-/// which re-runs the exact builtin through the helper. The result Number replaces `this`.
+/// Numbers (so ToNumber/ToInt32 run no author code). The exact builtin identity permits any
+/// receiver, which these Math operations ignore. The result Number replaces `this`.
 /// Clobbers x9, x11, x13, x14, x16, x17, d0, d1; preserves x10, x12 and x15 for the ordinary
 /// call on a decline.
 #[cfg(all(
@@ -6844,14 +6850,6 @@ fn emit_math_intrinsic(
         emit_exec_word_load(a, 13, 20, arg0 + 8);
         emit_exec_number_guard(a, 13, 1, 16, hit_slow);
     }
-    // `this`: Undefined, or an Object, which falls through.
-    let this_undefined = a.new_label();
-    emit_exec_word_load(a, 17, 20, this_off);
-    a.mov_imm64(16, crate::value::PACK_UNDEFINED);
-    a.cmp_reg_x(17, 16);
-    a.b_cond(C_EQ, this_undefined);
-    emit_exec_tag_guard(a, 17, crate::value::PACK_OBJ, 16, hit_slow);
-    a.bind(this_undefined);
     // Compute (d0 <- result). Declines here still precede every state change.
     let commit = a.new_label();
     let ops: &[u8] = if argc == 1 {
@@ -6911,9 +6909,13 @@ fn emit_math_intrinsic(
     a.bind(commit);
     emit_exec_number_store(a, 0, 20, this_off, 9);
     a.sub_imm(20, 20, (argc + 1) * 8);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_fast_math_intrinsic as *const () as u64);
     a.b(done);
 }
 
+/// Where an intrinsic block finds its call site's bytecode pc for the helper's operand word:
+/// an immediate in the site's own code, or w8 in the chunk's shared intrinsic stub.
 #[derive(Clone, Copy)]
 enum IntrinsicPc {
     Imm(u32),
@@ -7079,19 +7081,11 @@ fn emit_call_intrinsics1(
     a.b(done);
 
     // isNaN(number) / Number.isNaN(number): both answer SameValue(n, NaN) for a
-    // Number argument (ToNumber is the identity). The receiver is unused; it
-    // must be Undefined or an object.
+    // Number argument (ToNumber is the identity). The exact builtin ignores its receiver.
     a.bind(is_nan);
     {
-        let receiver_ready = a.new_label();
         emit_exec_word_load(a, 9, 20, -8);
         emit_exec_number_guard(a, 9, 0, 16, hit_slow);
-        emit_exec_word_load(a, 9, 20, -24);
-        a.mov_imm64(16, crate::value::PACK_UNDEFINED);
-        a.cmp_reg_x(9, 16);
-        a.b_cond(C_EQ, receiver_ready);
-        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
-        a.bind(receiver_ready);
         // ---- commit: Boolean over the receiver slot ----
         a.fcmp(0, 0);
         a.cset_w(9, C_VS);
@@ -7099,6 +7093,8 @@ fn emit_call_intrinsics1(
         a.logic_x(1, 9, 9, 16);
         emit_exec_word_store(a, 9, 20, -24);
         a.sub_imm(20, 20, 16);
+        #[cfg(test)]
+        regions::emit_lowering_event(a, record_fast_math_intrinsic as *const () as u64);
         a.b(done);
     }
 
@@ -7118,19 +7114,19 @@ fn emit_call_intrinsics1(
     a.b(done);
 
     // Math.sqrt(number): the call IC already proved builtin identity.
-    // The receiver is ignored semantically; it must be an object.
+    // All receiver kinds are accepted by the exact builtin.
     a.bind(math1);
     emit_math_intrinsic(a, layout, 1, no_intr, hit_slow, done);
 
     a.bind(sqrt);
-    emit_exec_word_load(a, 9, 20, -24);
-    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, hit_slow);
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_number_guard(a, 9, 0, 16, hit_slow);
     a.ldur_d(0, 20, -8);
     a.fsqrt(0, 0);
     emit_exec_number_store(a, 0, 20, -24, 9);
     a.sub_imm(20, 20, 16);
+    #[cfg(test)]
+    regions::emit_lowering_event(a, record_fast_math_intrinsic as *const () as u64);
     a.b(done);
 
     // Array#push(value): builtin identity is proven by the call IC. The
@@ -8597,14 +8593,13 @@ fn get_method_inlinable(layout: &crate::value::JitLayout) -> bool {
 
 /// Same gate as [`get_prop_inlinable`] plus the `writable` byte (the store re-checks it — an
 /// in-place defineProperty can flip attributes without changing the shape) and the creation
-/// commit's PropertyLayout count.
+/// commit's layout-cell stores.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn set_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
     get_prop_inlinable(layout)
-        && layout_rc_fits(layout)
         && layout.entry_writable < 256
         && layout.entry_accessor < 256
         && layout.obj_extensible < 4096
@@ -9210,7 +9205,7 @@ fn emit_instanceof_inline(
 
 /// Probe one polymorphic property-creation way: x12 = the way's `IcState` cell. Entry has x11
 /// at the receiver Object and the incoming value at sp-16. A hit leaves x12 at its IcState and
-/// x13 holding the current entries length and x7 at a replacement layout Rc (zero keeps the
+/// x13 holding the current entries length and x7 at a replacement layout cell (zero keeps the
 /// current prediction), then branches to `commit`; a miss has no side effects. Clobbers x7, x9
 /// and x12..x17 only.
 #[cfg(all(
@@ -9325,10 +9320,6 @@ fn emit_prop_create_probe(
     a.ldr_imm(17, 7, (layout.layout_data_off + layout.vec_len_off) as u32);
     a.cmp_reg_x(13, 17);
     a.b_cond(C_HS, miss);
-    // Replacing a last-owned private key buffer would run a destructor: let Rust do that.
-    a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
-    a.cbz(16, true, key_ready);
-    layout_rc_guard_shared(a, layout, 16, 17, miss);
     a.bind(key_ready);
     // Same live global epoch recorded by the fill; saturation is never cacheable.
     a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
@@ -9506,14 +9497,8 @@ fn emit_set_prop_inline(
         a.madd(15, 13, 16, 15);
         guard_prop_data(a, 9, 15, ea, miss);
         guard_prop_writable(a, 9, 15, ew, miss);
-        // The store overwrites the old value, a function's deferred prototype included (a cell,
-        // which dies once no word names it), so a packed entry's old value is not read. A wide
-        // entry still sends a BigInt old value to the helper.
-        if layout.entry_accessor != layout.entry_value + 8 {
-            a.ldurb(9, 15, ev);
-            a.cmp_imm_w(9, 5);
-            a.b_cond(C_EQ, miss);
-        }
+        // The incoming word replaces the old value without observing it, including a
+        // deferred prototype. Shape/data/writability and the write barrier remain in force.
     };
     // One pass over the ways (x8 = way cursor, w6 = ways left; neither probe clobbers them,
     // and the creation probe returns its layout in x7): each way is examined once, by kind — an
@@ -9570,15 +9555,10 @@ fn emit_set_prop_inline(
         a.bind(create_commit);
         // All creation proofs are complete. Preserve x7 (layout), x12 (IC), x13 (length) and
         // x10/x11 (receiver).
-        // Install the replacement key layout: a PropertyLayout Rc, not a value owner.
+        // The heap roots this immutable shared layout. Replacing a private old layout
+        // leaves reclamation to the collector; no helper or ownership traffic is required.
         let layout_installed = a.new_label();
         a.cbz(7, true, layout_installed);
-        layout_rc_inc(a, layout, 7, 17);
-        a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
-        let old_layout_released = a.new_label();
-        a.cbz(16, true, old_layout_released);
-        layout_rc_dec_shared(a, layout, 16, 17);
-        a.bind(old_layout_released);
         a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
         a.bind(layout_installed);
         // From here no branch can fail: compute the vacant entry and pack the incoming value.
@@ -11653,8 +11633,8 @@ fn emit_get_elem_inline_marked(
 /// Inline dense-element write (`a[i] = v`, and the value-keeping `SetElem` when `keep`): the
 /// machine-code mirror of `Interp::fast_set_elem` — overwrite an existing own writable data
 /// element. `v` *moves* into the slot (under `keep` it also stays on the stack as the expression
-/// result). An old value or a `v` that is not a Number (see `emit_packed_number_drop_guard` and
-/// `emit_packed_stack_encode`), an accessor or non-writable slot, or any dense miss falls to the
+/// result). An incoming non-Number (see `emit_packed_stack_encode`), an accessor or
+/// non-writable slot, or any dense miss falls to the
 /// checked helper.
 /// Where a mirror store's key index comes from.
 #[cfg(all(
@@ -11863,15 +11843,6 @@ fn emit_set_elem_inline_marked(
     // 8. data property, writable
     guard_prop_data(a, 9, 15, ea, slow);
     guard_prop_writable(a, 9, 15, ew, slow);
-    // 9. old value: a packed entry's must be a Number (`emit_packed_number_drop_guard`); a wide
-    //    entry's BigInt takes the helper.
-    if layout.entry_accessor == layout.entry_value + 8 {
-        emit_packed_number_drop_guard(a, layout, 15, slow);
-    } else {
-        a.ldurb(9, 15, ev);
-        a.cmp_imm_w(9, 5);
-        a.b_cond(C_EQ, slow);
-    }
     // --- commit ---
     // Move v into the entry.
     emit_packed_stack_encode(a, -8, slow);
@@ -11920,7 +11891,7 @@ fn emit_set_elem_inline_marked(
 /// Numeric overwrites of the current keyless dense storage. ECMA-262 OrdinarySetWithOwnDescriptor
 /// and Array.[[DefineOwnProperty]] permit an existing writable data element to be overwritten
 /// without consulting prototypes or changing length. Holes, accessors, non-writable properties
-/// and reference-bearing old values retain the checked path. No guard follows the first write.
+/// retain the checked path. No guard follows the first write.
 /// Entry: x12 = DenseElems, x9 = index, x10 = the receiver's cell address, x11 = Object.
 #[cfg(all(
     target_arch = "aarch64",
@@ -11947,11 +11918,11 @@ fn emit_packed_element_store(
     a.add_shifted(15, 15, 9, 4);
     guard_prop_data(a, 14, 15, layout.property_meta as u32, slow);
     guard_prop_writable(a, 14, 15, layout.property_meta as u32, slow);
-    emit_packed_number_drop_guard(a, layout, 15, slow);
+    emit_packed_existing_guard(a, layout, 15, slow);
     emit_packed_stack_encode(a, -8, slow);
     a.stur(16, 15, layout.property_value as i32);
     // The canonical packed property stays authoritative. Hot numeric arrays can also own an
-    // f64 mirror; this Number-to-Number write preserves it exactly, including -0/NaN.
+    // f64 mirror; this numeric write preserves it exactly, including -0/NaN.
     emit_mirror_store(
         a,
         layout,
@@ -12398,14 +12369,13 @@ enum KeySrc {
     SlotPre(u32, bool),
 }
 
-/// Guard that a packed property's old value is a Number, whose overwrite needs no destructor.
-/// Keeping this numeric-only makes the emitted template small; other packed values use the
-/// checked helper. On success w9 holds the old value's tag and x12 is scratch.
+/// Load and guard a Number for a numeric READ. On success x12 holds its bits, which the
+/// read/write region transfers to its FP home. Stores need only the separate hole guard.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_packed_number_drop_guard(
+fn emit_packed_number_read_guard(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     entry: u32,
@@ -12425,6 +12395,24 @@ fn emit_packed_number_drop_guard(
     a.cmp_reg_x(9, 14);
     a.b_cond(C_LS, slow);
     a.bind(number);
+}
+
+/// A packed dense hole is not an existing own element. Retain its prototype-sensitive slow
+/// path when overwriting any other value kind without consulting ownership or payload data.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_packed_existing_guard(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    entry: u32,
+    slow: usize,
+) {
+    a.ldur(12, entry, layout.entry_value as i32);
+    a.mov_imm64(14, crate::value::PACK_EMPTY);
+    a.cmp_reg_x(12, 14);
+    a.b_cond(C_EQ, slow);
 }
 
 /// Encode a wide Number at `off` into x16. Other kinds stay on the checked path, keeping the
@@ -12648,15 +12636,6 @@ fn emit_elem_local_keyed(
         }
     } else {
         guard_prop_writable(a, 9, 15, ew, slow);
-        // 9. old value: a packed entry's must be a Number (`emit_packed_number_drop_guard`); a
-        //    wide entry's BigInt takes the helper. The store overwrites it.
-        if layout.entry_accessor == layout.entry_value + 8 {
-            emit_packed_number_drop_guard(a, layout, 15, slow);
-        } else {
-            a.ldurb(9, 15, ev);
-            a.cmp_imm_w(9, 5);
-            a.b_cond(C_EQ, slow);
-        }
         // --- commit: move v into the entry ---
         emit_packed_stack_encode(a, -8, slow);
         a.stur(16, 15, ev);
@@ -13849,27 +13828,24 @@ fn emit_chain_marked(
                 guard_prop_data(a, 9, 15, ea, guard!());
                 guard_prop_writable(a, 9, 15, ew, guard!());
                 if layout.entry_accessor == layout.entry_value + 8 {
-                    // Replacing a Number needs no ownership work. Reject every tagged old
-                    // value before committing, then write the chain result as a packed f64.
-                    a.ldur(13, 15, ev);
-                    a.lsr_imm(9, 13, 48);
-                    a.movz(16, (crate::value::PACK_OBJ >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_HS, guard!());
-                    let old_num = a.new_label();
-                    a.movz(16, (crate::value::PACK_UNDEFINED >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_LO, old_num);
-                    a.movz(16, (crate::value::PACK_SYM >> 48) as u32, 0);
-                    a.cmp_reg_x(9, 16);
-                    a.b_cond(C_LS, guard!());
-                    a.bind(old_num);
                     emit_exec_number_store(a, dv, 15, ev, 13);
                 } else {
-                    a.ldrb_imm(9, 15, ev as u32);
-                    a.cmp_imm_w(9, 4);
-                    a.b_cond(C_NE, guard!());
+                    a.movz(9, 4, 0);
+                    a.stur(9, 15, ev);
                     a.stur_d(dv, 15, ev + 8);
+                }
+                #[cfg(test)]
+                {
+                    // The chain's receiver cache can keep x8 live across this test-only
+                    // callback; the common event helper saves x2..x7 and d16..d31.
+                    a.sub_imm(31, 31, 16);
+                    a.stp_off(8, 9, 0);
+                    regions::emit_lowering_event(
+                        a,
+                        record_chain_property_store as *const () as u64,
+                    );
+                    a.ldp_off(8, 9, 0);
+                    a.add_imm(31, 31, 16);
                 }
                 free.push(dv);
             }
@@ -14087,7 +14063,11 @@ fn emit_chain_marked(
                     if is_set {
                         guard_prop_writable(a, 14, 15, layout.property_meta as u32, guard!());
                     }
-                    emit_packed_number_drop_guard(a, layout, 15, guard!());
+                    if is_set {
+                        emit_packed_existing_guard(a, layout, 15, guard!());
+                    } else {
+                        emit_packed_number_read_guard(a, layout, 15, guard!());
+                    }
                     if is_set {
                         a.fmov_x_d(16, dv);
                         a.fcmp(dv, dv);
@@ -14211,7 +14191,11 @@ fn emit_chain_marked(
                     if is_set {
                         guard_prop_writable(a, 14, 15, ew, guard!());
                     }
-                    emit_packed_number_drop_guard(a, layout, 15, guard!());
+                    if is_set {
+                        emit_packed_existing_guard(a, layout, 15, guard!());
+                    } else {
+                        emit_packed_number_read_guard(a, layout, 15, guard!());
+                    }
                     if is_set {
                         a.fmov_x_d(16, dv);
                         a.fcmp(dv, dv);
@@ -14228,10 +14212,6 @@ fn emit_chain_marked(
                 }
                 if is_set {
                     guard_prop_writable(a, 9, 15, ew, guard!());
-                    // old value: a BigInt bails; the store overwrites any other
-                    a.ldrb_imm(14, 15, ev as u32);
-                    a.cmp_imm_w(14, 5);
-                    a.b_cond(C_EQ, guard!());
                     // commit: entry = Num(dv)
                     a.movz(9, 4, 0);
                     a.stur(9, 15, ev);
@@ -16765,9 +16745,6 @@ fn emit_loop_chain(
                             }
                             elem_entry!(r);
                             guard_prop_writable(a, 9, 15, ew, guard!());
-                            a.ldrb_imm(14, 15, ev as u32);
-                            a.cmp_imm_w(14, 5);
-                            a.b_cond(C_EQ, guard!());
                             a.movz(9, 4, 0);
                             a.stur(9, 15, ev);
                             a.stur_d(2, 15, ev + 8);
@@ -17575,29 +17552,22 @@ fn emit_helper(a: &mut asm::Asm, idx: usize, imm: u32) {
     a.mov(20, 0);
 }
 
-/// Return only after the completion router has established that no finalizer/iterator
-/// pad must execute (ECMA-262 ReturnStatement and TryStatement Evaluation). A direct
-/// callee can inherit an occupied result after a failed tail call, so prove vacancy
-/// before transferring ownership; the checked fallback drops a displaced owner once.
+/// Publish a return only after the completion router has established that no finalizer or
+/// iterator pad must execute (ECMA-262 ReturnStatement and TryStatement Evaluation). The
+/// result word may already be occupied after a failed tail call; GC owns its displaced cell.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_return(a: &mut asm::Asm, mode: u32, ret_ok: usize) {
-    let slow = a.new_label();
     let ret = std::mem::offset_of!(JitCtx, ret) as u32;
-    a.ldr_imm(9, 19, ret);
-    a.mov_imm64(10, crate::value::PACK_UNDEFINED);
-    a.cmp_reg_x(9, 10);
-    a.b_cond(C_NE, slow);
     if mode == 1 {
         a.ldur(9, 20, -8);
         a.sub_imm(20, 20, 8);
-        a.str_imm(9, 19, ret);
+    } else {
+        a.mov_imm64(9, crate::value::PACK_UNDEFINED);
     }
-    a.b(ret_ok);
-    a.bind(slow);
-    emit_helper(a, H_RETURN, mode);
+    a.str_imm(9, 19, ret);
     a.b(ret_ok);
 }
 
@@ -18674,3 +18644,11 @@ pub(crate) unsafe fn run_moved_env(
 ) -> Result<PackedValue, Abrupt> {
     unreachable!("jit code cannot exist on this platform")
 }
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_count_guard_tests.rs"]
+mod count_guard_tests;

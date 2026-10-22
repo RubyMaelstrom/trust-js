@@ -32,11 +32,9 @@ fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     let Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    let chunk = user
-        .func
-        .code2
-        .get()
-        .or_else(|| user.func.code.get())
+    let runtime = user.func.runtime();
+    let chunk = runtime
+        .execution_code()
         .and_then(Option::as_ref)
         .expect("compiled caller")
         .clone();

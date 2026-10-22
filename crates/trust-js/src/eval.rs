@@ -20,20 +20,21 @@ pub(crate) struct EnumerationShape {
 type EnumerationLayouts = [Option<PropertyLayout>; 6];
 
 /// Only key strings are pinned: never a receiver, prototype, Realm, descriptor or JS value.
-/// NamedEntries detaches on mutation with Rc::make_mut, so pins also make key identity immutable.
+/// NamedEntries detaches shared data on mutation, so pins also make key identity immutable.
 pub(crate) struct CachedForInKeys {
     keys: ForInKeys,
     layouts: EnumerationLayouts,
 }
 
-/// The cached key backing is a cell the cache owns (layouts are Rust-heap shape data).
+/// The cached key backing and predicted key layouts are cells retained by this cache.
 impl crate::gc_trace::GcTrace for CachedForInKeys {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let CachedForInKeys {
             keys: ForInKeys(keys),
-            layouts: _,
+            layouts,
         } = self;
         sink.object(keys);
+        crate::gc_trace::GcTrace::trace_gc(layouts.as_slice(), sink);
     }
 }
 
@@ -43,7 +44,6 @@ impl CachedForInKeys {
             // Conservatively charge duplicates and unused predicted suffixes. The census below
             // instead de-duplicates shared allocations across objects, hints and cache entries.
             let storage = std::mem::size_of::<PropertyLayoutData>()
-                + 2 * std::mem::size_of::<usize>()
                 + layout.capacity() * std::mem::size_of::<Rc<str>>();
             let storage = layout.index_capacity().map_or(storage, |capacity| {
                 storage
@@ -2226,7 +2226,7 @@ impl Interp {
             let (layout, prefix, enumerable) = object.props.enumeration_layout()?;
             let index = shape.depth as usize;
             shape.levels[index] = (
-                layout.map_or(0, |keys| Rc::as_ptr(keys) as usize),
+                layout.map_or(0, |keys| keys.as_ptr() as usize),
                 prefix,
                 enumerable,
             );
@@ -7403,6 +7403,7 @@ impl Interp {
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
+            p.mark_layout_shared();
             Box::new(p)
         });
         let props =
@@ -7431,6 +7432,7 @@ impl Interp {
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
+            p.mark_layout_shared();
             Box::new(p)
         });
         let obj = crate::value::Object::new_with_parts(
@@ -9318,10 +9320,8 @@ fn default_constructor(derived: bool, class: &Class) -> Function {
     Function {
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
-        calls: std::cell::Cell::new(0),
-        code: std::cell::OnceCell::new(),
-        code2: std::cell::OnceCell::new(),
-        fn_maps: std::cell::OnceCell::new(),
+        runtime: std::cell::OnceCell::new(),
+
         env_layouts: std::cell::OnceCell::new(),
         name: None,
         params,

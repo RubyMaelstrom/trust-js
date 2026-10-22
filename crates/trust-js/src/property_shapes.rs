@@ -90,6 +90,7 @@ impl ShapeLayouts {
     }
 
     pub(super) fn insert(&mut self, shape: u32, keys: PropertyLayout) {
+        keys.mark_shared();
         if !is_cacheable_shape(shape) {
             return;
         }
@@ -117,6 +118,18 @@ impl ShapeLayouts {
             .iter()
             .filter_map(Option::as_ref)
             .flat_map(|page| page.iter().filter_map(|entry| entry.keys.as_ref()))
+    }
+}
+
+impl crate::gc_trace::GcTrace for ShapeLayouts {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self { pages } = self;
+        for page in pages.iter().flatten() {
+            for entry in page.iter() {
+                let LayoutEntry { shape: _, keys } = entry;
+                crate::gc_trace::GcTrace::trace_gc(keys, sink);
+            }
+        }
     }
 }
 
@@ -162,7 +175,7 @@ mod tests {
         let mut layouts = ShapeLayouts::default();
         assert_eq!(layouts.allocated_bytes(), 0);
         let keys = crate::value::new_property_layout(vec![Rc::from("first")]);
-        let weak = Rc::downgrade(&keys);
+        let weak = crate::gc_handle::WeakRef::to(keys.as_ptr() as usize);
         layouts.insert(17, keys);
         assert_eq!(layouts.allocated_bytes(), std::mem::size_of::<LayoutPage>());
         assert_eq!(&*layouts.get(17).unwrap()[0], "first");
@@ -175,7 +188,12 @@ mod tests {
         );
         assert_eq!(layouts.len(), 1);
         assert!(layouts.get(17).is_none());
-        assert!(weak.upgrade().is_none());
+        crate::value::property_layout_cell_tests::collect(
+            &crate::value::active_gc_heap(),
+            &layouts,
+            crate::gc_core::CollectionKind::Major,
+        );
+        assert!(weak.live_ptr().is_none());
         assert_eq!(&*layouts.get(collision).unwrap()[0], "second");
         layouts.insert(
             SHAPE_UNCACHEABLE,

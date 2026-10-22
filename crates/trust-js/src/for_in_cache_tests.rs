@@ -96,7 +96,7 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
     // Receivers live only in this helper frame (the collector scans the stack).
     let (weak_layout, weak_a, first, second) = crate::gc_test::in_frame(|| {
         let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
-        let weak_layout = Rc::downgrade(&layout);
+        let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
         let a = predicted_object(&layout, 1);
         let b = predicted_object(&layout, 2);
         let weak_a = crate::value::Gc::downgrade(a.as_obj().unwrap());
@@ -108,18 +108,21 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
             !crate::value::Gc::ptr_eq(first.as_obj().unwrap(), second.as_obj().unwrap()),
             "live prefix participates in proof"
         );
-        let references = Rc::strong_count(&layout);
+        let identity = layout.as_ptr();
         for _ in 0..10 {
             backing(&mut engine, &a);
             backing(&mut engine, &b); // leave stale recency entries for both pinned layouts.
         }
         assert_eq!(
-            Rc::strong_count(&layout),
-            references,
-            "recency keys must not retain layout pins"
+            layout.as_ptr(),
+            identity,
+            "recency updates preserve the live layout identity"
         );
         (weak_layout, weak_a, first, second)
     });
+    // A minor also traces the Rust cache's newly published layout pins.
+    engine.interp.gc_collect_minor();
+    assert!(crate::gc_test::alive(&weak_layout));
     // A collection reclaims the dropped receivers.
     engine.interp.gc_collect();
     assert!(
@@ -127,15 +130,16 @@ fn for_in_cache_pins_layout_not_sources_and_releases_evicted_layouts() {
         "cache does not root receiver"
     );
     assert!(
-        weak_layout.upgrade().is_some(),
+        crate::gc_test::alive(&weak_layout),
         "live cache entries own layout proof"
     );
     for index in 0..400 {
         let layout = crate::value::new_property_layout(vec![Rc::from(format!("fresh{index}"))]);
         backing(&mut engine, &predicted_object(&layout, 1));
     }
+    engine.interp.gc_collect();
     assert!(
-        weak_layout.upgrade().is_none(),
+        !crate::gc_test::alive(&weak_layout),
         "stale recency records must not own evicted layouts"
     );
     engine.interp.gc_collect();
@@ -170,11 +174,11 @@ fn for_in_cache_accounts_unused_predictions_and_detaches_on_mutation() {
     let layout = crate::value::new_property_layout(vec![Rc::from("a"), Rc::from("b")]);
     let source = predicted_object(&layout, 2);
     let original = backing(&mut engine, &source);
-    let old_layout = Rc::downgrade(&layout);
+    let old_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
     drop(layout);
     source.as_obj().unwrap().borrow_mut().props.remove("a");
     assert!(
-        old_layout.upgrade().is_some(),
+        crate::gc_test::alive(&old_layout),
         "cache pins immutable pre-mutation allocation"
     );
     assert_eq!(key_at(&original, 0), "a");

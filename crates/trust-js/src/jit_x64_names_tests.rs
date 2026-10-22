@@ -193,7 +193,7 @@ fn native_deep_globals_load_store_and_all_numeric_update_kinds() {
 }
 
 #[test]
-fn native_name_wide_and_packed_owner_transfers_and_last_owner_fallback() {
+fn native_name_loads_and_stores_all_execution_word_kinds() {
     check(
         r#"
         var shared, values=[undefined,null,false,true,-0,NaN,Infinity,-Infinity,42.25,
@@ -412,4 +412,95 @@ fn native_name_stores_record_their_owners_in_cards() {
             "{name}: {after} native stores after the holder became old"
         );
     }
+}
+
+#[test]
+fn native_name_overwrites_do_not_read_displaced_bigints_or_deferred_words() {
+    let mut engine = Engine::new();
+    engine
+        .eval("var outer=0;function source(){};", false)
+        .unwrap();
+    let (chunk, code) = compile(&mut engine, "function write(){outer=7;return 0;}");
+    let env = new_scope(Some(engine.interp.global_env));
+    run(&mut engine, &chunk, &code, &env);
+    let global = engine.interp.global;
+    for deferred in [false, true] {
+        if deferred {
+            let globals = engine.interp.global_env;
+            let source = engine.interp.get_var("source", &globals).ok().unwrap();
+            let owner = source.as_obj().unwrap();
+            let mut template = crate::value::Props::new();
+            template.insert(
+                "constructor",
+                crate::value::Property::builtin(Value::Undefined),
+            );
+            // Install a property-only word directly to prove that a numeric PutValue never
+            // observes/materializes the value it displaces. Ordinary reads still guard it.
+            let mut property = global.borrow().props.get("outer").unwrap().clone();
+            property.defer_function_prototype(owner, engine.interp.object_proto, &template);
+            // Reinsert the same descriptor class: a mutable descriptor escape would demote
+            // the shape and test a semantic IC miss rather than the displaced-word guard.
+            global.borrow_mut().props.insert("outer", property);
+        } else {
+            assert!(global.borrow_mut().props.set_value(
+                "outer",
+                Value::BigInt(crate::bigint::JsBigInt::from_u64(99)),
+            ));
+        }
+        let before = TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get);
+        assert_eq!(number(run(&mut engine, &chunk, &code, &env)), 0.0);
+        assert!(
+            TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get) > before,
+            "the native store must replace displaced deferred={deferred} without a helper"
+        );
+        assert_eq!(
+            global
+                .borrow()
+                .props
+                .get("outer")
+                .unwrap()
+                .value()
+                .as_num_opt(),
+            Some(7.0)
+        );
+    }
+}
+
+#[test]
+fn native_name_bigint_stores_decode_the_word_and_record_an_old_holders_card() {
+    let mut engine = Engine::new();
+    let (chunk, code) = compile(&mut engine, "function write(value){outer=value;return 0;}");
+    let holder = scope(None, "outer", 0.0, new_binding_layout_id());
+    let child = new_scope(Some(holder));
+    for _ in 0..2 {
+        run(&mut engine, &chunk, &code, &child);
+    }
+    engine.interp.gc_collect();
+    let weak = crate::gc_test::in_frame(|| {
+        let value = Value::BigInt(crate::bigint::JsBigInt::from_u64(123456789));
+        let weak = crate::gc_handle::WeakRef::to(value.cell_word().unwrap() as usize);
+        let before = TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get);
+        let result = crate::jit::run(
+            &mut engine.interp,
+            &chunk,
+            &code,
+            &child,
+            Value::Undefined,
+            &[value],
+        )
+        .unwrap_or_else(|_| panic!("native BigInt store throws"));
+        assert_eq!(number(result), 0.0);
+        assert!(
+            TEST_NATIVE_NAME_OPS.with(std::cell::Cell::get) > before,
+            "the incoming BigInt must take the native name-store path"
+        );
+        weak
+    });
+    engine.interp.gc_collect_minor();
+    assert!(crate::gc_test::alive(&weak));
+    engine.interp.gc_collect();
+    assert!(crate::gc_test::alive(&weak));
+    assert!(
+        matches!(&holder.borrow().vars.get("outer").unwrap().value, Value::BigInt(value) if value.to_string_radix(10) == "123456789")
+    );
 }

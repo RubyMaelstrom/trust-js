@@ -50,9 +50,9 @@ fn with_chunk<R>(engine: &mut Engine, name: &str, spliced: bool, f: impl FnOnce(
         panic!("{name} is not a user function")
     };
     let stage = if spliced {
-        &user.func.code2
+        &user.func.runtime().code2
     } else {
-        &user.func.code
+        &user.func.runtime().code
     };
     let chunk = stage
         .get()
@@ -68,7 +68,12 @@ fn second_stage(engine: &mut Engine, name: &str) -> bool {
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    user.func.code2.get().and_then(Option::as_ref).is_some()
+    user.func
+        .runtime()
+        .code2
+        .get()
+        .and_then(Option::as_ref)
+        .is_some()
 }
 
 /// Every named global function has native code.

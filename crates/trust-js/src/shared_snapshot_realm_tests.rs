@@ -153,9 +153,9 @@ fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
 }
 
 fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
-    let cache = user.binding_getter_cache.take();
+    let cache = user.take_binding_getter_cache();
     let cached = cache.is_some();
-    user.binding_getter_cache.set(cache);
+    user.put_binding_getter_cache(cache);
     cached
 }
 
@@ -199,7 +199,7 @@ fn realms_sharing_a_snapshot_keep_distinct_intrinsics_globals_and_objects() {
         assert!(Rc::ptr_eq(&main_hot, &child_hot), "{tier:?}: shared AST");
         if tier != Tier::Interp {
             assert!(
-                main_hot.code.get().is_some_and(Option::is_some),
+                main_hot.runtime().code.get().is_some_and(Option::is_some),
                 "{tier:?}: the shared function was compiled"
             );
         }
@@ -353,7 +353,7 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         if tier == Tier::Jit {
             let call = shared_method(it, "call");
             assert!(
-                call.code2.get().is_some_and(Option::is_some),
+                call.runtime().code2.get().is_some_and(Option::is_some),
                 "the warmed caller has an inlined second-stage body"
             );
         }

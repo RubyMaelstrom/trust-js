@@ -46,8 +46,8 @@ fn assert_native(engine: &mut Engine, names: &[&str]) {
         let crate::value::Callable::User(user) = &object.call else {
             panic!("{name} is not a user function")
         };
-        let native = user
-            .func
+        let runtime = user.func.runtime();
+        let native = runtime
             .code
             .get()
             .and_then(Option::as_ref)

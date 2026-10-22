@@ -211,8 +211,8 @@ fn string_concat_helpers_reach_compiled_tiers() {
             let crate::value::Callable::User(user) = &object.call else {
                 panic!("{name} is not a user function");
             };
-            let chunk = user
-                .func
+            let runtime = user.func.runtime();
+            let chunk = runtime
                 .code
                 .get()
                 .and_then(Option::as_ref)

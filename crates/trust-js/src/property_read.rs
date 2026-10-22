@@ -232,10 +232,10 @@ impl Interp {
         // The first successful proof retains the identifier and a bounded structural proof for
         // this closure's own environment. The AST is shared by closures and Realms, so dynamic
         // binding state belongs on UserCallable and is guarded by the live environment chain.
-        if let Some(cache) = user.binding_getter_cache.take() {
+        if let Some(cache) = user.take_binding_getter_cache() {
             match self.probe_binding_getter_cache(&user.env, &cache) {
                 BindingGetterProbe::Value(value) => {
-                    user.binding_getter_cache.set(Some(cache));
+                    user.put_binding_getter_cache(Some(cache));
                     #[cfg(test)]
                     record_binding_getter(1);
                     return Some(value);
@@ -243,19 +243,19 @@ impl Interp {
                 BindingGetterProbe::UninitializedOrImport => {
                     // The structural proof still holds. Read TDZ/import state live on every
                     // access, and retain the cache so a later ordinary binding write can hit.
-                    user.binding_getter_cache.set(Some(cache));
+                    user.put_binding_getter_cache(Some(cache));
                     return None;
                 }
                 BindingGetterProbe::Stale => {
                     if let Some((next, value)) =
                         self.resolve_binding_getter(&user.env, cache.name.as_ref())
                     {
-                        user.binding_getter_cache.set(Some(Box::new(next)));
+                        user.put_binding_getter_cache(Some(next));
                         #[cfg(test)]
                         record_binding_getter(2);
                         return Some(value);
                     }
-                    user.binding_getter_cache.set(None);
+                    user.put_binding_getter_cache(None);
                     return None;
                 }
             }
@@ -272,7 +272,7 @@ impl Interp {
             return None;
         }
         let (cache, value) = self.resolve_binding_getter(&user.env, name)?;
-        user.binding_getter_cache.set(Some(Box::new(cache)));
+        user.put_binding_getter_cache(Some(cache));
         #[cfg(test)]
         record_binding_getter(0);
         Some(value)
@@ -447,7 +447,8 @@ impl Interp {
             {
                 return None;
             }
-            let chunk = f.code.get()?.as_ref()?;
+            let runtime = f.runtime();
+            let chunk = runtime.code.get()?.as_ref()?;
             // Most getters have another body. Reject the cached negative proof
             // before acquiring a chunk owner or inspecting call/receiver state.
             if !chunk.is_record_getter() {

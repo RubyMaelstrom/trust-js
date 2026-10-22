@@ -65,7 +65,17 @@ impl WeakCell for crate::interpreter::WeakValue {
     }
 }
 
-/// Reference-counted Rust allocations (code, layouts, heaps): not cells, but asked the same way.
+/// An untyped weak payload reference (property layouts in targeted tests).
+impl WeakCell for crate::gc_handle::WeakRef {
+    fn live_address(&self) -> Option<usize> {
+        self.live_ptr()
+    }
+    fn heap(&self) -> Option<crate::value::GcHeap> {
+        None
+    }
+}
+
+/// Reference-counted Rust allocations (code and heaps): not cells, but asked the same way.
 impl<T> WeakCell for std::rc::Weak<T> {
     fn live_address(&self) -> Option<usize> {
         self.upgrade()

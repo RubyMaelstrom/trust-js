@@ -72,7 +72,7 @@ fn templates_share_keys_but_not_values_or_descriptors() {
     let key_owners = Rc::strong_count(&layout[0]);
     let mut a = template.instantiate_plain([Value::Num(1.0), Value::Num(2.0)].into_iter());
     let b = template.instantiate_plain([Value::Num(3.0), Value::Num(4.0)].into_iter());
-    assert!(Rc::ptr_eq(
+    assert!(crate::value::PropertyLayout::ptr_eq(
         a.shared_layout().unwrap(),
         b.shared_layout().unwrap()
     ));
@@ -98,7 +98,10 @@ fn templates_share_keys_but_not_values_or_descriptors() {
         b.ordered_keys().iter().map(|k| &**k).collect::<Vec<_>>(),
         ["x", "y"]
     );
-    assert!(!Rc::ptr_eq(a.shared_layout().unwrap(), &layout));
+    assert!(!crate::value::PropertyLayout::ptr_eq(
+        a.shared_layout().unwrap(),
+        &layout
+    ));
 }
 
 #[test]
@@ -126,7 +129,7 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
     for (slot, key) in layout.iter().enumerate() {
         other.append_initialized_field(key, Property::plain(Value::Num((100 + slot) as f64)));
     }
-    assert!(Rc::ptr_eq(
+    assert!(crate::value::PropertyLayout::ptr_eq(
         short.shared_layout().unwrap(),
         other.shared_layout().unwrap()
     ));
@@ -145,7 +148,7 @@ fn ordinary_shared_index_respects_live_prefix_and_mutation() {
         other.get("field2").unwrap().value().as_num_opt(),
         Some(102.0)
     );
-    assert!(!Rc::ptr_eq(
+    assert!(!crate::value::PropertyLayout::ptr_eq(
         short.shared_layout().unwrap(),
         other.shared_layout().unwrap()
     ));
@@ -217,7 +220,7 @@ fn ordinary_dynamic_and_json_objects_share_keys_across_creation_sites() {
         for name in ["b", "c", "d"] {
             let other = object(&mut engine, name);
             assert!(
-                Rc::ptr_eq(
+                crate::value::PropertyLayout::ptr_eq(
                     a.borrow().props.shared_layout().unwrap(),
                     other.borrow().props.shared_layout().unwrap()
                 ),
@@ -246,7 +249,10 @@ fn reserved_layout_prefix_is_not_an_own_property() {
     assert!(props.property_at(1).is_none());
     assert_eq!(props.values().count(), 1);
     props.insert("different", Property::plain(Value::Num(2.0)));
-    assert!(!Rc::ptr_eq(props.shared_layout().unwrap(), &layout));
+    assert!(!crate::value::PropertyLayout::ptr_eq(
+        props.shared_layout().unwrap(),
+        &layout
+    ));
     assert!(!props.contains("y"));
     assert_eq!(&*layout[1], "y");
 }
@@ -259,7 +265,7 @@ fn learned_insertion_chains_reserve_once_without_creating_predicted_fields() {
     eval(&mut engine, "function make(){var o={};o.chainFirst=1;o.chainSecond=2;o.chainThird=3;return o} var warm;for(var n=0;n<100;n++)warm=make();var partial={};partial.chainFirst=4;");
     let partial = object(&mut engine, "partial");
     let warm = object(&mut engine, "warm");
-    assert!(Rc::ptr_eq(
+    assert!(crate::value::PropertyLayout::ptr_eq(
         partial.borrow().props.shared_layout().unwrap(),
         warm.borrow().props.shared_layout().unwrap()
     ));
@@ -282,7 +288,7 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
         let a = object(&mut engine, "a");
         let b = object(&mut engine, "b");
         assert!(
-            Rc::ptr_eq(
+            crate::value::PropertyLayout::ptr_eq(
                 a.borrow().props.shared_layout().unwrap(),
                 b.borrow().props.shared_layout().unwrap()
             ),
@@ -296,6 +302,7 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
             };
             assert!(user
                 .func
+                .runtime()
                 .code
                 .get()
                 .and_then(Option::as_ref)
@@ -325,19 +332,17 @@ fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
         let Callable::User(user) = &wrapper.call else {
             panic!("user wrapper")
         };
-        let chunk = user
-            .func
-            .code2
-            .get()
-            .or_else(|| user.func.code.get())
+        let runtime = user.func.runtime();
+        let chunk = runtime
+            .execution_code()
             .and_then(Option::as_ref)
             .expect("compiled initializer");
-        assert!(Rc::ptr_eq(
+        assert!(crate::value::PropertyLayout::ptr_eq(
             chunk.instance_layout().expect("learned chunk layout"),
             a.borrow().props.shared_layout().unwrap()
         ));
     }
-    engine.interp.construct_capacity_hints.clear();
+    engine.interp.construct_capacity_hints = Default::default();
     assert_eq!(
         eval(
             &mut engine,
@@ -346,7 +351,7 @@ fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
         "7|11|alpha,beta"
     );
     let c = object(&mut engine, "c");
-    assert!(!Rc::ptr_eq(
+    assert!(!crate::value::PropertyLayout::ptr_eq(
         a.borrow().props.shared_layout().unwrap(),
         c.borrow().props.shared_layout().unwrap()
     ));
@@ -404,7 +409,7 @@ fn native_creation_accepts_equal_keys_from_distinct_allocations() {
         ),
         "7|8|alpha,beta"
     );
-    assert!(Rc::ptr_eq(
+    assert!(crate::value::PropertyLayout::ptr_eq(
         target.borrow().props.shared_layout().unwrap(),
         &layout
     ));
@@ -452,7 +457,7 @@ fn warmed_descriptors_accessors_and_proxies_remain_instance_local() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[test]
-fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
+fn native_creation_replaces_private_and_shared_layout_cells_without_helpers() {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
@@ -473,15 +478,20 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
                 if shared {
                     Props::with_layout(3, Some(previous.clone()))
                 } else {
-                    Props::with_capacity(3)
+                    Props::with_layout(
+                        3,
+                        Some(crate::value::new_property_layout(vec![
+                            Rc::from("wrong"),
+                            Rc::from("unused"),
+                        ])),
+                    )
                 }
             }),
             0
         );
         assert_eq!(
-            Rc::strong_count(&previous),
-            1,
-            "native replacement releases exactly one old layout owner"
+            &*previous[0], "wrong",
+            "replacing a layout never mutates its data"
         );
         assert_eq!(
             eval(
@@ -491,14 +501,15 @@ fn native_creation_adopts_cached_layouts_and_defers_last_owner_drops() {
             "7|8|alpha,beta"
         );
     }
-    assert!(
+    assert_eq!(
         measured_creation_write(&mut engine, &target, || {
             Props::with_layout(
                 3,
                 Some(crate::value::new_property_layout(vec![Rc::from("private")])),
             )
-        }) > 0,
-        "Rust must release a last-owned old layout"
+        }),
+        0,
+        "the collector owns the replaced private layout cell"
     );
     assert_eq!(
         eval(&mut engine, "Object.keys(target).join(',')"),

@@ -59,9 +59,9 @@ fn global_user_callable(engine: &mut Engine, name: &str) -> crate::value::UserFn
 }
 
 fn has_binding_getter_cache(user: &crate::value::UserCallable) -> bool {
-    let cache = user.binding_getter_cache.take();
+    let cache = user.take_binding_getter_cache();
     let cached = cache.is_some();
-    user.binding_getter_cache.set(cache);
+    user.put_binding_getter_cache(cache);
     cached
 }
 

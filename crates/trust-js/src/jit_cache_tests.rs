@@ -21,9 +21,8 @@ fn chunk(i: &mut Interp, name: &str) -> Rc<Chunk> {
         panic!("user function")
     };
     user.func
-        .code2
-        .get()
-        .or_else(|| user.func.code.get())
+        .runtime()
+        .execution_code()
         .and_then(Option::as_ref)
         .expect("fixture bytecode")
         .clone()
@@ -597,7 +596,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             code.upgrade().is_none(),
             "mapping owner died while caller cache survived"
         );
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
         let stale = cached(&caller, key).expect("stale identity intentionally remains weak-pinned");
         assert_eq!(stale, ic);
         // Without the test's own pin, the cache's keeps the dead callee's address reserved.
@@ -617,9 +616,10 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
     {
         let mut e = engine();
         eval(&mut e, "var factory=new Function('offset','return function(x){return offset+x}');var first=factory(17),sibling=factory(37);function invokeShared(f,x){return f(x,99);}");
-        let (first_pin, first_key, ast, sibling_key) = in_frame(|| {
+        let (first_pin, first_key, ast, sibling_key, factory_pin) = in_frame(|| {
             let first = value(&mut e, "first");
             let sibling = value(&mut e, "sibling");
+            let factory = value(&mut e, "factory");
             let ast = function_pin(&first);
             assert_eq!(ast.as_ptr(), function_pin(&sibling).as_ptr());
             (
@@ -627,8 +627,19 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
                 HiddenAddress::of(&first),
                 ast,
                 HiddenAddress::of(&sibling),
+                Gc::downgrade(factory.as_obj().unwrap()),
             )
         });
+        // Retire the factory's separate runtime before warming the sharing proof. After the
+        // first closure dies below, only the sibling retains the inner AST and runtime.
+        e.set_tier(Tier::Interp);
+        eval(&mut e, "factory=null;");
+        e.interp.gc_collect();
+        assert!(
+            !alive(&factory_pin),
+            "factory no longer retains the inner AST"
+        );
+        e.set_tier(Tier::Jit);
         assert_eq!(
             eval(
                 &mut e,
@@ -642,7 +653,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         assert!(cached(&caller, sibling_key).is_none());
         let code = in_frame(|| native_code(&mut e, "first"));
         e.set_tier(Tier::Interp);
-        eval(&mut e, "first=null;factory=null;");
+        eval(&mut e, "first=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
         e.interp.gc_collect();
         assert!(!alive(&first_pin));
@@ -661,8 +672,8 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         assert!(cached(&caller, first_key).is_some());
     }
     // Overflow owns an independent object pin after its original caller Chunk
-    // disappears. Seed it from a REAL compiled primary entry, then exercise its
-    // normal guarded Rust hit through the reusable native callback entry.
+    // disappears. First prove its current-epoch hit through a fresh empty callback cache;
+    // caller retirement must then fence that entry, while a later callback recovers normally.
     {
         let mut e = engine();
         eval(
@@ -696,6 +707,21 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
                 .lookup(key.get(), genv, epoch)
                 .is_some()
         }
+        assert!(
+            overflow_hit(&e, key),
+            "a current-epoch overflow entry is published"
+        );
+        assert!(in_frame(|| {
+            let target = value(&mut e, "target");
+            // This callback cache has no primary entry: the published overflow is the only
+            // cached route to the live target's native code on its first call.
+            let callback = crate::callback::CallbackCache::new();
+            matches!(
+                callback.call(&mut e.interp, &target, Value::Undefined, [Value::Num(8.0)]),
+                Ok(Value::Num(9.0))
+            )
+        }));
+        assert!(overflow_hit(&e, key));
         e.set_tier(Tier::Interp);
         eval(&mut e, "invokeTarget=null;");
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(Relaxed);
@@ -704,8 +730,11 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
             caller_code.upgrade().is_none(),
             "overflow does not retain original caller Chunk"
         );
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
-        assert!(overflow_hit(&e, key));
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        assert!(
+            !overflow_hit(&e, key),
+            "caller runtime retirement fences old raw overflow addresses"
+        );
         assert!(
             pin.weak_count() >= 2,
             "overflow retains its own pin besides the observer"
@@ -725,7 +754,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         e.interp.gc_collect();
         assert!(!alive(&pin));
         assert!(callee_code.upgrade().is_none());
-        assert_eq!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
+        assert_ne!(crate::bytecode::CALL_IC_EPOCH.load(Relaxed), epoch);
         assert!(
             !overflow_hit(&e, key),
             "GC retires dead overflow entry and its pin together"

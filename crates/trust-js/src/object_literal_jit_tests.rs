@@ -72,6 +72,7 @@ fn object_literal_builders_have_real_native_entries() {
         let chunk = match &object.borrow().call {
             Callable::User(user) => user
                 .func
+                .runtime()
                 .code
                 .get()
                 .and_then(Option::as_ref)

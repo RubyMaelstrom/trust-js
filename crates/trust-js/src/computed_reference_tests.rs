@@ -36,8 +36,8 @@ fn check_all_tiers(source: &str, native_functions: &[&str]) {
                 let Callable::User(user) = &object.call else {
                     panic!("fixture user function")
                 };
-                let chunk = user
-                    .func
+                let runtime = user.func.runtime();
+                let chunk = runtime
                     .code
                     .get()
                     .and_then(Option::as_ref)

@@ -91,6 +91,11 @@ impl HandleTable {
         })
     }
 
+    /// Lifetime metadata only: safe even after the heap's cells have been released.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.get()
+    }
+
     /// A collection of the heap starts (`true`, before its marking) or ends (`false`, once its
     /// sweep has freed the dead, or when the heap deferred it).
     pub(crate) fn set_collecting(&self, collecting: bool) {

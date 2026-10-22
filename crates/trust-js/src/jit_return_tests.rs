@@ -22,9 +22,8 @@ fn compile_return(engine: &mut Engine, source: &str) -> (Rc<Chunk>, JitCode) {
     (chunk, code)
 }
 
-/// Deliberately seed the private result slot to exercise BOTH native vacancy branches.
-/// These fixtures have no environment operations or calls; the real native prologue,
-/// local clone, return template, epilogue and checked fallback all execute unchanged.
+/// Seed the private result slot, then run the real native prologue, local load, return
+/// template and epilogue. These fixtures have no environment operations or calls.
 fn enter(
     engine: &mut Engine,
     chunk: &Chunk,
@@ -138,6 +137,59 @@ fn packed_native_return_all_tags_use_empty_slot_without_helper() {
     }
 }
 
+/// Every displaced execution-word kind can be overwritten directly. Mode0 must publish
+/// Undefined over an occupied word, including after falling off the function's end.
+#[test]
+fn packed_native_return_replaces_all_displaced_kinds_without_helper() {
+    let mut engine = Engine::new();
+    engine
+        .eval("var returnSymbol=Symbol('displaced');", false)
+        .unwrap();
+    let env = engine.interp.global_env;
+    let symbol = engine.interp.get_var("returnSymbol", &env).ok().unwrap();
+    let displaced = crate::rooting::RootedVec::from_vec(vec![
+        Value::Undefined,
+        Value::Null,
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Num(0.0),
+        Value::Num(-0.0),
+        Value::Num(1.25),
+        Value::Num(f64::NAN),
+        Value::Num(f64::INFINITY),
+        Value::Num(f64::NEG_INFINITY),
+        Value::Str("displaced string".into()),
+        symbol,
+        Value::Obj(crate::value::Object::new(None)),
+        Value::BigInt(crate::bigint::JsBigInt::from_i128(i128::MAX)),
+    ]);
+    for source in [
+        "function pass(value){return value;}",
+        "function pass(value){return;}",
+        "function pass(value){}",
+    ] {
+        let (chunk, code) = compile_return(&mut engine, source);
+        for previous in &displaced {
+            let (result, helpers) = enter(
+                &mut engine,
+                &chunk,
+                &code,
+                Value::Num(42.0),
+                previous.clone(),
+            );
+            assert_eq!(
+                helpers, 0,
+                "{source}: every occupied word must commit natively"
+            );
+            if source.contains("return value") {
+                assert_eq!(result.as_num_opt(), Some(42.0));
+            } else {
+                assert!(matches!(result, Value::Undefined));
+            }
+        }
+    }
+}
+
 /// The returned object survives the collection `enter` runs after the callee's
 /// teardown, and once the test drops the result a collection finds it dead: neither the
 /// occupied result slot nor the native frame keeps a hidden owner.
@@ -162,7 +214,7 @@ fn packed_native_return_occupied_alias_and_bare_cleanup_are_exact() {
                 };
                 let (result, helpers) =
                     enter(&mut engine, &chunk, &code, Value::Obj(object), previous);
-                assert_eq!(helpers, usize::from(occupied), "{source}");
+                assert_eq!(helpers, 0, "{source} occupied={occupied}");
                 if source.contains("return value") {
                     assert!(
                         matches!(&result, Value::Obj(o) if crate::value::Gc::as_ptr(o) == weak.as_ptr())
@@ -244,7 +296,8 @@ fn packed_native_return_direct_call_moves_and_clears_the_entire_word() {
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(chunk.jit.get().flatten().is_some());
         chunk.inline_attempted.set(true);
         chunk.inline_retry_at.set(0);
@@ -370,7 +423,8 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(chunk.jit.get().flatten().is_some());
         assert_eq!(chunk.jit_needs_activation_state(), name == "shaped");
         chunk.inline_attempted.set(true);

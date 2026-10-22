@@ -90,8 +90,8 @@ fn own_data_reads_warm_after_native_compilation_and_clone_live_value_kinds() {
         }
         assert_eq!(
             reads(usize::from(this)) - before,
-            11,
-            "all ordinary values except BigInt use native reads"
+            12,
+            "all ordinary execution values use native reads"
         );
     }
 }

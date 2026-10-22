@@ -312,7 +312,7 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
 }
 
 /// Read wide Binding.value to compact RAX, or copy a packed property. No ownership change.
-/// CX/R8..R11 preserved. Empty/BigInt/reserved words take the authoritative helper.
+/// CX/R8..R11 preserved. Empty/property-only/reserved words take the authoritative helper.
 fn read_word(a: &mut Asm, slow: usize) {
     let packed = a.label();
     let done = a.label();
@@ -328,9 +328,9 @@ fn read_word(a: &mut Asm, slow: usize) {
         a.nr_op_imm(7, AX, tag);
         a.jcc(EQ, label);
     }
-    a.nr_op_imm(7, AX, 6);
+    a.nr_op_imm(7, AX, 5);
     a.jcc(BELOW, slow);
-    // Sym/Object plus String use an explicit tag map; no invalid wide discriminant admitted.
+    // BigInt/String/Symbol/Object use an explicit tag map; no invalid wide tag is admitted.
     a.jmp(pointer);
     a.bind(undefined);
     a.nr_imm(AX, PACK_UNDEFINED);
@@ -352,15 +352,21 @@ fn read_word(a: &mut Asm, slow: usize) {
     a.nr_imm(AX, 0x7ff8_0000_0000_0000);
     a.jmp(done);
     a.bind(pointer);
+    let bigint = a.label();
     let string = a.label();
     let symbol = a.label();
     let object = a.label();
-    for (tag, label) in [(6, string), (7, symbol), (8, object)] {
+    for (tag, label) in [(5, bigint), (6, string), (7, symbol), (8, object)] {
         a.nr_op_imm(7, AX, tag);
         a.jcc(EQ, label);
     }
     a.jmp(slow);
-    for (label, tag) in [(string, PACK_STR), (symbol, PACK_SYM), (object, PACK_OBJ)] {
+    for (label, tag) in [
+        (bigint, crate::value::PACK_BIGINT),
+        (string, PACK_STR),
+        (symbol, PACK_SYM),
+        (object, PACK_OBJ),
+    ] {
         a.bind(label);
         a.nr_load(AX, CX, 8);
         a.nr_imm(DX, tag);
@@ -372,36 +378,20 @@ fn read_word(a: &mut Asm, slow: usize) {
     a.bind(done);
 }
 
-/// Keep RAX intact; DX becomes zero for immediate values or the shared owner pointer.
-fn owner_pointer(a: &mut Asm, slow: usize) {
-    let owner = a.label();
-    let scalar = a.label();
-    let done = a.label();
+/// Values crossing into execution storage cannot carry TDZ/EMPTY or a deferred prototype.
+/// References need no ownership decoding. The checked path materializes property-only words.
+fn execution_word_guard(a: &mut Asm, slow: usize) {
     a.nr_mov(DX, AX);
     a.nr_shift(true, DX, 48);
-    for tag in [0x7ffa, 0x7ffd] {
-        a.nr_op_imm(7, DX, tag);
-        a.jcc(EQ, slow);
-    }
-    for tag in [0x7ffe, 0x7fff, 0xfff9] {
-        a.nr_op_imm(7, DX, tag);
-        a.jcc(EQ, owner);
-    }
-    a.jcc(ABOVE, slow);
-    a.jmp(scalar);
-    a.bind(owner);
-    a.nr_mov(DX, AX);
-    a.nr_shift(false, DX, 16);
-    a.nr_shift(true, DX, 16);
-    a.jmp(done);
-    a.bind(scalar);
-    a.nr_imm(DX, 0);
-    a.bind(done);
+    a.nr_op_imm(7, DX, (crate::value::PACK_EMPTY >> 48) as i32);
+    a.jcc(EQ, slow);
+    a.nr_op_imm(7, DX, (crate::value::PACK_LAZY_PROTO >> 48) as i32);
+    a.jcc(BELOW ^ 1, slow);
 }
 
 fn load_value(a: &mut Asm, for_call: bool, slow: usize) {
     read_word(a, slow);
-    owner_pointer(a, slow);
+    execution_word_guard(a, slow);
     if for_call {
         a.nr_imm(DX, PACK_UNDEFINED);
         a.nr_store(SP, 0, DX);
@@ -428,6 +418,7 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
     let undefined = a.label();
     let null = a.label();
     let boolean = a.label();
+    let bigint = a.label();
     let string = a.label();
     let symbol = a.label();
     let object = a.label();
@@ -435,6 +426,7 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
         (0x7ff9, undefined),
         (0x7ffb, null),
         (0x7ffc, boolean),
+        (0x7ffd, bigint),
         (0x7ffe, string),
         (0x7fff, symbol),
         (0xfff9, object),
@@ -454,7 +446,7 @@ fn decode_rhs(a: &mut Asm, slow: usize) {
     a.nr_mov(R9, R10);
     a.nr_op_imm(4, R9, 1);
     a.jmp(done);
-    for (label, tag) in [(string, 6), (symbol, 7), (object, 8)] {
+    for (label, tag) in [(bigint, 5), (string, 6), (symbol, 7), (object, 8)] {
         a.bind(label);
         a.nr_imm(R8, tag);
         a.nr_mov(R9, R10);
@@ -504,8 +496,6 @@ fn store_value(a: &mut Asm, slow: usize) {
     a.nr_mem(true, &[0x8b], R10, SP, -8);
     card_address(a);
     decode_rhs(a, slow);
-    read_word(a, slow);
-    owner_pointer(a, slow);
     // R8/R9/R10 hold the transferred new word.
     let packed = a.label();
     let done = a.label();

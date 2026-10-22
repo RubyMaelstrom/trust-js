@@ -3600,10 +3600,8 @@ impl Parser {
         let func = Function {
             scan: std::cell::Cell::new(0),
             hoist: std::cell::OnceCell::new(),
-            calls: std::cell::Cell::new(0),
-            code: std::cell::OnceCell::new(),
-            code2: std::cell::OnceCell::new(),
-            fn_maps: std::cell::OnceCell::new(),
+            runtime: std::cell::OnceCell::new(),
+
             env_layouts: std::cell::OnceCell::new(),
             name,
             params,
@@ -3820,10 +3818,8 @@ impl Parser {
             let func = Function {
                 scan: std::cell::Cell::new(0),
                 hoist: std::cell::OnceCell::new(),
-                calls: std::cell::Cell::new(0),
-                code: std::cell::OnceCell::new(),
-                code2: std::cell::OnceCell::new(),
-                fn_maps: std::cell::OnceCell::new(),
+                runtime: std::cell::OnceCell::new(),
+
                 env_layouts: std::cell::OnceCell::new(),
                 name: None,
                 params: Vec::new(),
@@ -4003,10 +3999,8 @@ impl Parser {
         Ok(Function {
             scan: std::cell::Cell::new(0),
             hoist: std::cell::OnceCell::new(),
-            calls: std::cell::Cell::new(0),
-            code: std::cell::OnceCell::new(),
-            code2: std::cell::OnceCell::new(),
-            fn_maps: std::cell::OnceCell::new(),
+            runtime: std::cell::OnceCell::new(),
+
             env_layouts: std::cell::OnceCell::new(),
             name: None,
             params,
@@ -4251,10 +4245,8 @@ impl Parser {
             Function {
                 scan: std::cell::Cell::new(0),
                 hoist: std::cell::OnceCell::new(),
-                calls: std::cell::Cell::new(0),
-                code: std::cell::OnceCell::new(),
-                code2: std::cell::OnceCell::new(),
-                fn_maps: std::cell::OnceCell::new(),
+                runtime: std::cell::OnceCell::new(),
+
                 env_layouts: std::cell::OnceCell::new(),
                 name: None,
                 params,
@@ -4278,10 +4270,8 @@ impl Parser {
             Function {
                 scan: std::cell::Cell::new(0),
                 hoist: std::cell::OnceCell::new(),
-                calls: std::cell::Cell::new(0),
-                code: std::cell::OnceCell::new(),
-                code2: std::cell::OnceCell::new(),
-                fn_maps: std::cell::OnceCell::new(),
+                runtime: std::cell::OnceCell::new(),
+
                 env_layouts: std::cell::OnceCell::new(),
                 name: None,
                 params,

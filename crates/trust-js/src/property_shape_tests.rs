@@ -1,8 +1,8 @@
-//! Property shapes stay sound when one Engine's object is written through another's
-//! interpreter: [[Get]]/[[Set]] stay ordinary. Official local ECMA-262 snapshot e28783d5,
+//! Property shapes stay distinct across Engines' transition caches, while each Engine's
+//! objects and layouts remain on its own heap. Official local ECMA-262 snapshot e28783d5,
 //! OrdinaryGet, OrdinarySetWithOwnDescriptor, OrdinaryGetOwnProperty. Cache identities are not
-//! part of the observable semantics. No embedder can make such a write (S6 step 11b: scoped
-//! values are branded by their scope, handles checked), so these are internal tests.
+//! part of the observable semantics. Scoped values and checked handles prevent an embedder
+//! from creating a strong object edge between these separate Agents (I6).
 
 use super::*;
 use crate::{bytecode::Tier, Completion, Engine};
@@ -26,14 +26,63 @@ fn run(engine: &mut Engine, source: &str) -> String {
 
 #[test]
 fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
+    use crate::gc_core::CollectionKind;
+
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut owner = Engine::new();
         let original = value(&mut owner, "({alpha:1})");
         let local = value(&mut owner, "({alpha:1,gamma:2})");
+        let parent_shape = original.as_obj().unwrap().borrow().props.shape();
+        let local_shape = local.as_obj().unwrap().borrow().props.shape();
+        let global = owner.interp.global_this();
+        owner
+            .interp
+            .set_member_key(&global, "a", local.clone())
+            .ok()
+            .unwrap();
+        owner
+            .interp
+            .set_member_key(&global, "b", original.clone())
+            .ok()
+            .unwrap();
+
         let mut foreign = Engine::new();
         let _different_prefix = value(&mut foreign, "({beta:1})");
         foreign.interp.activate_gc_heap();
-        assert!(foreign
+        // Reproduce a foreign cache learning a transition from an unknown parent using
+        // only neutral keys and an integer identity. Heap-local shape counters would give
+        // this alpha/delta child the same ID as the owner's alpha/gamma child. The layout
+        // allocated here belongs to foreign; publishing it in original would violate I6.
+        let prefix = [(Rc::from("alpha"), PropClass::DataWritable)];
+        let (foreign_shape, foreign_layout) = shape_transition(
+            parent_shape,
+            &Rc::from("delta"),
+            PropClass::DataWritable,
+            Some(&prefix),
+        );
+        assert_ne!(
+            foreign_shape, local_shape,
+            "foreign child identity, {tier:?}"
+        );
+        let foreign_layout = foreign_layout.expect("foreign transition layout");
+        assert_eq!(&*foreign_layout[0], "alpha");
+        assert_eq!(&*foreign_layout[1], "delta");
+        let foreign_word = foreign_layout.cell_word() as usize;
+        assert_eq!(
+            foreign
+                .interp
+                .gc_heap
+                .shapes
+                .borrow()
+                .layouts
+                .get(foreign_shape)
+                .unwrap()
+                .cell_word() as usize,
+            foreign_word
+        );
+
+        owner.interp.activate_gc_heap();
+        assert!(owner
             .interp
             .set_member_key(&original, "delta", Value::Num(3.0))
             .is_ok());
@@ -43,19 +92,40 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         );
         owner.set_tier(tier);
         owner.set_tier_threshold(0);
-        owner.interp.activate_gc_heap();
-        let global = owner.interp.global_this();
-        owner
-            .interp
-            .set_member_key(&global, "a", local)
-            .ok()
-            .unwrap();
-        owner
-            .interp
-            .set_member_key(&global, "b", original)
-            .ok()
-            .unwrap();
+        let owner_words = [&original, &local].map(|value| {
+            value
+                .as_obj()
+                .unwrap()
+                .borrow()
+                .props
+                .shared_layout()
+                .expect("owner transition layout")
+                .cell_word() as usize
+        });
         assert_eq!(run(&mut owner, "function read(o){return o.gamma;}for(var n=0;n<200;n++)read(a);read(a)+'|'+read(b)+'|'+b.delta"), "2|undefined|3", "{tier:?}");
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            owner.interp.activate_gc_heap();
+            owner.interp.gc_heap_collect_explicit(kind);
+            foreign.interp.activate_gc_heap();
+            foreign.interp.gc_heap_collect_explicit(kind);
+            let owner_core = owner.interp.gc_heap.core.borrow();
+            let foreign_core = foreign.interp.gc_heap.core.borrow();
+            for word in owner_words {
+                assert!(owner_core.owns_cell(word, owner.interp.gc_heap.property_layout_desc));
+                assert!(!foreign_core.owns_cell(word, foreign.interp.gc_heap.property_layout_desc));
+            }
+            assert!(
+                foreign_core.owns_cell(foreign_word, foreign.interp.gc_heap.property_layout_desc)
+            );
+            assert!(!owner_core.owns_cell(foreign_word, owner.interp.gc_heap.property_layout_desc));
+            drop(foreign_core);
+            drop(owner_core);
+            assert_eq!(
+                run(&mut owner, "read(a)+'|'+read(b)+'|'+b.delta"),
+                "2|undefined|3",
+                "{tier:?}, {kind:?}"
+            );
+        }
     }
 }
 

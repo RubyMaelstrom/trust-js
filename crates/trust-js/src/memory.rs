@@ -419,6 +419,7 @@ pub(crate) struct Visitor {
     fragment_source_only: bool,
     loop_site_tokens: HashSet<usize>,
     gc_heaps: HashSet<usize>,
+    heap_ids: HashSet<u64>,
     lstrs: HashSet<usize>,
     rc_strs: HashSet<usize>,
     property_layouts: HashSet<usize>,
@@ -433,6 +434,7 @@ pub(crate) struct Visitor {
     native_managed_identity_conflict: bool,
     host_managed_allocations: HashMap<(&'static str, usize), usize>,
     functions: HashSet<usize>,
+    function_runtimes: HashSet<usize>,
     classes: HashSet<usize>,
     chunks: HashSet<usize>,
     inline_site_allocations: HashSet<usize>,
@@ -509,6 +511,7 @@ impl Visitor {
         if !self.gc_heaps.insert(identity) {
             return (0, true);
         }
+        self.heap_ids.insert(crate::value::heap_id(heap));
         crate::value::scan_gc_heap_retained_memory(heap, self)
     }
 
@@ -661,12 +664,22 @@ impl Visitor {
                     self.callable_metadata = self
                         .callable_metadata
                         .saturating_add(size_of_val(value.as_ref()));
-                    if let Some(cache) = value.binding_getter_cache.take() {
+                    if let Some(sidecar) = value.cache.take() {
                         self.callable_metadata = self
                             .callable_metadata
-                            .saturating_add(cache.retained_requested_storage_bytes());
-                        self.rc_str(&cache.name);
-                        value.binding_getter_cache.set(Some(cache));
+                            .saturating_add(size_of::<crate::value::UserCallableCache>());
+                        if let Some(runtime) = &sidecar.runtime {
+                            self.function_runtime(runtime, true);
+                        }
+                        if let Some(cache) = &sidecar.binding_getter {
+                            self.callable_metadata = self.callable_metadata.saturating_add(
+                                cache
+                                    .retained_requested_storage_bytes()
+                                    .saturating_sub(size_of_val(cache)),
+                            );
+                            self.rc_str(&cache.name);
+                        }
+                        value.cache.set(Some(sidecar));
                     }
                 }
                 self.function(&value.func);
@@ -877,23 +890,9 @@ impl Visitor {
                 }
             }
         }
-        if let Some(chunk) = function.code.get().and_then(Option::as_ref) {
-            self.chunk(chunk);
-        }
-        if let Some(chunk) = function.code2.get().and_then(Option::as_ref) {
-            self.chunk(chunk);
-        }
-        if let Some(maps) = function.fn_maps.get() {
-            bytes = bytes.saturating_add(size_of::<crate::ast::FunctionMaps>());
-            bytes = bytes.saturating_add(maps.roots.heap_bytes());
-            self.props(&maps.function);
-            if let Some(prototype_map) = &maps.prototype {
-                self.props(prototype_map);
-            }
-            if let Some((name, named)) = &*maps.named.borrow() {
-                bytes = bytes.saturating_add(name.len());
-                self.props(named);
-            }
+        if let Some(cache) = function.runtime.get() {
+            bytes = bytes.saturating_add(cache.retained_bytes());
+            cache.for_each(|runtime, allocated| self.function_runtime(runtime, allocated));
         }
         if let Some(layouts) = function.env_layouts.get() {
             bytes = bytes.saturating_add(size_of::<
@@ -904,6 +903,53 @@ impl Visitor {
             }
         }
         self.add_function_bytecode_bytes(bytes);
+    }
+
+    fn function_runtime(
+        &mut self,
+        runtime: &crate::function_runtime::FunctionRuntime,
+        allocated: bool,
+    ) {
+        if !self
+            .function_runtimes
+            .insert(std::ptr::from_ref(runtime) as usize)
+        {
+            return;
+        }
+        if allocated {
+            self.add_function_bytecode_bytes(size_of_val(runtime));
+        }
+        // Check only Rust metadata before following a runtime that may outlive its heap.
+        if let Some(chunk) = runtime.code.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some(chunk) = runtime.code2.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
+        if let Some(maps) = runtime.fn_maps.get() {
+            self.add_function_bytecode_bytes(size_of::<crate::ast::FunctionMaps>());
+            let cells_live = self.includes_heap(&runtime.heap);
+            if cells_live {
+                self.props(&maps.function);
+            } else {
+                self.retired_props(&maps.function);
+            }
+            if let Some(prototype_map) = &maps.prototype {
+                if cells_live {
+                    self.props(prototype_map);
+                } else {
+                    self.retired_props(prototype_map);
+                }
+            }
+            if let Some((name, named)) = &*maps.named.borrow() {
+                self.rc_str(name);
+                if cells_live {
+                    self.props(named);
+                } else {
+                    self.retired_props(named);
+                }
+            }
+        }
     }
 
     pub(crate) fn binding_layout(&mut self, layout: &Rc<crate::interpreter::BindingLayout>) {
@@ -973,12 +1019,24 @@ impl Visitor {
         }
     }
 
+    pub(crate) fn includes_heap(&self, heap: &crate::value::HeapLifetime) -> bool {
+        heap.is_alive() && (self.heap_ids.is_empty() || self.heap_ids.contains(&heap.id))
+    }
+
+    /// A dead/foreign template still owns Rust buffers; its cell-backed layouts and values
+    /// cannot be followed. This method reads only the Props' inline Rust storage metadata.
+    pub(crate) fn retired_props(&mut self, props: &crate::value::Props) {
+        let (bytes, exact) = props.retained_requested_storage_bytes();
+        self.detached_property_storage = self.detached_property_storage.saturating_add(bytes);
+        self.detached_property_storage_opaque |= !exact;
+    }
+
     pub(crate) fn property_layout(&mut self, layout: &crate::value::PropertyLayout) {
-        if self.property_layouts.insert(Rc::as_ptr(layout) as usize) {
-            // Requested payload, like the other Rc-backed categories: one layout body and key
-            // buffer per shared layout, not private allocator/refcount headers or one copy per
-            // instance. The optional standard HashMap has a known entry-capacity lower bound;
-            // Rust does not expose its exact bucket allocation.
+        if self.property_layouts.insert(layout.as_ptr() as usize) {
+            // Requested payload: one layout cell body and key buffer per layout, not one copy
+            // per instance or a second copy through the arena's reserved-page accounting.
+            // The optional standard HashMap has a known entry-capacity lower bound; Rust
+            // does not expose its exact bucket allocation.
             self.detached_property_storage = self.detached_property_storage.saturating_add(
                 size_of::<crate::value::PropertyLayoutData>()
                     + layout.capacity() * size_of::<Rc<str>>(),
@@ -2358,6 +2416,13 @@ fn scan_symbol_agent(interp: &Interp, visitor: &mut Visitor, totals: &mut Direct
 fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     let mut visitor = Visitor::default();
     let mut totals = DirectTotals::default();
+    fn note_heaps(interp: &Interp, ids: &mut HashSet<u64>) {
+        ids.insert(crate::value::heap_id(&interp.gc_heap));
+        for child in interp.shadow_realms.values() {
+            note_heaps(child, ids);
+        }
+    }
+    note_heaps(interp, &mut visitor.heap_ids);
     scan_realm(interp, objects, scopes, &mut visitor, &mut totals);
     scan_symbol_agent(interp, &mut visitor, &mut totals);
     visitor
@@ -2598,7 +2663,10 @@ mod tests {
         let b = b.borrow().props.clone();
         let layout = a.shared_layout().expect("shared layout");
         assert!(layout.has_index());
-        assert!(Rc::ptr_eq(layout, b.shared_layout().expect("b layout")));
+        assert!(crate::value::PropertyLayout::ptr_eq(
+            layout,
+            b.shared_layout().expect("b layout")
+        ));
 
         let expected_layout = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>()
@@ -2626,7 +2694,7 @@ mod tests {
             Rc::from("live"),
             Rc::from("unused prediction"),
         ]);
-        let weak_layout = Rc::downgrade(&layout);
+        let weak_layout = crate::gc_handle::WeakRef::to(layout.as_ptr() as usize);
         let expected_layout_bytes = size_of::<crate::value::PropertyLayoutData>()
             + layout.capacity() * size_of::<Rc<str>>();
         // The source lives only in this helper frame (the collector scans the stack).
@@ -2653,10 +2721,9 @@ mod tests {
         // A collection reclaims the dropped source.
         engine.interp.gc_collect();
         assert!(!crate::gc_test::alive(&weak_source));
-        assert_eq!(
-            weak_layout.strong_count(),
-            1,
-            "cache is the only layout owner"
+        assert!(
+            crate::gc_test::alive(&weak_layout),
+            "cache retains the layout after its source dies"
         );
         let mut visitor = Visitor::default();
         for _ in 0..2 {

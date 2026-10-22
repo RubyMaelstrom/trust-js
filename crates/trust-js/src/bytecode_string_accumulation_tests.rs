@@ -270,7 +270,7 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     assert_eq!(chunk.ops.len(), 15);
     chunk.inline_attempted.set(true);
     chunk.inline_retry_at.set(0);
-    assert!(function.code.set(Some(chunk.clone())).is_ok());
+    assert!(function.runtime().code.set(Some(chunk.clone())).is_ok());
     chunk
 }
 
@@ -628,12 +628,11 @@ fn complete_no_dup_region_commits_without_creating_an_expression_owner() {
     let mut chunk =
         bytecode::compile(&function("function* subject(part){yield result+=part;}")).unwrap();
     let original = first_plan(&chunk);
-    {
+    chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| {
         // Undef supplies the following Yield's independently specified value.
-        let chunk = Rc::get_mut(&mut chunk).unwrap();
         chunk.ops[original.pc + 3] = chunk.ops[original.pc + 4];
         chunk.ops[original.pc + 4] = Op::Undef;
-    }
+    });
     let plan = first_plan(&chunk);
     assert!(!plan.keep);
     let holder = scope(&engine, Value::lstr("A"));

@@ -41,8 +41,8 @@ fn invoke(
     let crate::ast::Stmt::FuncDecl(function) = &parsed[0] else {
         unreachable!()
     };
-    let mut chunk = compile(function).unwrap();
-    Rc::get_mut(&mut chunk).unwrap().ops[0] = op;
+    let chunk = compile(function).unwrap();
+    let chunk = Chunk::rewrite_owned_for_test(chunk, |chunk| chunk.ops[0] = op);
     let local = matches!(op, Op::GetElemLocal(_));
     let mut slots = [
         PackedValue::pack(if local {

@@ -102,6 +102,7 @@ fn caller_chunk(engine: &mut crate::Engine) -> Rc<Chunk> {
         panic!("user function")
     };
     user.func
+        .runtime()
         .code
         .get()
         .and_then(Option::as_ref)

@@ -5,6 +5,7 @@
 //! Collector and memory traversal must not count as value observations.
 
 use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
+use crate::gc_trace::GcTrace;
 use std::cell::RefCell;
 
 enum State {
@@ -111,18 +112,30 @@ impl LazyFunctionPrototype {
 }
 
 /// The trace of a deferred-prototype cell: its function and the prototype's parent,
-/// or once materialized the prototype. Its finalizer (`gc_box::finalize`) drops the key layout.
+/// or once materialized the prototype, and its predicted key layout.
 pub(super) fn trace_cell(cell: *const u8, visit: &mut dyn FnMut(*const u8)) {
     // SAFETY: deferred-prototype cells are initialized by `gc_box::new` before any collection.
     let lazy = unsafe { &*cell.cast::<LazyFunctionPrototype>() };
-    visit(Gc::as_ptr(&lazy.owner).cast());
-    // SAFETY: collections run at safepoints, where no state is mutably borrowed (I9):
-    // `materialize` holds its borrow across one allocation, which never collects.
-    // `try_borrow_unguarded` panics if one is.
-    let state = unsafe { lazy.state.try_borrow_unguarded() }
-        .expect("deferred prototype mutably borrowed during GC (I9)");
-    let (State::Parent(edge) | State::Materialized(edge)) = state;
-    visit(Gc::as_ptr(edge).cast());
+    lazy.trace_gc(&mut crate::gc_trace::VisitSink(visit));
+}
+
+impl crate::gc_trace::GcTrace for LazyFunctionPrototype {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            owner,
+            state,
+            layout,
+            shape: _,
+            constructor: _,
+        } = self;
+        sink.object(owner);
+        layout.trace_gc(sink);
+        // SAFETY: collections run at safepoints, where materialization holds no mutable borrow.
+        let state = unsafe { state.try_borrow_unguarded() }
+            .expect("deferred prototype mutably borrowed during GC (I9)");
+        let (State::Parent(edge) | State::Materialized(edge)) = state;
+        sink.object(edge);
+    }
 }
 
 /// Prototypes materialized on this thread so far (tests).
@@ -403,10 +416,9 @@ mod tests {
         );
     }
 
-    /// P1 S5: the deferred-prototype descriptor's trace reports exactly the cell's
-    /// two edges, in order: the function, then the prototype's parent while it is deferred;
-    /// the function, then the prototype once it is materialized (the promoted word no longer
-    /// names the cell, which stays allocated until a collection).
+    /// The descriptor reports the function, its key layout, then the prototype's parent
+    /// while deferred or the prototype once materialized. The promoted word no longer names
+    /// the cell, which stays allocated until a collection.
     #[test]
     fn deferred_prototype_cell_traces_its_function_and_state_edge() {
         let mut engine = Engine::new();
@@ -428,6 +440,13 @@ mod tests {
                     .bits();
                 assert_eq!(word & !0xffff_ffff_ffff, PACK_LAZY_PROTO);
                 let cell = (word & 0xffff_ffff_ffff) as *const u8;
+                // SAFETY: the live function's validated deferred word names this initialized
+                // cell; no safepoint occurs while inspecting it or materializing its value.
+                let layout = unsafe { &*cell.cast::<LazyFunctionPrototype>() }
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr() as usize;
                 let deferred = edges(cell);
                 let prototype = function.borrow().props.get("prototype").unwrap().value();
                 let materialized = edges(cell);
@@ -437,14 +456,14 @@ mod tests {
                 (
                     deferred,
                     materialized,
-                    vec![owner, parent],
-                    vec![owner, prototype],
+                    vec![owner, layout, parent],
+                    vec![owner, layout, prototype],
                 )
             });
-        assert_eq!(deferred, expected_deferred, "function, then parent");
+        assert_eq!(deferred, expected_deferred, "function, layout, then parent");
         assert_eq!(
             materialized, expected_materialized,
-            "function, then prototype"
+            "function, layout, then prototype"
         );
     }
 

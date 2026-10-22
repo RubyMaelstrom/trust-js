@@ -51,7 +51,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
         primary.inline_retry_at.set(0);
-        assert!(function.code.set(Some(primary.clone())).is_ok());
+        assert!(function.runtime().code.set(Some(primary.clone())).is_ok());
         for _ in 0..8 {
             assert_eq!(eval_string(i, "subject(5)"), "9:8:8");
         }
@@ -62,7 +62,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             .expect("prepared inline body");
         assert!(inlined.prepared_entry);
         assert!(inlined.inline_realm_compatible(genv));
-        assert!(function.code2.set(Some(inlined.clone())).is_ok());
+        assert!(function.runtime().code2.set(Some(inlined.clone())).is_ok());
         assert_eq!(eval_string(i, "calls=0;subject(5)+'|'+calls"), "9:8:8|1");
         let primary_code = primary
             .jit
@@ -88,6 +88,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
             assert!(!inlined.inline_realm_compatible(child_genv));
             assert!(Rc::ptr_eq(
                 function
+                    .runtime()
                     .execution_code_for(child_genv)
                     .and_then(Option::as_ref)
                     .unwrap(),
@@ -131,6 +132,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
         }
         assert!(Rc::ptr_eq(
             function
+                .runtime()
                 .execution_code_for(genv)
                 .and_then(Option::as_ref)
                 .unwrap(),
@@ -156,9 +158,14 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
     run(i, snapshot);
     let user = subject(i);
     let primary = bytecode::compile(&user.func).unwrap();
-    assert!(user.func.code.set(Some(primary.clone())).is_ok());
+    assert!(user.func.runtime().code.set(Some(primary.clone())).is_ok());
     let secondary = bytecode::compile(&user.func).unwrap();
-    assert!(user.func.code2.set(Some(secondary.clone())).is_ok());
+    assert!(user
+        .func
+        .runtime()
+        .code2
+        .set(Some(secondary.clone()))
+        .is_ok());
     assert_eq!(eval_string(i, "subject(5)"), "6");
     let code = secondary.jit.get().flatten().expect("native second stage");
     let child = i.create_realm();
@@ -169,6 +176,7 @@ fn second_stage_without_realm_dependent_inlines_remains_selected_in_other_realms
         assert!(secondary.inline_realm_compatible(genv));
         assert!(Rc::ptr_eq(
             user.func
+                .runtime()
                 .execution_code_for(genv)
                 .and_then(Option::as_ref)
                 .unwrap(),
@@ -213,7 +221,7 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
     let primary = bytecode::compile(&user.func).unwrap();
     primary.inline_attempted.set(true);
     primary.inline_retry_at.set(0);
-    assert!(user.func.code.set(Some(primary.clone())).is_ok());
+    assert!(user.func.runtime().code.set(Some(primary.clone())).is_ok());
     for _ in 0..8 {
         assert_eq!(eval_string(i, "subject(5)"), "16");
     }

@@ -227,10 +227,18 @@ mod tests {
         });
         engine.op_state().register_gc::<MixedHost>();
         engine.eval("key=bridge=payload=owner=null", false).unwrap();
-        engine.interp.gc_collect();
-        let host = engine.host::<MixedHost>().unwrap();
-        assert!(host.values.iter().all(|value| !value.is_cleared()));
-        assert_eq!(host.live_native, [true; 4]);
+        // Debug layout-owner verification must not consume the native graph's root worklist
+        // before the real marker reaches this mixed native/WeakMap fixed point.
+        for minor in [true, false, true, false] {
+            if minor {
+                engine.interp.gc_collect_minor();
+            } else {
+                engine.interp.gc_collect();
+            }
+            let host = engine.host::<MixedHost>().unwrap();
+            assert!(host.values.iter().all(|value| !value.is_cleared()));
+            assert_eq!(host.live_native, [true; 4]);
+        }
         engine.host_mut::<MixedHost>().unwrap().root = false;
         engine.interp.gc_collect();
         let host = engine.host::<MixedHost>().unwrap();

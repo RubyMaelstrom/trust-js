@@ -247,6 +247,45 @@ fn warm_assignment_expressions_use_native_stores_without_losing_rhs_owners() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 fn creation_ics_use_each_active_heaps_shape_directory() {
+    const CHILD: &str = "TRUST_JS_TEST_CREATION_DIRECTORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "jit::property_store_tests::creation_ics_use_each_active_heaps_shape_directory",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("TRUST_JS_INLINE_AT", "4294967295")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    fn create_chunk(engine: &mut Engine) -> std::rc::Rc<crate::bytecode::Chunk> {
+        engine.interp.activate_gc_heap();
+        let env = engine.interp.global_env;
+        let value = engine
+            .interp
+            .get_var("create", &env)
+            .ok()
+            .expect("create binding");
+        let object = value.as_obj().expect("create function").borrow();
+        let crate::value::Callable::User(user) = &object.call else {
+            panic!("create is a user function")
+        };
+        let runtime = user.func.runtime();
+        runtime
+            .execution_code()
+            .and_then(Option::as_ref)
+            .expect("create compiled")
+            .clone()
+    }
     let mut first = Engine::new();
     let mut second = Engine::new();
     for (engine, key) in [(&mut first, "alpha"), (&mut second, "beta")] {
@@ -262,7 +301,34 @@ fn creation_ics_use_each_active_heaps_shape_directory() {
     }
     for _ in 0..4 {
         for (engine, key) in [(&mut first, "alpha"), (&mut second, "beta")] {
-            let before = crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get);
+            let chunk = create_chunk(engine);
+            assert!(
+                chunk.jit.get().flatten().is_some(),
+                "create has native code"
+            );
+            let runs = chunk.jit_runs.get();
+            let mut stores = chunk.jit_ops().iter().filter_map(|op| match *op {
+                crate::bytecode::Op::SetProp(_, cache)
+                | crate::bytecode::Op::SetPropDrop(_, cache)
+                | crate::bytecode::Op::SetPropThisDrop(_, cache)
+                | crate::bytecode::Op::SetPropLocalDrop(_, _, cache) => Some(cache),
+                _ => None,
+            });
+            let cache = stores.next().expect("create has one property store");
+            assert!(stores.next().is_none());
+            assert_eq!(
+                chunk
+                    .jit_cache_preferred(cache)
+                    .expect("monomorphic creation cache")
+                    .depth,
+                crate::bytecode::IC_CREATE,
+                "creation depth0xFD cannot enter numeric ChainOp::StoreProp, which requires depth0"
+            );
+            let epoch = crate::value::proto_epoch();
+            let before = (
+                crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get),
+                crate::bytecode::TEST_JIT_EXEC_PROPERTY_HELPERS.with(std::cell::Cell::get),
+            );
             assert_eq!(
                 eval(
                     engine,
@@ -273,8 +339,20 @@ fn creation_ics_use_each_active_heaps_shape_directory() {
                 ),
                 "123"
             );
+            assert!(
+                chunk.jit_runs.get() > runs,
+                "create entered its native body"
+            );
             assert_eq!(
-                crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get),
+                crate::value::proto_epoch(),
+                epoch,
+                "isolated creation proof must have a stable prototype epoch"
+            );
+            assert_eq!(
+                (
+                    crate::bytecode::TEST_JIT_SET_PROP_HELPERS.with(std::cell::Cell::get),
+                    crate::bytecode::TEST_JIT_EXEC_PROPERTY_HELPERS.with(std::cell::Cell::get),
+                ),
                 before,
                 "a warm creation commits through the active directory without a helper"
             );

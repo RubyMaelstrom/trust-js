@@ -71,13 +71,13 @@ fn cold_loop_functions_wait_for_executed_hotness_or_call_threshold() {
             assert_eq!(value(&mut engine, "cold(100)"), "4950");
         }
         assert!(
-            cold.code.get().is_none(),
+            cold.runtime().code.get().is_none(),
             "short loop calls must not trigger compilation"
         );
-        assert!(unused.code.get().is_none());
+        assert!(unused.runtime().code.get().is_none());
         assert_eq!(value(&mut engine, "cold(100)"), "4950");
         assert!(
-            cold.code.get().is_some_and(Option::is_some),
+            cold.runtime().code.get().is_some_and(Option::is_some),
             "call threshold still admits hot functions"
         );
     }
@@ -468,13 +468,15 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
     ))]
     if crate::bytecode::inline_recompile_at() == 100 {
         let hot = function(&mut engine, "hot");
-        let primary = hot.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = hot.runtime();
+        let primary = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert_eq!(
             primary.jit_runs.get(),
             100,
             "each generic native entry must count once, until promotion"
         );
-        let spliced = hot
+        let runtime = hot.runtime();
+        let spliced = runtime
             .code2
             .get()
             .and_then(Option::as_ref)
@@ -505,8 +507,8 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                 let callee = frame.callee();
                 let outer = callee.borrow();
                 if let crate::value::Callable::User(user) = &outer.call {
-                    observation.outer_second_stage = user.func.code2.get().is_some();
-                    if let Some(chunk) = user.func.code.get().and_then(Option::as_ref) {
+                    observation.outer_second_stage = user.func.runtime().code2.get().is_some();
+                    if let Some(chunk) = user.func.runtime().code.get().and_then(Option::as_ref) {
                         observation.outer_borrowed = chunk.osr.get().is_some();
                         observation.outer_primary = chunk.jit.get().is_some();
                     }
@@ -519,11 +521,14 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                     if let crate::value::Callable::User(user) = &hot.call {
                         observation.primary_runs = user
                             .func
+                            .runtime()
                             .code
                             .get()
                             .and_then(Option::as_ref)
                             .map(|chunk| chunk.jit_runs.get());
-                        if let Some(spliced) = user.func.code2.get().and_then(Option::as_ref) {
+                        if let Some(spliced) =
+                            user.func.runtime().code2.get().and_then(Option::as_ref)
+                        {
                             observation.spliced_runs = Some(spliced.jit_runs.get());
                             observation.spliced_native = spliced.jit.get().flatten().is_some();
                             observation.spliced_guard = spliced
@@ -642,8 +647,8 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         let crate::value::Callable::User(user) = &callee.call else {
             panic!("child user callee")
         };
-        let spliced = user
-            .func
+        let runtime = user.func.runtime();
+        let spliced = runtime
             .code2
             .get()
             .and_then(Option::as_ref)

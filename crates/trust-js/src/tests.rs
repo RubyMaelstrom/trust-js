@@ -14552,7 +14552,7 @@ fn loop_free_functions_earn_native_code_through_vm_runs() {
         let crate::value::Callable::User(user) = &object.call else {
             panic!("user function")
         };
-        user.func.code.get().cloned().flatten()
+        user.func.runtime().code.get().cloned().flatten()
     };
     run_in(
         &mut engine,
@@ -26584,7 +26584,9 @@ fn compiled_base_class_constructors_preserve_instance_initialization_order() {
             panic!("Base is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
-            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            crate::value::Callable::User(user) => {
+                user.func.runtime().code.get().is_some_and(Option::is_some)
+            }
             _ => false,
         };
         assert!(
@@ -26639,7 +26641,9 @@ fn compiled_derived_class_constructors_preserve_super_and_this_binding_semantics
             panic!("Derived is not an object on {tier:?}");
         };
         let constructor_compiled = match &ctor.borrow().call {
-            crate::value::Callable::User(user) => user.func.code.get().is_some_and(Option::is_some),
+            crate::value::Callable::User(user) => {
+                user.func.runtime().code.get().is_some_and(Option::is_some)
+            }
             _ => false,
         };
         assert!(
@@ -26794,7 +26798,7 @@ fn compiled_try_finally_preserves_every_completion_kind() {
             };
             let compiled = match &function.borrow().call {
                 crate::value::Callable::User(user) => {
-                    user.func.code.get().is_some_and(Option::is_some)
+                    user.func.runtime().code.get().is_some_and(Option::is_some)
                 }
                 _ => false,
             };

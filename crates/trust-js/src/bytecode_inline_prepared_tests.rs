@@ -75,7 +75,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
         primary.inline_retry_at.set(0);
-        assert!(user.func.code.set(Some(primary.clone())).is_ok());
+        assert!(user.func.runtime().code.set(Some(primary.clone())).is_ok());
         // Inline planning consumes native call-cache feedback; the transformed continuation
         // is then exercised separately on both the bytecode and template native tiers.
         engine.set_tier(Tier::Jit);
@@ -107,7 +107,8 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
             };
             // FnFrame tracks the callable object identity, rather than the shared AST.
             LEAF_FUNCTION.with(|function| function.set(crate::value::Gc::as_ptr(&callee) as usize));
-            let body = user.func.execution_code().and_then(Option::as_ref).unwrap();
+            let runtime = user.func.runtime();
+            let body = runtime.execution_code().and_then(Option::as_ref).unwrap();
             body.jit.get().flatten()
         });
         // Positive control: the original Call really exposes the physical leaf frame at
@@ -118,7 +119,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         if let Some(code) = &callee_code {
             code.residency.referenced.set(0);
         }
-        assert!(user.func.code2.set(Some(chunk.clone())).is_ok());
+        assert!(user.func.runtime().code2.set(Some(chunk.clone())).is_ok());
         engine.set_tier(tier);
         SAW_REAL_LEAF_FRAME.with(|saw| saw.set(false));
         assert_eq!(
@@ -194,9 +195,11 @@ fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
     };
     let function = user.func.clone();
     drop(object);
-    let primary = function.code.get().and_then(Option::as_ref).unwrap();
+    let runtime = function.runtime();
+    let primary = runtime.code.get().and_then(Option::as_ref).unwrap();
     assert!(primary.prepared_entry);
-    let chunk = function
+    let runtime = function.runtime();
+    let chunk = runtime
         .code2
         .get()
         .and_then(Option::as_ref)

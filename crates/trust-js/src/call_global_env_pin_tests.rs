@@ -91,12 +91,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             function,
         )
     });
-    let chunk = function
-        .code
-        .get()
-        .and_then(Option::as_ref)
-        .unwrap()
-        .clone();
+    let runtime = function.runtime();
+    let chunk = runtime.code.get().and_then(Option::as_ref).unwrap().clone();
     let code = chunk.jit.get().flatten().expect("real template caller");
     assert!(!code.pc_offsets.is_empty());
     let cache = chunk

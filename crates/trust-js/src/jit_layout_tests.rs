@@ -333,7 +333,7 @@ fn scope_offsets_read_generation_parent_and_bindings() {
 }
 
 #[test]
-fn property_layout_counts_read_the_live_strong_count() {
+fn property_layout_words_address_the_live_cell_payload() {
     let engine = crate::Engine::new();
     let layout = probe(&engine);
     let object = Object::new(None);
@@ -353,12 +353,8 @@ fn property_layout_counts_read_the_live_strong_count() {
         .clone()
         .expect("a named map has a key layout");
     assert_eq!(word, read(&shared as *const PropertyLayout as usize, 0));
-    let count = || read::<usize>(word, layout.repr.layout_rc_strong_off);
-    assert_eq!(count(), Rc::strong_count(&shared));
-    let extra = shared.clone();
-    assert_eq!(count(), Rc::strong_count(&shared));
-    drop(extra);
-    assert_eq!(count(), Rc::strong_count(&shared));
+    assert_eq!(word, shared.as_ptr() as usize);
+    assert!(shared.is_shared());
     let keys = word + layout.layout_data_off;
     assert_eq!(keys, &shared.keys as *const Vec<Rc<str>> as usize);
 }

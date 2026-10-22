@@ -795,7 +795,7 @@ mod computed_read_cache_tests {
 /// *same, still-alive* object — and therefore that everything recorded at fill time still
 /// holds: its `call` field is the same `Callable::User` (a live function's `call` is never
 /// reassigned; the one upgrade site only converts `Callable::None`), which pins the `Function`,
-/// its env, its compiled chunk (`Function::code` is set once). Machine code is separately
+/// its env, its compiled chunk (`FunctionRuntime::code` is set once). Machine code is separately
 /// protected by the non-sentinel epoch and an owned lease acquired before reentrancy. A hit
 /// therefore skips the object borrow and dispatch checks. Rust dispatch leases the code;
 /// direct native entry/exit marks protect mappings without a Rust frame.
@@ -820,7 +820,7 @@ pub struct CallIc {
     pub callee: usize,
     /// `Env::as_ptr` of the callee's closure env (a hit reconstructs a handle from it).
     pub env: *const std::cell::RefCell<crate::interpreter::Scope>,
-    /// Address of the `Rc<Chunk>` handle inside the callee's `Function::code` (set-once cell).
+    /// Address of the `Rc<Chunk>` handle inside the callee's `FunctionRuntime::code` (set-once cell).
     pub chunk: *const Rc<Chunk>,
     /// `Rc::as_ptr` of the chunk's resident machine code. Valid only after the
     /// non-sentinel epoch guard; acquire a lease before any reentrant work.
@@ -1019,12 +1019,25 @@ pub(crate) fn invalidate_call_caches() {
 pub(crate) struct PrivateSite {
     env: std::cell::Cell<usize>,
     pin: std::cell::RefCell<crate::interpreter::WeakEnv>,
-    /// Rooted: an unresolved name's key is a fresh string nothing else holds.
-    key: std::cell::RefCell<crate::rooting::Rooted<Option<crate::lstr::LStr>>>,
+    /// The owning Chunk's actual-owner root registration retains this late key.
+    key: std::cell::RefCell<Option<crate::lstr::LStr>>,
     slot: std::cell::Cell<u32>,
     /// The entry key last found for `key`. Instances that share a property layout share this
     /// allocation, so a pointer match answers the key comparison without reading its text.
     entry_key: std::cell::RefCell<Option<Rc<str>>>,
+}
+
+impl crate::gc_trace::GcTrace for PrivateSite {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        let Self {
+            env: _,
+            pin: _,
+            key,
+            slot: _,
+            entry_key: _,
+        } = self;
+        key.trace_gc(sink);
+    }
 }
 
 impl PrivateSite {
@@ -1032,7 +1045,7 @@ impl PrivateSite {
         Self {
             env: std::cell::Cell::new(0),
             pin: std::cell::RefCell::new(crate::interpreter::WeakEnv::new()),
-            key: std::cell::RefCell::new(crate::rooting::Rooted::new(None)),
+            key: std::cell::RefCell::new(None),
             slot: std::cell::Cell::new(u32::MAX),
             entry_key: std::cell::RefCell::new(None),
         }
@@ -1061,7 +1074,7 @@ impl PrivateSite {
             self.slot.set(u32::MAX);
             *self.entry_key.borrow_mut() = None;
         }
-        **self.key.borrow_mut() = Some(key.clone());
+        *self.key.borrow_mut() = Some(key.clone());
         *self.pin.borrow_mut() = Env::downgrade(env);
         self.env.set(raw);
         key
@@ -2283,7 +2296,8 @@ pub struct Chunk {
     /// Shared call/constructor eligibility also depends on this immutable body property.
     has_tail_calls: bool,
     /// Literal values (strings, BigInts), roots for as long as the chunk lives.
-    consts: crate::rooting::RootedVec,
+    consts: Vec<Value>,
+    heap: crate::value::HeapLifetime,
     names: Vec<Rc<str>>,
     n_slots: usize,
     /// Slot names, for TDZ ReferenceError messages.
@@ -2474,7 +2488,150 @@ pub(crate) struct RecordGetterPlan {
     template: u32,
 }
 
+impl crate::gc_trace::GcTrace for Chunk {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        // Decision 2: every field is inventoried. AST/source and binding layouts are neutral
+        // Rust data; ICs and feedback carry weak proofs, never strong cell ownership. Child
+        // chunks have their own actual-owner registrations, including late compiled children.
+        let Self {
+            debug_origin: _,
+            prepared_entry: _,
+            lean_new_target: _,
+            rest_slot: _,
+            lazy_arguments: _,
+            arguments_count: _,
+            ops: _,
+            jit_needs_activation_state: _,
+            has_tail_calls: _,
+            consts,
+            heap: _,
+            names: _,
+            n_slots: _,
+            slot_names: _,
+            borrowed_parameter_aliases: _,
+            function_osr_entries: _,
+            n_refs: _,
+            n_params: _,
+            arguments_slot: _,
+            uses_this: _,
+            lexical_this: _,
+            strict: _,
+            resumable: _,
+            instance_capacity_hint: _,
+            instance_layout,
+            forwarded_capacity_hint: _,
+            initializer_layout,
+            funcs: _,
+            templates: _,
+            eval_exprs: _,
+            class_plans: _,
+            assignment_targets: _,
+            lexical_scopes: _,
+            cap_inits: _,
+            activation_plan: _,
+            binding_layout_id: _,
+            reuse_activation: _,
+            env_this: _,
+            env_arguments: _,
+            caches: _,
+            feedback: _,
+            feedback_shapes: _,
+            obj_maps,
+            record_getter: _,
+            name_caches: _,
+            deep_name_caches: _,
+            resolution_caches: _,
+            name_pins: _,
+            name_num_bits: _,
+            name_num_valid: _,
+            cap_caches: _,
+            cap_pins: _,
+            initializer_plan: _,
+            simple_constructor_shapes: _,
+            simple_constructor_plan: _,
+            arguments_forwarder: _,
+            arguments_forwarder_runtime: _,
+            regexp_literals: _,
+            call_caches: _,
+            call_names: _,
+            positions: _,
+            call_positions: _,
+            construct_positions: _,
+            construct_caches: _,
+            private_sites,
+            call_pins: _,
+            inline_sites: _,
+            inline_targets: _,
+            inline_planning_genv: _,
+            jit_runs: _,
+            vm_runs: _,
+            inline_attempted: _,
+            inline_retry_at: _,
+            inline_checks: _,
+            inline_feedback: _,
+            jit: _,
+            jit_budget_wait_bytes: _,
+            osr: _,
+        } = self;
+        consts.trace_gc(sink);
+        private_sites.as_ref().trace_gc(sink);
+        instance_layout.trace_gc(sink);
+        if let Some(layout) = initializer_layout.get() {
+            layout.trace_gc(sink);
+        }
+        for map in obj_maps {
+            if let Some(map) = map.get() {
+                map.trace_gc(sink);
+            }
+        }
+    }
+}
+
 impl Chunk {
+    /// Rewrite a uniquely owned test fixture while its GC-cell roots are unpublished. Weak
+    /// root registration intentionally prevents Rc::get_mut; try_unwrap permits those weak
+    /// registrations while still proving that no other code owner can observe the mutation.
+    #[cfg(test)]
+    pub(crate) fn rewrite_owned_for_test(
+        chunk: Rc<Self>,
+        edit: impl FnOnce(&mut Self),
+    ) -> Rc<Self> {
+        let heap = crate::value::active_gc_heap();
+        assert!(chunk.belongs_to_heap(crate::value::heap_id(&heap)));
+        assert!(
+            chunk.jit.untried(),
+            "fixture has published or attempted native code"
+        );
+        assert!(
+            chunk.osr.get().is_none_or(|state| state.unavailable()),
+            "fixture has published or retryable OSR code"
+        );
+        let _no_gc = heap.core.borrow().nogc();
+        let mut chunk = Rc::try_unwrap(chunk)
+            .unwrap_or_else(|_| panic!("fixture rewrite requires unique strong Chunk ownership"));
+        edit(&mut chunk);
+        assert_eq!(crate::value::active_heap_id(), crate::value::heap_id(&heap));
+        assert!(chunk.belongs_to_heap(crate::value::heap_id(&heap)));
+        assert!(chunk.jit.untried(), "fixture edit published native code");
+        assert!(
+            chunk.osr.get().is_none_or(|state| state.unavailable()),
+            "fixture edit published or made OSR code retryable"
+        );
+        let chunk = Rc::new(chunk);
+        crate::value::register_code_roots(&chunk);
+        chunk
+    }
+
+    #[cfg(test)]
+    pub(crate) fn heap_id(&self) -> u64 {
+        self.heap.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn belongs_to_heap(&self, heap: u64) -> bool {
+        self.heap.id == heap && self.heap.is_alive()
+    }
+
     /// A whole getter body with no effect except reading Number-valued own data
     /// fields and creating its returned record. A miss precedes every JS effect.
     fn record_getter_plan(&self) -> Option<&RecordGetterPlan> {
@@ -2605,11 +2762,14 @@ impl Chunk {
     /// properties, RegExp programs, chunks, and JIT sidecars route back through the one
     /// allocation-family visitor for identity deduplication.
     pub(crate) fn scan_retained_memory(&self, visitor: &mut crate::memory::Visitor) {
-        if let Some(layout) = &self.instance_layout {
-            visitor.property_layout(layout);
-        }
-        if let Some(layout) = self.initializer_layout.get() {
-            visitor.property_layout(layout);
+        let cells_live = visitor.includes_heap(&self.heap);
+        if cells_live {
+            if let Some(layout) = &self.instance_layout {
+                visitor.property_layout(layout);
+            }
+            if let Some(layout) = self.initializer_layout.get() {
+                visitor.property_layout(layout);
+            }
         }
         refresh_current_layout_feedback(&self.feedback, &self.feedback_shapes, &self.caches);
         macro_rules! vec_bytes {
@@ -2675,8 +2835,10 @@ impl Chunk {
                 .saturating_mul(std::mem::size_of::<u32>()),
         );
 
-        for value in &self.consts {
-            visitor.value(value);
+        if cells_live {
+            for value in &self.consts {
+                visitor.value(value);
+            }
         }
         for name in self.names.iter().chain(&self.slot_names) {
             visitor.rc_str(name);
@@ -2767,7 +2929,11 @@ impl Chunk {
         for map in &self.obj_maps {
             if let Some(map) = map.get() {
                 bytes = bytes.saturating_add(std::mem::size_of::<crate::value::Props>());
-                visitor.props(map);
+                if cells_live {
+                    visitor.props(map);
+                } else {
+                    visitor.retired_props(map);
+                }
             }
         }
         bytes = bytes
@@ -2803,6 +2969,16 @@ impl Chunk {
         for regex in &self.regexp_literals {
             if let Some(regex) = regex.get() {
                 visitor.regex(regex);
+            }
+        }
+        for site in &self.private_sites {
+            if cells_live {
+                if let Some(key) = &*site.key.borrow() {
+                    visitor.lstr(key);
+                }
+            }
+            if let Some(key) = &*site.entry_key.borrow() {
+                visitor.rc_str(key);
             }
         }
         let call_pins = self.call_pins.borrow();
@@ -6302,10 +6478,8 @@ pub(crate) fn compile_module(body: &[Stmt], bindings: &[(String, bool)]) -> Opti
         start: 0,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
-        calls: std::cell::Cell::new(0),
-        code: std::cell::OnceCell::new(),
-        code2: std::cell::OnceCell::new(),
-        fn_maps: std::cell::OnceCell::new(),
+        runtime: std::cell::OnceCell::new(),
+
         env_layouts: std::cell::OnceCell::new(),
     };
     let started = crate::jit::perf_stage_start();
@@ -6347,10 +6521,8 @@ pub(crate) fn compile_script(body: &[Stmt], strict: bool) -> Option<Rc<Chunk>> {
         start: 0,
         scan: std::cell::Cell::new(0),
         hoist: std::cell::OnceCell::new(),
-        calls: std::cell::Cell::new(0),
-        code: std::cell::OnceCell::new(),
-        code2: std::cell::OnceCell::new(),
-        fn_maps: std::cell::OnceCell::new(),
+        runtime: std::cell::OnceCell::new(),
+
         env_layouts: std::cell::OnceCell::new(),
     };
     let started = crate::jit::perf_stage_start();
@@ -7231,7 +7403,8 @@ fn finish_chunk(
         ops: c.ops,
         jit_needs_activation_state,
         has_tail_calls,
-        consts: crate::rooting::RootedVec::from_vec(c.consts),
+        consts: c.consts.into_vec(),
+        heap: crate::value::active_heap_lifetime(),
         names: c.names,
         n_slots: c.slot_names.len(),
         slot_names: c.slot_names,
@@ -7306,7 +7479,9 @@ fn finish_chunk(
         jit_budget_wait_bytes: std::cell::Cell::new(0),
         osr: std::cell::OnceCell::new(),
     };
-    Some(Rc::new(chunk))
+    let chunk = Rc::new(chunk);
+    crate::value::register_code_roots(&chunk);
+    Some(chunk)
 }
 
 /// Machine-code runs before the first bounded, feedback-adaptive inline checkpoint.
@@ -7712,7 +7887,8 @@ fn plan_inlines_at(
             }) {
                 skip!(idx, "param shape");
             }
-            let Some(Some(callee_chunk)) = f.code.get() else {
+            let runtime = f.runtime();
+            let Some(Some(callee_chunk)) = runtime.code.get() else {
                 skip!(idx, "callee not compiled");
             };
             if std::ptr::eq(&**callee_chunk, chunk) {
@@ -7993,7 +8169,7 @@ struct Compiler {
     homed_lets: crate::fasthash::FastSet<String>,
     homed_pending: crate::fasthash::FastSet<String>,
     ops: Vec<Op>,
-    consts: Vec<Value>,
+    consts: crate::rooting::RootedVec,
     names: Vec<Rc<str>>,
     /// Compile-only index for larger name pools. `names` remains the authoritative ordered
     /// table: object-literal keys can be contiguous duplicates, so this maps to the FIRST entry.
@@ -8955,7 +9131,8 @@ impl Compiler {
         let saved_self_hosted = std::mem::replace(&mut self.self_hosted, f.self_hosted);
         self.inline_depth += 1;
         self.plan_stack.push((w.nested.clone(), 0));
-        let hot_chunk = f.code.get().and_then(Option::as_ref);
+        let runtime = f.runtime();
+        let hot_chunk = runtime.code.get().and_then(Option::as_ref);
         self.cache_seed_stack.push((
             hot_chunk
                 .map(|chunk| property_cache_seeds(chunk))
@@ -14811,10 +14988,11 @@ pub(crate) fn try_function_osr(
     {
         return Ok(None);
     }
-    if function.code.get().is_none() {
-        let _ = function.code.set(compile(&function));
+    if function.runtime().code.get().is_none() {
+        let _ = function.runtime().code.set(compile(&function));
     }
-    let Some(baseline) = function.code.get().and_then(Option::as_ref) else {
+    let runtime = function.runtime();
+    let Some(baseline) = runtime.code.get().and_then(Option::as_ref) else {
         return Ok(None);
     };
     let legacy_mapped_parameters = !function.is_strict
@@ -21340,6 +21518,13 @@ pub(crate) unsafe extern "C" fn jit_exec(
     mut sp: *mut PackedValue,
 ) -> crate::jit::SpFlag {
     let chunk = &*(*ctx).chunk;
+    #[cfg(test)]
+    if matches!(
+        chunk.ops[pc as usize],
+        Op::SetProp(..) | Op::SetPropDrop(..) | Op::SetPropThisDrop(..) | Op::SetPropLocalDrop(..)
+    ) {
+        TEST_JIT_EXEC_PROPERTY_HELPERS.with(|count| count.set(count.get() + 1));
+    }
     let _inline_position = ImplicitCallPosition::enter((*ctx).interp, chunk, pc as usize);
     if matches!(
         chunk.ops[pc as usize],
@@ -22686,6 +22871,7 @@ thread_local! {
     pub(crate) static TEST_JIT_SET_ELEM_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    pub(crate) static TEST_JIT_EXEC_PROPERTY_HELPERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TEST_JIT_EXEC_ELEMENT_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -25604,19 +25790,8 @@ pub(crate) unsafe extern "C" fn jit_return(
     #[cfg(test)]
     TEST_JIT_RETURN_HELPERS.with(|count| count.set(count.get() + 1));
     let ctx = &mut *ctx;
-    // An empty destination needs
-    // neither a destructor nor a spill across one. Decrementing sp transfers
-    // the source slot's ownership; it is outside the live operand stack after
-    // return, exactly as with read() in the checked fallback below.
-    if ctx.ret.is_undefined() {
-        if mode == 1 {
-            sp = sp.sub(1);
-            std::ptr::write(&mut ctx.ret, sp.read());
-        }
-        return sp;
-    }
-    // Do not assume every caller provides an empty slot. Normal assignment
-    // releases any displaced object/string/BigInt/symbol exactly once.
+    // Only the published result is a root after return. Overwriting an earlier result never
+    // inspects it; the collector reclaims its cell when the remaining graph no longer reaches it.
     ctx.ret = if mode == 1 {
         sp = sp.sub(1);
         sp.read()
@@ -25988,7 +26163,7 @@ mod return_slot_tests {
     /// JitCtx's prefix offsets and sizes, with the packed `this` word itself at [48].
     /// A function's deferred prototype, the one packed word that owned a box, names a cell in its
     /// function's heap: overwriting the word releases nothing (the cell still owns its key
-    /// layout), and the next collection frees the cell, whose finalizer drops the layout.
+    /// layout), and the next collection frees the cell. The layout is traced independently.
     #[test]
     fn packed_native_abi_preserves_prefix_offsets_and_distinguishes_drop_boundaries() {
         use std::mem::{offset_of, size_of};
@@ -26046,12 +26221,11 @@ mod return_slot_tests {
             before + 1,
             "one cell per deferred prototype"
         );
-        assert_eq!(Rc::strong_count(&keys), 2, "the cell owns the key layout");
+        assert!(keys.is_shared(), "the deferred cell shares the key layout");
         crate::gc_test::in_frame(|| property.set_value(Value::Undefined));
-        assert_eq!(
-            Rc::strong_count(&keys),
-            2,
-            "overwriting the lazy word released nothing"
+        assert!(
+            keys.is_shared(),
+            "overwriting the lazy word leaves sharing sticky"
         );
         engine.interp.gc_collect();
         assert_eq!(
@@ -26059,10 +26233,9 @@ mod return_slot_tests {
             before,
             "the cell died at the next collection"
         );
-        assert_eq!(
-            Rc::strong_count(&keys),
-            1,
-            "its finalizer dropped the key layout"
+        assert!(
+            keys.is_shared(),
+            "sharing remains sticky after a holder dies"
         );
     }
 }
@@ -26215,5 +26388,198 @@ impl NativeActivation {
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn env_address(&self) -> usize {
         Env::as_ptr(&self.env) as usize
+    }
+}
+
+#[cfg(test)]
+mod layout_cell_roots_tests {
+    use super::*;
+    use crate::gc_core::CollectionKind;
+    use crate::value::property_layout_cell_tests::{collect, isolated, Words};
+    use crate::value::{new_property_layout, Props};
+
+    #[test]
+    fn chunks_root_static_and_late_initializer_layouts_and_constants() {
+        let (heap, _release, _active) = isolated();
+        let body = crate::parser::parse_script(
+            "function C(){this.first=1;this.second=2;return 'kept constant';}",
+            false,
+        )
+        .ok()
+        .unwrap();
+        let Stmt::FuncDecl(function) = &body[0] else {
+            panic!("constructor")
+        };
+        let chunk = compile(function).expect("constructor compiles");
+        let predicted = chunk
+            .instance_layout()
+            .expect("static field prediction")
+            .cell_word();
+        let constant = chunk
+            .consts
+            .iter()
+            .find_map(|value| match value {
+                Value::Str(text) if &**text == "kept constant" => Some(text.cell_word()),
+                _ => None,
+            })
+            .unwrap();
+        let weak_constant = crate::gc_handle::WeakRef::to(constant as usize);
+        let weak_prediction = crate::gc_handle::WeakRef::to(predicted as usize);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        assert!(heap
+            .core
+            .borrow()
+            .owns_cell(constant as usize, heap.string_desc));
+        assert!(weak_constant.live_ptr().is_some());
+        assert!(heap
+            .core
+            .borrow()
+            .owns_cell(predicted as usize, heap.property_layout_desc));
+        assert!(weak_prediction.live_ptr().is_some());
+        let learned = new_property_layout(vec![Rc::from("late initializer prediction")]);
+        let learned_word = learned.cell_word();
+        chunk.note_initializer_layout(&learned);
+        drop(learned);
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            collect(&heap, &Words(Vec::new()), kind);
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(constant as usize, heap.string_desc));
+            assert!(weak_constant.live_ptr().is_some());
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(predicted as usize, heap.property_layout_desc));
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(learned_word as usize, heap.property_layout_desc));
+            assert!(chunk
+                .consts
+                .iter()
+                .any(|value| matches!(value, Value::Str(text) if &**text == "kept constant")));
+        }
+        drop(chunk);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        assert!(!heap
+            .core
+            .borrow()
+            .owns_cell(constant as usize, heap.string_desc));
+        assert!(weak_constant.live_ptr().is_none());
+        assert!(weak_prediction.live_ptr().is_none());
+        assert!(!heap
+            .core
+            .borrow()
+            .owns_cell(predicted as usize, heap.property_layout_desc));
+        assert!(!heap
+            .core
+            .borrow()
+            .owns_cell(learned_word as usize, heap.property_layout_desc));
+    }
+
+    #[test]
+    fn installed_literal_maps_are_traced_after_chunk_publication() {
+        let (heap, _release, _active) = isolated();
+        let body =
+            crate::parser::parse_script("function literal(){return {first:1,second:2};}", false)
+                .ok()
+                .unwrap();
+        let Stmt::FuncDecl(function) = &body[0] else {
+            panic!("literal function")
+        };
+        let chunk = compile(function).unwrap();
+        assert_eq!(chunk.obj_maps.len(), 1);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        let props = Props::with_layout(
+            2,
+            Some(new_property_layout(vec![Rc::from("literal prediction")])),
+        );
+        let word = props.shared_layout().unwrap().cell_word();
+        props.mark_layout_shared();
+        chunk.obj_maps[0].set(Box::new(props)).ok().unwrap();
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            collect(&heap, &Words(Vec::new()), kind);
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(word as usize, heap.property_layout_desc));
+        }
+        drop(chunk);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        assert!(!heap
+            .core
+            .borrow()
+            .owns_cell(word as usize, heap.property_layout_desc));
+    }
+}
+
+#[cfg(test)]
+mod private_site_root_tests {
+    use super::*;
+    use crate::gc_core::CollectionKind;
+    use crate::gc_trace::{GcSink, GcTrace};
+    use crate::value::property_layout_cell_tests::{collect, isolated, Words};
+
+    #[test]
+    fn late_private_keys_are_chunk_roots_and_never_retired_heap_thread_roots() {
+        let (heap, release, _active) = isolated();
+        let body =
+            crate::parser::parse_script("class Box{#field;read(){return this.#field;}}", false)
+                .ok()
+                .unwrap();
+        let Stmt::ClassDecl(class) = &body[0] else {
+            panic!("class")
+        };
+        let method = class
+            .members
+            .iter()
+            .find_map(|member| member.func.as_ref())
+            .unwrap();
+        let chunk = compile(method).unwrap();
+        assert_eq!(chunk.private_sites.len(), 1);
+        collect(&heap, &Words(Vec::new()), CollectionKind::Major);
+        let env = crate::interpreter::new_scope(None);
+        let key = chunk.private_sites[0].key(&env, || match Value::lstr("late private key") {
+            Value::Str(key) => key,
+            _ => unreachable!(),
+        });
+        let word = key.cell_word();
+        let weak = crate::gc_handle::WeakRef::to(word as usize);
+        drop(key);
+        for kind in [CollectionKind::Minor, CollectionKind::Major] {
+            collect(&heap, &Words(Vec::new()), kind);
+            assert!(weak.live_ptr().is_some());
+            assert!(heap
+                .core
+                .borrow()
+                .owns_cell(word as usize, heap.string_desc));
+        }
+        drop(release);
+        assert!(weak.live_ptr().is_none());
+        let (later, _release_later, _active_later) = isolated();
+        struct Seen(u64, bool);
+        impl GcSink for Seen {
+            fn word(&mut self, word: u64) {
+                self.1 |= word == self.0;
+            }
+        }
+        let mut seen = Seen(word, false);
+        crate::gc_trace::trace_thread_roots(&mut seen);
+        assert!(
+            !seen.1,
+            "a Chunk surviving heap release must not publish a stale private key as a thread root"
+        );
+        collect(&later, &Words(Vec::new()), CollectionKind::Major);
+        // Keeping the old chunk's Rust allocation is safe; only its original heap registered it.
+        let mut cells = Vec::new();
+        struct WordsOut<'a>(&'a mut Vec<u64>);
+        impl GcSink for WordsOut<'_> {
+            fn word(&mut self, word: u64) {
+                self.0.push(word);
+            }
+        }
+        chunk.trace_gc(&mut WordsOut(&mut cells));
+        assert!(cells.contains(&word));
     }
 }

@@ -61,14 +61,15 @@ fn read_chunk() -> (Rc<Chunk>, ReadSite) {
     (chunk, site)
 }
 
-fn use_kind(chunk: &mut Rc<Chunk>, site: ReadSite, kind: ReadKind) {
-    let chunk = Rc::get_mut(chunk).expect("the test owns the fixture chunk");
-    chunk.ops[site.pc] = match kind {
-        ReadKind::Stack => Op::GetProp(site.name, site.cache),
-        ReadKind::This => Op::GetPropThis(site.name, site.cache),
-        ReadKind::Local => Op::GetPropLocal(site.slot, site.name, site.cache),
-        ReadKind::Method => Op::GetMethod(site.name, site.cache),
-    };
+fn use_kind(chunk: Rc<Chunk>, site: ReadSite, kind: ReadKind) -> Rc<Chunk> {
+    Chunk::rewrite_owned_for_test(chunk, |chunk| {
+        chunk.ops[site.pc] = match kind {
+            ReadKind::Stack => Op::GetProp(site.name, site.cache),
+            ReadKind::This => Op::GetPropThis(site.name, site.cache),
+            ReadKind::Local => Op::GetPropLocal(site.slot, site.name, site.cache),
+            ReadKind::Method => Op::GetMethod(site.name, site.cache),
+        };
+    })
 }
 
 struct Invocation {
@@ -250,7 +251,7 @@ fn named_read_helper_round_trips_every_value_tag_and_method_receiver() {
         ReadKind::Local,
         ReadKind::Method,
     ] {
-        use_kind(&mut chunk, site, kind);
+        chunk = use_kind(chunk, site, kind);
         for (tag, expected) in values.iter().enumerate() {
             let receiver = crate::value::Object::new(None);
             receiver
@@ -318,7 +319,7 @@ fn named_read_proxy_reentry_runs_after_borrowed_lookup_and_keeps_method_receiver
         ReadKind::This,
         ReadKind::Method,
     ] {
-        use_kind(&mut chunk, site, kind);
+        chunk = use_kind(chunk, site, kind);
         let mut outcome = invoke(
             &mut engine,
             &chunk,

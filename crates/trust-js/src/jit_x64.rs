@@ -6,8 +6,8 @@
 
 use super::{
     JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_COMPLETE, H_COND, H_EXEC, H_GET_ELEM,
-    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_RETURN,
-    H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER, H_PUSH_HANDLER, H_SET_PROP,
+    H_SLICE_OP, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -121,25 +121,18 @@ impl Asm {
         self.bytes(&(disp + 6).to_le_bytes());
         self.bytes(&tag.to_le_bytes());
     }
-    /// Transfer an owned packed return word only after checking the full vacant
-    /// sentinel. Occupied destinations retain the checked destructor boundary.
+    /// The completion router has already handled finalizers and iterator pads. Publish the
+    /// new word even when an earlier result occupies the destination; GC owns displaced cells.
     fn return_value(&mut self, mode: u32, ret_ok: usize) {
-        let slow = self.label();
         let ret = std::mem::offset_of!(super::JitCtx, ret) as i32;
-        self.mov_word_imm(PACK_UNDEFINED);
-        self.bytes(&[0x49, 0x39, 0x84, 0x24]); // cmp [r12+ret],rax
-        self.bytes(&ret.to_le_bytes());
-        self.jcc(0x85, slow);
         if mode == 1 {
             self.add_sp(-SLOT_BYTES as i8);
             self.load_word_r13(0);
-            self.bytes(&[0x49, 0x89, 0x84, 0x24]); // mov [r12+ret],rax
-            self.bytes(&ret.to_le_bytes());
+        } else {
+            self.mov_word_imm(PACK_UNDEFINED);
         }
-        self.jmp(ret_ok);
-        self.bind(slow);
-        self.call_helper_ptr(H_RETURN, mode);
-        self.bytes(&[0x49, 0x89, 0xc5]); // r13=sp
+        self.bytes(&[0x49, 0x89, 0x84, 0x24]); // mov [r12+ret],rax
+        self.bytes(&ret.to_le_bytes());
         self.jmp(ret_ok);
     }
     fn cmp_qword_r13_rax(&mut self, disp: i32) {
@@ -193,19 +186,10 @@ impl Asm {
             0x48, 0xc1, 0xea, 0x10, // shr rdx,16 (unsigned low48)
         ]);
     }
-    /// EAX contains the high16 tag. Only exact String/Symbol/Object tags take
-    /// the reference path. BigInt and reserved property tags remain checked.
-    fn reference_or_immediate(&mut self, rc_ok: bool, immediate: usize, slow: usize) {
-        let reference = self.label();
-        self.cmp_eax(0x7ffd);
-        self.jcc(0x84, slow);
-        for tag in [0x7ffe, 0x7fff, 0xfff9] {
-            self.cmp_eax(tag);
-            self.jcc(0x84, if rc_ok { reference } else { slow });
-        }
-        self.jcc(0x87, slow); // above PACK_OBJ is reserved, never an execution Number
-        self.jmp(immediate);
-        self.bind(reference);
+    /// Property-only deferred words must materialize before entering execution storage.
+    fn guard_execution_tag(&mut self, slow: usize) {
+        self.cmp_eax((crate::value::PACK_LAZY_PROTO >> 48) as u32);
+        self.jcc(0x83, slow);
     }
     fn guard_number_r13(&mut self, disp: i32, slow: usize) {
         self.load_tag_r13(disp);
@@ -237,8 +221,8 @@ impl Asm {
         self.add_sp(-8);
     }
 
-    /// Equality for owner-free Undefined/Null/Bool pairs, after the numeric path declined.
-    /// Do not infer string/BigInt equality from raw bits or drop reference owners here.
+    /// Equality for Undefined/Null/Bool pairs, after the numeric path declined.
+    /// String/BigInt content and coercion keep their semantic checked paths.
     fn scalar_equality(&mut self, strict: bool, negate: bool, slow: usize) {
         let booleans = self.label();
         let compare = self.label();
@@ -278,10 +262,9 @@ impl Asm {
         self.add_sp(-8);
     }
 
-    /// Borrow ToBoolean into edx without changing the live operand/its owner. Consuming
-    /// callers use only scalar arms; a peek may also inspect String/Symbol/ordinary Object.
-    /// BigInt, exotic HTMLDDA and destructor-running drops retain the checked helpers.
-    fn truthy_r13(&mut self, peek: bool, layout: &crate::value::JitLayout, slow: usize) {
+    /// ToBoolean into edx without changing the operand. String/Symbol/ordinary Object work
+    /// for both consuming and peek operations; BigInt and possible HTMLDDA keep checked paths.
+    fn truthy_r13(&mut self, layout: &crate::value::JitLayout, slow: usize) {
         let tagged = self.label();
         let boolean = self.label();
         let falsy = self.label();
@@ -310,7 +293,7 @@ impl Asm {
             .obj_from_cell
             .checked_add(layout.obj_ic_plain)
             .filter(|offset| *offset <= i32::MAX as usize);
-        if peek && layout.valid {
+        if layout.valid {
             self.cmp_eax(0x7fff);
             self.jcc(0x84, truthy);
             self.cmp_eax(0x7ffe);
@@ -681,15 +664,8 @@ fn emit_prop_own(
     a.bytes(&[0x4c, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=value tag
     a.cmp_eax((crate::value::PACK_EMPTY >> 48) as u32);
     a.jcc(0x84, slow);
-    let immediate = a.label();
-    let copied = a.label();
-    // BigInt and reserved/lazy-prototype words keep their checked materialization.
-    a.reference_or_immediate(true, immediate, slow);
-    a.bytes(&[0x4c, 0x89, 0xd0]);
-    a.jmp(copied);
-    a.bind(immediate);
-    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=immediate word
-    a.bind(copied);
+    a.guard_execution_tag(slow);
+    a.bytes(&[0x4c, 0x89, 0xd0]); // rax=the live property word, including BigInt
     a.store_word_r13(0);
     a.add_sp(8);
     #[cfg(test)]
@@ -907,7 +883,6 @@ pub(super) fn compile_entry(
     let unwind = a.label();
     let ret_ok = a.label();
     let ret_throw = a.label();
-    let rc_ok = layout.valid;
     let interrupt_offset = (ilayout.valid
         && ilayout.interrupt_poll_tick <= i32::MAX as usize
         && ilayout.gc_next <= i32::MAX as usize)
@@ -1046,69 +1021,31 @@ pub(super) fn compile_entry(
             }
             Op::LoadLocal(slot) => {
                 let slow = a.label();
-                let done = a.label();
-                let copy = a.label();
+                let exit = a.label();
                 let off = i32::from(*slot) * SLOT_BYTES;
                 a.load_tag_r15(off);
                 a.cmp_eax(0x7ffa); // Empty is a TDZ throw
                 a.jcc(0x84, slow);
-                a.reference_or_immediate(rc_ok, copy, slow);
+                a.guard_execution_tag(slow);
                 a.load_word_r15(off);
-                a.jmp(done);
-                a.bind(copy);
-                a.load_word_r15(off);
-                a.bind(done);
                 a.store_word_r13(0);
                 a.add_sp(8);
-                let exit = a.label();
                 a.jmp(exit);
                 a.bind(slow);
                 a.helper_spflag(H_EXEC, pc as u32, unwind);
                 a.bind(exit);
             }
             Op::StoreLocal(slot) => {
-                let slow = a.label();
-                let commit = a.label();
-                let exit = a.label();
-                let off = i32::from(*slot) * SLOT_BYTES;
-                a.load_tag_r15(off);
-                a.reference_or_immediate(rc_ok, commit, slow);
-                a.bind(commit);
-                a.load_word_r13(-SLOT_BYTES); // move the word: it owns nothing
-                a.store_word_r15(off);
+                // The incoming execution word replaces the old local without reading it.
+                a.load_word_r13(-SLOT_BYTES);
+                a.store_word_r15(i32::from(*slot) * SLOT_BYTES);
                 a.add_sp(-8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
             }
-            Op::Pop => {
-                let slow = a.label();
-                let commit = a.label();
-                let exit = a.label();
-                a.load_tag_r13(-SLOT_BYTES);
-                a.reference_or_immediate(rc_ok, commit, slow);
-                a.bind(commit);
-                a.add_sp(-8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
-            }
+            Op::Pop => a.add_sp(-8),
             Op::Dup => {
-                let slow = a.label();
-                let copy = a.label();
-                let exit = a.label();
-                a.load_tag_r13(-SLOT_BYTES);
-                a.reference_or_immediate(rc_ok, copy, slow);
-                a.bind(copy);
                 a.load_word_r13(-SLOT_BYTES);
                 a.store_word_r13(0);
                 a.add_sp(8);
-                a.jmp(exit);
-                a.bind(slow);
-                a.helper_spflag(H_EXEC, pc as u32, unwind);
-                a.bind(exit);
             }
             Op::EqEq | Op::StrictEq | Op::NotEq | Op::StrictNotEq => {
                 let slow = a.label();
@@ -1172,7 +1109,7 @@ pub(super) fn compile_entry(
             Op::JumpIfFalse(target) => {
                 let slow = a.label();
                 let have = a.label();
-                a.truthy_r13(false, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.add_sp(-SLOT_BYTES as i8);
                 a.jmp(have);
                 a.bind(slow);
@@ -1185,7 +1122,7 @@ pub(super) fn compile_entry(
             Op::JumpIfFalsePeek(target) | Op::JumpIfTruePeek(target) => {
                 let slow = a.label();
                 let have = a.label();
-                a.truthy_r13(true, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.jmp(have);
                 a.bind(slow);
                 a.call_helper_pair(H_COND, COND_PEEK_TRUTHY);
@@ -1213,7 +1150,7 @@ pub(super) fn compile_entry(
             Op::Not => {
                 let slow = a.label();
                 let done = a.label();
-                a.truthy_r13(false, layout, slow);
+                a.truthy_r13(layout, slow);
                 a.bytes(&[0x83, 0xf2, 0x01]); // negate truthiness
                 a.mov_word_imm(PACK_BOOL);
                 a.bytes(&[0x48, 0x09, 0xd0]);
@@ -1481,7 +1418,8 @@ mod tests {
         let Callable::User(user) = &object.call else {
             panic!("{name} is not a user function");
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert_eq!(
             chunk.jit.get().map(|code| code.is_some()),
             Some(expected),

@@ -621,7 +621,8 @@ mod tests {
         let Callable::User(user) = &object.call else {
             panic!("user")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         if chunk.jit.get().flatten().is_some() {
             assert!(entry
                 .cache
@@ -660,10 +661,16 @@ mod tests {
         let Callable::User(user) = &object.call else {
             panic!("user")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         if crate::bytecode::inline_recompile_at() == 100 && chunk.jit.get().flatten().is_some() {
             assert!(
-                user.func.code2.get().and_then(Option::as_ref).is_some(),
+                user.func
+                    .runtime()
+                    .code2
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some(),
                 "later feedback must be reconsidered after the empty first checkpoint"
             );
         }
@@ -695,9 +702,16 @@ mod tests {
         let Callable::User(user) = &object.call else {
             panic!("user")
         };
-        let chunk = user.func.code.get().and_then(Option::as_ref).unwrap();
+        let runtime = user.func.runtime();
+        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         if crate::bytecode::inline_recompile_at() == 100 && chunk.jit.get().flatten().is_some() {
-            assert!(user.func.code2.get().and_then(Option::as_ref).is_some());
+            assert!(user
+                .func
+                .runtime()
+                .code2
+                .get()
+                .and_then(Option::as_ref)
+                .is_some());
         }
     }
 }

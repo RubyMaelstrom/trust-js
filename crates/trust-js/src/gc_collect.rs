@@ -642,7 +642,7 @@ impl EdgeReporter<'_, '_> {
 
 impl Marking<'_> {
     /// The roots of interpreter `index` and of its host.
-    fn trace_interp_roots(&self, index: usize, words: &mut WordSink<'_>) {
+    fn trace_interp_roots(&self, index: usize, words: &mut dyn GcSink) {
         self.interps[index].trace_gc_roots(words);
         let mut host = self.hosts[index].borrow_mut();
         for &root in &host.roots {
@@ -668,7 +668,7 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         }
         // The tree shares one heap; its interned strings live as long as it does.
         if let Some(root) = self.interps.first() {
-            crate::value::trace_interned_strings(&root.gc_heap, &mut words);
+            crate::value::trace_heap_roots(&root.gc_heap, &mut words);
             // The Realms an embedder replaced by entering others, until it leaves them (S6 step
             // 11b, `GcState::entered_realms`).
             #[cfg(feature = "embed")]
@@ -840,6 +840,18 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             interp.check_native_realm_records(&registered, heap);
         }
         self.interps[0].gc_heap.handles.check_records(heap);
+        #[cfg(debug_assertions)]
+        crate::value::check_layout_owners(&self.interps[0].gc_heap, heap, |sink| {
+            for interp in &self.interps {
+                // Verification only inspects layout-owning roots. NativeGcGraph traversal
+                // consumes its worklist, which must remain intact for the actual marker.
+                interp.trace_gc_roots(sink);
+                for (_, layout) in interp.construct_capacity_hints.values() {
+                    layout.trace_gc(sink);
+                }
+            }
+            crate::gc_trace::trace_thread_roots(sink);
+        });
     }
 }
 
@@ -951,6 +963,26 @@ impl Interp {
         }
     }
 
+    /// Exercise the real root/side-slot/sweep client without conservative native roots. This
+    /// makes native old-to-young edge tests independent of stale words in Rust frames.
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {
+        assert!(self.gc_heap_root());
+        let heap = self.gc_heap.clone();
+        let marking = Marking::new(self, kind);
+        heap.handles.set_collecting(true);
+        assert!(heap.core.borrow_mut().start_marking(false, &marking, kind));
+        heap.records.borrow_mut().consume();
+        heap.handles.consume();
+        let native = marking.into_native_graphs();
+        self.gc_heap_sweep(&heap, native, kind);
+        crate::value::gc_finish_generation(&heap);
+    }
+
     /// Phase 1: mark from this tree's roots, side slots, ephemerons and the native stack (and,
     /// in a minor collection, from the heap's old cells whose cards are set). `None` when the
     /// heap deferred the collection.
@@ -1013,6 +1045,9 @@ impl Interp {
             crate::gc_handle::clear_dead_weak_cells(|addr| core.is_dead_target(addr))
         };
         heap.core.borrow_mut().finish_collection(&pinned);
+        if kind == CollectionKind::Major {
+            crate::value::prune_function_runtimes_after_major(heap);
+        }
         heap.handles.set_collecting(false);
         // The heap's bits no longer say what died: from here on only the list's length counts.
         let reclaimed = dead.len();
@@ -1306,7 +1341,7 @@ impl Interp {
             proxy_trap_caches: _,         // weak pins
             self_hosted: _,
             shared_snapshots: _,         // parsed source
-            construct_capacity_hints: _, // weak pins
+            construct_capacity_hints: _, // conditional side slots
             iterator_sym,
             wk_syms,
             short_circuit: _,

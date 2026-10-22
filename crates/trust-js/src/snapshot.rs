@@ -1542,10 +1542,8 @@ fn dec_function_inner(r: &mut Reader) -> R<Function> {
         // Lazy runtime caches — start empty, exactly as the parser leaves them.
         scan: Cell::new(0),
         hoist: OnceCell::new(),
-        calls: Cell::new(0),
-        code: OnceCell::new(),
-        code2: OnceCell::new(),
-        fn_maps: OnceCell::new(),
+        runtime: std::cell::OnceCell::new(),
+
         env_layouts: OnceCell::new(),
     })
 }

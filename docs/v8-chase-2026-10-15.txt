@@ -6706,7 +6706,8 @@ change, reviewed; 2026-10-22):
   exemptions. Deliberate wrong prologue and directory-base registers
   are both rejected by the
   comparator. Evidence is in target/s6-step12ar.
-- Measured on crystal aarch64, CPU 5, rustc 1.99.0: fresh fat-LTO,
+- Measured on crystal aarch64, CPU 5, rustc 1.99.1 for 11b and
+  12a; the retained main reference uses rustc 1.99.0. Fat-LTO,
   one-codegen-unit release exports (11b adbe71c66a3e, reviewed 12a
   5ea1c66f0230, main 311ae9ae5658), copies made together, 15
   interleaved rounds of empty/vue/react/djot/sustained at JIT and
@@ -6744,3 +6745,352 @@ change, reviewed; 2026-10-22):
     increase. Bytecode compile time there is unchanged. Both
     captures retain every sample under m12a-compile and
     m12a-compile-react; all exits, outputs and counters are valid.
+
+Step 12c/12d review clarification (2026-10-22), before either step:
+- The neutral Copy/view step compares generated code with 12b. The
+  original 11b label predates the intended changes in 12a and 12b;
+  it is not a requirement to restore their removed instructions.
+- The storage audit found Interp.new_target still read as a wide
+  value by ARM direct calls, including a second-word load, a wide
+  save and a byte-only clear. Pack it in 12d with Binding.value,
+  with_obj and VM this, including save/restore and root accounting.
+  This preserves 12e's requirement for unchanged emitted code.
+
+Step 12b full-gate review repair (2026-10-22), before the fix:
+- The first lib gates exposed a debug verifier defect: layout-owner
+  inventory called the collector's host-root traversal, consuming
+  the native graph before actual marking. Inventory must use only
+  the interpreter's non-consuming field trace; host graphs contain
+  addresses, not layout-handle owner slots. The mixed native/JS
+  ephemeron test is the integration regression for this path.
+- Chunk root registration adds Weak owners, so Rc::get_mut is no
+  longer a valid fixture-editing mechanism. Rewrite uniquely strong
+  fixture chunks as owned values inside the existing test no-GC
+  guard, then publish a new Rc and register that actual owner.
+- Owner-death cache tests must expect runtime retirement's new epoch
+  fence while retaining their live-sibling sharing proof. Native
+  creation-counter proofs require process isolation from the global
+  prototype epoch. A new runtime test also used an embed-only
+  microtask wrapper in non-embed builds; preserve its internal work.
+- The frozen first local gate was stopped after workspace/downstream
+  success and the recorded lib failures; zombie completed. The
+  corrected tree receives fresh routine gates on both machines.
+
+Step 12b review tooling correction (2026-10-22):
+- The retained DWARF helper treated pointer DIEs without an explicit
+  byte size as their pointee type, creating oversized member ranges
+  in the dump comparator. It now reads the containing unit's address
+  size and rejects overlapping or out-of-bounds struct members.
+- Re-extracted both 12a layouts from the original retained binaries
+  and repeated all nine comparisons with the corrected ranges:
+  every chunk still passes, with no exemptions. Original evidence
+  is preserved; corrected evidence is under target/s6-step12ar,
+  layouts-corrected and dumps-corrected-layouts.txt.
+
+Step 12b measurement clarification (2026-10-22), before measuring:
+- Binary .comment sections identify rustc 1.99.1 (58cf8f9c3) in
+  11b and 12a, and 1.99.0 (b940084d7) in the retained S0 main
+  binary. Corrected 12a's compiler description; its comparisons
+  with 11b use the same compiler, while comparisons with the old
+  main artifact include a compiler difference.
+- Rebuild e3310993 from a fresh export with the current compiler
+  and fat-LTO/one-codegen-unit settings. Measure both this matched
+  main and the retained S0 main beside 12a and 12b, copying all
+  four binaries together. Keep both references and report the
+  compiler effect separately; no historical result is overwritten.
+
+Step 12b stress fixture repair (2026-10-22), before the fix:
+- Targeted stress found a fixture that passes an unbranded object
+  from one Engine to another interpreter with the foreign heap
+  active. This is unavailable through the scoped public API and
+  violates I6 once property layouts become heap cells: the foreign
+  transition cache installs its layout in the owner's object.
+- Retain the shape-identity/collision regression using heap-neutral
+  key prefixes and integer shape IDs to exercise the foreign
+  transition cache. Keep each resulting layout in its own heap,
+  mutate objects with their owner active, and preserve all-tier
+  warmed-cache assertions. Explicit minor/major collections check
+  both heaps. The collector verifier and ownership rules stay in
+  force; no production cross-heap references are introduced.
+
+Step 12b performance review (2026-10-22), before any repair:
+
+All 360 samples in target/s6-step10/m12b are valid: 15 interleaved
+rounds, six workloads, four retained fat-LTO engines, crystal CPU 5.
+Quiet began after 60 seconds (inference 9 ticks, all CPUs 2437 ticks);
+other cores busy median 0.40, maximum 3.30. Outputs agree, counters are
+unscaled, and exits are zero.
+
+Against 12a, fixture cycles rise 0.5-1.8%; sustained JIT/bytecode cycles
+rise 2.0/3.1%. Peak RSS stays within 2.8% on every workload. Native
+compile medians improve and fixture generated code shrinks 1.2-1.7%.
+However, sustained allocation's median longest pause rises from 17.9 ms
+to 21.1/21.0 ms, about 18/17% at JIT/bytecode, with paired 95% bootstrap
+intervals wholly above 16%. This exceeds the component regression
+policy: hold 12b for investigation and rework.
+
+A diagnostic repeats 150 major collections over the sustained workload's
+retained 200,000-object shape. Profiles of the exact retained engines
+attribute most additional sampled cycles to Heap::locate, mark_word and
+mark. The new per-object layout edge is the leading explanation; this is
+profiling evidence, not an acceptance comparison. Data:
+target/s6-step12br/pause-profile. User-space instruction samples work;
+stack sampling is denied by the current perf settings, which remain
+unchanged. No implementation repair is chosen yet.
+
+Step 12e preflight clarifications (2026-10-22), before 12d/12e:
+
+Shrinking Value can change JitCtx.error's Option<Abrupt> and
+resume_step's Option<VmStep>, shifting later JitCtx fields and
+JitFrame's word base. Interp is repr(Rust); pending_new_target and
+import_meta can affect its probed member offsets too. No byte delta is
+assumed before measurement. Keep the compact carriers: 12e's neutral
+comparison to 12d may normalize only actual DWARF-measured JIT field
+moves, proven at each instruction's base register and source emitter.
+All other instructions, scalar constants and branch destinations remain
+exact. Object, Property, Scope, Binding, Chunk and fixed cache records
+must be measured as applicable; they receive no blanket exemption.
+
+The argument-loan audit also found an existing Function.prototype.apply
+rooting gap: its ordinary pooled Vec is unregistered while later indexed
+getters may collect values returned by earlier getters. Keep that
+evaluated prefix rooted during construction as part of 12e's
+apply/argument boundary work. Both simple and forwarded constructor
+initializer paths must stop destructively replacing words in borrowed
+caller windows. Bare native tests must exercise opaque function-pointer
+calls for Ok and Err, EMPTY forwarding and post-call polling/tail-drain
+lifetimes on ARM, x64 and Wine.
+
+Step 12b marking review amendment (2026-10-22), before the repair:
+
+Evaluate a bounded positive-word cache local to one Marker to avoid
+resolving and checking the same shared layout/prototype edge repeatedly.
+Compare a tiny recent-word set with a small direct-mapped table; retain
+the version supported by full-workload measurements, including misses
+and churn. Every traced edge remains present.
+
+Only an allocated, non-zombie cell proven marked may enter the cache,
+after first-mark parent/statistics/worklist and waiter-wakeup
+bookkeeping. Exact-word equality is required. A fresh cache starts each
+collection before native-stack scanning and disappears before post-
+marking allocations or sweeping. Minor card-owner worklist tracing,
+private-layout owner verification and the independent heap verifier
+remain unchanged. Tests cover collisions, repeated collections and
+address reuse, ephemeron wakeups, old-to-young cards and invalid words;
+key mutations must fail their intended assertions. Preserve the initial
+measurements, then repeat routine gates and matched performance after
+any retained production change.
+
+Step 12b cache comparison (2026-10-22), before refinement:
+
+Fresh fat-LTO recent4 (42d1bac6f3ed), direct32 (2b69819fa623) and
+inlining-only (eaacf3a3d057) exports were compared with 12a, initial 12b
+and matched main over 540 valid fixture samples. Direct32 restores the
+sustained longest pause to about 17.7 ms; recent4 reaches 19.1 ms and
+inlining alone 20.7 ms. However, direct32 adds minor-collection miss
+traffic versus inlining alone. Across 88 additional shared/distinct-
+layout diagnostic samples, it improves shared major-collection time
+about 19%, but distinct layouts' cycles rise 6.7% versus initial 12b.
+These are diagnostic comparisons, not replacements for the acceptance
+fixtures; keep all samples.
+
+Evaluate one contained refinement: use the cache for small trace batches
+and the original locate/mark path for batches above 64 edges. Specialize
+mark_word at compile time, select the loop once per batch, and keep all
+marking/waiter/card behavior identical. This preserves small shared-edge
+caching during both collection kinds and avoids filling it with long
+unique streams. The threshold is an amortization heuristic, not a claim
+that large batches are unique. Test uncached sole-held
+targets/descendants and add large repeated-reference and shared-minor
+diagnostics before selection. No candidate is accepted yet.
+
+Step 12b marking selection (2026-10-22), before final routine gates:
+
+Retain the 32-entry exact positive-word cache with the 64-edge batch
+limit. The uncached specialization preserves every first-mark effect;
+large batches still traverse all edges. The measured source is frozen
+at core SHA 2eadf66c; a separately reviewed 167-line test insertion
+adds real minor-first and old-carded large-batch cases. Production is
+byte-identical. The final source core SHA is 179ef1d8.
+
+Fresh fat-LTO binary 787cbefb0836 (20127584 bytes), current compiler,
+was compared over 540 valid fixture samples and 176 diagnostic samples.
+Against 12a, sustained longest-pause medians fall 17.98 to 15.61/15.55
+ms at JIT/bytecode; total GC time falls 6.1/5.5%. Framework cycles
+change +1.54/+0.23/+0.34% for Vue/React/Djot, with peak RSS within
+2.5%. The distinct-layout diagnostic costs 2.33% cycles versus initial
+12b (paired 95% CI 0.50..4.79), down from the broad cache's 6.7%.
+Shared major and young shared churn improve 34.6% and 17.8%. Large
+repeated arrays lose the broad cache's extra gain but remain 3.6%
+faster than initial 12b. These probes supplement the acceptance
+fixtures; none replaces them.
+
+A 600-sample, 100-round follow-up investigated the noisy empty-exit
+GC and React compilation components. React native compilation is
+4.2% lower than 12a (95% CI -9.29..-1.13). Empty startup wall/cycles
+change +0.86/+1.65%, RSS -0.02%. Its exit-GC median changes +0.26%,
+but the interval remains wide (-3.38..17.96%); do not claim a precise
+exit-GC speedup or equivalence. Retain the initial 15-round estimate
+and all follow-up samples. Both have identical outputs and valid
+counters. The first 12a empty run alone has 31 major faults; it is
+retained. Other-core load medians/maxima are 0.595/3.175 for fixtures,
+0.895/3.415 for diagnostics and 1.499/4.256 for the small follow-up.
+All runs start after the established 60-second quiet check.
+
+Artifacts: target/s6-step10/m12b-mark-batch64, m12b-batch64-probes
+and m12b-batch64-small, including component-review.jsonl intervals.
+Final local and zombie routine gates follow this selection. No
+commit is made before those gates and the source review complete.
+
+Step 12e native ABI clarification (2026-10-22), before implementation:
+
+The existing bare/captured callback conversion changes the function
+pointer's return type from Result<scoped Value, scoped Value> to
+Result<internal Value, internal Value>. Equal size/alignment and
+successful opaque calls do not establish this aggregate ABI contract.
+Rust documents compatibility for transparent wrappers themselves, not
+an automatic substitution through arbitrary aggregate types.
+
+Keep callback calls at a signature with their actual declared Result
+return type, then convert its Ok/Err value explicitly. Preserve bare
+function storage without an allocated closure, native caching,
+read-only argument loans, brands and EMPTY normalization. The read-
+only preflight is selecting the smallest sound dispatch representation
+before 12e starts; no implementation choice is made here. ABI tests
+remain required regression evidence, rather than the safety argument.
+
+References checked against Rust 1.99.1 documentation:
+https://doc.rust-lang.org/std/primitive.fn.html#abi-compatibility
+https://doc.rust-lang.org/reference/type-layout.html
+
+Step 12e ABI design selected (2026-10-22), before implementation:
+
+Use a separate typed ScopedNative bare-function variant and a typed
+ScopedCaptured body. The native IC keeps its existing fields and uses
+unused direct flag 0x40 to select the declared callback signature inside
+Rust helpers. Its compiled-entry bit stays clear and intrinsic ID stays
+zero. All four native pointer reconstruction paths must honor the flag
+before reentry; scoped callbacks never enter engine-intrinsic shortcuts.
+
+Map Ok/Err explicitly after calling the original typed pointer. Share
+native bookkeeping without allocating a closure adapter. Retain argument
+loans, captures, host restoration, interruption, constructor state and
+post-call tail lifetimes. Existing emitted probes still test direct bit
+zero; verify unchanged code and measure the expected-stable callable,
+cache and payload layouts. This changes no public callback ergonomics.
+The detailed source inventory is retained locally for implementation;
+these requirements and the safety rationale are tracked here.
+
+Step 12d x64 fixed-name completion (2026-10-22), before the fix:
+
+The new exact-mode tests found that x64 has no native FIXED_NAME_IC
+branch: a valid fixed-layout current scope falls to the helper. Complete
+that path in 12d, whose coverage explicitly includes packed native
+binding commits in fixed environments. Reuse the validated slot-address
+logic; preserve layout/slot bounds, full-word with absence, live
+initialization/import/mutability flags and the actual environment's
+write barrier. Exercise all word kinds, rejection and recovery, and a
+discriminating isolated mutation. This is a deliberate x64 admission
+addition, not a claimed neutral width-only rewrite. Unrelated packed
+loop paths keep their existing admission and bailout behavior.
+
+Step 12b, traced property layouts and generated count guards (code
+change, reviewed; 2026-10-22):
+- PropertyLayout is a non-Copy GC handle. Cloning permanently marks
+  its payload shared; structural writes detach into a private cell.
+  Keys and their optional index have a payload finalizer. Objects,
+  Props, deferred prototypes, shape directories, array-length and
+  for-in caches, constructor hints, function maps and chunks trace
+  their layout edges. Debug verification counts owning slots, not
+  repeated visits, before enforcing the private-layout invariant.
+- Function runtime caches belong to a heap identified by a
+  never-reused ID. Primary lookup borrows its stable entry; foreign
+  entries are bounded to four and live closures keep evicted entries
+  recoverable through a weak per-heap index. Major collections prune
+  and shrink that index after finalization; minors do not scan it.
+  Actual weak Chunk/FunctionMaps registrations trace late fields.
+  Source cloning clears derived caches without touching old cells,
+  and runtime retirement fences raw call-cache slots before freeing
+  them, even when another owner retains the compiled chunk.
+- Generated layout count traffic and jit_ownership.rs are gone.
+  Stores no longer inspect displaced values for ownership; dense
+  holes still take their checked path, and numeric reads retain
+  their type guards. Exact Math/isNaN intrinsics ignore receiver
+  kind. x64 word transfers admit BigInt while preserving TDZ,
+  lazy-word, equality and HTMLDDA semantics. Native return paths
+  publish their result unconditionally, including full Undefined
+  for mode zero. Descriptor, capacity and receiver card checks stay.
+- Sole-holder tests cover static and late code/template layouts,
+  constants, private keys, weak constructor hints and cache eviction.
+  Foreign parsed-code reuse, runtime leases and neutral clones run
+  across heaps and after heap release. Native counter assertions
+  distinguish real fast commits from helper fallbacks. Ten isolated
+  mutations fail at their intended assertions: eight trace/shared/
+  retirement cases, a native creation-card omission, and a faithful
+  per-heap shape-ID allocator restoring the old collision.
+- Final selected-source routine gates (fresh after the marking repair):
+  - aarch64 lib 2367/0/7, list +40/-2 (two renamed tests); all five
+    clippy configurations and formatting clean, rustdoc retains
+    eight warnings, workspace all-target build has no diagnostics.
+    Downstream host/timers/fs/web/node/runtime pass 37/6/0/62/45/184
+    tests, with the existing web/runtime ignores.
+  - Test262 JIT threshold 8: 53575/53575, identical baseline report.
+    Targeted stress: 1822 pass, five ignored, no failures or
+    timeouts across all 1827 selected tests; no retries needed.
+  - zombie x64 lib 2197/0/7; Wine 2189/3/7, only the three baseline
+    snapshot codec failures. Lists +37/-2. x64 clippy is clean and
+    Windows retains 23 diagnostics. All release checks pass.
+  - Fixtures keep outputs, 56/10/160 compiles and 21/6/16
+    collections on both machines. Difftest: 138 agree, 12 budget
+    skips, no crash. Sustained allocation keeps its output and
+    194 collections at both tiers. All nine final dump pairs match
+    initial 12b exactly apart from consistent address relocations.
+  - Full root-owned local/remote logs and source maps are retained
+    in target/s6-step12bmr; the remote source matches all 493
+    selected paths. Earlier failed gates and diagnostic variants
+    remain preserved separately; no failure is relabeled a pass.
+- The per-Marker cache has 32 exact positive words, initialized
+  afresh each collection. It records only allocated, non-zombie
+  marks after every first-mark effect and waiter notification.
+  Descriptor batches above 64 edges use the uncached specialized
+  loop; card tracing and both verifiers remain independent.
+  Thirteen tests cover hits, collisions, invalid words, native
+  roots, reuse, cards, conditional edges and the real minor paths.
+  Three cache mutants and two batch-path mutants fail their
+  intended assertions in isolated successful builds. The final
+  two minor tests are test-only additions to measured production;
+  root review verifies the exact 167-line insertion.
+- Release DWARF: Object 160, Interp 5776, JitCtx 328 and JitFrame
+  2376 bytes remain unchanged; PropertyLayoutData grows 32 to 40
+  while losing its external Rc header; Chunk grows 1320 to 1344.
+- All nine fixture/stub dump comparisons are accounted for by exact
+  source-constrained rewrites, four measured Vec-header loads and
+  four measured Chunk loads/stores. The comparator verifies base
+  register provenance, scalar MOV/MOVK constants, consistent tagged
+  pointer relocations and surviving branch destinations. Cards and
+  semantic checks remain exact. No unexplained chunk is exempted.
+  - Djot's inline-stub constructor crosses the existing optional
+    code budget: 15820 to 15040 bytes against a 15104-byte limit.
+    Retained binaries' REGIONLOG confirms rejection then admission.
+    A fresh isolated 12a diagnostic export raises only that budget
+    allowance, admitting the old region for complete comparison.
+    Its entire code matches after the planned rewrites; it is never
+    used as a performance baseline or production candidate.
+  - Four deliberate comparator mutations are rejected: wrong
+    Undefined publication, wrong hole tag, wrong layout base
+    register and an omitted card inside the newly admitted region.
+    Each corresponding unmodified comparison passes.
+- Performance selection and all component intervals are recorded
+  above, including rejected variants and the small-component
+  follow-up. Final fat-LTO binary 787cbefb0836 (20127584 bytes),
+  parent 12a 5ea1c66f0230, matched main 4de8ccc1edd4, rustc 1.99.1,
+  fat LTO/one codegen unit on Crystal aarch64 (CPU 5 pinned,
+  Cortex-X925/A725, Linux 7.3.0, frequency boost disabled).
+  Framework cycles versus 12a change +1.54/+0.23/+0.34%; sustained
+  JIT/bytecode cycles -1.72/-0.48%. Median longest sustained pauses
+  improve 13.2/13.5%, and total GC time 6.1/5.5%. Generated fixture
+  code shrinks, while compile-cost and memory reviews are retained
+  separately. The noisy empty exit-GC interval remains explicit.
+  Against matched main, framework cycles improve 10.5/14.4/8.1%,
+  sustained JIT/bytecode 34.8/28.2%; this does not close S0's
+  outstanding React RSS or Djot GC-share bounds.

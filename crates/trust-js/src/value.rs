@@ -263,6 +263,7 @@ impl PackedValue {
         self.0.get() == PACK_EMPTY
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn is_undefined(&self) -> bool {
         self.0.get() == PACK_UNDEFINED
@@ -1108,7 +1109,7 @@ pub struct JitLayout {
     /// first word of an object cell.
     pub obj_from_cell: usize,
     /// The build's representation facts beyond these offsets ([`JitRepr`]): where a key layout's
-    /// strong count sits, how named fields and binding-map entries hold their elements, a slot
+    /// named fields and binding-map entries hold their elements, a slot
     /// memo's width and the Collection tag, probed once per process.
     pub(crate) repr: &'static JitRepr,
     pub obj_proto: usize,
@@ -1131,7 +1132,7 @@ pub struct JitLayout {
     pub props_entries: usize,
     /// Nullable stored Rc pointer to the shared key Vec; live keys are its fields-length prefix.
     pub props_layout: usize,
-    /// Stored layout Rc pointer -> the key Vec header.
+    /// Stored layout cell address -> its first-field key Vec header.
     pub layout_data_off: usize,
     pub shape_layout_entry_size: usize,
     pub shape_layout_entry_id: usize,
@@ -1303,9 +1304,6 @@ pub(crate) fn probe_vec_layout<T>(vec: &Vec<T>) -> Option<JitVecLayout> {
 /// interpreter's fields at probed offsets.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct JitRepr {
-    /// Stored PropertyLayout Rc pointer → its strong count. Key layouts are
-    /// `Rc<PropertyLayoutData>`: located and verified on a live layout.
-    pub(crate) layout_rc_strong_off: usize,
     /// How the instance-field storage at `JitLayout::props_entries` holds its `Property` values.
     pub(crate) props_fields: JitVecLayout,
     /// Where a small (or indexed) binding map keeps its ordered entries, and how: an `InlineVec`
@@ -1324,7 +1322,7 @@ pub(crate) struct JitRepr {
     /// alone), so one unsigned range test can admit them. Probed: Collection's tag must directly
     /// follow None's.
     pub(crate) exotic_ordinary_contiguous: bool,
-    /// The PropertyLayout count, named-field and Collection-tag probes held: a `JitLayout` is
+    /// The named-field and Collection-tag probes held: a `JitLayout` is
     /// valid only if they did.
     pub(crate) valid: bool,
 }
@@ -1337,16 +1335,6 @@ pub(crate) fn jit_repr() -> &'static JitRepr {
 
 fn probe_jit_repr() -> JitRepr {
     use std::mem::offset_of;
-    // Key layouts are `Rc<PropertyLayoutData>` (never a value owner): locate their strong count
-    // on a live one.
-    let key_layout = Rc::new(PropertyLayoutData::new(vec![Rc::<str>::from("key")]));
-    let layout_rc_strong_off = probe_strong_count(
-        unsafe { *(&key_layout as *const PropertyLayout as *const usize) },
-        Rc::as_ptr(&key_layout) as usize,
-        || Rc::strong_count(&key_layout),
-        || key_layout.clone(),
-    );
-
     // Named fields: an InlineVec keeping the first INLINE_NAMED_SLOTS in the cell, probed in
     // place and spilled.
     let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
@@ -1397,7 +1385,6 @@ fn probe_jit_repr() -> JitRepr {
         && u64::from(slot_memo_none) + 1 == 1u64 << (8 * slot_memo_width);
 
     JitRepr {
-        layout_rc_strong_off: layout_rc_strong_off.unwrap_or(0),
         props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
             ptr: 0,
             len: 0,
@@ -1408,41 +1395,7 @@ fn probe_jit_repr() -> JitRepr {
         slot_memo_none,
         exotic_collection_tag,
         exotic_ordinary_contiguous,
-        valid: layout_rc_strong_off.is_some() && props_fields.is_some() && collection_ok,
-    }
-}
-
-/// Locate the strong count of a reference-counted allocation from its stored pointer `stored`,
-/// whose data starts at `data`: the one header word that reads `count()` and follows it while an
-/// extra owner made by `owner` comes and goes. `None` unless exactly one word does.
-fn probe_strong_count<T>(
-    stored: usize,
-    data: usize,
-    count: impl Fn() -> usize,
-    owner: impl FnOnce() -> T,
-) -> Option<usize> {
-    let header = data.checked_sub(stored)?;
-    if !header.is_multiple_of(8) || header > 64 {
-        return None;
-    }
-    // SAFETY: the header words lie between the stored pointer and the live allocation's data.
-    let words = || -> Vec<usize> {
-        (0..header)
-            .step_by(8)
-            .map(|off| unsafe { *((stored + off) as *const usize) })
-            .collect()
-    };
-    let (before, held) = (words(), count());
-    let extra = owner();
-    let (during, counted) = (words(), count());
-    drop(extra);
-    let after = words();
-    let mut moved = (0..before.len()).filter(|&i| {
-        before[i] == held && during[i] == counted && after[i] == held && counted == held + 1
-    });
-    match (moved.next(), moved.next()) {
-        (Some(word), None) => Some(word * 8),
-        _ => None,
+        valid: props_fields.is_some() && collection_ok,
     }
 }
 
@@ -1495,7 +1448,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     };
     let mut keys = Vec::with_capacity(3);
     keys.push(Rc::<str>::from("key"));
-    let key_layout = Some(Rc::new(PropertyLayoutData::new(keys)));
+    let key_layout = Some(new_property_layout(keys));
     let key_vec = &key_layout.as_ref().unwrap().keys;
     let key_ptr = key_vec.as_ptr() as usize;
     let key_words = unsafe {
@@ -1508,11 +1461,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && vec_len_off.is_some_and(|o| key_words[o / 8] == 1)
         && vec_cap_off.is_some_and(|o| key_words[o / 8] == 3);
     let layout_word = unsafe { *(&key_layout as *const Option<PropertyLayout> as *const usize) };
-    // Generated creation code follows the stored Rc to the live PropertyLayoutData and then to
+    // Generated creation code follows the stored cell address to PropertyLayoutData and then to
     // its first-field key Vec. Measure this path instead of relying on the Rust struct layout.
     let layout_data_off = (&key_layout.as_ref().unwrap().keys as *const Vec<Rc<str>> as usize)
         .wrapping_sub(layout_word);
-    // (The layout's strong count is `JitRepr::layout_rc_strong_off`.)
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = layout_data_off < 256
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
@@ -2064,7 +2016,59 @@ pub struct UserCallable {
     /// A lazily allocated proof for a getter body that returns one captured binding. Kept after
     /// the JIT-visible prefix so ordinary call probes retain their established field offsets;
     /// most functions pay only this nullable pointer and allocate no cache.
-    pub(crate) binding_getter_cache: Cell<Option<Box<crate::interpreter::BindingGetterCache>>>,
+    pub(crate) cache: Cell<Option<Box<UserCallableCache>>>,
+}
+
+/// The existing nullable closure sidecar also pins foreign runtime entries. Primary closures
+/// need no pin: their AST owns its stable primary entry. Runtime leases survive getter resets.
+pub(crate) struct UserCallableCache {
+    pub(crate) runtime: Option<Rc<crate::function_runtime::FunctionRuntime>>,
+    pub(crate) binding_getter: Option<crate::interpreter::BindingGetterCache>,
+}
+
+impl UserCallable {
+    pub(crate) fn take_binding_getter_cache(
+        &self,
+    ) -> Option<crate::interpreter::BindingGetterCache> {
+        let mut sidecar = self.cache.take()?;
+        let proof = sidecar.binding_getter.take();
+        self.cache.set(Some(sidecar));
+        proof
+    }
+
+    pub(crate) fn put_binding_getter_cache(
+        &self,
+        proof: Option<crate::interpreter::BindingGetterCache>,
+    ) {
+        let mut sidecar = self.cache.take();
+        if let Some(sidecar) = &mut sidecar {
+            sidecar.binding_getter = proof;
+        } else if proof.is_some() {
+            sidecar = Some(Box::new(UserCallableCache {
+                runtime: None,
+                binding_getter: proof,
+            }));
+        }
+        if sidecar
+            .as_ref()
+            .is_some_and(|sidecar| sidecar.runtime.is_none() && sidecar.binding_getter.is_none())
+        {
+            sidecar = None;
+        }
+        self.cache.set(sidecar);
+    }
+
+    fn cloned_runtime_pin(&self) -> Option<Box<UserCallableCache>> {
+        let sidecar = self.cache.take();
+        let pin = sidecar.as_ref().and_then(|sidecar| sidecar.runtime.clone());
+        self.cache.set(sidecar);
+        pin.map(|runtime| {
+            Box::new(UserCallableCache {
+                runtime: Some(runtime),
+                binding_getter: None,
+            })
+        })
+    }
 }
 
 impl Clone for UserCallable {
@@ -2075,7 +2079,7 @@ impl Clone for UserCallable {
             realm: self.realm,
             // A cloned callable starts without a resolution proof. Its new owner can refill a
             // cache against the same live environment when it is first used.
-            binding_getter_cache: Cell::new(None),
+            cache: Cell::new(self.cloned_runtime_pin()),
         }
     }
 }
@@ -2094,11 +2098,20 @@ pub struct WrappedCrossCallable {
 
 impl Callable {
     pub(crate) fn user(func: Rc<Function>, env: Env, realm: usize) -> Callable {
+        let runtime = match func.runtime() {
+            crate::function_runtime::RuntimeLease::Primary(_) => None,
+            crate::function_runtime::RuntimeLease::Foreign(runtime) => {
+                Some(Box::new(UserCallableCache {
+                    runtime: Some(runtime),
+                    binding_getter: None,
+                }))
+            }
+        };
         let user = UserCallable {
             func,
             env,
             realm,
-            binding_getter_cache: Cell::new(None),
+            cache: Cell::new(runtime),
         };
         Callable::User(crate::gc_box::new(user))
     }
@@ -2216,7 +2229,7 @@ pub(crate) struct Object {
 impl Object {
     /// Whether finalization has any owned allocation to release. Exhaustive field and variant
     /// matches make new storage participate in this decision. Property words and cell handles
-    /// have no owning drops, but inline properties can own accessor boxes and a layout Rc.
+    /// have no owning drops, but inline properties can own accessor boxes.
     fn owns_payload(&self) -> bool {
         let Self {
             proto: _,
@@ -2240,9 +2253,8 @@ impl Object {
             proto_slot: _,
             len_slot: _,
         } = props;
-        let NamedEntries { fields, layout } = entries;
+        let NamedEntries { fields, layout: _ } = entries;
         fields.spilled()
-            || layout.is_some()
             || elems.0.is_some()
             || native_typed_array.is_some()
             || fields.iter().any(|property| {
@@ -2456,7 +2468,11 @@ pub(crate) struct GcState {
     diagnostics: RefCell<allocation_diagnostics::State>,
     weak_observers: RefCell<crate::fasthash::FastMap<usize, crate::weak_metadata::DeathObservers>>,
     shapes: RefCell<ShapeTable>,
+    function_runtimes: RefCell<
+        crate::fasthash::FastMap<u64, std::rc::Weak<crate::function_runtime::FunctionRuntime>>,
+    >,
     array_length_shape: Cell<u32>,
+    array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
     allocated: Cell<u64>,
     /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
@@ -2474,13 +2490,14 @@ pub(crate) struct GcState {
     pub(crate) user_fn_desc: crate::gc_core::DescId,
     /// Deferred-prototype cells (each a function's [`LazyFunctionPrototype`]).
     pub(crate) lazy_proto_desc: crate::gc_core::DescId,
+    /// Ordered property-key payload cells.
+    pub(crate) property_layout_desc: crate::gc_core::DescId,
     /// This heap's interned one-unit ASCII and small array-index strings (`jstr::unit_lstr`,
     /// `jstr::index_lstr`), roots for the heap's lifetime.
     pub(crate) interned_strings: RefCell<Vec<Option<crate::lstr::LStr>>>,
-    /// P1 S4: the roots of the AST-level templates built in this heap (see [`TemplateRoots`]),
-    /// held weakly: a template's strings are roots while the template lives. Dead entries are
-    /// dropped as they are traced.
-    pub(crate) template_roots: RefCell<Vec<std::rc::Weak<TemplateStrings>>>,
+    /// Actual AST template and compiled chunk owners, weakly registered in their heap. Their
+    /// constants and layouts are roots for the Rust owner's lifetime, including late fields.
+    pub(crate) code_roots: RefCell<Vec<std::rc::Weak<dyn crate::gc_trace::GcTrace>>>,
     /// S6 step 11b: the Realms an embedder entered and has not left (`Ctx::enter_realm`), each
     /// with the state of the Realm it replaced, which is a root of every collection until the
     /// entry is left. Innermost last.
@@ -2580,6 +2597,7 @@ struct CellDescs {
     string: crate::gc_core::DescId,
     user_fn: crate::gc_core::DescId,
     lazy_proto: crate::gc_core::DescId,
+    property_layout: crate::gc_core::DescId,
 }
 
 /// The cell heap behind a [`GcState`] and the descriptors of its cell kinds.
@@ -2612,13 +2630,18 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
         // A closure's environment is set when the closure is made.
         carded: false,
     });
-    // The finalizer drops the cell's `PropertyLayout`, its only Rust-heap owner.
     let lazy_proto = core.register_desc(crate::gc_core::LayoutDesc {
         name: "lazy prototype",
         trace: lazy_function_prototype::trace_cell,
-        finalize: Some(crate::gc_box::finalize::<LazyFunctionPrototype>),
+        finalize: None,
         // Materialization writes the cell's state (`LazyFunctionPrototype::materialize`).
         carded: true,
+    });
+    let property_layout = core.register_desc(crate::gc_core::LayoutDesc {
+        name: "property layout",
+        trace: crate::gc_box::trace_none,
+        finalize: Some(crate::gc_box::finalize::<PropertyLayoutData>),
+        carded: false,
     });
     (
         core,
@@ -2630,6 +2653,7 @@ fn new_cell_heap() -> (crate::gc_core::Heap, CellDescs) {
             string,
             user_fn,
             lazy_proto,
+            property_layout,
         },
     )
 }
@@ -2678,22 +2702,79 @@ pub(crate) fn interned_string(
     })
 }
 
-/// Report a heap's interned strings, roots for its lifetime.
-pub(crate) fn trace_interned_strings(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
+/// Report this heap's permanent caches and actual live code/template owners. Root containers
+/// are scanned in full in minor collections, including fields published since the last one.
+pub(crate) fn trace_heap_roots(heap: &GcState, sink: &mut dyn crate::gc_trace::GcSink) {
     for string in heap.interned_strings.borrow().iter().flatten() {
         sink.word(string.cell_word());
     }
-    heap.template_roots
+    use crate::gc_trace::GcTrace;
+    heap.array_length_layout.borrow().trace_gc(sink);
+    heap.shapes.borrow().layouts.trace_gc(sink);
+    heap.code_roots
         .borrow_mut()
-        .retain(|roots| match roots.upgrade() {
-            Some(strings) => {
-                for string in strings.borrow().iter() {
-                    sink.word(string.cell_word());
-                }
+        .retain(|owner| match owner.upgrade() {
+            Some(owner) => {
+                owner.trace_gc(sink);
                 true
             }
             None => false,
         });
+}
+
+/// Verify the COW invariant by actual owning-slot identity, independently of repeated collector
+/// visits. Only words resolved as this heap's layout cells may have their shared bit read.
+#[cfg(debug_assertions)]
+pub(crate) fn check_layout_owners(
+    heap: &GcState,
+    core: &crate::gc_core::Heap,
+    trace_roots: impl FnOnce(&mut dyn crate::gc_trace::GcSink),
+) {
+    use crate::gc_trace::{GcSink, GcTrace};
+    struct Owners<'a> {
+        core: &'a crate::gc_core::Heap,
+        desc: crate::gc_core::DescId,
+        slots: crate::fasthash::FastMap<usize, usize>,
+    }
+    impl GcSink for Owners<'_> {
+        fn word(&mut self, _: u64) {}
+        fn layout(&mut self, layout: &PropertyLayout) {
+            let cell = layout.as_ptr() as usize;
+            if !self.core.owns_cell(cell, self.desc) {
+                return;
+            }
+            if layout.is_shared() {
+                return;
+            }
+            let slot = std::ptr::from_ref(layout) as usize;
+            if let Some(&previous) = self.slots.get(&cell) {
+                assert_eq!(
+                    previous, slot,
+                    "private property layout {cell:#x} has two owning slots"
+                );
+            } else {
+                self.slots.insert(cell, slot);
+            }
+        }
+    }
+    let mut owners = Owners {
+        core,
+        desc: heap.property_layout_desc,
+        slots: Default::default(),
+    };
+    for cell in core.live_cells(heap.object_desc) {
+        // SAFETY: allocated non-zombie cells of this descriptor hold initialized Objects; all
+        // engine borrows have ended at the safepoint (I9), as for the ordinary descriptor walk.
+        let object = unsafe { (&*(cell as *const RefCell<Object>)).try_borrow_unguarded() }
+            .expect("object mutably borrowed during layout verification (I9)");
+        object.trace_gc(&mut owners);
+    }
+    for cell in core.live_cells(heap.lazy_proto_desc) {
+        // SAFETY: same initialized-cell and safepoint contract.
+        unsafe { &*(cell as *const LazyFunctionPrototype) }.trace_gc(&mut owners);
+    }
+    trace_heap_roots(heap, &mut owners);
+    trace_roots(&mut owners);
 }
 
 /// A fresh payload cell of `size` bytes in the active Agent's heap (see `GcBox::new`).
@@ -2770,6 +2851,7 @@ impl crate::gc_trace::GcTrace for Object {
         for property in props.values().chain(self.internal_slots().values()) {
             property.trace_gc(sink);
         }
+        props.entries.layout.trace_gc(sink);
         props.trace_symbol_keys(sink);
         match exotic {
             Exotic::ArrayIterator(state) => sink.value(&state.target),
@@ -2815,6 +2897,7 @@ impl crate::gc_trace::GcTrace for Object {
 
 impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        crate::gc_trace::GcTrace::trace_gc(&self.entries.layout, sink);
         for property in self.values() {
             crate::gc_trace::GcTrace::trace_gc(property, sink);
         }
@@ -3267,6 +3350,10 @@ pub(crate) fn scan_gc_heap_retained_memory(
                 .sum::<usize>(),
         );
     }
+    bytes = bytes.saturating_add(
+        heap.function_runtimes.borrow().capacity()
+            * std::mem::size_of::<(u64, std::rc::Weak<crate::function_runtime::FunctionRuntime>)>(),
+    );
     let shapes = heap.shapes.borrow();
     bytes = bytes.saturating_add(
         shapes
@@ -3290,6 +3377,13 @@ pub(crate) fn scan_gc_heap_retained_memory(
     for layout in shapes.layouts.iter() {
         visitor.property_layout(layout);
     }
+    if let Some(layout) = &*heap.array_length_layout.borrow() {
+        visitor.property_layout(layout);
+    }
+    bytes = bytes.saturating_add(
+        heap.code_roots.borrow().capacity()
+            * std::mem::size_of::<std::rc::Weak<dyn crate::gc_trace::GcTrace>>(),
+    );
     (bytes, shapes.transitions.is_empty())
 }
 
@@ -3475,7 +3569,9 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
         weak_observers: RefCell::new(Default::default()),
         shapes: RefCell::new(ShapeTable::new()),
+        function_runtimes: RefCell::default(),
         array_length_shape: Cell::new(SHAPE_EMPTY),
+        array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
         allocated: Cell::new(0),
         core: RefCell::new(core),
@@ -3486,8 +3582,9 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         string_desc: descs.string,
         user_fn_desc: descs.user_fn,
         lazy_proto_desc: descs.lazy_proto,
+        property_layout_desc: descs.property_layout,
         interned_strings: RefCell::default(),
-        template_roots: RefCell::default(),
+        code_roots: RefCell::default(),
         #[cfg(feature = "embed")]
         entered_realms: RefCell::default(),
         records: RefCell::default(),
@@ -3556,51 +3653,78 @@ pub(crate) fn active_heap_id() -> u64 {
     with_active_gc_heap(|heap| heap.heap_id)
 }
 
-/// The strings one AST-level template holds.
-pub(crate) type TemplateStrings = RefCell<Vec<crate::lstr::LStr>>;
-
-/// The roots of one AST-level template (`ast::FunctionMaps`): the strings it holds, cells of
-/// the heap that built it. They are roots while the template lives, and the heap lists them
-/// weakly (`GcState::template_roots`), so the strings of discarded code are collected. Clones
-/// share the roots.
-#[derive(Clone)]
-pub(crate) struct TemplateRoots {
-    strings: Rc<TemplateStrings>,
+/// Heap identity and an inert lifetime token. Parsed code may outlive its first Engine;
+/// this token can be checked without reading any cell or retaining the heap.
+#[derive(Clone, Debug)]
+pub(crate) struct HeapLifetime {
+    pub(crate) id: u64,
+    handles: std::rc::Weak<crate::handles::HandleTable>,
 }
 
-impl TemplateRoots {
-    /// Roots for a template the active heap builds.
-    pub(crate) fn new() -> Self {
-        let strings = Rc::new(TemplateStrings::default());
-        with_active_gc_heap(|heap| {
-            heap.template_roots
-                .borrow_mut()
-                .push(Rc::downgrade(&strings))
-        });
-        TemplateRoots { strings }
+impl HeapLifetime {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.handles
+            .upgrade()
+            .is_some_and(|handles| handles.is_alive())
     }
+}
 
-    /// Keep `value`, a string the template holds, for the template's lifetime.
-    pub(crate) fn pin(&self, value: &Value) {
-        if let Value::Str(string) = value {
-            self.strings.borrow_mut().push(string.clone());
+pub(crate) fn active_heap_lifetime() -> HeapLifetime {
+    with_active_gc_heap(|heap| HeapLifetime {
+        id: heap.heap_id,
+        handles: Rc::downgrade(&heap.handles),
+    })
+}
+
+/// Recover an evicted foreign entry while a live closure pins it. Never-reused cache identities
+/// avoid pointer ABA; the index is weak and pruned on cold insertion and after major GC.
+pub(crate) fn foreign_function_runtime(cache: u64) -> Rc<crate::function_runtime::FunctionRuntime> {
+    with_active_gc_heap(|heap| {
+        let mut entries = heap.function_runtimes.borrow_mut();
+        if let Some(entry) = entries.get(&cache).and_then(std::rc::Weak::upgrade) {
+            return entry;
         }
-    }
+        if entries.len().is_multiple_of(64) {
+            entries.retain(|_, entry| entry.strong_count() != 0);
+        }
+        let entry = Rc::new(crate::function_runtime::FunctionRuntime::new());
+        entries.insert(cache, Rc::downgrade(&entry));
+        entry
+    })
+}
 
-    /// Bytes allocated beside the template (memory accounting).
-    pub(crate) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<TemplateStrings>()
-            + 2 * std::mem::size_of::<usize>()
-            + self.strings.borrow().capacity() * std::mem::size_of::<crate::lstr::LStr>()
+/// Major-only maintenance runs after payload finalizers released closure/runtime leases.
+/// Minors leave this index alone; cold misses still prune between major collections.
+pub(crate) fn prune_function_runtimes_after_major(heap: &GcState) {
+    let mut entries = heap.function_runtimes.borrow_mut();
+    entries.retain(|_, entry| entry.strong_count() != 0);
+    // Preserve a modest floor and 2x live headroom; shrink only beyond 4x underfill so a
+    // fluctuating set of foreign functions does not repeatedly resize the index.
+    let capacity = entries.capacity();
+    if capacity > 128 && entries.len().saturating_mul(4) < capacity {
+        let target = entries.len().saturating_mul(2).max(64);
+        entries.shrink_to(target);
     }
 }
 
-impl std::fmt::Debug for TemplateRoots {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut roots = f.debug_struct("TemplateRoots");
-        roots.field("strings", &self.strings.borrow().len());
-        roots.finish()
-    }
+#[cfg(test)]
+pub(crate) fn function_runtime_index_stats(heap: &GcState) -> (usize, usize, usize) {
+    let entries = heap.function_runtimes.borrow();
+    (
+        entries.len(),
+        entries.capacity(),
+        entries
+            .values()
+            .filter(|entry| entry.strong_count() == 0)
+            .count(),
+    )
+}
+
+/// Register the actual owner, so fields installed after publication are traced too. The heap
+/// keeps only a Weak: discarded code stops rooting cells and no code/heap cycle is made.
+pub(crate) fn register_code_roots<T: crate::gc_trace::GcTrace + 'static>(owner: &Rc<T>) {
+    let traced: Rc<dyn crate::gc_trace::GcTrace> = owner.clone();
+    with_active_gc_heap(|heap| heap.code_roots.borrow_mut().push(Rc::downgrade(&traced)));
 }
 
 #[inline]
@@ -4717,22 +4841,121 @@ impl std::ops::IndexMut<usize> for DenseStorage {
 /// observable. The immutable name index is built once with the layout and shared by every object
 /// with that ordered key sequence. Layouts contain no JS values, prototypes, or SymbolData
 /// ownership.
-#[derive(Clone)]
 #[repr(C)]
 pub(crate) struct PropertyLayoutData {
     /// Keep the key vector first: the native creation paths probe this field's live offset and
     /// use it to compare a constructor's predicted next key.
     keys: Vec<Rc<str>>,
-    /// Read-only after publication. A structural mutation first detaches the Rc layout, updates
+    /// Read-only after publication. A structural mutation first detaches shared data, updates
     /// `keys`, then rebuilds this table on that private copy.
     index: Option<Box<crate::fasthash::FastMap<Rc<str>, usize>>>,
+    shared: Cell<bool>,
 }
 
-pub(crate) type PropertyLayout = Rc<PropertyLayoutData>;
+/// A non-Copy, count-free handle. A cloned handle permanently marks its data shared;
+/// structural mutation of shared data copies it into a new private cell.
+#[repr(transparent)]
+pub(crate) struct PropertyLayout(crate::gc_box::GcBox<PropertyLayoutData>);
+
+impl PropertyLayout {
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const PropertyLayoutData {
+        crate::gc_box::GcBox::as_ptr(&self.0)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.as_ptr() == b.as_ptr()
+    }
+
+    #[inline]
+    pub(crate) fn cell_word(&self) -> u64 {
+        self.as_ptr() as u64
+    }
+
+    #[inline]
+    pub(crate) fn mark_shared(&self) {
+        self.shared.set(true);
+    }
+
+    #[inline]
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared.get()
+    }
+
+    fn make_mut(&mut self) -> &mut PropertyLayoutData {
+        if self.is_shared() {
+            *self = PropertyLayout(crate::gc_box::new((**self).clone()));
+        }
+        self.get_mut_private()
+            .expect("detached property layout is private")
+    }
+
+    fn get_mut_private(&mut self) -> Option<&mut PropertyLayoutData> {
+        if self.is_shared() {
+            return None;
+        }
+        // SAFETY: non-Copy handles mark shared on Clone. A private cell has one owning slot
+        // (checked at safepoints), exclusively borrowed here; it has no interior GC children.
+        Some(unsafe { &mut *self.as_ptr().cast_mut() })
+    }
+}
+
+impl Clone for PropertyLayout {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.mark_shared();
+        Self(self.0)
+    }
+}
+
+impl std::ops::Deref for PropertyLayout {
+    type Target = PropertyLayoutData;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PropertyLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PropertyLayout")
+            .field(&self.as_ptr())
+            .finish()
+    }
+}
+
+impl crate::gc_trace::GcTrace for PropertyLayout {
+    #[inline]
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        sink.layout(self);
+    }
+}
+
+impl crate::gc_box::Payload for PropertyLayoutData {
+    fn desc(heap: &GcState) -> crate::gc_core::DescId {
+        heap.property_layout_desc
+    }
+}
+
+impl Clone for PropertyLayoutData {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            index: self.index.clone(),
+            shared: Cell::new(false),
+        }
+    }
+}
 
 impl PropertyLayoutData {
     pub(crate) fn new(keys: Vec<Rc<str>>) -> Self {
-        Self { keys, index: None }
+        Self {
+            keys,
+            index: None,
+            shared: Cell::new(false),
+        }
     }
 
     fn with_shared_index(keys: Vec<Rc<str>>) -> Self {
@@ -4793,13 +5016,17 @@ impl std::ops::Deref for PropertyLayoutData {
 }
 
 pub(crate) fn new_property_layout(keys: Vec<Rc<str>>) -> PropertyLayout {
-    Rc::new(PropertyLayoutData::new(keys))
+    PropertyLayout(crate::gc_box::new(PropertyLayoutData::new(keys)))
 }
 
 /// Build an immutable layout index for a bounded shape/constructor key sequence. Longer maps
 /// retain the existing per-object index and its incremental insertion behavior.
 pub(crate) fn new_shared_indexed_property_layout(keys: Vec<Rc<str>>) -> PropertyLayout {
-    Rc::new(PropertyLayoutData::with_shared_index(keys))
+    let layout = PropertyLayout(crate::gc_box::new(PropertyLayoutData::with_shared_index(
+        keys,
+    )));
+    layout.mark_shared();
+    layout
 }
 
 /// Named properties kept in the object cell (S3, Decision 3): the measured count that holds
@@ -4875,12 +5102,12 @@ impl NamedEntries {
             if len == 0 && &*key == "length" {
                 // Array builders outside the native literal helper share this key-only prefix
                 // too; element slots remain in their existing independent dense representation.
-                self.layout = Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone));
+                self.layout = Some(array_length_layout());
             } else {
-                let layout = Rc::make_mut(
-                    self.layout
-                        .get_or_insert_with(|| new_property_layout(Vec::new())),
-                );
+                let layout = self
+                    .layout
+                    .get_or_insert_with(|| new_property_layout(Vec::new()))
+                    .make_mut();
                 layout.keys.truncate(len);
                 layout.keys.push(key);
                 layout.rebuild_index();
@@ -4897,7 +5124,11 @@ impl NamedEntries {
         let key = self.keys().last()?.clone();
         let property = self.fields.pop()?;
         // Do not retain the tail of large, shrinking arrays through an unused prediction.
-        if let Some(layout) = self.layout.as_mut().and_then(Rc::get_mut) {
+        if let Some(layout) = self
+            .layout
+            .as_mut()
+            .and_then(PropertyLayout::get_mut_private)
+        {
             layout.keys.truncate(self.fields.len());
             layout.rebuild_index();
         }
@@ -4905,7 +5136,7 @@ impl NamedEntries {
     }
     fn remove(&mut self, slot: usize) {
         let len = self.len();
-        let layout = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        let layout = self.layout.as_mut().expect("live entry layout").make_mut();
         layout.keys.truncate(len);
         layout.keys.remove(slot);
         self.fields.remove(slot);
@@ -4916,7 +5147,7 @@ impl NamedEntries {
         if len == 0 {
             return;
         }
-        let layout = Rc::make_mut(self.layout.as_mut().expect("live entry layout"));
+        let layout = self.layout.as_mut().expect("live entry layout").make_mut();
         layout.keys.truncate(len);
         let mut slot = 0;
         let mut retained = 0;
@@ -5265,13 +5496,24 @@ thread_local! {
         Rc::from("prototype"),
         Rc::from("constructor"),
     ];
-    /// Key-only layout has no Agent identities or JS values, like FN_KEYS itself.
-    static ARRAY_LENGTH_LAYOUT: PropertyLayout = new_property_layout(vec![fn_key(0)]);
 }
 
 /// Shape reached by adding the intrinsic `"length"` key to an empty map. Array literals create
 /// this same one-property named map constantly. The memo belongs to the Agent alongside its
 /// transition table; globally unique IDs also remain valid on pooled coroutine workers.
+fn array_length_layout() -> PropertyLayout {
+    with_active_gc_heap(|heap| {
+        let mut cached = heap.array_length_layout.borrow_mut();
+        cached
+            .get_or_insert_with(|| {
+                let layout = new_property_layout(vec![fn_key(0)]);
+                layout.mark_shared();
+                layout
+            })
+            .clone()
+    })
+}
+
 fn array_length_shape(length_key: &Rc<str>) -> u32 {
     with_active_gc_heap(|heap| {
         let cached = heap.array_length_shape.get();
@@ -5562,6 +5804,13 @@ impl Props {
         })
     }
 
+    /// Cached layouts are immutable before their first instance is created.
+    pub(crate) fn mark_layout_shared(&self) {
+        if let Some(layout) = &self.entries.layout {
+            layout.mark_shared();
+        }
+    }
+
     pub(crate) fn shared_layout(&self) -> Option<&PropertyLayout> {
         self.entries.layout.as_ref()
     }
@@ -5760,7 +6009,7 @@ impl Props {
                     false,
                     false,
                 )]),
-                layout: Some(ARRAY_LENGTH_LAYOUT.with(Clone::clone)),
+                layout: Some(array_length_layout()),
             },
             shape,
             // An empty InlinePacked has no active packed representation. Preserve the
@@ -7765,12 +8014,16 @@ mod object_accounting_tests {
     use crate::interpreter::WeakTarget;
     use crate::weak_metadata::{Subscriber, WeakMetadata};
 
-    struct Roots(Vec<u64>);
-    impl MarkClient for Roots {
+    struct Roots<'a>(Vec<u64>, &'a GcHeap);
+    impl MarkClient for Roots<'_> {
         fn roots(&self, sink: &mut dyn FnMut(u64)) {
             for &word in &self.0 {
                 sink(word);
             }
+            trace_heap_roots(
+                self.1,
+                &mut crate::gc_trace::VisitSink(&mut |cell| sink(cell as u64)),
+            );
         }
         fn side_slot_owners(&self, _: &mut dyn FnMut(usize)) {}
         fn trace_side_slots(&self, _: usize, _: &mut dyn FnMut(u64)) {}
@@ -7780,7 +8033,7 @@ mod object_accounting_tests {
     /// Drive the real object descriptor with precise roots, so death assertions do not depend
     /// on conservative retention in the test's frame. Preserve the production phase ordering.
     fn collect(heap: &GcHeap, roots: &[Gc], kind: CollectionKind) {
-        let client = Roots(roots.iter().map(|o| Gc::as_ptr(o) as u64).collect());
+        let client = Roots(roots.iter().map(|o| Gc::as_ptr(o) as u64).collect(), heap);
         assert!(heap.core.borrow_mut().start_marking(false, &client, kind));
         let dead = crate::gc_sweep::DeadObjects::new(heap);
         sweep_object_metadata(heap, &dead);
@@ -7940,8 +8193,8 @@ mod object_accounting_tests {
             .as_ref()
             .unwrap()
             .clone();
-        let refs = Rc::strong_count(&layout);
-        assert!(named.borrow().owns_payload());
+        let identity = layout.as_ptr();
+        assert!(!named.borrow().owns_payload());
         let spilled = Object::new_with_capacity(None, INLINE_NAMED_SLOTS + 1);
         assert!(spilled.borrow().owns_payload());
         let sidecar = Object::new(None);
@@ -7972,13 +8225,14 @@ mod object_accounting_tests {
         }));
         assert!(native.borrow().owns_payload());
         collect(&heap, &[], CollectionKind::Major);
-        assert_eq!(
-            Rc::strong_count(&layout),
-            refs - 1,
-            "the inline object's layout Rc is released"
-        );
+        assert_eq!(layout.as_ptr(), identity);
+        assert_eq!(&*layout[0], "field");
         assert_eq!(dropped.get(), 1, "native Rust state drops exactly once");
         drop(release);
         assert_eq!(dropped.get(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "property_layout_cell_tests.rs"]
+pub(crate) mod property_layout_cell_tests;

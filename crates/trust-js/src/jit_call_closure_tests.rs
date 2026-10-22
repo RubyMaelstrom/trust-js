@@ -359,12 +359,8 @@ fn settle(engine: &mut Engine, name: &str) {
     let crate::value::Callable::User(user) = &object.call else {
         panic!("{name} is not a user function")
     };
-    let chunk = user
-        .func
-        .code
-        .get()
-        .and_then(Option::as_ref)
-        .expect("chunk");
+    let runtime = user.func.runtime();
+    let chunk = runtime.code.get().and_then(Option::as_ref).expect("chunk");
     assert!(chunk.jit.get().flatten().is_some(), "{name} runs natively");
     chunk.inline_attempted.set(true);
     chunk.inline_retry_at.set(0);
