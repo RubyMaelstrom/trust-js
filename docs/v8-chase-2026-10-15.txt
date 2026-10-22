@@ -6515,3 +6515,94 @@ Step 11 closed (2026-10-22): the plan f43c3136, 11a d8651ca5, 11b
     arguments would be undefined behaviour; debug builds assert it
     never does (11b).
   - Step 10's list stands.
+
+Step 12 plan (2026-10-22), from a read-only survey of df5da39d
+(target/s6-survey12/report.md, its census, experiments and
+disassembly beside it) and the owner's decision:
+- The owner: the packed 8-byte word replaces the 16-byte Value enum
+  everywhere, in the engine's Rust code and in the embed API (11b's
+  Value<'s> becomes 8 bytes too). TRust's port follows the merge
+  review, against the API this step leaves.
+- What the survey found: the packed word already encodes every value
+  (NaN-boxed: every f64 inline, NaNs canonicalized, eight tags plus
+  the property-only deferred prototype), and both of the collector's
+  scans resolve its cell words by mask. The 16-byte Value is stored
+  in 154 declarations (Binding.value with 94 sites, Scope.with_obj,
+  the VM's this, builtins' state), passed or returned by 1,312
+  functions, matched by 2,048 variant patterns (341 more in tests,
+  111 in the embed API) and constructed at 2,427 sites. Generated
+  code reads a wide Value only in seven binding templates and the
+  with-object guards (which rely on Option<Value>'s niche) on ARM64
+  and six emitters on x64; no helper's ABI carries one. The wide
+  Value can derive Copy today (a clean check of an export); the
+  packed word cannot, for 28 writes through shared references and
+  the deferred prototype's promotion. Object holds 16 bytes for its
+  heap's Rc, a weak-observed flag and a registry slot: allocation
+  takes two Rc increments and a decrement and reserves a slot, and
+  each dead object's finalizer spends about 40 instructions on that
+  bookkeeping before its payload's drops (in 10c's profile 0.34%,
+  1.25% and 1.81% of cycles on vue, djot and the sustained workload,
+  an estimated 8%, 15% and 5% of their GC pause). One ARM64 template
+  (SetProp's creation commit) still counts PropertyLayout
+  references, and guards that the counted model motivated remain.
+- The design: Value becomes a Copy, !Send word (repr(transparent)
+  over u64) whose associated constants and functions are named like
+  today's variants, so the constructions compile unchanged; matches
+  go through a view, today's enum, made only by an inline view() and
+  never stored. A property word stays the only place a deferred
+  prototype lives; frame slots become cells of words. Bindings and
+  this hold words, so the binding templates take the packed path
+  globals take, and with_obj is a word with EMPTY for none. The
+  embed API's Value<'s> becomes the word with its zero-sized brand
+  and a kind() view; EMPTY reads as undefined, which retires 11b's
+  open item on undefined behaviour in release builds.
+- Step 12 runs as six commits, each built, gated (tiered) and
+  measured on its own:
+  - 12a, heap-level object accounting: objects drop their heap's Rc
+    and registry slot; the live count rises at allocation and falls
+    by each swept object page's dead; weak observers are keyed by
+    address and evicted from the dead list; objects with nothing to
+    free skip finalization where the sweep can tell. Its review
+    also measures the byte budget's floor below 8 MiB with the
+    nursery, the lever left for react's peak RSS (a change of
+    default is recorded before it is made).
+  - 12b, PropertyLayout as payload cells (traced from properties,
+    the shape cache, deferred prototypes and templates, copy on
+    write by a sticky shared bit, checked in debug builds); the
+    creation commit's count traffic, jit_ownership.rs and the guards
+    the counted model motivated go.
+  - 12c, Copy and views, neutral: the wide Value Copy, the packed
+    word Copy with cells for its 28 shared writes, view() and kind()
+    as identities, every pattern ported (by a codemod, compiler-
+    checked), and Gc's and Env's Deref to RefCell removed so that no
+    borrow can pass the barrier (11b's open item). The dumps must be
+    11b's.
+  - 12d, packed storage the JIT reads: Binding.value, with_obj, the
+    VM's this and JitThisView as words; the binding templates' wide
+    branches and x64's wide emitters deleted.
+  - 12e, the flip, engine and embed API together (their layouts are
+    tied): Value and Value<'s> become words, the natives' arguments
+    slices of words (DecodedArgs and its kin gone), every number
+    construction canonicalizing NaN, raw bits unsafe and checked in
+    debug builds. The dumps must be 12d's.
+  - 12f, one representation: the packed word becomes Value, and the
+    conversions, StoredValue and the wide emitters' remains go.
+  Step 12 closes with the milestone gate after 12f; the S6 exit gate
+  and the merge review with the owner follow.
+- Risks, each with its check: words in Rust frames for the
+  conservative scan (resolved by mask, as JIT frames' words are;
+  the step's whole-suite stress); NaN payloads (canonicalized at
+  construction, debug-checked raw bits); the lost niche (the
+  with-object probe would refuse every name template without a
+  failing test: a test of a name template under with); a native's
+  argument slice moving during its call (asserted); decoding at hot
+  matches (predicates where the measurement shows it); copy on
+  write without counts (12b's debug check).
+- Not expected of step 12: react's peak RSS (+48% against S0's
+  +25%), which comes from cell pages and dead payloads; djot's GC
+  time (7.8% against 5%) is expected to fall with 12a, not
+  necessarily under 5%. The exit gate reports both against the
+  bounds.
+- Not in step 12: element-range dirtiness and a per-page card
+  summary (step 10's open items); N-API finalizers at teardown
+  (11a's).
